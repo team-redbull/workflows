@@ -1,0 +1,4 @@
+# For api.py — the unified Swagger entrypoint that starts workflows.
+-r workflows/requirements.txt
+fastapi>=0.110,<1
+uvicorn>=0.29,<1

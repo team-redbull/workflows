@@ -1,0 +1,42 @@
+# The lightweight "brain": runs workflows only. Its own ServiceAccount per the
+# RBAC-isolation requirement (no Segments Manager credentials mounted — it never
+# makes those calls; activities do).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: workflow-worker
+  namespace: {{ .Values.namespace }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: workflow-worker
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: workflow-worker
+spec:
+  replicas: {{ .Values.workflowWorker.replicas }}
+  selector:
+    matchLabels:
+      app: workflow-worker
+  template:
+    metadata:
+      labels:
+        app: workflow-worker
+    spec:
+      serviceAccountName: workflow-worker
+      containers:
+        - name: workflow-worker
+          image: "{{ .Values.workflowWorker.image.repository }}:{{ .Values.workflowWorker.image.tag }}"
+          imagePullPolicy: {{ .Values.workflowWorker.image.pullPolicy }}
+          env:
+            - name: TEMPORAL_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: orchestrator-config
+                  key: TEMPORAL_HOST
+            - name: TEMPORAL_NAMESPACE
+              valueFrom:
+                configMapKeyRef:
+                  name: orchestrator-config
+                  key: TEMPORAL_NAMESPACE

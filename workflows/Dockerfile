@@ -12,4 +12,4 @@ COPY shared/ /app/shared/
 COPY workflows/ /app/workflows/
 
 ENV PYTHONPATH=/app
-CMD ["python", "-m", "workflows.main_worker"]
+CMD ["python", "-m", "workflows.worker_init"]

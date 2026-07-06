@@ -24,7 +24,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Cluster Orchestrator API", lifespan=lifespan)
+app = FastAPI(title="Redbull Workflows Orchestrator API", lifespan=lifespan)
 
 
 @app.post("/workflows/segment-allocation", response_model=SegmentAllocationResult)

@@ -1,45 +1,30 @@
 # Default values target the local kind cluster (prep-temporal), where the
-# Temporal server and Segments Manager run on the host and are reached via
-# host.docker.internal. For OpenShift, override config.* (e.g. via
-# values-openshift.yaml or --set) — the images and templates stay the same.
+# Temporal server runs on the host and is reached via host.docker.internal.
+# For OpenShift, override config.* (e.g. via values-openshift.yaml or --set) —
+# the images and templates stay the same.
 
 namespace: segment-allocation
 
 config:
   temporalHost: "host.docker.internal:7233"
   temporalNamespace: "default"
-  segmentManagerUrl: "http://host.docker.internal:8000"
-  # In-cluster mock generator (dev). In prod: point at the external team's IPAM URL
-  # and set mockGenerator.enabled=false.
-  generatorUrl: "http://segment-generator.segment-allocation.svc.cluster.local:9000"
-
-# Credentials for the Segments Manager. Replace for non-local environments,
-# e.g. via --set secrets.segmentsPassword=... or a separate values file.
-secrets:
-  segmentsUser: "admin"
-  segmentsPassword: "admin"
+  # Deployments API (segment allocation, Step 1). Base host only; the
+  # /api/v2/projects/{PROJECT_ID}/groups/{GROUP}/deployments path is composed
+  # from projectId + group at request time.
+  deploymentApiUrl: "https://america.com"
+  deploymentProjectId: "REPLACE_ME"
+  deploymentGroup: "REPLACE_ME"
 
 workflowWorker:
   image:
-    repository: segment-allocation-workflow
-    tag: dev
-    pullPolicy: IfNotPresent
+    repository: ghcr.io/team-redbull/workflows/segment-allocation-workflow
+    tag: latest
+    pullPolicy: Always
   replicas: 1
 
 activityWorker:
   image:
-    repository: segment-allocation-activity
-    tag: dev
-    pullPolicy: IfNotPresent
+    repository: ghcr.io/team-redbull/workflows/segment-allocation-activity
+    tag: latest
+    pullPolicy: Always
   replicas: 1
-
-# LOCAL DEV ONLY: deploys the mock IPAM that generatorUrl points at by default.
-# Disable when generatorUrl points at a real external generator.
-mockGenerator:
-  enabled: true
-  image:
-    repository: segment-generator-mock
-    tag: dev
-    pullPolicy: IfNotPresent
-  sitePrefixes: "site1:192,site2:193,site3:194"
-  port: 9000

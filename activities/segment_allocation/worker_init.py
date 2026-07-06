@@ -26,10 +26,9 @@ async def main() -> None:
         client,
         task_queue=SEGMENT_ALLOCATION_ACTIVITY_QUEUE,
         activities=[
-            get_available_segment,
-            request_segment,
-            register_segment,
-            allocate_segment,
+            create_deployment,
+            get_deployment,
+            commit_segment_to_git,
         ],
     )
     logging.getLogger(__name__).info(

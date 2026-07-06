@@ -9,17 +9,9 @@ class OrchestratorError(Exception):
     """Base class for all orchestrator domain errors."""
 
 
-class NoSegmentAvailableError(OrchestratorError):
-    """No segment could be allocated for the cluster at the requested site.
-
-    Raised when the Segments Manager has no available segment to assign and
-    (after attempting generation) allocation still cannot succeed.
-    """
+class DeploymentApiError(OrchestratorError):
+    """The deployments API returned an unexpected status or malformed payload."""
 
 
-class SegmentGeneratorError(OrchestratorError):
-    """The external segment generator (IPAM) API failed or returned bad data."""
-
-
-class SegmentManagerError(OrchestratorError):
-    """The team's Segments Manager API returned an unexpected error."""
+class GitCommitError(OrchestratorError):
+    """Committing the allocated segment to the GitOps repository failed."""

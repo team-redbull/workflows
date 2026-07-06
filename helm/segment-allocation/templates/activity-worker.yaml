@@ -1,5 +1,5 @@
-# The segment-allocation activity "limb": its own deployment, ServiceAccount and
-# Segments Manager credentials. Heavy/domain deps and secrets live here, not in the brain.
+# The segment-allocation activity "limb": its own deployment and ServiceAccount.
+# Heavy/domain deps and (future) secrets live here, not in the brain.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -31,5 +31,3 @@ spec:
           envFrom:
             - configMapRef:
                 name: orchestrator-config
-            - secretRef:
-                name: segments-manager-credentials

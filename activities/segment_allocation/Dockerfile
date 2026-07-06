@@ -9,4 +9,4 @@ COPY shared/ /app/shared/
 COPY activities/ /app/activities/
 
 ENV PYTHONPATH=/app
-CMD ["python", "-m", "activities.segment_allocation.main_worker"]
+CMD ["python", "-m", "activities.segment_allocation.worker_init"]

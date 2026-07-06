@@ -1,5 +1,7 @@
 from __future__ import annotations
+
 from datetime import datetime
+
 from pydantic import BaseModel, Field
 
 
@@ -10,17 +12,16 @@ class SegmentAllocationInput(BaseModel):
     site: str = Field(min_length=1)
 
 
-class SegmentSpec(BaseModel):
-    """A network segment definition, as generated and/or stored.
+class DeploymentStatus(BaseModel):
+    """Structural view of a deployment resource as returned by the deployments API.
 
-    Mirrors the Segments Manager's create payload plus availability state.
+    We trust the external API's payload (black box) and only parse the fields we
+    act on: the lifecycle `status` and, once created, the allocated `segment`
+    carried under `additionalInfo.segment`.
     """
 
-    site: str = Field(min_length=1)
-    vlan_id: int = Field(ge=1, le=4094)
-    segment: str = Field(min_length=1)  # CIDR, e.g. "192.168.15.0/24"
-    epg_name: str = Field(min_length=1)
-    dhcp: bool = True
+    status: str = Field(min_length=1)
+    segment: str | None = None
 
 
 class SegmentAllocationResult(BaseModel):
@@ -28,7 +29,6 @@ class SegmentAllocationResult(BaseModel):
 
     cluster_name: str
     site: str
-    vlan_id: int
+    uuid: str
     segment: str
-    epg_name: str
     allocated_at: datetime

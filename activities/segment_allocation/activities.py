@@ -1,17 +1,16 @@
 """Segment-allocation activity implementations — the execution limbs.
 
-These run in the segment-allocation activity deployment. They talk to:
-  - the team's Segments Manager (SEGMENT_MANAGER_URL)  — read pool, create, allocate
-  - the external generator / IPAM (GENERATOR_URL) — a black box; we trust its output
+These run in the segment-allocation activity deployment. Step 1 talks to the
+deployments API (DEPLOYMENT_API_URL) to create a deployment and read back the
+allocated segment, then commits that segment to GitOps.
 
 Conventions enforced here:
   * activity.logger only (not the root logger).
-  * Idempotency: create_segment tolerates an already-existing segment; allocate is
-    idempotent per (cluster, site) by the Segments Manager's contract.
-  * Every httpx.AsyncClient is created INSIDE the activity via `async with`, with an
-    explicit timeout strictly below the workflow's start_to_close_timeout (30s). This
-    frees the worker on a network hang before Temporal times the activity out, and
-    keeps the auth session cookie scoped to a single invocation (no global leak).
+  * Every httpx.AsyncClient is created INSIDE the activity via `async with`, with
+    an explicit timeout strictly below the workflow's start_to_close_timeout (30s).
+    This frees the worker on a network hang before Temporal reaps the activity and
+    keeps any auth/session state scoped to a single invocation (no global leak).
+  * Idempotency: create/commit are safe to retry (see per-activity notes).
 """
 
 from __future__ import annotations
@@ -19,12 +18,11 @@ from __future__ import annotations
 import httpx
 from temporalio import activity
 
-from shared.exceptions import (
-    NoSegmentAvailableError,
-    SegmentGeneratorError,
-    SegmentManagerError,
+from shared.exceptions import DeploymentApiError
+from shared.models.segment_allocation import (
+    DeploymentStatus,
+    SegmentAllocationInput,
 )
-from shared.models.segment_allocation import *
 from shared.settings import SegmentActivitySettings
 
 _settings = SegmentActivitySettings()
@@ -33,133 +31,91 @@ _settings = SegmentActivitySettings()
 # connection fails the HTTP call and releases the worker before Temporal reaps it.
 _HTTP_TIMEOUT = httpx.Timeout(10.0)
 
-
-def _segment_manager_client() -> httpx.AsyncClient:
-    """A fresh, per-invocation client for the Segments Manager (own cookie jar)."""
-    return httpx.AsyncClient(base_url=_settings.segment_manager_url, timeout=_HTTP_TIMEOUT)
-
-
-async def _login(client: httpx.AsyncClient) -> None:
-    """Authenticate; the session cookie is stored on this client's jar only."""
-    resp = await client.post(
-        "/api/auth/login",
-        json={"username": _settings.segment_manager_user, "password": _settings.segment_manager_password},
-    )
-    if resp.status_code != 200:
-        raise SegmentManagerError(
-            f"Login failed: {resp.status_code} {resp.text}"
-        )
+# TODO(pending): auth headers for the deployments API are not finalized yet.
+_API_HEADERS: dict[str, str] = {}
 
 
 @activity.defn
-async def get_available_segment(site: str) -> SegmentSpec | None:
-    """Return the first unallocated, non-released segment at the site, or None."""
-    async with _segment_manager_client() as client:
-        resp = await client.get("/api/segments")
-        if resp.status_code != 200:
-            raise SegmentManagerError(
-                f"List segments failed: {resp.status_code} {resp.text}"
-            )
-        for seg in resp.json():
-            if (
-                seg.get("site") == site
-                and not seg.get("cluster_name")
-                and not seg.get("released", False)
-            ):
-                activity.logger.info(
-                    "Found available segment %s at site=%s",
-                    seg.get("segment"),
-                    site,
-                )
-                return SegmentSpec(
-                    site=seg["site"],
-                    vlan_id=seg["vlan_id"],
-                    segment=seg["segment"],
-                    epg_name=seg["epg_name"],
-                    dhcp=seg.get("dhcp", False),
-                )
-    activity.logger.info("No available segment at site=%s", site)
-    return None
+async def create_deployment(allocation_input: SegmentAllocationInput) -> str:
+    """Create a deployment and return its `uuid`.
 
-
-@activity.defn
-async def request_segment(site: str) -> SegmentSpec:
-    """Ask the external generator for a new valid segment at the site"""
-    async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
+    POSTs to the deployments collection endpoint. The response `uuid` identifies
+    the deployment we then poll (see `get_deployment`).
+    """
+    # TODO(pending): the exact JSON payload the deployments API expects is not
+    # finalized. cluster_name/site are carried through until the schema is known.
+    payload = {
+        "cluster_name": allocation_input.cluster_name,
+        "site": allocation_input.site,
+    }
+    async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT, headers=_API_HEADERS) as client:
         try:
-            resp = await client.post(_settings.segment_generator_url, json={"site": site})
+            resp = await client.post(_settings.deployments_endpoint, json=payload)
         except httpx.HTTPError as exc:
-            raise SegmentGeneratorError(f"Generator call failed: {exc}") from exc
-        if resp.status_code != 200:
-            raise SegmentGeneratorError(
-                f"Generator returned {resp.status_code}: {resp.text}"
+            raise DeploymentApiError(f"Create deployment call failed: {exc}") from exc
+        if resp.status_code not in (200, 201):
+            raise DeploymentApiError(
+                f"Create deployment returned {resp.status_code}: {resp.text}"
             )
         try:
-            spec = SegmentSpec.model_validate(resp.json())
-        except Exception as exc:  # malformed payload from the generator
-            raise SegmentGeneratorError(f"Invalid generator payload: {exc}") from exc
+            uuid = resp.json()["uuid"]
+        except (ValueError, KeyError, TypeError) as exc:
+            raise DeploymentApiError(
+                f"Create deployment response missing 'uuid': {resp.text}"
+            ) from exc
+
     activity.logger.info(
-        "Generated segment %s for site=%s",
-        spec.segment,
-        site,
+        "Created deployment uuid=%s for cluster=%s site=%s",
+        uuid,
+        allocation_input.cluster_name,
+        allocation_input.site,
     )
-    return spec
+    return uuid
 
 
 @activity.defn
-async def register_segment(spec: SegmentSpec) -> None:
-    """Register a segment in the Segments Manager.
+async def get_deployment(uuid: str) -> DeploymentStatus:
+    """Fetch a deployment's current status (and segment once created).
 
-    Idempotent: a duplicate (already-created) segment is treated as success, so a
-    retried activity does not fail on the manager's VLAN-uniqueness constraint.
+    Extracts `status` and, when present, `additionalInfo.segment`. The workflow
+    polls this until status == "CREATED".
     """
-    async with _segment_manager_client() as client:
-        await _login(client)
-        resp = await client.post("/api/segments", json=spec.model_dump())
-        if resp.status_code in (200, 201):
-            activity.logger.info("Created segment vlan=%s", spec.vlan_id)
-            return
-        # Already exists -> the desired state is satisfied; treat as success.
-        body = resp.text.lower()
-        if resp.status_code in (400, 409) and "overlaps" in body:
-            activity.logger.info(
-                "Segment vlan=%s already exists; treating as created", spec.vlan_id
+    url = f"{_settings.deployments_endpoint}/{uuid}"
+    async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT, headers=_API_HEADERS) as client:
+        try:
+            resp = await client.get(url)
+        except httpx.HTTPError as exc:
+            raise DeploymentApiError(f"Get deployment call failed: {exc}") from exc
+        if resp.status_code != 200:
+            raise DeploymentApiError(
+                f"Get deployment {uuid} returned {resp.status_code}: {resp.text}"
             )
-            return
-        raise SegmentManagerError(
-            f"Create segment failed: {resp.status_code} {resp.text}"
-        )
+        try:
+            body = resp.json()
+            status = body["status"]
+        except (ValueError, KeyError, TypeError) as exc:
+            raise DeploymentApiError(
+                f"Get deployment {uuid} response missing 'status': {resp.text}"
+            ) from exc
+        segment = (body.get("additionalInfo") or {}).get("segment")
+
+    activity.logger.info("Deployment uuid=%s status=%s", uuid, status)
+    return DeploymentStatus(status=status, segment=segment)
 
 
 @activity.defn
-async def allocate_segment(allocation_input: SegmentAllocationInput) -> SegmentAllocationResult:
-    """Allocate a segment at the site to the cluster.
+async def commit_segment_to_git(allocation_input: SegmentAllocationInput, segment: str) -> None:
+    """Commit the allocated segment to the GitOps repository.
 
-    Idempotent per the manager contract: if the cluster already holds a segment at
-    the site, the existing one is returned instead of allocating a new one.
+    Must be idempotent: a retry after a partial/committed write should converge to
+    the same state, never duplicate it.
     """
-    async with _segment_manager_client() as client:
-        await _login(client)
-        resp = await client.post(
-            "/api/allocate-vlan",
-            json={
-                "cluster_name": allocation_input.cluster_name,
-                "site": allocation_input.site,
-            },
-        )
-        if resp.status_code == 200:
-            result = SegmentAllocationResult.model_validate(resp.json())
-            activity.logger.info(
-                "Allocated vlan=%s to cluster=%s",
-                result.vlan_id,
-                result.cluster_name,
-            )
-            return result
-        body = resp.text.lower()
-        if "no segment" in body or "available" in body:
-            raise NoSegmentAvailableError(
-                f"No segment available at site={allocation_input.site}: {resp.text}"
-            )
-        raise SegmentManagerError(
-            f"Allocate failed: {resp.status_code} {resp.text}"
-        )
+    # TODO(pending): Git repository, hierarchy, and commit logic are not finalized.
+    # Left as a no-op (warn only) so Step 1 completes end-to-end; wire up the real
+    # commit once the GitOps hierarchy is defined, and keep it idempotent.
+    activity.logger.warning(
+        "Segment=%s for cluster=%s site=%s NOT committed to Git yet (logic pending)",
+        segment,
+        allocation_input.cluster_name,
+        allocation_input.site,
+    )

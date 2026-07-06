@@ -1,0 +1,34 @@
+# OpenShift overlay — install with:
+#   helm upgrade --install segment-allocation ./helm/segment-allocation \
+#     -f helm/segment-allocation/values-openshift.yaml \
+#     --set namespace=workflows \
+#     --set config.temporalHost=<host>:<port> \
+#     --set config.deploymentProjectId=<project> \
+#     --set config.deploymentGroup=<group>
+
+namespace: workflows
+
+config:
+  temporalHost: "temporal-frontend.temporal.svc.cluster.local:7233"
+  temporalNamespace: "default"
+  deploymentApiUrl: "https://america.com"
+  deploymentProjectId: "REPLACE_ME"
+  deploymentGroup: "REPLACE_ME"
+
+workflowWorker:
+  image:
+    # Replace with your Artifactory path, e.g.:
+    # repository: artifactory.company.com/temporal/segment-allocation-workflow
+    repository: REPLACE_ME/segment-allocation-workflow
+    tag: latest
+    pullPolicy: Always
+  replicas: 1
+
+activityWorker:
+  image:
+    # Replace with your Artifactory path, e.g.:
+    # repository: artifactory.company.com/temporal/segment-allocation-activity
+    repository: REPLACE_ME/segment-allocation-activity
+    tag: latest
+    pullPolicy: Always
+  replicas: 1

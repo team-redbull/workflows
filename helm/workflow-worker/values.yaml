@@ -13,7 +13,7 @@ config:
   temporalNamespace: "default"
 image:
   repository: ghcr.io/team-redbull/connectivity-workflow
-  tag: v1.0.17
+  tag: v1.0.20
   pullPolicy: IfNotPresent
 replicas: 3
 # The SHARED workflow trigger API (api.py), run from the same image as a single

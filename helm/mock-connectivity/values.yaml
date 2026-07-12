@@ -10,16 +10,13 @@
 
 image:
   repository: ghcr.io/team-redbull/mock-connectivity
-  tag: v0.1.0
+  tag: v1.0.10
   pullPolicy: IfNotPresent
-
 # State (pending request ids) is in-memory only — one replica only, or
 # requests submitted to one pod never resolve when polled against another.
 replicas: 1
-
 service:
   port: 9000
-
 # NOTE: the simulated approval delay (COMPLETION_DELAY_SECONDS) deliberately
 # does NOT live here. It is defined directly in templates/config.yaml — the
 # ConfigMap is the operator's edit surface for it (edit + restart the

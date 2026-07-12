@@ -20,9 +20,10 @@ workflows/                       The orchestration "brain" (lightweight deployme
 activities/<domain>/             The execution "limbs" (one deployment per domain)
   activities.py                  Concrete activity implementations
   worker_init.py                 Registers activities, polls that domain's queue
-dev/mock-connectivity/           LOCAL-DEV ONLY stand-in for the external next service
+dev/mock-connectivity/           Test-only stand-in for the external next service (image for helm/mock-connectivity/)
 helm/workflow-worker/            Helm chart for the brain — ONE release, shared by every domain
 helm/connectivity/               Helm chart for the connectivity limb (one chart per domain)
+helm/mock-connectivity/          Helm chart for the mock next service — e2e/test environments ONLY, never prod
 api.py                           Unified FastAPI/Swagger entrypoint to start workflows
 ```
 
@@ -76,9 +77,12 @@ api.py                           Unified FastAPI/Swagger entrypoint to start wor
   open-rules requests (`NEXT_OPEN_RULES_URI`) and polls request status
   (`NEXT_CHECK_STATUS_URI`) against `NEXT_URL`, **trusting the responses**
   (structural parse only).
-- `dev/mock-connectivity/` is a local stand-in, isolated and dev-only, and is NOT
-  deployed by the Helm chart — in dev, `config.nextUrl` simply points at it; in prod,
-  at the real service. Its `COMPLETION_DELAY_SECONDS` simulates the human approval.
+- `dev/mock-connectivity/` is a stand-in for e2e/test environments, isolated from
+  production code paths. It's deployed via its own chart, `helm/mock-connectivity/`
+  (never installed alongside a production `connectivity` release) — point
+  `config.nextUrl` at its Service in test environments; in prod, at the real service.
+  Its `COMPLETION_DELAY_SECONDS` simulates the human approval — set directly in
+  `helm/mock-connectivity/templates/config.yaml` (edit + restart, no rebuild).
 - next request approval is HUMAN-driven and unbounded (minutes → hours → more).
   Workflows must never deadline-fail while waiting: poll with durable timers +
   backoff and `continue_as_new` to keep history bounded.
@@ -173,13 +177,16 @@ api.py                           Unified FastAPI/Swagger entrypoint to start wor
 
 ## 9. Deploy & run (local)
 
-- Two charts: `helm/workflow-worker/` (ConfigMap + the brain, its own ServiceAccount)
-  and `helm/connectivity/` (ConfigMap + Secret + the connectivity limb, its own
-  ServiceAccount). **Neither creates a Namespace** — both deploy into whichever
-  namespace the release targets (`helm install -n <ns> [--create-namespace]`
-  standalone; redbull-platform's `namespaces` release pre-creates it there). The
-  mock next service is NOT part of either chart — run it separately (uvicorn/docker)
-  and point `config.nextUrl` at it.
+- Three charts: `helm/workflow-worker/` (ConfigMap + the brain, its own ServiceAccount),
+  `helm/connectivity/` (ConfigMap + Secret + the connectivity limb, its own
+  ServiceAccount), and `helm/mock-connectivity/` (ConfigMap + Deployment + Service, its
+  own ServiceAccount) — the last **only** for e2e/test environments where the real next
+  service is unreachable; never install it alongside a production `connectivity`
+  release. **None creates a Namespace** — all three deploy into whichever namespace the
+  release targets (`helm install -n <ns> [--create-namespace]` standalone;
+  redbull-platform's `namespaces` release pre-creates it there). For a bare local
+  kind/uvicorn run without any chart, run the mock directly
+  (`uvicorn app:app` inside `dev/mock-connectivity/`) and point `config.nextUrl` at it.
 - Assumed already running: a Temporal server and the Segments Manager (reached via
   OpenShift routes or localhost — no port assumptions in code).
 - Trigger workflows via the unified API: `uvicorn api:app --port 8080`, Swagger at

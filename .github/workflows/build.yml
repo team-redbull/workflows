@@ -1,9 +1,9 @@
 name: Build and Push
 
-# Two images from this one repo: the workflow "brain" (workflows/Dockerfile)
-# and the connectivity activity "limb" (activities/connectivity/Dockerfile).
-# dev/mock-connectivity is dev-only and never deployed by the Helm chart, so
-# it is not built/published here (see CLAUDE.md section 4).
+# Three images from this one repo: the workflow "brain" (workflows/Dockerfile),
+# the connectivity activity "limb" (activities/connectivity/Dockerfile), and
+# the test-only mock of the next service (dev/mock-connectivity/Dockerfile),
+# deployed via helm/mock-connectivity for e2e testing (see CLAUDE.md section 4).
 
 on:
   push:
@@ -38,6 +38,19 @@ jobs:
       helm-image-path: activityWorker.image
     secrets: inherit
 
+  build-mock-connectivity:
+    if: github.event_name == 'push'
+    # Sequential, not parallel: all three calls bump the same shared vX.Y.Z git
+    # tag and commit+push to the same branch; running in parallel races.
+    needs: build-connectivity-activity
+    uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
+    with:
+      image-name: mock-connectivity
+      dockerfile: dev/mock-connectivity/Dockerfile
+      helm-values-path: helm/mock-connectivity/values.yaml
+      helm-image-path: image
+    secrets: inherit
+
   cleanup-workflow-brain-on-delete:
     if: github.event_name == 'delete'
     uses: team-redbull/.github/.github/workflows/ghcr-cleanup-on-delete.yml@main
@@ -50,4 +63,11 @@ jobs:
     uses: team-redbull/.github/.github/workflows/ghcr-cleanup-on-delete.yml@main
     with:
       image-name: connectivity-activity
+    secrets: inherit
+
+  cleanup-mock-connectivity-on-delete:
+    if: github.event_name == 'delete'
+    uses: team-redbull/.github/.github/workflows/ghcr-cleanup-on-delete.yml@main
+    with:
+      image-name: mock-connectivity
     secrets: inherit

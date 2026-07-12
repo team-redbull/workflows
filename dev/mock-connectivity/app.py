@@ -1,10 +1,11 @@
-"""LOCAL DEV ONLY — mock of the external "next" connectivity (firewall) service.
+"""Test-only mock of the external "next" connectivity (firewall) service.
 
-This stands in for a black-box service owned by another team; the user's prod
-environment is air-gapped, so local runs need a stand-in. The orchestrator
-treats the three endpoints as opaque; this implementation only exists so local
-runs can exercise the full submit -> poll -> complete cycle. In production you
-point NEXT_URL at the real service and ignore this folder entirely.
+This stands in for a black-box service owned by another team; the real
+environment is air-gapped, so local runs and OpenShift e2e tests need a
+stand-in (deployed via helm/mock-connectivity/). The orchestrator treats the
+three endpoints as opaque; this implementation only exists so those runs can
+exercise the full submit -> poll -> complete cycle. In production you point
+NEXT_URL at the real service and ignore this folder entirely.
 
 Behavior:
   * POST /token-renewal-uri returns a static mock token.

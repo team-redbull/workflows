@@ -13,10 +13,9 @@ config:
   temporalNamespace: "default"
 image:
   repository: ghcr.io/team-redbull/connectivity-workflow
-  tag: v1.0.8
+  tag: v1.0.11
   pullPolicy: IfNotPresent
 replicas: 3
-
 # The connectivity-workflow trigger API (api.py), run from the same image as a
 # separate Deployment + Service named `connectivity-api`. The Segments Manager
 # points CONNECTIVITY_WORKFLOW_API_URL at this Service so segment creation can

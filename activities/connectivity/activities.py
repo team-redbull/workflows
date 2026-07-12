@@ -314,7 +314,11 @@ async def publish_request_ids(update: ConnectivityRequestsUpdate) -> None:
     async with _segment_manager_client() as client:
         resp = await client.put(
             "/api/segments/connectivity-requests",
-            json={"segment": update.segment, "request_ids": update.request_ids},
+            json={
+                "segment": update.segment,
+                "request_ids": update.request_ids,
+                "submitted_at": update.submitted_at.isoformat(),
+            },
             headers=_segment_manager_auth(),
         )
         if resp.status_code == 200:

@@ -33,9 +33,11 @@ Worker-file naming convention: the workflow (brain) worker is
    input segment (the peer set for all supported types).
 3. `submit_open_rules(...)` x2 per MCE segment (both directions), all in parallel.
    Port policy per direction comes from the ConfigMap (`PORTS_HC_TO_MCE`, ...).
-4. `publish_request_ids(segment, ids)` — `PUT /api/segments/connectivity-requests`
+4. `publish_request_ids(segment, ids, submitted_at)` — `PUT /api/segments/connectivity-requests`
    so the Segments Manager UI shows the pending request ids beside the segment's
-   status while approval is awaited.
+   status while approval is awaited. `submitted_at` (captured once via
+   `workflow.now()` when the rules were submitted) drives the "time since submit"
+   header in the UI popover.
 5. Poll `check_connectivity_requests(ids)` until every request is `complete`.
    Approval is HUMAN-driven (minutes -> hours+): the workflow polls forever with
    backoff (15s -> 5m cap) and rolls history over with `continue_as_new` — it
@@ -101,8 +103,9 @@ Inspect runs in the Temporal UI and verify the segment's `status` in the manager
 
 While the workflow waits for approval (~60s with the mock's default delay), the
 Segments Manager UI shows a **Requests ID** button beside the segment's status —
-click it for a popover with the pending next request ids. The button disappears
-on its own once every request completes and the segment unlocks.
+click it for a popover showing time elapsed since submission plus the pending
+next request ids. The button disappears on its own once every request completes
+and the segment unlocks.
 
 ### kind
 

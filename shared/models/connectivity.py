@@ -6,6 +6,7 @@ list of primitives), never an untyped dict.
 
 from __future__ import annotations
 
+from datetime import datetime
 from enum import Enum
 
 from pydantic import BaseModel, Field
@@ -54,6 +55,7 @@ class ConnectivityRequestsUpdate(BaseModel):
 
     segment: str = Field(min_length=1)
     request_ids: list[int]
+    submitted_at: datetime  # drives the "time since submit" header in the UI popover
 
 
 class ConnectivityResumeState(BaseModel):
@@ -62,6 +64,7 @@ class ConnectivityResumeState(BaseModel):
     request_ids: list[int]
     pending_ids: list[int]
     peer_segment_count: int
+    submitted_at: datetime
 
 
 class ConnectivityRunArgs(BaseModel):

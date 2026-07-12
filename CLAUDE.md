@@ -81,7 +81,11 @@ api.py                           Unified FastAPI/Swagger entrypoint to start wor
   (`PUT /api/segments/connectivity-requests`, replace semantics) and republishes
   whenever the pending set shrinks; the final EMPTY list removes the display, then
   the segment is unlocked. The manager's UI shows the ids behind a "Requests ID"
-  button beside the status badge.
+  button beside the status badge. The workflow captures `workflow.now()` once, at
+  submission time (`_open_rules`), and sends it as `submitted_at` on every publish
+  call (including republishes and across `continue_as_new`, via
+  `ConnectivityResumeState.submitted_at`) — the manager's popover uses it to show
+  elapsed time since submission.
 
 ## 5. Temporal SDK rules (gotchas — must follow)
 

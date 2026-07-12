@@ -15,7 +15,7 @@ slow approval.
 from __future__ import annotations
 
 import asyncio
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
@@ -79,6 +79,7 @@ class ConnectivityWorkflow:
         self._phase = "pending"
         self._total_requests = 0
         self._pending_requests = 0
+        self._submitted_at: datetime | None = None
 
     @workflow.query
     def progress(self) -> ConnectivityProgress:
@@ -101,6 +102,7 @@ class ConnectivityWorkflow:
             request_ids = resume.request_ids
             pending = resume.pending_ids
             peer_count = resume.peer_segment_count
+            self._submitted_at = resume.submitted_at
 
         self._total_requests = len(request_ids)
         self._pending_requests = len(pending)
@@ -125,6 +127,7 @@ class ConnectivityWorkflow:
                             request_ids=request_ids,
                             pending_ids=pending,
                             peer_segment_count=peer_count,
+                            submitted_at=self._submitted_at,
                         ),
                     )
                 )
@@ -250,6 +253,7 @@ class ConnectivityWorkflow:
                 )
         refs: list[ConnectivityRequestRef] = list(await asyncio.gather(*submissions))
         request_ids = [ref.id for ref in refs]
+        self._submitted_at = workflow.now()
         workflow.logger.info(
             "Submitted %d open-rules requests for %d MCE segment(s)",
             len(request_ids),
@@ -268,7 +272,9 @@ class ConnectivityWorkflow:
         """Mirror the still-pending request ids into the Segments Manager UI."""
         await workflow.execute_activity(
             publish_request_ids,
-            ConnectivityRequestsUpdate(segment=segment, request_ids=request_ids),
+            ConnectivityRequestsUpdate(
+                segment=segment, request_ids=request_ids, submitted_at=self._submitted_at
+            ),
             task_queue=CONNECTIVITY_ACTIVITY_QUEUE,
             start_to_close_timeout=_ACTIVITY_TIMEOUT,
             retry_policy=_RETRY_POLICY,

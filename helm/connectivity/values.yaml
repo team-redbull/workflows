@@ -30,8 +30,16 @@ config:
   # "domain" value stamped into next open-rules payloads.
   domain: "domain1"
 # Bearer token for mutating Segments Manager calls (must match its API_TOKEN).
-# Replace for non-local environments, e.g. via --set secrets.segmentManagerApiToken=...
 secrets:
+  # RECOMMENDED for real environments: reference an out-of-band Secret holding
+  # the token (key SEGMENT_MANAGER_API_TOKEN), created once in-cluster, so the
+  # value never passes through git or Helm values — same pattern as the
+  # Segments Manager chart's `auth.existingSecret`. When set, this chart does
+  # NOT create/own its own token Secret.
+  existingSecret: ""
+  # Chart-managed fallback (local/dev only): the chart creates a
+  # `segment-manager-token` Secret from this value. Only consulted when
+  # existingSecret is empty. Override via --set, never commit a real token.
   segmentManagerApiToken: "dev-token"
 activityWorker:
   image:

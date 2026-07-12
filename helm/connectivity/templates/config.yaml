@@ -22,8 +22,11 @@ data:
   # only a restart of the activity workers — no image rebuild.
   PORTS_HC_TO_MCE: '{"tcp": ["30000-32767"], "udp": ["9000"]}'
   PORTS_MCE_TO_HC: '{"tcp": ["6443", "30000-32767"]}'
+{{- if not .Values.secrets.existingSecret }}
 ---
 # Bearer token for mutating Segments Manager calls. Replace for non-local envs.
+# Skipped when secrets.existingSecret is set (the token then lives in an
+# out-of-band Secret this chart neither creates nor owns).
 apiVersion: v1
 kind: Secret
 metadata:
@@ -31,3 +34,4 @@ metadata:
 type: Opaque
 stringData:
   SEGMENT_MANAGER_API_TOKEN: {{ .Values.secrets.segmentManagerApiToken | quote }}
+{{- end }}

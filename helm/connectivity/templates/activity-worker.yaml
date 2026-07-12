@@ -30,4 +30,4 @@ spec:
             - configMapRef:
                 name: orchestrator-config
             - secretRef:
-                name: segment-manager-token
+                name: {{ .Values.secrets.existingSecret | default "segment-manager-token" }}

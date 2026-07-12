@@ -1,0 +1,58 @@
+# The SHARED workflow trigger front-door for EVERY workflow domain (not one per
+# domain): the unified FastAPI service (api.py) that starts workflows on
+# POST /workflows/<domain>. Runs from the same "brain" image (it shares the
+# workflow definitions + Temporal client and holds no activity secrets), just a
+# different entrypoint. Adding a new workflow domain = add its route to api.py,
+# NOT a new Deployment. This is the Service the Segments Manager (and any other
+# caller) points its *_WORKFLOW_API_URL at.
+{{- if .Values.workflowsApi.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: workflows-api
+  labels:
+    app: workflows-api
+spec:
+  replicas: {{ .Values.workflowsApi.replicas }}
+  selector:
+    matchLabels:
+      app: workflows-api
+  template:
+    metadata:
+      labels:
+        app: workflows-api
+    spec:
+      # Reuses the brain's ServiceAccount — same trust boundary (Temporal client
+      # only, no Segments Manager token, no next URLs).
+      serviceAccountName: workflow-worker
+      containers:
+        - name: workflows-api
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "{{ .Values.workflowsApi.port }}"]
+          envFrom:
+            - configMapRef:
+                name: workflow-worker-config
+          ports:
+            - name: http
+              containerPort: {{ .Values.workflowsApi.port }}
+          readinessProbe:
+            tcpSocket:
+              port: {{ .Values.workflowsApi.port }}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: workflows-api
+  labels:
+    app: workflows-api
+spec:
+  selector:
+    app: workflows-api
+  ports:
+    - name: http
+      port: {{ .Values.workflowsApi.port }}
+      targetPort: {{ .Values.workflowsApi.port }}
+{{- end }}

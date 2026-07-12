@@ -9,7 +9,6 @@
 # rebuild, no chart re-render).
 
 namespace: connectivity
-
 config:
   temporalHost: "host.docker.internal:7233"
   temporalNamespace: "default"
@@ -25,22 +24,19 @@ config:
   nextCheckStatusUri: "/check-request-status"
   # "domain" value stamped into next open-rules payloads.
   domain: "domain1"
-
 # Bearer token for mutating Segments Manager calls (must match its API_TOKEN).
 # Replace for non-local environments, e.g. via --set secrets.segmentManagerApiToken=...
 secrets:
   segmentManagerApiToken: "dev-token"
-
 workflowWorker:
   image:
     repository: connectivity-workflow
     tag: dev
     pullPolicy: IfNotPresent
   replicas: 3
-
 activityWorker:
   image:
-    repository: connectivity-activity
-    tag: dev
+    repository: ghcr.io/team-redbull/connectivity-activity
+    tag: v1.0.1
     pullPolicy: IfNotPresent
   replicas: 2

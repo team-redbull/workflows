@@ -9,6 +9,12 @@
 # rebuild, no chart re-render).
 
 namespace: connectivity
+# Whether the chart creates the Namespace object named above. Default true so
+# the chart is self-sufficient standalone (e.g. a local kind cluster). Set to
+# false when deployed onto a platform that pre-creates the namespace itself
+# (e.g. redbull-platform's namespaces release) — otherwise this chart's own
+# Namespace creation collides with that platform's ownership of the object.
+createNamespace: true
 config:
   temporalHost: "host.docker.internal:7233"
   temporalNamespace: "default"

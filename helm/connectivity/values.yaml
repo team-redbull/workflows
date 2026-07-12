@@ -36,7 +36,7 @@ workflowWorker:
   replicas: 3
 activityWorker:
   image:
-    repository: connectivity-activity
-    tag: dev
+    repository: ghcr.io/team-redbull/connectivity-activity
+    tag: v1.0.3
     pullPolicy: IfNotPresent
   replicas: 2

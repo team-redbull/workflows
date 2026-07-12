@@ -1,0 +1,9 @@
+# Every key equals a TemporalSettings field (uppercased) — keep shared/settings.py
+# and this file aligned.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: workflow-worker-config
+data:
+  TEMPORAL_HOST: {{ .Values.config.temporalHost | quote }}
+  TEMPORAL_NAMESPACE: {{ .Values.config.temporalNamespace | quote }}

@@ -21,7 +21,8 @@ activities/<domain>/             The execution "limbs" (one deployment per domai
   activities.py                  Concrete activity implementations
   worker_init.py                 Registers activities, polls that domain's queue
 dev/mock-connectivity/           LOCAL-DEV ONLY stand-in for the external next service
-helm/connectivity/               Helm chart deploying the workers (kind or OpenShift)
+helm/workflow-worker/            Helm chart for the brain — ONE release, shared by every domain
+helm/connectivity/               Helm chart for the connectivity limb (one chart per domain)
 api.py                           Unified FastAPI/Swagger entrypoint to start workflows
 ```
 
@@ -51,6 +52,11 @@ api.py                           Unified FastAPI/Swagger entrypoint to start wor
   set: Segments Manager HTTP + bearer token, next-service HTTP).
 - Keep signatures in `shared/interfaces/` clean so an activity (e.g. "unlock segment")
   can be re-registered on another queue by a future sub-workflow without moving code.
+- **The brain is ONE deployment for every domain**, not one per workflow. Its Helm
+  chart (`helm/workflow-worker/`) is standalone and deployed exactly once; each new
+  workflow domain adds its own `activities/<domain>/` + `helm/<domain>/` chart (the
+  limb) and registers against `workflow-worker`'s already-running brain — it does not
+  get (or need) its own copy of the brain.
 
 ## 3. Deployment-target agnostic
 
@@ -167,9 +173,13 @@ api.py                           Unified FastAPI/Swagger entrypoint to start wor
 
 ## 9. Deploy & run (local)
 
-- Helm chart at `helm/connectivity/` creates namespace + ConfigMap + Secret + two
-  workers (each its own ServiceAccount). The mock next service is NOT part of the
-  chart — run it separately (uvicorn/docker) and point `config.nextUrl` at it.
+- Two charts: `helm/workflow-worker/` (ConfigMap + the brain, its own ServiceAccount)
+  and `helm/connectivity/` (ConfigMap + Secret + the connectivity limb, its own
+  ServiceAccount). **Neither creates a Namespace** — both deploy into whichever
+  namespace the release targets (`helm install -n <ns> [--create-namespace]`
+  standalone; redbull-platform's `namespaces` release pre-creates it there). The
+  mock next service is NOT part of either chart — run it separately (uvicorn/docker)
+  and point `config.nextUrl` at it.
 - Assumed already running: a Temporal server and the Segments Manager (reached via
   OpenShift routes or localhost — no port assumptions in code).
 - Trigger workflows via the unified API: `uvicorn api:app --port 8080`, Swagger at

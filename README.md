@@ -19,7 +19,8 @@ shared/                         Contract layer (temporalio + pydantic only)
 workflows/                      The brain (ConnectivityWorkflow + main_worker_init.py)
 activities/connectivity/        The limb (activity impls + worker_init.py)
 dev/mock-connectivity/          LOCAL-DEV stand-in for the next service (black box)
-helm/connectivity/              Helm chart deploying the two workers (kind or OpenShift)
+helm/workflow-worker/           Helm chart for the brain — ONE release, shared by every domain
+helm/connectivity/               Helm chart for the connectivity limb (kind or OpenShift)
 ```
 
 Worker-file naming convention: the workflow (brain) worker is
@@ -115,16 +116,25 @@ docker build -f activities/connectivity/Dockerfile -t connectivity-activity:dev 
 docker build -t mock-connectivity:dev dev/mock-connectivity   # run outside the chart
 
 kind load docker-image connectivity-workflow:dev connectivity-activity:dev --name prep-temporal
-helm install connectivity helm/connectivity
+helm install workflow-worker helm/workflow-worker -n redbull-workflows --create-namespace
+helm install connectivity helm/connectivity -n redbull-workflows
 ```
+
+Neither chart creates the namespace itself — `--create-namespace` on the first
+`helm install` is what creates `redbull-workflows` here. On redbull-platform that
+namespace is pre-created by its own `namespaces` release instead, so both charts
+are installed there with plain `-n redbull-workflows` (no `--create-namespace`).
 
 ## Deploying elsewhere (e.g. air-gapped OpenShift)
 
 Push the two worker images to a registry the cluster can pull from, then:
 
 ```bash
-helm install connectivity helm/connectivity \
-  --set workflowWorker.image.repository=<registry>/connectivity-workflow \
+helm install workflow-worker helm/workflow-worker -n redbull-workflows --create-namespace \
+  --set image.repository=<registry>/connectivity-workflow \
+  --set config.temporalHost=<temporal-host>:7233
+
+helm install connectivity helm/connectivity -n redbull-workflows \
   --set activityWorker.image.repository=<registry>/connectivity-activity \
   --set config.temporalHost=<temporal-host>:7233 \
   --set config.segmentManagerUrl=https://<segments-manager-route> \
@@ -135,6 +145,6 @@ helm install connectivity helm/connectivity \
   --set secrets.segmentManagerApiToken=<real-token>
 ```
 
-No mock is ever deployed by the chart — `config.nextUrl` is the only knob. Edit
+No mock is ever deployed by either chart — `config.nextUrl` is the only knob. Edit
 the `PORTS_*` keys in the live `orchestrator-config` ConfigMap (then restart the
 activity workers) to change the port policy without a rebuild.

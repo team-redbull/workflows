@@ -1,0 +1,6 @@
+apiVersion: v2
+name: workflow-worker
+description: Temporal workflow "brain" worker — polls the workflow task queue for every workflow domain registered under workflows/. One deployment, shared across all domains (see activities/<domain> charts, e.g. helm/connectivity, for the per-domain limbs).
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

@@ -1,0 +1,18 @@
+# Default values target the local kind cluster, where the Temporal server
+# runs on the host and is reached via host.docker.internal. For OpenShift,
+# override config.* — the image and templates stay the same.
+#
+# This chart never creates or names a Namespace: it deploys into whichever
+# namespace the release targets (`helm install -n <ns>`, or the release's
+# `namespace:` field in redbull-platform's helmfile). On redbull-platform that
+# namespace (redbull-workflows) is pre-created by its own `namespaces` release;
+# standalone, pass `--create-namespace` to `helm install`.
+
+config:
+  temporalHost: "host.docker.internal:7233"
+  temporalNamespace: "default"
+image:
+  repository: ghcr.io/team-redbull/connectivity-workflow
+  tag: v1.0.4
+  pullPolicy: IfNotPresent
+replicas: 3

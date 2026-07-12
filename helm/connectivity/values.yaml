@@ -7,14 +7,13 @@
 # It is defined directly in templates/config.yaml — the ConfigMap is the
 # operator's edit surface for ports (edit + restart activity workers, no
 # rebuild, no chart re-render).
+#
+# This chart never creates or names a Namespace: it deploys into whichever
+# namespace the release targets (`helm install -n <ns>`, or the release's
+# `namespace:` field in redbull-platform's helmfile). On redbull-platform that
+# namespace (redbull-workflows) is pre-created by its own `namespaces` release;
+# standalone, pass `--create-namespace` to `helm install`.
 
-namespace: connectivity
-# Whether the chart creates the Namespace object named above. Default true so
-# the chart is self-sufficient standalone (e.g. a local kind cluster). Set to
-# false when deployed onto a platform that pre-creates the namespace itself
-# (e.g. redbull-platform's namespaces release) — otherwise this chart's own
-# Namespace creation collides with that platform's ownership of the object.
-createNamespace: true
 config:
   temporalHost: "host.docker.internal:7233"
   temporalNamespace: "default"
@@ -34,12 +33,6 @@ config:
 # Replace for non-local environments, e.g. via --set secrets.segmentManagerApiToken=...
 secrets:
   segmentManagerApiToken: "dev-token"
-workflowWorker:
-  image:
-    repository: ghcr.io/team-redbull/connectivity-workflow
-    tag: v1.0.4
-    pullPolicy: IfNotPresent
-  replicas: 3
 activityWorker:
   image:
     repository: ghcr.io/team-redbull/connectivity-activity

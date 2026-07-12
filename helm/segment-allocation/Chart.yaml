@@ -1,6 +1,0 @@
-apiVersion: v2
-name: segment-allocation
-description: Segment allocation sub-workflow (Temporal workflow + activity workers, plus a dev mock IPAM generator)
-type: application
-version: 0.1.0
-appVersion: "0.1.0"

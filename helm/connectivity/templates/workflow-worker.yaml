@@ -1,6 +1,6 @@
 # The lightweight "brain": runs workflows only. Its own ServiceAccount per the
-# RBAC-isolation requirement (no Segments Manager credentials mounted — it never
-# makes those calls; activities do).
+# RBAC-isolation requirement (no Segments Manager token, no next URLs mounted —
+# it never makes those calls; activities do).
 apiVersion: v1
 kind: ServiceAccount
 metadata:

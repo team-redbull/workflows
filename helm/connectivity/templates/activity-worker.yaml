@@ -1,35 +1,35 @@
-# The segment-allocation activity "limb": its own deployment, ServiceAccount and
-# Segments Manager credentials. Heavy/domain deps and secrets live here, not in the brain.
+# The connectivity activity "limb": its own deployment, ServiceAccount and
+# Segments Manager token. Heavy/domain deps and secrets live here, not in the brain.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: segment-activity-worker
+  name: connectivity-activity-worker
   namespace: {{ .Values.namespace }}
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: segment-activity-worker
+  name: connectivity-activity-worker
   namespace: {{ .Values.namespace }}
   labels:
-    app: segment-activity-worker
+    app: connectivity-activity-worker
 spec:
   replicas: {{ .Values.activityWorker.replicas }}
   selector:
     matchLabels:
-      app: segment-activity-worker
+      app: connectivity-activity-worker
   template:
     metadata:
       labels:
-        app: segment-activity-worker
+        app: connectivity-activity-worker
     spec:
-      serviceAccountName: segment-activity-worker
+      serviceAccountName: connectivity-activity-worker
       containers:
-        - name: segment-activity-worker
+        - name: connectivity-activity-worker
           image: "{{ .Values.activityWorker.image.repository }}:{{ .Values.activityWorker.image.tag }}"
           imagePullPolicy: {{ .Values.activityWorker.image.pullPolicy }}
           envFrom:
             - configMapRef:
                 name: orchestrator-config
             - secretRef:
-                name: segments-manager-credentials
+                name: segment-manager-token

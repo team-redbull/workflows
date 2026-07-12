@@ -1,5 +1,5 @@
-# LOCAL DEV ONLY mock IPAM. Build from this folder:
-#   docker build -t segment-generator-mock:dev dev/mock-generator
+# LOCAL DEV ONLY mock of the next connectivity service. Build from this folder:
+#   docker build -t mock-connectivity:dev dev/mock-connectivity
 FROM python:3.12-slim
 
 WORKDIR /app

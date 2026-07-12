@@ -1,3 +1,3 @@
-# -- Segment Allocation Workflow --
-SEGMENT_ALLOCATION_WORKFLOW_QUEUE = "segment-allocation-workflow"
-SEGMENT_ALLOCATION_ACTIVITY_QUEUE = "segment-allocation-activity"
+# -- Connectivity Workflow --
+CONNECTIVITY_WORKFLOW_QUEUE = "connectivity-workflow"
+CONNECTIVITY_ACTIVITY_QUEUE = "connectivity-activity"

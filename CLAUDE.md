@@ -12,15 +12,16 @@ shared/                          Contract layer — the API between brain and li
   interfaces/                    Activity signatures ONLY (@activity.defn, no body)
   exceptions.py                  Shared custom errors
   consts.py                      Shared constants (e.g. task-queue names)
+  settings.py                    pydantic-settings BaseSettings (fail-fast typed config)
   logging_config.py              Shared worker logging setup
 workflows/                       The orchestration "brain" (lightweight deployment)
   <name>.py                      Workflow logic
-  main_worker.py                 Registers workflows, polls the workflow queue
+  main_worker_init.py            Registers workflows, polls the workflow queue
 activities/<domain>/             The execution "limbs" (one deployment per domain)
-  <name>_tasks.py                Concrete activity implementations
-  main_worker.py                 Registers activities, polls that domain's queue
-dev/mock-generator/              LOCAL-DEV ONLY stand-in for an external black-box API
-helm/segment-allocation/         Helm chart deploying all resources (kind or OpenShift)
+  activities.py                  Concrete activity implementations
+  worker_init.py                 Registers activities, polls that domain's queue
+dev/mock-connectivity/           LOCAL-DEV ONLY stand-in for the external next service
+helm/connectivity/               Helm chart deploying the workers (kind or OpenShift)
 api.py                           Unified FastAPI/Swagger entrypoint to start workflows
 ```
 
@@ -29,10 +30,14 @@ api.py                           Unified FastAPI/Swagger entrypoint to start wor
 - The workflow "brain" packages into one lightweight deployment.
 - Each `activities/<domain>/` packages into its own deployment with its own
   ServiceAccount, Secrets, and (when needed) heavy container image.
+- **Worker-file naming convention:** the brain's worker entrypoint is
+  `workflows/main_worker_init.py`; each activity domain's is
+  `activities/<domain>/worker_init.py` — deliberately different names so the two
+  worker kinds are never confused. Dockerfile CMDs must match these module paths.
 
 ### `shared/` rules (the contract)
-- Lightweight ONLY: `temporalio` + `pydantic`. **Never** heavy execution libraries
-  here (no `kubernetes`, `boto3`, `ansible-runner`, `httpx`, etc.).
+- Lightweight ONLY: `temporalio` + `pydantic` + `pydantic-settings`. **Never** heavy
+  execution libraries here (no `kubernetes`, `boto3`, `ansible-runner`, `httpx`, etc.).
 - `interfaces/` holds `@activity.defn` signatures with a `...`/`pass` body. The real
   implementation lives in `activities/<domain>/` and is registered against that name.
 - This layer is the typed contract: it prevents typos, enforces type safety, and lets
@@ -42,30 +47,41 @@ api.py                           Unified FastAPI/Swagger entrypoint to start wor
 
 - The driver for a **separate deployment** is **shared dependency set + RBAC/Secrets**,
   NOT the sub-workflow boundary per se.
-- For now, segment-allocation activities live under `activities/segment_allocation/`
-  (one cohesive dep+cred set: Segments Manager HTTP, generator HTTP, future gitops).
-- Keep signatures in `shared/interfaces/` clean so an activity (e.g. "update segments
-  mongo") can be re-registered on another queue by a future sub-workflow without moving
-  code.
+- Connectivity activities live under `activities/connectivity/` (one cohesive dep+cred
+  set: Segments Manager HTTP + bearer token, next-service HTTP).
+- Keep signatures in `shared/interfaces/` clean so an activity (e.g. "unlock segment")
+  can be re-registered on another queue by a future sub-workflow without moving code.
 
 ## 3. Deployment-target agnostic
 
 - Nothing in orchestrator code knows about kind vs OpenShift. All endpoints come from
-  env vars (`TEMPORAL_HOST`, `SEGMENT_MANAGER_URL`, `GENERATOR_URL`, ...).
+  env vars (`TEMPORAL_HOST`, `SEGMENT_MANAGER_URL`, `NEXT_URL`, `NEXT_*_URI`, ...).
 - The same images run anywhere; only Helm `values.yaml` (`config.*`) differs.
-- Local kind reaches host services (`temporal server start-dev`, Segments Manager) via
-  `host.docker.internal` — that string lives ONLY in Helm values, never in code.
+- Local kind reaches host services via `host.docker.internal` — that string lives ONLY
+  in Helm values, never in code.
+- Env naming: a service-name prefix (e.g. `NEXT_`) is used ONLY for values that belong
+  to that service (its URL, its URI paths). Our own policy inputs (`DOMAIN`, `PORTS_*`)
+  carry no service prefix.
 
 ## 4. External dependencies are black boxes
 
-- The segment generator (IPAM) is another team's service in production. The orchestrator
-  just makes an HTTP call to `GENERATOR_URL` and **trusts the response** (structural
-  parse only).
-- `dev/mock-generator/` is a local stand-in, isolated and dev-only. It is the ONLY place
-  site-prefix logic (`site1:192,site2:193,site3:194`) lives. In prod, point
-  `GENERATOR_URL` at the real service and set `mockGenerator.enabled=false`.
-- Site-prefix / validity is NOT re-checked in the orchestrator: prod segments are already
-  valid and the Segments Manager validates on write. `site` is a plain `str`.
+- The **next connectivity (firewall) service** is another team's service in production
+  (air-gapped). The orchestrator token-renews (`NEXT_TOKEN_RENEWAL_URI`), POSTs
+  open-rules requests (`NEXT_OPEN_RULES_URI`) and polls request status
+  (`NEXT_CHECK_STATUS_URI`) against `NEXT_URL`, **trusting the responses**
+  (structural parse only).
+- `dev/mock-connectivity/` is a local stand-in, isolated and dev-only, and is NOT
+  deployed by the Helm chart — in dev, `config.nextUrl` simply points at it; in prod,
+  at the real service. Its `COMPLETION_DELAY_SECONDS` simulates the human approval.
+- next request approval is HUMAN-driven and unbounded (minutes → hours → more).
+  Workflows must never deadline-fail while waiting: poll with durable timers +
+  backoff and `continue_as_new` to keep history bounded.
+- **Pending request ids are mirrored into the Segments Manager UI** while the wait
+  lasts: after submitting open-rules the workflow calls `publish_request_ids`
+  (`PUT /api/segments/connectivity-requests`, replace semantics) and republishes
+  whenever the pending set shrinks; the final EMPTY list removes the display, then
+  the segment is unlocked. The manager's UI shows the ids behind a "Requests ID"
+  button beside the status badge.
 
 ## 5. Temporal SDK rules (gotchas — must follow)
 
@@ -83,29 +99,49 @@ api.py                           Unified FastAPI/Swagger entrypoint to start wor
 - **Routing:** every `execute_activity` sets `task_queue=` to the target domain's queue
   (constants in `shared/consts.py`) so work lands on the correct deployment.
 - **Timeouts/retries:** every activity sets `start_to_close_timeout` + a `RetryPolicy`.
-  Mark non-retryable error types explicitly when a failure is deterministic.
+  Mark non-retryable error types explicitly when a failure is deterministic
+  (e.g. `non_retryable_error_types=["SegmentNotFoundError"]`).
+- **Plain exceptions do NOT fail a workflow:** a non-FailureError raised in workflow
+  code fails the workflow *task*, which retries forever (the run hangs RUNNING).
+  Deterministic failures raised FROM WORKFLOW CODE must be
+  `temporalio.exceptions.ApplicationError(..., non_retryable=True)`. (Activity-raised
+  custom exceptions are fine — the SDK converts them to ApplicationError with `type` =
+  class name.)
+- **Single-model workflow argument only:** typed payload conversion is silently
+  SKIPPED when the number of payloads differs from the number of declared `run()`
+  parameters — a `run(input, resume=None)` started with one payload receives a raw
+  dict. Always give `run()` exactly ONE Pydantic argument (wrap extra/internal state
+  in it, e.g. `ConnectivityRunArgs{input, resume}`).
+- **Polling loops:** `workflow.sleep(...)` is a durable, replay-safe server-side timer
+  (never `time.sleep`). For unbounded waits, back off to a capped interval and
+  `workflow.continue_as_new(...)` every N cycles so history stays bounded. Changing
+  poll constants is a non-deterministic change for in-flight runs.
 - **httpx timeout < activity `start_to_close_timeout`:** give every `httpx.AsyncClient`
   an explicit `timeout=` strictly below the activity timeout (currently 10s < 30s), so a
   network hang fails the HTTP call and frees the worker before Temporal reaps the
   activity and leaves the thread hung.
 - **Per-invocation HTTP client:** create `httpx.AsyncClient` INSIDE each activity via
-  `async with`, so auth/session cookies are scoped to one invocation and never leak
-  across concurrent activity runs.
+  `async with`, so auth tokens/cookies are scoped to one invocation and never leak
+  across concurrent activity runs. next tokens are renewed fresh per invocation.
 
 ## 6. Idempotency (required for all activities)
 
 - Network calls fail and Temporal retries — activities must be strictly idempotent.
 - Do not blindly duplicate infrastructure: use UPSERTs, check-before-create, idempotency
-  keys, and treat "already exists" responses as success.
-- Examples here: `create_segment` treats duplicate-VLAN/409 as success; `allocate_segment`
-  relies on the Segments Manager returning the cluster's existing segment if already
-  allocated. Workflow IDs are deterministic (`segment-allocation-<site>-<cluster>`) for
-  natural dedup.
+  keys, and treat "already exists / already done" responses as success.
+- Examples here: `unlock_segment` treats "Segment already unlocked" (200) as success;
+  `submit_open_rules` is idempotent in effect (identical firewall rules converge; a
+  retried-but-accepted POST leaves only an orphan request id that is never polled);
+  `publish_request_ids` is a replace-style PUT (re-sending the current list answers
+  "Segment already up to date").
+  Workflow IDs are deterministic (`connectivity-<TYPE>-<segment CIDR, / -> ->`) for
+  natural dedup — a duplicate trigger while running gets HTTP 409.
 
 ## 7. Strict validation & clean typed state (coding preferences)
 
 - **Strict, absolute verification** — no broad/tolerant thresholds. If N conditions are
-  required, fail loudly if even one is missing.
+  required, fail loudly if even one is missing (e.g. unsupported segment type, empty
+  MCE pool, unknown next request status).
 - **Typed state only** — pass Pydantic models (or dataclasses) between workflows and
   activities. Never untyped dicts across the boundary.
 - Keep validation where it belongs: structural validation on our own models; trust
@@ -114,17 +150,24 @@ api.py                           Unified FastAPI/Swagger entrypoint to start wor
 ## 8. Configuration
 
 - Env vars are the config surface. `.env.example` documents them; `.env` is gitignored.
-- Decision in progress: migrate `os.environ.get(...)` to a `pydantic-settings`
-  `BaseSettings` (`shared/settings.py`) for fail-fast typed config + `.env` loading.
+- `shared/settings.py` holds pydantic-settings `BaseSettings` groups: `TemporalSettings`
+  (workers + api.py) and `ConnectivityActivitySettings` (activity worker only).
+  **Field names equal the Helm ConfigMap/Secret keys lowercased** — keep
+  `shared/settings.py` and `helm/connectivity/templates/config.yaml` aligned.
   Do NOT import settings from inside a workflow definition (sandbox) — only from worker
   entrypoints / `api.py` / activities.
+- **ConfigMaps hold minimum, operator-editable data.** Anything an operator may change
+  without a rebuild (e.g. the `PORTS_*` per-direction port policy, compact JSON per
+  protocol) lives in the ConfigMap — defined directly in the ConfigMap TEMPLATE, not in
+  values.yaml — and is expanded/validated in code (fail-fast at worker startup).
 
 ## 9. Deploy & run (local)
 
-- Helm chart at `helm/segment-allocation/` creates namespace + ConfigMap + Secret +
-  two workers (each its own ServiceAccount) + the dev mock generator (gated by
-  `mockGenerator.enabled`).
-- Prereqs on host: `temporal server start-dev` (`:7233`, UI `:8223`), Segments Manager
-  (`:8000`). Build the three images, `kind load` into `prep-temporal`, `helm install`.
+- Helm chart at `helm/connectivity/` creates namespace + ConfigMap + Secret + two
+  workers (each its own ServiceAccount). The mock next service is NOT part of the
+  chart — run it separately (uvicorn/docker) and point `config.nextUrl` at it.
+- Assumed already running: a Temporal server and the Segments Manager (reached via
+  OpenShift routes or localhost — no port assumptions in code).
 - Trigger workflows via the unified API: `uvicorn api:app --port 8080`, Swagger at
-  `/docs`, `POST /workflows/segment-allocation`.
+  `/docs`. `POST /workflows/connectivity` is ASYNC: 202 + workflow id immediately;
+  poll `GET /workflows/connectivity/{workflow_id}` for progress/result.

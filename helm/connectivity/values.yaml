@@ -1,0 +1,46 @@
+# Default values target the local kind cluster, where the Temporal server and
+# the mock next service run on the host and are reached via host.docker.internal.
+# For OpenShift, override config.* (e.g. via values-openshift.yaml or --set) —
+# the images and templates stay the same.
+#
+# NOTE: the per-direction port policy (PORTS_*) deliberately does NOT live here.
+# It is defined directly in templates/config.yaml — the ConfigMap is the
+# operator's edit surface for ports (edit + restart activity workers, no
+# rebuild, no chart re-render).
+
+namespace: connectivity
+
+config:
+  temporalHost: "host.docker.internal:7233"
+  temporalNamespace: "default"
+  segmentManagerUrl: "http://host.docker.internal:8000"
+  # The next (connectivity/firewall) service. In dev this points at
+  # dev/mock-connectivity running OUTSIDE the chart; in air-gapped prod, at the
+  # real next service.
+  nextUrl: "http://host.docker.internal:9000"
+  # next URI paths are configurable because prod paths may differ from the
+  # placeholders the local mock serves.
+  nextTokenRenewalUri: "/token-renewal-uri"
+  nextOpenRulesUri: "/open-rules-uri"
+  nextCheckStatusUri: "/check-request-status"
+  # "domain" value stamped into next open-rules payloads.
+  domain: "domain1"
+
+# Bearer token for mutating Segments Manager calls (must match its API_TOKEN).
+# Replace for non-local environments, e.g. via --set secrets.segmentManagerApiToken=...
+secrets:
+  segmentManagerApiToken: "dev-token"
+
+workflowWorker:
+  image:
+    repository: connectivity-workflow
+    tag: dev
+    pullPolicy: IfNotPresent
+  replicas: 3
+
+activityWorker:
+  image:
+    repository: connectivity-activity
+    tag: dev
+    pullPolicy: IfNotPresent
+  replicas: 2

@@ -1,0 +1,35 @@
+# Endpoint + policy configuration. This is the ONLY place environment-specific
+# values live. Every key equals a ConnectivityActivitySettings field (uppercased)
+# — keep shared/settings.py and this file aligned.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: orchestrator-config
+  namespace: {{ .Values.namespace }}
+data:
+  TEMPORAL_HOST: {{ .Values.config.temporalHost | quote }}
+  TEMPORAL_NAMESPACE: {{ .Values.config.temporalNamespace | quote }}
+  SEGMENT_MANAGER_URL: {{ .Values.config.segmentManagerUrl | quote }}
+  NEXT_URL: {{ .Values.config.nextUrl | quote }}
+  NEXT_TOKEN_RENEWAL_URI: {{ .Values.config.nextTokenRenewalUri | quote }}
+  NEXT_OPEN_RULES_URI: {{ .Values.config.nextOpenRulesUri | quote }}
+  NEXT_CHECK_STATUS_URI: {{ .Values.config.nextCheckStatusUri | quote }}
+  DOMAIN: {{ .Values.config.domain | quote }}
+  # -- Port policy per rule direction (the operator's edit surface) ----------
+  # Compact JSON per protocol: {"tcp": ["PORT", "START-END", ...], "udp": [...]}.
+  # The activity layer expands this into the next API's ports structure, and
+  # validates the syntax at worker startup (a bad edit crash-loops the activity
+  # worker instead of failing a workflow hours in). Changing ports requires
+  # only a restart of the activity workers — no image rebuild.
+  PORTS_HC_TO_MCE: '{"tcp": ["30000-32767"], "udp": ["9000"]}'
+  PORTS_MCE_TO_HC: '{"tcp": ["6443", "30000-32767"]}'
+---
+# Bearer token for mutating Segments Manager calls. Replace for non-local envs.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: segment-manager-token
+  namespace: {{ .Values.namespace }}
+type: Opaque
+stringData:
+  SEGMENT_MANAGER_API_TOKEN: {{ .Values.secrets.segmentManagerApiToken | quote }}

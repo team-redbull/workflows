@@ -1,83 +1,137 @@
-# Cluster Orchestrator — Segment Allocation
+# Cluster Orchestrator — Connectivity
 
-First sub-workflow of an OpenShift cluster lifecycle orchestrator built on Temporal.
-Given a `cluster_name` and `site`, it secures a network segment + VLAN + EPG for the
-cluster and records the allocation in the team's **Segments Manager**.
+Connectivity sub-workflow of an OpenShift cluster lifecycle orchestrator built on
+Temporal. Given a `segment` (CIDR) and its `type`, it opens firewall rules against
+every same-site MCE segment via the black-box **next** connectivity service, waits for the
+(human-approved) requests to complete, then flips the segment's status
+`Locked -> Available` in the team's **Segments Manager**.
+
+Phase 1 implements the `HC` type; other types fail loudly until implemented.
 
 ## Layout
 
 ```
-api.py                          Unified FastAPI/Swagger entrypoint for all workflows
+api.py                          Unified FastAPI/Swagger entrypoint (async trigger + status)
 shared/                         Contract layer (temporalio + pydantic only)
-  models/segment.py             Typed state across the workflow/activity boundary
-  interfaces/segment_activities Activity signatures (no bodies)
-  exceptions.py / enums.py
-workflows/                      The brain (workflow + worker)
-activities/segment_allocation/  The limb (activity impls + worker)
-dev/mock-generator/             LOCAL-DEV stand-in for the external IPAM (black box)
-helm/segment-allocation/        Helm chart deploying all resources (kind or OpenShift)
+  models/connectivity.py        Typed state across the workflow/activity boundary
+  interfaces/connectivity.py    Activity signatures (no bodies)
+  settings.py / exceptions.py / consts.py / logging_config.py
+workflows/                      The brain (ConnectivityWorkflow + main_worker_init.py)
+activities/connectivity/        The limb (activity impls + worker_init.py)
+dev/mock-connectivity/          LOCAL-DEV stand-in for the next service (black box)
+helm/connectivity/              Helm chart deploying the two workers (kind or OpenShift)
 ```
+
+Worker-file naming convention: the workflow (brain) worker is
+`workflows/main_worker_init.py`; each activity domain's worker is
+`activities/<domain>/worker_init.py`.
 
 ## Flow
 
-1. `get_available_segment(site)` — pick an unallocated segment if one exists.
-2. else `generate_segment(site)` (external IPAM) + `create_segment(spec)`.
-3. `allocate_segment(cluster, site)` — idempotent assign in the Segments Manager.
+1. `validate_segment_exists(segment, type)` — fail fast before touching the firewall.
+2. `list_mce_segments(segment, type)` — every MCE CIDR in the same site as the
+   input segment (the peer set for all supported types).
+3. `submit_open_rules(...)` x2 per MCE segment (both directions), all in parallel.
+   Port policy per direction comes from the ConfigMap (`PORTS_HC_TO_MCE`, ...).
+4. `publish_request_ids(segment, ids)` — `PUT /api/segments/connectivity-requests`
+   so the Segments Manager UI shows the pending request ids beside the segment's
+   status while approval is awaited.
+5. Poll `check_connectivity_requests(ids)` until every request is `complete`.
+   Approval is HUMAN-driven (minutes -> hours+): the workflow polls forever with
+   backoff (15s -> 5m cap) and rolls history over with `continue_as_new` — it
+   never fails on a slow approval. Whenever requests complete, the published id
+   list shrinks accordingly; the final empty update removes the display.
+6. `unlock_segment(segment)` — `POST /api/segments/unlock` (status Locked -> Available).
+
+The trigger is async: `POST /workflows/connectivity` returns **202 + workflow id**
+immediately; poll `GET /workflows/connectivity/{workflow_id}` for phase/pending
+counts (workflow query) and the final result.
 
 ## Design notes
 
-- **Deployment-agnostic:** endpoints come from env (`TEMPORAL_HOST`, `SEGMENT_MANAGER_URL`,
-  `GENERATOR_URL`). The same images run on kind or OpenShift; only the Helm `values.yaml`
-  (`config.*`) changes. `host.docker.internal` appears only there, never in code.
-- **Generator is a black box:** the orchestrator just HTTP-calls `GENERATOR_URL`. The
-  `dev/mock-generator` is the only place site-prefix logic lives, and it is dev-only.
-- **Pydantic data converter** is registered on every `Client.connect` (workers + starter).
-- **httpx timeout (10s) < activity start_to_close_timeout (30s)** so a network hang frees
-  the worker before Temporal reaps the activity. Each `httpx.AsyncClient` is per-invocation
-  (`async with`), so the auth cookie never leaks across concurrent activity runs.
+- **Deployment-agnostic:** endpoints come from env (`TEMPORAL_HOST`,
+  `SEGMENT_MANAGER_URL`, `NEXT_URL`, `NEXT_*_URI`). The same images run on kind or
+  OpenShift; only the Helm `values.yaml` (`config.*`) changes.
+  `host.docker.internal` appears only there, never in code.
+- **next is a black box:** the orchestrator token-renews and HTTP-calls `NEXT_URL`;
+  `dev/mock-connectivity` is the dev-only stand-in and is NOT deployed by the chart —
+  `config.nextUrl` simply points at it in dev and at the real service in prod.
+- **Ports live in the ConfigMap** (`helm/connectivity/templates/config.yaml`), as
+  compact JSON per protocol; the activity layer expands them into the next API's
+  structure and validates the syntax at worker startup. Changing ports = edit the
+  ConfigMap + restart the activity workers. No rebuild.
+- **Pydantic data converter** is registered on every `Client.connect` (workers + api).
+- **httpx timeout (10s) < activity start_to_close_timeout (30s)** so a network hang
+  frees the worker before Temporal reaps the activity. Each `httpx.AsyncClient` is
+  per-invocation (`async with`), so next tokens never leak across concurrent runs.
+- **Idempotency:** unlock treats "already unlocked" as success; re-submitting
+  identical open-rules requests converges to the same firewall state;
+  `publish_request_ids` is a replace-style PUT (re-sends are a no-op); workflow ids
+  are deterministic (`connectivity-<TYPE>-<segment with / replaced by ->`), so a
+  duplicate trigger while running gets HTTP 409.
 
-## Run locally (kind cluster `prep-temporal`)
+## Run locally
 
-Prereqs on the host: `temporal server start-dev` (`:7233`), Segments Manager (`:8000`).
+Assumed already running: a Temporal server (`TEMPORAL_HOST`) and the Segments
+Manager (`SEGMENT_MANAGER_URL` — e.g. the OpenShift route), with `API_TOKEN`
+matching `SEGMENT_MANAGER_API_TOKEN`.
 
 ```bash
-# Build images
-docker build -f workflows/Dockerfile -t segment-allocation-workflow:dev .
-docker build -f activities/segment_allocation/Dockerfile -t segment-allocation-activity:dev .
-docker build -t segment-generator-mock:dev dev/mock-generator
+cp .env.example .env    # then point it at your Temporal / Segments Manager
 
-# Load into kind
-kind load docker-image segment-allocation-workflow:dev segment-allocation-activity:dev \
-  segment-generator-mock:dev --name prep-temporal
+# The mock next service (dev only; approval delay configurable)
+cd dev/mock-connectivity && COMPLETION_DELAY_SECONDS=60 uvicorn app:app --port 9000 &
 
-# Deploy (creates the namespace + all resources)
-helm install segment-allocation helm/segment-allocation
+# Workers (from the repo root)
+pip install -r activities/connectivity/requirements.txt
+PYTHONPATH=. python -m workflows.main_worker_init &
+PYTHONPATH=. python -m activities.connectivity.worker_init &
 
-# Start the unified API from the host
+# Unified API
 pip install -r requirements.txt
 PYTHONPATH=. uvicorn api:app --port 8080
 # Swagger UI: http://localhost:8080/docs
-# or: curl -X POST localhost:8080/workflows/segment-allocation \
-#       -H 'content-type: application/json' -d '{"cluster_name":"web-cluster","site":"site1"}'
+# curl -X POST localhost:8080/workflows/connectivity \
+#   -H 'content-type: application/json' -d '{"segment":"130.154.20.0/24","type":"HC"}'
+# curl localhost:8080/workflows/connectivity/connectivity-HC-130.154.20.0-24
 ```
 
-Inspect at the Temporal UI (http://localhost:8223) and verify in the manager:
-`curl http://localhost:8000/api/segments`.
+Inspect runs in the Temporal UI and verify the segment's `status` in the manager:
+`curl "$SEGMENT_MANAGER_URL/api/segments?type=HC"`.
 
-## Deploying elsewhere (e.g. OpenShift)
+While the workflow waits for approval (~60s with the mock's default delay), the
+Segments Manager UI shows a **Requests ID** button beside the segment's status —
+click it for a popover with the pending next request ids. The button disappears
+on its own once every request completes and the segment unlocks.
 
-Push the three images to a registry the cluster can pull from, then:
+### kind
 
 ```bash
-helm install segment-allocation helm/segment-allocation \
-  --set workflowWorker.image.repository=<registry>/segment-allocation-workflow \
-  --set activityWorker.image.repository=<registry>/segment-allocation-activity \
-  --set config.temporalHost=<temporal-host>:7233 \
-  --set config.segmentManagerUrl=http://<segments-manager-host> \
-  --set config.generatorUrl=<external-ipam-url> \
-  --set mockGenerator.enabled=false \
-  --set secrets.segmentsPassword=<real-password>
+docker build -f workflows/Dockerfile -t connectivity-workflow:dev .
+docker build -f activities/connectivity/Dockerfile -t connectivity-activity:dev .
+docker build -t mock-connectivity:dev dev/mock-connectivity   # run outside the chart
+
+kind load docker-image connectivity-workflow:dev connectivity-activity:dev --name prep-temporal
+helm install connectivity helm/connectivity
 ```
 
-`mockGenerator.enabled=false` skips deploying the dev IPAM stand-in once `generatorUrl`
-points at the real external service.
+## Deploying elsewhere (e.g. air-gapped OpenShift)
+
+Push the two worker images to a registry the cluster can pull from, then:
+
+```bash
+helm install connectivity helm/connectivity \
+  --set workflowWorker.image.repository=<registry>/connectivity-workflow \
+  --set activityWorker.image.repository=<registry>/connectivity-activity \
+  --set config.temporalHost=<temporal-host>:7233 \
+  --set config.segmentManagerUrl=https://<segments-manager-route> \
+  --set config.nextUrl=https://<real-next-service> \
+  --set config.nextTokenRenewalUri=<real-path> \
+  --set config.nextOpenRulesUri=<real-path> \
+  --set config.nextCheckStatusUri=<real-path> \
+  --set secrets.segmentManagerApiToken=<real-token>
+```
+
+No mock is ever deployed by the chart — `config.nextUrl` is the only knob. Edit
+the `PORTS_*` keys in the live `orchestrator-config` ConfigMap (then restart the
+activity workers) to change the port policy without a rebuild.

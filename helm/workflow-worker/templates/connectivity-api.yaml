@@ -1,0 +1,57 @@
+# The connectivity-workflow trigger front-door: the FastAPI service (api.py)
+# that starts a ConnectivityWorkflow on POST /workflows/connectivity. Runs from
+# the SAME "brain" image (it shares the workflow definitions + Temporal client
+# and holds no activity secrets), just a different entrypoint. This is the
+# service the Segments Manager's CONNECTIVITY_WORKFLOW_API_URL points at, so a
+# segment creation can trigger the workflow in-cluster.
+{{- if .Values.connectivityApi.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: connectivity-api
+  labels:
+    app: connectivity-api
+spec:
+  replicas: {{ .Values.connectivityApi.replicas }}
+  selector:
+    matchLabels:
+      app: connectivity-api
+  template:
+    metadata:
+      labels:
+        app: connectivity-api
+    spec:
+      # Reuses the brain's ServiceAccount — same trust boundary (Temporal client
+      # only, no Segments Manager token, no next URLs).
+      serviceAccountName: workflow-worker
+      containers:
+        - name: connectivity-api
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "{{ .Values.connectivityApi.port }}"]
+          envFrom:
+            - configMapRef:
+                name: workflow-worker-config
+          ports:
+            - name: http
+              containerPort: {{ .Values.connectivityApi.port }}
+          readinessProbe:
+            tcpSocket:
+              port: {{ .Values.connectivityApi.port }}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: connectivity-api
+  labels:
+    app: connectivity-api
+spec:
+  selector:
+    app: connectivity-api
+  ports:
+    - name: http
+      port: {{ .Values.connectivityApi.port }}
+      targetPort: {{ .Values.connectivityApi.port }}
+{{- end }}

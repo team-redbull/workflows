@@ -4,7 +4,9 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Lightweight deps only (temporalio + pydantic) — no heavy execution libraries.
+# Lightweight deps only: temporalio + pydantic for the worker, plus fastapi +
+# uvicorn so the same image can also serve the trigger API (api.py). Still no
+# activity-execution libraries.
 COPY workflows/requirements.txt /app/workflows/requirements.txt
 RUN pip install --no-cache-dir -r /app/workflows/requirements.txt
 

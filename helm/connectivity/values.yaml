@@ -43,6 +43,6 @@ secrets:
 activityWorker:
   image:
     repository: ghcr.io/team-redbull/connectivity-activity
-    tag: v1.0.24
+    tag: v1.0.27
     pullPolicy: IfNotPresent
   replicas: 2

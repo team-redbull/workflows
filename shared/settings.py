@@ -65,8 +65,19 @@ class ConnectivityActivitySettings(BaseSettings):
     # The activity layer expands this to the next API's ports structure.
     ports_hc_to_mce: dict[str, list[str]]
     ports_mce_to_hc: dict[str, list[str]]
+    ports_inventory_to_mce: dict[str, list[str]]
+    ports_mce_to_inventory: dict[str, list[str]]
+    ports_pxe_to_mce: dict[str, list[str]]
+    ports_mce_to_pxe: dict[str, list[str]]
 
-    @field_validator("ports_hc_to_mce", "ports_mce_to_hc")
+    @field_validator(
+        "ports_hc_to_mce",
+        "ports_mce_to_hc",
+        "ports_inventory_to_mce",
+        "ports_mce_to_inventory",
+        "ports_pxe_to_mce",
+        "ports_mce_to_pxe",
+    )
     @classmethod
     def _validate_port_profile(cls, profile: dict[str, list[str]]) -> dict[str, list[str]]:
         """Strict, fail-fast validation of the ConfigMap port syntax."""

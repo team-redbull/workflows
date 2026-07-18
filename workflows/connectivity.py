@@ -1,10 +1,11 @@
 """Connectivity workflow — opens firewall rules for a segment via the next API,
 then flips the segment Locked -> Available in the Segments Manager.
 
-Phase 1 implements the HC behavior (HC <-> every same-site MCE segment, both
-directions); the input accepts any segment type and unsupported ones fail
-loudly. Every supported type currently peers with the MCE segments in its
-own site.
+HC, INVENTORY and PXE segments all peer with every same-site MCE segment,
+both directions (list_mce_segments + a bidirectional OpenRulesRequest per
+peer). The input accepts any segment type; unsupported ones fail loudly.
+MCE-type input is not implemented yet — it will not peer-discover but open
+rules directly off its own ConfigMap-defined port profile.
 
 Completion of next requests depends on a HUMAN approval and can take minutes,
 hours or more — the workflow therefore polls indefinitely (durable timers with
@@ -61,9 +62,10 @@ _VALIDATE_RETRY_POLICY = RetryPolicy(
 )
 
 # Types connectivity is implemented for. Every supported type peers with the
-# MCE segments (single peer per type). Phase 2+: add members here plus their
-# PORTS_* config in the activity layer.
-_SUPPORTED_TYPES = frozenset({SegmentType.HC})
+# MCE segments (single peer per type). MCE itself is not supported yet — it
+# will need a different (non-peer-discovery) code path. New peer-based types:
+# add the member here plus its PORTS_* config in the activity layer.
+_SUPPORTED_TYPES = frozenset({SegmentType.HC, SegmentType.INVENTORY, SegmentType.PXE})
 
 # Endless-poll pacing: back off from 15s to a 5-minute cap while waiting for
 # the human approval, and continue_as_new periodically so workflow history

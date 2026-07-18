@@ -22,6 +22,10 @@ data:
   # only a restart of the activity workers — no image rebuild.
   PORTS_HC_TO_MCE: '{"tcp": ["30000-32767"], "udp": ["9000"]}'
   PORTS_MCE_TO_HC: '{"tcp": ["6443", "30000-32767"]}'
+  PORTS_INVENTORY_TO_MCE: '{"tcp": ["30000-32767"], "udp": ["9000"]}'
+  PORTS_MCE_TO_INVENTORY: '{"tcp": ["6443", "30000-32767"]}'
+  PORTS_PXE_TO_MCE: '{"tcp": ["30000-32767"], "udp": ["9000"]}'
+  PORTS_MCE_TO_PXE: '{"tcp": ["6443", "30000-32767"]}'
 {{- if not .Values.secrets.existingSecret }}
 ---
 # Bearer token for mutating Segments Manager calls. Replace for non-local envs.

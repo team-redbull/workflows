@@ -63,6 +63,10 @@ _COMMENT_LABELS: dict[SegmentType, str] = {
 _PORT_PROFILES: dict[tuple[SegmentType, SegmentType], dict[str, list[str]]] = {
     (SegmentType.HC, SegmentType.MCE): _settings.ports_hc_to_mce,
     (SegmentType.MCE, SegmentType.HC): _settings.ports_mce_to_hc,
+    (SegmentType.INVENTORY, SegmentType.MCE): _settings.ports_inventory_to_mce,
+    (SegmentType.MCE, SegmentType.INVENTORY): _settings.ports_mce_to_inventory,
+    (SegmentType.PXE, SegmentType.MCE): _settings.ports_pxe_to_mce,
+    (SegmentType.MCE, SegmentType.PXE): _settings.ports_mce_to_pxe,
 }
 
 

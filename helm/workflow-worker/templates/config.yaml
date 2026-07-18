@@ -1,9 +1,22 @@
-# Every key equals a TemporalSettings field (uppercased) — keep shared/settings.py
-# and this file aligned.
+# orchestrator-config: the GLOBAL config shared by every workflow domain.
+# Owned by this chart (the brain is the one release always present), and mounted
+# by the brain, the workflows-api, AND every activity limb (e.g. the connectivity
+# activity worker mounts this + its own connectivity-config).
+#
+# Contains only values common to all domains: the Temporal connection, the
+# operator "domain" tag, and the Segments Manager URL. Per-workflow endpoints
+# (e.g. the next URIs, port policy) live in that workflow's own ConfigMap.
+#
+# The brain/api use only TEMPORAL_*; DOMAIN and SEGMENTS_MANAGER_URL are here so
+# domains reuse them without duplication (the brain ignores the extra keys —
+# ConnectivityActivitySettings, not the brain's settings, declares them).
+# Every key equals a settings field (uppercased) — keep shared/settings.py aligned.
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: workflow-worker-config
+  name: orchestrator-config
 data:
   TEMPORAL_HOST: {{ .Values.config.temporalHost | quote }}
   TEMPORAL_NAMESPACE: {{ .Values.config.temporalNamespace | quote }}
+  DOMAIN: {{ .Values.config.domain | quote }}
+  SEGMENTS_MANAGER_URL: {{ .Values.config.segmentsManagerUrl | quote }}

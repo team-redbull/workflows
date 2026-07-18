@@ -1,19 +1,18 @@
-# Endpoint + policy configuration. This is the ONLY place environment-specific
-# values live. Every key equals a ConnectivityActivitySettings field (uppercased)
-# — keep shared/settings.py and this file aligned.
+# connectivity-config: the per-workflow ConfigMap for the connectivity domain.
+# Holds ONLY connectivity-specific endpoints + policy. Values shared across all
+# domains (Temporal, DOMAIN, SEGMENTS_MANAGER_URL) live in the global
+# `orchestrator-config` owned by the workflow-worker chart, which the activity
+# worker also mounts. Every key equals a ConnectivityActivitySettings field
+# (uppercased) — keep shared/settings.py and this file aligned.
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: orchestrator-config
+  name: connectivity-config
 data:
-  TEMPORAL_HOST: {{ .Values.config.temporalHost | quote }}
-  TEMPORAL_NAMESPACE: {{ .Values.config.temporalNamespace | quote }}
-  SEGMENT_MANAGER_URL: {{ .Values.config.segmentManagerUrl | quote }}
   NEXT_URL: {{ .Values.config.nextUrl | quote }}
   NEXT_TOKEN_RENEWAL_URI: {{ .Values.config.nextTokenRenewalUri | quote }}
   NEXT_OPEN_RULES_URI: {{ .Values.config.nextOpenRulesUri | quote }}
   NEXT_CHECK_STATUS_URI: {{ .Values.config.nextCheckStatusUri | quote }}
-  DOMAIN: {{ .Values.config.domain | quote }}
   # -- Port policy per rule direction (the operator's edit surface) ----------
   # Compact JSON per protocol: {"tcp": ["PORT", "START-END", ...], "udp": [...]}.
   # The activity layer expands this into the next API's ports structure, and
@@ -34,8 +33,8 @@ data:
 apiVersion: v1
 kind: Secret
 metadata:
-  name: segment-manager-token
+  name: segments-manager-token
 type: Opaque
 stringData:
-  SEGMENT_MANAGER_API_TOKEN: {{ .Values.secrets.segmentManagerApiToken | quote }}
+  SEGMENTS_MANAGER_API_TOKEN: {{ .Values.secrets.segmentsManagerApiToken | quote }}
 {{- end }}

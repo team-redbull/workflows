@@ -62,7 +62,7 @@ api.py                           Unified FastAPI/Swagger entrypoint to start wor
 ## 3. Deployment-target agnostic
 
 - Nothing in orchestrator code knows about kind vs OpenShift. All endpoints come from
-  env vars (`TEMPORAL_HOST`, `SEGMENT_MANAGER_URL`, `NEXT_URL`, `NEXT_*_URI`, ...).
+  env vars (`TEMPORAL_HOST`, `SEGMENTS_MANAGER_URL`, `NEXT_URL`, `NEXT_*_URI`, ...).
 - The same images run anywhere; only Helm `values.yaml` (`config.*`) differs.
 - Local kind reaches host services via `host.docker.internal` — that string lives ONLY
   in Helm values, never in code.
@@ -164,10 +164,24 @@ api.py                           Unified FastAPI/Swagger entrypoint to start wor
 ## 8. Configuration
 
 - Env vars are the config surface. `.env.example` documents them; `.env` is gitignored.
+- **ConfigMaps are split by scope, not by chart-convenience:**
+  - `orchestrator-config` (GLOBAL; owned by `helm/workflow-worker/`, the always-present
+    brain release) holds only values every domain shares: `TEMPORAL_HOST`,
+    `TEMPORAL_NAMESPACE`, `DOMAIN`, `SEGMENTS_MANAGER_URL`.
+  - `<domain>-config` (PER-WORKFLOW; owned by that domain's chart) holds that domain's
+    own endpoints/policy — e.g. `connectivity-config` = `NEXT_*` URIs + `PORTS_*`.
+  A domain's activity worker mounts BOTH (global + its own) plus its Secret, so the
+  brain release must be installed before any limb (else the pod stalls in
+  `CreateContainerConfigError` on the missing global ConfigMap).
 - `shared/settings.py` holds pydantic-settings `BaseSettings` groups: `TemporalSettings`
   (workers + api.py) and `ConnectivityActivitySettings` (activity worker only).
-  **Field names equal the Helm ConfigMap/Secret keys lowercased** — keep
-  `shared/settings.py` and `helm/connectivity/templates/config.yaml` aligned.
+  **Field names equal the Helm ConfigMap/Secret keys lowercased** — keep them aligned
+  with `helm/workflow-worker/templates/config.yaml` (global keys) and
+  `helm/connectivity/templates/config.yaml` (connectivity keys + token Secret).
+  Which ConfigMap a key lives in is INDEPENDENT of which settings class declares it:
+  pydantic reads the flat merged pod env, so `DOMAIN`/`SEGMENTS_MANAGER_URL` sit in the
+  global ConfigMap yet stay `ConnectivityActivitySettings` fields (only the activity
+  requires them; the brain ignores the extra keys via `extra="ignore"`).
   Do NOT import settings from inside a workflow definition (sandbox) — only from worker
   entrypoints / `api.py` / activities.
 - **ConfigMaps hold minimum, operator-editable data.** Anything an operator may change

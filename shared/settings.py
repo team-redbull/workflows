@@ -11,9 +11,18 @@ Two settings groups, matching the deployment boundary:
     The workflow worker has no business holding these.
 
 Field names deliberately equal the Helm ConfigMap/Secret keys (lowercased) —
-pydantic-settings matches env vars case-insensitively, so SEGMENT_MANAGER_URL
-populates segment_manager_url. Keep the two files aligned:
-helm/connectivity/templates/config.yaml <-> this module.
+pydantic-settings matches env vars case-insensitively, so SEGMENTS_MANAGER_URL
+populates segments_manager_url.
+
+Note: which ConfigMap a key lives in (an ops grouping) is INDEPENDENT of which
+settings class declares it (a code grouping). pydantic reads the flat process
+env, so it never sees the ConfigMap boundary. DOMAIN and SEGMENTS_MANAGER_URL
+live in the shared `orchestrator-config` ConfigMap (so future workflows reuse
+them without duplication), yet stay fields on ConnectivityActivitySettings —
+only the activity worker requires them, and it mounts orchestrator-config +
+connectivity-config together. Keep the files aligned:
+helm/workflow-worker/templates/config.yaml   (orchestrator-config: temporal + domain + segments-manager url)
+helm/connectivity/templates/config.yaml      (connectivity-config: next URIs + ports; + the token Secret)
 
 Do NOT import this module from inside a workflow definition (it runs in the
 sandbox) — only from worker entrypoints, api.py, and activity implementations.
@@ -44,8 +53,8 @@ class ConnectivityActivitySettings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     # --- Segments Manager (GETs are public; mutating calls need the token) ---
-    segment_manager_url: str
-    segment_manager_api_token: str
+    segments_manager_url: str
+    segments_manager_api_token: str
 
     # --- our payload policy (NOT next's config — no NEXT_ prefix) ---
     domain: str

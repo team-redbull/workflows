@@ -1,8 +1,8 @@
 """Connectivity activity implementations — the execution limbs.
 
 These run in the connectivity activity deployment. They talk to:
-  - the team's Segments Manager (SEGMENT_MANAGER_URL) — validate/list segments,
-    unlock (Bearer token via SEGMENT_MANAGER_API_TOKEN; GETs are public)
+  - the team's Segments Manager (SEGMENTS_MANAGER_URL) — validate/list segments,
+    unlock (Bearer token via SEGMENTS_MANAGER_API_TOKEN; GETs are public)
   - the next connectivity service (NEXT_URL) — a black box; we trust its output
     (token renewal, open firewall rules, request status)
 
@@ -26,7 +26,7 @@ import httpx
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
-from shared.exceptions import NextApiError, SegmentManagerError, SegmentNotFoundError
+from shared.exceptions import NextApiError, SegmentsManagerError, SegmentNotFoundError
 from shared.models.connectivity import (
     ConnectivityInput,
     ConnectivityRequestRef,
@@ -97,14 +97,14 @@ def _expand_ports(profile: dict[str, list[str]]) -> list[dict]:
     return ports
 
 
-def _segment_manager_client() -> httpx.AsyncClient:
+def _segments_manager_client() -> httpx.AsyncClient:
     """A fresh, per-invocation client for the Segments Manager."""
-    return httpx.AsyncClient(base_url=_settings.segment_manager_url, timeout=_HTTP_TIMEOUT)
+    return httpx.AsyncClient(base_url=_settings.segments_manager_url, timeout=_HTTP_TIMEOUT)
 
 
-def _segment_manager_auth() -> dict[str, str]:
+def _segments_manager_auth() -> dict[str, str]:
     """Bearer header for mutating Segments Manager calls (GETs are public)."""
-    return {"Authorization": f"Bearer {_settings.segment_manager_api_token}"}
+    return {"Authorization": f"Bearer {_settings.segments_manager_api_token}"}
 
 
 def _next_client() -> httpx.AsyncClient:
@@ -129,12 +129,12 @@ async def _fetch_next_token(client: httpx.AsyncClient) -> str:
 @activity.defn
 async def validate_segment_exists(connectivity_input: ConnectivityInput) -> None:
     """Assert the input segment exists in the Segments Manager (by type + CIDR)."""
-    async with _segment_manager_client() as client:
+    async with _segments_manager_client() as client:
         resp = await client.get(
             "/api/segments", params={"type": connectivity_input.type.value}
         )
         if resp.status_code != 200:
-            raise SegmentManagerError(
+            raise SegmentsManagerError(
                 f"List segments failed: {resp.status_code} {resp.text}"
             )
         for seg in resp.json():
@@ -159,12 +159,12 @@ async def _fetch_segment_site(
         "/api/segments", params={"type": connectivity_input.type.value}
     )
     if resp.status_code != 200:
-        raise SegmentManagerError(f"List segments failed: {resp.status_code} {resp.text}")
+        raise SegmentsManagerError(f"List segments failed: {resp.status_code} {resp.text}")
     for seg in resp.json():
         if seg.get("segment") == connectivity_input.segment:
             site = seg.get("site")
             if not site:
-                raise SegmentManagerError(f"Segment entry missing 'site': {seg}")
+                raise SegmentsManagerError(f"Segment entry missing 'site': {seg}")
             return site
     raise SegmentNotFoundError(
         f"Segment {connectivity_input.segment} (type={connectivity_input.type.value}) "
@@ -175,12 +175,12 @@ async def _fetch_segment_site(
 @activity.defn
 async def list_mce_segments(connectivity_input: ConnectivityInput) -> list[str]:
     """Return the CIDRs of MCE-type segments in the same site as the input segment."""
-    async with _segment_manager_client() as client:
+    async with _segments_manager_client() as client:
         site = await _fetch_segment_site(client, connectivity_input)
 
         resp = await client.get("/api/segments", params={"type": SegmentType.MCE.value})
         if resp.status_code != 200:
-            raise SegmentManagerError(
+            raise SegmentsManagerError(
                 f"List MCE segments failed: {resp.status_code} {resp.text}"
             )
         segments: list[str] = []
@@ -189,7 +189,7 @@ async def list_mce_segments(connectivity_input: ConnectivityInput) -> list[str]:
                 continue
             cidr = seg.get("segment")
             if not cidr:
-                raise SegmentManagerError(f"MCE segment entry missing 'segment': {seg}")
+                raise SegmentsManagerError(f"MCE segment entry missing 'segment': {seg}")
             segments.append(cidr)
     activity.logger.info("Found %d MCE segment(s) in site=%s", len(segments), site)
     return segments
@@ -315,7 +315,7 @@ async def publish_request_ids(update: ConnectivityRequestsUpdate) -> None:
     Idempotent: PUT semantics — the manager stores exactly the list sent, and
     re-sending the current value is a no-op ("already up to date").
     """
-    async with _segment_manager_client() as client:
+    async with _segments_manager_client() as client:
         resp = await client.put(
             "/api/segments/connectivity-requests",
             json={
@@ -323,7 +323,7 @@ async def publish_request_ids(update: ConnectivityRequestsUpdate) -> None:
                 "request_ids": update.request_ids,
                 "submitted_at": update.submitted_at.isoformat(),
             },
-            headers=_segment_manager_auth(),
+            headers=_segments_manager_auth(),
         )
         if resp.status_code == 200:
             activity.logger.info(
@@ -336,7 +336,7 @@ async def publish_request_ids(update: ConnectivityRequestsUpdate) -> None:
             raise SegmentNotFoundError(
                 f"Segment {update.segment} not found in the Segments Manager"
             )
-        raise SegmentManagerError(
+        raise SegmentsManagerError(
             f"Publish request ids failed: {resp.status_code} {resp.text}"
         )
 
@@ -348,11 +348,11 @@ async def unlock_segment(segment: str) -> None:
     Idempotent: the manager answers 200 "Segment already unlocked" for a
     segment that is not Locked, which we treat as success.
     """
-    async with _segment_manager_client() as client:
+    async with _segments_manager_client() as client:
         resp = await client.post(
             "/api/segments/unlock",
             json={"segment": segment},
-            headers=_segment_manager_auth(),
+            headers=_segments_manager_auth(),
         )
         if resp.status_code == 200:
             activity.logger.info("Segment %s unlocked: %s", segment, resp.text)
@@ -361,6 +361,6 @@ async def unlock_segment(segment: str) -> None:
             raise SegmentNotFoundError(
                 f"Segment {segment} not found in the Segments Manager"
             )
-        raise SegmentManagerError(
+        raise SegmentsManagerError(
             f"Unlock failed: {resp.status_code} {resp.text}"
         )

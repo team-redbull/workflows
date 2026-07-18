@@ -11,7 +11,7 @@ class OrchestratorError(Exception):
     """Base class for all orchestrator domain errors."""
 
 
-class SegmentManagerError(OrchestratorError):
+class SegmentsManagerError(OrchestratorError):
     """The team's Segments Manager API returned an unexpected error."""
 
 

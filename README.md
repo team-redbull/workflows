@@ -53,9 +53,14 @@ counts (workflow query) and the final result.
 ## Design notes
 
 - **Deployment-agnostic:** endpoints come from env (`TEMPORAL_HOST`,
-  `SEGMENT_MANAGER_URL`, `NEXT_URL`, `NEXT_*_URI`). The same images run on kind or
+  `SEGMENTS_MANAGER_URL`, `NEXT_URL`, `NEXT_*_URI`). The same images run on kind or
   OpenShift; only the Helm `values.yaml` (`config.*`) changes.
   `host.docker.internal` appears only there, never in code.
+- **ConfigMap split by scope:** `orchestrator-config` (owned by the
+  `workflow-worker` chart) holds the values every domain shares — `TEMPORAL_*`,
+  `DOMAIN`, `SEGMENTS_MANAGER_URL`. Each workflow adds its own `<domain>-config`
+  (here `connectivity-config`: the `NEXT_*` endpoints + port policy). A domain's
+  activity worker mounts both, so install `workflow-worker` before the limb.
 - **next is a black box:** the orchestrator token-renews and HTTP-calls `NEXT_URL`;
   `dev/mock-connectivity` is the dev-only stand-in and is NOT deployed by the chart —
   `config.nextUrl` simply points at it in dev and at the real service in prod.
@@ -76,8 +81,8 @@ counts (workflow query) and the final result.
 ## Run locally
 
 Assumed already running: a Temporal server (`TEMPORAL_HOST`) and the Segments
-Manager (`SEGMENT_MANAGER_URL` — e.g. the OpenShift route), with `API_TOKEN`
-matching `SEGMENT_MANAGER_API_TOKEN`.
+Manager (`SEGMENTS_MANAGER_URL` — e.g. the OpenShift route), with `API_TOKEN`
+matching `SEGMENTS_MANAGER_API_TOKEN`.
 
 ```bash
 cp .env.example .env    # then point it at your Temporal / Segments Manager
@@ -100,7 +105,7 @@ PYTHONPATH=. uvicorn api:app --port 8080
 ```
 
 Inspect runs in the Temporal UI and verify the segment's `status` in the manager:
-`curl "$SEGMENT_MANAGER_URL/api/segments?type=HC"`.
+`curl "$SEGMENTS_MANAGER_URL/api/segments?type=HC"`.
 
 While the workflow waits for approval (~60s with the mock's default delay), the
 Segments Manager UI shows a **Requests ID** button beside the segment's status —
@@ -130,19 +135,22 @@ are installed there with plain `-n redbull-workflows` (no `--create-namespace`).
 Push the two worker images to a registry the cluster can pull from, then:
 
 ```bash
+# The brain owns orchestrator-config (the global values), so install it first.
 helm install workflow-worker helm/workflow-worker -n redbull-workflows --create-namespace \
   --set image.repository=<registry>/connectivity-workflow \
-  --set config.temporalHost=<temporal-host>:7233
+  --set config.temporalHost=<temporal-host>:7233 \
+  --set config.segmentsManagerUrl=https://<segments-manager-route> \
+  --set config.domain=<domain>
 
+# The limb only sets its own next endpoints + token; it reads the global values
+# from orchestrator-config above.
 helm install connectivity helm/connectivity -n redbull-workflows \
   --set activityWorker.image.repository=<registry>/connectivity-activity \
-  --set config.temporalHost=<temporal-host>:7233 \
-  --set config.segmentManagerUrl=https://<segments-manager-route> \
   --set config.nextUrl=https://<real-next-service> \
   --set config.nextTokenRenewalUri=<real-path> \
   --set config.nextOpenRulesUri=<real-path> \
   --set config.nextCheckStatusUri=<real-path> \
-  --set secrets.segmentManagerApiToken=<real-token>
+  --set secrets.segmentsManagerApiToken=<real-token>
 ```
 
 No mock is ever deployed by either chart — `config.nextUrl` is the only knob. Edit

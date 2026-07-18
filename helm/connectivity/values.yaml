@@ -8,6 +8,10 @@
 # operator's edit surface for ports (edit + restart activity workers, no
 # rebuild, no chart re-render).
 #
+# The GLOBAL values (Temporal connection, DOMAIN, segmentsManagerUrl) are NOT
+# here either — they live in the workflow-worker chart's `orchestrator-config`,
+# which this chart's activity worker also mounts. Install workflow-worker first.
+#
 # This chart never creates or names a Namespace: it deploys into whichever
 # namespace the release targets (`helm install -n <ns>`, or the release's
 # `namespace:` field in redbull-platform's helmfile). On redbull-platform that
@@ -15,9 +19,6 @@
 # standalone, pass `--create-namespace` to `helm install`.
 
 config:
-  temporalHost: "host.docker.internal:7233"
-  temporalNamespace: "default"
-  segmentManagerUrl: "http://host.docker.internal:8000"
   # The next (connectivity/firewall) service. In dev this points at
   # dev/mock-connectivity running OUTSIDE the chart; in air-gapped prod, at the
   # real next service.
@@ -27,20 +28,18 @@ config:
   nextTokenRenewalUri: "/token-renewal-uri"
   nextOpenRulesUri: "/open-rules-uri"
   nextCheckStatusUri: "/check-request-status"
-  # "domain" value stamped into next open-rules payloads.
-  domain: "domain1"
 # Bearer token for mutating Segments Manager calls (must match its API_TOKEN).
 secrets:
   # RECOMMENDED for real environments: reference an out-of-band Secret holding
-  # the token (key SEGMENT_MANAGER_API_TOKEN), created once in-cluster, so the
+  # the token (key SEGMENTS_MANAGER_API_TOKEN), created once in-cluster, so the
   # value never passes through git or Helm values — same pattern as the
   # Segments Manager chart's `auth.existingSecret`. When set, this chart does
   # NOT create/own its own token Secret.
   existingSecret: ""
   # Chart-managed fallback (local/dev only): the chart creates a
-  # `segment-manager-token` Secret from this value. Only consulted when
+  # `segments-manager-token` Secret from this value. Only consulted when
   # existingSecret is empty. Override via --set, never commit a real token.
-  segmentManagerApiToken: "dev-token"
+  segmentsManagerApiToken: "dev-token"
 activityWorker:
   image:
     repository: ghcr.io/team-redbull/connectivity-activity

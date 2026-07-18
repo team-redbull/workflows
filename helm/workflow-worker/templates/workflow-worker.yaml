@@ -30,4 +30,4 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           envFrom:
             - configMapRef:
-                name: workflow-worker-config
+                name: orchestrator-config

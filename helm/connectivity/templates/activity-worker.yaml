@@ -27,7 +27,13 @@ spec:
           image: "{{ .Values.activityWorker.image.repository }}:{{ .Values.activityWorker.image.tag }}"
           imagePullPolicy: {{ .Values.activityWorker.image.pullPolicy }}
           envFrom:
+            # Global config (Temporal + DOMAIN + SEGMENTS_MANAGER_URL), owned by
+            # the workflow-worker chart — install that release first, or this
+            # pod stalls in CreateContainerConfigError on the missing ConfigMap.
             - configMapRef:
                 name: orchestrator-config
+            # Connectivity-specific endpoints + port policy, owned by this chart.
+            - configMapRef:
+                name: connectivity-config
             - secretRef:
-                name: {{ .Values.secrets.existingSecret | default "segment-manager-token" }}
+                name: {{ .Values.secrets.existingSecret | default "segments-manager-token" }}

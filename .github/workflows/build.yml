@@ -25,14 +25,14 @@ jobs:
       helm-image-path: image
     secrets: inherit
 
-  build-segment-connectivity-activity:
+  build-segment-connectivity:
     if: github.event_name == 'push'
     # Sequential, not parallel: both calls bump the same shared vX.Y.Z git
     # tag and commit+push to the same branch; running in parallel races.
     needs: build-workflow-brain
     uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
     with:
-      image-name: segment-connectivity-activity
+      image-name: segment-connectivity
       dockerfile: activities/segment_connectivity/Dockerfile
       helm-values-path: helm/segment-connectivity/values.yaml
       helm-image-path: activityWorker.image
@@ -42,7 +42,7 @@ jobs:
     if: github.event_name == 'push'
     # Sequential, not parallel: all three calls bump the same shared vX.Y.Z git
     # tag and commit+push to the same branch; running in parallel races.
-    needs: build-segment-connectivity-activity
+    needs: build-segment-connectivity
     uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
     with:
       image-name: mock-segment-connectivity
@@ -58,11 +58,11 @@ jobs:
       image-name: workflows
     secrets: inherit
 
-  cleanup-segment-connectivity-activity-on-delete:
+  cleanup-segment-connectivity-on-delete:
     if: github.event_name == 'delete'
     uses: team-redbull/.github/.github/workflows/ghcr-cleanup-on-delete.yml@main
     with:
-      image-name: segment-connectivity-activity
+      image-name: segment-connectivity
     secrets: inherit
 
   cleanup-mock-segment-connectivity-on-delete:

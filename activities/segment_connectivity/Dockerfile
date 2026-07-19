@@ -1,5 +1,5 @@
 # Segment-connectivity activity "limb" image. Build from the REPO ROOT so shared/ is in context:
-#   docker build -f activities/segment_connectivity/Dockerfile -t segment-connectivity-activity:dev .
+#   docker build -f activities/segment_connectivity/Dockerfile -t segment-connectivity:dev .
 FROM python:3.12-slim
 
 WORKDIR /app

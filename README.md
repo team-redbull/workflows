@@ -125,10 +125,10 @@ and the segment unlocks.
 
 ```bash
 docker build -f workflows/Dockerfile -t workflows:dev .
-docker build -f activities/segment_connectivity/Dockerfile -t segment-connectivity-activity:dev .
+docker build -f activities/segment_connectivity/Dockerfile -t segment-connectivity:dev .
 docker build -t mock-segment-connectivity:dev dev/mock-segment-connectivity   # run outside the chart
 
-kind load docker-image workflows:dev segment-connectivity-activity:dev --name prep-temporal
+kind load docker-image workflows:dev segment-connectivity:dev --name prep-temporal
 helm install workflows helm/workflows -n redbull-workflows --create-namespace
 helm install segment-connectivity helm/segment-connectivity -n redbull-workflows
 ```
@@ -153,7 +153,7 @@ helm install workflows helm/workflows -n redbull-workflows --create-namespace \
 # The limb only sets its own next endpoints + token; it reads the global values
 # from orchestrator-config above.
 helm install segment-connectivity helm/segment-connectivity -n redbull-workflows \
-  --set activityWorker.image.repository=<registry>/segment-connectivity-activity \
+  --set activityWorker.image.repository=<registry>/segment-connectivity \
   --set config.nextUrl=https://<real-next-service> \
   --set config.nextTokenRenewalUri=<real-path> \
   --set config.nextOpenRulesUri=<real-path> \

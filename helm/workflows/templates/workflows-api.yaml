@@ -32,7 +32,7 @@ spec:
           command: ["uvicorn", "workflows.api:app", "--host", "0.0.0.0", "--port", "{{ .Values.workflowsApi.port }}"]
           envFrom:
             - configMapRef:
-                name: orchestrator-config
+                name: workflows-config
           ports:
             - name: http
               containerPort: {{ .Values.workflowsApi.port }}

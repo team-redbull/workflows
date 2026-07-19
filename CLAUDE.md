@@ -140,7 +140,7 @@ helm/workflows/  helm/segment-connectivity/  helm/mock-segment-connectivity/
 ## 8. Configuration
 
 - Env vars are the config surface (`.env.example` documents them; `.env` gitignored).
-- **ConfigMaps split by scope, not chart-convenience:** `orchestrator-config` (GLOBAL; owned by the
+- **ConfigMaps split by scope, not chart-convenience:** `workflows-config` (GLOBAL; owned by the
   always-present `helm/workflows/` brain release) holds only shared values — `TEMPORAL_HOST`,
   `TEMPORAL_NAMESPACE`, `DOMAIN`, `SEGMENTS_MANAGER_URL`. `<domain>-config` (owned by that domain's
   chart) holds its own endpoints/policy — e.g. `segment-connectivity-config` = `NEXT_*` URIs +

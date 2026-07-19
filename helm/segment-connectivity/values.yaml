@@ -9,7 +9,7 @@
 # rebuild, no chart re-render).
 #
 # The GLOBAL values (Temporal connection, DOMAIN, segmentsManagerUrl) are NOT
-# here either — they live in the workflows chart's `orchestrator-config`,
+# here either — they live in the workflows chart's `workflows-config`,
 # which this chart's activity worker also mounts. Install workflows first.
 #
 # This chart never creates or names a Namespace: it deploys into whichever

@@ -1,4 +1,4 @@
-# orchestrator-config: the GLOBAL config shared by every workflow domain.
+# workflows-config: the GLOBAL config shared by every workflow domain.
 # Owned by this chart (the brain is the one release always present), and mounted
 # by the brain, the workflows-api, AND every activity limb (e.g. the segment-connectivity
 # activity worker mounts this + its own segment-connectivity-config).
@@ -14,7 +14,7 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: orchestrator-config
+  name: workflows-config
 data:
   TEMPORAL_HOST: {{ .Values.config.temporalHost | quote }}
   TEMPORAL_NAMESPACE: {{ .Values.config.temporalNamespace | quote }}

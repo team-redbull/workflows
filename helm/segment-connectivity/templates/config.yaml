@@ -1,7 +1,7 @@
 # segment-connectivity-config: the per-workflow ConfigMap for the segment-connectivity domain.
 # Holds ONLY segment-connectivity-specific endpoints + policy. Values shared across all
 # domains (Temporal, DOMAIN, SEGMENTS_MANAGER_URL) live in the global
-# `orchestrator-config` owned by the workflows chart, which the activity
+# `workflows-config` owned by the workflows chart, which the activity
 # worker also mounts. Every key equals a SegmentConnectivityActivitySettings field
 # (uppercased) — keep shared/settings.py and this file aligned.
 apiVersion: v1

@@ -17,11 +17,11 @@ populates segments_manager_url.
 Note: which ConfigMap a key lives in (an ops grouping) is INDEPENDENT of which
 settings class declares it (a code grouping). pydantic reads the flat process
 env, so it never sees the ConfigMap boundary. DOMAIN and SEGMENTS_MANAGER_URL
-live in the shared `orchestrator-config` ConfigMap (so future workflows reuse
+live in the shared `workflows-config` ConfigMap (so future workflows reuse
 them without duplication), yet stay fields on SegmentConnectivityActivitySettings —
-only the activity worker requires them, and it mounts orchestrator-config +
+only the activity worker requires them, and it mounts workflows-config +
 segment-connectivity-config together. Keep the files aligned:
-helm/workflows/templates/config.yaml   (orchestrator-config: temporal + domain + segments-manager url)
+helm/workflows/templates/config.yaml   (workflows-config: temporal + domain + segments-manager url)
 helm/segment-connectivity/templates/config.yaml      (segment-connectivity-config: next URIs + ports; + the token Secret)
 
 Do NOT import this module from inside a workflow definition (it runs in the

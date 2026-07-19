@@ -31,7 +31,7 @@ spec:
             # the workflows chart — install that release first, or this
             # pod stalls in CreateContainerConfigError on the missing ConfigMap.
             - configMapRef:
-                name: orchestrator-config
+                name: workflows-config
             # Segment-connectivity-specific endpoints + port policy, owned by this chart.
             - configMapRef:
                 name: segment-connectivity-config

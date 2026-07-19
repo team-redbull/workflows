@@ -2,7 +2,7 @@
 # runs on the host and is reached via host.docker.internal. For OpenShift,
 # override config.* — the image and templates stay the same.
 #
-# This chart owns `orchestrator-config`, the GLOBAL ConfigMap shared by every
+# This chart owns `workflows-config`, the GLOBAL ConfigMap shared by every
 # workflow domain: the Temporal connection plus the domain tag and Segments
 # Manager URL that all domains reuse. The brain itself only needs TEMPORAL_*;
 # domain/segmentsManagerUrl live here so activity limbs (e.g. segment-connectivity) can

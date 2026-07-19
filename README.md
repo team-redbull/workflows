@@ -64,7 +64,7 @@ counts (workflow query) and the final result.
   `SEGMENTS_MANAGER_URL`, `NEXT_URL`, `NEXT_*_URI`). The same images run on kind or
   OpenShift; only the Helm `values.yaml` (`config.*`) changes.
   `host.docker.internal` appears only there, never in code.
-- **ConfigMap split by scope:** `orchestrator-config` (owned by the
+- **ConfigMap split by scope:** `workflows-config` (owned by the
   `workflows` chart) holds the values every domain shares — `TEMPORAL_*`,
   `DOMAIN`, `SEGMENTS_MANAGER_URL`. Each workflow adds its own `<domain>-config`
   (here `segment-connectivity-config`: the `NEXT_*` endpoints + port policy). A domain's
@@ -143,7 +143,7 @@ are installed there with plain `-n redbull-workflows` (no `--create-namespace`).
 Push the two worker images to a registry the cluster can pull from, then:
 
 ```bash
-# The brain owns orchestrator-config (the global values), so install it first.
+# The brain owns workflows-config (the global values), so install it first.
 helm install workflows helm/workflows -n redbull-workflows --create-namespace \
   --set image.repository=<registry>/workflows \
   --set config.temporalHost=<temporal-host>:7233 \
@@ -151,7 +151,7 @@ helm install workflows helm/workflows -n redbull-workflows --create-namespace \
   --set config.domain=<domain>
 
 # The limb only sets its own next endpoints + token; it reads the global values
-# from orchestrator-config above.
+# from workflows-config above.
 helm install segment-connectivity helm/segment-connectivity -n redbull-workflows \
   --set activityWorker.image.repository=<registry>/segment-connectivity \
   --set config.nextUrl=https://<real-next-service> \
@@ -162,5 +162,5 @@ helm install segment-connectivity helm/segment-connectivity -n redbull-workflows
 ```
 
 No mock is ever deployed by either chart — `config.nextUrl` is the only knob. Edit
-the `PORTS_*` keys in the live `orchestrator-config` ConfigMap (then restart the
+the `PORTS_*` keys in the live `workflows-config` ConfigMap (then restart the
 activity workers) to change the port policy without a rebuild.

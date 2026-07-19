@@ -1,4 +1,3 @@
-# For api.py — the unified Swagger entrypoint that starts workflows.
+# Local dev: run the brain + its trigger API (workflows/api.py) from source.
+# fastapi/uvicorn already come in via the brain's own requirements below.
 -r workflows/requirements.txt
-fastapi>=0.110,<1
-uvicorn>=0.29,<1

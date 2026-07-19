@@ -1,6 +1,0 @@
-apiVersion: v2
-name: connectivity
-description: Connectivity activity worker — opens firewall rules via the next service and unlocks segments in the Segments Manager. Deploys alongside the shared helm/workflow-worker chart, which runs the workflow brain.
-type: application
-version: 0.1.0
-appVersion: "0.1.0"

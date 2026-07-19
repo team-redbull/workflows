@@ -1,0 +1,6 @@
+# Test/dev-only dependencies — never shipped in an image.
+-r workflows/requirements.txt
+-r activities/segment_connectivity/requirements.txt
+pytest>=8,<10
+pytest-asyncio>=1,<2
+respx>=0.22,<1

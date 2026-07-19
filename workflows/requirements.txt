@@ -1,8 +1,9 @@
-temporalio>=1.8,<2
+temporalio>=1.28,<2
 pydantic>=2,<3
 pydantic-settings>=2,<3
-# The trigger front-door (api.py) runs from this same image via a separate
-# entrypoint (`uvicorn api:app`; see helm/workflow-worker/connectivity-api).
+# The trigger front-door (workflows/api.py) runs from this same image via a
+# separate entrypoint (`uvicorn workflows.api:app`; see
+# helm/workflows/templates/workflows-api.yaml).
 # Lightweight web deps only — still no activity-execution libraries.
 fastapi>=0.110,<1
 uvicorn>=0.29,<1

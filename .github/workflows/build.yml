@@ -1,9 +1,9 @@
 name: Build and Push
 
 # Three images from this one repo: the workflow "brain" (workflows/Dockerfile),
-# the connectivity activity "limb" (activities/connectivity/Dockerfile), and
-# the test-only mock of the next service (dev/mock-connectivity/Dockerfile),
-# deployed via helm/mock-connectivity for e2e testing (see CLAUDE.md section 4).
+# the segment-connectivity activity "limb" (activities/segment_connectivity/Dockerfile), and
+# the test-only mock of the next service (dev/mock-segment-connectivity/Dockerfile),
+# deployed via helm/mock-segment-connectivity for e2e testing (see CLAUDE.md section 4).
 
 on:
   push:
@@ -19,35 +19,35 @@ jobs:
     if: github.event_name == 'push'
     uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
     with:
-      image-name: connectivity-workflow
+      image-name: workflows
       dockerfile: workflows/Dockerfile
-      helm-values-path: helm/workflow-worker/values.yaml
+      helm-values-path: helm/workflows/values.yaml
       helm-image-path: image
     secrets: inherit
 
-  build-connectivity-activity:
+  build-segment-connectivity-activity:
     if: github.event_name == 'push'
     # Sequential, not parallel: both calls bump the same shared vX.Y.Z git
     # tag and commit+push to the same branch; running in parallel races.
     needs: build-workflow-brain
     uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
     with:
-      image-name: connectivity-activity
-      dockerfile: activities/connectivity/Dockerfile
-      helm-values-path: helm/connectivity/values.yaml
+      image-name: segment-connectivity-activity
+      dockerfile: activities/segment_connectivity/Dockerfile
+      helm-values-path: helm/segment-connectivity/values.yaml
       helm-image-path: activityWorker.image
     secrets: inherit
 
-  build-mock-connectivity:
+  build-mock-segment-connectivity:
     if: github.event_name == 'push'
     # Sequential, not parallel: all three calls bump the same shared vX.Y.Z git
     # tag and commit+push to the same branch; running in parallel races.
-    needs: build-connectivity-activity
+    needs: build-segment-connectivity-activity
     uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
     with:
-      image-name: mock-connectivity
-      dockerfile: dev/mock-connectivity/Dockerfile
-      helm-values-path: helm/mock-connectivity/values.yaml
+      image-name: mock-segment-connectivity
+      dockerfile: dev/mock-segment-connectivity/Dockerfile
+      helm-values-path: helm/mock-segment-connectivity/values.yaml
       helm-image-path: image
     secrets: inherit
 
@@ -55,19 +55,19 @@ jobs:
     if: github.event_name == 'delete'
     uses: team-redbull/.github/.github/workflows/ghcr-cleanup-on-delete.yml@main
     with:
-      image-name: connectivity-workflow
+      image-name: workflows
     secrets: inherit
 
-  cleanup-connectivity-activity-on-delete:
+  cleanup-segment-connectivity-activity-on-delete:
     if: github.event_name == 'delete'
     uses: team-redbull/.github/.github/workflows/ghcr-cleanup-on-delete.yml@main
     with:
-      image-name: connectivity-activity
+      image-name: segment-connectivity-activity
     secrets: inherit
 
-  cleanup-mock-connectivity-on-delete:
+  cleanup-mock-segment-connectivity-on-delete:
     if: github.event_name == 'delete'
     uses: team-redbull/.github/.github/workflows/ghcr-cleanup-on-delete.yml@main
     with:
-      image-name: mock-connectivity
+      image-name: mock-segment-connectivity
     secrets: inherit

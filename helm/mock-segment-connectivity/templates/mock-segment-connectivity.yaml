@@ -1,0 +1,56 @@
+# Test-only mock of the next service, reached over HTTP by the segment-connectivity
+# activity worker (config.nextUrl in helm/segment-connectivity). Its own ServiceAccount
+# per the per-deployment RBAC-isolation convention, though this mock needs no
+# permissions — it never talks to the Kubernetes API.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mock-segment-connectivity
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mock-segment-connectivity
+  labels:
+    app: mock-segment-connectivity
+spec:
+  # Pending request state is in-memory only (see values.yaml) — do not scale
+  # this beyond 1 replica.
+  replicas: {{ .Values.replicas }}
+  selector:
+    matchLabels:
+      app: mock-segment-connectivity
+  template:
+    metadata:
+      labels:
+        app: mock-segment-connectivity
+    spec:
+      serviceAccountName: mock-segment-connectivity
+      containers:
+        - name: mock-segment-connectivity
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - containerPort: 9000
+          envFrom:
+            - configMapRef:
+                name: mock-segment-connectivity-config
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 9000
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 9000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mock-segment-connectivity
+spec:
+  selector:
+    app: mock-segment-connectivity
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: 9000

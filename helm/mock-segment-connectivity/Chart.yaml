@@ -1,0 +1,6 @@
+apiVersion: v2
+name: mock-segment-connectivity
+description: Mock of the external "next" connectivity (firewall) service (dev/mock-segment-connectivity), deployed for end-to-end testing where the real next service is unreachable. Never used in production — point helm/segment-connectivity's config.nextUrl at the real service there instead.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

@@ -1,11 +1,11 @@
 """Workflow worker — the lightweight "brain" deployment.
 
-Registers ConnectivityWorkflow and polls the workflow task queue. Activities
-are NOT registered here: they run in their own deployment on a separate queue
-(see activities/connectivity/worker_init.py).
+Registers SegmentConnectivityWorkflow and polls the workflow task queue. 
+Activities are NOT registered here: they run in their own deployment on a separate queue
+(see activities/segment_connectivity/worker_init.py).
 
 Connects with the Pydantic data converter so that Pydantic models
-(ConnectivityInput, ConnectivityResult, ...) serialize correctly across the
+(SegmentConnectivityInput, SegmentConnectivityResult, ...) serialize correctly across the
 workflow boundary.
 """
 
@@ -18,16 +18,18 @@ from temporalio.client import Client
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.worker import Worker
 
-from shared.consts import CONNECTIVITY_WORKFLOW_QUEUE
+from shared.consts import SEGMENT_CONNECTIVITY_WORKFLOW_QUEUE
 from shared.logging_config import configure_logging
 from shared.settings import TemporalSettings
-from workflows.connectivity import ConnectivityWorkflow
+from shared.shutdown import install_shutdown_handler
+from workflows.segment_connectivity import SegmentConnectivityWorkflow
 
 _settings = TemporalSettings()
 
 
 async def main() -> None:
     configure_logging()
+    logger = logging.getLogger(__name__)
     client = await Client.connect(
         _settings.temporal_host,
         namespace=_settings.temporal_namespace,
@@ -35,15 +37,23 @@ async def main() -> None:
     )
     worker = Worker(
         client,
-        task_queue=CONNECTIVITY_WORKFLOW_QUEUE,
-        workflows=[ConnectivityWorkflow],
+        task_queue=SEGMENT_CONNECTIVITY_WORKFLOW_QUEUE,
+        workflows=[SegmentConnectivityWorkflow],
     )
-    logging.getLogger(__name__).info(
+
+    # Graceful rollout: on SIGTERM/SIGINT finish the workflow tasks in hand,
+    # then exit — instead of dying mid-task.
+    stop = install_shutdown_handler()
+
+    logger.info(
         "Workflow worker polling queue=%s on %s",
-        CONNECTIVITY_WORKFLOW_QUEUE,
+        SEGMENT_CONNECTIVITY_WORKFLOW_QUEUE,
         _settings.temporal_host,
     )
-    await worker.run()
+
+    async with worker:
+        await stop.wait()
+    logger.info("Workflow worker shut down gracefully")
 
 
 if __name__ == "__main__":

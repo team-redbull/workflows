@@ -6,7 +6,7 @@ Values are read from the process environment and, if present, a .env file
 Two settings groups, matching the deployment boundary:
   - TemporalSettings: needed by anything that connects a Temporal Client
     (both workers and api.py).
-  - ConnectivityActivitySettings: needed only by the connectivity activity
+  - SegmentConnectivityActivitySettings: needed only by the segment-connectivity activity
     worker/tasks (Segments Manager + next API URLs/credentials + port policy).
     The workflow worker has no business holding these.
 
@@ -18,14 +18,15 @@ Note: which ConfigMap a key lives in (an ops grouping) is INDEPENDENT of which
 settings class declares it (a code grouping). pydantic reads the flat process
 env, so it never sees the ConfigMap boundary. DOMAIN and SEGMENTS_MANAGER_URL
 live in the shared `orchestrator-config` ConfigMap (so future workflows reuse
-them without duplication), yet stay fields on ConnectivityActivitySettings —
+them without duplication), yet stay fields on SegmentConnectivityActivitySettings —
 only the activity worker requires them, and it mounts orchestrator-config +
-connectivity-config together. Keep the files aligned:
-helm/workflow-worker/templates/config.yaml   (orchestrator-config: temporal + domain + segments-manager url)
-helm/connectivity/templates/config.yaml      (connectivity-config: next URIs + ports; + the token Secret)
+segment-connectivity-config together. Keep the files aligned:
+helm/workflows/templates/config.yaml   (orchestrator-config: temporal + domain + segments-manager url)
+helm/segment-connectivity/templates/config.yaml      (segment-connectivity-config: next URIs + ports; + the token Secret)
 
 Do NOT import this module from inside a workflow definition (it runs in the
-sandbox) — only from worker entrypoints, api.py, and activity implementations.
+sandbox) — only from worker entrypoints, api.py, and activity
+implementations.
 """
 
 from __future__ import annotations
@@ -44,12 +45,10 @@ class TemporalSettings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     temporal_host: str
-    # Temporal's tenant-isolation unit; override only if the server hosts this
-    # project in a dedicated namespace.
     temporal_namespace: str = "default"
 
 
-class ConnectivityActivitySettings(BaseSettings):
+class SegmentConnectivityActivitySettings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     # --- Segments Manager (GETs are public; mutating calls need the token) ---
@@ -66,6 +65,12 @@ class ConnectivityActivitySettings(BaseSettings):
     next_token_renewal_uri: str = "/token-renewal-uri"
     next_open_rules_uri: str = "/open-rules-uri"
     next_check_status_uri: str = "/check-request-status"
+
+    # Seconds between polls of a submitted next request's status. Differs
+    # sharply by environment (fast in local/dev against the mock, slow in prod
+    # against the real human-approved service), so no code default — an
+    # operator must set it explicitly in each environment's ConfigMap.
+    next_checking_request_interval_seconds: int
 
     # --- port policy per direction (REQUIRED — populated from the ConfigMap;
     # no code defaults, so a missing/typo'd key fails the worker at startup,

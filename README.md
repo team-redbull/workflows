@@ -1,6 +1,6 @@
-# Cluster Orchestrator — Connectivity
+# Cluster Orchestrator — Segment-connectivity
 
-Connectivity sub-workflow of an OpenShift cluster lifecycle orchestrator built on
+Segment-connectivity sub-workflow of an OpenShift cluster lifecycle orchestrator built on
 Temporal. Given a `segment` (CIDR) and its `type`, it opens firewall rules against
 every same-site MCE segment via the black-box **next** connectivity service, waits for the
 (human-approved) requests to complete, then flips the segment's status
@@ -11,16 +11,15 @@ Phase 1 implements the `HC` type; other types fail loudly until implemented.
 ## Layout
 
 ```
-api.py                          Unified FastAPI/Swagger entrypoint (async trigger + status)
 shared/                         Contract layer (temporalio + pydantic only)
-  models/connectivity.py        Typed state across the workflow/activity boundary
-  interfaces/connectivity.py    Activity signatures (no bodies)
+  models/segment_connectivity.py     Typed state across the workflow/activity boundary
+  interfaces/segment_connectivity.py Activity signatures (no bodies)
   settings.py / exceptions.py / consts.py / logging_config.py
-workflows/                      The brain (ConnectivityWorkflow + main_worker_init.py)
-activities/connectivity/        The limb (activity impls + worker_init.py)
-dev/mock-connectivity/          LOCAL-DEV stand-in for the next service (black box)
-helm/workflow-worker/           Helm chart for the brain — ONE release, shared by every domain
-helm/connectivity/               Helm chart for the connectivity limb (kind or OpenShift)
+workflows/                      The brain (SegmentConnectivityWorkflow + main_worker_init.py + api.py)
+activities/segment_connectivity/        The limb (activity impls + worker_init.py)
+dev/mock-segment-connectivity/          LOCAL-DEV stand-in for the next service (black box)
+helm/workflows/           Helm chart for the brain — ONE release, shared by every domain
+helm/segment-connectivity/               Helm chart for the segment-connectivity limb (kind or OpenShift)
 ```
 
 Worker-file naming convention: the workflow (brain) worker is
@@ -29,25 +28,34 @@ Worker-file naming convention: the workflow (brain) worker is
 
 ## Flow
 
-1. `validate_segment_exists(segment, type)` — fail fast before touching the firewall.
-2. `list_mce_segments(segment, type)` — every MCE CIDR in the same site as the
-   input segment (the peer set for all supported types).
+1. `get_segment_site(segment, type)` — validate the segment exists (fail fast
+   before touching the firewall) and learn its site in one fetch.
+2. `list_mce_segments(site)` — every MCE CIDR in that site (the peer set for
+   all supported types).
 3. `submit_open_rules(...)` x2 per MCE segment (both directions), all in parallel.
    Port policy per direction comes from the ConfigMap (`PORTS_HC_TO_MCE`, ...).
-4. `publish_request_ids(segment, ids, submitted_at)` — `PUT /api/segments/connectivity-requests`
+4. `publish_request_ids(segment, ids, submitted_at)` — `PUT /api/segments/segment-connectivity-requests`
    so the Segments Manager UI shows the pending request ids beside the segment's
    status while approval is awaited. `submitted_at` (captured once via
    `workflow.now()` when the rules were submitted) drives the "time since submit"
    header in the UI popover.
-5. Poll `check_connectivity_requests(ids)` until every request is `complete`.
+5. Poll `check_segment_connectivity_requests(ids)` until every request is `complete`.
    Approval is HUMAN-driven (minutes -> hours+): the workflow polls forever with
    backoff (15s -> 5m cap) and rolls history over with `continue_as_new` — it
    never fails on a slow approval. Whenever requests complete, the published id
    list shrinks accordingly; the final empty update removes the display.
 6. `unlock_segment(segment)` — `POST /api/segments/unlock` (status Locked -> Available).
 
-The trigger is async: `POST /workflows/connectivity` returns **202 + workflow id**
-immediately; poll `GET /workflows/connectivity/{workflow_id}` for phase/pending
+Activity retries are unbounded (transient outages of the Segments Manager or the
+next service are out-waited); only classified deterministic errors — segment not
+found, bad API token, missing port profile, unsupported type, unexpected request
+status — fail the workflow. On such a terminal failure (or cancellation) the
+workflow best-effort clears the pending-ids display and publishes a
+"workflow failed" note beside the segment's status (the segment stays Locked;
+best-effort — the note endpoint exists in the Segments Manager).
+
+The trigger is async: `POST /workflows/segment-connectivity` returns **202 + workflow id**
+immediately; poll `GET /workflows/segment-connectivity/{workflow_id}` for phase/pending
 counts (workflow query) and the final result.
 
 ## Design notes
@@ -57,14 +65,14 @@ counts (workflow query) and the final result.
   OpenShift; only the Helm `values.yaml` (`config.*`) changes.
   `host.docker.internal` appears only there, never in code.
 - **ConfigMap split by scope:** `orchestrator-config` (owned by the
-  `workflow-worker` chart) holds the values every domain shares — `TEMPORAL_*`,
+  `workflows` chart) holds the values every domain shares — `TEMPORAL_*`,
   `DOMAIN`, `SEGMENTS_MANAGER_URL`. Each workflow adds its own `<domain>-config`
-  (here `connectivity-config`: the `NEXT_*` endpoints + port policy). A domain's
-  activity worker mounts both, so install `workflow-worker` before the limb.
+  (here `segment-connectivity-config`: the `NEXT_*` endpoints + port policy). A domain's
+  activity worker mounts both, so install `workflows` before the limb.
 - **next is a black box:** the orchestrator token-renews and HTTP-calls `NEXT_URL`;
-  `dev/mock-connectivity` is the dev-only stand-in and is NOT deployed by the chart —
+  `dev/mock-segment-connectivity` is the dev-only stand-in and is NOT deployed by the chart —
   `config.nextUrl` simply points at it in dev and at the real service in prod.
-- **Ports live in the ConfigMap** (`helm/connectivity/templates/config.yaml`), as
+- **Ports live in the ConfigMap** (`helm/segment-connectivity/templates/config.yaml`), as
   compact JSON per protocol; the activity layer expands them into the next API's
   structure and validates the syntax at worker startup. Changing ports = edit the
   ConfigMap + restart the activity workers. No rebuild.
@@ -75,8 +83,8 @@ counts (workflow query) and the final result.
 - **Idempotency:** unlock treats "already unlocked" as success; re-submitting
   identical open-rules requests converges to the same firewall state;
   `publish_request_ids` is a replace-style PUT (re-sends are a no-op); workflow ids
-  are deterministic (`connectivity-<TYPE>-<segment with / replaced by ->`), so a
-  duplicate trigger while running gets HTTP 409.
+  are deterministic (`segment-connectivity-<TYPE>-<segment network address, CIDR mask
+  dropped>`), so a duplicate trigger while running gets HTTP 409.
 
 ## Run locally
 
@@ -88,20 +96,20 @@ matching `SEGMENTS_MANAGER_API_TOKEN`.
 cp .env.example .env    # then point it at your Temporal / Segments Manager
 
 # The mock next service (dev only; approval delay configurable)
-cd dev/mock-connectivity && COMPLETION_DELAY_SECONDS=60 uvicorn app:app --port 9000 &
+cd dev/mock-segment-connectivity && COMPLETION_DELAY_SECONDS=60 uvicorn app:app --port 9000 &
 
 # Workers (from the repo root)
-pip install -r activities/connectivity/requirements.txt
+pip install -r activities/segment_connectivity/requirements.txt
 PYTHONPATH=. python -m workflows.main_worker_init &
-PYTHONPATH=. python -m activities.connectivity.worker_init &
+PYTHONPATH=. python -m activities.segment_connectivity.worker_init &
 
 # Unified API
 pip install -r requirements.txt
-PYTHONPATH=. uvicorn api:app --port 8080
+PYTHONPATH=. uvicorn workflows.api:app --port 8080
 # Swagger UI: http://localhost:8080/docs
-# curl -X POST localhost:8080/workflows/connectivity \
+# curl -X POST localhost:8080/workflows/segment-connectivity \
 #   -H 'content-type: application/json' -d '{"segment":"130.154.20.0/24","type":"HC"}'
-# curl localhost:8080/workflows/connectivity/connectivity-HC-130.154.20.0-24
+# curl localhost:8080/workflows/segment-connectivity/segment-connectivity-HC-130.154.20.0
 ```
 
 Inspect runs in the Temporal UI and verify the segment's `status` in the manager:
@@ -116,13 +124,13 @@ and the segment unlocks.
 ### kind
 
 ```bash
-docker build -f workflows/Dockerfile -t connectivity-workflow:dev .
-docker build -f activities/connectivity/Dockerfile -t connectivity-activity:dev .
-docker build -t mock-connectivity:dev dev/mock-connectivity   # run outside the chart
+docker build -f workflows/Dockerfile -t workflows:dev .
+docker build -f activities/segment_connectivity/Dockerfile -t segment-connectivity-activity:dev .
+docker build -t mock-segment-connectivity:dev dev/mock-segment-connectivity   # run outside the chart
 
-kind load docker-image connectivity-workflow:dev connectivity-activity:dev --name prep-temporal
-helm install workflow-worker helm/workflow-worker -n redbull-workflows --create-namespace
-helm install connectivity helm/connectivity -n redbull-workflows
+kind load docker-image workflows:dev segment-connectivity-activity:dev --name prep-temporal
+helm install workflows helm/workflows -n redbull-workflows --create-namespace
+helm install segment-connectivity helm/segment-connectivity -n redbull-workflows
 ```
 
 Neither chart creates the namespace itself — `--create-namespace` on the first
@@ -136,16 +144,16 @@ Push the two worker images to a registry the cluster can pull from, then:
 
 ```bash
 # The brain owns orchestrator-config (the global values), so install it first.
-helm install workflow-worker helm/workflow-worker -n redbull-workflows --create-namespace \
-  --set image.repository=<registry>/connectivity-workflow \
+helm install workflows helm/workflows -n redbull-workflows --create-namespace \
+  --set image.repository=<registry>/workflows \
   --set config.temporalHost=<temporal-host>:7233 \
   --set config.segmentsManagerUrl=https://<segments-manager-route> \
   --set config.domain=<domain>
 
 # The limb only sets its own next endpoints + token; it reads the global values
 # from orchestrator-config above.
-helm install connectivity helm/connectivity -n redbull-workflows \
-  --set activityWorker.image.repository=<registry>/connectivity-activity \
+helm install segment-connectivity helm/segment-connectivity -n redbull-workflows \
+  --set activityWorker.image.repository=<registry>/segment-connectivity-activity \
   --set config.nextUrl=https://<real-next-service> \
   --set config.nextTokenRenewalUri=<real-path> \
   --set config.nextOpenRulesUri=<real-path> \

@@ -1,0 +1,39 @@
+# The segment-connectivity activity "limb": its own deployment, ServiceAccount and
+# Segments Manager token. Heavy/domain deps and secrets live here, not in the brain.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: segment-connectivity
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: segment-connectivity
+  labels:
+    app: segment-connectivity
+spec:
+  replicas: {{ .Values.activityWorker.replicas }}
+  selector:
+    matchLabels:
+      app: segment-connectivity
+  template:
+    metadata:
+      labels:
+        app: segment-connectivity
+    spec:
+      serviceAccountName: segment-connectivity
+      containers:
+        - name: segment-connectivity
+          image: "{{ .Values.activityWorker.image.repository }}:{{ .Values.activityWorker.image.tag }}"
+          imagePullPolicy: {{ .Values.activityWorker.image.pullPolicy }}
+          envFrom:
+            # Global config (Temporal + DOMAIN + SEGMENTS_MANAGER_URL), owned by
+            # the workflows chart — install that release first, or this
+            # pod stalls in CreateContainerConfigError on the missing ConfigMap.
+            - configMapRef:
+                name: orchestrator-config
+            # Segment-connectivity-specific endpoints + port policy, owned by this chart.
+            - configMapRef:
+                name: segment-connectivity-config
+            - secretRef:
+                name: {{ .Values.secrets.existingSecret | default "segments-manager-token" }}

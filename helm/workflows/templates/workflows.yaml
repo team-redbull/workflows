@@ -1,0 +1,33 @@
+# The lightweight "brain": runs workflows only, for every workflow domain
+# registered in workflows/main_worker_init.py. Its own ServiceAccount per the
+# RBAC-isolation requirement (no Segments Manager token, no next URLs mounted —
+# it never makes those calls; activities do).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: workflows
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: workflows
+  labels:
+    app: workflows
+spec:
+  replicas: {{ .Values.replicas }}
+  selector:
+    matchLabels:
+      app: workflows
+  template:
+    metadata:
+      labels:
+        app: workflows
+    spec:
+      serviceAccountName: workflows
+      containers:
+        - name: workflows
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          envFrom:
+            - configMapRef:
+                name: orchestrator-config

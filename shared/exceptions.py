@@ -15,6 +15,15 @@ class SegmentsManagerError(OrchestratorError):
     """The team's Segments Manager API returned an unexpected error."""
 
 
+class SegmentsManagerAuthError(OrchestratorError):
+    """The Segments Manager rejected our credentials (401/403).
+
+    Deterministic — a bad SEGMENTS_MANAGER_API_TOKEN never fixes itself, so
+    workflows list this type in non_retryable_error_types (with unbounded
+    retries elsewhere, an unclassified auth error would retry forever).
+    """
+
+
 class SegmentNotFoundError(OrchestratorError):
     """The requested segment does not exist in the Segments Manager.
 

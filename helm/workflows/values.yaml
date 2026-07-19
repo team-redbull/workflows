@@ -23,7 +23,7 @@ config:
   domain: "domain1"
 image:
   repository: ghcr.io/team-redbull/workflows
-  tag: v1.0.28
+  tag: v1.0.29
   pullPolicy: IfNotPresent
 replicas: 3
 # The SHARED workflow trigger API (workflows/api.py), run from the same image

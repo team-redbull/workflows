@@ -22,8 +22,9 @@ from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
 from shared.consts import SEGMENT_CONNECTIVITY_ACTIVITY_QUEUE, SEGMENT_CONNECTIVITY_WORKFLOW_QUEUE
-from shared.exceptions import SegmentNotFoundError
+from shared.exceptions import BmcSegmentNotConfiguredError, SegmentNotFoundError
 from shared.models.segment_connectivity import (
+    BmcOpenRulesRequest,
     SegmentConnectivityFailureNotice,
     SegmentConnectivityInput,
     SegmentConnectivityRequestRef,
@@ -31,18 +32,22 @@ from shared.models.segment_connectivity import (
     SegmentConnectivityResumeState,
     SegmentConnectivityRunArgs,
     OpenRulesRequest,
+    PeerSegmentsQuery,
+    SegmentRef,
     SegmentType,
 )
 from workflows.segment_connectivity import SegmentConnectivityWorkflow
 
 SEGMENT = "10.0.0.0/24"
 HC_INPUT = SegmentConnectivityInput(segment=SEGMENT, type=SegmentType.HC)
+MCE_INPUT = SegmentConnectivityInput(segment=SEGMENT, type=SegmentType.MCE)
 
 
 def make_mock_activities(
     *,
     site: str = "site-a",
-    mce_segments: tuple[str, ...] = ("10.1.0.0/24",),
+    peer_segments: tuple[SegmentRef, ...] = (SegmentRef(segment="10.1.0.0/24", type=SegmentType.MCE),),
+    bmc_segment: str | None = "10.99.0.0/16",
     check_script: list[list[int]] | None = None,
     check_always_pending: bool = False,
     site_fail_times: int = 0,
@@ -52,13 +57,16 @@ def make_mock_activities(
 
     check_script: per-poll return values; once exhausted (and not
     check_always_pending) every subsequent poll returns [] (all complete).
+    bmc_segment=None simulates an unconfigured site (get_bmc_segment raises).
     """
     calls: dict[str, list] = {
         name: []
         for name in (
             "get_segment_site",
-            "list_mce_segments",
+            "list_peer_segments",
             "submit_open_rules",
+            "get_bmc_segment",
+            "submit_bmc_open_rules",
             "publish_request_ids",
             "check_segment_connectivity_requests",
             "get_next_checking_request_interval",
@@ -81,13 +89,25 @@ def make_mock_activities(
         return site
 
     @activity.defn
-    async def list_mce_segments(site_arg: str) -> list[str]:
-        calls["list_mce_segments"].append(site_arg)
-        return list(mce_segments)
+    async def list_peer_segments(query: PeerSegmentsQuery) -> list[SegmentRef]:
+        calls["list_peer_segments"].append(query)
+        return list(peer_segments)
 
     @activity.defn
     async def submit_open_rules(request: OpenRulesRequest) -> SegmentConnectivityRequestRef:
         calls["submit_open_rules"].append(request)
+        return SegmentConnectivityRequestRef(id=next(ids), status="pending")
+
+    @activity.defn
+    async def get_bmc_segment(site_arg: str) -> str:
+        calls["get_bmc_segment"].append(site_arg)
+        if bmc_segment is None:
+            raise BmcSegmentNotConfiguredError(f"No BMC segment configured for site={site_arg}")
+        return bmc_segment
+
+    @activity.defn
+    async def submit_bmc_open_rules(request: BmcOpenRulesRequest) -> SegmentConnectivityRequestRef:
+        calls["submit_bmc_open_rules"].append(request)
         return SegmentConnectivityRequestRef(id=next(ids), status="pending")
 
     @activity.defn
@@ -118,8 +138,10 @@ def make_mock_activities(
 
     return calls, [
         get_segment_site,
-        list_mce_segments,
+        list_peer_segments,
         submit_open_rules,
+        get_bmc_segment,
+        submit_bmc_open_rules,
         publish_request_ids,
         check_segment_connectivity_requests,
         get_next_checking_request_interval,
@@ -189,8 +211,13 @@ async def test_happy_path_submits_polls_publishes_and_unlocks():
     assert result.peer_segment_count == 1
     # 2 directions x 1 MCE segment; the mock's ids race, so order-insensitive.
     assert sorted(result.request_ids) == [1, 2]
-    assert calls["list_mce_segments"] == ["site-a"]
+    assert calls["list_peer_segments"] == [
+        PeerSegmentsQuery(source_type=SegmentType.HC, site="site-a")
+    ]
     assert len(calls["submit_open_rules"]) == 2
+    # The BMC leg is MCE-only: an HC input never touches it.
+    assert calls["get_bmc_segment"] == []
+    assert calls["submit_bmc_open_rules"] == []
     assert calls["unlock_segment"] == [SEGMENT]
     # Publish trail: all ids after submit, shrink to [2], then the clearing [].
     published = [u.request_ids for u in calls["publish_request_ids"]]
@@ -200,18 +227,19 @@ async def test_happy_path_submits_polls_publishes_and_unlocks():
     assert calls["publish_segment_connectivity_failure"] == []
 
 
-async def test_unsupported_type_fails_fast_before_any_activity():
-    calls, mocks = make_mock_activities()
-    mce_input = SegmentConnectivityInput(segment=SEGMENT, type=SegmentType.MCE)
-    async with _Harness(mocks) as client:
-        with pytest.raises(WorkflowFailureError) as exc_info:
-            await _execute(client, SegmentConnectivityRunArgs(input=mce_input))
+def test_supported_types_covers_every_segment_type():
+    # All 4 real SegmentType members are supported today, so the
+    # "UnsupportedSegmentType" fail-fast path can no longer be exercised
+    # through the public API with a real SegmentType value (the enum is
+    # closed, and Temporal's workflow sandbox re-executes this module in
+    # isolation, so monkeypatching _SUPPORTED_TYPES from the test process
+    # doesn't reach the sandboxed copy either). This locks in the gate's
+    # current coverage instead: if a 5th SegmentType is ever added without
+    # updating _SUPPORTED_TYPES, this test fails loudly and prompts an
+    # explicit decision, exactly as the gate is meant to.
+    from workflows.segment_connectivity import _SUPPORTED_TYPES
 
-    cause = _workflow_cause(exc_info)
-    assert isinstance(cause, ApplicationError)
-    assert cause.type == "UnsupportedSegmentType"
-    assert calls["get_segment_site"] == []
-    assert calls["publish_segment_connectivity_failure"] == []  # pre-validation: no note
+    assert _SUPPORTED_TYPES == frozenset(SegmentType)
 
 
 async def test_segment_not_found_fails_without_retry_or_note():
@@ -238,19 +266,80 @@ async def test_transient_activity_failures_are_outwaited():
     assert len(calls["get_segment_site"]) == 3  # 2 transient failures + success
 
 
-async def test_empty_mce_pool_fails_and_publishes_failure_note():
-    calls, mocks = make_mock_activities(mce_segments=())
+async def test_empty_peer_pool_fails_and_publishes_failure_note():
+    calls, mocks = make_mock_activities(peer_segments=())
     async with _Harness(mocks) as client:
         with pytest.raises(WorkflowFailureError) as exc_info:
             await _execute(client, SegmentConnectivityRunArgs(input=HC_INPUT))
 
     cause = _workflow_cause(exc_info)
     assert isinstance(cause, ApplicationError)
-    assert cause.type == "NoMceSegments"
+    assert cause.type == "NoPeerSegments"
     assert calls["submit_open_rules"] == []
     (notice,) = calls["publish_segment_connectivity_failure"]
     assert notice.segment == SEGMENT
-    assert "No same-site MCE segments" in notice.message
+    assert "No same-site peer segments" in notice.message
+
+
+async def test_mce_source_peers_with_hc_inventory_and_pxe():
+    peers = (
+        SegmentRef(segment="10.1.0.0/24", type=SegmentType.HC),
+        SegmentRef(segment="10.2.0.0/24", type=SegmentType.INVENTORY),
+        SegmentRef(segment="10.3.0.0/24", type=SegmentType.PXE),
+    )
+    calls, mocks = make_mock_activities(peer_segments=peers, check_script=[[]])
+    async with _Harness(mocks) as client:
+        result = await _execute(client, SegmentConnectivityRunArgs(input=MCE_INPUT))
+
+    assert result.peer_segment_count == 3
+    assert calls["list_peer_segments"] == [
+        PeerSegmentsQuery(source_type=SegmentType.MCE, site="site-a")
+    ]
+    assert len(calls["submit_open_rules"]) == 6
+    pairs = {(r.source_type, r.destination_type) for r in calls["submit_open_rules"]}
+    assert pairs == {
+        (SegmentType.MCE, SegmentType.HC),
+        (SegmentType.HC, SegmentType.MCE),
+        (SegmentType.MCE, SegmentType.INVENTORY),
+        (SegmentType.INVENTORY, SegmentType.MCE),
+        (SegmentType.MCE, SegmentType.PXE),
+        (SegmentType.PXE, SegmentType.MCE),
+    }
+    # Plus the mandatory one-directional BMC leg.
+    assert calls["get_bmc_segment"] == ["site-a"]
+    (bmc_request,) = calls["submit_bmc_open_rules"]
+    assert bmc_request.mce_segment == SEGMENT
+    assert bmc_request.bmc_segment == "10.99.0.0/16"
+    assert len(result.request_ids) == 7
+
+
+async def test_mce_source_with_no_peers_still_submits_bmc_rule():
+    calls, mocks = make_mock_activities(peer_segments=(), check_script=[[]])
+    async with _Harness(mocks) as client:
+        result = await _execute(client, SegmentConnectivityRunArgs(input=MCE_INPUT))
+
+    assert result.peer_segment_count == 0
+    assert len(result.request_ids) == 1
+    assert calls["submit_open_rules"] == []
+    assert len(calls["submit_bmc_open_rules"]) == 1
+    assert calls["publish_segment_connectivity_failure"] == []
+
+
+async def test_mce_source_missing_bmc_config_fails_non_retryable():
+    calls, mocks = make_mock_activities(bmc_segment=None)
+    async with _Harness(mocks) as client:
+        with pytest.raises(WorkflowFailureError) as exc_info:
+            await _execute(client, SegmentConnectivityRunArgs(input=MCE_INPUT))
+
+    cause = _workflow_cause(exc_info)
+    assert isinstance(cause, ApplicationError)
+    assert cause.type == "BmcSegmentNotConfiguredError"
+    # Non-retryable classification: exactly one attempt.
+    assert len(calls["get_bmc_segment"]) == 1
+    assert calls["submit_bmc_open_rules"] == []
+    assert calls["submit_open_rules"] == []
+    (notice,) = calls["publish_segment_connectivity_failure"]
+    assert notice.segment == SEGMENT
 
 
 async def test_resume_path_skips_submission_and_finishes():
@@ -271,7 +360,7 @@ async def test_resume_path_skips_submission_and_finishes():
     assert result.peer_segment_count == 3
     # Resume never re-validates or re-submits.
     assert calls["get_segment_site"] == []
-    assert calls["list_mce_segments"] == []
+    assert calls["list_peer_segments"] == []
     assert calls["submit_open_rules"] == []
     # The original submission time survives continue_as_new.
     published = [(u.request_ids, u.submitted_at) for u in calls["publish_request_ids"]]

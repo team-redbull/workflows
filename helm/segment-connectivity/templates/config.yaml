@@ -29,6 +29,12 @@ data:
   PORTS_MCE_TO_INVENTORY: '{"tcp": ["6443", "30000-32767"]}'
   PORTS_PXE_TO_MCE: '{"tcp": ["30000-32767"], "udp": ["9000"]}'
   PORTS_MCE_TO_PXE: '{"tcp": ["6443", "30000-32767"]}'
+  # -- BMC: every MCE segment also opens a one-directional rule to its
+  # site's static BMC network (not tracked by the Segments Manager, so it
+  # is a static site -> CIDR mapping here instead of a Segments Manager
+  # query). Placeholder values below — set every real site before deploying.
+  BMC_SEGMENTS_BY_SITE: '{"site-a": "10.50.0.0/16"}'
+  PORTS_MCE_TO_BMC: '{"tcp": ["623"], "udp": ["623"]}'
 {{- if not .Values.secrets.existingSecret }}
 ---
 # Bearer token for mutating Segments Manager calls. Replace for non-local envs.

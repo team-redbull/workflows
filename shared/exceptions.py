@@ -39,3 +39,11 @@ class NextApiError(OrchestratorError):
     the activity RetryPolicy. Configuration problems (e.g. port policy) are NOT
     this error: they fail the worker at startup instead.
     """
+
+
+class BmcSegmentNotConfiguredError(OrchestratorError):
+    """No BMC segment is configured for the given site (BMC_SEGMENTS_BY_SITE).
+
+    Deterministic — a missing ConfigMap entry never fixes itself, so workflows
+    list this type in non_retryable_error_types.
+    """

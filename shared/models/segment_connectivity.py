@@ -42,6 +42,32 @@ class OpenRulesRequest(BaseModel):
     destination_type: SegmentType
 
 
+class SegmentRef(BaseModel):
+    """A same-site segment eligible to peer with some source type — carries
+    its own type because one source type can peer with several destination
+    types at once (e.g. MCE peers with HC, INVENTORY and PXE)."""
+
+    segment: str = Field(min_length=1)  # CIDR
+    type: SegmentType
+
+
+class PeerSegmentsQuery(BaseModel):
+    """Input to list_peer_segments: which type is asking, and where."""
+
+    source_type: SegmentType
+    site: str = Field(min_length=1)
+
+
+class BmcOpenRulesRequest(BaseModel):
+    """One-directional MCE -> BMC firewall-rule request. BMC is not a
+    Segments-Manager-tracked SegmentType — its CIDR is a static,
+    ConfigMap-sourced value per site — so this is a deliberately separate,
+    narrower model from OpenRulesRequest."""
+
+    mce_segment: str = Field(min_length=1)
+    bmc_segment: str = Field(min_length=1)
+
+
 class SegmentConnectivityRequestRef(BaseModel):
     """The next API's acknowledgement of a submitted open-rules request."""
 

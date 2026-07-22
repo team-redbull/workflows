@@ -27,17 +27,21 @@ from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
 from shared.exceptions import (
+    BmcSegmentNotConfiguredError,
     NextApiError,
     SegmentsManagerAuthError,
     SegmentsManagerError,
     SegmentNotFoundError,
 )
 from shared.models.segment_connectivity import (
+    BmcOpenRulesRequest,
     SegmentConnectivityFailureNotice,
     SegmentConnectivityInput,
     SegmentConnectivityRequestRef,
     SegmentConnectivityRequestsUpdate,
     OpenRulesRequest,
+    PeerSegmentsQuery,
+    SegmentRef,
     SegmentType,
 )
 from shared.settings import SegmentConnectivityActivitySettings
@@ -63,9 +67,20 @@ _COMMENT_LABELS: dict[SegmentType, str] = {
     SegmentType.PXE: "PXE",
 }
 
+# BMC is not a SegmentType (it's not Segments-Manager-tracked — see
+# get_bmc_segment), so its labels live outside the SegmentType-keyed dicts
+# above rather than stretching those dicts to cover a type that can never be
+# queried, listed, or given as workflow input.
+_BMC_SYSTEM_NAME = "bmc"
+_BMC_COMMENT_LABEL = "BMC"
+
 # Port policy per (source, destination) type pair, straight from the ConfigMap
 # (syntax validated fail-fast at worker startup by SegmentConnectivityActivitySettings).
 # New type pairs: add a PORTS_<SRC>_TO_<DST> settings field + an entry here.
+# Deliberately excludes BMC: _peer_types() derives Segments-Manager-queryable
+# peer types from this dict's keys, and BMC segments are never queryable from
+# the Segments Manager (see get_bmc_segment) — an (MCE, BMC) entry here would
+# make list_peer_segments wrongly try `GET /api/segments?type=BMC`.
 _PORT_PROFILES: dict[tuple[SegmentType, SegmentType], dict[str, list[str]]] = {
     (SegmentType.HC, SegmentType.MCE): _settings.ports_hc_to_mce,
     (SegmentType.MCE, SegmentType.HC): _settings.ports_mce_to_hc,
@@ -171,60 +186,94 @@ async def get_segment_site(connectivity_input: SegmentConnectivityInput) -> str:
     )
 
 
+def _peer_types(source_type: SegmentType) -> list[SegmentType]:
+    """Destination types source_type peers with, derived from the configured
+    port profiles — the port policy IS the peering topology, so a future
+    segment type wires up symmetric peer-discovery as soon as its PORTS_*
+    config is added, with no changes here. Sorted for stable, reproducible
+    output ordering (log readability / test determinism)."""
+    return sorted(
+        {dest for (src, dest) in _PORT_PROFILES if src == source_type},
+        key=lambda t: t.value,
+    )
+
+
+async def _list_segments_by_type(
+    client: httpx.AsyncClient, seg_type: SegmentType, site: str
+) -> list[SegmentRef]:
+    resp = await client.get("/api/segments", params={"type": seg_type.value})
+    if resp.status_code != 200:
+        _raise_segments_manager_error(f"List {seg_type.value} segments", resp)
+    refs: list[SegmentRef] = []
+    for seg in resp.json():
+        if seg.get("site") != site:
+            continue
+        cidr = seg.get("segment")
+        if not cidr:
+            raise SegmentsManagerError(f"{seg_type.value} segment entry missing 'segment': {seg}")
+        refs.append(SegmentRef(segment=cidr, type=seg_type))
+    return refs
+
+
 @activity.defn
-async def list_mce_segments(site: str) -> list[str]:
-    """Return the CIDRs of MCE-type segments in the given site."""
+async def list_peer_segments(query: PeerSegmentsQuery) -> list[SegmentRef]:
+    """Return every same-site segment eligible to peer with query.source_type."""
+    peer_types = _peer_types(query.source_type)
+    if not peer_types:
+        # A code/config gap (a supported type with no PORTS_* profile wired
+        # up yet) — not reachable with today's 4 types, but fail loudly
+        # rather than silently treating it as "nothing co-located yet".
+        raise ApplicationError(
+            f"No peer types configured for source_type={query.source_type.value} "
+            "(add PORTS_<SRC>_TO_<DST> config entries)",
+            type="PeerTypesNotConfigured",
+            non_retryable=True,
+        )
     async with _segments_manager_client() as client:
-        resp = await client.get("/api/segments", params={"type": SegmentType.MCE.value})
-        if resp.status_code != 200:
-            _raise_segments_manager_error("List MCE segments", resp)
-        segments: list[str] = []
-        for seg in resp.json():
-            if seg.get("site") != site:
-                continue
-            cidr = seg.get("segment")
-            if not cidr:
-                raise SegmentsManagerError(f"MCE segment entry missing 'segment': {seg}")
-            segments.append(cidr)
-    activity.logger.info("Found %d MCE segment(s) in site=%s", len(segments), site)
+        results = await asyncio.gather(
+            *(_list_segments_by_type(client, t, query.site) for t in peer_types)
+        )
+    segments = [ref for group in results for ref in group]
+    activity.logger.info(
+        "Found %d peer segment(s) in site=%s for source_type=%s (peer types=%s)",
+        len(segments),
+        query.site,
+        query.source_type.value,
+        [t.value for t in peer_types],
+    )
     return segments
 
 
-@activity.defn
-async def submit_open_rules(request: OpenRulesRequest) -> SegmentConnectivityRequestRef:
-    """Submit one open-firewall-rules request to the next API.
+async def _submit_next_open_rules(
+    *,
+    source_segment: str,
+    source_system_name: str,
+    destination_segment: str,
+    destination_system_name: str,
+    comment: str,
+    profile: dict[str, list[str]],
+) -> SegmentConnectivityRequestRef:
+    """Build the next-API payload and submit it. Shared by submit_open_rules
+    and submit_bmc_open_rules — everything below this point is generic over
+    who the source/destination are.
 
     Idempotent in effect: a retry after an unacknowledged-but-accepted POST
     opens identical rules, which converge to the same firewall state (the
     duplicate request id is simply never polled).
     """
-    profile = _PORT_PROFILES.get((request.source_type, request.destination_type))
-    if profile is None:
-        # Deterministic: the workflow submitted a direction the port policy
-        # doesn't cover — a code/config gap, not a next-service failure.
-        raise ApplicationError(
-            f"No port profile configured for {request.source_type.value} -> "
-            f"{request.destination_type.value} (add a PORTS_* config entry)",
-            type="PortProfileMissing",
-            non_retryable=True,
-        )
-
     payload = {
         "ad_groups": [],
-        "comment": (
-            f"{_COMMENT_LABELS[request.source_type]}: {request.source_segment} -> "
-            f"{_COMMENT_LABELS[request.destination_type]}: {request.destination_segment}"
-        ),
+        "comment": comment,
         "properties": {
             "source": {
-                "system_name": _SYSTEM_NAMES[request.source_type],
+                "system_name": source_system_name,
                 "domain": _settings.domain,
-                "addresses": [{"type": "segment", "segment": request.source_segment}],
+                "addresses": [{"type": "segment", "segment": source_segment}],
             },
             "destination": {
-                "system_name": _SYSTEM_NAMES[request.destination_type],
+                "system_name": destination_system_name,
                 "domain": _settings.domain,
-                "addresses": [{"type": "segment", "segment": request.destination_segment}],
+                "addresses": [{"type": "segment", "segment": destination_segment}],
             },
             "ports": _expand_ports(profile),
         },
@@ -252,10 +301,68 @@ async def submit_open_rules(request: OpenRulesRequest) -> SegmentConnectivityReq
     activity.logger.info(
         "Submitted open-rules request id=%d (%s -> %s)",
         ref.id,
-        request.source_segment,
-        request.destination_segment,
+        source_segment,
+        destination_segment,
     )
     return ref
+
+
+@activity.defn
+async def submit_open_rules(request: OpenRulesRequest) -> SegmentConnectivityRequestRef:
+    """Submit one open-firewall-rules request to the next API."""
+    profile = _PORT_PROFILES.get((request.source_type, request.destination_type))
+    if profile is None:
+        # Deterministic: the workflow submitted a direction the port policy
+        # doesn't cover — a code/config gap, not a next-service failure.
+        raise ApplicationError(
+            f"No port profile configured for {request.source_type.value} -> "
+            f"{request.destination_type.value} (add a PORTS_* config entry)",
+            type="PortProfileMissing",
+            non_retryable=True,
+        )
+    return await _submit_next_open_rules(
+        source_segment=request.source_segment,
+        source_system_name=_SYSTEM_NAMES[request.source_type],
+        destination_segment=request.destination_segment,
+        destination_system_name=_SYSTEM_NAMES[request.destination_type],
+        comment=(
+            f"{_COMMENT_LABELS[request.source_type]}: {request.source_segment} -> "
+            f"{_COMMENT_LABELS[request.destination_type]}: {request.destination_segment}"
+        ),
+        profile=profile,
+    )
+
+
+@activity.defn
+async def get_bmc_segment(site: str) -> str:
+    """Return the site's static BMC CIDR from ConfigMap (BMC_SEGMENTS_BY_SITE).
+
+    A pure config lookup, not an API call: BMC is not a Segments-Manager-
+    tracked segment type.
+    """
+    bmc_segment = _settings.bmc_segments_by_site.get(site)
+    if not bmc_segment:
+        raise BmcSegmentNotConfiguredError(
+            f"No BMC segment configured for site={site} (check BMC_SEGMENTS_BY_SITE)"
+        )
+    return bmc_segment
+
+
+@activity.defn
+async def submit_bmc_open_rules(request: BmcOpenRulesRequest) -> SegmentConnectivityRequestRef:
+    """Submit the one-directional MCE -> BMC open-rules request
+    (PORTS_MCE_TO_BMC)."""
+    return await _submit_next_open_rules(
+        source_segment=request.mce_segment,
+        source_system_name=_SYSTEM_NAMES[SegmentType.MCE],
+        destination_segment=request.bmc_segment,
+        destination_system_name=_BMC_SYSTEM_NAME,
+        comment=(
+            f"{_COMMENT_LABELS[SegmentType.MCE]}: {request.mce_segment} -> "
+            f"{_BMC_COMMENT_LABEL}: {request.bmc_segment}"
+        ),
+        profile=_settings.ports_mce_to_bmc,
+    )
 
 
 @activity.defn

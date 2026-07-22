@@ -10,11 +10,14 @@ from __future__ import annotations
 from temporalio import activity
 
 from shared.models.segment_connectivity import (
+    BmcOpenRulesRequest,
     SegmentConnectivityFailureNotice,
     SegmentConnectivityInput,
     SegmentConnectivityRequestRef,
     SegmentConnectivityRequestsUpdate,
     OpenRulesRequest,
+    PeerSegmentsQuery,
+    SegmentRef,
 )
 
 
@@ -30,12 +33,14 @@ async def get_segment_site(connectivity_input: SegmentConnectivityInput) -> str:
 
 
 @activity.defn
-async def list_mce_segments(site: str) -> list[str]:
-    """Return the CIDRs of MCE-type segments in the given site.
+async def list_peer_segments(query: PeerSegmentsQuery) -> list[SegmentRef]:
+    """Return every same-site segment eligible to peer with query.source_type.
 
-    MCE-only by design: every supported segment type currently peers with the
-    MCE segments. Site-scoped: only MCE segments co-located with the input
-    segment are valid peers.
+    Peer types are derived from the activity layer's configured
+    PORTS_<SRC>_TO_<DST> port profiles — the port policy IS the peering
+    topology (e.g. an HC source currently returns only MCE peers, while an
+    MCE source returns HC + INVENTORY + PXE peers). Site-scoped: only
+    same-site segments are valid peers.
     """
     ...
 
@@ -79,6 +84,24 @@ async def unlock_segment(segment: str) -> None:
     Identified by CIDR (POST /api/segments/unlock). Idempotent: an
     already-unlocked segment is treated as success.
     """
+    ...
+
+
+@activity.defn
+async def get_bmc_segment(site: str) -> str:
+    """Return the site's static BMC CIDR from ConfigMap (BMC_SEGMENTS_BY_SITE).
+
+    BMC is not a Segments-Manager-tracked segment type, so this is a pure
+    config lookup, not an API call. Raises BmcSegmentNotConfiguredError if the
+    site has no configured entry — deterministic, non-retryable.
+    """
+    ...
+
+
+@activity.defn
+async def submit_bmc_open_rules(request: BmcOpenRulesRequest) -> SegmentConnectivityRequestRef:
+    """Submit the one-directional MCE -> BMC open-rules request
+    (PORTS_MCE_TO_BMC). Idempotent in the same sense as submit_open_rules."""
     ...
 
 

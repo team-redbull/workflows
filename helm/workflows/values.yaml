@@ -25,7 +25,7 @@ image:
   repository: ghcr.io/team-redbull/workflows
   tag: v1.0.35
   pullPolicy: IfNotPresent
-replicas: 3
+replicas: 2
 # The SHARED workflow trigger API (workflows/api.py), run from the same image
 # as a single Deployment + Service named `workflows-api` that fronts EVERY
 # workflow domain (a new domain adds a route to workflows/api.py, not a new
@@ -34,5 +34,5 @@ replicas: 3
 # in-cluster.
 workflowsApi:
   enabled: true
-  replicas: 1
+  replicas: 2
   port: 8080

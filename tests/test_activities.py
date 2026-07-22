@@ -16,26 +16,33 @@ from temporalio.testing import ActivityEnvironment
 
 from activities.segment_connectivity.activities import (
     _expand_ports,
+    _peer_types,
     check_segment_connectivity_requests,
+    get_bmc_segment,
     get_next_checking_request_interval,
     get_segment_site,
-    list_mce_segments,
+    list_peer_segments,
     publish_segment_connectivity_failure,
     publish_request_ids,
+    submit_bmc_open_rules,
     submit_open_rules,
     unlock_segment,
 )
 from shared.exceptions import (
+    BmcSegmentNotConfiguredError,
     NextApiError,
     SegmentNotFoundError,
     SegmentsManagerAuthError,
     SegmentsManagerError,
 )
 from shared.models.segment_connectivity import (
+    BmcOpenRulesRequest,
     SegmentConnectivityFailureNotice,
     SegmentConnectivityInput,
     SegmentConnectivityRequestsUpdate,
     OpenRulesRequest,
+    PeerSegmentsQuery,
+    SegmentRef,
     SegmentType,
 )
 
@@ -100,11 +107,22 @@ async def test_get_segment_site_server_error_is_retryable_type(env):
         await env.run(get_segment_site, HC_INPUT)
 
 
-# --- list_mce_segments ---
+# --- _peer_types / list_peer_segments ---
+
+
+def test_peer_types_derived_from_port_profiles():
+    assert _peer_types(SegmentType.HC) == [SegmentType.MCE]
+    assert _peer_types(SegmentType.INVENTORY) == [SegmentType.MCE]
+    assert _peer_types(SegmentType.PXE) == [SegmentType.MCE]
+    assert _peer_types(SegmentType.MCE) == [
+        SegmentType.HC,
+        SegmentType.INVENTORY,
+        SegmentType.PXE,
+    ]
 
 
 @respx.mock
-async def test_list_mce_segments_filters_by_site(env):
+async def test_list_peer_segments_hc_source_queries_mce_and_filters_by_site(env):
     respx.get(f"{SM}/api/segments", params={"type": "MCE"}).mock(
         return_value=httpx.Response(
             200,
@@ -115,9 +133,39 @@ async def test_list_mce_segments_filters_by_site(env):
             ],
         )
     )
-    assert await env.run(list_mce_segments, "site-a") == [
-        "10.1.0.0/24",
-        "10.3.0.0/24",
+    result = await env.run(
+        list_peer_segments, PeerSegmentsQuery(source_type=SegmentType.HC, site="site-a")
+    )
+    assert result == [
+        SegmentRef(segment="10.1.0.0/24", type=SegmentType.MCE),
+        SegmentRef(segment="10.3.0.0/24", type=SegmentType.MCE),
+    ]
+
+
+@respx.mock
+async def test_list_peer_segments_mce_source_queries_all_peer_types_and_merges(env):
+    respx.get(f"{SM}/api/segments", params={"type": "HC"}).mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                {"segment": "10.1.0.0/24", "site": "site-a"},
+                {"segment": "10.9.0.0/24", "site": "site-b"},
+            ],
+        )
+    )
+    respx.get(f"{SM}/api/segments", params={"type": "INVENTORY"}).mock(
+        return_value=httpx.Response(200, json=[{"segment": "10.2.0.0/24", "site": "site-a"}])
+    )
+    respx.get(f"{SM}/api/segments", params={"type": "PXE"}).mock(
+        return_value=httpx.Response(200, json=[{"segment": "10.3.0.0/24", "site": "site-a"}])
+    )
+    result = await env.run(
+        list_peer_segments, PeerSegmentsQuery(source_type=SegmentType.MCE, site="site-a")
+    )
+    assert sorted(result, key=lambda r: r.segment) == [
+        SegmentRef(segment="10.1.0.0/24", type=SegmentType.HC),
+        SegmentRef(segment="10.2.0.0/24", type=SegmentType.INVENTORY),
+        SegmentRef(segment="10.3.0.0/24", type=SegmentType.PXE),
     ]
 
 
@@ -177,6 +225,51 @@ async def test_submit_open_rules_missing_port_profile_is_non_retryable(env):
         )
     assert exc_info.value.type == "PortProfileMissing"
     assert exc_info.value.non_retryable is True
+
+
+# --- get_bmc_segment / submit_bmc_open_rules ---
+
+
+async def test_get_bmc_segment_returns_configured_cidr(env):
+    # BMC_SEGMENTS_BY_SITE from conftest: {"site-a": "10.99.0.0/16"}.
+    assert await env.run(get_bmc_segment, "site-a") == "10.99.0.0/16"
+
+
+async def test_get_bmc_segment_missing_site_raises(env):
+    with pytest.raises(BmcSegmentNotConfiguredError):
+        await env.run(get_bmc_segment, "site-unknown")
+
+
+@respx.mock
+async def test_submit_bmc_open_rules_builds_one_directional_payload(env):
+    respx.post(f"{NEXT}/token-renewal-uri").mock(
+        return_value=httpx.Response(200, json={"access_token": "tok-1"})
+    )
+    open_rules = respx.post(f"{NEXT}/open-rules-uri").mock(
+        return_value=httpx.Response(201, json={"id": 99, "status": "pending"})
+    )
+
+    ref = await env.run(
+        submit_bmc_open_rules,
+        BmcOpenRulesRequest(mce_segment="10.0.0.0/24", bmc_segment="10.99.0.0/16"),
+    )
+
+    assert ref.id == 99
+    import json
+
+    payload = json.loads(open_rules.calls.last.request.content)
+    assert payload["properties"]["source"]["system_name"] == "mce"
+    assert payload["properties"]["source"]["addresses"] == [
+        {"type": "segment", "segment": "10.0.0.0/24"}
+    ]
+    assert payload["properties"]["destination"]["system_name"] == "bmc"
+    assert payload["properties"]["destination"]["addresses"] == [
+        {"type": "segment", "segment": "10.99.0.0/16"}
+    ]
+    # PORTS_MCE_TO_BMC from conftest: tcp 623.
+    assert payload["properties"]["ports"] == [
+        {"type": "port", "port": 623, "protocol": "TCP"}
+    ]
 
 
 # --- check_segment_connectivity_requests ---

@@ -31,6 +31,7 @@ implementations.
 
 from __future__ import annotations
 
+import ipaddress
 import re
 
 from pydantic import field_validator
@@ -84,6 +85,13 @@ class SegmentConnectivityActivitySettings(BaseSettings):
     ports_pxe_to_mce: dict[str, list[str]]
     ports_mce_to_pxe: dict[str, list[str]]
 
+    # --- BMC: every MCE segment also opens a one-directional rule to its
+    # site's static BMC network. BMC is NOT a Segments-Manager-tracked
+    # segment type, so its CIDR is a static, operator-configured mapping
+    # (site name -> CIDR) rather than something queried at runtime. ---------
+    bmc_segments_by_site: dict[str, str]
+    ports_mce_to_bmc: dict[str, list[str]]
+
     @field_validator(
         "ports_hc_to_mce",
         "ports_mce_to_hc",
@@ -91,6 +99,7 @@ class SegmentConnectivityActivitySettings(BaseSettings):
         "ports_mce_to_inventory",
         "ports_pxe_to_mce",
         "ports_mce_to_pxe",
+        "ports_mce_to_bmc",
     )
     @classmethod
     def _validate_port_profile(cls, profile: dict[str, list[str]]) -> dict[str, list[str]]:
@@ -118,3 +127,16 @@ class SegmentConnectivityActivitySettings(BaseSettings):
                 if start > end:
                     raise ValueError(f"inverted range in entry {entry!r} for {protocol!r}")
         return profile
+
+    @field_validator("bmc_segments_by_site")
+    @classmethod
+    def _validate_bmc_segments_by_site(cls, sites: dict[str, str]) -> dict[str, str]:
+        """Strict, fail-fast validation of the ConfigMap site->CIDR mapping."""
+        if not sites:
+            raise ValueError("bmc_segments_by_site must not be empty")
+        for site, cidr in sites.items():
+            try:
+                ipaddress.ip_network(cidr, strict=True)
+            except ValueError as exc:
+                raise ValueError(f"invalid CIDR {cidr!r} for site {site!r}: {exc}") from exc
+        return sites

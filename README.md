@@ -2,11 +2,15 @@
 
 Segment-connectivity sub-workflow of an OpenShift cluster lifecycle orchestrator built on
 Temporal. Given a `segment` (CIDR) and its `type`, it opens firewall rules against
-every same-site MCE segment via the black-box **next** connectivity service, waits for the
-(human-approved) requests to complete, then flips the segment's status
-`Locked -> Available` in the team's **Segments Manager**.
+every same-site segment of the other types its type peers with, via the black-box
+**next** connectivity service, waits for the (human-approved) requests to complete,
+then flips the segment's status `Locked -> Available` in the team's **Segments Manager**.
 
-Phase 1 implements the `HC` type; other types fail loudly until implemented.
+All four types are implemented: `HC`, `INVENTORY` and `PXE` each peer with same-site
+`MCE` segments, and `MCE` peers with all three of them — symmetric, driven by the
+`PORTS_*` config rather than hardcoded per type. `MCE` segments additionally get one
+mandatory, one-directional rule to their site's static BMC network (not tracked by
+the Segments Manager — see the Flow section below).
 
 ## Layout
 
@@ -30,10 +34,16 @@ Worker-file naming convention: the workflow (brain) worker is
 
 1. `get_segment_site(segment, type)` — validate the segment exists (fail fast
    before touching the firewall) and learn its site in one fetch.
-2. `list_mce_segments(site)` — every MCE CIDR in that site (the peer set for
-   all supported types).
-3. `submit_open_rules(...)` x2 per MCE segment (both directions), all in parallel.
+2. `list_peer_segments(source_type, site)` — every same-site segment of the
+   other types `source_type` peers with, derived from the configured
+   `PORTS_*` profiles (e.g. `HC` -> only `MCE`; `MCE` -> `HC` + `INVENTORY` + `PXE`).
+3. `submit_open_rules(...)` x2 per peer segment (both directions), all in parallel.
    Port policy per direction comes from the ConfigMap (`PORTS_HC_TO_MCE`, ...).
+   `MCE` segments additionally get one mandatory, one-directional
+   `submit_bmc_open_rules(...)` toward `get_bmc_segment(site)` — the site's
+   static BMC CIDR from `BMC_SEGMENTS_BY_SITE` (BMC is not tracked by the
+   Segments Manager, so this is a ConfigMap lookup, never a Segments Manager
+   query, and never peers back).
 4. `publish_request_ids(segment, ids, submitted_at)` — `PUT /api/segments/segment-connectivity-requests`
    so the Segments Manager UI shows the pending request ids beside the segment's
    status while approval is awaited. `submitted_at` (captured once via
@@ -48,11 +58,11 @@ Worker-file naming convention: the workflow (brain) worker is
 
 Activity retries are unbounded (transient outages of the Segments Manager or the
 next service are out-waited); only classified deterministic errors — segment not
-found, bad API token, missing port profile, unsupported type, unexpected request
-status — fail the workflow. On such a terminal failure (or cancellation) the
-workflow best-effort clears the pending-ids display and publishes a
-"workflow failed" note beside the segment's status (the segment stays Locked;
-best-effort — the note endpoint exists in the Segments Manager).
+found, bad API token, missing port profile, unconfigured BMC segment, unsupported
+type, unexpected request status — fail the workflow. On such a terminal failure
+(or cancellation) the workflow best-effort clears the pending-ids display and
+publishes a "workflow failed" note beside the segment's status (the segment stays
+Locked; best-effort — the note endpoint exists in the Segments Manager).
 
 The trigger is async: `POST /workflows/segment-connectivity` returns **202 + workflow id**
 immediately; poll `GET /workflows/segment-connectivity/{workflow_id}` for phase/pending
@@ -76,6 +86,11 @@ counts (workflow query) and the final result.
   compact JSON per protocol; the activity layer expands them into the next API's
   structure and validates the syntax at worker startup. Changing ports = edit the
   ConfigMap + restart the activity workers. No rebuild.
+- **BMC is ConfigMap-only, not Segments-Manager-tracked:** `BMC_SEGMENTS_BY_SITE`
+  maps site name -> static BMC CIDR; `PORTS_MCE_TO_BMC` is its port policy, same
+  shape as every other `PORTS_*` key. Every `MCE` segment opens exactly one
+  one-directional rule toward it — never the reverse, and never a peer-discovery
+  query.
 - **Pydantic data converter** is registered on every `Client.connect` (workers + api).
 - **httpx timeout (10s) < activity start_to_close_timeout (30s)** so a network hang
   frees the worker before Temporal reaps the activity. Each `httpx.AsyncClient` is

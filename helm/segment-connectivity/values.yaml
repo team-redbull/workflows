@@ -47,6 +47,6 @@ secrets:
 activityWorker:
   image:
     repository: ghcr.io/team-redbull/segment-connectivity
-    tag: v1.0.36
+    tag: v1.0.39
     pullPolicy: IfNotPresent
   replicas: 2

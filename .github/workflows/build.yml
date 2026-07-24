@@ -21,20 +21,24 @@ jobs:
     with:
       image-name: workflows
       dockerfile: workflows/Dockerfile
-      helm-values-path: helm/workflows/values.yaml
+      # Chart lives in its own repo now (Argo CD). The bump + tag land there.
+      chart-repo: team-redbull/helm-charts-workflows
+      helm-values-path: values.yaml
       helm-image-path: image
     secrets: inherit
 
   build-segment-connectivity:
     if: github.event_name == 'push'
-    # Sequential, not parallel: both calls bump the same shared vX.Y.Z git
-    # tag and commit+push to the same branch; running in parallel races.
+    # Kept sequential after the brain only to avoid two jobs pushing the mock/code
+    # repo at once; the two Argo charts bump SEPARATE helm-charts repos so they no
+    # longer race on a shared tag.
     needs: build-workflow-brain
     uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
     with:
       image-name: segment-connectivity
       dockerfile: activities/segment_connectivity/Dockerfile
-      helm-values-path: helm/segment-connectivity/values.yaml
+      chart-repo: team-redbull/helm-charts-segment-connectivity
+      helm-values-path: values.yaml
       helm-image-path: activityWorker.image
     secrets: inherit
 

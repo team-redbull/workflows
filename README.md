@@ -11,8 +11,9 @@ complete, then flips the segment's status `Locked -> Available`.
 then fire a best-effort HTTP trigger at this service — which put creation outside
 Temporal (invisible in the UI, silently skipped whenever that call failed). The
 direction is reversed: callers POST the definition to
-`POST /workflows/segment-connectivity`, and the workflow calls the Segments Manager
-itself. Every step of a segment's life is now one durable, replayable run.
+`POST /workflows/segment-connectivity/open-segment-rules`, and the workflow calls the
+Segments Manager itself. Every step of a segment's life is now one durable, replayable
+run.
 
 All four types are implemented: `HC`, `INVENTORY` and `PXE` each peer with same-site
 `MCE` segments, and `MCE` peers with all three of them — symmetric, driven by the
@@ -80,13 +81,22 @@ unexpected request status — fail the workflow. On such a terminal failure
 publishes a "workflow failed" note beside the segment's status (the segment stays
 Locked; best-effort — the note endpoint exists in the Segments Manager).
 
-The trigger is async: `POST /workflows/segment-connectivity` returns **202 + workflow id**
-immediately; poll `GET /workflows/segment-connectivity/{workflow_id}` for phase/pending
-counts (workflow query) and the final result. Because creation happens inside the
-workflow, an invalid definition surfaces as a FAILED run on that status endpoint,
-not as a 4xx on the trigger.
+The trigger is async: `POST /workflows/segment-connectivity/open-segment-rules` returns
+**202 + workflow id** immediately; poll `GET /workflows/runs/{workflow_id}` for
+phase/pending counts (workflow query) and the final result. Because creation happens
+inside the workflow, an invalid definition surfaces as a FAILED run on that status
+endpoint, not as a 4xx on the trigger.
 
-`POST /workflows/segment-connectivity/bulk` takes `{"segments": [...]}` and starts
+### Paths: `/workflows/<domain>/<workflow>`, status on `/workflows/runs`
+
+A domain holds MANY workflows, so it is never itself an endpoint — `open-segment-rules`
+owns its own path under the `segment-connectivity` prefix, and a sibling (say a future
+`close-segment-rules`) is then just another route. Status is deliberately NOT under the
+domain: Temporal workflow ids are globally unique, so one `GET /workflows/runs/{id}`
+serves every domain — and a `{workflow_id}` catch-all under the domain prefix would
+swallow every sibling workflow's path.
+
+`POST /workflows/segment-connectivity/open-segment-rules/bulk` takes `{"segments": [...]}` and starts
 **one workflow per segment** — each gets its own deterministic id, its own
 independently-approved firewall requests, and its own failure, so a bad row can
 neither delay nor fail the others. It always answers 202 with a per-item report
@@ -147,10 +157,10 @@ PYTHONPATH=. python -m activities.segment_connectivity.worker_init &
 pip install -r requirements.txt
 PYTHONPATH=. uvicorn workflows.api:app --port 8080
 # Swagger UI: http://localhost:8080/docs
-# curl -X POST localhost:8080/workflows/segment-connectivity \
+# curl -X POST localhost:8080/workflows/segment-connectivity/open-segment-rules \
 #   -H 'content-type: application/json' \
 #   -d '{"segment":"130.154.20.0/24","type":"HC","site":"site1","vlan_id":100,"epg_name":"EPG_PROD_01"}'
-# curl localhost:8080/workflows/segment-connectivity/open-segment-rules-HC-130.154.20.0
+# curl localhost:8080/workflows/runs/open-segment-rules-HC-130.154.20.0
 ```
 
 Inspect runs in the Temporal UI and verify the segment's `status` in the manager:

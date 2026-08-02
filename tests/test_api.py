@@ -72,7 +72,8 @@ def make_client():
 def test_start_uses_the_deterministic_workflow_id(make_client):
     fake = _FakeClient()
     response = make_client(fake).post(
-        "/workflows/segment-connectivity", json=_definition("130.154.20.0/24", 100)
+        "/workflows/segment-connectivity/open-segment-rules",
+        json=_definition("130.154.20.0/24", 100),
     )
 
     assert response.status_code == 202
@@ -85,7 +86,7 @@ def test_start_rejects_an_incomplete_definition(make_client):
     """The definition must be complete here — the workflow creates the segment,
     so a missing vlan_id can no longer be filled in by the Segments Manager."""
     response = make_client(_FakeClient()).post(
-        "/workflows/segment-connectivity",
+        "/workflows/segment-connectivity/open-segment-rules",
         json={"segment": "10.0.0.0/24", "type": "HC"},
     )
     assert response.status_code == 422
@@ -94,15 +95,29 @@ def test_start_rejects_an_incomplete_definition(make_client):
 def test_start_conflicts_when_already_running(make_client):
     fake = _FakeClient(already_started={"open-segment-rules-HC-10.0.0.0"})
     response = make_client(fake).post(
-        "/workflows/segment-connectivity", json=_definition("10.0.0.0/24", 100)
+        "/workflows/segment-connectivity/open-segment-rules",
+        json=_definition("10.0.0.0/24", 100),
     )
     assert response.status_code == 409
+
+
+def test_routes_are_scoped_to_the_workflow_not_the_domain():
+    """The domain prefix must stay free for the domain's OTHER workflows: no
+    route may sit on the bare `/workflows/<domain>`, and none may claim a
+    `{workflow_id}`-style catch-all under it (that swallows every sibling's
+    path). Status lives on the shared /workflows/runs router instead."""
+    paths = {route.path for route in router_module.router.routes}
+
+    assert paths == {
+        "/workflows/segment-connectivity/open-segment-rules",
+        "/workflows/segment-connectivity/open-segment-rules/bulk",
+    }
 
 
 def test_bulk_starts_one_workflow_per_segment(make_client):
     fake = _FakeClient()
     response = make_client(fake).post(
-        "/workflows/segment-connectivity/bulk",
+        "/workflows/segment-connectivity/open-segment-rules/bulk",
         json={
             "segments": [
                 _definition("10.0.0.0/24", 100),
@@ -125,7 +140,7 @@ def test_bulk_reports_per_segment_instead_of_failing_the_batch(make_client):
     of reporting per item rather than with a single status code."""
     fake = _FakeClient(already_started={"open-segment-rules-HC-10.0.0.0"})
     response = make_client(fake).post(
-        "/workflows/segment-connectivity/bulk",
+        "/workflows/segment-connectivity/open-segment-rules/bulk",
         json={
             "segments": [
                 _definition("10.0.0.0/24", 100),
@@ -145,7 +160,7 @@ def test_bulk_reports_per_segment_instead_of_failing_the_batch(make_client):
 def test_bulk_duplicate_cidrs_collapse_onto_one_workflow(make_client):
     fake = _FakeClient()
     response = make_client(fake).post(
-        "/workflows/segment-connectivity/bulk",
+        "/workflows/segment-connectivity/open-segment-rules/bulk",
         json={"segments": [_definition("10.0.0.0/24", 100)] * 2},
     )
 
@@ -157,7 +172,7 @@ def test_bulk_duplicate_cidrs_collapse_onto_one_workflow(make_client):
 def test_bulk_start_failure_is_reported_not_raised(make_client):
     fake = _FakeClient(fail=True)
     response = make_client(fake).post(
-        "/workflows/segment-connectivity/bulk",
+        "/workflows/segment-connectivity/open-segment-rules/bulk",
         json={"segments": [_definition("10.0.0.0/24", 100)]},
     )
 
@@ -169,6 +184,6 @@ def test_bulk_start_failure_is_reported_not_raised(make_client):
 
 def test_bulk_rejects_an_empty_batch(make_client):
     response = make_client(_FakeClient()).post(
-        "/workflows/segment-connectivity/bulk", json={"segments": []}
+        "/workflows/segment-connectivity/open-segment-rules/bulk", json={"segments": []}
     )
     assert response.status_code == 422

@@ -55,13 +55,21 @@ tags cross-repo.
   `segment-connectivity-activity-worker`. Chart/release names match resource names.
 - **Domain vs workflow naming — one domain holds MANY workflows.** Anything shared by every workflow
   in a domain is named after the DOMAIN: the activity queue (`segment-connectivity-activity`), the
-  limb Deployment/SA/ConfigMap, `shared/models|interfaces/<domain>.py`, and the API prefix
+  limb Deployment/SA/ConfigMap, `shared/models|interfaces/<domain>.py`, and the API PREFIX
   `/workflows/<domain>`. Anything belonging to ONE workflow is named after the WORKFLOW: its module
   (`workflows/open_segment_rules.py`), its class, its own task queue
-  (`open-segment-rules-workflow`), its workflow ids (`open-segment-rules-<TYPE>-<network>`) and its
-  RunArgs/ResumeState/Progress/Result models. Workflow ids MUST carry the workflow name — two
-  workflows acting on the same segment would otherwise collide on one id. The API path stays
-  domain-scoped even though a domain has several workflows.
+  (`open-segment-rules-workflow`), its workflow ids (`open-segment-rules-<TYPE>-<network>`), its
+  RunArgs/ResumeState/Progress/Result models, and its ROUTE under the domain prefix. Workflow ids
+  MUST carry the workflow name — two workflows acting on the same segment would otherwise collide on
+  one id.
+- **API paths are `/workflows/<domain>/<workflow>`; status is `/workflows/runs/{workflow_id}`.** A
+  domain is a prefix, never an endpoint: the bare `/workflows/<domain>` must stay free, or the first
+  workflow silently claims the whole domain. Status is domain-agnostic ON PURPOSE — workflow ids are
+  globally unique, so `workflows/routers/runs.py` serves every domain, and a per-domain
+  `GET /workflows/<domain>/{workflow_id}` would additionally swallow every sibling workflow's path.
+  That router addresses the `progress` query BY NAME and returns progress/result as decoded JSON:
+  a workflow wanting a live progress surface just defines `@workflow.query def progress`; one that
+  doesn't degrades to status-only.
 
 ## 3. Deployment-target agnostic
 
@@ -76,7 +84,7 @@ tags cross-repo.
 ## 4. External dependencies are black boxes
 
 - **The workflow is the ENTRY POINT; the Segments Manager is a dependency, never a trigger.** A
-  caller POSTs the full segment DEFINITION to `POST /workflows/segment-connectivity` and the workflow
+  caller POSTs the full segment DEFINITION to `POST /workflows/segment-connectivity/open-segment-rules` and the workflow
   creates the segment itself (`create_segment`, step 1) before opening any rules. The reverse used to
   be true — the Segments Manager created the segment then fired a best-effort HTTP trigger at us —
   which left creation outside Temporal: invisible in the UI and silently skipped whenever that call
@@ -192,8 +200,8 @@ tags cross-repo.
 - Assumed already running: a Temporal server and the Segments Manager (via OpenShift routes or
   localhost — no port assumptions in code).
 - Trigger via the unified API: `uvicorn workflows.api:app --port 8080`, Swagger at `/docs`.
-  `POST /workflows/segment-connectivity` is ASYNC (202 + workflow id) and takes the full segment
-  definition; poll `GET /workflows/segment-connectivity/{workflow_id}` for progress/result. The
+  `POST /workflows/segment-connectivity/open-segment-rules` is ASYNC (202 + workflow id) and takes
+  the full segment definition; poll `GET /workflows/runs/{workflow_id}` for progress/result. The
   `/bulk` variant takes a list and starts ONE WORKFLOW PER SEGMENT (never one batch workflow — each
   segment has its own dedup id, its own human approval and its own failure), answering 202 with a
   per-item report rather than a single pass/fail code.

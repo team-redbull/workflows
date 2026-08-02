@@ -18,9 +18,9 @@ from activities.segment_connectivity.activities import (
     _expand_ports,
     _peer_types,
     check_segment_connectivity_requests,
+    create_segment,
     get_bmc_segment,
     get_next_checking_request_interval,
-    get_segment_site,
     list_peer_segments,
     publish_segment_connectivity_failure,
     publish_request_ids,
@@ -31,14 +31,16 @@ from activities.segment_connectivity.activities import (
 from shared.exceptions import (
     BmcSegmentNotConfiguredError,
     NextApiError,
+    SegmentConflictError,
     SegmentNotFoundError,
     SegmentsManagerAuthError,
     SegmentsManagerError,
+    SegmentValidationError,
 )
 from shared.models.segment_connectivity import (
     BmcOpenRulesRequest,
     SegmentConnectivityFailureNotice,
-    SegmentConnectivityInput,
+    OpenSegmentRulesInput,
     SegmentConnectivityRequestsUpdate,
     OpenRulesRequest,
     PeerSegmentsQuery,
@@ -49,7 +51,23 @@ from shared.models.segment_connectivity import (
 SM = "http://segments-manager.test"
 NEXT = "http://next.test"
 
-HC_INPUT = SegmentConnectivityInput(segment="10.0.0.0/24", type=SegmentType.HC)
+HC_INPUT = OpenSegmentRulesInput(
+    segment="10.0.0.0/24",
+    type=SegmentType.HC,
+    site="site-a",
+    vlan_id=100,
+    epg_name="EPG_TEST_01",
+)
+# What the Segments Manager stores for HC_INPUT once created.
+STORED_HC_SEGMENT = {
+    "segment": "10.0.0.0/24",
+    "type": "HC",
+    "site": "site-a",
+    "vlan_id": 100,
+    "epg_name": "EPG_TEST_01",
+    "dhcp": True,
+    "status": "Locked",
+}
 
 
 @pytest.fixture
@@ -69,42 +87,112 @@ def test_expand_ports_ranges_and_single_ports():
     ]
 
 
-# --- get_segment_site ---
+# --- create_segment ---
 
 
 @respx.mock
-async def test_get_segment_site_returns_site(env):
-    respx.get(f"{SM}/api/segments", params={"type": "HC"}).mock(
+async def test_create_segment_posts_the_full_definition(env):
+    route = respx.post(f"{SM}/api/segments").mock(
+        return_value=httpx.Response(200, json={"message": "Segment created", "id": "abc"})
+    )
+    await env.run(create_segment, HC_INPUT)
+
+    assert route.called
+    import json
+
+    body = json.loads(route.calls.last.request.content)
+    # Exactly the Segments Manager's Segment schema (which is extra="forbid").
+    assert body == {
+        "segment": "10.0.0.0/24",
+        "type": "HC",
+        "site": "site-a",
+        "vlan_id": 100,
+        "epg_name": "EPG_TEST_01",
+        "dhcp": True,
+    }
+    assert route.calls.last.request.headers["Authorization"].startswith("Bearer ")
+
+
+@respx.mock
+async def test_create_segment_existing_identical_segment_is_success(env):
+    """A retried-but-already-applied create (or an operator re-running
+    connectivity for an existing segment) must converge, not fail."""
+    respx.post(f"{SM}/api/segments").mock(
+        return_value=httpx.Response(400, json={"detail": "VLAN 100 already exists at site 'site-a'"})
+    )
+    respx.get(f"{SM}/api/segments/by-segment").mock(
+        return_value=httpx.Response(200, json=STORED_HC_SEGMENT)
+    )
+    await env.run(create_segment, HC_INPUT)  # no raise
+
+
+@respx.mock
+async def test_create_segment_existing_segment_with_different_dhcp_is_success(env):
+    """dhcp is editable after creation, so a differing flag is a later edit,
+    not a conflicting definition."""
+    respx.post(f"{SM}/api/segments").mock(
+        return_value=httpx.Response(400, json={"detail": "already exists"})
+    )
+    respx.get(f"{SM}/api/segments/by-segment").mock(
+        return_value=httpx.Response(200, json={**STORED_HC_SEGMENT, "dhcp": False})
+    )
+    await env.run(create_segment, HC_INPUT)  # no raise
+
+
+@respx.mock
+async def test_create_segment_existing_segment_with_different_identity_conflicts(env):
+    respx.post(f"{SM}/api/segments").mock(
+        return_value=httpx.Response(400, json={"detail": "already exists"})
+    )
+    respx.get(f"{SM}/api/segments/by-segment").mock(
+        return_value=httpx.Response(200, json={**STORED_HC_SEGMENT, "vlan_id": 999})
+    )
+    with pytest.raises(SegmentConflictError) as exc_info:
+        await env.run(create_segment, HC_INPUT)
+    assert "vlan_id" in str(exc_info.value)
+
+
+@respx.mock
+async def test_create_segment_rejected_definition_is_validation_error(env):
+    """A 400 with no such segment stored = the definition itself was bad. The
+    manager's own wording is carried through — it is the validator of record."""
+    respx.post(f"{SM}/api/segments").mock(
         return_value=httpx.Response(
-            200,
-            json=[
-                {"segment": "10.9.0.0/24", "site": "site-b"},
-                {"segment": "10.0.0.0/24", "site": "site-a"},
-            ],
+            400, json={"detail": "Segment 10.0.0.0/24 overlaps with existing segment"}
         )
     )
-    assert await env.run(get_segment_site, HC_INPUT) == "site-a"
+    respx.get(f"{SM}/api/segments/by-segment").mock(
+        return_value=httpx.Response(404, json={"detail": "Segment not found"})
+    )
+    with pytest.raises(SegmentValidationError) as exc_info:
+        await env.run(create_segment, HC_INPUT)
+    assert "overlaps with existing segment" in str(exc_info.value)
 
 
 @respx.mock
-async def test_get_segment_site_missing_segment_is_not_found(env):
-    respx.get(f"{SM}/api/segments").mock(return_value=httpx.Response(200, json=[]))
-    with pytest.raises(SegmentNotFoundError):
-        await env.run(get_segment_site, HC_INPUT)
-
-
-@respx.mock
-async def test_get_segment_site_auth_failure_is_classified(env):
-    respx.get(f"{SM}/api/segments").mock(return_value=httpx.Response(401))
+async def test_create_segment_auth_failure_is_classified(env):
+    respx.post(f"{SM}/api/segments").mock(return_value=httpx.Response(401))
     with pytest.raises(SegmentsManagerAuthError):
-        await env.run(get_segment_site, HC_INPUT)
+        await env.run(create_segment, HC_INPUT)
 
 
 @respx.mock
-async def test_get_segment_site_server_error_is_retryable_type(env):
-    respx.get(f"{SM}/api/segments").mock(return_value=httpx.Response(503))
+async def test_create_segment_server_error_is_retryable_type(env):
+    respx.post(f"{SM}/api/segments").mock(return_value=httpx.Response(503))
     with pytest.raises(SegmentsManagerError):
-        await env.run(get_segment_site, HC_INPUT)
+        await env.run(create_segment, HC_INPUT)
+
+
+@respx.mock
+async def test_create_segment_unreadable_lookup_stays_retryable(env):
+    """A conflict we cannot yet classify (the lookup itself failed) must retry,
+    not guess at a terminal failure."""
+    respx.post(f"{SM}/api/segments").mock(
+        return_value=httpx.Response(400, json={"detail": "already exists"})
+    )
+    respx.get(f"{SM}/api/segments/by-segment").mock(return_value=httpx.Response(503))
+    with pytest.raises(SegmentsManagerError):
+        await env.run(create_segment, HC_INPUT)
 
 
 # --- _peer_types / list_peer_segments ---

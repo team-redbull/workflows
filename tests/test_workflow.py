@@ -1,4 +1,4 @@
-"""Workflow tests: real SegmentConnectivityWorkflow, mock activities, time-skipping env.
+"""Workflow tests: real OpenSegmentRulesWorkflow, mock activities, time-skipping env.
 
 The time-skipping environment makes the poll loop's constant interval and
 retry backoffs run in milliseconds. The workflow routes activities to
@@ -21,37 +21,52 @@ from temporalio.exceptions import ActivityError, ApplicationError, CancelledErro
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
-from shared.consts import SEGMENT_CONNECTIVITY_ACTIVITY_QUEUE, SEGMENT_CONNECTIVITY_WORKFLOW_QUEUE
-from shared.exceptions import BmcSegmentNotConfiguredError, SegmentNotFoundError
+from shared.consts import SEGMENT_CONNECTIVITY_ACTIVITY_QUEUE, OPEN_SEGMENT_RULES_WORKFLOW_QUEUE
+from shared.exceptions import BmcSegmentNotConfiguredError, SegmentValidationError
 from shared.models.segment_connectivity import (
     BmcOpenRulesRequest,
     SegmentConnectivityFailureNotice,
-    SegmentConnectivityInput,
+    OpenSegmentRulesInput,
     SegmentConnectivityRequestRef,
     SegmentConnectivityRequestsUpdate,
-    SegmentConnectivityResumeState,
-    SegmentConnectivityRunArgs,
+    OpenSegmentRulesResumeState,
+    OpenSegmentRulesRunArgs,
     OpenRulesRequest,
     PeerSegmentsQuery,
     SegmentRef,
     SegmentType,
 )
-from workflows.segment_connectivity import SegmentConnectivityWorkflow
+from workflows.open_segment_rules import OpenSegmentRulesWorkflow
 
 SEGMENT = "10.0.0.0/24"
-HC_INPUT = SegmentConnectivityInput(segment=SEGMENT, type=SegmentType.HC)
-MCE_INPUT = SegmentConnectivityInput(segment=SEGMENT, type=SegmentType.MCE)
+SITE = "site-a"
+
+
+def _input(segment_type: SegmentType) -> OpenSegmentRulesInput:
+    """A complete segment definition — the workflow now CREATES the segment, so
+    its input carries every field the Segments Manager needs, not just a
+    reference to an existing one."""
+    return OpenSegmentRulesInput(
+        segment=SEGMENT,
+        type=segment_type,
+        site=SITE,
+        vlan_id=100,
+        epg_name="EPG_TEST_01",
+    )
+
+
+HC_INPUT = _input(SegmentType.HC)
+MCE_INPUT = _input(SegmentType.MCE)
 
 
 def make_mock_activities(
     *,
-    site: str = "site-a",
     peer_segments: tuple[SegmentRef, ...] = (SegmentRef(segment="10.1.0.0/24", type=SegmentType.MCE),),
     bmc_segment: str | None = "10.99.0.0/16",
     check_script: list[list[int]] | None = None,
     check_always_pending: bool = False,
-    site_fail_times: int = 0,
-    site_error: Exception | None = None,
+    create_fail_times: int = 0,
+    create_error: Exception | None = None,
 ):
     """Build the full mock activity set + a call recorder.
 
@@ -62,7 +77,7 @@ def make_mock_activities(
     calls: dict[str, list] = {
         name: []
         for name in (
-            "get_segment_site",
+            "create_segment",
             "list_peer_segments",
             "submit_open_rules",
             "get_bmc_segment",
@@ -76,17 +91,16 @@ def make_mock_activities(
     }
     script = list(check_script or [])
     ids = itertools.count(1)
-    site_failures_left = [site_fail_times]
+    create_failures_left = [create_fail_times]
 
     @activity.defn
-    async def get_segment_site(connectivity_input: SegmentConnectivityInput) -> str:
-        calls["get_segment_site"].append(connectivity_input)
-        if site_error is not None:
-            raise site_error
-        if site_failures_left[0] > 0:
-            site_failures_left[0] -= 1
+    async def create_segment(rules_input: OpenSegmentRulesInput) -> None:
+        calls["create_segment"].append(rules_input)
+        if create_error is not None:
+            raise create_error
+        if create_failures_left[0] > 0:
+            create_failures_left[0] -= 1
             raise RuntimeError("simulated transient Segments Manager outage")
-        return site
 
     @activity.defn
     async def list_peer_segments(query: PeerSegmentsQuery) -> list[SegmentRef]:
@@ -137,7 +151,7 @@ def make_mock_activities(
         calls["publish_segment_connectivity_failure"].append(notice)
 
     return calls, [
-        get_segment_site,
+        create_segment,
         list_peer_segments,
         submit_open_rules,
         get_bmc_segment,
@@ -163,8 +177,8 @@ class _Harness:
         client = Client(**config)
         self._workflow_worker = Worker(
             client,
-            task_queue=SEGMENT_CONNECTIVITY_WORKFLOW_QUEUE,
-            workflows=[SegmentConnectivityWorkflow],
+            task_queue=OPEN_SEGMENT_RULES_WORKFLOW_QUEUE,
+            workflows=[OpenSegmentRulesWorkflow],
         )
         self._activity_worker = Worker(
             client,
@@ -189,13 +203,13 @@ def _workflow_cause(exc_info) -> BaseException:
     return cause
 
 
-async def _execute(client: Client, args: SegmentConnectivityRunArgs):
+async def _execute(client: Client, args: OpenSegmentRulesRunArgs):
     return await asyncio.wait_for(
         client.execute_workflow(
-            SegmentConnectivityWorkflow.run,
+            OpenSegmentRulesWorkflow.run,
             args,
             id=f"test-{uuid.uuid4()}",
-            task_queue=SEGMENT_CONNECTIVITY_WORKFLOW_QUEUE,
+            task_queue=OPEN_SEGMENT_RULES_WORKFLOW_QUEUE,
         ),
         timeout=60,  # real seconds — a misclassified error would retry forever
     )
@@ -204,7 +218,7 @@ async def _execute(client: Client, args: SegmentConnectivityRunArgs):
 async def test_happy_path_submits_polls_publishes_and_unlocks():
     calls, mocks = make_mock_activities(check_script=[[2], []])
     async with _Harness(mocks) as client:
-        result = await _execute(client, SegmentConnectivityRunArgs(input=HC_INPUT))
+        result = await _execute(client, OpenSegmentRulesRunArgs(input=HC_INPUT))
 
     assert result.segment == SEGMENT
     assert result.type == SegmentType.HC
@@ -212,7 +226,7 @@ async def test_happy_path_submits_polls_publishes_and_unlocks():
     # 2 directions x 1 MCE segment; the mock's ids race, so order-insensitive.
     assert sorted(result.request_ids) == [1, 2]
     assert calls["list_peer_segments"] == [
-        PeerSegmentsQuery(source_type=SegmentType.HC, site="site-a")
+        PeerSegmentsQuery(source_type=SegmentType.HC, site=SITE)
     ]
     assert len(calls["submit_open_rules"]) == 2
     # The BMC leg is MCE-only: an HC input never touches it.
@@ -237,40 +251,54 @@ def test_supported_types_covers_every_segment_type():
     # current coverage instead: if a 5th SegmentType is ever added without
     # updating _SUPPORTED_TYPES, this test fails loudly and prompts an
     # explicit decision, exactly as the gate is meant to.
-    from workflows.segment_connectivity import _SUPPORTED_TYPES
+    from workflows.open_segment_rules import _SUPPORTED_TYPES
 
     assert _SUPPORTED_TYPES == frozenset(SegmentType)
 
 
-async def test_segment_not_found_fails_without_retry_or_note():
-    calls, mocks = make_mock_activities(site_error=SegmentNotFoundError("missing"))
+async def test_creation_is_the_first_step_and_carries_the_full_definition():
+    calls, mocks = make_mock_activities(check_script=[[]])
+    async with _Harness(mocks) as client:
+        await _execute(client, OpenSegmentRulesRunArgs(input=HC_INPUT))
+
+    # The segment is created by the workflow, before anything is submitted.
+    assert calls["create_segment"] == [HC_INPUT]
+    assert calls["create_segment"][0].vlan_id == 100
+    assert calls["create_segment"][0].epg_name == "EPG_TEST_01"
+
+
+async def test_rejected_definition_fails_without_retry_or_note():
+    calls, mocks = make_mock_activities(
+        create_error=SegmentValidationError("VLAN 100 already exists at site 'site-a'")
+    )
     async with _Harness(mocks) as client:
         with pytest.raises(WorkflowFailureError) as exc_info:
-            await _execute(client, SegmentConnectivityRunArgs(input=HC_INPUT))
+            await _execute(client, OpenSegmentRulesRunArgs(input=HC_INPUT))
 
     cause = _workflow_cause(exc_info)
     assert isinstance(cause, ApplicationError)
-    assert cause.type == "SegmentNotFoundError"
+    assert cause.type == "SegmentValidationError"
     # Non-retryable classification: exactly one attempt, no failure note
-    # (validation phase — nothing was submitted).
-    assert len(calls["get_segment_site"]) == 1
+    # (creation phase — nothing was submitted, and there may be no segment
+    # to annotate).
+    assert len(calls["create_segment"]) == 1
     assert calls["publish_segment_connectivity_failure"] == []
 
 
 async def test_transient_activity_failures_are_outwaited():
-    calls, mocks = make_mock_activities(site_fail_times=2)
+    calls, mocks = make_mock_activities(create_fail_times=2)
     async with _Harness(mocks) as client:
-        result = await _execute(client, SegmentConnectivityRunArgs(input=HC_INPUT))
+        result = await _execute(client, OpenSegmentRulesRunArgs(input=HC_INPUT))
 
     assert sorted(result.request_ids) == [1, 2]
-    assert len(calls["get_segment_site"]) == 3  # 2 transient failures + success
+    assert len(calls["create_segment"]) == 3  # 2 transient failures + success
 
 
 async def test_empty_peer_pool_fails_and_publishes_failure_note():
     calls, mocks = make_mock_activities(peer_segments=())
     async with _Harness(mocks) as client:
         with pytest.raises(WorkflowFailureError) as exc_info:
-            await _execute(client, SegmentConnectivityRunArgs(input=HC_INPUT))
+            await _execute(client, OpenSegmentRulesRunArgs(input=HC_INPUT))
 
     cause = _workflow_cause(exc_info)
     assert isinstance(cause, ApplicationError)
@@ -289,11 +317,11 @@ async def test_mce_source_peers_with_hc_inventory_and_pxe():
     )
     calls, mocks = make_mock_activities(peer_segments=peers, check_script=[[]])
     async with _Harness(mocks) as client:
-        result = await _execute(client, SegmentConnectivityRunArgs(input=MCE_INPUT))
+        result = await _execute(client, OpenSegmentRulesRunArgs(input=MCE_INPUT))
 
     assert result.peer_segment_count == 3
     assert calls["list_peer_segments"] == [
-        PeerSegmentsQuery(source_type=SegmentType.MCE, site="site-a")
+        PeerSegmentsQuery(source_type=SegmentType.MCE, site=SITE)
     ]
     assert len(calls["submit_open_rules"]) == 6
     pairs = {(r.source_type, r.destination_type) for r in calls["submit_open_rules"]}
@@ -306,7 +334,7 @@ async def test_mce_source_peers_with_hc_inventory_and_pxe():
         (SegmentType.PXE, SegmentType.MCE),
     }
     # Plus the mandatory one-directional BMC leg.
-    assert calls["get_bmc_segment"] == ["site-a"]
+    assert calls["get_bmc_segment"] == [SITE]
     (bmc_request,) = calls["submit_bmc_open_rules"]
     assert bmc_request.mce_segment == SEGMENT
     assert bmc_request.bmc_segment == "10.99.0.0/16"
@@ -316,7 +344,7 @@ async def test_mce_source_peers_with_hc_inventory_and_pxe():
 async def test_mce_source_with_no_peers_still_submits_bmc_rule():
     calls, mocks = make_mock_activities(peer_segments=(), check_script=[[]])
     async with _Harness(mocks) as client:
-        result = await _execute(client, SegmentConnectivityRunArgs(input=MCE_INPUT))
+        result = await _execute(client, OpenSegmentRulesRunArgs(input=MCE_INPUT))
 
     assert result.peer_segment_count == 0
     assert len(result.request_ids) == 1
@@ -329,7 +357,7 @@ async def test_mce_source_missing_bmc_config_fails_non_retryable():
     calls, mocks = make_mock_activities(bmc_segment=None)
     async with _Harness(mocks) as client:
         with pytest.raises(WorkflowFailureError) as exc_info:
-            await _execute(client, SegmentConnectivityRunArgs(input=MCE_INPUT))
+            await _execute(client, OpenSegmentRulesRunArgs(input=MCE_INPUT))
 
     cause = _workflow_cause(exc_info)
     assert isinstance(cause, ApplicationError)
@@ -345,7 +373,7 @@ async def test_mce_source_missing_bmc_config_fails_non_retryable():
 async def test_resume_path_skips_submission_and_finishes():
     submitted_at = datetime(2026, 7, 18, 9, 30, tzinfo=timezone.utc)
     calls, mocks = make_mock_activities(check_script=[[12], []])
-    resume = SegmentConnectivityResumeState(
+    resume = OpenSegmentRulesResumeState(
         request_ids=[11, 12],
         pending_request_ids=[11, 12],
         peer_segment_count=3,
@@ -353,13 +381,13 @@ async def test_resume_path_skips_submission_and_finishes():
     )
     async with _Harness(mocks) as client:
         result = await _execute(
-            client, SegmentConnectivityRunArgs(input=HC_INPUT, resume=resume)
+            client, OpenSegmentRulesRunArgs(input=HC_INPUT, resume=resume)
         )
 
     assert result.request_ids == [11, 12]
     assert result.peer_segment_count == 3
-    # Resume never re-validates or re-submits.
-    assert calls["get_segment_site"] == []
+    # Resume never re-creates or re-submits.
+    assert calls["create_segment"] == []
     assert calls["list_peer_segments"] == []
     assert calls["submit_open_rules"] == []
     # The original submission time survives continue_as_new.
@@ -372,15 +400,15 @@ async def test_cancellation_publishes_failure_note_with_orphaned_ids():
     calls, mocks = make_mock_activities(check_always_pending=True)
     async with _Harness(mocks) as client:
         handle = await client.start_workflow(
-            SegmentConnectivityWorkflow.run,
-            SegmentConnectivityRunArgs(input=HC_INPUT),
+            OpenSegmentRulesWorkflow.run,
+            OpenSegmentRulesRunArgs(input=HC_INPUT),
             id=f"test-{uuid.uuid4()}",
-            task_queue=SEGMENT_CONNECTIVITY_WORKFLOW_QUEUE,
+            task_queue=OPEN_SEGMENT_RULES_WORKFLOW_QUEUE,
         )
         # Let it get past submission into the poll loop before cancelling.
         async def _wait_for_polling():
             while True:
-                progress = await handle.query(SegmentConnectivityWorkflow.progress)
+                progress = await handle.query(OpenSegmentRulesWorkflow.progress)
                 if progress.phase == "awaiting-completion":
                     return
                 await asyncio.sleep(0.05)

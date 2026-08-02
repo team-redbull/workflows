@@ -12,7 +12,7 @@ from temporalio import activity
 from shared.models.segment_connectivity import (
     BmcOpenRulesRequest,
     SegmentConnectivityFailureNotice,
-    SegmentConnectivityInput,
+    OpenSegmentRulesInput,
     SegmentConnectivityRequestRef,
     SegmentConnectivityRequestsUpdate,
     OpenRulesRequest,
@@ -22,12 +22,23 @@ from shared.models.segment_connectivity import (
 
 
 @activity.defn
-async def get_segment_site(connectivity_input: SegmentConnectivityInput) -> str:
-    """Validate the input segment exists in the Segments Manager (by type +
-    CIDR) and return its site — one fetch serves both needs.
+async def create_segment(rules_input: OpenSegmentRulesInput) -> None:
+    """Create the segment in the Segments Manager (POST /api/segments).
 
-    Raises SegmentNotFoundError if absent — deterministic, marked non-retryable
-    by the workflow so a bad input fails fast instead of retrying.
+    Step 1 of the workflow, and the reason the workflow owns the whole
+    lifecycle: the segment is born Locked here and unlocked by the last step,
+    with every firewall request in between recorded in the same Temporal run.
+
+    Idempotent by check-after-conflict: a create rejected because the CIDR
+    already exists is looked up and, if the stored segment matches this
+    definition, treated as success — which covers both a Temporal retry of an
+    accepted-but-unacknowledged POST and an operator re-running connectivity
+    for a segment that already exists.
+
+    Raises SegmentValidationError (definition rejected) or SegmentConflictError
+    (CIDR exists with different attributes) — both deterministic, marked
+    non-retryable by the workflow so a bad input fails fast instead of
+    retrying forever.
     """
     ...
 

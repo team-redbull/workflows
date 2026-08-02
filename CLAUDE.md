@@ -19,9 +19,14 @@ workflows/                   The orchestration "brain" (one lightweight deployme
 activities/<domain>/         The execution "limbs" (one deployment per domain)
   activities.py / worker_init.py   Concrete impls / registers activities, polls that queue
 dev/mock-segment-connectivity/    Test-only stand-in for the external next service
-helm/workflows/  helm/segment-connectivity/  helm/mock-segment-connectivity/
-                             Brain (ONE release, all domains) / limb (one per domain) / mock (e2e ONLY)
+helm/mock-segment-connectivity/   The ONLY chart still in this repo (e2e only)
 ```
+
+Prod charts live in their OWN repos (Argo CD, one per service — the ApplicationSet
+derives `helm-charts-<service>` from the service folder name in redbull-platform):
+`helm-charts-workflows-orchestrator` (brain: ONE release for all domains) and
+`helm-charts-segment-connectivity` (limb: one per domain). CI here bumps their image
+tags cross-repo.
 
 - **Workflows and activities are fundamentally separate:** code, deployments, images, task queues,
   RBAC/Secrets. Brain = one lightweight deployment; each `activities/<domain>/` = its own deployment
@@ -41,13 +46,22 @@ helm/workflows/  helm/segment-connectivity/  helm/mock-segment-connectivity/
   (one dep+cred set: Segments Manager HTTP + bearer token, next HTTP).
 - Keep `shared/interfaces/` signatures clean so an activity (e.g. "unlock segment") can be
   re-registered on another queue by a future sub-workflow without moving code.
-- **Brain is ONE deployment for every domain**, not one per workflow — `helm/workflows/` is
-  standalone, deployed once. Each new domain adds `activities/<domain>/` + `helm/<domain>/` and
+- **Brain is ONE deployment for every domain**, not one per workflow — `helm-charts-workflows-orchestrator` is
+  standalone, deployed once. Each new domain adds `activities/<domain>/` + a `helm-charts-<domain>` chart repo and
   registers against the already-running brain.
-- **Resource naming:** brain Deployment + ServiceAccount = `workflows`; its trigger API =
-  `workflows-api` (reuses the `workflows` SA). Each domain's Deployment + SA is named by the domain
-  only — e.g. `segment-connectivity`, NOT `segment-connectivity-activity-worker`. Chart/release
-  names match resource names.
+- **Resource naming:** brain Deployment + ServiceAccount = `workflows-orchestrator`; its trigger API =
+  `workflows-orchestrator-api` (reuses the `workflows-orchestrator` SA). Each domain's Deployment + SA
+  is named by the domain only — e.g. `segment-connectivity`, NOT
+  `segment-connectivity-activity-worker`. Chart/release names match resource names.
+- **Domain vs workflow naming — one domain holds MANY workflows.** Anything shared by every workflow
+  in a domain is named after the DOMAIN: the activity queue (`segment-connectivity-activity`), the
+  limb Deployment/SA/ConfigMap, `shared/models|interfaces/<domain>.py`, and the API prefix
+  `/workflows/<domain>`. Anything belonging to ONE workflow is named after the WORKFLOW: its module
+  (`workflows/open_segment_rules.py`), its class, its own task queue
+  (`open-segment-rules-workflow`), its workflow ids (`open-segment-rules-<TYPE>-<network>`) and its
+  RunArgs/ResumeState/Progress/Result models. Workflow ids MUST carry the workflow name — two
+  workflows acting on the same segment would otherwise collide on one id. The API path stays
+  domain-scoped even though a domain has several workflows.
 
 ## 3. Deployment-target agnostic
 
@@ -61,6 +75,13 @@ helm/workflows/  helm/segment-connectivity/  helm/mock-segment-connectivity/
 
 ## 4. External dependencies are black boxes
 
+- **The workflow is the ENTRY POINT; the Segments Manager is a dependency, never a trigger.** A
+  caller POSTs the full segment DEFINITION to `POST /workflows/segment-connectivity` and the workflow
+  creates the segment itself (`create_segment`, step 1) before opening any rules. The reverse used to
+  be true — the Segments Manager created the segment then fired a best-effort HTTP trigger at us —
+  which left creation outside Temporal: invisible in the UI and silently skipped whenever that call
+  failed. Keep it this way: anything a workflow's outcome depends on belongs INSIDE the run, as a
+  retried activity, not in a caller's fire-and-forget call. New domains follow the same shape.
 - The **next connectivity (firewall) service** is another team's air-gapped service. The orchestrator
   token-renews (`NEXT_TOKEN_RENEWAL_URI`), POSTs open-rules (`NEXT_OPEN_RULES_URI`), and polls status
   (`NEXT_CHECK_STATUS_URI`) against `NEXT_URL`, **trusting responses** (structural parse only).
@@ -75,7 +96,7 @@ helm/workflows/  helm/segment-connectivity/  helm/mock-segment-connectivity/
   replace semantics), republishes whenever the pending set shrinks; the final EMPTY list removes the
   display (behind the UI's "Requests ID" button), then the segment unlocks. `workflow.now()` is
   captured once at submission (`_open_rules`) and sent as `submitted_at` on every publish (incl.
-  republishes and across `continue_as_new`, via `SegmentConnectivityResumeState.submitted_at`) for
+  republishes and across `continue_as_new`, via `OpenSegmentRulesResumeState.submitted_at`) for
   the UI's elapsed-time popover.
 - **Terminal failure is surfaced, not silent:** on a post-validation non-retryable failure or
   cancellation, best-effort `publish_segment_connectivity_failure` clears the pending-ids display and
@@ -123,12 +144,13 @@ helm/workflows/  helm/segment-connectivity/  helm/mock-segment-connectivity/
 
 - Network calls fail and Temporal retries — activities must be strictly idempotent: UPSERTs,
   check-before-create, idempotency keys; treat "already exists / already done" as success. Examples:
-  `unlock_segment` treats "Segment already unlocked" (200) as success; `submit_open_rules` converges
-  (a retried-but-accepted POST leaves only an orphan request id never polled); `publish_request_ids`
-  is a replace-style PUT.
-- Workflow IDs are deterministic (`segment-connectivity-<TYPE>-<network address, CIDR mask dropped>`,
-  e.g. `segment-connectivity-HC-130.154.20.0`) for natural dedup — a duplicate trigger while running
-  gets HTTP 409.
+  `create_segment` treats an existing segment MATCHING the definition as success and only fails on a
+  genuine disagreement (`SegmentConflictError`); `unlock_segment` treats "Segment already unlocked"
+  (200) as success; `submit_open_rules` converges (a retried-but-accepted POST leaves only an orphan
+  request id never polled); `publish_request_ids` is a replace-style PUT.
+- Workflow IDs are deterministic (`open-segment-rules-<TYPE>-<network address, CIDR mask dropped>`,
+  e.g. `open-segment-rules-HC-130.154.20.0`) for natural dedup — a duplicate trigger while running
+  gets HTTP 409 (in the bulk route, an `already_running` item).
 
 ## 7. Strict validation & clean typed state
 
@@ -140,16 +162,16 @@ helm/workflows/  helm/segment-connectivity/  helm/mock-segment-connectivity/
 ## 8. Configuration
 
 - Env vars are the config surface (`.env.example` documents them; `.env` gitignored).
-- **ConfigMaps split by scope, not chart-convenience:** `workflows-config` (GLOBAL; owned by the
-  always-present `helm/workflows/` brain release) holds only shared values — `TEMPORAL_HOST`,
+- **ConfigMaps split by scope, not chart-convenience:** `workflows-orchestrator-config` (GLOBAL; owned by the
+  always-present `helm-charts-workflows-orchestrator` brain release) holds only shared values — `TEMPORAL_HOST`,
   `TEMPORAL_NAMESPACE`, `DOMAIN`, `SEGMENTS_MANAGER_URL`. `<domain>-config` (owned by that domain's
   chart) holds its own endpoints/policy — e.g. `segment-connectivity-config` = `NEXT_*` URIs +
   `PORTS_*`. A domain worker mounts BOTH + its Secret, so the brain release must install before any
   limb (else `CreateContainerConfigError` on the missing global ConfigMap).
 - **`shared/settings.py`** groups: `TemporalSettings` (workers + api.py) and
   `SegmentConnectivityActivitySettings` (activity worker only). Field names = Helm ConfigMap/Secret keys
-  lowercased — keep aligned with `helm/workflows/templates/config.yaml` (global) and
-  `helm/segment-connectivity/templates/config.yaml` (connectivity keys + token Secret). Which ConfigMap
+  lowercased — keep aligned with `helm-charts-workflows-orchestrator/templates/config.yaml` (global) and
+  `helm-charts-segment-connectivity/templates/config.yaml` (connectivity keys + token Secret). Which ConfigMap
   a key lives in is INDEPENDENT of which settings class declares it (pydantic reads the flat merged pod
   env — `DOMAIN`/`SEGMENTS_MANAGER_URL` sit in the global ConfigMap yet stay
   `SegmentConnectivityActivitySettings` fields; the brain ignores extras via `extra="ignore"`). Do NOT
@@ -162,7 +184,7 @@ helm/workflows/  helm/segment-connectivity/  helm/mock-segment-connectivity/
 
 - Three charts, NONE creates a Namespace (all deploy into whichever namespace the release targets —
   `helm install -n <ns> [--create-namespace]`, or redbull-platform's `namespaces` release pre-creates
-  it): `helm/workflows/` (ConfigMap + brain + SA), `helm/segment-connectivity/` (ConfigMap + Secret +
+  it): `helm-charts-workflows-orchestrator` (ConfigMap + brain + SA), `helm-charts-segment-connectivity` (ConfigMap + Secret +
   limb + SA), `helm/mock-segment-connectivity/` (ConfigMap + Deployment + Service + SA) — the last for
   e2e/test ONLY, never alongside a prod `segment-connectivity` release. For a bare kind/uvicorn run
   without a chart, run the mock directly (`uvicorn app:app` in `dev/mock-segment-connectivity/`) and
@@ -170,5 +192,12 @@ helm/workflows/  helm/segment-connectivity/  helm/mock-segment-connectivity/
 - Assumed already running: a Temporal server and the Segments Manager (via OpenShift routes or
   localhost — no port assumptions in code).
 - Trigger via the unified API: `uvicorn workflows.api:app --port 8080`, Swagger at `/docs`.
-  `POST /workflows/segment-connectivity` is ASYNC (202 + workflow id); poll
-  `GET /workflows/segment-connectivity/{workflow_id}` for progress/result.
+  `POST /workflows/segment-connectivity` is ASYNC (202 + workflow id) and takes the full segment
+  definition; poll `GET /workflows/segment-connectivity/{workflow_id}` for progress/result. The
+  `/bulk` variant takes a list and starts ONE WORKFLOW PER SEGMENT (never one batch workflow — each
+  segment has its own dedup id, its own human approval and its own failure), answering 202 with a
+  per-item report rather than a single pass/fail code.
+- In-cluster the API is `workflows-orchestrator-api` (ClusterIP:8080) plus an OpenShift **Route**
+  (`workflowsApi.route.*` in helm-charts-workflows-orchestrator) — it needs a hostname because starting a workflow
+  is now an operator action. NOTE: `workflows/api.py` has NO auth of its own; anyone who can reach
+  that hostname can start a workflow. Disable the Route (and port-forward) where that matters.

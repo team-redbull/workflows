@@ -1,14 +1,16 @@
 """Segment-connectivity activity implementations — the execution limbs.
 
 These run in the segment-connectivity activity deployment. They talk to:
-  - the team's Segments Manager (SEGMENTS_MANAGER_URL) — validate/list segments,
-    unlock (Bearer token via SEGMENTS_MANAGER_API_TOKEN; GETs are public)
+  - the team's Segments Manager (SEGMENTS_MANAGER_URL) — create/list segments,
+    publish request ids, unlock (Bearer token via SEGMENTS_MANAGER_API_TOKEN;
+    GETs are public)
   - the next connectivity service (NEXT_URL) — a black box; we trust its output
     (token renewal, open firewall rules, request status)
 
 Conventions enforced here:
   * activity.logger only (not the root logger).
-  * Idempotency: unlock treats an already-unlocked segment as success;
+  * Idempotency: create accepts an existing segment that matches the requested
+    definition; unlock treats an already-unlocked segment as success;
     re-submitting identical open-rules requests converges to the same firewall
     state (worst case an orphan request id we never poll).
   * Every httpx.AsyncClient is created INSIDE the activity via `async with`,
@@ -29,14 +31,16 @@ from temporalio.exceptions import ApplicationError
 from shared.exceptions import (
     BmcSegmentNotConfiguredError,
     NextApiError,
+    SegmentConflictError,
     SegmentsManagerAuthError,
     SegmentsManagerError,
     SegmentNotFoundError,
+    SegmentValidationError,
 )
 from shared.models.segment_connectivity import (
     BmcOpenRulesRequest,
     SegmentConnectivityFailureNotice,
-    SegmentConnectivityInput,
+    OpenSegmentRulesInput,
     SegmentConnectivityRequestRef,
     SegmentConnectivityRequestsUpdate,
     OpenRulesRequest,
@@ -159,31 +163,115 @@ async def _fetch_next_token(client: httpx.AsyncClient) -> str:
     return token
 
 
-@activity.defn
-async def get_segment_site(connectivity_input: SegmentConnectivityInput) -> str:
-    """Validate the input segment exists (by type + CIDR) and return its site."""
-    async with _segments_manager_client() as client:
-        resp = await client.get(
-            "/api/segments", params={"type": connectivity_input.type.value}
-        )
-        if resp.status_code != 200:
-            _raise_segments_manager_error("List segments", resp)
-        for seg in resp.json():
-            if seg.get("segment") == connectivity_input.segment:
-                site = seg.get("site")
-                if not site:
-                    raise SegmentsManagerError(f"Segment entry missing 'site': {seg}")
-                activity.logger.info(
-                    "Validated segment %s (type=%s) exists in site=%s",
-                    connectivity_input.segment,
-                    connectivity_input.type.value,
-                    site,
-                )
-                return site
-    raise SegmentNotFoundError(
-        f"Segment {connectivity_input.segment} (type={connectivity_input.type.value}) "
-        "not found in the Segments Manager"
+# Fields compared when a create is rejected because the CIDR already exists,
+# to tell "we (or a previous attempt) already created exactly this" from "the
+# CIDR belongs to a different segment". Deliberately the segment's IMMUTABLE
+# identity: the Segments Manager models `dhcp` as the one field editable after
+# creation (PATCH /api/segments), so a flipped dhcp flag is a legitimate later
+# edit, not evidence of a conflicting definition — comparing it would fail
+# re-runs for a segment an operator has since reconfigured. A difference there
+# is logged instead.
+_SEGMENT_IDENTITY_FIELDS = ("type", "site", "vlan_id", "epg_name")
+
+
+def _segments_manager_detail(resp: httpx.Response) -> str:
+    """The Segments Manager's own error text, which is what an operator has to
+    act on. Falls back to the raw body for anything not shaped like its
+    {"detail": ...} error (a proxy's HTML, a bare list, ...)."""
+    try:
+        body = resp.json()
+    except ValueError:
+        return resp.text
+    if isinstance(body, dict) and body.get("detail") is not None:
+        return str(body["detail"])
+    return resp.text
+
+
+async def _accept_existing_segment(
+    client: httpx.AsyncClient,
+    rules_input: OpenSegmentRulesInput,
+    create_resp: httpx.Response,
+) -> None:
+    """Resolve a rejected create: idempotent replay, or a real failure?
+
+    The Segments Manager answers 400 both for "this CIDR/VLAN is already
+    taken" and for "this definition is invalid", so only its stored record can
+    tell them apart. Look the CIDR up and decide:
+      * absent          -> the definition itself was rejected (SegmentValidationError)
+      * present, same   -> a previous attempt already applied it: success
+      * present, differs-> two definitions for one CIDR (SegmentConflictError)
+    """
+    resp = await client.get(
+        "/api/segments/by-segment", params={"segment": rules_input.segment}
     )
+    if resp.status_code == 404:
+        raise SegmentValidationError(
+            f"Segments Manager rejected segment {rules_input.segment}: "
+            f"{_segments_manager_detail(create_resp)}"
+        )
+    if resp.status_code != 200:
+        # Not classifiable yet — treat as transient and let the retry policy
+        # ask again rather than guessing at a terminal failure.
+        _raise_segments_manager_error("Look up existing segment", resp)
+
+    existing = resp.json()
+    wanted = rules_input.model_dump(mode="json")
+    differences = {
+        field: (wanted[field], existing.get(field))
+        for field in _SEGMENT_IDENTITY_FIELDS
+        if existing.get(field) != wanted[field]
+    }
+    if differences:
+        raise SegmentConflictError(
+            f"Segment {rules_input.segment} already exists in the Segments "
+            f"Manager with different attributes (field: requested != stored): "
+            + ", ".join(
+                f"{field}: {want!r} != {got!r}" for field, (want, got) in differences.items()
+            )
+        )
+    if existing.get("dhcp") != wanted["dhcp"]:
+        activity.logger.info(
+            "Segment %s already exists with dhcp=%s (requested %s) — keeping the "
+            "stored value; dhcp is editable after creation",
+            rules_input.segment,
+            existing.get("dhcp"),
+            wanted["dhcp"],
+        )
+    activity.logger.info(
+        "Segment %s already exists with matching attributes — treating create as done",
+        rules_input.segment,
+    )
+
+
+@activity.defn
+async def create_segment(rules_input: OpenSegmentRulesInput) -> None:
+    """Create the segment in the Segments Manager (born Locked).
+
+    Idempotent: see _accept_existing_segment — a create rejected because the
+    CIDR is already stored succeeds when the stored segment matches.
+    """
+    async with _segments_manager_client() as client:
+        resp = await client.post(
+            "/api/segments",
+            json=rules_input.model_dump(mode="json"),
+            headers=_segments_manager_auth(),
+        )
+        if resp.status_code in (200, 201):
+            activity.logger.info(
+                "Created segment %s (type=%s, site=%s, vlan=%d) in the Segments Manager",
+                rules_input.segment,
+                rules_input.type.value,
+                rules_input.site,
+                rules_input.vlan_id,
+            )
+            return
+        # 400 = the manager's own validation (bad definition OR already taken);
+        # 422 = the request didn't even match its schema. Both are about THIS
+        # payload, so both go through the same disambiguation.
+        if resp.status_code in (400, 409, 422):
+            await _accept_existing_segment(client, rules_input, resp)
+            return
+        _raise_segments_manager_error("Create segment", resp)
 
 
 def _peer_types(source_type: SegmentType) -> list[SegmentType]:

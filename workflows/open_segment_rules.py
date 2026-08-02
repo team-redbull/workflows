@@ -1,5 +1,22 @@
-"""Segment-connectivity workflow — opens firewall rules for a segment via the next API,
-then flips the segment Locked -> Available in the Segments Manager.
+"""open-segment-rules — creates a segment in the Segments Manager, opens its
+firewall rules via the next API, then flips it Locked -> Available.
+
+The FIRST workflow of the `segment-connectivity` domain, named for what it does
+rather than for the domain, so a sibling (e.g. a close-segment-rules that tears
+the rules down when a segment is decommissioned) can join the domain without a
+naming collision. Domain-scoped things — the activity queue, the limb
+deployment, the models, the `/workflows/segment-connectivity` API prefix — stay
+named after the DOMAIN and are shared; workflow-scoped things (this class, its
+task queue, its workflow ids, its RunArgs/ResumeState/Progress/Result models)
+carry the workflow name.
+
+This workflow owns a segment's WHOLE lifecycle and is its single entry point:
+an operator POSTs the segment definition to the trigger API (workflows/api.py)
+and the workflow calls the Segments Manager itself (create_segment, step 1).
+It used to work the other way round — the Segments Manager created the segment
+and then fired a best-effort HTTP trigger at us — which left creation outside
+Temporal: invisible in the UI, and silently skipped whenever that call failed.
+Now every step is one durable, replayable run.
 
 HC, INVENTORY, PXE and MCE segments each peer with every same-site segment of
 the OTHER types the port policy defines for them (list_peer_segments + a
@@ -41,9 +58,9 @@ with workflow.unsafe.imports_passed_through():
     from shared.consts import SEGMENT_CONNECTIVITY_ACTIVITY_QUEUE
     from shared.interfaces.segment_connectivity import (
         check_segment_connectivity_requests,
+        create_segment,
         get_bmc_segment,
         get_next_checking_request_interval,
-        get_segment_site,
         list_peer_segments,
         publish_segment_connectivity_failure,
         publish_request_ids,
@@ -54,13 +71,13 @@ with workflow.unsafe.imports_passed_through():
     from shared.models.segment_connectivity import (
         BmcOpenRulesRequest,
         SegmentConnectivityFailureNotice,
-        SegmentConnectivityInput,
-        SegmentConnectivityProgress,
+        OpenSegmentRulesInput,
+        OpenSegmentRulesProgress,
         SegmentConnectivityRequestRef,
         SegmentConnectivityRequestsUpdate,
-        SegmentConnectivityResult,
-        SegmentConnectivityResumeState,
-        SegmentConnectivityRunArgs,
+        OpenSegmentRulesResult,
+        OpenSegmentRulesResumeState,
+        OpenSegmentRulesRunArgs,
         OpenRulesRequest,
         PeerSegmentsQuery,
         SegmentRef,
@@ -74,15 +91,20 @@ with workflow.unsafe.imports_passed_through():
 # non-retryable ApplicationError. An UNCLASSIFIED deterministic failure retries
 # every minute forever (workflow stuck RUNNING, visible in the Temporal UI).
 _ACTIVITY_TIMEOUT = timedelta(seconds=90)
+# The full classified-permanent set, shared by both policies below so a newly
+# classified error can never be added to one and forgotten in the other.
+_NON_RETRYABLE_ERROR_TYPES = [
+    "SegmentNotFoundError",
+    "SegmentValidationError",
+    "SegmentConflictError",
+    "SegmentsManagerAuthError",
+    "BmcSegmentNotConfiguredError",
+]
 _RETRY_POLICY = RetryPolicy(
     initial_interval=timedelta(seconds=1),
     backoff_coefficient=2.0,
     maximum_interval=timedelta(minutes=1),
-    non_retryable_error_types=[
-        "SegmentNotFoundError",
-        "SegmentsManagerAuthError",
-        "BmcSegmentNotConfiguredError",
-    ],
+    non_retryable_error_types=_NON_RETRYABLE_ERROR_TYPES,
 )
 # The failure note is best-effort cleanup on a workflow that is already dying:
 # a few bounded attempts, then give up (the workflow swallows the error).
@@ -91,11 +113,7 @@ _FAILURE_NOTE_RETRY_POLICY = RetryPolicy(
     backoff_coefficient=2.0,
     maximum_interval=timedelta(seconds=10),
     maximum_attempts=3,
-    non_retryable_error_types=[
-        "SegmentNotFoundError",
-        "SegmentsManagerAuthError",
-        "BmcSegmentNotConfiguredError",
-    ],
+    non_retryable_error_types=_NON_RETRYABLE_ERROR_TYPES,
 )
 
 # Types connectivity is implemented for. Which OTHER types each one peers
@@ -117,70 +135,70 @@ _CONTINUE_AS_NEW_AFTER = timedelta(hours=48)
 
 
 @workflow.defn
-class SegmentConnectivityWorkflow:
+class OpenSegmentRulesWorkflow:
     def __init__(self) -> None:
         self._phase = "pending"
         self._total_requests = 0
         self._pending_request_ids: list[int] = []
 
     @workflow.query
-    def progress(self) -> SegmentConnectivityProgress:
+    def progress(self) -> OpenSegmentRulesProgress:
         """Cheap progress surface for the async caller (GET status endpoint)."""
-        return SegmentConnectivityProgress(
+        return OpenSegmentRulesProgress(
             phase=self._phase,
             total_requests=self._total_requests,
             pending_requests=len(self._pending_request_ids),
         )
 
     @workflow.run
-    async def run(self, run_args: SegmentConnectivityRunArgs) -> SegmentConnectivityResult:
-        connectivity_input = run_args.input
+    async def run(self, run_args: OpenSegmentRulesRunArgs) -> OpenSegmentRulesResult:
+        rules_input = run_args.input
         resume = run_args.resume
-        site: str | None = None
         if resume is None:
             workflow.logger.info(
-                "Opening connectivity for segment=%s type=%s",
-                connectivity_input.segment,
-                connectivity_input.type.value,
+                "Creating segment=%s (type=%s, site=%s) and opening its connectivity",
+                rules_input.segment,
+                rules_input.type.value,
+                rules_input.site,
             )
-            if connectivity_input.type not in _SUPPORTED_TYPES:
+            if rules_input.type not in _SUPPORTED_TYPES:
                 raise ApplicationError(
-                    f"Connectivity for type={connectivity_input.type.value} is not "
+                    f"Connectivity for type={rules_input.type.value} is not "
                     f"supported yet (supported: {sorted(t.value for t in _SUPPORTED_TYPES)})",
                     type="UnsupportedSegmentType",
                 )
 
-            # Step 1 — validate the segment (and learn its site) before opening
-            # any firewall rules. Failures here need no failure note: nothing
-            # has been submitted and the segment may not even exist.
-            self._phase = "validating-segment"
-            site = await workflow.execute_activity(
-                get_segment_site,
-                connectivity_input,
+            # Step 1 — create the segment (born Locked) in the Segments
+            # Manager, which is also what validates the definition. Idempotent,
+            # so a re-trigger for an already-created segment simply proceeds to
+            # open its rules. Failures here need no failure note: nothing has
+            # been submitted, and there may be no segment to annotate.
+            self._phase = "creating-segment"
+            await workflow.execute_activity(
+                create_segment,
+                rules_input,
                 task_queue=SEGMENT_CONNECTIVITY_ACTIVITY_QUEUE,
                 start_to_close_timeout=_ACTIVITY_TIMEOUT,
                 retry_policy=_RETRY_POLICY,
             )
 
-        # Post-validation, failures are terminal-by-classification only (or a
-        # cancellation): surface them in the Segments Manager UI before
+        # Once the segment exists, failures are terminal-by-classification only
+        # (or a cancellation): surface them in the Segments Manager UI before
         # propagating, so the segment is not left silently Locked.
         # ContinueAsNewError deliberately passes through uncaught.
         try:
-            return await self._run_validated(connectivity_input, site, resume)
+            return await self._run_created(rules_input, resume)
         except (ActivityError, ApplicationError, asyncio.CancelledError) as exc:
-            await self._publish_failure(connectivity_input.segment, exc)
+            await self._publish_failure(rules_input.segment, exc)
             raise
 
-    async def _run_validated(
+    async def _run_created(
         self,
-        connectivity_input: SegmentConnectivityInput,
-        site: str | None,
-        resume: SegmentConnectivityResumeState | None,
-    ) -> SegmentConnectivityResult:
+        rules_input: OpenSegmentRulesInput,
+        resume: OpenSegmentRulesResumeState | None,
+    ) -> OpenSegmentRulesResult:
         if resume is None:
-            assert site is not None  # set on every fresh (non-resume) run
-            state = await self._open_rules(connectivity_input, site)
+            state = await self._open_rules(rules_input)
         else:
             # Resumed after continue_as_new: rules are already submitted,
             # jump straight back into polling.
@@ -214,9 +232,9 @@ class SegmentConnectivityWorkflow:
                     len(pending_request_ids),
                 )
                 workflow.continue_as_new(
-                    SegmentConnectivityRunArgs(
-                        input=connectivity_input,
-                        resume=SegmentConnectivityResumeState(
+                    OpenSegmentRulesRunArgs(
+                        input=rules_input,
+                        resume=OpenSegmentRulesResumeState(
                             request_ids=request_ids,
                             pending_request_ids=pending_request_ids,
                             peer_segment_count=state.peer_segment_count,
@@ -236,7 +254,7 @@ class SegmentConnectivityWorkflow:
                 # Completed ids drop off the Segments Manager display; the
                 # final empty update deletes the display entirely.
                 await self._publish_request_ids(
-                    connectivity_input.segment, still_pending_request_ids, submitted_at
+                    rules_input.segment, still_pending_request_ids, submitted_at
                 )
             pending_request_ids = still_pending_request_ids
             self._pending_request_ids = pending_request_ids
@@ -251,7 +269,7 @@ class SegmentConnectivityWorkflow:
         self._phase = "unlocking-segment"
         await workflow.execute_activity(
             unlock_segment,
-            connectivity_input.segment,
+            rules_input.segment,
             task_queue=SEGMENT_CONNECTIVITY_ACTIVITY_QUEUE,
             start_to_close_timeout=_ACTIVITY_TIMEOUT,
             retry_policy=_RETRY_POLICY,
@@ -260,26 +278,33 @@ class SegmentConnectivityWorkflow:
         self._phase = "completed"
         workflow.logger.info(
             "Connectivity complete for segment=%s: %d rules opened, segment unlocked",
-            connectivity_input.segment,
+            rules_input.segment,
             len(request_ids),
         )
-        return SegmentConnectivityResult(
-            segment=connectivity_input.segment,
-            type=connectivity_input.type,
+        return OpenSegmentRulesResult(
+            segment=rules_input.segment,
+            type=rules_input.type,
             peer_segment_count=state.peer_segment_count,
             request_ids=request_ids,
         )
 
     async def _open_rules(
-        self, connectivity_input: SegmentConnectivityInput, site: str
-    ) -> SegmentConnectivityResumeState:
-        """Step 2 of a fresh run: list peers, fan out submissions, publish ids."""
+        self, rules_input: OpenSegmentRulesInput
+    ) -> OpenSegmentRulesResumeState:
+        """Step 2 of a fresh run: list peers, fan out submissions, publish ids.
+
+        The site is taken straight from the input rather than read back from
+        the Segments Manager: create_segment has already reconciled the two
+        (it fails on a stored segment whose site disagrees), so a second fetch
+        could only return the same value.
+        """
+        site = rules_input.site
         # Same-site peer CIDRs across every type this segment's type peers
         # with (derived from the activity layer's port profiles).
         self._phase = "listing-peer-segments"
         peer_segments: list[SegmentRef] = await workflow.execute_activity(
             list_peer_segments,
-            PeerSegmentsQuery(source_type=connectivity_input.type, site=site),
+            PeerSegmentsQuery(source_type=rules_input.type, site=site),
             task_queue=SEGMENT_CONNECTIVITY_ACTIVITY_QUEUE,
             start_to_close_timeout=_ACTIVITY_TIMEOUT,
             retry_policy=_RETRY_POLICY,
@@ -291,7 +316,7 @@ class SegmentConnectivityWorkflow:
         # Resolved before building any submission below so a missing BMC
         # config fails before anything is submitted, not partway through.
         bmc_segment: str | None = None
-        if connectivity_input.type == SegmentType.MCE:
+        if rules_input.type == SegmentType.MCE:
             bmc_segment = await workflow.execute_activity(
                 get_bmc_segment,
                 site,
@@ -308,16 +333,16 @@ class SegmentConnectivityWorkflow:
         for peer in peer_segments:
             for rule in (
                 OpenRulesRequest(
-                    source_segment=connectivity_input.segment,
+                    source_segment=rules_input.segment,
                     destination_segment=peer.segment,
-                    source_type=connectivity_input.type,
+                    source_type=rules_input.type,
                     destination_type=peer.type,
                 ),
                 OpenRulesRequest(
                     source_segment=peer.segment,
-                    destination_segment=connectivity_input.segment,
+                    destination_segment=rules_input.segment,
                     source_type=peer.type,
-                    destination_type=connectivity_input.type,
+                    destination_type=rules_input.type,
                 ),
             ):
                 submissions.append(
@@ -335,7 +360,7 @@ class SegmentConnectivityWorkflow:
                 workflow.execute_activity(
                     submit_bmc_open_rules,
                     BmcOpenRulesRequest(
-                        mce_segment=connectivity_input.segment, bmc_segment=bmc_segment
+                        mce_segment=rules_input.segment, bmc_segment=bmc_segment
                     ),
                     task_queue=SEGMENT_CONNECTIVITY_ACTIVITY_QUEUE,
                     start_to_close_timeout=_ACTIVITY_TIMEOUT,
@@ -346,7 +371,7 @@ class SegmentConnectivityWorkflow:
         if not submissions:
             raise ApplicationError(
                 f"No same-site peer segments found in the Segments Manager for "
-                f"type={connectivity_input.type.value} — nothing to open "
+                f"type={rules_input.type.value} — nothing to open "
                 "connectivity against",
                 type="NoPeerSegments",
             )
@@ -363,10 +388,10 @@ class SegmentConnectivityWorkflow:
         # Surface the freshly submitted ids beside the segment's status in the
         # Segments Manager UI; they stay visible until the requests complete.
         await self._publish_request_ids(
-            connectivity_input.segment, request_ids, submitted_at
+            rules_input.segment, request_ids, submitted_at
         )
 
-        return SegmentConnectivityResumeState(
+        return OpenSegmentRulesResumeState(
             request_ids=request_ids,
             pending_request_ids=list(request_ids),
             peer_segment_count=len(peer_segments),

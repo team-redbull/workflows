@@ -22,11 +22,30 @@ class SegmentType(str, Enum):
     PXE = "PXE"
 
 
-class SegmentConnectivityInput(BaseModel):
-    """Input to SegmentConnectivityWorkflow: the segment whose firewall rules to open."""
+class OpenSegmentRulesInput(BaseModel):
+    """Input to OpenSegmentRulesWorkflow: the segment to CREATE in the
+    Segments Manager, then open firewall rules for.
+
+    This workflow is the single entry point for a segment's whole lifecycle —
+    the Segments Manager no longer triggers it on segment creation, it is a
+    dependency the workflow calls (create_segment is step 1). So the input is
+    the full segment definition, not just a reference to an existing one, and
+    every step of the flow is visible in one Temporal run.
+
+    Field names and constraints mirror the Segments Manager's own Segment
+    schema (POST /api/segments, extra="forbid"): the shapes must match for the
+    create_segment activity to post this straight through. Semantic validation
+    (site is configured, CIDR matches the site prefix, no overlap, VLAN free)
+    stays the Segments Manager's job — it is the validator of record, and
+    re-deriving its rules here would only let the two drift.
+    """
 
     segment: str = Field(min_length=1)  # CIDR, e.g. "130.154.20.0/24"
     type: SegmentType
+    site: str = Field(min_length=1)
+    vlan_id: int = Field(ge=1, le=4094)
+    epg_name: str = Field(min_length=1)
+    dhcp: bool = True
 
 
 class OpenRulesRequest(BaseModel):
@@ -93,7 +112,7 @@ class SegmentConnectivityFailureNotice(BaseModel):
     message: str = Field(min_length=1)
 
 
-class SegmentConnectivityResumeState(BaseModel):
+class OpenSegmentRulesResumeState(BaseModel):
     """Polling state carried across continue_as_new runs of the workflow."""
 
     request_ids: list[int]
@@ -102,7 +121,7 @@ class SegmentConnectivityResumeState(BaseModel):
     submitted_at: datetime
 
 
-class SegmentConnectivityRunArgs(BaseModel):
+class OpenSegmentRulesRunArgs(BaseModel):
     """The workflow's single argument: public input + internal resume state.
 
     A single-model argument is the Temporal-recommended shape. It also avoids
@@ -112,11 +131,11 @@ class SegmentConnectivityRunArgs(BaseModel):
     a raw dict instead of a Pydantic model.
     """
 
-    input: SegmentConnectivityInput
-    resume: SegmentConnectivityResumeState | None = None
+    input: OpenSegmentRulesInput
+    resume: OpenSegmentRulesResumeState | None = None
 
 
-class SegmentConnectivityProgress(BaseModel):
+class OpenSegmentRulesProgress(BaseModel):
     """Returned by the workflow's `progress` query (surfaced by the status API)."""
 
     phase: str
@@ -124,7 +143,7 @@ class SegmentConnectivityProgress(BaseModel):
     pending_requests: int
 
 
-class SegmentConnectivityResult(BaseModel):
+class OpenSegmentRulesResult(BaseModel):
     segment: str
     type: SegmentType
     peer_segment_count: int

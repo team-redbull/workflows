@@ -32,6 +32,29 @@ class SegmentNotFoundError(OrchestratorError):
     """
 
 
+class SegmentValidationError(OrchestratorError):
+    """The Segments Manager rejected the segment definition we asked it to
+    create (unknown site, CIDR outside the site prefix, overlap with an
+    existing segment, VLAN already taken at that site, ...).
+
+    Deterministic — the same definition will be rejected on every retry, so
+    workflows list this type in non_retryable_error_types. The Segments
+    Manager's own message is carried through verbatim: it is the validator of
+    record, so its wording is what the operator needs to fix the input.
+    """
+
+
+class SegmentConflictError(OrchestratorError):
+    """The segment's CIDR already exists in the Segments Manager, but with
+    different attributes than the ones we were asked to create it with.
+
+    Distinct from a retried-but-already-applied create (identical attributes,
+    which create_segment treats as success): here the caller's definition and
+    the stored one genuinely disagree, and only a human can decide which is
+    right. Deterministic — non-retryable.
+    """
+
+
 class NextApiError(OrchestratorError):
     """The next (connectivity) service failed or returned a malformed payload.
 

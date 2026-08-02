@@ -20,9 +20,9 @@ from temporalio.worker import Worker
 
 from activities.segment_connectivity.activities import (
     check_segment_connectivity_requests,
+    create_segment,
     get_bmc_segment,
     get_next_checking_request_interval,
-    get_segment_site,
     list_peer_segments,
     publish_segment_connectivity_failure,
     publish_request_ids,
@@ -50,7 +50,7 @@ async def main() -> None:
         client,
         task_queue=SEGMENT_CONNECTIVITY_ACTIVITY_QUEUE,
         activities=[
-            get_segment_site,
+            create_segment,
             list_peer_segments,
             submit_open_rules,
             get_bmc_segment,

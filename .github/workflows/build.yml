@@ -22,7 +22,9 @@ jobs:
       image-name: workflows
       dockerfile: workflows/Dockerfile
       # Chart lives in its own repo now (Argo CD). The bump + tag land there.
-      chart-repo: team-redbull/helm-charts-workflows
+      # Repo name follows the Argo service name (workflows-orchestrator), not
+      # this repo's name — the ApplicationSet derives it as helm-charts-<service>.
+      chart-repo: team-redbull/helm-charts-workflows-orchestrator
       helm-values-path: values.yaml
       helm-image-path: image
     secrets: inherit

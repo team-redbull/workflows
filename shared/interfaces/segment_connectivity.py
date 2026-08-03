@@ -100,7 +100,7 @@ async def unlock_segment(segment: str) -> None:
 
 @activity.defn
 async def get_bmc_segment(site: str) -> str:
-    """Return the site's static BMC CIDR from ConfigMap (BMC_SEGMENTS_BY_SITE).
+    """Return the site's static BMC CIDR from ConfigMap (SITE_NETWORKS).
 
     BMC is not a Segments-Manager-tracked segment type, so this is a pure
     config lookup, not an API call. Raises BmcSegmentNotConfiguredError if the

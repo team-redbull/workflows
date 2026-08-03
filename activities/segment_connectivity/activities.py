@@ -423,17 +423,19 @@ async def submit_open_rules(request: OpenRulesRequest) -> SegmentConnectivityReq
 
 @activity.defn
 async def get_bmc_segment(site: str) -> str:
-    """Return the site's static BMC CIDR from ConfigMap (BMC_SEGMENTS_BY_SITE).
+    """Return the site's static BMC CIDR from ConfigMap (SITE_NETWORKS).
 
     A pure config lookup, not an API call: BMC is not a Segments-Manager-
-    tracked segment type.
+    tracked segment type. SITE_NETWORKS is the shared site topology — the same
+    structure the Segments Manager reads `pool` from — so an unknown site here
+    means the site is genuinely unconfigured, not that the two drifted apart.
     """
-    bmc_segment = _settings.bmc_segments_by_site.get(site)
-    if not bmc_segment:
+    networks = _settings.site_networks.get(site)
+    if networks is None:
         raise BmcSegmentNotConfiguredError(
-            f"No BMC segment configured for site={site} (check BMC_SEGMENTS_BY_SITE)"
+            f"No BMC segment configured for site={site} (check SITE_NETWORKS)"
         )
-    return bmc_segment
+    return networks.bmc
 
 
 @activity.defn

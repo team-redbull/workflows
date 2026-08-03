@@ -34,12 +34,42 @@ from __future__ import annotations
 import ipaddress
 import re
 
-from pydantic import field_validator
+from pydantic import BaseModel, ConfigDict, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # "9000" or "30000-32767"
 _PORT_ENTRY_RE = re.compile(r"^(\d{1,5})(?:-(\d{1,5}))?$")
 _SUPPORTED_PROTOCOLS = ("tcp", "udp")
+
+
+class SiteNetworks(BaseModel):
+    """One site's networks, from the shared SITE_NETWORKS topology.
+
+    This structure is defined ONCE — redbull-platform gitops/values/<env>.yaml,
+    key `siteNetworks` — and rendered into BOTH this chart's ConfigMap and the
+    Segments Manager's. That is what guarantees the two services agree on the
+    site list; it used to be enforced only by a comment.
+
+    extra="ignore" is load-bearing: Segments Manager owns `pool` (the range its
+    segments must fall inside) and this service must never depend on it, nor
+    break when another consumer adds a sub-key.
+
+    `bmc` is required rather than optional on purpose — a typo ("bcm") then
+    crash-loops the worker at startup instead of failing a workflow hours in.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    bmc: str
+
+    @field_validator("bmc")
+    @classmethod
+    def _validate_bmc(cls, cidr: str) -> str:
+        try:
+            ipaddress.ip_network(cidr, strict=True)
+        except ValueError as exc:
+            raise ValueError(f"invalid BMC CIDR {cidr!r}: {exc}") from exc
+        return cidr
 
 
 class TemporalSettings(BaseSettings):
@@ -85,11 +115,12 @@ class SegmentConnectivityActivitySettings(BaseSettings):
     ports_pxe_to_mce: dict[str, list[str]]
     ports_mce_to_pxe: dict[str, list[str]]
 
-    # --- BMC: every MCE segment also opens a one-directional rule to its
-    # site's static BMC network. BMC is NOT a Segments-Manager-tracked
-    # segment type, so its CIDR is a static, operator-configured mapping
-    # (site name -> CIDR) rather than something queried at runtime. ---------
-    bmc_segments_by_site: dict[str, str]
+    # --- The shared site topology (SITE_NETWORKS). This service reads only
+    # each site's `bmc`: every MCE segment also opens a one-directional rule to
+    # its site's static BMC network. BMC is NOT a Segments-Manager-tracked
+    # segment type, so its CIDR is operator-configured rather than queried at
+    # runtime. The Segments Manager reads `pool` out of the same structure. ---
+    site_networks: dict[str, SiteNetworks]
     ports_mce_to_bmc: dict[str, list[str]]
 
     @field_validator(
@@ -128,15 +159,10 @@ class SegmentConnectivityActivitySettings(BaseSettings):
                     raise ValueError(f"inverted range in entry {entry!r} for {protocol!r}")
         return profile
 
-    @field_validator("bmc_segments_by_site")
+    @field_validator("site_networks")
     @classmethod
-    def _validate_bmc_segments_by_site(cls, sites: dict[str, str]) -> dict[str, str]:
-        """Strict, fail-fast validation of the ConfigMap site->CIDR mapping."""
+    def _validate_site_networks(cls, sites: dict[str, SiteNetworks]) -> dict[str, SiteNetworks]:
+        """Fail fast on an empty topology. Per-site CIDRs are validated by SiteNetworks."""
         if not sites:
-            raise ValueError("bmc_segments_by_site must not be empty")
-        for site, cidr in sites.items():
-            try:
-                ipaddress.ip_network(cidr, strict=True)
-            except ValueError as exc:
-                raise ValueError(f"invalid CIDR {cidr!r} for site {site!r}: {exc}") from exc
+            raise ValueError("site_networks must not be empty")
         return sites

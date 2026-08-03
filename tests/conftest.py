@@ -24,7 +24,7 @@ os.environ.update(
         "PORTS_MCE_TO_INVENTORY": '{"tcp": ["6443"]}',
         "PORTS_PXE_TO_MCE": '{"udp": ["69"]}',
         "PORTS_MCE_TO_PXE": '{"tcp": ["6443"]}',
-        "BMC_SEGMENTS_BY_SITE": '{"site-a": "10.99.0.0/16"}',
+        "SITE_NETWORKS": '{"site-a": {"pool": "192.11.0.0/16", "bmc": "10.99.0.0/16"}}',
         "PORTS_MCE_TO_BMC": '{"tcp": ["623"]}',
     }
 )

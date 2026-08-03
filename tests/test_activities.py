@@ -319,7 +319,7 @@ async def test_submit_open_rules_missing_port_profile_is_non_retryable(env):
 
 
 async def test_get_bmc_segment_returns_configured_cidr(env):
-    # BMC_SEGMENTS_BY_SITE from conftest: {"site-a": "10.99.0.0/16"}.
+    # SITE_NETWORKS from conftest: site-a's bmc is 10.99.0.0/16.
     assert await env.run(get_bmc_segment, "site-a") == "10.99.0.0/16"
 
 

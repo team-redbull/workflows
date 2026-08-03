@@ -57,7 +57,7 @@ Worker-file naming convention: the workflow (brain) worker is
    Port policy per direction comes from the ConfigMap (`PORTS_HC_TO_MCE`, ...).
    `MCE` segments additionally get one mandatory, one-directional
    `submit_bmc_open_rules(...)` toward `get_bmc_segment(site)` — the site's
-   static BMC CIDR from `BMC_SEGMENTS_BY_SITE` (BMC is not tracked by the
+   static BMC CIDR from `SITE_NETWORKS` (BMC is not tracked by the
    Segments Manager, so this is a ConfigMap lookup, never a Segments Manager
    query, and never peers back).
 4. `publish_request_ids(segment, ids, submitted_at)` — `PUT /api/segments/segment-connectivity-requests`
@@ -121,8 +121,9 @@ segments actually got a workflow.
   compact JSON per protocol; the activity layer expands them into the next API's
   structure and validates the syntax at worker startup. Changing ports = edit the
   ConfigMap + restart the activity workers. No rebuild.
-- **BMC is ConfigMap-only, not Segments-Manager-tracked:** `BMC_SEGMENTS_BY_SITE`
-  maps site name -> static BMC CIDR; `PORTS_MCE_TO_BMC` is its port policy, same
+- **BMC is ConfigMap-only, not Segments-Manager-tracked:** `SITE_NETWORKS` maps
+  site name -> `{pool, bmc}`; this service reads only `bmc` (the Segments Manager
+  owns `pool`). `PORTS_MCE_TO_BMC` is its port policy, same
   shape as every other `PORTS_*` key. Every `MCE` segment opens exactly one
   one-directional rule toward it — never the reverse, and never a peer-discovery
   query.

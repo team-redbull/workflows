@@ -350,7 +350,7 @@ async def _submit_next_open_rules(
     duplicate request id is simply never polled).
     """
     payload = {
-        "ad_groups": [],
+        "ad_groups": [_settings.next_group],
         "comment": comment,
         "properties": {
             "source": {

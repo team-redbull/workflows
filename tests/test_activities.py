@@ -285,6 +285,8 @@ async def test_submit_open_rules_builds_payload_and_returns_ref(env):
     import json
 
     payload = json.loads(request.content)
+    # NEXT_GROUP from conftest.
+    assert payload["ad_groups"] == ["test-group"]
     assert payload["properties"]["source"]["addresses"] == [
         {"type": "segment", "segment": "10.0.0.0/24"}
     ]
@@ -346,6 +348,7 @@ async def test_submit_bmc_open_rules_builds_one_directional_payload(env):
     import json
 
     payload = json.loads(open_rules.calls.last.request.content)
+    assert payload["ad_groups"] == ["test-group"]
     assert payload["properties"]["source"]["system_name"] == "mce"
     assert payload["properties"]["source"]["addresses"] == [
         {"type": "segment", "segment": "10.0.0.0/24"}

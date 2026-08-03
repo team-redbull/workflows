@@ -97,6 +97,12 @@ class SegmentConnectivityActivitySettings(BaseSettings):
     next_open_rules_uri: str = "/open-rules-uri"
     next_check_status_uri: str = "/check-request-status"
 
+    # The AD group next attributes every open-rules request to (payload
+    # `ad_groups`). It names a group in NEXT's own directory, so it is theirs to
+    # define and differs per environment — no code default, an operator must set
+    # it in each environment's ConfigMap.
+    next_group: str
+
     # Seconds between polls of a submitted next request's status. Differs
     # sharply by environment (fast in local/dev against the mock, slow in prod
     # against the real human-approved service), so no code default — an

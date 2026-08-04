@@ -13,7 +13,7 @@ from shared.models.segment_connectivity import (
     BmcOpenRulesRequest,
     SegmentConnectivityFailureNotice,
     OpenSegmentRulesInput,
-    SegmentConnectivityRequestRef,
+    NextRequestRef,
     SegmentConnectivityRequestsUpdate,
     OpenRulesRequest,
     PeerSegmentsQuery,
@@ -57,7 +57,7 @@ async def list_peer_segments(query: PeerSegmentsQuery) -> list[SegmentRef]:
 
 
 @activity.defn
-async def submit_open_rules(request: OpenRulesRequest) -> SegmentConnectivityRequestRef:
+async def submit_open_rules(request: OpenRulesRequest) -> NextRequestRef:
     """Submit one open-firewall-rules request to the next API.
 
     Idempotent in effect: a retried submission opens identical rules, which
@@ -67,8 +67,13 @@ async def submit_open_rules(request: OpenRulesRequest) -> SegmentConnectivityReq
 
 
 @activity.defn
-async def check_segment_connectivity_requests(request_ids: list[int]) -> list[int]:
-    """Batch-check next request statuses; return the ids STILL PENDING."""
+async def check_next_requests(request_ids: list[int]) -> list[int]:
+    """Batch-check next request statuses; return the ids STILL PENDING.
+
+    Named after NEXT, not after the workflow that submitted them: it takes bare
+    request ids, so every workflow in this domain polls its own next requests
+    through this one activity.
+    """
     ...
 
 
@@ -110,7 +115,7 @@ async def get_bmc_segment(site: str) -> str:
 
 
 @activity.defn
-async def submit_bmc_open_rules(request: BmcOpenRulesRequest) -> SegmentConnectivityRequestRef:
+async def submit_bmc_open_rules(request: BmcOpenRulesRequest) -> NextRequestRef:
     """Submit the one-directional MCE -> BMC open-rules request
     (PORTS_MCE_TO_BMC). Idempotent in the same sense as submit_open_rules."""
     ...
@@ -119,7 +124,7 @@ async def submit_bmc_open_rules(request: BmcOpenRulesRequest) -> SegmentConnecti
 @activity.defn
 async def publish_segment_connectivity_failure(notice: SegmentConnectivityFailureNotice) -> None:
     """Best-effort terminal-failure surface: clear the pending request-ids
-    display, then publish a "segment-connectivity workflow failed" note beside the
+    display, then publish a "<workflow> failed" note beside the
     segment's status badge (the Segments Manager's segment-connectivity-failure
     endpoint — the workflow swallows this activity's errors either way)."""
     ...

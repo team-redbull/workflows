@@ -33,6 +33,7 @@ from shared.models.segment_connectivity import (
     OpenSegmentRulesRunArgs,
 )
 from workflows.routers.deps import get_temporal_client
+from workflows.routers.models import StartWorkflowResponse
 from workflows.open_segment_rules import OpenSegmentRulesWorkflow
 
 router = APIRouter(prefix="/workflows/segment-connectivity", tags=["segment-connectivity"])
@@ -42,12 +43,11 @@ _OPEN_SEGMENT_RULES_PATH = "/open-segment-rules"
 
 
 # API-layer request/response models — these never cross the workflow boundary.
-class StartSegmentConnectivityResponse(BaseModel):
-    workflow_id: str
-    run_id: str
-
-
-class BulkSegmentConnectivityInput(BaseModel):
+# Named after the WORKFLOW, not the domain: they describe one workflow's input
+# and its per-segment outcome, so a sibling workflow in this domain could not
+# reuse them. The domain-agnostic StartWorkflowResponse comes from
+# workflows/routers/models.py instead.
+class BulkOpenSegmentRulesInput(BaseModel):
     """Many segment definitions in one request (e.g. a CSV import).
 
     Fans out to one workflow PER SEGMENT rather than one workflow for the
@@ -60,7 +60,7 @@ class BulkSegmentConnectivityInput(BaseModel):
     segments: list[OpenSegmentRulesInput] = Field(min_length=1)
 
 
-class BulkSegmentConnectivityItem(BaseModel):
+class BulkOpenSegmentRulesItem(BaseModel):
     """Per-segment outcome of the FAN-OUT only — not of the workflow, which by
     definition has barely begun. `started` means Temporal accepted the run."""
 
@@ -71,11 +71,11 @@ class BulkSegmentConnectivityItem(BaseModel):
     error: str | None = None
 
 
-class BulkStartSegmentConnectivityResponse(BaseModel):
+class BulkStartOpenSegmentRulesResponse(BaseModel):
     started: int
     already_running: int
     failed: int
-    results: list[BulkSegmentConnectivityItem]
+    results: list[BulkOpenSegmentRulesItem]
 
 
 def _workflow_id(rules_input: OpenSegmentRulesInput) -> str:
@@ -107,13 +107,13 @@ async def _start(client: Client, rules_input: OpenSegmentRulesInput):
 
 @router.post(
     _OPEN_SEGMENT_RULES_PATH,
-    response_model=StartSegmentConnectivityResponse,
+    response_model=StartWorkflowResponse,
     status_code=202,
 )
 async def start_open_segment_rules(
     rules_input: OpenSegmentRulesInput,
     client: Client = Depends(get_temporal_client),
-) -> StartSegmentConnectivityResponse:
+) -> StartWorkflowResponse:
     """Create a segment and open its connectivity — returns immediately (202).
 
     The body is the full segment definition; the workflow creates it in the
@@ -131,20 +131,20 @@ async def start_open_segment_rules(
                 f"{_workflow_id(rules_input)}"
             ),
         )
-    return StartSegmentConnectivityResponse(
+    return StartWorkflowResponse(
         workflow_id=handle.id, run_id=handle.result_run_id or ""
     )
 
 
 @router.post(
     f"{_OPEN_SEGMENT_RULES_PATH}/bulk",
-    response_model=BulkStartSegmentConnectivityResponse,
+    response_model=BulkStartOpenSegmentRulesResponse,
     status_code=202,
 )
 async def start_open_segment_rules_bulk(
-    bulk_input: BulkSegmentConnectivityInput,
+    bulk_input: BulkOpenSegmentRulesInput,
     client: Client = Depends(get_temporal_client),
-) -> BulkStartSegmentConnectivityResponse:
+) -> BulkStartOpenSegmentRulesResponse:
     """Start one workflow per segment definition — returns immediately (202).
 
     Always 202 with a per-item report, never a single pass/fail status: the
@@ -157,24 +157,24 @@ async def start_open_segment_rules_bulk(
 
     async def _start_one(
         rules_input: OpenSegmentRulesInput,
-    ) -> BulkSegmentConnectivityItem:
+    ) -> BulkOpenSegmentRulesItem:
         workflow_id = _workflow_id(rules_input)
         try:
             handle = await _start(client, rules_input)
         except WorkflowAlreadyStartedError:
-            return BulkSegmentConnectivityItem(
+            return BulkOpenSegmentRulesItem(
                 segment=rules_input.segment,
                 workflow_id=workflow_id,
                 status="already_running",
             )
         except Exception as exc:  # noqa: BLE001 — one bad row must not sink the batch
-            return BulkSegmentConnectivityItem(
+            return BulkOpenSegmentRulesItem(
                 segment=rules_input.segment,
                 workflow_id=workflow_id,
                 status="failed",
                 error=str(exc),
             )
-        return BulkSegmentConnectivityItem(
+        return BulkOpenSegmentRulesItem(
             segment=rules_input.segment,
             workflow_id=handle.id,
             status="started",
@@ -185,7 +185,7 @@ async def start_open_segment_rules_bulk(
     counts = {status: 0 for status in ("started", "already_running", "failed")}
     for item in results:
         counts[item.status] += 1
-    return BulkStartSegmentConnectivityResponse(
+    return BulkStartOpenSegmentRulesResponse(
         started=counts["started"],
         already_running=counts["already_running"],
         failed=counts["failed"],

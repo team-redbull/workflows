@@ -27,7 +27,7 @@ from shared.models.segment_connectivity import (
     BmcOpenRulesRequest,
     SegmentConnectivityFailureNotice,
     OpenSegmentRulesInput,
-    SegmentConnectivityRequestRef,
+    NextRequestRef,
     SegmentConnectivityRequestsUpdate,
     OpenSegmentRulesResumeState,
     OpenSegmentRulesRunArgs,
@@ -83,7 +83,7 @@ def make_mock_activities(
             "get_bmc_segment",
             "submit_bmc_open_rules",
             "publish_request_ids",
-            "check_segment_connectivity_requests",
+            "check_next_requests",
             "get_next_checking_request_interval",
             "unlock_segment",
             "publish_segment_connectivity_failure",
@@ -108,9 +108,9 @@ def make_mock_activities(
         return list(peer_segments)
 
     @activity.defn
-    async def submit_open_rules(request: OpenRulesRequest) -> SegmentConnectivityRequestRef:
+    async def submit_open_rules(request: OpenRulesRequest) -> NextRequestRef:
         calls["submit_open_rules"].append(request)
-        return SegmentConnectivityRequestRef(id=next(ids), status="pending")
+        return NextRequestRef(id=next(ids), status="pending")
 
     @activity.defn
     async def get_bmc_segment(site_arg: str) -> str:
@@ -120,17 +120,17 @@ def make_mock_activities(
         return bmc_segment
 
     @activity.defn
-    async def submit_bmc_open_rules(request: BmcOpenRulesRequest) -> SegmentConnectivityRequestRef:
+    async def submit_bmc_open_rules(request: BmcOpenRulesRequest) -> NextRequestRef:
         calls["submit_bmc_open_rules"].append(request)
-        return SegmentConnectivityRequestRef(id=next(ids), status="pending")
+        return NextRequestRef(id=next(ids), status="pending")
 
     @activity.defn
     async def publish_request_ids(update: SegmentConnectivityRequestsUpdate) -> None:
         calls["publish_request_ids"].append(update)
 
     @activity.defn
-    async def check_segment_connectivity_requests(request_ids: list[int]) -> list[int]:
-        calls["check_segment_connectivity_requests"].append(list(request_ids))
+    async def check_next_requests(request_ids: list[int]) -> list[int]:
+        calls["check_next_requests"].append(list(request_ids))
         if script:
             return script.pop(0)
         if check_always_pending:
@@ -157,7 +157,7 @@ def make_mock_activities(
         get_bmc_segment,
         submit_bmc_open_rules,
         publish_request_ids,
-        check_segment_connectivity_requests,
+        check_next_requests,
         get_next_checking_request_interval,
         unlock_segment,
         publish_segment_connectivity_failure,

@@ -19,7 +19,7 @@ from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.worker import Worker
 
 from activities.segment_connectivity.activities import (
-    check_segment_connectivity_requests,
+    check_next_requests,
     create_segment,
     get_bmc_segment,
     get_next_checking_request_interval,
@@ -56,7 +56,7 @@ async def main() -> None:
             get_bmc_segment,
             submit_bmc_open_rules,
             publish_request_ids,
-            check_segment_connectivity_requests,
+            check_next_requests,
             get_next_checking_request_interval,
             unlock_segment,
             publish_segment_connectivity_failure,

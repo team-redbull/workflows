@@ -41,7 +41,7 @@ from shared.models.segment_connectivity import (
     BmcOpenRulesRequest,
     SegmentConnectivityFailureNotice,
     OpenSegmentRulesInput,
-    SegmentConnectivityRequestRef,
+    NextRequestRef,
     SegmentConnectivityRequestsUpdate,
     OpenRulesRequest,
     PeerSegmentsQuery,
@@ -340,7 +340,7 @@ async def _submit_next_open_rules(
     destination_system_name: str,
     comment: str,
     profile: dict[str, list[str]],
-) -> SegmentConnectivityRequestRef:
+) -> NextRequestRef:
     """Build the next-API payload and submit it. Shared by submit_open_rules
     and submit_bmc_open_rules — everything below this point is generic over
     who the source/destination are.
@@ -382,7 +382,7 @@ async def _submit_next_open_rules(
                 f"Open-rules returned {resp.status_code}: {resp.text}"
             )
         try:
-            ref = SegmentConnectivityRequestRef.model_validate(resp.json())
+            ref = NextRequestRef.model_validate(resp.json())
         except Exception as exc:  # malformed payload from the black box
             raise NextApiError(f"Invalid open-rules response: {exc}") from exc
 
@@ -396,7 +396,7 @@ async def _submit_next_open_rules(
 
 
 @activity.defn
-async def submit_open_rules(request: OpenRulesRequest) -> SegmentConnectivityRequestRef:
+async def submit_open_rules(request: OpenRulesRequest) -> NextRequestRef:
     """Submit one open-firewall-rules request to the next API."""
     profile = _PORT_PROFILES.get((request.source_type, request.destination_type))
     if profile is None:
@@ -439,7 +439,7 @@ async def get_bmc_segment(site: str) -> str:
 
 
 @activity.defn
-async def submit_bmc_open_rules(request: BmcOpenRulesRequest) -> SegmentConnectivityRequestRef:
+async def submit_bmc_open_rules(request: BmcOpenRulesRequest) -> NextRequestRef:
     """Submit the one-directional MCE -> BMC open-rules request
     (PORTS_MCE_TO_BMC)."""
     return await _submit_next_open_rules(
@@ -456,7 +456,7 @@ async def submit_bmc_open_rules(request: BmcOpenRulesRequest) -> SegmentConnecti
 
 
 @activity.defn
-async def check_segment_connectivity_requests(request_ids: list[int]) -> list[int]:
+async def check_next_requests(request_ids: list[int]) -> list[int]:
     """Batch-check next request statuses; return the ids still pending.
 
     "Still pending" is a normal return value, never an error — long-term

@@ -65,7 +65,7 @@ Worker-file naming convention: the workflow (brain) worker is
    status while approval is awaited. `submitted_at` (captured once via
    `workflow.now()` when the rules were submitted) drives the "time since submit"
    header in the UI popover.
-5. Poll `check_segment_connectivity_requests(ids)` until every request is `complete`.
+5. Poll `check_next_requests(ids)` until every request is `complete`.
    Approval is HUMAN-driven (minutes -> hours+): the workflow polls forever with
    backoff (15s -> 5m cap) and rolls history over with `continue_as_new` — it
    never fails on a slow approval. Whenever requests complete, the published id

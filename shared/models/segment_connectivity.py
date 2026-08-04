@@ -87,8 +87,13 @@ class BmcOpenRulesRequest(BaseModel):
     bmc_segment: str = Field(min_length=1)
 
 
-class SegmentConnectivityRequestRef(BaseModel):
-    """The next API's acknowledgement of a submitted open-rules request."""
+class NextRequestRef(BaseModel):
+    """The next API's acknowledgement of a submitted request.
+
+    Named after NEXT rather than after this domain or workflow: it is whatever
+    next hands back for ANY submitted request, so a future workflow submitting
+    a different kind of rule change gets the same shape back.
+    """
 
     id: int
     status: str

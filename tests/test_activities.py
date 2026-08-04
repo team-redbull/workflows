@@ -17,7 +17,7 @@ from temporalio.testing import ActivityEnvironment
 from activities.segment_connectivity.activities import (
     _expand_ports,
     _peer_types,
-    check_segment_connectivity_requests,
+    check_next_requests,
     create_segment,
     get_bmc_segment,
     get_next_checking_request_interval,
@@ -363,7 +363,7 @@ async def test_submit_bmc_open_rules_builds_one_directional_payload(env):
     ]
 
 
-# --- check_segment_connectivity_requests ---
+# --- check_next_requests ---
 
 
 @respx.mock
@@ -377,7 +377,7 @@ async def test_check_connectivity_requests_returns_pending_ids(env):
     respx.get(f"{NEXT}/check-request-status/2").mock(
         return_value=httpx.Response(200, json={"status": "pending"})
     )
-    assert await env.run(check_segment_connectivity_requests, [1, 2]) == [2]
+    assert await env.run(check_next_requests, [1, 2]) == [2]
 
 
 @respx.mock
@@ -389,7 +389,7 @@ async def test_check_connectivity_requests_unexpected_status_is_non_retryable(en
         return_value=httpx.Response(200, json={"status": "rejected"})
     )
     with pytest.raises(ApplicationError) as exc_info:
-        await env.run(check_segment_connectivity_requests, [1])
+        await env.run(check_next_requests, [1])
     assert exc_info.value.type == "UnexpectedRequestStatus"
     assert exc_info.value.non_retryable is True
 
@@ -401,7 +401,7 @@ async def test_check_connectivity_requests_next_error_is_retryable_type(env):
     )
     respx.get(f"{NEXT}/check-request-status/1").mock(return_value=httpx.Response(502))
     with pytest.raises(NextApiError):
-        await env.run(check_segment_connectivity_requests, [1])
+        await env.run(check_next_requests, [1])
 
 
 # --- get_next_checking_request_interval ---

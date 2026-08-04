@@ -57,7 +57,7 @@ from temporalio.exceptions import ActivityError, ApplicationError, is_cancelled_
 with workflow.unsafe.imports_passed_through():
     from shared.consts import SEGMENT_CONNECTIVITY_ACTIVITY_QUEUE
     from shared.interfaces.segment_connectivity import (
-        check_segment_connectivity_requests,
+        check_next_requests,
         create_segment,
         get_bmc_segment,
         get_next_checking_request_interval,
@@ -73,7 +73,7 @@ with workflow.unsafe.imports_passed_through():
         SegmentConnectivityFailureNotice,
         OpenSegmentRulesInput,
         OpenSegmentRulesProgress,
-        SegmentConnectivityRequestRef,
+        NextRequestRef,
         SegmentConnectivityRequestsUpdate,
         OpenSegmentRulesResult,
         OpenSegmentRulesResumeState,
@@ -244,7 +244,7 @@ class OpenSegmentRulesWorkflow:
                 )
             await workflow.sleep(interval)  # durable, replay-safe timer
             still_pending_request_ids = await workflow.execute_activity(
-                check_segment_connectivity_requests,
+                check_next_requests,
                 pending_request_ids,
                 task_queue=SEGMENT_CONNECTIVITY_ACTIVITY_QUEUE,
                 start_to_close_timeout=_ACTIVITY_TIMEOUT,
@@ -376,7 +376,7 @@ class OpenSegmentRulesWorkflow:
                 type="NoPeerSegments",
             )
 
-        refs: list[SegmentConnectivityRequestRef] = list(await asyncio.gather(*submissions))
+        refs: list[NextRequestRef] = list(await asyncio.gather(*submissions))
         request_ids = [ref.id for ref in refs]
         submitted_at = workflow.now()
         workflow.logger.info(
@@ -423,7 +423,10 @@ class OpenSegmentRulesWorkflow:
             # real failure raised by the activity.
             cause = getattr(exc, "cause", None)
             reason = str(cause) if cause is not None else str(exc)
-        message = f"Segment-connectivity workflow failed: {reason}"
+        # Names the WORKFLOW, not the domain: the endpoint and the UI display
+        # are domain-level and shared, so the message is the only thing telling
+        # an operator which of the domain's workflows died on this segment.
+        message = f"open-segment-rules workflow failed: {reason}"
         if self._pending_request_ids:
             message += f" (orphaned next request ids: {self._pending_request_ids})"
         try:

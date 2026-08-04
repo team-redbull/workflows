@@ -1,0 +1,754 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Redbull Workflows — orchestrator guide</title>
+<meta name="description" content="How the Temporal-based cluster-lifecycle orchestrator is built: layers, task-queue routing, naming, and the SDK rules that cost us time.">
+<link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/assets/site.css">
+</head>
+<body data-page="guide">
+
+<a class="skip-link" href="#main">Skip to content</a>
+
+<!-- Topbar: identical on every page. Brand + deployed version upper-left; the
+     "Workflows" menu is built from the catalogue in assets/nav.js. -->
+<header class="topbar">
+  <a class="brand" href="/">
+    <span class="brand-mark" aria-hidden="true">&#9650;</span>
+    <span class="brand-name">Redbull Workflows</span>
+    <span class="brand-ver" title="deployed image tag of this documentation site">__DOC_VERSION__</span>
+  </a>
+  <nav class="topnav" aria-label="Site">
+    <a class="topnav-link" href="/" aria-current="page">Orchestrator guide</a>
+    <div class="wfmenu">
+      <button class="wfmenu-btn" id="wfmenu-btn" type="button"
+              aria-expanded="false" aria-haspopup="true" aria-controls="wfmenu-panel">
+        Workflows <span class="caret" aria-hidden="true">&#9662;</span>
+      </button>
+      <div class="wfmenu-panel" id="wfmenu-panel" role="menu" aria-label="Workflows by domain" hidden></div>
+    </div>
+    <noscript>
+      <a class="topnav-link" href="/segment-connectivity/open-segment-rules.html">open-segment-rules</a>
+    </noscript>
+  </nav>
+</header>
+
+<main id="main">
+<header class="masthead">
+  <div class="masthead-inner">
+    <div class="eyebrow">Repository guide · team-redbull/workflows</div>
+    <h1>workflows-orchestrator<span class="dim"> — how this repo works</span></h1>
+    <p class="lede">
+      This repo runs long-lived cluster-lifecycle operations as <b>Temporal workflows</b>: multi-step jobs that call
+      other teams' services, survive crashes and redeploys, and can sit waiting on a human for hours without losing
+      their place. Read this before your first change — the layering and the queue routing are the two things that
+      won't be obvious from the code alone.
+    </p>
+    <div class="facts">
+      <div class="fact"><span class="k">Stack</span><span class="v">Python 3.12 · temporalio · pydantic · FastAPI</span></div>
+      <div class="fact"><span class="k">Deployables</span><span class="v">1 brain + 1 limb per domain (+ trigger API)</span></div>
+      <div class="fact"><span class="k">Domains today</span><span class="v">segment-connectivity</span></div>
+      <div class="fact"><span class="k">Workflows today</span><span class="v">open-segment-rules</span></div>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <!-- ================= 0. CATALOGUE ================= -->
+  <!-- Rendered from the CATALOGUE in assets/nav.js — the same data the topbar
+       menu uses, so the two can never drift. First section on purpose: a reader
+       who came here for one workflow should not have to scroll to find it. -->
+  <section id="workflows" style="margin-top:48px">
+    <div class="sec-head">
+      <div class="eyebrow">The catalogue</div>
+      <h2>Every workflow this orchestrator runs</h2>
+      <p class="lede">Grouped by <b>domain</b> — the unit that owns one activity deployment, one queue and one
+      credential set. The same list is in the <b>Workflows</b> menu at the top of every page.</p>
+    </div>
+    <div class="wfcards" id="wf-catalogue"></div>
+    <p class="note" style="margin-top:16px"><b>Planned entries are shown deliberately.</b> They have no page yet, so
+    they are listed but not clickable — the shape of what is coming is part of the map. The rest of this page is about
+    the machinery underneath all of them.</p>
+  </section>
+
+  <!-- ================= 1. TEMPORAL ================= -->
+  <section id="temporal">
+    <div class="sec-head">
+      <div class="eyebrow">Start here · no Temporal experience needed</div>
+      <h2>What Temporal is, and why this repo uses it</h2>
+      <p class="lede">You don't need to be an expert. You need to know what problem it solves, and the dozen words
+      that show up in our code. That's this section.</p>
+    </div>
+
+    <div class="stack">
+      <div class="panel">
+        <h3>The problem it solves</h3>
+        <p>Take a real job from this repo: create a network segment, ask another team's firewall service to open
+        rules for it, <b>wait for a human to approve them</b>, then unlock the segment. That wait is minutes, hours,
+        sometimes days.</p>
+        <p>Write that as a normal script and every one of these sinks it: the pod restarts mid-job and the state is
+        gone; a dependency is down for five minutes and the job dies; the script is run twice and opens duplicate
+        firewall rules; something fails at 3am and nobody can see how far it got. You end up hand-building retries,
+        a state table, a scheduler and an audit trail — badly.</p>
+      </div>
+
+      <div class="panel accent">
+        <h3>The one idea: durable execution</h3>
+        <p>You write ordinary Python — <code>await this</code>, <code>if that</code>, <code>sleep two minutes</code>,
+        <code>loop until done</code>. Temporal records the result of every step in a <b>history</b>. If the process
+        dies, another worker picks the job up, <b>replays</b> the history to rebuild the exact state the code was in,
+        and carries on from the next line.</p>
+        <p>So a function can run for a week across a dozen pod restarts and still be a single, readable function.
+        That is the whole pitch. Everything else is detail.</p>
+      </div>
+
+      <div class="panel">
+        <h3>Why it fits us specifically</h3>
+        <ul>
+          <li><b>The wait is unbounded.</b> Approval is human. A durable timer costs nothing while it waits and
+          survives every deploy — no cron, no polling table.</li>
+          <li><b>Our dependencies wobble.</b> Retries with backoff are configuration, not code we write.</li>
+          <li><b>Every run must be visible.</b> The Temporal UI shows each step, its input, its result, and exactly
+          where a failed run stopped — that's our audit trail and our debugger.</li>
+          <li><b>Duplicate triggers must be harmless.</b> A run gets a deterministic ID, so triggering the same
+          segment twice while it's running is refused by the server, not by our code.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h3 style="margin:34px 0 12px">The vocabulary you'll meet in this codebase</h3>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>Term</th><th>What it means</th><th>Where you'll see it</th></tr></thead>
+        <tbody>
+          <tr><td class="k">Workflow</td><td class="muted">The orchestration function — the plan. Decides <em>what</em> happens and in what order. Contains no I/O.</td><td class="k">workflows/open_segment_rules.py</td></tr>
+          <tr><td class="k">Activity</td><td class="muted">One unit of real work: an HTTP call, a config read. Everything that can fail or touch the outside world.</td><td class="k">activities/&lt;domain&gt;/activities.py</td></tr>
+          <tr><td class="k">Worker</td><td class="muted">A process that connects to Temporal, says "I can run these workflows / these activities", and polls for work.</td><td class="k">*_worker_init.py</td></tr>
+          <tr><td class="k">Task queue</td><td class="muted">A named mailbox. Workers poll a queue; work addressed to that queue reaches those workers. This is our routing.</td><td class="k">shared/consts.py</td></tr>
+          <tr><td class="k">Workflow ID</td><td class="muted">Our name for one logical run — we derive it from the input, so a duplicate trigger collides on purpose.</td><td class="k">open-segment-rules-HC-10.0.0.0</td></tr>
+          <tr><td class="k">Run ID</td><td class="muted">Temporal's ID for one attempt at that workflow ID. Changes on continue-as-new; you rarely need it.</td><td class="muted">returned by the trigger API</td></tr>
+          <tr><td class="k">History</td><td class="muted">The append-only log of everything that happened in a run. The source of truth for replay.</td><td class="muted">Temporal UI, per run</td></tr>
+          <tr><td class="k">Replay</td><td class="muted">Re-running your workflow code against a recorded history to rebuild state. Why determinism matters.</td><td class="muted">happens automatically</td></tr>
+          <tr><td class="k">Retry policy</td><td class="muted">How an activity retries: interval, backoff, and which error types must <em>not</em> retry.</td><td class="k">_RETRY_POLICY</td></tr>
+          <tr><td class="k">Durable timer</td><td class="muted"><code>workflow.sleep(...)</code> — server-side, survives restarts, free while waiting. Never <code>time.sleep</code>.</td><td class="muted">the poll loop</td></tr>
+          <tr><td class="k">Query</td><td class="muted">A read-only peek into a <em>running</em> workflow's state. Our status endpoint uses one.</td><td class="k">@workflow.query def progress</td></tr>
+          <tr><td class="k">continue_as_new</td><td class="muted">Restart the run with fresh state and an empty history — how an endless loop stays bounded.</td><td class="muted">every 48 h in the poll loop</td></tr>
+          <tr><td class="k">Data converter</td><td class="muted">How arguments and results are serialized. We pass the Pydantic one everywhere, or our models won't encode.</td><td class="k">pydantic_data_converter</td></tr>
+          <tr><td class="k">Namespace</td><td class="muted">Temporal's tenant boundary. One env var; you'll rarely touch it.</td><td class="k">TEMPORAL_NAMESPACE</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="panel warn" style="margin-top:20px">
+      <h3>The one rule that will bite you: workflow code must be deterministic</h3>
+      <p>Because a workflow is replayed, the same code re-run against the same history must make exactly the same
+      decisions. Anything that could answer differently on a second run is banned inside workflow code — and Temporal's
+      sandbox will stop most of it.</p>
+      <div class="grid-2" style="margin-top:4px">
+        <div>
+          <p style="color:var(--good);font-family:var(--mono);font-size:11.5px;letter-spacing:.08em">FINE IN A WORKFLOW</p>
+          <ul style="margin-top:6px">
+            <li>Branching, loops, arithmetic on your own state</li>
+            <li><code>await workflow.execute_activity(...)</code></li>
+            <li><code>workflow.now()</code>, <code>workflow.sleep()</code>, <code>workflow.logger</code></li>
+            <li><code>asyncio.gather</code> over activity handles</li>
+          </ul>
+        </div>
+        <div>
+          <p style="color:var(--bad);font-family:var(--mono);font-size:11.5px;letter-spacing:.08em">MUST BE AN ACTIVITY</p>
+          <ul style="margin-top:6px">
+            <li>Any HTTP / DB / filesystem call</li>
+            <li><code>datetime.now()</code>, <code>random</code>, <code>uuid4</code></li>
+            <li>Reading env vars or settings</li>
+            <li>Anything whose answer could change between runs</li>
+          </ul>
+        </div>
+      </div>
+      <p class="note"><b>Corollary that surprises everyone:</b> changing workflow code is a compatibility question.
+      Reordering steps or renaming an activity changes what replay expects, so runs already in flight can break.
+      New workflows and bug-free additions are fine; reshaping an existing flow needs a look at what's running.</p>
+    </div>
+  </section>
+
+  <!-- ================= 2. THREE LAYERS ================= -->
+  <section id="layers">
+    <div class="sec-head">
+      <div class="eyebrow">Architecture</div>
+      <h2>Three layers, deliberately kept apart</h2>
+      <p class="lede">The brain decides, the limbs do, and a thin typed contract sits between them. They are separate
+      code, separate images, separate deployments, separate credentials — and they never call each other directly.</p>
+    </div>
+
+    <div class="diagram mid">
+      <svg viewBox="0 0 900 300" role="img"
+           aria-label="Three layers: the workflows brain and the per-domain activity limbs both depend on the shared contract layer in the middle, which holds Pydantic models, activity signatures, constants and settings.">
+        <defs>
+          <marker id="a-n" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0.5 L8,4 L0,7.5 Z"/></marker>
+        </defs>
+
+        <text class="hd" x="20" y="24">DECIDES · ONE DEPLOYMENT FOR EVERY DOMAIN</text>
+        <rect class="box tmp" x="20" y="34" width="380" height="86" rx="5"/>
+        <text class="t" x="38" y="62">workflows/</text>
+        <text class="s" x="38" y="82">the brain — orchestration logic + the trigger API</text>
+        <text class="s" x="38" y="100">lightweight image: temporalio, pydantic, fastapi</text>
+
+        <text class="hd" x="500" y="24">DOES THE WORK · ONE DEPLOYMENT PER DOMAIN</text>
+        <rect class="box nxt" x="500" y="34" width="380" height="86" rx="5"/>
+        <text class="t" x="518" y="62">activities/&lt;domain&gt;/</text>
+        <text class="s" x="518" y="82">the limbs — every HTTP call, credential and heavy dep</text>
+        <text class="s" x="518" y="100">its own image, ServiceAccount and Secrets</text>
+
+        <path class="arw" d="M210,124 V186" marker-end="url(#a-n)"/>
+        <text class="l dim" x="220" y="160">imports</text>
+        <path class="arw" d="M690,124 V186" marker-end="url(#a-n)"/>
+        <text class="l dim" x="700" y="160">imports</text>
+
+        <text class="hd mid" x="450" y="208">THE CONTRACT BETWEEN THEM</text>
+        <rect class="box sm" x="20" y="218" width="860" height="74" rx="5"/>
+        <text class="t" x="38" y="244">shared/</text>
+        <text class="s" x="38" y="264">models/ (typed state) · interfaces/ (signatures, no bodies) · consts.py · settings.py</text>
+        <text class="s" x="38" y="282">stays featherweight on purpose — never httpx, never a cloud SDK</text>
+      </svg>
+    </div>
+    <div class="diagram-caption">
+      <span class="swatch tmp"><i></i>brain</span>
+      <span class="swatch nxt"><i></i>limbs</span>
+      <span class="swatch sm"><i></i>contract</span>
+      <span>Both sides depend on <code>shared/</code>. Neither depends on the other.</span>
+    </div>
+
+    <div class="table-scroll" style="margin-top:20px">
+      <table>
+        <thead><tr><th>Layer</th><th>Holds</th><th>May depend on</th><th>Ships as</th></tr></thead>
+        <tbody>
+          <tr>
+            <td class="k">shared/</td>
+            <td class="muted">Pydantic models, activity signatures with empty bodies, task-queue constants, typed settings, error classes</td>
+            <td class="muted"><code>temporalio</code>, <code>pydantic</code>, <code>pydantic-settings</code> — nothing else, ever</td>
+            <td class="muted">baked into both images</td>
+          </tr>
+          <tr>
+            <td class="k">workflows/</td>
+            <td class="muted">One module per workflow, the worker entrypoint, and <code>api.py</code> + routers</td>
+            <td class="muted">shared + <code>fastapi</code>/<code>uvicorn</code>. No HTTP client, no cloud SDK</td>
+            <td class="muted"><code>workflows-orchestrator</code> Deployment, plus <code>-api</code> from the same image</td>
+          </tr>
+          <tr>
+            <td class="k">activities/&lt;domain&gt;/</td>
+            <td class="muted">The real implementations + that domain's worker entrypoint</td>
+            <td class="muted">shared + whatever the domain needs (<code>httpx</code> today; heavier later)</td>
+            <td class="muted">one Deployment + ServiceAccount + Secret per domain</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 style="margin:30px 0 12px">How the contract actually works</h3>
+    <p class="lede" style="margin-bottom:16px">A workflow never imports an implementation — it imports a <em>signature</em>.
+    The signature and the implementation are registered under the same name, so Temporal matches them at runtime while
+    your editor and type-checker still see real types.</p>
+    <div class="grid-3">
+      <div class="codecard">
+        <span class="cap">1 · shared/interfaces/&lt;domain&gt;.py</span>
+        <pre><span class="c"># signature only — no body</span>
+<span class="kwd">@activity.defn</span>
+<span class="kwd">async def</span> unlock_segment(
+    segment: str
+) -> <span class="kwd">None</span>:
+    <span class="c">"""Locked -> Available."""</span>
+    ...</pre>
+      </div>
+      <div class="codecard">
+        <span class="cap">2 · activities/&lt;domain&gt;/activities.py</span>
+        <pre><span class="c"># the real thing, same name</span>
+<span class="kwd">@activity.defn</span>
+<span class="kwd">async def</span> unlock_segment(
+    segment: str
+) -> <span class="kwd">None</span>:
+    <span class="kwd">async with</span> _client() <span class="kwd">as</span> c:
+        <span class="kwd">await</span> c.post(...)</pre>
+      </div>
+      <div class="codecard">
+        <span class="cap">3 · workflows/&lt;workflow&gt;.py</span>
+        <pre><span class="c"># imports the SIGNATURE</span>
+<span class="kwd">await</span> workflow.execute_activity(
+    unlock_segment,
+    segment,
+    task_queue=<span class="str">SC_ACTIVITY_QUEUE</span>,
+    start_to_close_timeout=...,
+    retry_policy=...,
+)</pre>
+      </div>
+    </div>
+    <p class="note" style="margin-top:14px"><b>Why bother?</b> The brain image never pulls in the limb's dependencies or
+    credentials, yet a typo in an activity name is a broken import instead of a runtime mystery, and both sides are
+    type-checked against one definition.</p>
+  </section>
+
+  <!-- ================= 3. RUNTIME ================= -->
+  <section id="runtime">
+    <div class="sec-head">
+      <div class="eyebrow">Runtime</div>
+      <h2>What happens when someone triggers a workflow</h2>
+      <p class="lede">The single most useful thing to internalise: <b>the brain and the limb never talk to each other.</b>
+      Both connect only to the Temporal server, and everything moves through task queues.</p>
+    </div>
+
+    <div class="diagram wide">
+      <svg viewBox="0 0 1040 400" role="img"
+           aria-label="Runtime diagram: the trigger API starts a workflow on the Temporal server. The brain deployment polls the workflow task queue and issues commands. The limb deployment polls the domain activity task queue and returns results. The brain and limb never communicate directly.">
+        <defs>
+          <marker id="a-tmp" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0.5 L8,4 L0,7.5 Z"/></marker>
+          <marker id="a-nxt" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0.5 L8,4 L0,7.5 Z"/></marker>
+          <marker id="a-gh"  viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0.5 L8,4 L0,7.5 Z"/></marker>
+        </defs>
+
+        <!-- API -->
+        <rect class="box n" x="20" y="155" width="170" height="90" rx="5"/>
+        <text class="t mid" x="105" y="188">API</text>
+        <text class="s mid" x="105" y="207">workflows-orchestrator-api</text>
+        <text class="s mid" x="105" y="224">FastAPI · /docs</text>
+
+        <path class="arw tmp" d="M194,180 H286" marker-end="url(#a-tmp)"/>
+        <text class="l mid dim" x="240" y="172">start</text>
+        <path class="arw tmp" d="M286,220 H194" marker-end="url(#a-tmp)"/>
+        <text class="l mid dim" x="240" y="240">status</text>
+
+        <!-- Temporal -->
+        <rect class="box tmp" x="290" y="60" width="180" height="280" rx="5"/>
+        <text class="t mid" x="380" y="180">Temporal</text>
+        <text class="t mid" x="380" y="200">Server</text>
+        <text class="s mid" x="380" y="224">history · queues</text>
+        <text class="s mid" x="380" y="240">timers · dedup</text>
+
+        <!-- brain -->
+        <rect class="box tmp" x="680" y="60" width="340" height="120" rx="5"/>
+        <text class="t" x="700" y="92">workflows-orchestrator</text>
+        <text class="s" x="700" y="112">runs workflow code — decides what happens next</text>
+        <text class="s" x="700" y="130">ONE deployment, every domain</text>
+        <text class="s" x="700" y="160">main_worker_init.py</text>
+
+        <path class="arw tmp" d="M474,100 H676" marker-end="url(#a-tmp)"/>
+        <text class="l" x="480" y="92">workflow task queue</text>
+        <text class="l dim" x="480" y="118">open-segment-rules-workflow</text>
+        <path class="arw tmp" d="M676,150 H474" marker-end="url(#a-tmp)"/>
+        <text class="l" x="480" y="143">schedule activity · start timer</text>
+
+        <!-- limb -->
+        <rect class="box nxt" x="680" y="220" width="340" height="120" rx="5"/>
+        <text class="t" x="700" y="252">segment-connectivity</text>
+        <text class="s" x="700" y="272">runs activities — every outbound HTTP call</text>
+        <text class="s" x="700" y="290">ONE deployment per domain</text>
+        <text class="s" x="700" y="320">worker_init.py</text>
+
+        <path class="arw nxt" d="M474,262 H676" marker-end="url(#a-nxt)"/>
+        <text class="l" x="480" y="254">activity task queue</text>
+        <text class="l dim" x="480" y="280">segment-connectivity-activity</text>
+        <path class="arw nxt" d="M676,312 H474" marker-end="url(#a-nxt)"/>
+        <text class="l" x="480" y="305">result (or failure)</text>
+
+        <!-- never -->
+        <path class="arw bad" d="M850,184 V216"/>
+        <text class="l bad" x="862" y="204">never talk directly</text>
+      </svg>
+    </div>
+
+    <h3 style="margin:28px 0 12px">The same thing in words</h3>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>#</th><th>What happens</th><th>Where</th></tr></thead>
+        <tbody>
+          <tr><td class="k">1</td><td class="muted">Someone POSTs to a trigger route. The API derives a deterministic workflow ID and asks Temporal to start a run on that workflow's queue. It answers <code>202</code> immediately — it never waits for the outcome.</td><td class="k">workflows/routers/</td></tr>
+          <tr><td class="k">2</td><td class="muted">Temporal writes the run into history and puts a task on the workflow queue.</td><td class="muted">server</td></tr>
+          <tr><td class="k">3</td><td class="muted">The brain, polling that queue, executes workflow code until it needs something from the outside world. It doesn't perform the call — it returns a <em>command</em>: "schedule this activity on that queue".</td><td class="k">workflows/&lt;workflow&gt;.py</td></tr>
+          <tr><td class="k">4</td><td class="muted">Temporal puts that on the domain's activity queue. The limb picks it up, makes the real HTTP call, returns the result — retrying on its own if it fails.</td><td class="k">activities/&lt;domain&gt;/</td></tr>
+          <tr><td class="k">5</td><td class="muted">The result lands in history; the brain wakes and continues from the next line. Steps 3–5 repeat, including across sleeps that last hours.</td><td class="muted">loop</td></tr>
+          <tr><td class="k">6</td><td class="muted">Meanwhile anyone can <code>GET /workflows/runs/{workflow_id}</code>, which reads run status and queries the workflow for live progress.</td><td class="k">workflows/routers/runs.py</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="panel ok" style="margin-top:20px">
+      <h3>Why this shape pays off</h3>
+      <ul>
+        <li>The brain holds <b>no credentials</b> and no service SDKs — it only ever names activities.</li>
+        <li>A limb can be redeployed, scaled or crash-looped without touching workflow logic; queued work simply waits.</li>
+        <li>A new domain with heavy dependencies gets its own image and RBAC without bloating anything that exists.</li>
+        <li>Every step is in history, so "what did this run actually do?" is answered by the Temporal UI, not by log archaeology.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ================= 4. QUEUES ================= -->
+  <section id="queues">
+    <div class="sec-head">
+      <div class="eyebrow">The routing rule</div>
+      <h2>Activity queue per <em>domain</em>. Workflow queue per <em>workflow</em>.</h2>
+      <p class="lede">These two are scoped differently on purpose, and it's the detail people get wrong first.
+      A domain holds many workflows; the domain owns the limb, each workflow owns its own front door.</p>
+    </div>
+
+    <div class="diagram wide">
+      <svg viewBox="0 0 1120 250" role="img"
+           aria-label="Queue routing: each workflow has its own workflow task queue, all served by one brain deployment. The brain routes every activity to the queue of the domain it belongs to, and each domain queue is served by that domain's own limb deployment.">
+        <defs>
+          <marker id="a-sm" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0.5 L8,4 L0,7.5 Z"/></marker>
+        </defs>
+
+        <text class="hd" x="20" y="24">ONE QUEUE PER WORKFLOW</text>
+        <text class="hd" x="310" y="24">ONE BRAIN, ALL DOMAINS</text>
+        <text class="hd" x="600" y="24">ONE QUEUE PER DOMAIN</text>
+        <text class="hd" x="890" y="24">ONE LIMB PER DOMAIN</text>
+
+        <rect class="box sm"    x="20" y="40"  width="210" height="42" rx="4"/>
+        <text class="s" x="34" y="59">open-segment-rules</text>
+        <text class="s" x="34" y="74">-workflow</text>
+
+        <rect class="box ghost" x="20" y="100" width="210" height="42" rx="4"/>
+        <text class="s ghost" x="34" y="119">close-segment-rules</text>
+        <text class="s ghost" x="34" y="134">-workflow  (future)</text>
+
+        <rect class="box ghost" x="20" y="160" width="210" height="42" rx="4"/>
+        <text class="s ghost" x="34" y="179">&lt;other-domain&gt;</text>
+        <text class="s ghost" x="34" y="194">-workflow  (future)</text>
+
+        <path class="arw"       d="M234,61  H306" marker-end="url(#a-n)"/>
+        <path class="arw ghost" d="M234,121 H306" marker-end="url(#a-gh)"/>
+        <path class="arw ghost" d="M234,181 H306" marker-end="url(#a-gh)"/>
+
+        <rect class="box tmp" x="310" y="40" width="210" height="162" rx="4"/>
+        <text class="t mid" x="415" y="112">workflows-</text>
+        <text class="t mid" x="415" y="130">orchestrator</text>
+        <text class="s mid" x="415" y="150">one deployment</text>
+
+        <path class="arw sm" d="M524,90  H596" marker-end="url(#a-sm)"/>
+        <path class="arw ghost" d="M524,170 H596" marker-end="url(#a-gh)"/>
+        <text class="l dim" x="530" y="82">task_queue=</text>
+
+        <rect class="box sm"    x="600" y="60"  width="210" height="52" rx="4"/>
+        <text class="s" x="614" y="84">segment-connectivity</text>
+        <text class="s" x="614" y="100">-activity</text>
+
+        <rect class="box ghost" x="600" y="144" width="210" height="52" rx="4"/>
+        <text class="s ghost" x="614" y="168">&lt;other-domain&gt;</text>
+        <text class="s ghost" x="614" y="184">-activity  (future)</text>
+
+        <path class="arw sm"    d="M814,86  H886" marker-end="url(#a-sm)"/>
+        <path class="arw ghost" d="M814,170 H886" marker-end="url(#a-gh)"/>
+
+        <rect class="box nxt"   x="890" y="60"  width="210" height="52" rx="4"/>
+        <text class="s" x="904" y="84">segment-connectivity</text>
+        <text class="s" x="904" y="100">deployment + SA + Secret</text>
+
+        <rect class="box ghost" x="890" y="144" width="210" height="52" rx="4"/>
+        <text class="s ghost" x="904" y="168">&lt;other-domain&gt;</text>
+        <text class="s ghost" x="904" y="184">deployment  (future)</text>
+      </svg>
+    </div>
+    <div class="diagram-caption">
+      <span class="swatch n"><i class="dash"></i>not built yet — drawn to show where it would slot in</span>
+    </div>
+
+    <div class="grid-2" style="margin-top:20px">
+      <div class="panel">
+        <h3>Why the activity queue follows the domain</h3>
+        <p>A queue maps one-to-one onto a <b>deployment</b>, and what forces a separate deployment is a shared
+        <b>dependency and credential set</b> — not where one workflow ends and the next begins.</p>
+        <p>Every <code>segment-connectivity</code> activity needs the same two things: a Segments Manager URL with a
+        bearer token, and the NEXT firewall endpoints. That set is the deployment, so that set is the queue. A second
+        workflow in the domain reuses the same limb rather than duplicating the credentials.</p>
+      </div>
+      <div class="panel">
+        <h3>Why the workflow queue follows the workflow</h3>
+        <p>Workflow code is cheap and credential-free, so all of it lives in one brain deployment — but each workflow
+        still gets its own queue.</p>
+        <p>That keeps workflows independently addressable: one can be paused by simply not polling its queue, moved to
+        a dedicated worker if it ever needs isolation, or drained during a risky migration, without touching its
+        siblings. Sharing one queue would tangle all of that together.</p>
+      </div>
+    </div>
+
+    <p class="note" style="margin-top:16px"><b>In code:</b> queue names are constants in
+    <code>shared/consts.py</code>, and <em>every</em> <code>execute_activity</code> call passes
+    <code>task_queue=</code> explicitly. Forgetting it sends the activity to the workflow's own queue, where nothing
+    can run it — the run then sits there with an activity that never starts.</p>
+  </section>
+
+  <!-- ================= 5. PRINCIPLES ================= -->
+  <!-- Moved here from the open-segment-rules page: these hold for every workflow
+       in every domain, so they belong to the orchestrator, not to one example. -->
+  <section id="principles">
+    <div class="sec-head">
+      <div class="eyebrow">Design decisions worth knowing</div>
+      <h2>Three rules that surprise people</h2>
+      <p class="lede">These are not open-segment-rules trivia — they apply to every workflow you will write here, and
+      each one is the opposite of the instinct you arrive with.</p>
+    </div>
+    <div class="stack">
+
+      <div class="panel">
+        <h3>1 · The workflow is the entry point — a dependency never triggers it</h3>
+        <p>A caller POSTs the full <b>definition</b> of the thing to be built, and the workflow creates it as its
+        first step. It used to be the other way round for segments: the Segments Manager created the segment, then
+        fired a best-effort HTTP call at us. That left creation <em>outside</em> Temporal — invisible in the UI, no
+        retries, and silently skipped whenever that call failed.</p>
+        <p class="note"><b>The general rule:</b> anything a run's outcome depends on belongs inside the run, as a
+        retried activity — not in a caller's fire-and-forget request. New domains follow the same shape.</p>
+      </div>
+
+      <div class="panel">
+        <h3>2 · A run may last for days, and that is fine</h3>
+        <p>Where a human has to approve something, there is <b>no timeout on the wait</b>, by design. Durable timers
+        cost nothing while they wait, and <code>continue_as_new</code> every N cycles keeps history bounded — so a run
+        waiting a week is no more expensive than one waiting an hour.</p>
+        <p class="note"><b>Never "fix" a slow run by adding a deadline.</b> A deadline turns "the approver is on
+        holiday" into a failed run and a half-built system. If a run looks stuck, read its phase on the status
+        endpoint before assuming it is broken.</p>
+      </div>
+
+      <div class="panel">
+        <h3>3 · Every activity must be idempotent — retries are constant, not exceptional</h3>
+        <p>Activities retry with <b>no attempt limit</b>, so every one of them will eventually run twice. That makes
+        idempotency a requirement, not a nicety: UPSERT, check-before-create, idempotency keys, and treat
+        "already exists" or "already done" as <em>success</em>.</p>
+        <p>In practice that means a create call accepts an existing object that matches the definition and fails only
+        on genuine disagreement; a state change accepts an object already in the target state; a publish is a
+        replace-style PUT rather than an append.</p>
+        <p class="note"><b>Inside one run</b> — a worker crash, a redeploy, a <code>continue_as_new</code> — finished
+        steps are never redone: Temporal replays their recorded results from history. <b>A brand-new run is
+        different:</b> it starts from step 1 with no memory of the last one, so re-running a completed workflow is
+        only as safe as its activities are idempotent. While a run is still in flight there is no second run at all —
+        the deterministic workflow ID makes the trigger answer <b>409</b>.</p>
+      </div>
+
+      <p class="note"><b>A fourth one is already above:</b> the brain and the limbs are separate deployments that
+      never call each other — see <a href="#layers">Three layers</a> and <a href="#runtime">what happens when someone
+      triggers a workflow</a>.</p>
+    </div>
+  </section>
+
+  <!-- ================= 6. NAMING ================= -->
+  <section id="naming">
+    <div class="sec-head">
+      <div class="eyebrow">Naming</div>
+      <h2>Is this thing named after the domain, or after the workflow?</h2>
+      <p class="lede">One test settles nearly every case: <b>could a sibling workflow in this domain reuse it
+      unchanged?</b> Yes → it belongs to the domain. No → it belongs to the workflow.</p>
+    </div>
+
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>Named after the DOMAIN</th><th>Named after the WORKFLOW</th></tr></thead>
+        <tbody>
+          <tr>
+            <td class="kw">segment-connectivity-activity <span style="color:var(--ink-3)">(activity queue)</span></td>
+            <td class="kw">open-segment-rules-workflow <span style="color:var(--ink-3)">(workflow queue)</span></td>
+          </tr>
+          <tr>
+            <td class="kw">activities/segment_connectivity/</td>
+            <td class="kw">workflows/open_segment_rules.py</td>
+          </tr>
+          <tr>
+            <td class="kw">shared/models|interfaces/segment_connectivity.py</td>
+            <td class="kw">OpenSegmentRulesRunArgs / ResumeState / Progress / Result</td>
+          </tr>
+          <tr>
+            <td class="kw">/workflows/segment-connectivity <span style="color:var(--ink-3)">(route prefix)</span></td>
+            <td class="kw">/open-segment-rules <span style="color:var(--ink-3)">(route under it)</span></td>
+          </tr>
+          <tr>
+            <td class="kw">the Deployment, ServiceAccount, ConfigMap, Secret</td>
+            <td class="kw">open-segment-rules-&lt;TYPE&gt;-&lt;network&gt; <span style="color:var(--ink-3)">(workflow ids)</span></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="grid-2" style="margin-top:16px">
+      <div class="panel">
+        <h3>Two traps worth knowing</h3>
+        <ul>
+          <li><b>A domain is a prefix, never an endpoint.</b> If the first workflow claims the bare
+          <code>/workflows/&lt;domain&gt;</code> path, the second one has nowhere to go.</li>
+          <li><b>Workflow IDs must carry the workflow name.</b> Two workflows acting on the same segment would
+          otherwise collide on one ID and the second would be refused as already-started.</li>
+        </ul>
+      </div>
+      <div class="panel">
+        <h3>A third case: named after the external system</h3>
+        <p>Some things are neither — they're defined by whoever is on the other end of the wire.
+        <code>check_next_requests</code> and <code>NextRequestRef</code> are named after NEXT because they speak
+        NEXT's API and every workflow in the domain shares them.</p>
+        <p>Meanwhile anything mirroring a Segments Manager endpoint keeps that endpoint's name, because renaming it
+        here would silently desync two repos.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= 7. REPO TOUR ================= -->
+  <section id="tour">
+    <div class="sec-head">
+      <div class="eyebrow">Orientation</div>
+      <h2>Where things live</h2>
+    </div>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>Path</th><th>What's in it</th><th>You touch it when…</th></tr></thead>
+        <tbody>
+          <tr><td class="k">shared/models/</td><td class="muted">Pydantic models crossing the brain/limb boundary</td><td class="muted">a step needs new typed state</td></tr>
+          <tr><td class="k">shared/interfaces/</td><td class="muted">Activity signatures, bodies are <code>...</code></td><td class="muted">adding or re-typing an activity</td></tr>
+          <tr><td class="k">shared/consts.py</td><td class="muted">Task-queue names</td><td class="muted">adding a workflow or a domain</td></tr>
+          <tr><td class="k">shared/settings.py</td><td class="muted">Typed env config, validated at worker startup</td><td class="muted">adding a ConfigMap or Secret key</td></tr>
+          <tr><td class="k">shared/exceptions.py</td><td class="muted">Error classes — the ones you classify as non-retryable</td><td class="muted">a new permanent failure mode appears</td></tr>
+          <tr><td class="k">workflows/&lt;name&gt;.py</td><td class="muted">One workflow's orchestration logic</td><td class="muted">changing what happens, or in what order</td></tr>
+          <tr><td class="k">workflows/main_worker_init.py</td><td class="muted">Brain entrypoint — registers workflows, polls their queues</td><td class="muted">adding a workflow</td></tr>
+          <tr><td class="k">workflows/api.py</td><td class="muted">FastAPI composition root; owns the Temporal client</td><td class="muted">adding a domain router</td></tr>
+          <tr><td class="k">workflows/routers/</td><td class="muted">One module per domain + the shared <code>runs</code> status route</td><td class="muted">adding a trigger endpoint</td></tr>
+          <tr><td class="k">activities/&lt;domain&gt;/activities.py</td><td class="muted">The real implementations</td><td class="muted">changing how we call an external service</td></tr>
+          <tr><td class="k">activities/&lt;domain&gt;/worker_init.py</td><td class="muted">Limb entrypoint — registers that domain's activities</td><td class="muted">adding an activity</td></tr>
+          <tr><td class="k">dev/mock-segment-connectivity/</td><td class="muted">Stand-in for NEXT, with a configurable approval delay</td><td class="muted">running end-to-end locally</td></tr>
+          <tr><td class="k">tests/</td><td class="muted">Workflow tests on the time-skipping test environment, activity tests with mocked HTTP, plus a contract test</td><td class="muted">always</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note" style="margin-top:12px"><b>Not here:</b> production Helm charts. Each service has its own
+    <code>helm-charts-&lt;service&gt;</code> repo that Argo CD watches; CI in this repo bumps their image tags. The only
+    chart still living here is the test-only mock.</p>
+  </section>
+
+  <!-- ================= 8. ADDING ================= -->
+  <section id="adding">
+    <div class="sec-head">
+      <div class="eyebrow">Recipes</div>
+      <h2>Adding your own</h2>
+    </div>
+    <div class="grid-2">
+      <div class="panel">
+        <h3>A new workflow in an existing domain</h3>
+        <ol>
+          <li>Add its models to <code>shared/models/&lt;domain&gt;.py</code> — one <code>RunArgs</code> wrapper, plus
+          <code>Progress</code> and <code>Result</code>.</li>
+          <li>Add any new activity signatures to <code>shared/interfaces/&lt;domain&gt;.py</code> and implement them in
+          that domain's <code>activities.py</code> — existing ones you just reuse.</li>
+          <li>Add its queue name to <code>shared/consts.py</code>.</li>
+          <li>Write <code>workflows/&lt;workflow&gt;.py</code>, routing every activity to the <b>domain's</b> activity queue.</li>
+          <li>Register it in <code>main_worker_init.py</code> and add a route under the existing domain prefix.</li>
+          <li>Register any new activity in that domain's <code>worker_init.py</code>.</li>
+        </ol>
+        <p class="note">No new deployment, no new chart, no new credentials.</p>
+      </div>
+      <div class="panel">
+        <h3>A whole new domain</h3>
+        <ol>
+          <li>Everything on the left, plus:</li>
+          <li><code>shared/models|interfaces/&lt;domain&gt;.py</code> and a domain activity queue constant.</li>
+          <li><code>activities/&lt;domain&gt;/</code> with its own <code>requirements.txt</code>,
+          <code>Dockerfile</code> and <code>worker_init.py</code>.</li>
+          <li>A settings group in <code>shared/settings.py</code> for its endpoints and credentials.</li>
+          <li>A new <code>workflows/routers/&lt;domain&gt;.py</code>, included in <code>api.py</code>.</li>
+          <li>A build job in <code>.github/workflows/build.yml</code> and a new
+          <code>helm-charts-&lt;domain&gt;</code> repo for Argo CD.</li>
+        </ol>
+        <p class="note">The brain is already deployed — a new domain registers against it, it doesn't fork it.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= 9. GOTCHAS ================= -->
+  <section id="gotchas">
+    <div class="sec-head">
+      <div class="eyebrow">Hard-won</div>
+      <h2>SDK rules that cost us time</h2>
+      <p class="lede">Each of these has a failure mode that looks like something else. Worth reading once now rather
+      than debugging later.</p>
+    </div>
+    <div class="grid-2">
+      <div class="panel warn">
+        <h3>A plain exception does not fail a workflow</h3>
+        <p>Raising a normal exception in <em>workflow</em> code fails the workflow <em>task</em>, which retries
+        forever — the run hangs in RUNNING instead of failing. Deterministic failures raised from workflow code must
+        be <code>ApplicationError</code>. From <em>activity</em> code, ordinary exceptions are fine: the SDK converts
+        them, using the class name as the error type.</p>
+      </div>
+      <div class="panel warn">
+        <h3>Unclassified permanent errors retry forever</h3>
+        <p>Our activities retry with <b>no attempt limit</b>, so outages are simply out-waited. The flip side: an
+        error that will never succeed also retries forever unless it's listed in
+        <code>non_retryable_error_types</code> or raised as a non-retryable <code>ApplicationError</code>. Symptom: a
+        run stuck RUNNING with a failing activity, not a FAILED run.</p>
+      </div>
+      <div class="panel">
+        <h3>Wrap shared imports in the sandbox</h3>
+        <p>Inside a workflow module, import <code>shared/</code> under
+        <code>with workflow.unsafe.imports_passed_through():</code> — Pydantic's C extensions crash the sandbox
+        otherwise. Worker entrypoints run outside it and import normally. And never import settings from workflow code.</p>
+      </div>
+      <div class="panel">
+        <h3>Pass the Pydantic data converter everywhere</h3>
+        <p>Every <code>Client.connect(...)</code> — both workers <em>and</em> <code>api.py</code> — must pass
+        <code>pydantic_data_converter</code>. Miss one and payloads fail to serialize at the boundary it owns.</p>
+      </div>
+      <div class="panel">
+        <h3>Give <code>run()</code> exactly one Pydantic argument</h3>
+        <p>Typed conversion is silently skipped when the number of payloads doesn't match the number of declared
+        parameters — you get a raw dict instead of your model, with no error. Wrap input plus internal state in a
+        single <code>RunArgs</code> model.</p>
+      </div>
+      <div class="panel">
+        <h3>Client timeouts must sit under activity timeouts</h3>
+        <p>Give every HTTP client an explicit timeout below the activity's <code>start_to_close_timeout</code>
+        (60 s vs 90 s here), so a network hang fails the call and frees the worker before Temporal reaps the activity.
+        Create the client <em>inside</em> the activity so tokens never leak across runs.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= 10. LOCAL ================= -->
+  <section id="local">
+    <div class="sec-head">
+      <div class="eyebrow">Getting hands-on</div>
+      <h2>Running it on your machine</h2>
+      <p class="lede">Four processes: a Temporal dev server, the brain, the limb, and the trigger API — plus the mock
+      when you want a full end-to-end run.</p>
+    </div>
+    <pre><span class="c"># 0 · deps + a local Temporal (UI on :8233)</span>
+pip install -r requirements-dev.txt
+temporal server start-dev
+
+<span class="c"># 1 · the brain — polls the workflow queue</span>
+PYTHONPATH=. python -m workflows.main_worker_init
+
+<span class="c"># 2 · the limb — polls the domain activity queue</span>
+PYTHONPATH=. python -m activities.segment_connectivity.worker_init
+
+<span class="c"># 3 · the trigger API — Swagger on http://localhost:8080/docs</span>
+PYTHONPATH=. uvicorn workflows.api:app --port 8080
+
+<span class="c"># 4 · optional: stand in for the NEXT firewall service</span>
+cd dev/mock-segment-connectivity &amp;&amp; uvicorn app:app --port 9000
+
+<span class="c"># tests — no server needed, the SDK ships a time-skipping test env</span>
+pytest -q</pre>
+    <p class="note" style="margin-top:14px">Config comes from <code>.env</code> (see <code>.env.example</code>); the
+    settings classes fail fast at startup, so a missing or malformed key crashes the worker immediately rather than
+    mid-run. In the mock, <code>COMPLETION_DELAY_SECONDS</code> stands in for the human approval — set it low and a
+    full run finishes in seconds.</p>
+  </section>
+
+  <footer>
+    <span>CLAUDE.md — the authoritative rules</span>
+    <span>README.md</span>
+    <span>shared/consts.py</span>
+    <span>workflows/api.py</span>
+    <span>tests/test_contract.py</span>
+  </footer>
+
+</div>
+</main>
+
+<script src="/assets/nav.js" defer></script>
+</body>
+</html>

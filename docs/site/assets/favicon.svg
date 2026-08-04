@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <!-- A run: three steps on a spine, the last one open (waiting on a human). -->
+  <rect width="32" height="32" rx="7" fill="#131a1c"/>
+  <path d="M9 9 V23" stroke="#4d5b5f" stroke-width="2" stroke-linecap="round"/>
+  <circle cx="9" cy="9"  r="3.4" fill="#4fb9bd"/>
+  <circle cx="9" cy="16" r="3.4" fill="#4fb9bd"/>
+  <circle cx="9" cy="23" r="3.4" fill="none" stroke="#dd9a4d" stroke-width="2"/>
+  <path d="M15 9 H24 M15 16 H22 M15 23 H20" stroke="#75868a" stroke-width="2" stroke-linecap="round"/>
+</svg>

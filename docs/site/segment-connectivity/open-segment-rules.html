@@ -1,0 +1,677 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>open-segment-rules — Redbull Workflows</title>
+<meta name="description" content="The open-segment-rules workflow: create a segment, open firewall rules to its same-site peers, wait for human approval, unlock.">
+<link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/assets/site.css">
+</head>
+<body data-page="/segment-connectivity/open-segment-rules.html">
+
+<a class="skip-link" href="#main">Skip to content</a>
+
+<!-- Topbar: identical on every page. Brand + deployed version upper-left; the
+     "Workflows" menu is built from the catalogue in assets/nav.js. -->
+<header class="topbar">
+  <a class="brand" href="/">
+    <span class="brand-mark" aria-hidden="true">&#9650;</span>
+    <span class="brand-name">Redbull Workflows</span>
+    <span class="brand-ver" title="deployed image tag of this documentation site">__DOC_VERSION__</span>
+  </a>
+  <nav class="topnav" aria-label="Site">
+    <a class="topnav-link" href="/">Orchestrator guide</a>
+    <div class="wfmenu">
+      <button class="wfmenu-btn" id="wfmenu-btn" type="button"
+              aria-expanded="false" aria-haspopup="true" aria-controls="wfmenu-panel">
+        Workflows <span class="caret" aria-hidden="true">&#9662;</span>
+      </button>
+      <div class="wfmenu-panel" id="wfmenu-panel" role="menu" aria-label="Workflows by domain" hidden></div>
+    </div>
+    <noscript>
+      <a class="topnav-link" href="/segment-connectivity/open-segment-rules.html">open-segment-rules</a>
+    </noscript>
+  </nav>
+</header>
+
+<main id="main">
+<header class="masthead">
+  <div class="masthead-inner">
+    <div class="eyebrow">Temporal workflow · domain: segment-connectivity</div>
+    <h1>open-segment-rules<span class="dim"> — what actually happens</span></h1>
+    <p class="lede">
+      A single request creates a network segment in the Segments Manager, sends a request to NEXT to open
+      every firewall rule it needs against its same-site neighbours, waits for a <em>human</em> to approve
+      those rules — for as long as that takes — and only then flips the segment from <b>Locked</b> to
+      <b>Available</b>.
+    </p>
+    <p class="lede">One segment = one durable Temporal run, from creation to unlock.</p>
+    <div class="facts">
+      <div class="fact"><span class="k">Trigger</span><span class="v">POST /workflows/segment-connectivity/open-segment-rules</span></div>
+      <div class="fact"><span class="k">Workflow id</span><span class="v">open-segment-rules-&lt;TYPE&gt;-&lt;network&gt;</span></div>
+      <div class="fact"><span class="k">Workflow queue</span><span class="v">open-segment-rules-workflow</span></div>
+      <div class="fact"><span class="k">Activity queue</span><span class="v">segment-connectivity-activity</span></div>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <!-- ======================= THE FLOW ======================= -->
+  <section id="flow">
+    <div class="sec-head">
+      <div class="eyebrow">The run, step by step</div>
+      <h2>From “create this segment” to “segment is Available”</h2>
+      <p class="lede">Five stages, left to right. The colour of each box is the system it talks to, and the segment
+      stays <b>Locked</b> the whole way across until the last one. The cards underneath expand each numbered stage —
+      what it calls, what it returns, and why it's built that way.</p>
+    </div>
+
+    <div class="diagram rail">
+      <svg viewBox="0 0 1060 400" role="img"
+           aria-label="Horizontal flow: an operator posts a segment definition, then the workflow runs five stages left to right — create the segment (Segments Manager), find same-site peers (Segments Manager), submit open-rules requests (NEXT), wait for human approval while polling (NEXT), and unlock the segment (Segments Manager). The segment stays Locked until the final stage, where it becomes Available.">
+        <defs>
+          <marker id="ah-n"   viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0.5 L8,4 L0,7.5 Z"/></marker>
+          <marker id="ah-nxt" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0.5 L8,4 L0,7.5 Z"/></marker>
+          <marker id="ah-bad" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0.5 L8,4 L0,7.5 Z"/></marker>
+        </defs>
+
+        <!-- entry -->
+        <rect class="entry-pill" x="30" y="18" width="430" height="30" rx="4"/>
+        <text class="entry-t" x="44" y="38">POST /workflows/segment-connectivity/open-segment-rules</text>
+        <path class="f-arrow" d="M114,48 V136" marker-end="url(#ah-n)"/>
+
+        <!-- stage 1 -->
+        <rect class="fbox sm" x="30" y="142" width="168" height="112" rx="5"/>
+        <circle class="stepno sm" cx="52" cy="164" r="12"/>
+        <text class="stepno-t" x="52" y="168">1</text>
+        <text class="f-title" x="48" y="202">Create segment</text>
+        <text class="f-sys sm" x="48" y="222">Segments Manager</text>
+        <text class="f-det" x="48" y="240">born Locked</text>
+
+        <path class="f-arrow" d="M202,198 H234" marker-end="url(#ah-n)"/>
+
+        <!-- stage 2 -->
+        <rect class="fbox sm" x="238" y="142" width="168" height="112" rx="5"/>
+        <circle class="stepno sm" cx="260" cy="164" r="12"/>
+        <text class="stepno-t" x="260" y="168">2</text>
+        <text class="f-title" x="256" y="202">Find peers</text>
+        <text class="f-sys sm" x="256" y="222">Segments Manager</text>
+        <text class="f-det" x="256" y="240">same site only</text>
+
+        <path class="f-arrow" d="M410,198 H442" marker-end="url(#ah-n)"/>
+
+        <!-- stage 3 -->
+        <rect class="fbox nxt" x="446" y="142" width="168" height="112" rx="5"/>
+        <circle class="stepno nxt" cx="468" cy="164" r="12"/>
+        <text class="stepno-t" x="468" y="168">3</text>
+        <text class="f-title" x="464" y="202">Submit rules</text>
+        <text class="f-sys nxt" x="464" y="222">NEXT</text>
+        <text class="f-det" x="464" y="240">2 per peer, +1 BMC</text>
+
+        <path class="f-arrow" d="M618,198 H650" marker-end="url(#ah-n)"/>
+
+        <!-- stage 4 -->
+        <path class="f-arrow nxt" d="M700,138 C688,96 792,96 780,138" marker-end="url(#ah-nxt)"/>
+        <text class="loop-l" x="740" y="88">poll until every request completes</text>
+
+        <rect class="fbox nxt" x="654" y="142" width="168" height="112" rx="5"/>
+        <circle class="stepno nxt" cx="676" cy="164" r="12"/>
+        <text class="stepno-t" x="676" y="168">4</text>
+        <text class="f-title" x="672" y="202">Wait for approval</text>
+        <text class="f-sys nxt" x="672" y="222">NEXT &#183; a human</text>
+        <text class="f-det" x="672" y="240">no deadline: hours+</text>
+
+        <path class="f-arrow" d="M826,198 H858" marker-end="url(#ah-n)"/>
+
+        <!-- stage 5 -->
+        <rect class="fbox sm" x="862" y="142" width="168" height="112" rx="5"/>
+        <circle class="stepno sm" cx="884" cy="164" r="12"/>
+        <text class="stepno-t" x="884" y="168">5</text>
+        <text class="f-title" x="880" y="202">Unlock segment</text>
+        <text class="f-sys sm" x="880" y="222">Segments Manager</text>
+        <text class="f-det" x="880" y="240">Locked &#8594; Available</text>
+
+        <!-- status ribbon -->
+        <text class="mini" x="30" y="288">SEGMENT STATUS THROUGHOUT</text>
+        <rect class="rib lock" x="30"  y="298" width="168" height="26" rx="3"/>
+        <text class="rib-t" x="114" y="315">Locked</text>
+        <rect class="rib lock" x="238" y="298" width="168" height="26" rx="3"/>
+        <text class="rib-t" x="322" y="315">Locked</text>
+        <rect class="rib lock" x="446" y="298" width="168" height="26" rx="3"/>
+        <text class="rib-t" x="530" y="315">Locked</text>
+        <rect class="rib lock" x="654" y="298" width="168" height="26" rx="3"/>
+        <text class="rib-t" x="738" y="315">Locked</text>
+        <rect class="rib ok"   x="862" y="298" width="168" height="26" rx="3"/>
+        <text class="rib-t ok" x="946" y="315">Available</text>
+
+        <!-- failure strip -->
+        <rect class="failstrip" x="30" y="348" width="1000" height="34" rx="4"/>
+        <text class="fail-t hd" x="46" y="369">IF IT FAILS OR IS CANCELLED &#8594;</text>
+        <text class="fail-t" x="252" y="369">a failure note is published to the Segments Manager and the segment deliberately stays Locked.</text>
+      </svg>
+    </div>
+    <div class="diagram-caption">
+      <span class="swatch sm"><i></i>Segments Manager</span>
+      <span class="swatch nxt"><i></i>NEXT</span>
+      <span>Stages 1&#8211;5 all run inside one Temporal workflow; each is a retried activity.</span>
+    </div>
+
+    <h3 style="margin:40px 0 10px">The same run, in detail</h3>
+    <p class="lede" style="margin-bottom:24px">Each card carries a <code>phase</code> — the workflow's own
+    progress marker, held in the workflow object and updated as it moves between stages. It is not a Temporal
+    status (those are <code>RUNNING</code>, <code>COMPLETED</code>, <code>FAILED</code>); it is read live off a
+    running workflow through a Temporal <b>query</b>, which is how
+    <code>GET /workflows/runs/{workflow_id}</code> can tell you <em>where inside the run</em> a segment currently is.</p>
+
+    <div class="flow">
+
+      <!-- gate -->
+      <div class="step gate">
+        <div class="marker">✓</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>Type check</h3>
+            <span class="phase">phase <b>pending</b></span>
+          </div>
+          <p>Runs before anything is created. Supported types are <code>HC</code>, <code>INVENTORY</code>,
+          <code>PXE</code>, <code>MCE</code> — anything else fails the run immediately with
+          <code>UnsupportedSegmentType</code>. Nothing exists yet, so there is nothing to clean up.</p>
+        </div>
+      </div>
+
+      <!-- 1 -->
+      <div class="step">
+        <div class="marker">1</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>create_segment</h3>
+            <span class="phase">phase <b>creating-segment</b></span>
+          </div>
+          <p>The workflow creates the segment itself — the Segments Manager is a dependency, never the trigger.
+          The segment is born <b>Locked</b>. This call is also what validates the definition (site, CIDR, overlap, VLAN):
+          a bad definition surfaces here as a FAILED run, not as a 4xx on the trigger.</p>
+          <div class="calls">
+            <div class="call sm"><span class="verb">POST</span><span class="path">/api/segments <em>· Bearer</em></span></div>
+            <div class="call sm"><span class="verb">GET</span><span class="path">/api/segments/by-segment?segment=… <em>· only on 400/409/422, to tell “already created” from “invalid”</em></span></div>
+          </div>
+          <p class="note"><b>Safe to run twice.</b> Temporal retries this call, so “that CIDR already exists” must not be
+          an error. When the create comes back rejected, the activity sends a second request —
+          <code>GET /api/segments/by-segment?segment=…</code> — to see whether the segment is in fact already there,
+          and decides from what comes back: if it matches the definition you sent, it counts as done and the run
+          continues; if the CIDR exists with a <em>different</em> type, site, VLAN or EPG, it's a real clash and fails
+          with <code>SegmentConflictError</code>; if it isn't there at all, the definition itself was rejected.
+          <code>dhcp</code> isn't compared — it's editable after creation, so a changed value is a legitimate edit,
+          not a clash.</p>
+          <p class="note"><b>When does that actually happen?</b> Mostly when the create succeeded but this side never
+          found out: the response was lost, the worker was killed mid-call, or the activity timed out after the
+          Segments Manager had already committed. It also covers an operator re-triggering a segment an earlier run
+          created, and a segment somebody created by hand in the Segments Manager before running this.</p>
+        </div>
+      </div>
+
+      <!-- 2 -->
+      <div class="step">
+        <div class="marker">2</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>list_peer_segments</h3>
+            <span class="phase">phase <b>listing-peer-segments</b></span>
+          </div>
+          <p>Finds every <b>same-site</b> segment this type must peer with. Which types those are isn't hardcoded —
+          it's derived from the configured <code>PORTS_&lt;SRC&gt;_TO_&lt;DST&gt;</code> profiles. The port policy <em>is</em> the peering topology.</p>
+          <div class="calls">
+            <div class="call sm"><span class="verb">GET</span><span class="path">/api/segments?type=&lt;PEER_TYPE&gt; <em>· one per peer type, filtered to site in code</em></span></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 2b -->
+      <div class="step">
+        <div class="marker">2b</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>get_bmc_segment <span class="chip cfg" style="vertical-align:middle">MCE only</span></h3>
+          </div>
+          <p>MCE segments also need a rule to their site's BMC network. BMC isn't tracked by the Segments Manager,
+          so this is a pure config lookup from the shared <code>SITE_NETWORKS</code> topology. Resolved <em>before</em>
+          any submission, so a missing site fails cleanly instead of halfway through.</p>
+          <div class="calls">
+            <div class="call cfg"><span class="verb">CONFIG</span><span class="path">SITE_NETWORKS[&lt;site&gt;].bmc <em>· missing → BmcSegmentNotConfiguredError</em></span></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 3 -->
+      <div class="step">
+        <div class="marker">3</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>submit_open_rules × N</h3>
+            <span class="phase">phase <b>submitting-rules</b></span>
+          </div>
+          <p><b>Two requests per peer</b> — one in each direction — plus one <code>MCE → BMC</code> request if the segment is MCE.
+          All submitted in parallel. Each submission renews a token to NEXT first, then posts the rule with the port profile
+          for that direction. NEXT answers with a request id.</p>
+          <div class="calls">
+            <div class="call nxt"><span class="verb">POST</span><span class="path">$NEXT_URL$NEXT_TOKEN_RENEWAL_URI <em>· fresh token per call</em></span></div>
+            <div class="call nxt"><span class="verb">POST</span><span class="path">$NEXT_URL$NEXT_OPEN_RULES_URI <em>· → { id, status }</em></span></div>
+          </div>
+          <p class="note">Zero submissions (no same-site peers found) is a hard failure: <code>NoPeerSegments</code>.
+          A segment with nothing to connect to is a mistake, not a no-op.</p>
+        </div>
+      </div>
+
+      <!-- 4 -->
+      <div class="step">
+        <div class="marker">4</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>publish_request_ids</h3>
+          </div>
+          <p>Mirrors the pending NEXT request ids into the Segments Manager UI (behind the segment's “Requests ID” button),
+          together with <code>submitted_at</code> so the UI can show elapsed time. Replace-semantics PUT — republished
+          every time the pending set shrinks, and finally with an empty list, which removes the display.</p>
+          <div class="calls">
+            <div class="call sm"><span class="verb">PUT</span><span class="path">/api/segments/segment-connectivity-requests <em>· { segment, request_ids, submitted_at }</em></span></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 5 wait -->
+      <div class="step wait">
+        <div class="marker">⏸</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>Wait for human approval</h3>
+            <span class="phase">phase <b>awaiting-completion</b></span>
+          </div>
+          <p>Somebody has to approve those NEXT firewall requests. That takes minutes, hours, or longer — so the workflow
+          has <b>no deadline here at all</b>. It polls the request status on durable Temporal timers, which survive
+          worker restarts and deploys.</p>
+          <div class="loopbox">
+            <div class="loop-title">Poll loop — repeats until nothing is pending</div>
+            <ol>
+              <li>Sleep <code>NEXT_CHECKING_REQUEST_INTERVAL_SECONDS</code> (read once per run via <code>get_next_checking_request_interval</code>).</li>
+              <li><code>check_next_requests</code> → <code>GET $NEXT_CHECK_STATUS_URI/{id}</code> for every pending id, concurrently.</li>
+              <li>Statuses are <code>pending</code> or <code>complete</code>. Anything else fails the run loudly (<code>UnexpectedRequestStatus</code>).</li>
+              <li>If the pending set shrank → republish the ids so the UI stays accurate.</li>
+              <li>After <b>48 h of wall-clock time</b> → <code>continue_as_new</code>, carrying pending ids + <code>submitted_at</code>, so history stays bounded no matter how long approval takes.</li>
+            </ol>
+          </div>
+        </div>
+      </div>
+
+      <!-- 6 -->
+      <div class="step done">
+        <div class="marker">5</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>unlock_segment</h3>
+            <span class="phase">phase <b>unlocking-segment</b> → <b>completed</b></span>
+          </div>
+          <p>All rules open. The segment flips <b>Locked → Available</b> and the run returns its result.
+          Already-unlocked counts as success.</p>
+          <div class="calls">
+            <div class="call sm"><span class="verb">POST</span><span class="path">/api/segments/unlock <em>· { segment }</em></span></div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ======================= PEERING ======================= -->
+  <section id="peering">
+    <div class="sec-head">
+      <div class="eyebrow">Who connects to whom</div>
+      <h2>Peering matrix — one cell = one open-rules request</h2>
+      <p class="lede">Read a row as the source. Every ✓ is a separate submission to NEXT with its own request id and its own approval.
+      The matrix is not written in code — it is exactly the set of <code>PORTS_*</code> keys present in the ConfigMap.</p>
+    </div>
+    <div class="diagram topology">
+      <svg viewBox="0 0 660 380" role="img"
+           aria-label="Topology diagram: MCE sits at the centre and peers bidirectionally with HC, INVENTORY and PXE segments on the same site, two open-rules requests each. MCE additionally has a one-way link to the site's static BMC network.">
+        <defs>
+          <marker id="ah-e2" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0.5 L8,4 L0,7.5 Z"/></marker>
+          <marker id="ah-e1" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0.5 L8,4 L0,7.5 Z"/></marker>
+        </defs>
+
+        <!-- edges -->
+        <path class="edge two" d="M281,164 L134,86"  marker-start="url(#ah-e2)" marker-end="url(#ah-e2)"/>
+        <path class="edge two" d="M281,216 L134,294" marker-start="url(#ah-e2)" marker-end="url(#ah-e2)"/>
+        <path class="edge two" d="M379,164 L526,86"  marker-start="url(#ah-e2)" marker-end="url(#ah-e2)"/>
+        <path class="edge one" d="M379,216 L526,294" marker-end="url(#ah-e1)"/>
+
+        <rect x="164" y="110" width="86" height="17" rx="2" class="edge-mask"/>
+        <text class="edge-l" x="207" y="123">2 requests</text>
+        <rect x="164" y="245" width="86" height="17" rx="2" class="edge-mask"/>
+        <text class="edge-l" x="207" y="258">2 requests</text>
+        <rect x="410" y="110" width="86" height="17" rx="2" class="edge-mask"/>
+        <text class="edge-l" x="453" y="123">2 requests</text>
+        <rect x="404" y="245" width="98" height="17" rx="2" class="edge-mask"/>
+        <text class="edge-l" x="453" y="258">1 request</text>
+
+        <!-- nodes -->
+        <rect class="node-box peer" x="20"  y="34"  width="130" height="52" rx="4"/>
+        <text class="node-t" x="85"  y="56">HC</text>
+        <text class="node-s" x="85"  y="72">hosted cluster</text>
+
+        <rect class="node-box peer" x="20"  y="294" width="130" height="52" rx="4"/>
+        <text class="node-t" x="85"  y="316">INVENTORY</text>
+        <text class="node-s" x="85"  y="332">same site only</text>
+
+        <rect class="node-box peer" x="510" y="34"  width="130" height="52" rx="4"/>
+        <text class="node-t" x="575" y="56">PXE</text>
+        <text class="node-s" x="575" y="72">same site only</text>
+
+        <rect class="node-box bmc"  x="510" y="294" width="130" height="52" rx="4"/>
+        <text class="node-t" x="575" y="316">BMC</text>
+        <text class="node-s" x="575" y="332">static · SITE_NETWORKS</text>
+
+        <rect class="node-box mce"  x="265" y="164" width="130" height="52" rx="4"/>
+        <text class="node-t" x="330" y="186">MCE</text>
+        <text class="node-s" x="330" y="202">peers with all three</text>
+      </svg>
+    </div>
+    <div class="diagram-caption">
+      <span class="swatch sm"><i></i>bidirectional — a rule is opened each way</span>
+      <span class="swatch nxt"><i class="dash"></i>one-way, MCE runs only</span>
+    </div>
+
+    <div class="table-scroll" style="margin-top:20px">
+      <table class="matrix">
+        <thead>
+          <tr>
+            <th>from ↓ &nbsp; to →</th>
+            <th>MCE</th><th>HC</th><th>INVENTORY</th><th>PXE</th><th>BMC <span style="text-transform:none;letter-spacing:0">(static)</span></th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <th>MCE</th>
+            <td class="self">—</td>
+            <td class="yes">✓</td><td class="yes">✓</td><td class="yes">✓</td>
+            <td class="oneway">✓ one-way</td>
+          </tr>
+          <tr>
+            <th>HC</th>
+            <td class="yes">✓</td><td class="self">—</td><td class="no">·</td><td class="no">·</td><td class="no">·</td>
+          </tr>
+          <tr>
+            <th>INVENTORY</th>
+            <td class="yes">✓</td><td class="no">·</td><td class="self">—</td><td class="no">·</td><td class="no">·</td>
+          </tr>
+          <tr>
+            <th>PXE</th>
+            <td class="yes">✓</td><td class="no">·</td><td class="no">·</td><td class="self">—</td><td class="no">·</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="grid-2" style="margin-top:16px">
+      <div class="panel">
+        <h3>It works in both directions, by construction</h3>
+        <p style="font-size:13.5px;color:var(--ink-2)">Adding an <b>HC</b> segment discovers the site's existing MCE segments and opens
+        <code>HC↔MCE</code> for each. Adding an <b>MCE</b> segment discovers every existing HC, INVENTORY and PXE segment on that site
+        and opens all of those pairs. So a site converges to full connectivity whatever order segments are added in.</p>
+        <p style="font-size:13.5px;color:var(--ink-2)"><b>With one exception: a site needs its MCE segment first.</b>
+        HC, INVENTORY and PXE peer only with MCE, so on a site that has none there is nothing to open rules against —
+        the run fails with <code>NoPeerSegments</code> rather than creating a segment nothing can reach.</p>
+      </div>
+      <div class="panel">
+        <h3>How many requests will a run make?</h3>
+        <p style="font-size:13.5px;color:var(--ink-2)"><span class="mono">2 × (same-site peers found)</span>, plus <span class="mono">1</span> if the segment is MCE (the BMC rule).
+        A new HC segment on a site with 3 MCE segments submits 6 requests; a new MCE segment on a site with 2 HC + 1 PXE submits 7.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================= API ======================= -->
+  <section id="api">
+    <div class="sec-head">
+      <div class="eyebrow">HTTP surface</div>
+      <h2>How you start it and how you watch it</h2>
+      <p class="lede">Served by <code>workflows-orchestrator-api</code> (Swagger at <code>/docs</code>). Starting is always async —
+      approval is human-driven, so nothing here ever blocks on the outcome.</p>
+    </div>
+
+    <div class="api">
+
+      <div class="endpoint">
+        <div class="endpoint-head">
+          <span class="method">POST</span>
+          <span class="path">/workflows/segment-connectivity/open-segment-rules</span>
+          <span class="ret">202 · 409 if already running</span>
+        </div>
+        <div class="endpoint-body">
+          <p>Body is the full segment <b>definition</b> — you are not referencing an existing segment, you are asking for one to be created and connected.</p>
+          <pre><span class="c">// request</span>
+{
+  "segment":  "130.154.20.0/24",   <span class="c">// CIDR</span>
+  "type":     "HC",                <span class="c">// MCE | HC | INVENTORY | PXE</span>
+  "site":     "site-a",
+  "vlan_id":  412,                 <span class="c">// 1–4094</span>
+  "epg_name": "epg-hc-412",
+  "dhcp":     true                 <span class="c">// optional, defaults true</span>
+}
+
+<span class="c">// 202 response</span>
+{ "workflow_id": "open-segment-rules-HC-130.154.20.0", "run_id": "…" }</pre>
+          <p class="note"><b>Deduplication is free.</b> The workflow id is derived from type + network address (the CIDR mask is dropped),
+          so re-triggering the same segment while a run is in flight returns <b>409</b> instead of starting a second run.</p>
+        </div>
+      </div>
+
+      <div class="endpoint">
+        <div class="endpoint-head">
+          <span class="method">POST</span>
+          <span class="path">/workflows/segment-connectivity/open-segment-rules/bulk</span>
+          <span class="ret">202 · always</span>
+        </div>
+        <div class="endpoint-body">
+          <p>Takes <code>{ "segments": [ …definitions… ] }</code> and starts <b>one workflow per segment</b>, never one batch workflow —
+          each segment gets its own dedup id, its own approval, and its own failure. Row 7 being bad must not sink row 8.</p>
+          <pre><span class="c">// 202 response — a per-item report, not a single pass/fail</span>
+{
+  "started": 2, "already_running": 1, "failed": 0,
+  "results": [
+    { "segment": "130.154.20.0/24", "workflow_id": "open-segment-rules-HC-130.154.20.0",
+      "status": "started", "run_id": "…" },
+    { "segment": "130.154.30.0/24", "workflow_id": "open-segment-rules-MCE-130.154.30.0",
+      "status": "already_running" }
+  ]
+}</pre>
+        </div>
+      </div>
+
+      <div class="endpoint">
+        <div class="endpoint-head">
+          <span class="method">GET</span>
+          <span class="path">/workflows/runs/{workflow_id}</span>
+          <span class="ret">200 · 404 if unknown id</span>
+        </div>
+        <div class="endpoint-body">
+          <p>One status endpoint for every domain and every workflow — workflow ids are globally unique, so the path needs neither.
+          While RUNNING it returns live <code>progress</code>; when COMPLETED, the <code>result</code>; when FAILED, the root-cause <code>error</code>.</p>
+          <pre><span class="c">// RUNNING</span>
+{ "workflow_id": "open-segment-rules-HC-130.154.20.0",
+  "workflow_type": "OpenSegmentRulesWorkflow", "status": "RUNNING",
+  "progress": { "phase": "awaiting-completion", "total_requests": 6, "pending_requests": 2 } }
+
+<span class="c">// COMPLETED</span>
+{ …, "status": "COMPLETED",
+  "result": { "segment": "130.154.20.0/24", "type": "HC",
+              "peer_segment_count": 3, "request_ids": [101,102,103,104,105,106] } }</pre>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ======================= FAILURE ======================= -->
+  <section id="failure">
+    <div class="sec-head">
+      <div class="eyebrow">When things go wrong</div>
+      <h2>Outages are out-waited. Real errors stop the run and get published.</h2>
+      <p class="lede">The single most important rule: <b>retries are unbounded</b>. Every activity retries forever
+      (1 s → doubling → capped at 1 min, 90 s per attempt), so a Segments Manager or NEXT outage never fails a run — it just waits.
+      Retrying stops <em>only</em> for errors explicitly classified as permanent.</p>
+    </div>
+
+    <div class="grid-2">
+      <div class="panel alarm">
+        <h3>Classified as permanent — these fail the run</h3>
+        <ul>
+          <li><code>SegmentValidationError</code> — the Segments Manager rejected the definition</li>
+          <li><code>SegmentConflictError</code> — that CIDR exists with different attributes</li>
+          <li><code>SegmentNotFoundError</code> — segment vanished mid-run</li>
+          <li><code>SegmentsManagerAuthError</code> — 401/403; check <code>SEGMENTS_MANAGER_API_TOKEN</code></li>
+          <li><code>BmcSegmentNotConfiguredError</code> — site missing from <code>SITE_NETWORKS</code></li>
+          <li><code>UnsupportedSegmentType</code> · <code>NoPeerSegments</code> — raised by the workflow itself</li>
+          <li><code>PortProfileMissing</code> · <code>PeerTypesNotConfigured</code> — a <code>PORTS_*</code> config gap</li>
+          <li><code>UnexpectedRequestStatus</code> — NEXT reported something other than pending/complete</li>
+        </ul>
+      </div>
+      <div class="panel">
+        <h3>Anything unclassified retries forever</h3>
+        <p style="font-size:13.5px;color:var(--ink-2)">This is deliberate, and it has a diagnostic signature worth recognising:
+        a run that is genuinely stuck on a permanent-but-unclassified error shows as <b>RUNNING</b> in the Temporal UI, not FAILED,
+        with the error attached to the retrying activity. If you see that, the fix is to classify the error — not to add a deadline.</p>
+        <h3 style="margin-top:6px">Timeout budget</h3>
+        <p style="font-size:13.5px;color:var(--ink-2)">HTTP client 60 s &lt; activity <code>start_to_close</code> 90 s, so a hung
+        connection fails the call and frees the worker before Temporal reaps it.</p>
+      </div>
+    </div>
+
+    <div class="panel" style="margin-top:16px">
+      <h3>Terminal failure is surfaced, never silent</h3>
+      <p style="font-size:13.5px;color:var(--ink-2)">
+        If a run fails after the segment exists — or is cancelled — a best-effort compensation step clears the pending-ids
+        display and publishes an <code>open-segment-rules workflow failed</code> note carrying the orphaned request ids,
+        so the segment isn't left looking Locked for no reason.
+        The segment <b>stays Locked on purpose</b>: connectivity was never established.</p>
+      <div class="calls">
+        <div class="call sm"><span class="verb">PUT</span><span class="path">/api/segments/segment-connectivity-requests <em>· { request_ids: [] } — clear the display</em></span></div>
+        <div class="call sm"><span class="verb">PUT</span><span class="path">/api/segments/segment-connectivity-failure <em>· { segment, message }</em></span></div>
+      </div>
+      <p class="note">Best-effort means best-effort: 3 quick attempts, and any error is swallowed so it can never mask the real failure.
+      Note that <b>terminating</b> a workflow (as opposed to cancelling it) skips this cleanup entirely — prefer cancel.</p>
+    </div>
+  </section>
+
+  <!-- ======================= REFERENCE ======================= -->
+  <section id="reference">
+    <div class="sec-head">
+      <div class="eyebrow">Reference</div>
+      <h2>Inputs, phases, and the knobs an operator can turn</h2>
+    </div>
+
+    <h3 style="margin-bottom:10px">Request body — <code>OpenSegmentRulesInput</code></h3>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>Field</th><th>Type</th><th>Rules</th><th>What it's for</th></tr></thead>
+        <tbody>
+          <tr><td class="k">segment</td><td class="k">str</td><td class="muted">non-empty, CIDR</td><td class="muted">The network, e.g. <code>130.154.20.0/24</code>. Also the identity used everywhere downstream.</td></tr>
+          <tr><td class="k">type</td><td class="k">enum</td><td class="muted">MCE · HC · INVENTORY · PXE</td><td class="muted">Decides which peers are discovered and which port profiles apply.</td></tr>
+          <tr><td class="k">site</td><td class="k">str</td><td class="muted">non-empty</td><td class="muted">Peering is strictly same-site. Also selects the BMC network for MCE.</td></tr>
+          <tr><td class="k">vlan_id</td><td class="k">int</td><td class="muted nums">1–4094</td><td class="muted">Passed straight through to the Segments Manager.</td></tr>
+          <tr><td class="k">epg_name</td><td class="k">str</td><td class="muted">non-empty</td><td class="muted">Passed straight through to the Segments Manager.</td></tr>
+          <tr><td class="k">dhcp</td><td class="k">bool</td><td class="muted">default <code>true</code></td><td class="muted">Editable later, so it's ignored when matching an already-existing segment.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note" style="margin-top:10px">Semantic validation (site exists, CIDR fits the site prefix, no overlap, VLAN free) is the
+    Segments Manager's job — it's the validator of record. That's why a bad definition shows up as a FAILED run rather than a 400.</p>
+
+    <h3 style="margin:28px 0 10px">Phases you'll see on the status endpoint</h3>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>phase</th><th>Meaning</th><th>Normal duration</th></tr></thead>
+        <tbody>
+          <tr><td class="k">pending</td><td class="muted">Run accepted, type not yet checked</td><td class="muted">instant</td></tr>
+          <tr><td class="k">creating-segment</td><td class="muted">Creating the segment in the Segments Manager</td><td class="muted">seconds</td></tr>
+          <tr><td class="k">listing-peer-segments</td><td class="muted">Discovering same-site peers (+ BMC for MCE)</td><td class="muted">seconds</td></tr>
+          <tr><td class="k">submitting-rules</td><td class="muted">Posting open-rules requests to NEXT in parallel</td><td class="muted">seconds</td></tr>
+          <tr><td class="k">awaiting-completion</td><td class="muted">Polling NEXT — <b>waiting on a human</b></td><td class="muted">minutes → hours+</td></tr>
+          <tr><td class="k">unlocking-segment</td><td class="muted">Flipping Locked → Available</td><td class="muted">seconds</td></tr>
+          <tr><td class="k">completed</td><td class="muted">Done; <code>result</code> is available</td><td class="muted">—</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 style="margin:28px 0 10px">Operator knobs — change these without a rebuild</h3>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>Key</th><th>Lives in</th><th>Effect</th></tr></thead>
+        <tbody>
+          <tr><td class="k">NEXT_CHECKING_REQUEST_INTERVAL_SECONDS</td><td class="muted">segment-connectivity-config</td><td class="muted">Poll cadence while waiting for approval. Fast locally, slow in prod.</td></tr>
+          <tr><td class="k">PORTS_&lt;SRC&gt;_TO_&lt;DST&gt;</td><td class="muted">segment-connectivity-config</td><td class="muted">Per-direction port policy <em>and</em> the peering topology. e.g. <code>{"tcp":["30000-32767"],"udp":["9000"]}</code></td></tr>
+          <tr><td class="k">SITE_NETWORKS</td><td class="muted">segment-connectivity-config</td><td class="muted">Shared site topology; this service reads each site's <code>bmc</code> CIDR.</td></tr>
+          <tr><td class="k">NEXT_URL · NEXT_*_URI · NEXT_GROUP</td><td class="muted">segment-connectivity-config</td><td class="muted">Where NEXT lives, its paths, and the AD group every request is attributed to.</td></tr>
+          <tr><td class="k">SEGMENTS_MANAGER_URL · DOMAIN</td><td class="muted">workflows-orchestrator-config</td><td class="muted">Shared by every domain — the brain release owns this ConfigMap.</td></tr>
+          <tr><td class="k">SEGMENTS_MANAGER_API_TOKEN</td><td class="muted">Secret</td><td class="muted">Bearer token for mutating calls. GETs are public.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note" style="margin-top:10px">All <code>PORTS_*</code> and <code>SITE_NETWORKS</code> values are validated at
+    <b>worker startup</b> — a typo crash-loops the pod immediately instead of failing a workflow hours in.</p>
+  </section>
+
+  <!-- ======================= RE-RUNNING ======================= -->
+  <!-- The general principles that used to sit here (the workflow is the entry
+       point · unbounded human waits · idempotency as a requirement · brain and
+       limbs are separate deployments) hold for EVERY workflow, so they moved to
+       the orchestrator guide. What stays is what "again" means for THIS run. -->
+  <section id="rerun">
+    <div class="sec-head">
+      <div class="eyebrow">Operating it</div>
+      <h2>What happens if you run the same segment again</h2>
+      <p class="lede">Idempotency is a rule of the orchestrator — see
+      <a href="/#principles">the three rules that surprise people</a> in the guide. What it buys you
+      <em>here</em>, and the one part that is not free, is worth being precise about.</p>
+    </div>
+
+    <div class="grid-2">
+      <div class="panel ok">
+        <h3>Retried inside a live run — nothing is redone</h3>
+        <p>A worker crash, a redeploy, a <code>continue_as_new</code>: finished steps are never re-executed.
+        Temporal replays their recorded results from history, so NEXT is not asked to open the same rules twice
+        and the approval you are already waiting on is not restarted.</p>
+        <p>And while a run is in flight there is no second run at all — the deterministic workflow id
+        <code>open-segment-rules-&lt;TYPE&gt;-&lt;network&gt;</code> makes the trigger answer <b>409</b>
+        (<code>already_running</code> in the bulk report).</p>
+      </div>
+
+      <div class="panel warn">
+        <h3>A brand-new run costs a second approval</h3>
+        <p>Trigger the same segment again <em>after</em> the previous run ended and it starts from step 1 with no
+        memory of it. <code>create_segment</code> and <code>unlock_segment</code> no-op, and
+        <code>publish_request_ids</code> is a replace-style PUT — but it <b>will</b> submit fresh open-rules
+        requests to NEXT, with new request ids that need new human approval.</p>
+        <p>The firewall converges to the same state and the old ids are simply orphaned, so nothing breaks.
+        It is not destructive — it is just slow, and it puts a human back in the loop.</p>
+      </div>
+    </div>
+
+    <p class="note" style="margin-top:16px"><b>Per-activity behaviour:</b> <code>create_segment</code> accepts an
+    existing segment that matches the definition and fails with <code>SegmentConflictError</code> only on genuine
+    disagreement (<code>dhcp</code> excluded — it is editable after creation); <code>unlock_segment</code> treats
+    "already unlocked" as success; <code>submit_open_rules</code> converges, worst case leaving an orphan request id
+    nobody polls.</p>
+  </section>
+
+  <footer>
+    <span>workflows/open_segment_rules.py</span>
+    <span>activities/segment_connectivity/activities.py</span>
+    <span>workflows/routers/segment_connectivity.py</span>
+    <span>shared/models/segment_connectivity.py</span>
+  </footer>
+
+</div>
+</main>
+
+<script src="/assets/nav.js" defer></script>
+</body>
+</html>

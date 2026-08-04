@@ -1,9 +1,10 @@
 name: Build and Push
 
-# Three images from this one repo: the workflow "brain" (workflows/Dockerfile),
-# the segment-connectivity activity "limb" (activities/segment_connectivity/Dockerfile), and
+# Four images from this one repo: the workflow "brain" (workflows/Dockerfile),
+# the segment-connectivity activity "limb" (activities/segment_connectivity/Dockerfile),
 # the test-only mock of the next service (dev/mock-segment-connectivity/Dockerfile),
-# deployed via helm/mock-segment-connectivity for e2e testing (see CLAUDE.md section 4).
+# deployed via helm/mock-segment-connectivity for e2e testing (see CLAUDE.md section 4),
+# and the documentation site (docs/Dockerfile), which carries no code at all.
 
 on:
   push:
@@ -57,6 +58,23 @@ jobs:
       helm-image-path: image
     secrets: inherit
 
+  build-workflows-docs:
+    if: github.event_name == 'push'
+    # Same sequential chain as the others: every one of these calls bumps the
+    # same shared vX.Y.Z git tag in this repo, so they cannot run in parallel.
+    needs: build-mock-segment-connectivity
+    uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
+    with:
+      # The docs site. Its own Argo service (workflows-docs) rather than a page
+      # bolted onto the API pod: it is static, holds no credentials and must stay
+      # readable when the orchestrator itself is down or being redeployed.
+      image-name: workflows-docs
+      dockerfile: docs/Dockerfile
+      chart-repo: team-redbull/helm-charts-workflows-docs
+      helm-values-path: values.yaml
+      helm-image-path: image
+    secrets: inherit
+
   cleanup-workflow-brain-on-delete:
     if: github.event_name == 'delete'
     uses: team-redbull/.github/.github/workflows/ghcr-cleanup-on-delete.yml@main
@@ -76,4 +94,11 @@ jobs:
     uses: team-redbull/.github/.github/workflows/ghcr-cleanup-on-delete.yml@main
     with:
       image-name: mock-segment-connectivity
+    secrets: inherit
+
+  cleanup-workflows-docs-on-delete:
+    if: github.event_name == 'delete'
+    uses: team-redbull/.github/.github/workflows/ghcr-cleanup-on-delete.yml@main
+    with:
+      image-name: workflows-docs
     secrets: inherit

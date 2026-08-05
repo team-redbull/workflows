@@ -1,7 +1,7 @@
 name: Build and Push
 
 # Four images from this one repo: the workflow "brain" (workflow_domains/Dockerfile),
-# the segment-lifecycle activity "limb" (activities/segment_lifecycle/Dockerfile),
+# the segment-lifecycle activity worker "limb" (activities/segment_lifecycle/Dockerfile),
 # the test-only mock of the next service (dev/mock-segment-connectivity/Dockerfile),
 # deployed via helm/mock-segment-connectivity for e2e testing (see CLAUDE.md section 4),
 # and the documentation site (docs/Dockerfile), which carries no code at all.
@@ -30,7 +30,7 @@ jobs:
       helm-image-path: image
     secrets: inherit
 
-  build-segment-lifecycle:
+  build-segment-lifecycle-worker:
     if: github.event_name == 'push'
     # Kept sequential after the brain only to avoid two jobs pushing the mock/code
     # repo at once; the two Argo charts bump SEPARATE helm-charts repos so they no
@@ -38,9 +38,9 @@ jobs:
     needs: build-workflow-brain
     uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
     with:
-      image-name: segment-lifecycle
+      image-name: segment-lifecycle-worker
       dockerfile: activities/segment_lifecycle/Dockerfile
-      chart-repo: team-redbull/helm-charts-segment-lifecycle
+      chart-repo: team-redbull/helm-charts-segment-lifecycle-worker
       helm-values-path: values.yaml
       helm-image-path: activityWorker.image
     secrets: inherit
@@ -49,7 +49,7 @@ jobs:
     if: github.event_name == 'push'
     # Sequential, not parallel: all three calls bump the same shared vX.Y.Z git
     # tag and commit+push to the same branch; running in parallel races.
-    needs: build-segment-lifecycle
+    needs: build-segment-lifecycle-worker
     uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
     with:
       image-name: mock-segment-connectivity
@@ -82,11 +82,11 @@ jobs:
       image-name: workflows
     secrets: inherit
 
-  cleanup-segment-lifecycle-on-delete:
+  cleanup-segment-lifecycle-worker-on-delete:
     if: github.event_name == 'delete'
     uses: team-redbull/.github/.github/workflows/ghcr-cleanup-on-delete.yml@main
     with:
-      image-name: segment-lifecycle
+      image-name: segment-lifecycle-worker
     secrets: inherit
 
   cleanup-mock-segment-connectivity-on-delete:

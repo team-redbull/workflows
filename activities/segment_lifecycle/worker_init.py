@@ -1,8 +1,10 @@
-"""Segment-lifecycle activity worker — the execution "limb" deployment.
+"""Segment-lifecycle activity worker — the `segment-lifecycle-worker` deployment.
 
 Registers the segment-lifecycle activities and polls the segment-lifecycle activity
-queue. Workflows are NOT registered here: the brain runs in its own deployment
-on a separate queue (see workflow_domains/main_worker_init.py).
+queue. The deployment carries the `-worker` suffix because it is a process; the
+queue it polls does not, because that queue belongs to the DOMAIN and is shared by
+every workflow in it. Workflows are NOT registered here: the brain runs in its own
+deployment on a separate queue (see workflow_domains/main_worker_init.py).
 
 Connects with the Pydantic data converter so that Pydantic models serialize
 correctly across the workflow boundary.

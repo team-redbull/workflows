@@ -29,7 +29,7 @@ helm/mock-segment-connectivity/   The ONLY chart still in this repo (e2e only)
 Prod charts live in their OWN repos (Argo CD, one per service — the ApplicationSet
 derives `helm-charts-<service>` from the service folder name in redbull-platform):
 `helm-charts-workflows-orchestrator` (brain: ONE release for all domains) and
-`helm-charts-segment-lifecycle` (limb: one per domain). CI here bumps their image
+`helm-charts-segment-lifecycle-worker` (limb: one per domain). CI here bumps their image
 tags cross-repo.
 
 - **Workflows and activities are fundamentally separate:** code, deployments, images, task queues,
@@ -57,14 +57,20 @@ tags cross-repo.
 - **Brain is ONE deployment for every domain**, not one per workflow — `helm-charts-workflows-orchestrator` is
   standalone, deployed once. Each new domain adds `activities/<domain>/` + a `helm-charts-<domain>` chart repo and
   registers against the already-running brain.
-- **Resource naming:** brain Deployment + ServiceAccount = `workflows-orchestrator`; its trigger API =
-  `workflows-orchestrator-api` (reuses the `workflows-orchestrator` SA). Each domain's Deployment + SA
-  is named by the domain only — e.g. `segment-lifecycle`, NOT
-  `segment-lifecycle-activity-worker`. Chart/release names match resource names.
+- **Resource naming — `-worker` names the POD, the bare domain names the DOMAIN.** Brain Deployment +
+  ServiceAccount = `workflows-orchestrator`; its trigger API = `workflows-orchestrator-api` (reuses the
+  `workflows-orchestrator` SA). Each domain's Deployment + SA is `<domain>-worker` — e.g.
+  `segment-lifecycle-worker`. The suffix is deliberate: a bare `segment-lifecycle` sitting next to
+  `workflows-orchestrator` in the namespace reads as a peer microservice ("the segment lifecycle
+  service"), when it is really the activity worker that implements that domain's activities and polls
+  its queue. `-worker` says "queue-polling process"; `-activity` would collide exactly with the queue
+  name, and `-domain` collides with `DOMAIN` (the DNS domain, section 3). Chart/release/image/Argo-app
+  names match resource names, so all of those carry `-worker` too.
 - **Domain vs workflow naming — one domain holds MANY workflows.** Anything shared by every workflow
-  in a domain is named after the DOMAIN: the activity queue (`segment-lifecycle-activity`), the
-  limb Deployment/SA/ConfigMap, `shared/models|interfaces/<domain>.py`, and the API PREFIX
-  `/workflows/<domain>`. Anything belonging to ONE workflow is named after the WORKFLOW: its module
+  in a domain is named after the DOMAIN: the activity queue (`segment-lifecycle-activity`), the limb
+  ConfigMap (`<domain>-config`), `shared/models|interfaces/<domain>.py`, and the API PREFIX
+  `/workflows/<domain>` — NOT the limb Deployment/SA, which are the process and take `-worker` per
+  the rule above. Anything belonging to ONE workflow is named after the WORKFLOW: its module
   (`workflow_domains/segment_lifecycle/open_segment_rules.py`), its class, its own task queue
   (`open-segment-rules-workflow`), its workflow ids (`open-segment-rules-<TYPE>-<network>`), its
   RunArgs/ResumeState/Progress/Result models, and its ROUTE under the domain prefix. Workflow ids
@@ -102,7 +108,7 @@ tags cross-repo.
   token-renews (`NEXT_TOKEN_RENEWAL_URI`), POSTs open-rules (`NEXT_OPEN_RULES_URI`), and polls status
   (`NEXT_CHECK_STATUS_URI`) against `NEXT_URL`, **trusting responses** (structural parse only).
 - `dev/mock-segment-connectivity/` stands in for e2e/test, isolated from prod paths; deployed via
-  `helm/mock-segment-connectivity/` (never alongside a prod `segment-lifecycle` release). Point
+  `helm/mock-segment-connectivity/` (never alongside a prod `segment-lifecycle-worker` release). Point
   `config.nextUrl` at its Service in test, at the real service in prod. Its `COMPLETION_DELAY_SECONDS`
   (set in that chart's config.yaml — edit + restart, no rebuild) simulates the human approval.
 - **Approval is HUMAN-driven and unbounded** (minutes → hours → more). Workflows must never
@@ -194,7 +200,7 @@ tags cross-repo.
 - **`shared/settings.py`** groups: `TemporalSettings` (workers + api.py) and
   `SegmentLifecycleActivitySettings` (activity worker only). Field names = Helm ConfigMap/Secret keys
   lowercased — keep aligned with `helm-charts-workflows-orchestrator/templates/config.yaml` (global) and
-  `helm-charts-segment-lifecycle/templates/config.yaml` (connectivity keys + token Secret). Which ConfigMap
+  `helm-charts-segment-lifecycle-worker/templates/config.yaml` (connectivity keys + token Secret). Which ConfigMap
   a key lives in is INDEPENDENT of which settings class declares it (pydantic reads the flat merged pod
   env — `DOMAIN`/`SEGMENTS_MANAGER_URL` sit in the global ConfigMap yet stay
   `SegmentLifecycleActivitySettings` fields; the brain ignores extras via `extra="ignore"`). Do NOT
@@ -207,9 +213,9 @@ tags cross-repo.
 
 - Three charts, NONE creates a Namespace (all deploy into whichever namespace the release targets —
   `helm install -n <ns> [--create-namespace]`, or redbull-platform's `namespaces` release pre-creates
-  it): `helm-charts-workflows-orchestrator` (ConfigMap + brain + SA), `helm-charts-segment-lifecycle` (ConfigMap + Secret +
+  it): `helm-charts-workflows-orchestrator` (ConfigMap + brain + SA), `helm-charts-segment-lifecycle-worker` (ConfigMap + Secret +
   limb + SA), `helm/mock-segment-connectivity/` (ConfigMap + Deployment + Service + SA) — the last for
-  e2e/test ONLY, never alongside a prod `segment-lifecycle` release. For a bare kind/uvicorn run
+  e2e/test ONLY, never alongside a prod `segment-lifecycle-worker` release. For a bare kind/uvicorn run
   without a chart, run the mock directly (`uvicorn app:app` in `dev/mock-segment-connectivity/`) and
   point `config.nextUrl` at it.
 - Assumed already running: a Temporal server and the Segments Manager (via OpenShift routes or

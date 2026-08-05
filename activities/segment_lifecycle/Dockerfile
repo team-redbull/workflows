@@ -1,5 +1,5 @@
-# Segment-lifecycle activity "limb" image. Build from the REPO ROOT so shared/ is in context:
-#   docker build -f activities/segment_lifecycle/Dockerfile -t segment-lifecycle:dev .
+# Segment-lifecycle activity worker "limb" image. Build from the REPO ROOT so shared/ is in context:
+#   docker build -f activities/segment_lifecycle/Dockerfile -t segment-lifecycle-worker:dev .
 FROM python:3.12-slim
 
 WORKDIR /app

@@ -22,7 +22,7 @@ them without duplication), yet stay fields on SegmentLifecycleActivitySettings â
 only the activity worker requires them, and it mounts workflows-orchestrator-config +
 segment-lifecycle-config together. Keep the files aligned:
 helm-charts-workflows-orchestrator/templates/config.yaml   (workflows-orchestrator-config: temporal + domain + segments-manager url)
-helm-charts-segment-lifecycle/templates/config.yaml        (segment-lifecycle-config: next URIs + ports; + the token Secret)
+helm-charts-segment-lifecycle-worker/templates/config.yaml (segment-lifecycle-config: next URIs + ports; + the token Secret)
 
 Do NOT import this module from inside a workflow definition (it runs in the
 sandbox) â€” only from worker entrypoints, api.py, and activity

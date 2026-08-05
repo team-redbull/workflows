@@ -1,6 +1,6 @@
 # -- Segment-lifecycle domain --
 # Queue names are scoped differently ON PURPOSE. The ACTIVITY queue belongs to
-# the DOMAIN: one activity-worker deployment (`segment-lifecycle`) owns that
+# the DOMAIN: one activity-worker deployment (`segment-lifecycle-worker`) owns that
 # domain's dependency + credential set, and every workflow in the domain routes
 # its activities there. Each WORKFLOW gets its OWN workflow queue, so a second
 # workflow in this domain (e.g. a future close-segment-rules) registers on its

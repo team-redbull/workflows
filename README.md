@@ -34,7 +34,7 @@ workflow_domains/                 The brain — one folder per domain, plus main
 activities/segment_lifecycle/     The limb (activity impls + worker_init.py)
 dev/mock-segment-connectivity/    LOCAL-DEV stand-in for the next service (black box)
 (chart: helm-charts-workflows-orchestrator repo)  the brain — ONE release, shared by every domain
-(chart: helm-charts-segment-lifecycle repo)       the segment-lifecycle limb
+(chart: helm-charts-segment-lifecycle-worker)     the segment-lifecycle-worker limb
 ```
 
 Worker-file naming convention: the workflow (brain) worker is
@@ -119,7 +119,7 @@ segments actually got a workflow.
 - **next is a black box:** the orchestrator token-renews and HTTP-calls `NEXT_URL`;
   `dev/mock-segment-connectivity` is the dev-only stand-in and is NOT deployed by the chart —
   `config.nextUrl` simply points at it in dev and at the real service in prod.
-- **Ports live in the ConfigMap** (`helm-charts-segment-lifecycle/templates/config.yaml`), as
+- **Ports live in the ConfigMap** (`helm-charts-segment-lifecycle-worker/templates/config.yaml`), as
   compact JSON per protocol; the activity layer expands them into the next API's
   structure and validates the syntax at worker startup. Changing ports = edit the
   ConfigMap + restart the activity workers. No rebuild.
@@ -179,12 +179,12 @@ and the segment unlocks.
 
 ```bash
 docker build -f workflow_domains/Dockerfile -t workflows:dev .
-docker build -f activities/segment_lifecycle/Dockerfile -t segment-lifecycle:dev .
+docker build -f activities/segment_lifecycle/Dockerfile -t segment-lifecycle-worker:dev .
 docker build -t mock-segment-connectivity:dev dev/mock-segment-connectivity   # run outside the chart
 
-kind load docker-image workflows:dev segment-lifecycle:dev --name prep-temporal
+kind load docker-image workflows:dev segment-lifecycle-worker:dev --name prep-temporal
 helm install workflows-orchestrator ../helm-charts-workflows-orchestrator -n redbull-workflows --create-namespace
-helm install segment-lifecycle ../helm-charts-segment-lifecycle -n redbull-workflows
+helm install segment-lifecycle-worker ../helm-charts-segment-lifecycle-worker -n redbull-workflows
 ```
 
 Neither chart creates the namespace itself — `--create-namespace` on the first
@@ -206,8 +206,8 @@ helm install workflows-orchestrator ../helm-charts-workflows-orchestrator -n red
 
 # The limb only sets its own next endpoints + token; it reads the global values
 # from workflows-orchestrator-config above.
-helm install segment-lifecycle ../helm-charts-segment-lifecycle -n redbull-workflows \
-  --set activityWorker.image.repository=<registry>/segment-lifecycle \
+helm install segment-lifecycle-worker ../helm-charts-segment-lifecycle-worker -n redbull-workflows \
+  --set activityWorker.image.repository=<registry>/segment-lifecycle-worker \
   --set config.nextUrl=https://<real-next-service> \
   --set config.nextTokenRenewalUri=<real-path> \
   --set config.nextOpenRulesUri=<real-path> \

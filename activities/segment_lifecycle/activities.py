@@ -1,6 +1,6 @@
 """Segment-lifecycle activity implementations — the execution limbs.
 
-These run in the segment-lifecycle activity deployment. They talk to:
+These run in the `segment-lifecycle-worker` deployment. They talk to:
   - the team's Segments Manager (SEGMENTS_MANAGER_URL) — create/list segments,
     publish request ids, unlock (Bearer token via SEGMENTS_MANAGER_API_TOKEN;
     GETs are public)

@@ -1,17 +1,17 @@
 """open-segment-rules — creates a segment in the Segments Manager, opens its
 firewall rules via the next API, then flips it Locked -> Available.
 
-The FIRST workflow of the `segment-connectivity` domain, named for what it does
+The FIRST workflow of the `segment-lifecycle` domain, named for what it does
 rather than for the domain, so a sibling (e.g. a close-segment-rules that tears
 the rules down when a segment is decommissioned) can join the domain without a
 naming collision. Domain-scoped things — the activity queue, the limb
-deployment, the models, the `/workflows/segment-connectivity` API prefix — stay
+deployment, the models, the `/workflows/segment-lifecycle` API prefix — stay
 named after the DOMAIN and are shared; workflow-scoped things (this class, its
 task queue, its workflow ids, its RunArgs/ResumeState/Progress/Result models)
 carry the workflow name.
 
 This workflow owns a segment's WHOLE lifecycle and is its single entry point:
-an operator POSTs the segment definition to the trigger API (workflows/api.py)
+an operator POSTs the segment definition to the trigger API (workflow_domains/api.py)
 and the workflow calls the Segments Manager itself (create_segment, step 1).
 It used to work the other way round — the Segments Manager created the segment
 and then fired a best-effort HTTP trigger at us — which left creation outside
@@ -55,8 +55,8 @@ from temporalio.common import RetryPolicy
 from temporalio.exceptions import ActivityError, ApplicationError, is_cancelled_exception
 
 with workflow.unsafe.imports_passed_through():
-    from shared.consts import SEGMENT_CONNECTIVITY_ACTIVITY_QUEUE
-    from shared.interfaces.segment_connectivity import (
+    from shared.consts import SEGMENT_LIFECYCLE_ACTIVITY_QUEUE
+    from shared.interfaces.segment_lifecycle import (
         check_next_requests,
         create_segment,
         get_bmc_segment,
@@ -68,7 +68,7 @@ with workflow.unsafe.imports_passed_through():
         submit_open_rules,
         unlock_segment,
     )
-    from shared.models.segment_connectivity import (
+    from shared.models.segment_lifecycle import (
         BmcOpenRulesRequest,
         SegmentConnectivityFailureNotice,
         OpenSegmentRulesInput,
@@ -177,7 +177,7 @@ class OpenSegmentRulesWorkflow:
             await workflow.execute_activity(
                 create_segment,
                 rules_input,
-                task_queue=SEGMENT_CONNECTIVITY_ACTIVITY_QUEUE,
+                task_queue=SEGMENT_LIFECYCLE_ACTIVITY_QUEUE,
                 start_to_close_timeout=_ACTIVITY_TIMEOUT,
                 retry_policy=_RETRY_POLICY,
             )
@@ -217,7 +217,7 @@ class OpenSegmentRulesWorkflow:
         self._phase = "awaiting-completion"
         interval_seconds = await workflow.execute_activity(
             get_next_checking_request_interval,
-            task_queue=SEGMENT_CONNECTIVITY_ACTIVITY_QUEUE,
+            task_queue=SEGMENT_LIFECYCLE_ACTIVITY_QUEUE,
             start_to_close_timeout=_ACTIVITY_TIMEOUT,
             retry_policy=_RETRY_POLICY,
         )
@@ -246,7 +246,7 @@ class OpenSegmentRulesWorkflow:
             still_pending_request_ids = await workflow.execute_activity(
                 check_next_requests,
                 pending_request_ids,
-                task_queue=SEGMENT_CONNECTIVITY_ACTIVITY_QUEUE,
+                task_queue=SEGMENT_LIFECYCLE_ACTIVITY_QUEUE,
                 start_to_close_timeout=_ACTIVITY_TIMEOUT,
                 retry_policy=_RETRY_POLICY,
             )
@@ -270,7 +270,7 @@ class OpenSegmentRulesWorkflow:
         await workflow.execute_activity(
             unlock_segment,
             rules_input.segment,
-            task_queue=SEGMENT_CONNECTIVITY_ACTIVITY_QUEUE,
+            task_queue=SEGMENT_LIFECYCLE_ACTIVITY_QUEUE,
             start_to_close_timeout=_ACTIVITY_TIMEOUT,
             retry_policy=_RETRY_POLICY,
         )
@@ -305,7 +305,7 @@ class OpenSegmentRulesWorkflow:
         peer_segments: list[SegmentRef] = await workflow.execute_activity(
             list_peer_segments,
             PeerSegmentsQuery(source_type=rules_input.type, site=site),
-            task_queue=SEGMENT_CONNECTIVITY_ACTIVITY_QUEUE,
+            task_queue=SEGMENT_LIFECYCLE_ACTIVITY_QUEUE,
             start_to_close_timeout=_ACTIVITY_TIMEOUT,
             retry_policy=_RETRY_POLICY,
         )
@@ -320,7 +320,7 @@ class OpenSegmentRulesWorkflow:
             bmc_segment = await workflow.execute_activity(
                 get_bmc_segment,
                 site,
-                task_queue=SEGMENT_CONNECTIVITY_ACTIVITY_QUEUE,
+                task_queue=SEGMENT_LIFECYCLE_ACTIVITY_QUEUE,
                 start_to_close_timeout=_ACTIVITY_TIMEOUT,
                 retry_policy=_RETRY_POLICY,
             )
@@ -349,7 +349,7 @@ class OpenSegmentRulesWorkflow:
                     workflow.execute_activity(
                         submit_open_rules,
                         rule,
-                        task_queue=SEGMENT_CONNECTIVITY_ACTIVITY_QUEUE,
+                        task_queue=SEGMENT_LIFECYCLE_ACTIVITY_QUEUE,
                         start_to_close_timeout=_ACTIVITY_TIMEOUT,
                         retry_policy=_RETRY_POLICY,
                     )
@@ -362,7 +362,7 @@ class OpenSegmentRulesWorkflow:
                     BmcOpenRulesRequest(
                         mce_segment=rules_input.segment, bmc_segment=bmc_segment
                     ),
-                    task_queue=SEGMENT_CONNECTIVITY_ACTIVITY_QUEUE,
+                    task_queue=SEGMENT_LIFECYCLE_ACTIVITY_QUEUE,
                     start_to_close_timeout=_ACTIVITY_TIMEOUT,
                     retry_policy=_RETRY_POLICY,
                 )
@@ -407,7 +407,7 @@ class OpenSegmentRulesWorkflow:
             SegmentConnectivityRequestsUpdate(
                 segment=segment, request_ids=request_ids, submitted_at=submitted_at
             ),
-            task_queue=SEGMENT_CONNECTIVITY_ACTIVITY_QUEUE,
+            task_queue=SEGMENT_LIFECYCLE_ACTIVITY_QUEUE,
             start_to_close_timeout=_ACTIVITY_TIMEOUT,
             retry_policy=_RETRY_POLICY,
         )
@@ -437,7 +437,7 @@ class OpenSegmentRulesWorkflow:
                     workflow.execute_activity(
                         publish_segment_connectivity_failure,
                         SegmentConnectivityFailureNotice(segment=segment, message=message),
-                        task_queue=SEGMENT_CONNECTIVITY_ACTIVITY_QUEUE,
+                        task_queue=SEGMENT_LIFECYCLE_ACTIVITY_QUEUE,
                         start_to_close_timeout=_ACTIVITY_TIMEOUT,
                         retry_policy=_FAILURE_NOTE_RETRY_POLICY,
                     )

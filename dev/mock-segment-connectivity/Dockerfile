@@ -1,6 +1,6 @@
 # Mock of the external "next" connectivity service, for e2e testing where the
 # real next service is unreachable (see helm/mock-segment-connectivity/). Build from
-# the REPO ROOT, like activities/segment_connectivity/Dockerfile:
+# the REPO ROOT, like activities/segment_lifecycle/Dockerfile:
 #   docker build -f dev/mock-segment-connectivity/Dockerfile -t mock-segment-connectivity:dev .
 FROM python:3.12-slim
 

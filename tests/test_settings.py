@@ -1,4 +1,4 @@
-"""SITE_NETWORKS parsing in SegmentConnectivityActivitySettings.
+"""SITE_NETWORKS parsing in SegmentLifecycleActivitySettings.
 
 SITE_NETWORKS is the shared site topology: the same JSON is rendered into this
 service's ConfigMap and the Segments Manager's, from one definition in
@@ -14,12 +14,12 @@ import json
 import pytest
 from pydantic import ValidationError
 
-from shared.settings import SegmentConnectivityActivitySettings
+from shared.settings import SegmentLifecycleActivitySettings
 
 
-def build(site_networks: dict) -> SegmentConnectivityActivitySettings:
+def build(site_networks: dict) -> SegmentLifecycleActivitySettings:
     """Construct settings with everything but SITE_NETWORKS taken from conftest env."""
-    return SegmentConnectivityActivitySettings(site_networks=site_networks)
+    return SegmentLifecycleActivitySettings(site_networks=site_networks)
 
 
 class TestSharedTopologyContract:
@@ -38,7 +38,7 @@ class TestSharedTopologyContract:
     def test_parses_from_a_json_string(self):
         """This is how the ConfigMap actually delivers it."""
         raw = json.dumps({"site1": {"pool": "192.10.0.0/16", "bmc": "10.50.0.0/16"}})
-        s = SegmentConnectivityActivitySettings(site_networks=json.loads(raw))
+        s = SegmentLifecycleActivitySettings(site_networks=json.loads(raw))
         assert s.site_networks["site1"].bmc == "10.50.0.0/16"
 
 
@@ -64,4 +64,4 @@ class TestFailFast:
         # env var, so build({}) would quietly validate conftest's value instead.
         monkeypatch.setenv("SITE_NETWORKS", "{}")
         with pytest.raises(ValidationError, match="must not be empty"):
-            SegmentConnectivityActivitySettings()
+            SegmentLifecycleActivitySettings()

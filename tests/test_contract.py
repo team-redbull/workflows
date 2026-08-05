@@ -11,8 +11,8 @@ from __future__ import annotations
 
 import typing
 
-import activities.segment_connectivity.activities as impl_module
-import shared.interfaces.segment_connectivity as interface_module
+import activities.segment_lifecycle.activities as impl_module
+import shared.interfaces.segment_lifecycle as interface_module
 
 
 def _activity_definitions(module) -> dict[str, object]:

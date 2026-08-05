@@ -17,7 +17,7 @@ docs/
   site/
     index.html                     the orchestrator guide (homepage)
     404.html
-    segment-connectivity/
+    segment-lifecycle/
       open-segment-rules.html      one page per workflow, under its domain
     assets/
       site.css                     every page's styling

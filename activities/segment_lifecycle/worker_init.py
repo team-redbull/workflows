@@ -1,8 +1,8 @@
-"""Segment-connectivity activity worker — the execution "limb" deployment.
+"""Segment-lifecycle activity worker — the execution "limb" deployment.
 
-Registers the segment-connectivity activities and polls the segment-connectivity activity
+Registers the segment-lifecycle activities and polls the segment-lifecycle activity
 queue. Workflows are NOT registered here: the brain runs in its own deployment
-on a separate queue (see workflows/main_worker_init.py).
+on a separate queue (see workflow_domains/main_worker_init.py).
 
 Connects with the Pydantic data converter so that Pydantic models serialize
 correctly across the workflow boundary.
@@ -18,7 +18,7 @@ from temporalio.client import Client
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.worker import Worker
 
-from activities.segment_connectivity.activities import (
+from activities.segment_lifecycle.activities import (
     check_next_requests,
     create_segment,
     get_bmc_segment,
@@ -30,7 +30,7 @@ from activities.segment_connectivity.activities import (
     submit_open_rules,
     unlock_segment,
 )
-from shared.consts import SEGMENT_CONNECTIVITY_ACTIVITY_QUEUE
+from shared.consts import SEGMENT_LIFECYCLE_ACTIVITY_QUEUE
 from shared.logging_config import configure_logging
 from shared.settings import TemporalSettings
 from shared.shutdown import install_shutdown_handler
@@ -48,7 +48,7 @@ async def main() -> None:
     )
     worker = Worker(
         client,
-        task_queue=SEGMENT_CONNECTIVITY_ACTIVITY_QUEUE,
+        task_queue=SEGMENT_LIFECYCLE_ACTIVITY_QUEUE,
         activities=[
             create_segment,
             list_peer_segments,
@@ -73,7 +73,7 @@ async def main() -> None:
 
     logger.info(
         "Activity worker polling queue=%s on %s",
-        SEGMENT_CONNECTIVITY_ACTIVITY_QUEUE,
+        SEGMENT_LIFECYCLE_ACTIVITY_QUEUE,
         _settings.temporal_host,
     )
     async with worker:

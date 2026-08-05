@@ -6,7 +6,7 @@ Values are read from the process environment and, if present, a .env file
 Two settings groups, matching the deployment boundary:
   - TemporalSettings: needed by anything that connects a Temporal Client
     (both workers and api.py).
-  - SegmentConnectivityActivitySettings: needed only by the segment-connectivity activity
+  - SegmentLifecycleActivitySettings: needed only by the segment-lifecycle activity
     worker/tasks (Segments Manager + next API URLs/credentials + port policy).
     The workflow worker has no business holding these.
 
@@ -18,11 +18,11 @@ Note: which ConfigMap a key lives in (an ops grouping) is INDEPENDENT of which
 settings class declares it (a code grouping). pydantic reads the flat process
 env, so it never sees the ConfigMap boundary. DOMAIN and SEGMENTS_MANAGER_URL
 live in the shared `workflows-orchestrator-config` ConfigMap (so future workflows reuse
-them without duplication), yet stay fields on SegmentConnectivityActivitySettings —
+them without duplication), yet stay fields on SegmentLifecycleActivitySettings —
 only the activity worker requires them, and it mounts workflows-orchestrator-config +
-segment-connectivity-config together. Keep the files aligned:
+segment-lifecycle-config together. Keep the files aligned:
 helm-charts-workflows-orchestrator/templates/config.yaml   (workflows-orchestrator-config: temporal + domain + segments-manager url)
-helm-charts-segment-connectivity/templates/config.yaml      (segment-connectivity-config: next URIs + ports; + the token Secret)
+helm-charts-segment-lifecycle/templates/config.yaml        (segment-lifecycle-config: next URIs + ports; + the token Secret)
 
 Do NOT import this module from inside a workflow definition (it runs in the
 sandbox) — only from worker entrypoints, api.py, and activity
@@ -79,7 +79,7 @@ class TemporalSettings(BaseSettings):
     temporal_namespace: str = "default"
 
 
-class SegmentConnectivityActivitySettings(BaseSettings):
+class SegmentLifecycleActivitySettings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     # --- Segments Manager (GETs are public; mutating calls need the token) ---

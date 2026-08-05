@@ -30,7 +30,7 @@
       <div class="wfmenu-panel" id="wfmenu-panel" role="menu" aria-label="Workflows by domain" hidden></div>
     </div>
     <noscript>
-      <a class="topnav-link" href="/segment-connectivity/open-segment-rules.html">open-segment-rules</a>
+      <a class="topnav-link" href="/segment-lifecycle/open-segment-rules.html">open-segment-rules</a>
     </noscript>
   </nav>
 </header>
@@ -49,7 +49,7 @@
     <div class="facts">
       <div class="fact"><span class="k">Stack</span><span class="v">Python 3.12 · temporalio · pydantic · FastAPI</span></div>
       <div class="fact"><span class="k">Deployables</span><span class="v">1 brain + 1 limb per domain (+ trigger API)</span></div>
-      <div class="fact"><span class="k">Domains today</span><span class="v">segment-connectivity</span></div>
+      <div class="fact"><span class="k">Domains today</span><span class="v">segment-lifecycle</span></div>
       <div class="fact"><span class="k">Workflows today</span><span class="v">open-segment-rules</span></div>
     </div>
   </div>
@@ -124,7 +124,7 @@
       <table>
         <thead><tr><th>Term</th><th>What it means</th><th>Where you'll see it</th></tr></thead>
         <tbody>
-          <tr><td class="k">Workflow</td><td class="muted">The orchestration function — the plan. Decides <em>what</em> happens and in what order. Contains no I/O.</td><td class="k">workflows/open_segment_rules.py</td></tr>
+          <tr><td class="k">Workflow</td><td class="muted">The orchestration function — the plan. Decides <em>what</em> happens and in what order. Contains no I/O.</td><td class="k">workflow_domains/segment_lifecycle/open_segment_rules.py</td></tr>
           <tr><td class="k">Activity</td><td class="muted">One unit of real work: an HTTP call, a config read. Everything that can fail or touch the outside world.</td><td class="k">activities/&lt;domain&gt;/activities.py</td></tr>
           <tr><td class="k">Worker</td><td class="muted">A process that connects to Temporal, says "I can run these workflows / these activities", and polls for work.</td><td class="k">*_worker_init.py</td></tr>
           <tr><td class="k">Task queue</td><td class="muted">A named mailbox. Workers poll a queue; work addressed to that queue reaches those workers. This is our routing.</td><td class="k">shared/consts.py</td></tr>
@@ -191,7 +191,7 @@
 
         <text class="hd" x="20" y="24">DECIDES · ONE DEPLOYMENT FOR EVERY DOMAIN</text>
         <rect class="box tmp" x="20" y="34" width="380" height="86" rx="5"/>
-        <text class="t" x="38" y="62">workflows/</text>
+        <text class="t" x="38" y="62">workflow_domains/</text>
         <text class="s" x="38" y="82">the brain — orchestration logic + the trigger API</text>
         <text class="s" x="38" y="100">lightweight image: temporalio, pydantic, fastapi</text>
 
@@ -231,8 +231,8 @@
             <td class="muted">baked into both images</td>
           </tr>
           <tr>
-            <td class="k">workflows/</td>
-            <td class="muted">One module per workflow, the worker entrypoint, and <code>api.py</code> + routers</td>
+            <td class="k">workflow_domains/</td>
+            <td class="muted">One folder per domain (its workflows + its router), the worker entrypoint, and <code>api.py</code></td>
             <td class="muted">shared + <code>fastapi</code>/<code>uvicorn</code>. No HTTP client, no cloud SDK</td>
             <td class="muted"><code>workflows-orchestrator</code> Deployment, plus <code>-api</code> from the same image</td>
           </tr>
@@ -272,7 +272,7 @@
         <span class="kwd">await</span> c.post(...)</pre>
       </div>
       <div class="codecard">
-        <span class="cap">3 · workflows/&lt;workflow&gt;.py</span>
+        <span class="cap">3 · workflow_domains/&lt;domain&gt;/&lt;workflow&gt;.py</span>
         <pre><span class="c"># imports the SIGNATURE</span>
 <span class="kwd">await</span> workflow.execute_activity(
     unlock_segment,
@@ -339,14 +339,14 @@
 
         <!-- limb -->
         <rect class="box nxt" x="680" y="220" width="340" height="120" rx="5"/>
-        <text class="t" x="700" y="252">segment-connectivity</text>
+        <text class="t" x="700" y="252">segment-lifecycle</text>
         <text class="s" x="700" y="272">runs activities — every outbound HTTP call</text>
         <text class="s" x="700" y="290">ONE deployment per domain</text>
         <text class="s" x="700" y="320">worker_init.py</text>
 
         <path class="arw nxt" d="M474,262 H676" marker-end="url(#a-nxt)"/>
         <text class="l" x="480" y="254">activity task queue</text>
-        <text class="l dim" x="480" y="280">segment-connectivity-activity</text>
+        <text class="l dim" x="480" y="280">segment-lifecycle-activity</text>
         <path class="arw nxt" d="M676,312 H474" marker-end="url(#a-nxt)"/>
         <text class="l" x="480" y="305">result (or failure)</text>
 
@@ -361,12 +361,12 @@
       <table>
         <thead><tr><th>#</th><th>What happens</th><th>Where</th></tr></thead>
         <tbody>
-          <tr><td class="k">1</td><td class="muted">Someone POSTs to a trigger route. The API derives a deterministic workflow ID and asks Temporal to start a run on that workflow's queue. It answers <code>202</code> immediately — it never waits for the outcome.</td><td class="k">workflows/routers/</td></tr>
+          <tr><td class="k">1</td><td class="muted">Someone POSTs to a trigger route. The API derives a deterministic workflow ID and asks Temporal to start a run on that workflow's queue. It answers <code>202</code> immediately — it never waits for the outcome.</td><td class="k">workflow_domains/&lt;domain&gt;/router.py</td></tr>
           <tr><td class="k">2</td><td class="muted">Temporal writes the run into history and puts a task on the workflow queue.</td><td class="muted">server</td></tr>
-          <tr><td class="k">3</td><td class="muted">The brain, polling that queue, executes workflow code until it needs something from the outside world. It doesn't perform the call — it returns a <em>command</em>: "schedule this activity on that queue".</td><td class="k">workflows/&lt;workflow&gt;.py</td></tr>
+          <tr><td class="k">3</td><td class="muted">The brain, polling that queue, executes workflow code until it needs something from the outside world. It doesn't perform the call — it returns a <em>command</em>: "schedule this activity on that queue".</td><td class="k">workflow_domains/&lt;domain&gt;/&lt;workflow&gt;.py</td></tr>
           <tr><td class="k">4</td><td class="muted">Temporal puts that on the domain's activity queue. The limb picks it up, makes the real HTTP call, returns the result — retrying on its own if it fails.</td><td class="k">activities/&lt;domain&gt;/</td></tr>
           <tr><td class="k">5</td><td class="muted">The result lands in history; the brain wakes and continues from the next line. Steps 3–5 repeat, including across sleeps that last hours.</td><td class="muted">loop</td></tr>
-          <tr><td class="k">6</td><td class="muted">Meanwhile anyone can <code>GET /workflows/runs/{workflow_id}</code>, which reads run status and queries the workflow for live progress.</td><td class="k">workflows/routers/runs.py</td></tr>
+          <tr><td class="k">6</td><td class="muted">Meanwhile anyone can <code>GET /workflows/runs/{workflow_id}</code>, which reads run status and queries the workflow for live progress.</td><td class="k">workflow_domains/routers/runs.py</td></tr>
         </tbody>
       </table>
     </div>
@@ -429,7 +429,7 @@
         <text class="l dim" x="530" y="82">task_queue=</text>
 
         <rect class="box sm"    x="600" y="60"  width="210" height="52" rx="4"/>
-        <text class="s" x="614" y="84">segment-connectivity</text>
+        <text class="s" x="614" y="84">segment-lifecycle</text>
         <text class="s" x="614" y="100">-activity</text>
 
         <rect class="box ghost" x="600" y="144" width="210" height="52" rx="4"/>
@@ -440,7 +440,7 @@
         <path class="arw ghost" d="M814,170 H886" marker-end="url(#a-gh)"/>
 
         <rect class="box nxt"   x="890" y="60"  width="210" height="52" rx="4"/>
-        <text class="s" x="904" y="84">segment-connectivity</text>
+        <text class="s" x="904" y="84">segment-lifecycle</text>
         <text class="s" x="904" y="100">deployment + SA + Secret</text>
 
         <rect class="box ghost" x="890" y="144" width="210" height="52" rx="4"/>
@@ -457,7 +457,7 @@
         <h3>Why the activity queue follows the domain</h3>
         <p>A queue maps one-to-one onto a <b>deployment</b>, and what forces a separate deployment is a shared
         <b>dependency and credential set</b> — not where one workflow ends and the next begins.</p>
-        <p>Every <code>segment-connectivity</code> activity needs the same two things: a Segments Manager URL with a
+        <p>Every <code>segment-lifecycle</code> activity needs the same two things: a Segments Manager URL with a
         bearer token, and the NEXT firewall endpoints. That set is the deployment, so that set is the queue. A second
         workflow in the domain reuses the same limb rather than duplicating the credentials.</p>
       </div>
@@ -544,19 +544,19 @@
         <thead><tr><th>Named after the DOMAIN</th><th>Named after the WORKFLOW</th></tr></thead>
         <tbody>
           <tr>
-            <td class="kw">segment-connectivity-activity <span style="color:var(--ink-3)">(activity queue)</span></td>
+            <td class="kw">segment-lifecycle-activity <span style="color:var(--ink-3)">(activity queue)</span></td>
             <td class="kw">open-segment-rules-workflow <span style="color:var(--ink-3)">(workflow queue)</span></td>
           </tr>
           <tr>
-            <td class="kw">activities/segment_connectivity/</td>
-            <td class="kw">workflows/open_segment_rules.py</td>
+            <td class="kw">activities/segment_lifecycle/</td>
+            <td class="kw">segment_lifecycle/open_segment_rules.py</td>
           </tr>
           <tr>
-            <td class="kw">shared/models|interfaces/segment_connectivity.py</td>
+            <td class="kw">shared/models|interfaces/segment_lifecycle.py</td>
             <td class="kw">OpenSegmentRulesRunArgs / ResumeState / Progress / Result</td>
           </tr>
           <tr>
-            <td class="kw">/workflows/segment-connectivity <span style="color:var(--ink-3)">(route prefix)</span></td>
+            <td class="kw">/workflows/segment-lifecycle <span style="color:var(--ink-3)">(route prefix)</span></td>
             <td class="kw">/open-segment-rules <span style="color:var(--ink-3)">(route under it)</span></td>
           </tr>
           <tr>
@@ -603,10 +603,11 @@
           <tr><td class="k">shared/consts.py</td><td class="muted">Task-queue names</td><td class="muted">adding a workflow or a domain</td></tr>
           <tr><td class="k">shared/settings.py</td><td class="muted">Typed env config, validated at worker startup</td><td class="muted">adding a ConfigMap or Secret key</td></tr>
           <tr><td class="k">shared/exceptions.py</td><td class="muted">Error classes — the ones you classify as non-retryable</td><td class="muted">a new permanent failure mode appears</td></tr>
-          <tr><td class="k">workflows/&lt;name&gt;.py</td><td class="muted">One workflow's orchestration logic</td><td class="muted">changing what happens, or in what order</td></tr>
-          <tr><td class="k">workflows/main_worker_init.py</td><td class="muted">Brain entrypoint — registers workflows, polls their queues</td><td class="muted">adding a workflow</td></tr>
-          <tr><td class="k">workflows/api.py</td><td class="muted">FastAPI composition root; owns the Temporal client</td><td class="muted">adding a domain router</td></tr>
-          <tr><td class="k">workflows/routers/</td><td class="muted">One module per domain + the shared <code>runs</code> status route</td><td class="muted">adding a trigger endpoint</td></tr>
+          <tr><td class="k">workflow_domains/&lt;domain&gt;/&lt;name&gt;.py</td><td class="muted">One workflow's orchestration logic</td><td class="muted">changing what happens, or in what order</td></tr>
+          <tr><td class="k">workflow_domains/main_worker_init.py</td><td class="muted">Brain entrypoint — one Worker per workflow queue, all in one process</td><td class="muted">adding a workflow</td></tr>
+          <tr><td class="k">workflow_domains/api.py</td><td class="muted">FastAPI composition root; owns the Temporal client</td><td class="muted">adding a domain router</td></tr>
+          <tr><td class="k">workflow_domains/&lt;domain&gt;/router.py</td><td class="muted">That domain's trigger routes</td><td class="muted">adding a trigger endpoint</td></tr>
+          <tr><td class="k">workflow_domains/routers/</td><td class="muted">What no domain owns: deps, shared models, the <code>runs</code> status route</td><td class="muted">rarely — it is domain-agnostic on purpose</td></tr>
           <tr><td class="k">activities/&lt;domain&gt;/activities.py</td><td class="muted">The real implementations</td><td class="muted">changing how we call an external service</td></tr>
           <tr><td class="k">activities/&lt;domain&gt;/worker_init.py</td><td class="muted">Limb entrypoint — registers that domain's activities</td><td class="muted">adding an activity</td></tr>
           <tr><td class="k">dev/mock-segment-connectivity/</td><td class="muted">Stand-in for NEXT, with a configurable approval delay</td><td class="muted">running end-to-end locally</td></tr>
@@ -634,7 +635,7 @@
           <li>Add any new activity signatures to <code>shared/interfaces/&lt;domain&gt;.py</code> and implement them in
           that domain's <code>activities.py</code> — existing ones you just reuse.</li>
           <li>Add its queue name to <code>shared/consts.py</code>.</li>
-          <li>Write <code>workflows/&lt;workflow&gt;.py</code>, routing every activity to the <b>domain's</b> activity queue.</li>
+          <li>Write <code>workflow_domains/&lt;domain&gt;/&lt;workflow&gt;.py</code>, routing every activity to the <b>domain's</b> activity queue.</li>
           <li>Register it in <code>main_worker_init.py</code> and add a route under the existing domain prefix.</li>
           <li>Register any new activity in that domain's <code>worker_init.py</code>.</li>
         </ol>
@@ -648,7 +649,7 @@
           <li><code>activities/&lt;domain&gt;/</code> with its own <code>requirements.txt</code>,
           <code>Dockerfile</code> and <code>worker_init.py</code>.</li>
           <li>A settings group in <code>shared/settings.py</code> for its endpoints and credentials.</li>
-          <li>A new <code>workflows/routers/&lt;domain&gt;.py</code>, included in <code>api.py</code>.</li>
+          <li>A new <code>workflow_domains/&lt;domain&gt;/</code> folder with its workflows and a <code>router.py</code>, included in <code>api.py</code>.</li>
           <li>A build job in <code>.github/workflows/build.yml</code> and a new
           <code>helm-charts-&lt;domain&gt;</code> repo for Argo CD.</li>
         </ol>
@@ -719,13 +720,13 @@ pip install -r requirements-dev.txt
 temporal server start-dev
 
 <span class="c"># 1 · the brain — polls the workflow queue</span>
-PYTHONPATH=. python -m workflows.main_worker_init
+PYTHONPATH=. python -m workflow_domains.main_worker_init
 
 <span class="c"># 2 · the limb — polls the domain activity queue</span>
-PYTHONPATH=. python -m activities.segment_connectivity.worker_init
+PYTHONPATH=. python -m activities.segment_lifecycle.worker_init
 
 <span class="c"># 3 · the trigger API — Swagger on http://localhost:8080/docs</span>
-PYTHONPATH=. uvicorn workflows.api:app --port 8080
+PYTHONPATH=. uvicorn workflow_domains.api:app --port 8080
 
 <span class="c"># 4 · optional: stand in for the NEXT firewall service</span>
 cd dev/mock-segment-connectivity &amp;&amp; uvicorn app:app --port 9000
@@ -742,7 +743,7 @@ pytest -q</pre>
     <span>CLAUDE.md — the authoritative rules</span>
     <span>README.md</span>
     <span>shared/consts.py</span>
-    <span>workflows/api.py</span>
+    <span>workflow_domains/api.py</span>
     <span>tests/test_contract.py</span>
   </footer>
 

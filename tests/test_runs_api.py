@@ -1,6 +1,6 @@
 """Run-status API tests: real routes, a stand-in Temporal client.
 
-This endpoint is deliberately domain-agnostic (see workflows/routers/runs.py),
+This endpoint is deliberately domain-agnostic (see workflow_domains/routers/runs.py),
 so what matters here is that it reports every terminal state without knowing
 which workflow it is looking at — including a workflow that exposes no
 `progress` query at all.
@@ -15,8 +15,8 @@ from temporalio.client import WorkflowExecutionStatus, WorkflowFailureError
 from temporalio.exceptions import ApplicationError
 from temporalio.service import RPCError, RPCStatusCode
 
-from workflows.routers import runs as router_module
-from workflows.routers.deps import get_temporal_client
+from workflow_domains.routers import runs as router_module
+from workflow_domains.routers.deps import get_temporal_client
 
 _NOT_FOUND = RPCError("not found", RPCStatusCode.NOT_FOUND, b"")
 

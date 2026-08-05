@@ -14,7 +14,7 @@ import respx
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 
-from activities.segment_connectivity.activities import (
+from activities.segment_lifecycle.activities import (
     _expand_ports,
     _peer_types,
     check_next_requests,
@@ -37,7 +37,7 @@ from shared.exceptions import (
     SegmentsManagerError,
     SegmentValidationError,
 )
-from shared.models.segment_connectivity import (
+from shared.models.segment_lifecycle import (
     BmcOpenRulesRequest,
     SegmentConnectivityFailureNotice,
     OpenSegmentRulesInput,

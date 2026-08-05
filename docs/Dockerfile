@@ -1,5 +1,5 @@
 # The documentation site — a 4th image out of this repo, alongside the brain,
-# the segment-connectivity limb and the NEXT mock. Static pages only: it holds
+# the segment-lifecycle limb and the NEXT mock. Static pages only: it holds
 # no credentials, talks to nothing, and is deployed by Argo CD from
 # helm-charts-workflows-docs into the redbull-workflows namespace.
 #

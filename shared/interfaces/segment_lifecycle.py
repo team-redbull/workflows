@@ -1,7 +1,7 @@
-"""Segment-connectivity activity signatures — the typed contract, no implementations.
+"""Segment-lifecycle activity signatures — the typed contract, no implementations.
 
-The real implementations live in activities/segment_connectivity/activities.py and are
-registered against these names on the segment-connectivity activity queue. Workflows
+The real implementations live in activities/segment_lifecycle/activities.py and are
+registered against these names on the segment-lifecycle activity queue. Workflows
 import THESE for type-checked activity references.
 """
 
@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from temporalio import activity
 
-from shared.models.segment_connectivity import (
+from shared.models.segment_lifecycle import (
     BmcOpenRulesRequest,
     SegmentConnectivityFailureNotice,
     OpenSegmentRulesInput,

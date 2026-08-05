@@ -1,5 +1,5 @@
-# Test-only mock of the next service, reached over HTTP by the segment-connectivity
-# activity worker (config.nextUrl in helm/segment-connectivity). Its own ServiceAccount
+# Test-only mock of the next service, reached over HTTP by the segment-lifecycle
+# activity worker (config.nextUrl in helm/segment-lifecycle). Its own ServiceAccount
 # per the per-deployment RBAC-isolation convention, though this mock needs no
 # permissions — it never talks to the Kubernetes API.
 apiVersion: v1

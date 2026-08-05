@@ -2,7 +2,7 @@
 
 The time-skipping environment makes the poll loop's constant interval and
 retry backoffs run in milliseconds. The workflow routes activities to
-SEGMENT_CONNECTIVITY_ACTIVITY_QUEUE explicitly, so each test runs TWO workers — one per
+SEGMENT_LIFECYCLE_ACTIVITY_QUEUE explicitly, so each test runs TWO workers — one per
 queue — exactly like the real brain/limb split.
 """
 
@@ -21,9 +21,9 @@ from temporalio.exceptions import ActivityError, ApplicationError, CancelledErro
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
-from shared.consts import SEGMENT_CONNECTIVITY_ACTIVITY_QUEUE, OPEN_SEGMENT_RULES_WORKFLOW_QUEUE
+from shared.consts import SEGMENT_LIFECYCLE_ACTIVITY_QUEUE, OPEN_SEGMENT_RULES_WORKFLOW_QUEUE
 from shared.exceptions import BmcSegmentNotConfiguredError, SegmentValidationError
-from shared.models.segment_connectivity import (
+from shared.models.segment_lifecycle import (
     BmcOpenRulesRequest,
     SegmentConnectivityFailureNotice,
     OpenSegmentRulesInput,
@@ -36,7 +36,9 @@ from shared.models.segment_connectivity import (
     SegmentRef,
     SegmentType,
 )
-from workflows.open_segment_rules import OpenSegmentRulesWorkflow
+from workflow_domains.segment_lifecycle.open_segment_rules import (
+    OpenSegmentRulesWorkflow,
+)
 
 SEGMENT = "10.0.0.0/24"
 SITE = "site-a"
@@ -182,7 +184,7 @@ class _Harness:
         )
         self._activity_worker = Worker(
             client,
-            task_queue=SEGMENT_CONNECTIVITY_ACTIVITY_QUEUE,
+            task_queue=SEGMENT_LIFECYCLE_ACTIVITY_QUEUE,
             activities=self._mock_activities,
         )
         await self._workflow_worker.__aenter__()
@@ -251,7 +253,7 @@ def test_supported_types_covers_every_segment_type():
     # current coverage instead: if a 5th SegmentType is ever added without
     # updating _SUPPORTED_TYPES, this test fails loudly and prompts an
     # explicit decision, exactly as the gate is meant to.
-    from workflows.open_segment_rules import _SUPPORTED_TYPES
+    from workflow_domains.segment_lifecycle.open_segment_rules import _SUPPORTED_TYPES
 
     assert _SUPPORTED_TYPES == frozenset(SegmentType)
 

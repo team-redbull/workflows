@@ -8,7 +8,7 @@
 <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/assets/site.css">
 </head>
-<body data-page="/segment-connectivity/open-segment-rules.html">
+<body data-page="/segment-lifecycle/open-segment-rules.html">
 
 <a class="skip-link" href="#main">Skip to content</a>
 
@@ -30,7 +30,7 @@
       <div class="wfmenu-panel" id="wfmenu-panel" role="menu" aria-label="Workflows by domain" hidden></div>
     </div>
     <noscript>
-      <a class="topnav-link" href="/segment-connectivity/open-segment-rules.html">open-segment-rules</a>
+      <a class="topnav-link" href="/segment-lifecycle/open-segment-rules.html">open-segment-rules</a>
     </noscript>
   </nav>
 </header>
@@ -38,7 +38,7 @@
 <main id="main">
 <header class="masthead">
   <div class="masthead-inner">
-    <div class="eyebrow">Temporal workflow · domain: segment-connectivity</div>
+    <div class="eyebrow">Temporal workflow · domain: segment-lifecycle</div>
     <h1>open-segment-rules<span class="dim"> — what actually happens</span></h1>
     <p class="lede">
       A single request creates a network segment in the Segments Manager, sends a request to NEXT to open
@@ -48,10 +48,10 @@
     </p>
     <p class="lede">One segment = one durable Temporal run, from creation to unlock.</p>
     <div class="facts">
-      <div class="fact"><span class="k">Trigger</span><span class="v">POST /workflows/segment-connectivity/open-segment-rules</span></div>
+      <div class="fact"><span class="k">Trigger</span><span class="v">POST /workflows/segment-lifecycle/open-segment-rules</span></div>
       <div class="fact"><span class="k">Workflow id</span><span class="v">open-segment-rules-&lt;TYPE&gt;-&lt;network&gt;</span></div>
       <div class="fact"><span class="k">Workflow queue</span><span class="v">open-segment-rules-workflow</span></div>
-      <div class="fact"><span class="k">Activity queue</span><span class="v">segment-connectivity-activity</span></div>
+      <div class="fact"><span class="k">Activity queue</span><span class="v">segment-lifecycle-activity</span></div>
     </div>
   </div>
 </header>
@@ -79,7 +79,7 @@
 
         <!-- entry -->
         <rect class="entry-pill" x="30" y="18" width="430" height="30" rx="4"/>
-        <text class="entry-t" x="44" y="38">POST /workflows/segment-connectivity/open-segment-rules</text>
+        <text class="entry-t" x="44" y="38">POST /workflows/segment-lifecycle/open-segment-rules</text>
         <path class="f-arrow" d="M114,48 V136" marker-end="url(#ah-n)"/>
 
         <!-- stage 1 -->
@@ -442,7 +442,7 @@
       <div class="endpoint">
         <div class="endpoint-head">
           <span class="method">POST</span>
-          <span class="path">/workflows/segment-connectivity/open-segment-rules</span>
+          <span class="path">/workflows/segment-lifecycle/open-segment-rules</span>
           <span class="ret">202 · 409 if already running</span>
         </div>
         <div class="endpoint-body">
@@ -467,7 +467,7 @@
       <div class="endpoint">
         <div class="endpoint-head">
           <span class="method">POST</span>
-          <span class="path">/workflows/segment-connectivity/open-segment-rules/bulk</span>
+          <span class="path">/workflows/segment-lifecycle/open-segment-rules/bulk</span>
           <span class="ret">202 · always</span>
         </div>
         <div class="endpoint-body">
@@ -606,10 +606,10 @@
       <table>
         <thead><tr><th>Key</th><th>Lives in</th><th>Effect</th></tr></thead>
         <tbody>
-          <tr><td class="k">NEXT_CHECKING_REQUEST_INTERVAL_SECONDS</td><td class="muted">segment-connectivity-config</td><td class="muted">Poll cadence while waiting for approval. Fast locally, slow in prod.</td></tr>
-          <tr><td class="k">PORTS_&lt;SRC&gt;_TO_&lt;DST&gt;</td><td class="muted">segment-connectivity-config</td><td class="muted">Per-direction port policy <em>and</em> the peering topology. e.g. <code>{"tcp":["30000-32767"],"udp":["9000"]}</code></td></tr>
-          <tr><td class="k">SITE_NETWORKS</td><td class="muted">segment-connectivity-config</td><td class="muted">Shared site topology; this service reads each site's <code>bmc</code> CIDR.</td></tr>
-          <tr><td class="k">NEXT_URL · NEXT_*_URI · NEXT_GROUP</td><td class="muted">segment-connectivity-config</td><td class="muted">Where NEXT lives, its paths, and the AD group every request is attributed to.</td></tr>
+          <tr><td class="k">NEXT_CHECKING_REQUEST_INTERVAL_SECONDS</td><td class="muted">segment-lifecycle-config</td><td class="muted">Poll cadence while waiting for approval. Fast locally, slow in prod.</td></tr>
+          <tr><td class="k">PORTS_&lt;SRC&gt;_TO_&lt;DST&gt;</td><td class="muted">segment-lifecycle-config</td><td class="muted">Per-direction port policy <em>and</em> the peering topology. e.g. <code>{"tcp":["30000-32767"],"udp":["9000"]}</code></td></tr>
+          <tr><td class="k">SITE_NETWORKS</td><td class="muted">segment-lifecycle-config</td><td class="muted">Shared site topology; this service reads each site's <code>bmc</code> CIDR.</td></tr>
+          <tr><td class="k">NEXT_URL · NEXT_*_URI · NEXT_GROUP</td><td class="muted">segment-lifecycle-config</td><td class="muted">Where NEXT lives, its paths, and the AD group every request is attributed to.</td></tr>
           <tr><td class="k">SEGMENTS_MANAGER_URL · DOMAIN</td><td class="muted">workflows-orchestrator-config</td><td class="muted">Shared by every domain — the brain release owns this ConfigMap.</td></tr>
           <tr><td class="k">SEGMENTS_MANAGER_API_TOKEN</td><td class="muted">Secret</td><td class="muted">Bearer token for mutating calls. GETs are public.</td></tr>
         </tbody>
@@ -664,9 +664,9 @@
 
   <footer>
     <span>workflows/open_segment_rules.py</span>
-    <span>activities/segment_connectivity/activities.py</span>
-    <span>workflows/routers/segment_connectivity.py</span>
-    <span>shared/models/segment_connectivity.py</span>
+    <span>activities/segment_lifecycle/activities.py</span>
+    <span>workflow_domains/segment_lifecycle/router.py</span>
+    <span>shared/models/segment_lifecycle.py</span>
   </footer>
 
 </div>

@@ -1,4 +1,4 @@
-"""Segment-connectivity HTTP surface — the domain's workflows, one path each.
+"""Segment-lifecycle HTTP surface — the domain's workflows, one path each.
 
 This is where a segment's life starts: the caller POSTs the segment
 DEFINITION here, and the workflow creates it in the Segments Manager itself
@@ -8,10 +8,10 @@ is one Temporal run visible in the Temporal UI.
 
 ASYNC trigger: POST returns 202 with the workflow id immediately (next-request
 approval is human-driven and can take hours); the caller polls
-GET /workflows/runs/{workflow_id} (workflows/routers/runs.py) for status/result.
+GET /workflows/runs/{workflow_id} (workflow_domains/routers/runs.py) for status/result.
 
 PATHS ARE `/workflows/<domain>/<workflow>`. The DOMAIN prefix lives in exactly
-one place (this router, mounted by workflows/api.py) and every workflow in the
+one place (this router, mounted by workflow_domains/api.py) and every workflow in the
 domain adds its own path under it — a domain holds many workflows, so it can
 never be the endpoint of one of them. Adding, say, a close-segment-rules
 workflow here is then a new route, not a redesign.
@@ -28,15 +28,17 @@ from temporalio.client import Client
 from temporalio.exceptions import WorkflowAlreadyStartedError
 
 from shared.consts import OPEN_SEGMENT_RULES_WORKFLOW_QUEUE
-from shared.models.segment_connectivity import (
+from shared.models.segment_lifecycle import (
     OpenSegmentRulesInput,
     OpenSegmentRulesRunArgs,
 )
-from workflows.routers.deps import get_temporal_client
-from workflows.routers.models import StartWorkflowResponse
-from workflows.open_segment_rules import OpenSegmentRulesWorkflow
+from workflow_domains.routers.deps import get_temporal_client
+from workflow_domains.routers.models import StartWorkflowResponse
+from workflow_domains.segment_lifecycle.open_segment_rules import (
+    OpenSegmentRulesWorkflow,
+)
 
-router = APIRouter(prefix="/workflows/segment-connectivity", tags=["segment-connectivity"])
+router = APIRouter(prefix="/workflows/segment-lifecycle", tags=["segment-lifecycle"])
 
 # One workflow of this domain = one path under the domain prefix.
 _OPEN_SEGMENT_RULES_PATH = "/open-segment-rules"
@@ -46,7 +48,7 @@ _OPEN_SEGMENT_RULES_PATH = "/open-segment-rules"
 # Named after the WORKFLOW, not the domain: they describe one workflow's input
 # and its per-segment outcome, so a sibling workflow in this domain could not
 # reuse them. The domain-agnostic StartWorkflowResponse comes from
-# workflows/routers/models.py instead.
+# workflow_domains/routers/models.py instead.
 class BulkOpenSegmentRulesInput(BaseModel):
     """Many segment definitions in one request (e.g. a CSV import).
 
@@ -127,7 +129,7 @@ async def start_open_segment_rules(
         raise HTTPException(
             status_code=409,
             detail=(
-                "Segment-connectivity workflow already running: "
+                "Segment-lifecycle workflow already running: "
                 f"{_workflow_id(rules_input)}"
             ),
         )

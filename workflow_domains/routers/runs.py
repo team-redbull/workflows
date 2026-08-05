@@ -8,7 +8,7 @@ Keeping it out of the domain routers is also what makes a domain hold several
 workflows. A `GET /workflows/<domain>/{workflow_id}` catch-all swallows every
 sibling's path segment — with `open-segment-rules` and a future
 `close-segment-rules` under the same domain, `GET
-/workflows/segment-connectivity/close-segment-rules` is a status lookup for a
+/workflows/segment-lifecycle/close-segment-rules` is a status lookup for a
 workflow id that happens to be spelled like a route.
 
 Progress and result are workflow-SPECIFIC shapes, so they come back as decoded
@@ -28,7 +28,7 @@ from pydantic import BaseModel
 from temporalio.client import Client, WorkflowExecutionStatus, WorkflowFailureError
 from temporalio.service import RPCError, RPCStatusCode
 
-from workflows.routers.deps import get_temporal_client
+from workflow_domains.routers.deps import get_temporal_client
 
 router = APIRouter(prefix="/workflows/runs", tags=["runs"])
 

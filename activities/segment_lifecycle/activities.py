@@ -1,6 +1,6 @@
-"""Segment-connectivity activity implementations — the execution limbs.
+"""Segment-lifecycle activity implementations — the execution limbs.
 
-These run in the segment-connectivity activity deployment. They talk to:
+These run in the segment-lifecycle activity deployment. They talk to:
   - the team's Segments Manager (SEGMENTS_MANAGER_URL) — create/list segments,
     publish request ids, unlock (Bearer token via SEGMENTS_MANAGER_API_TOKEN;
     GETs are public)
@@ -37,7 +37,7 @@ from shared.exceptions import (
     SegmentNotFoundError,
     SegmentValidationError,
 )
-from shared.models.segment_connectivity import (
+from shared.models.segment_lifecycle import (
     BmcOpenRulesRequest,
     SegmentConnectivityFailureNotice,
     OpenSegmentRulesInput,
@@ -48,9 +48,9 @@ from shared.models.segment_connectivity import (
     SegmentRef,
     SegmentType,
 )
-from shared.settings import SegmentConnectivityActivitySettings
+from shared.settings import SegmentLifecycleActivitySettings
 
-_settings = SegmentConnectivityActivitySettings()
+_settings = SegmentLifecycleActivitySettings()
 
 # Must stay strictly below the activity start_to_close_timeout (90s) so a hung
 # connection fails the HTTP call and releases the worker before Temporal reaps it.
@@ -79,7 +79,7 @@ _BMC_SYSTEM_NAME = "bmc"
 _BMC_COMMENT_LABEL = "BMC"
 
 # Port policy per (source, destination) type pair, straight from the ConfigMap
-# (syntax validated fail-fast at worker startup by SegmentConnectivityActivitySettings).
+# (syntax validated fail-fast at worker startup by SegmentLifecycleActivitySettings).
 # New type pairs: add a PORTS_<SRC>_TO_<DST> settings field + an entry here.
 # Deliberately excludes BMC: _peer_types() derives Segments-Manager-queryable
 # peer types from this dict's keys, and BMC segments are never queryable from

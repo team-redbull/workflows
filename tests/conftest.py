@@ -1,6 +1,6 @@
 """Test environment bootstrap.
 
-activities/segment_connectivity/activities.py instantiates SegmentConnectivityActivitySettings
+activities/segment_lifecycle/activities.py instantiates SegmentLifecycleActivitySettings
 at import time (fail-fast by design), so the full activity config must be in
 the environment BEFORE any test module imports it. Real env vars take
 precedence over the repo's .env, keeping tests deterministic everywhere.

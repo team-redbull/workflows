@@ -19,12 +19,12 @@
 
   var CATALOGUE = [
     {
-      domain: "segment-connectivity",
-      queue: "segment-connectivity-activity",
+      domain: "segment-lifecycle",
+      queue: "segment-lifecycle-activity",
       workflows: [
         {
           name: "open-segment-rules",
-          href: "/segment-connectivity/open-segment-rules.html",
+          href: "/segment-lifecycle/open-segment-rules.html",
           blurb: "create → peer → approve → unlock"
         },
         {

@@ -6,5 +6,5 @@ data:
   # Simulated human-approval delay (seconds) before a submitted request flips
   # from "pending" to "complete" — the operator's edit surface for tuning e2e
   # test timing. Edit here + restart the deployment; no image rebuild, no
-  # chart re-render (mirrors helm/segment-connectivity's PORTS_* knob).
+  # chart re-render (mirrors helm/segment-lifecycle's PORTS_* knob).
   COMPLETION_DELAY_SECONDS: "60"

@@ -1,4 +1,4 @@
-"""Typed state for the segment-connectivity workflow — the contract between brain and limbs.
+"""Typed state for the segment-lifecycle workflow — the contract between brain and limbs.
 
 Everything that crosses the workflow/activity boundary is a Pydantic model (or a
 list of primitives), never an untyped dict.

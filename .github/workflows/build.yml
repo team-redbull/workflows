@@ -46,24 +46,42 @@ jobs:
       - id: filter
         env:
           BEFORE: ${{ github.event.before }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
 
-          # Fail OPEN, never closed. A missing base (first push of a new
-          # branch, all-zero SHA) or an unreachable one (history rewritten by
-          # a force-push) means we cannot know what changed — so build all
-          # four. Skipping a build that was needed ships a stale image and is
-          # invisible; an extra build only costs minutes.
-          if [ -z "${BEFORE}" ] \
-             || [ "${BEFORE}" = "0000000000000000000000000000000000000000" ] \
-             || ! git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
-            echo "no usable base (BEFORE='${BEFORE}') — building everything"
+          # Three ways to establish what this push changed, in order of
+          # precision. The fallbacks matter: the obvious "no base → build
+          # everything" rule sounds safe but fires on the FIRST push of every
+          # new branch (github.event.before is all-zeros there), which turns
+          # an ordinary "branch, tweak docs, push" into all four images.
+          all=false
+          if [ -n "${BEFORE}" ] \
+             && [ "${BEFORE}" != "0000000000000000000000000000000000000000" ] \
+             && git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+            base="${BEFORE}"
+            echo "base: push range from ${BEFORE}"
+          elif [ "${GITHUB_REF_NAME}" != "${DEFAULT_BRANCH}" ] \
+               && base="$(git merge-base "origin/${DEFAULT_BRANCH}" "${GITHUB_SHA}" 2>/dev/null)" \
+               && [ -n "${base}" ]; then
+            # New or rewritten branch: everything it adds on top of the
+            # default branch IS its change set, which is both well defined
+            # and exactly what we want to test.
+            echo "base: branch point off ${DEFAULT_BRANCH} (${base})"
+          else
+            # Only reachable when the default branch itself has no usable
+            # base — i.e. it was force-pushed. Rare, and rebuilding all four
+            # is the right answer there: a skipped build that was needed
+            # ships a stale image to PROD and is invisible, whereas a
+            # redundant build only costs minutes.
+            echo "no usable base on ${GITHUB_REF_NAME} — building everything"
             all=true
             changed=""
-          else
-            all=false
-            changed="$(git diff --name-only "${BEFORE}" "${GITHUB_SHA}")"
-            echo "changed files in ${BEFORE}..${GITHUB_SHA}:"
+          fi
+
+          if [ "${all}" = false ]; then
+            changed="$(git diff --name-only "${base}" "${GITHUB_SHA}")"
+            echo "changed files:"
             printf '%s\n' "${changed}" | sed 's/^/  /'
           fi
 

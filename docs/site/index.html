@@ -150,7 +150,7 @@
       sandbox will stop most of it.</p>
       <div class="grid-2" style="margin-top:4px">
         <div>
-          <p style="color:var(--good);font-family:var(--mono);font-size:11.5px;letter-spacing:.08em">FINE IN A WORKFLOW</p>
+          <p style="color:var(--good);font-family:var(--mono);font-size:var(--fs-12);letter-spacing:.08em">FINE IN A WORKFLOW</p>
           <ul style="margin-top:6px">
             <li>Branching, loops, arithmetic on your own state</li>
             <li><code>await workflow.execute_activity(...)</code></li>
@@ -159,7 +159,7 @@
           </ul>
         </div>
         <div>
-          <p style="color:var(--bad);font-family:var(--mono);font-size:11.5px;letter-spacing:.08em">MUST BE AN ACTIVITY</p>
+          <p style="color:var(--bad);font-family:var(--mono);font-size:var(--fs-12);letter-spacing:.08em">MUST BE AN ACTIVITY</p>
           <ul style="margin-top:6px">
             <li>Any HTTP / DB / filesystem call</li>
             <li><code>datetime.now()</code>, <code>random</code>, <code>uuid4</code></li>

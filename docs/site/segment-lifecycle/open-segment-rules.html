@@ -414,16 +414,16 @@
     <div class="grid-2" style="margin-top:16px">
       <div class="panel">
         <h3>It works in both directions, by construction</h3>
-        <p style="font-size:13.5px;color:var(--ink-2)">Adding an <b>HC</b> segment discovers the site's existing MCE segments and opens
+        <p style="font-size:var(--fs-14);color:var(--ink-2)">Adding an <b>HC</b> segment discovers the site's existing MCE segments and opens
         <code>HC↔MCE</code> for each. Adding an <b>MCE</b> segment discovers every existing HC, INVENTORY and PXE segment on that site
         and opens all of those pairs. So a site converges to full connectivity whatever order segments are added in.</p>
-        <p style="font-size:13.5px;color:var(--ink-2)"><b>With one exception: a site needs its MCE segment first.</b>
+        <p style="font-size:var(--fs-14);color:var(--ink-2)"><b>With one exception: a site needs its MCE segment first.</b>
         HC, INVENTORY and PXE peer only with MCE, so on a site that has none there is nothing to open rules against —
         the run fails with <code>NoPeerSegments</code> rather than creating a segment nothing can reach.</p>
       </div>
       <div class="panel">
         <h3>How many requests will a run make?</h3>
-        <p style="font-size:13.5px;color:var(--ink-2)"><span class="mono">2 × (same-site peers found)</span>, plus <span class="mono">1</span> if the segment is MCE (the BMC rule).
+        <p style="font-size:var(--fs-14);color:var(--ink-2)"><span class="mono">2 × (same-site peers found)</span>, plus <span class="mono">1</span> if the segment is MCE (the BMC rule).
         A new HC segment on a site with 3 MCE segments submits 6 requests; a new MCE segment on a site with 2 HC + 1 PXE submits 7.</p>
       </div>
     </div>
@@ -537,18 +537,18 @@
       </div>
       <div class="panel">
         <h3>Anything unclassified retries forever</h3>
-        <p style="font-size:13.5px;color:var(--ink-2)">This is deliberate, and it has a diagnostic signature worth recognising:
+        <p style="font-size:var(--fs-14);color:var(--ink-2)">This is deliberate, and it has a diagnostic signature worth recognising:
         a run that is genuinely stuck on a permanent-but-unclassified error shows as <b>RUNNING</b> in the Temporal UI, not FAILED,
         with the error attached to the retrying activity. If you see that, the fix is to classify the error — not to add a deadline.</p>
         <h3 style="margin-top:6px">Timeout budget</h3>
-        <p style="font-size:13.5px;color:var(--ink-2)">HTTP client 60 s &lt; activity <code>start_to_close</code> 90 s, so a hung
+        <p style="font-size:var(--fs-14);color:var(--ink-2)">HTTP client 60 s &lt; activity <code>start_to_close</code> 90 s, so a hung
         connection fails the call and frees the worker before Temporal reaps it.</p>
       </div>
     </div>
 
     <div class="panel" style="margin-top:16px">
       <h3>Terminal failure is surfaced, never silent</h3>
-      <p style="font-size:13.5px;color:var(--ink-2)">
+      <p style="font-size:var(--fs-14);color:var(--ink-2)">
         If a run fails after the segment exists — or is cancelled — a best-effort compensation step clears the pending-ids
         display and publishes an <code>open-segment-rules workflow failed</code> note carrying the orphaned request ids,
         so the segment isn't left looking Locked for no reason.

@@ -31,7 +31,30 @@
   --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
   --sans: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
 
-  --topbar-h: 52px;
+  /* ---------------------------------------------------------- type scale ---
+     Named for the px each step renders at when the reader's browser font size
+     is the 16px default — so --fs-14 means "14px out of the box", not "14px
+     always". Every step is rem, i.e. a multiple of the ROOT font size, which
+     is exactly the knob the reader controls (browser font-size preference, and
+     zoom on top of it). One setting therefore rescales the whole document.
+     Two rules keep that property:
+       · no px font-size anywhere outside the `svg text` block near the bottom
+         (there px means viewBox user units and already scales — see its note);
+       · a size that belongs to the type scale uses a token, never a literal,
+         so the ladder stays a ladder and can be retuned in one place.       */
+  --fs-10: 0.625rem;
+  --fs-11: 0.6875rem;
+  --fs-12: 0.75rem;
+  --fs-13: 0.8125rem;
+  --fs-14: 0.875rem;
+  --fs-15: 0.9375rem;
+  --fs-16: 1rem;
+  --fs-17: 1.0625rem;
+  --fs-22: 1.375rem;
+  --fs-23: 1.4375rem;
+  --fs-31: 1.9375rem;
+
+  --topbar-h: 3.5rem;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -69,34 +92,65 @@
 
 * { box-sizing: border-box; }
 
+/* THE SIZE DIAL FOR THE WHOLE SITE. Everything below is rem, so this one
+   declaration sets type, column width, spacing and diagram scale together.
+   Want the docs bigger or smaller? Change this number and nothing else.
+
+   106.25% = 17px against a stock 16px browser default. Some correction is
+   wanted because a HiDPI laptop in its default scaled mode paints roughly 123
+   CSS px per inch where the spec assumes 96, so every site lands ~20% smaller
+   than its author meant — and CSS cannot detect that. Physical size, pixel
+   density and viewing distance are simply not exposed to the page, and the
+   things that look like proxies are not: viewport width can't tell a 13"
+   laptop from a small window on a 32" monitor, min-resolution can't tell a
+   Retina laptop from a 4K desktop, and CSS `in`/`mm` are hardcoded ratios of
+   px, not real inches. So there is no honest way to auto-fit each screen, and
+   anything that tried would be a guess that breaks on the screens it guessed
+   wrong about.
+
+   The generic answer is instead to ship ONE comfortable size for everyone.
+   17px is squarely normal for technical documentation, it needs nothing from
+   the reader in any browser on any machine, and it degrades gracefully rather
+   than being "correct on one screen and wrong on the rest". It deliberately
+   under-corrects for the HiDPI gap: a full correction reads fine on a laptop
+   but overbearing on a low-density desktop monitor, and of the two errors the
+   one that leaves a little room for the reader's own zoom is the safer.
+
+   A percentage, never px, so the small minority who HAVE set a font-size
+   preference (accessibility need, usually) still get it honored — they land
+   1.0625x whatever they chose instead of having it silently overridden. */
+html { font-size: 106.25%; }
+
 body {
   margin: 0;
   background: var(--paper);
   color: var(--ink);
   font-family: var(--sans);
-  font-size: 15px;
+  font-size: var(--fs-16);
   line-height: 1.6;
   -webkit-font-smoothing: antialiased;
 }
 
-.wrap { max-width: 1080px; margin: 0 auto; padding: 0 24px 96px; }
+/* Widths in rem, not px, so the measure grows WITH the text. Left in px, a
+   larger font size would just crowd more words into the same 1080px column. */
+.wrap { max-width: 67.5rem; margin: 0 auto; padding: 0 1.5rem 6rem; }
 
 /* ---------------------------------------------------------------- type --- */
 
 h1, h2, h3, h4 { text-wrap: balance; margin: 0; font-weight: 600; }
-h1 { font-family: var(--mono); font-size: 30px; letter-spacing: -.02em; }
-h2 { font-size: 21px; letter-spacing: -.01em; }
-h3 { font-size: 16px; }
+h1 { font-family: var(--mono); font-size: var(--fs-31); letter-spacing: -.02em; }
+h2 { font-size: var(--fs-22); letter-spacing: -.01em; }
+h3 { font-size: var(--fs-17); }
 p  { margin: 0; }
 code, .mono { font-family: var(--mono); font-size: .88em; }
-.eyebrow { font-family: var(--mono); font-size: 11px; letter-spacing: .13em; text-transform: uppercase; color: var(--ink-3); }
+.eyebrow { font-family: var(--mono); font-size: var(--fs-12); letter-spacing: .13em; text-transform: uppercase; color: var(--ink-3); }
 .lede { color: var(--ink-2); max-width: 68ch; }
 a { color: inherit; }
 
 .skip-link {
   position: absolute; left: -9999px; top: 0; z-index: 100;
   background: var(--surface); color: var(--ink); padding: 10px 16px;
-  border: 1px solid var(--tmp); border-radius: 0 0 4px 0; font-family: var(--mono); font-size: 12px;
+  border: 1px solid var(--tmp); border-radius: 0 0 4px 0; font-family: var(--mono); font-size: var(--fs-13);
 }
 .skip-link:focus { left: 0; }
 
@@ -125,22 +179,28 @@ a { color: inherit; }
    baseline alignment the two text items want (a replaced element sits its BOTTOM
    edge on the baseline, which reads as floating). Height only — width auto keeps
    the 2.68:1 artwork from being squashed. */
-.brand-mark { align-self: center; height: 18px; width: auto; }
+.brand-mark { align-self: center; height: 1.125rem; width: auto; }
+/* min-width:0 + ellipsis is the safety net that makes overlap impossible at ANY
+   width: as a flex item the name would otherwise refuse to shrink past its own
+   text (white-space:nowrap) and slide under the nav instead. With this it just
+   truncates. The breakpoints below exist so it rarely has to. */
 .brand-name {
-  font-family: var(--mono); font-size: 13.5px; font-weight: 600;
+  font-family: var(--mono); font-size: var(--fs-14); font-weight: 600;
   letter-spacing: .01em; color: var(--ink); white-space: nowrap;
+  min-width: 0; overflow: hidden; text-overflow: ellipsis;
 }
 .brand-ver {
-  font-family: var(--mono); font-size: 10.5px; letter-spacing: .04em;
+  font-family: var(--mono); font-size: var(--fs-11); letter-spacing: .04em;
   color: var(--ink-3); border: 1px solid var(--line-2); border-radius: 999px;
-  padding: 1px 7px; white-space: nowrap;
+  padding: 1px 7px; white-space: nowrap; flex: none;
 }
 .brand:hover .brand-name { color: var(--tmp); }
 
-.topnav { display: flex; align-items: center; gap: 6px; }
+/* Never shrink the nav — it is the only way off this page. The brand yields. */
+.topnav { display: flex; align-items: center; gap: 6px; flex: none; }
 
 .topnav-link, .wfmenu-btn {
-  font-family: var(--mono); font-size: 12px; line-height: 1;
+  font-family: var(--mono); font-size: var(--fs-13); line-height: 1;
   color: var(--ink-2); text-decoration: none;
   background: none; border: 1px solid transparent; border-radius: 4px;
   padding: 7px 11px; cursor: pointer; white-space: nowrap;
@@ -154,13 +214,13 @@ a { color: inherit; }
 
 .wfmenu { position: relative; }
 .wfmenu-btn { display: inline-flex; align-items: center; gap: 7px; border-color: var(--line-2); }
-.wfmenu-btn .caret { font-size: 9px; color: var(--ink-3); transition: transform .13s ease; }
+.wfmenu-btn .caret { font-size: var(--fs-10); color: var(--ink-3); transition: transform .13s ease; }
 .wfmenu-btn[aria-expanded="true"] { background: var(--sunken); color: var(--ink); border-color: var(--ink-3); }
 .wfmenu-btn[aria-expanded="true"] .caret { transform: rotate(180deg); }
 
 .wfmenu-panel {
   position: absolute; top: calc(100% + 7px); right: 0; z-index: 60;
-  min-width: 400px; max-height: min(70vh, 520px); overflow-y: auto;
+  min-width: 25rem; max-height: min(70vh, 32.5rem); overflow-y: auto;
   background: var(--surface); border: 1px solid var(--line-2); border-radius: 6px;
   box-shadow: 0 12px 32px -12px rgb(0 0 0 / .28), 0 2px 6px -2px rgb(0 0 0 / .12);
   padding: 6px;
@@ -171,7 +231,7 @@ a { color: inherit; }
 .wfgroup-head {
   display: flex; align-items: baseline; gap: 8px;
   padding: 7px 10px 5px;
-  font-family: var(--mono); font-size: 10px; letter-spacing: .12em;
+  font-family: var(--mono); font-size: var(--fs-11); letter-spacing: .12em;
   text-transform: uppercase; color: var(--ink-3);
 }
 .wfgroup-head .count { margin-left: auto; letter-spacing: 0; text-transform: none; opacity: .75; }
@@ -182,9 +242,9 @@ a { color: inherit; }
 }
 /* The workflow name never wraps — it is an identifier, and a broken one is
    harder to recognise than a truncated blurb. The blurb yields instead. */
-.wfitem .n { font-family: var(--mono); font-size: 12.5px; color: var(--ink); white-space: nowrap; }
+.wfitem .n { font-family: var(--mono); font-size: var(--fs-13); color: var(--ink); white-space: nowrap; }
 .wfitem .d {
-  font-size: 11.5px; color: var(--ink-3); margin-left: auto; text-align: right;
+  font-size: var(--fs-12); color: var(--ink-3); margin-left: auto; text-align: right;
   min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 a.wfitem:hover { background: var(--sunken); }
@@ -197,19 +257,31 @@ a.wfitem[aria-current="page"] .n { color: var(--tmp); font-weight: 600; }
 .wfitem.planned { cursor: default; }
 .wfitem.planned .n { color: var(--ink-3); }
 .wfitem.planned .d {
-  font-family: var(--mono); font-size: 10px; letter-spacing: .1em; text-transform: uppercase;
+  font-family: var(--mono); font-size: var(--fs-11); letter-spacing: .1em; text-transform: uppercase;
   border: 1px dashed var(--line-2); border-radius: 3px; padding: 1px 6px; color: var(--ink-3);
 }
 
 .wfmenu-foot {
   margin-top: 4px; border-top: 1px solid var(--line); padding: 9px 10px 5px;
-  font-size: 11.5px; color: var(--ink-3);
+  font-size: var(--fs-12); color: var(--ink-3);
 }
 
-@media (max-width: 560px) {
+/* The topbar is one non-wrapping row of fixed chrome, so unlike the content it
+   cannot reflow — it has to SHED parts as space runs out, and it runs out long
+   before the content does (it needs ~46rem all told, well above the 35em
+   content breakpoint). Shed in order of redundancy, never by guessing a device:
+   the version badge is informational, and "Orchestrator guide" points at the
+   same page the brand logo already links to, so both are recoverable losses
+   while the Workflows menu is not. */
+@media (max-width: 48em) {
+  .topnav-link { display: none; }
+}
+
+@media (max-width: 35em) {
   .topbar { gap: 10px; padding: 0 12px; }
-  .brand-name { font-size: 12px; }
-  .brand-mark { height: 15px; }
+  .brand-name { font-size: var(--fs-13); }
+  .brand-mark { height: .9375rem; }
+  .brand-ver { display: none; }
   .wfmenu-panel { position: fixed; left: 8px; right: 8px; min-width: 0; }
 }
 
@@ -217,26 +289,26 @@ a.wfitem[aria-current="page"] .n { color: var(--tmp); font-weight: 600; }
 
 header.masthead { border-bottom: 1px solid var(--line); background: var(--surface); }
 .masthead-inner {
-  max-width: 1080px; margin: 0 auto; padding: 36px 24px 32px;
+  max-width: 67.5rem; margin: 0 auto; padding: 2.25rem 1.5rem 2rem;
   display: flex; flex-direction: column; gap: 14px;
 }
 .masthead h1 .dim { color: var(--ink-3); }
 
 .facts {
-  display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(11.875rem, 1fr));
   gap: 1px; background: var(--line); border: 1px solid var(--line);
   border-radius: 3px; overflow: hidden; margin-top: 8px;
 }
 .fact { background: var(--surface); padding: 12px 14px; display: flex; flex-direction: column; gap: 3px; }
-.fact .k { font-family: var(--mono); font-size: 10.5px; letter-spacing: .1em; text-transform: uppercase; color: var(--ink-3); }
-.fact .v { font-family: var(--mono); font-size: 12.5px; color: var(--ink); word-break: break-word; }
+.fact .k { font-family: var(--mono); font-size: var(--fs-11); letter-spacing: .1em; text-transform: uppercase; color: var(--ink-3); }
+.fact .v { font-family: var(--mono); font-size: var(--fs-13); color: var(--ink); word-break: break-word; }
 
 /* ------------------------------------------------------------ sections --- */
 
-section { margin-top: 64px; }
+section { margin-top: 4rem; }
 .sec-head {
   display: flex; flex-direction: column; gap: 6px;
-  padding-bottom: 14px; margin-bottom: 26px; border-bottom: 1px solid var(--line);
+  padding-bottom: .875rem; margin-bottom: 1.625rem; border-bottom: 1px solid var(--line);
 }
 .stack { display: flex; flex-direction: column; gap: 16px; }
 
@@ -244,7 +316,7 @@ section { margin-top: 64px; }
 /* The homepage index. Same data as the topbar menu, in the open, so a first-time
    reader sees the whole surface without opening anything. */
 
-.wfcards { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; }
+.wfcards { display: grid; grid-template-columns: repeat(auto-fit, minmax(18.75rem, 1fr)); gap: 16px; }
 
 .wfdomain {
   background: var(--surface); border: 1px solid var(--line); border-radius: 4px;
@@ -254,8 +326,8 @@ section { margin-top: 64px; }
   display: flex; align-items: baseline; gap: 10px;
   padding: 12px 16px; background: var(--sunken); border-bottom: 1px solid var(--line);
 }
-.wfdomain-head .dn { font-family: var(--mono); font-size: 13px; font-weight: 600; color: var(--ink); }
-.wfdomain-head .dq { font-family: var(--mono); font-size: 10.5px; color: var(--ink-3); margin-left: auto; }
+.wfdomain-head .dn { font-family: var(--mono); font-size: var(--fs-14); font-weight: 600; color: var(--ink); }
+.wfdomain-head .dq { font-family: var(--mono); font-size: var(--fs-11); color: var(--ink-3); margin-left: auto; }
 .wfdomain-body { display: flex; flex-direction: column; }
 
 .wfrow {
@@ -263,14 +335,14 @@ section { margin-top: 64px; }
   padding: 13px 16px; text-decoration: none; border-bottom: 1px solid var(--line);
 }
 .wfrow:last-child { border-bottom: none; }
-.wfrow .n { font-family: var(--mono); font-size: 13px; color: var(--ink); }
-.wfrow .d { font-size: 12.5px; color: var(--ink-3); }
-.wfrow .go { margin-left: auto; font-family: var(--mono); font-size: 12px; color: var(--tmp); white-space: nowrap; }
+.wfrow .n { font-family: var(--mono); font-size: var(--fs-14); color: var(--ink); }
+.wfrow .d { font-size: var(--fs-13); color: var(--ink-3); }
+.wfrow .go { margin-left: auto; font-family: var(--mono); font-size: var(--fs-13); color: var(--tmp); white-space: nowrap; }
 a.wfrow:hover { background: var(--tmp-bg); }
 a.wfrow:focus-visible { outline: 2px solid var(--tmp); outline-offset: -2px; }
 .wfrow.planned .n { color: var(--ink-3); }
 .wfrow.planned .go {
-  color: var(--ink-3); font-size: 10px; letter-spacing: .1em; text-transform: uppercase;
+  color: var(--ink-3); font-size: var(--fs-11); letter-spacing: .1em; text-transform: uppercase;
   border: 1px dashed var(--line-2); border-radius: 3px; padding: 1px 6px;
 }
 
@@ -278,10 +350,10 @@ a.wfrow:focus-visible { outline: 2px solid var(--tmp); outline-offset: -2px; }
 
 .panel {
   background: var(--surface); border: 1px solid var(--line); border-radius: 4px;
-  padding: 16px 18px; display: flex; flex-direction: column; gap: 10px;
+  padding: 1rem 1.125rem; display: flex; flex-direction: column; gap: 10px;
 }
-.panel h3 { font-size: 14px; }
-.panel p, .panel li { font-size: 13.5px; color: var(--ink-2); }
+.panel h3 { font-size: var(--fs-15); }
+.panel p, .panel li { font-size: var(--fs-14); color: var(--ink-2); }
 .panel ul, .panel ol { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 6px; }
 .panel.accent { border-color: color-mix(in srgb, var(--tmp) 45%, var(--line)); background: var(--tmp-bg); }
 .panel.accent h3 { color: var(--tmp); }
@@ -292,15 +364,15 @@ a.wfrow:focus-visible { outline: 2px solid var(--tmp); outline-offset: -2px; }
 .panel.ok { border-color: color-mix(in srgb, var(--good) 40%, var(--line)); }
 .panel.ok h3 { color: var(--good); }
 
-.grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; }
-.grid-3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 16px; }
+.grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(18.75rem, 1fr)); gap: 16px; }
+.grid-3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(14.375rem, 1fr)); gap: 16px; }
 
-.note { font-size: 13px; color: var(--ink-2); border-left: 2px solid var(--line-2); padding-left: 12px; }
+.note { font-size: var(--fs-14); color: var(--ink-2); border-left: 2px solid var(--line-2); padding-left: 12px; }
 .note b { color: var(--ink); font-weight: 600; }
 
 .chip {
   display: inline-flex; align-items: center; gap: 6px;
-  font-family: var(--mono); font-size: 11.5px; line-height: 1.4;
+  font-family: var(--mono); font-size: var(--fs-12); line-height: 1.4;
   padding: 3px 8px; border-radius: 3px; border: 1px solid transparent; white-space: nowrap;
 }
 .chip .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; flex: none; }
@@ -309,31 +381,31 @@ a.wfrow:focus-visible { outline: 2px solid var(--tmp); outline-offset: -2px; }
 /* -------------------------------------------------------------- tables --- */
 
 .table-scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: 4px; background: var(--surface); }
-table { border-collapse: collapse; width: 100%; font-size: 13.5px; }
+table { border-collapse: collapse; width: 100%; font-size: var(--fs-14); }
 th, td { text-align: left; padding: 9px 14px; border-bottom: 1px solid var(--line); vertical-align: top; }
 thead th {
-  font-family: var(--mono); font-size: 10.5px; letter-spacing: .1em; text-transform: uppercase;
+  font-family: var(--mono); font-size: var(--fs-11); letter-spacing: .1em; text-transform: uppercase;
   color: var(--ink-3); font-weight: 500; background: var(--sunken); white-space: nowrap;
 }
 tbody tr:last-child td { border-bottom: none; }
-td.k, td .k { font-family: var(--mono); font-size: 12.5px; color: var(--ink); white-space: nowrap; }
-td.kw { font-family: var(--mono); font-size: 12.5px; color: var(--ink); }
+td.k, td .k { font-family: var(--mono); font-size: var(--fs-13); color: var(--ink); white-space: nowrap; }
+td.kw { font-family: var(--mono); font-size: var(--fs-13); color: var(--ink); }
 td.muted { color: var(--ink-2); }
 .nums { font-variant-numeric: tabular-nums; }
 
 .matrix th, .matrix td { text-align: center; }
 .matrix th:first-child, .matrix td:first-child { text-align: left; }
 .matrix td.self { color: var(--ink-3); }
-.matrix td.yes { color: var(--sm); font-family: var(--mono); font-size: 11.5px; }
-.matrix td.oneway { color: var(--nxt); font-family: var(--mono); font-size: 11.5px; }
+.matrix td.yes { color: var(--sm); font-family: var(--mono); font-size: var(--fs-12); }
+.matrix td.oneway { color: var(--nxt); font-family: var(--mono); font-size: var(--fs-12); }
 .matrix td.no { color: var(--line-2); }
-.matrix tbody th { font-family: var(--mono); font-size: 12.5px; font-weight: 600; text-align: left; white-space: nowrap; }
+.matrix tbody th { font-family: var(--mono); font-size: var(--fs-13); font-weight: 600; text-align: left; white-space: nowrap; }
 
 /* ---------------------------------------------------------------- code --- */
 
 pre {
   margin: 0; padding: 12px 14px; background: var(--sunken); border-radius: 3px;
-  overflow-x: auto; font-family: var(--mono); font-size: 12.5px; line-height: 1.55;
+  overflow-x: auto; font-family: var(--mono); font-size: var(--fs-13); line-height: 1.55;
   color: var(--ink); border: 1px solid var(--line);
 }
 pre .c { color: var(--ink-3); }
@@ -341,10 +413,10 @@ pre .kwd { color: var(--tmp); }
 pre .str { color: var(--sm); }
 
 .codecard { display: flex; flex-direction: column; gap: 8px; }
-.codecard .cap { font-family: var(--mono); font-size: 11px; color: var(--ink-3); }
+.codecard .cap { font-family: var(--mono); font-size: var(--fs-12); color: var(--ink-3); }
 
-.kv { display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; font-size: 13.5px; }
-.kv dt { font-family: var(--mono); font-size: 12.5px; color: var(--ink); }
+.kv { display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; font-size: var(--fs-14); }
+.kv dt { font-family: var(--mono); font-size: var(--fs-13); color: var(--ink); }
 .kv dd { margin: 0; color: var(--ink-2); }
 
 /* ------------------------------------------------------------ diagrams --- */
@@ -354,22 +426,32 @@ pre .str { color: var(--sm); }
   padding: 10px 12px; overflow-x: auto;
 }
 .diagram svg { display: block; width: 100%; height: auto; }
-.diagram.wide svg { min-width: 880px; }
-.diagram.mid svg  { min-width: 700px; }
-.diagram.rail svg { min-width: 880px; }
-.diagram.topology svg { min-width: 560px; max-width: 720px; margin: 0 auto; }
+.diagram.wide svg { min-width: 55rem; }
+.diagram.mid svg  { min-width: 43.75rem; }
+.diagram.rail svg { min-width: 55rem; }
+.diagram.topology svg { min-width: 35rem; max-width: 45rem; margin: 0 auto; }
 
 .diagram-caption {
-  margin-top: 10px; font-size: 12.5px; color: var(--ink-3);
+  margin-top: 10px; font-size: var(--fs-13); color: var(--ink-3);
   display: flex; flex-wrap: wrap; gap: 6px 16px; align-items: center;
 }
-.swatch { display: inline-flex; align-items: center; gap: 6px; font-family: var(--mono); font-size: 11px; }
+.swatch { display: inline-flex; align-items: center; gap: 6px; font-family: var(--mono); font-size: var(--fs-12); }
 .swatch i { width: 18px; height: 0; border-top: 2px solid currentColor; display: inline-block; }
 .swatch i.dash { border-top-style: dashed; }
 .swatch.sm { color: var(--sm); }
 .swatch.nxt { color: var(--nxt); }
 .swatch.tmp { color: var(--tmp); }
 .swatch.n { color: var(--ink-3); }
+
+/* Everything below styles content INSIDE an <svg viewBox="...">, and that is the
+   one place px is still correct. There, px is a viewBox user unit, not a CSS
+   pixel: the diagram is laid out on a fixed coordinate grid, `.diagram svg` is
+   width:100%, and the browser scales the whole grid — labels included — to
+   whatever the container ended up being. So these sizes already follow the root
+   scale, one step removed, and stay locked to the geometry they annotate.
+   Switching them to rem would break that: rem resolves against the root in CSS
+   px, so the labels would stop scaling with the drawing and start overflowing
+   their boxes. Leave them in px. */
 
 /* boxes-and-arrows primitives (guide diagrams) */
 svg .box { stroke-width: 1.6; }
@@ -460,41 +542,41 @@ svg text.loop-l  { font-family: var(--mono); font-size: 10.5px; fill: var(--nxt)
 
 .flow { display: flex; flex-direction: column; }
 
-.step { display: grid; grid-template-columns: 34px 1fr; gap: 20px; position: relative; padding-bottom: 26px; }
+.step { display: grid; grid-template-columns: 2.125rem 1fr; gap: 20px; position: relative; padding-bottom: 26px; }
 .step::before {
-  content: ""; position: absolute; left: 16px; top: 30px; bottom: -4px;
+  content: ""; position: absolute; left: 1rem; top: 1.875rem; bottom: -4px;
   width: 2px; background: var(--line-2);
 }
 .step:last-child::before { display: none; }
 
 .marker {
-  width: 34px; height: 34px; border-radius: 50%;
+  width: 2.125rem; height: 2.125rem; border-radius: 50%;
   display: grid; place-items: center;
-  font-family: var(--mono); font-size: 13px; font-weight: 600;
+  font-family: var(--mono); font-size: var(--fs-14); font-weight: 600;
   background: var(--surface); color: var(--ink); border: 2px solid var(--line-2);
   position: relative; z-index: 1;
 }
-.step.gate  .marker { border-color: var(--ink-3); color: var(--ink-2); font-size: 15px; }
+.step.gate  .marker { border-color: var(--ink-3); color: var(--ink-2); font-size: var(--fs-16); }
 .step.wait  .marker { border-color: var(--nxt);  color: var(--nxt); }
 .step.done  .marker { border-color: var(--good); color: var(--good); }
 
 .card {
   background: var(--surface); border: 1px solid var(--line); border-radius: 4px;
-  padding: 16px 18px; display: flex; flex-direction: column; gap: 10px;
+  padding: 1rem 1.125rem; display: flex; flex-direction: column; gap: 10px;
 }
 .step.wait .card { border-color: color-mix(in srgb, var(--nxt) 40%, var(--line)); }
 .step.done .card { border-color: color-mix(in srgb, var(--good) 40%, var(--line)); }
 
 .card-title { display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px; }
 .card-title h3 { font-family: var(--mono); font-weight: 600; }
-.phase { font-family: var(--mono); font-size: 11px; color: var(--ink-3); }
+.phase { font-family: var(--mono); font-size: var(--fs-12); color: var(--ink-3); }
 .phase b { color: var(--ink-2); font-weight: 500; }
-.card p { color: var(--ink-2); font-size: 14px; }
+.card p { color: var(--ink-2); font-size: var(--fs-15); }
 
 .calls { display: flex; flex-direction: column; gap: 6px; }
 .call {
   display: grid; grid-template-columns: auto 1fr; gap: 10px; align-items: center;
-  font-family: var(--mono); font-size: 12.5px; padding: 7px 10px;
+  font-family: var(--mono); font-size: var(--fs-13); padding: 7px 10px;
   background: var(--sunken); border-radius: 3px; border-left: 3px solid var(--line-2);
 }
 .call.sm  { border-left-color: var(--sm); }
@@ -507,10 +589,10 @@ svg text.loop-l  { font-family: var(--mono); font-size: 10.5px; fill: var(--nxt)
 .loopbox {
   border: 1px dashed color-mix(in srgb, var(--nxt) 55%, var(--line));
   background: var(--nxt-bg); border-radius: 4px; padding: 12px 14px;
-  display: flex; flex-direction: column; gap: 8px; font-size: 13.5px; color: var(--ink-2);
+  display: flex; flex-direction: column; gap: 8px; font-size: var(--fs-14); color: var(--ink-2);
 }
 .loopbox .loop-title {
-  font-family: var(--mono); font-size: 11px; letter-spacing: .1em;
+  font-family: var(--mono); font-size: var(--fs-12); letter-spacing: .1em;
   text-transform: uppercase; color: var(--nxt);
 }
 .loopbox ol { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 4px; }
@@ -524,25 +606,25 @@ svg text.loop-l  { font-family: var(--mono); font-size: 10.5px; fill: var(--nxt)
   padding: 12px 16px; border-bottom: 1px solid var(--line); background: var(--sunken);
 }
 .method {
-  font-family: var(--mono); font-size: 11px; font-weight: 600; letter-spacing: .08em;
+  font-family: var(--mono); font-size: var(--fs-12); font-weight: 600; letter-spacing: .08em;
   padding: 3px 7px; border-radius: 3px; background: var(--tmp-bg); color: var(--tmp);
   border: 1px solid color-mix(in srgb, var(--tmp) 30%, transparent);
 }
-.endpoint-head .path { font-family: var(--mono); font-size: 13.5px; word-break: break-all; }
-.endpoint-head .ret { margin-left: auto; font-family: var(--mono); font-size: 11.5px; color: var(--ink-3); }
-.endpoint-body { padding: 14px 16px; display: flex; flex-direction: column; gap: 12px; font-size: 13.5px; color: var(--ink-2); }
+.endpoint-head .path { font-family: var(--mono); font-size: var(--fs-14); word-break: break-all; }
+.endpoint-head .ret { margin-left: auto; font-family: var(--mono); font-size: var(--fs-12); color: var(--ink-3); }
+.endpoint-body { padding: .875rem 1rem; display: flex; flex-direction: column; gap: 12px; font-size: var(--fs-14); color: var(--ink-2); }
 
 /* -------------------------------------------------------------- footer --- */
 
 footer {
-  margin-top: 72px; padding-top: 20px; border-top: 1px solid var(--line);
-  font-size: 12.5px; color: var(--ink-3); font-family: var(--mono);
+  margin-top: 4.5rem; padding-top: 20px; border-top: 1px solid var(--line);
+  font-size: var(--fs-13); color: var(--ink-3); font-family: var(--mono);
   display: flex; flex-wrap: wrap; gap: 6px 18px;
 }
 
-@media (max-width: 620px) {
-  h1 { font-size: 22px; }
-  .step { grid-template-columns: 28px 1fr; gap: 14px; }
-  .step::before { left: 13px; }
-  .marker { width: 28px; height: 28px; font-size: 12px; }
+@media (max-width: 38.75em) {
+  h1 { font-size: var(--fs-23); }
+  .step { grid-template-columns: 1.75rem 1fr; gap: 14px; }
+  .step::before { left: .8125rem; }
+  .marker { width: 1.75rem; height: 1.75rem; font-size: var(--fs-13); }
 }

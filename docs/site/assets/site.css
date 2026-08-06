@@ -121,7 +121,11 @@ a { color: inherit; }
   display: flex; align-items: baseline; gap: 9px;
   text-decoration: none; margin-right: auto; min-width: 0;
 }
-.brand-mark { color: var(--bad); font-size: 13px; line-height: 1; transform: translateY(-1px); }
+/* The bulls, not a glyph: an <img>, so `align-self` has to opt it out of the
+   baseline alignment the two text items want (a replaced element sits its BOTTOM
+   edge on the baseline, which reads as floating). Height only — width auto keeps
+   the 2.68:1 artwork from being squashed. */
+.brand-mark { align-self: center; height: 18px; width: auto; }
 .brand-name {
   font-family: var(--mono); font-size: 13.5px; font-weight: 600;
   letter-spacing: .01em; color: var(--ink); white-space: nowrap;
@@ -205,6 +209,7 @@ a.wfitem[aria-current="page"] .n { color: var(--tmp); font-weight: 600; }
 @media (max-width: 560px) {
   .topbar { gap: 10px; padding: 0 12px; }
   .brand-name { font-size: 12px; }
+  .brand-mark { height: 15px; }
   .wfmenu-panel { position: fixed; left: 8px; right: 8px; min-width: 0; }
 }
 

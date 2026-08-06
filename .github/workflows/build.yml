@@ -16,8 +16,82 @@ permissions:
   packages: write
 
 jobs:
-  build-workflow-brain:
+  # Which images does this push actually affect? Without this, EVERY push
+  # rebuilt, re-tagged and redeployed all four — a CSS tweak in docs/ rolled
+  # the orchestrator and the worker pods for an image whose content had not
+  # changed at all.
+  #
+  # Per-JOB filtering, so it cannot be `on.push.paths`: that gates the whole
+  # workflow, which is the opposite of what is wanted when four independent
+  # images share one file. Hence a cheap job that diffs the push range and
+  # publishes a boolean per image.
+  #
+  # Plain git rather than a marketplace filter action: no third-party
+  # dependency in the path that decides what reaches production, and the
+  # edge cases are explicit below.
+  changes:
     if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      brain: ${{ steps.filter.outputs.brain }}
+      limb:  ${{ steps.filter.outputs.limb }}
+      mock:  ${{ steps.filter.outputs.mock }}
+      docs:  ${{ steps.filter.outputs.docs }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # need both ends of the range to diff them
+      - id: filter
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+
+          # Fail OPEN, never closed. A missing base (first push of a new
+          # branch, all-zero SHA) or an unreachable one (history rewritten by
+          # a force-push) means we cannot know what changed — so build all
+          # four. Skipping a build that was needed ships a stale image and is
+          # invisible; an extra build only costs minutes.
+          if [ -z "${BEFORE}" ] \
+             || [ "${BEFORE}" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+            echo "no usable base (BEFORE='${BEFORE}') — building everything"
+            all=true
+            changed=""
+          else
+            all=false
+            changed="$(git diff --name-only "${BEFORE}" "${GITHUB_SHA}")"
+            echo "changed files in ${BEFORE}..${GITHUB_SHA}:"
+            printf '%s\n' "${changed}" | sed 's/^/  /'
+          fi
+
+          match() {
+            if [ "${all}" = true ]; then echo true; return; fi
+            if printf '%s\n' "${changed}" | grep -qE "$1"; then echo true; else echo false; fi
+          }
+
+          # Paths mirror each Dockerfile's COPY set, NOT the folder that
+          # happens to share the image's name:
+          #   · both Python images bake in shared/, so it triggers both;
+          #   · the limb copies the WHOLE activities/ tree, not just
+          #     activities/segment_lifecycle/;
+          #   · the mock copies only dev/mock-segment-connectivity/ — and
+          #     deliberately NOT helm/mock-segment-connectivity/, which is
+          #     where CI writes its own version bump;
+          #   · this file changes what gets built, so it triggers all four.
+          SELF='\.github/workflows/build\.yml$'
+          {
+            echo "brain=$(match "^(workflow_domains/|shared/|${SELF})")"
+            echo "limb=$(match "^(activities/|shared/|${SELF})")"
+            echo "mock=$(match "^(dev/mock-segment-connectivity/|${SELF})")"
+            echo "docs=$(match "^(docs/|${SELF})")"
+          } | tee -a "${GITHUB_OUTPUT}"
+
+  build-workflow-brain:
+    needs: changes
+    if: ${{ needs.changes.outputs.brain == 'true' }}
     uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
     with:
       image-name: workflows
@@ -31,11 +105,17 @@ jobs:
     secrets: inherit
 
   build-segment-lifecycle-worker:
-    if: github.event_name == 'push'
     # Kept sequential after the brain only to avoid two jobs pushing the mock/code
     # repo at once; the two Argo charts bump SEPARATE helm-charts repos so they no
     # longer race on a shared tag.
-    needs: build-workflow-brain
+    #
+    # The two status guards are what let the chain SURVIVE a skip: a job whose
+    # `needs` was skipped is itself skipped by default, so without a status
+    # function in `if` a docs-only push would skip the brain and then everything
+    # queued behind it — including docs. `!failure()` keeps the old behaviour in
+    # the case that matters: a genuine failure upstream still stops the chain.
+    needs: [changes, build-workflow-brain]
+    if: ${{ !cancelled() && !failure() && needs.changes.outputs.limb == 'true' }}
     uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
     with:
       image-name: segment-lifecycle-worker
@@ -46,10 +126,12 @@ jobs:
     secrets: inherit
 
   build-mock-segment-connectivity:
-    if: github.event_name == 'push'
     # Sequential, not parallel: all three calls bump the same shared vX.Y.Z git
-    # tag and commit+push to the same branch; running in parallel races.
-    needs: build-segment-lifecycle-worker
+    # tag and commit+push to the same branch; running in parallel races. That is
+    # still true of any two that DO run together, so the chain stays — the
+    # filters just make it common for only one link to be live.
+    needs: [changes, build-segment-lifecycle-worker]
+    if: ${{ !cancelled() && !failure() && needs.changes.outputs.mock == 'true' }}
     uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
     with:
       image-name: mock-segment-connectivity
@@ -59,10 +141,12 @@ jobs:
     secrets: inherit
 
   build-workflows-docs:
-    if: github.event_name == 'push'
     # Same sequential chain as the others: every one of these calls bumps the
     # same shared vX.Y.Z git tag in this repo, so they cannot run in parallel.
-    needs: build-mock-segment-connectivity
+    # Last in the chain, so it is the job that most needed the skip guards —
+    # a docs-only push skips all three ahead of it.
+    needs: [changes, build-mock-segment-connectivity]
+    if: ${{ !cancelled() && !failure() && needs.changes.outputs.docs == 'true' }}
     uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
     with:
       # The docs site. Its own Argo service (workflows-docs) rather than a page

@@ -21,11 +21,17 @@ from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.worker import Worker
 
 from activities.segment_lifecycle.activities import (
+    allocate_segment,
+    append_allocation_to_cluster_values,
     check_next_requests,
     create_segment,
     get_bmc_segment,
+    get_dhcp_scope,
     get_next_checking_request_interval,
+    get_segment,
+    get_valid_sites,
     list_peer_segments,
+    locate_cluster_file,
     publish_segment_connectivity_failure,
     publish_request_ids,
     submit_bmc_open_rules,
@@ -52,6 +58,7 @@ async def main() -> None:
         client,
         task_queue=SEGMENT_LIFECYCLE_ACTIVITY_QUEUE,
         activities=[
+            # open-segment-rules
             create_segment,
             list_peer_segments,
             submit_open_rules,
@@ -62,6 +69,13 @@ async def main() -> None:
             get_next_checking_request_interval,
             unlock_segment,
             publish_segment_connectivity_failure,
+            # allocate-segment
+            get_valid_sites,
+            locate_cluster_file,
+            allocate_segment,
+            get_segment,
+            append_allocation_to_cluster_values,
+            get_dhcp_scope,
         ],
         # In-flight activities get this long to finish after shutdown starts
         # before being cancelled — keep it below the pod's

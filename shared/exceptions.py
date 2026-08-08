@@ -70,3 +70,64 @@ class BmcSegmentNotConfiguredError(OrchestratorError):
     Deterministic — a missing ConfigMap entry never fixes itself, so workflows
     list this type in non_retryable_error_types.
     """
+
+
+class ClusterFileNotFoundError(OrchestratorError):
+    """No `<cluster>.yaml` exists anywhere under the values repo's clusters
+    root — the cluster the caller asked to allocate a segment for has no
+    values file to write the allocation into.
+
+    Deterministic — the file has to be created by whoever defines the cluster,
+    so workflows list this type in non_retryable_error_types.
+    """
+
+
+class AmbiguousClusterFileError(OrchestratorError):
+    """More than one `<cluster>.yaml` exists under the values repo's clusters
+    root. Cluster file names are the identity the whole day1 stack keys on
+    (Argo Application names, DHCP scope names), so a duplicate is a repo
+    mistake a human must resolve — never something to guess about.
+
+    Deterministic — non-retryable.
+    """
+
+
+class SegmentPoolExhaustedError(OrchestratorError):
+    """The Segments Manager has no Available segment of the requested type at
+    the site (its allocate endpoint answered 503).
+
+    Deterministic in practice: a drained pool is refilled by an operator
+    creating segments, not by retrying every minute forever — so this fails
+    the run loudly instead of sitting RUNNING until someone notices.
+    """
+
+
+class ClusterValuesConflictError(OrchestratorError):
+    """The cluster's values file already carries an allocation that disagrees
+    with this one — a marker block with different values, or a `dhcp_values` /
+    top-level `vlanId` key written by something other than this workflow.
+
+    Appending anyway would create a duplicate top-level YAML key, which
+    silently discards the first block (taking scopeName/pxe/gateway/failover
+    with it). Deterministic — only a human can decide which allocation is
+    right, so non-retryable.
+    """
+
+
+class ValuesRepoGitError(OrchestratorError):
+    """A git operation against the values repo failed (clone, commit, push —
+    including a rejected non-fast-forward push).
+
+    Transient by classification: the retry re-clones from a temporary
+    directory and re-applies the append, so a concurrent push simply converges
+    on the next attempt. Deliberately NOT in non_retryable_error_types.
+    """
+
+
+class DhcpApiError(OrchestratorError):
+    """The DHCP scope API failed or returned a malformed payload.
+
+    Transient — retried by the activity RetryPolicy. A scope that does not
+    exist yet is NOT this error: get_dhcp_scope reports that as a normal
+    "not found yet" result for the workflow's bounded convergence poll.
+    """

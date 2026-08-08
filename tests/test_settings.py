@@ -65,3 +65,53 @@ class TestFailFast:
         monkeypatch.setenv("SITE_NETWORKS", "{}")
         with pytest.raises(ValidationError, match="must not be empty"):
             SegmentLifecycleActivitySettings()
+
+
+class TestDhcpExclusionOctetRanges:
+    """The ONE DHCP policy knob — a bad edit must crash-loop the worker at
+    startup, never mis-render a scope hours later."""
+
+    def test_parses_from_the_configmap_json_string(self, monkeypatch):
+        monkeypatch.setenv("DHCP_EXCLUSION_OCTET_RANGES", "[[1, 10], [100, 110], [241, 254]]")
+        s = SegmentLifecycleActivitySettings()
+        assert s.dhcp_exclusion_octet_ranges == [(1, 10), (100, 110), (241, 254)]
+
+    def test_empty_list_is_rejected(self, monkeypatch):
+        # Same env-not-kwarg rule as the empty topology above.
+        monkeypatch.setenv("DHCP_EXCLUSION_OCTET_RANGES", "[]")
+        with pytest.raises(ValidationError, match="must not be empty"):
+            SegmentLifecycleActivitySettings()
+
+    @pytest.mark.parametrize("ranges", ["[[0, 10]]", "[[1, 255]]", "[[241, 300]]"])
+    def test_octets_outside_the_slash_24_host_range_are_rejected(self, monkeypatch, ranges):
+        monkeypatch.setenv("DHCP_EXCLUSION_OCTET_RANGES", ranges)
+        with pytest.raises(ValidationError, match="1..254"):
+            SegmentLifecycleActivitySettings()
+
+    def test_inverted_pair_is_rejected(self, monkeypatch):
+        monkeypatch.setenv("DHCP_EXCLUSION_OCTET_RANGES", "[[10, 1]]")
+        with pytest.raises(ValidationError, match="inverted"):
+            SegmentLifecycleActivitySettings()
+
+    @pytest.mark.parametrize("ranges", ["[[241, 254], [1, 10]]", "[[1, 10], [5, 20]]"])
+    def test_descending_or_overlapping_pairs_are_rejected(self, monkeypatch, ranges):
+        monkeypatch.setenv("DHCP_EXCLUSION_OCTET_RANGES", ranges)
+        with pytest.raises(ValidationError, match="ascending"):
+            SegmentLifecycleActivitySettings()
+
+    def test_excluding_every_octet_is_rejected(self, monkeypatch):
+        monkeypatch.setenv("DHCP_EXCLUSION_OCTET_RANGES", "[[1, 254]]")
+        with pytest.raises(ValidationError, match="nothing left to distribute"):
+            SegmentLifecycleActivitySettings()
+
+
+class TestDay1ClustersRoot:
+
+    def test_default_is_sites(self):
+        assert SegmentLifecycleActivitySettings().day1_clusters_root == "sites"
+
+    @pytest.mark.parametrize("root", ["/sites", "sites/", " sites"])
+    def test_non_bare_paths_are_rejected(self, monkeypatch, root):
+        monkeypatch.setenv("DAY1_CLUSTERS_ROOT", root)
+        with pytest.raises(ValidationError, match="bare relative path"):
+            SegmentLifecycleActivitySettings()

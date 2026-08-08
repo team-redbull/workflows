@@ -1,0 +1,549 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>allocate-segment — Redbull Workflows</title>
+<meta name="description" content="The allocate-segment workflow: reserve a VLAN segment for a hosted cluster, write its dhcp_values block to the values repo, and wait for the DHCP scope to converge.">
+<link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/assets/site.css">
+</head>
+<body data-page="/segment-lifecycle/allocate-segment.html">
+
+<a class="skip-link" href="#main">Skip to content</a>
+
+<!-- Topbar: identical on every page. Brand + deployed version upper-left; the
+     "Workflows" menu is built from the catalogue in assets/nav.js. -->
+<header class="topbar">
+  <a class="brand" href="/">
+    <img class="brand-mark" src="/assets/redbull-logo.png" alt="" aria-hidden="true"
+         width="480" height="179">
+    <span class="brand-name">Redbull Workflows</span>
+    <span class="brand-ver" title="deployed image tag of this documentation site">__DOC_VERSION__</span>
+  </a>
+  <nav class="topnav" aria-label="Site">
+    <a class="topnav-link" href="/">Orchestrator guide</a>
+    <div class="wfmenu">
+      <button class="wfmenu-btn" id="wfmenu-btn" type="button"
+              aria-expanded="false" aria-haspopup="true" aria-controls="wfmenu-panel">
+        Workflows <span class="caret" aria-hidden="true">&#9662;</span>
+      </button>
+      <div class="wfmenu-panel" id="wfmenu-panel" role="menu" aria-label="Workflows by domain" hidden></div>
+    </div>
+    <noscript>
+      <a class="topnav-link" href="/segment-lifecycle/allocate-segment.html">allocate-segment</a>
+    </noscript>
+  </nav>
+</header>
+
+<main id="main">
+<header class="masthead">
+  <div class="masthead-inner">
+    <div class="eyebrow">Temporal workflow · domain: segment-lifecycle</div>
+    <h1>allocate-segment<span class="dim"> — what actually happens</span></h1>
+    <p class="lede">
+      A single request — just a <b>cluster name</b> — reserves a VLAN segment for that hosted cluster in the
+      Segments Manager, verifies the reservation landed, writes the <code>dhcp_values</code> block into the
+      cluster's values file in the day1 repo, and waits until Argo&nbsp;CD + Crossplane have turned that commit
+      into a live DHCP scope. The cluster gets its network <em>and</em> its DHCP scope from one durable run.
+    </p>
+    <p class="lede">It replaces the GitLab CI bash pipeline outright — the one with no durable retry, no
+    verification, and a failure mode of “cluster created without a VLAN”.</p>
+    <div class="facts">
+      <div class="fact"><span class="k">Trigger</span><span class="v">POST /workflows/segment-lifecycle/allocate-segment</span></div>
+      <div class="fact"><span class="k">Workflow id</span><span class="v">allocate-segment-&lt;TYPE&gt;-&lt;cluster&gt;</span></div>
+      <div class="fact"><span class="k">Workflow queue</span><span class="v">allocate-segment-workflow</span></div>
+      <div class="fact"><span class="k">Activity queue</span><span class="v">segment-lifecycle-activity</span></div>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <!-- ======================= THE FLOW ======================= -->
+  <section id="flow">
+    <div class="sec-head">
+      <div class="eyebrow">The run, step by step</div>
+      <h2>From “allocate for this cluster” to “DHCP scope is live”</h2>
+      <p class="lede">Five stages, left to right. The colour of each box is the system it talks to.
+      Verification sits <b>before</b> the git write on purpose: a VLAN is never recorded in the values repo
+      unless the Segments Manager confirms the reservation.</p>
+    </div>
+
+    <div class="diagram rail">
+      <svg viewBox="0 0 1060 330" role="img"
+           aria-label="Horizontal flow: an operator posts a cluster name, then the workflow runs five stages left to right — resolve the site from the values repo (git plus Segments Manager), allocate a segment (Segments Manager), verify the allocation by read-back (Segments Manager), push the dhcp_values block (git), and wait bounded for the DHCP scope (DHCP API). If it fails, the git history and the allocation both stand and a re-run converges.">
+        <defs>
+          <marker id="ah-n"   viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0.5 L8,4 L0,7.5 Z"/></marker>
+          <marker id="ah-nxt" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0.5 L8,4 L0,7.5 Z"/></marker>
+        </defs>
+
+        <!-- entry -->
+        <rect class="entry-pill" x="30" y="18" width="420" height="30" rx="4"/>
+        <text class="entry-t" x="44" y="38">POST /workflows/segment-lifecycle/allocate-segment</text>
+        <path class="f-arrow" d="M114,48 V136" marker-end="url(#ah-n)"/>
+
+        <!-- stage 1 -->
+        <rect class="fbox nxt" x="30" y="142" width="168" height="112" rx="5"/>
+        <circle class="stepno nxt" cx="52" cy="164" r="12"/>
+        <text class="stepno-t" x="52" y="168">1</text>
+        <text class="f-title" x="48" y="202">Resolve site</text>
+        <text class="f-sys nxt" x="48" y="222">values repo · SM</text>
+        <text class="f-det" x="48" y="240">from the file path</text>
+
+        <path class="f-arrow" d="M202,198 H234" marker-end="url(#ah-n)"/>
+
+        <!-- stage 2 -->
+        <rect class="fbox sm" x="238" y="142" width="168" height="112" rx="5"/>
+        <circle class="stepno sm" cx="260" cy="164" r="12"/>
+        <text class="stepno-t" x="260" y="168">2</text>
+        <text class="f-title" x="256" y="202">Allocate</text>
+        <text class="f-sys sm" x="256" y="222">Segments Manager</text>
+        <text class="f-det" x="256" y="240">idempotent reserve</text>
+
+        <path class="f-arrow" d="M410,198 H442" marker-end="url(#ah-n)"/>
+
+        <!-- stage 3 -->
+        <rect class="fbox sm" x="446" y="142" width="168" height="112" rx="5"/>
+        <circle class="stepno sm" cx="468" cy="164" r="12"/>
+        <text class="stepno-t" x="468" y="168">3</text>
+        <text class="f-title" x="464" y="202">Verify</text>
+        <text class="f-sys sm" x="464" y="222">Segments Manager</text>
+        <text class="f-det" x="464" y="240">read-back must match</text>
+
+        <path class="f-arrow" d="M618,198 H650" marker-end="url(#ah-n)"/>
+
+        <!-- stage 4 -->
+        <rect class="fbox nxt" x="654" y="142" width="168" height="112" rx="5"/>
+        <circle class="stepno nxt" cx="676" cy="164" r="12"/>
+        <text class="stepno-t" x="676" y="168">4</text>
+        <text class="f-title" x="672" y="202">Push values</text>
+        <text class="f-sys nxt" x="672" y="222">git · day1 repo</text>
+        <text class="f-det" x="672" y="240">vlanId + dhcp_values</text>
+
+        <path class="f-arrow" d="M826,198 H858" marker-end="url(#ah-n)"/>
+
+        <!-- stage 5 -->
+        <path class="f-arrow nxt" d="M908,138 C896,96 1000,96 988,138" marker-end="url(#ah-nxt)"/>
+        <text class="loop-l" x="948" y="88">poll ≤ 15 min, every 15 s</text>
+
+        <rect class="fbox nxt" x="862" y="142" width="168" height="112" rx="5"/>
+        <circle class="stepno nxt" cx="884" cy="164" r="12"/>
+        <text class="stepno-t" x="884" y="168">5</text>
+        <text class="f-title" x="880" y="202">Await DHCP scope</text>
+        <text class="f-sys nxt" x="880" y="222">DHCP API · read-only</text>
+        <text class="f-det" x="880" y="240">Crossplane converges</text>
+
+        <!-- failure strip -->
+        <rect class="failstrip" x="30" y="282" width="1000" height="34" rx="4"/>
+        <text class="fail-t hd" x="46" y="303">IF IT FAILS &#8594;</text>
+        <text class="fail-t" x="152" y="303">the allocation and any pushed commit both stand; a re-run idempotently reclaims the segment and converges the git write.</text>
+      </svg>
+    </div>
+    <div class="diagram-caption">
+      <span class="swatch sm"><i></i>Segments Manager</span>
+      <span class="swatch nxt"><i></i>git / DHCP stack (Argo CD → Crossplane → DHCP API)</span>
+      <span>Stages 1&#8211;5 all run inside one Temporal workflow; each is a retried activity.</span>
+    </div>
+
+    <h3 style="margin:40px 0 10px">The same run, in detail</h3>
+    <p class="lede" style="margin-bottom:24px">Each card carries a <code>phase</code> — read live off a running
+    workflow through a Temporal <b>query</b>, which is how <code>GET /workflows/runs/{workflow_id}</code> can tell
+    you <em>where inside the run</em> an allocation currently is.</p>
+
+    <div class="flow">
+
+      <!-- gate -->
+      <div class="step gate">
+        <div class="marker">✓</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>Type check — HC only</h3>
+            <span class="phase">phase <b>pending</b></span>
+          </div>
+          <p>Runs before anything is touched. This workflow allocates <b>HC segments only</b>; any other type
+          fails immediately with <code>UnsupportedSegmentType</code>. Without the gate a non-HC run would still
+          die — only hostedCluster files are named <code>&lt;cluster&gt;.yaml</code> — but as a misleading
+          <code>ClusterFileNotFoundError</code>. Future segment types get their own functions when they arrive.</p>
+        </div>
+      </div>
+
+      <!-- 1 -->
+      <div class="step">
+        <div class="marker">1</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>get_valid_sites + locate_cluster_file</h3>
+            <span class="phase">phase <b>resolving-site</b></span>
+          </div>
+          <p>There is deliberately <b>no <code>site</code> input</b>. The workflow shallow-clones the day1 values
+          repo and requires <em>exactly one</em> <code>sites/&lt;site&gt;/**/&lt;cluster&gt;.yaml</code>; the site is
+          the path segment under <code>sites/</code>, cross-checked against the Segments Manager's site list.
+          The repo layout is the source of truth — a caller can never claim a site the cluster does not live in.</p>
+          <div class="calls">
+            <div class="call sm"><span class="verb">GET</span><span class="path">/api/sites <em>· the cross-check list</em></span></div>
+            <div class="call nxt"><span class="verb">GIT</span><span class="path">clone --depth 1 $DAY1_REPO_URL <em>· fresh temp clone, always discarded</em></span></div>
+          </div>
+          <p class="note">Zero matches → <code>ClusterFileNotFoundError</code>; more than one →
+          <code>AmbiguousClusterFileError</code>; a site the Segments Manager doesn't know →
+          <code>UnknownSite</code>. All three fail the run before anything is allocated.</p>
+        </div>
+      </div>
+
+      <!-- 2 -->
+      <div class="step">
+        <div class="marker">2</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>allocate_segment</h3>
+            <span class="phase">phase <b>allocating-segment</b></span>
+          </div>
+          <p>Reserves a segment of the requested type for the cluster at the derived site. The Segments Manager
+          is idempotent per <code>(cluster, site, type)</code>: a repeat call — a Temporal retry, or a whole
+          re-run — returns the <em>existing</em> allocation, so double-allocation is impossible by construction.</p>
+          <div class="calls">
+            <div class="call sm"><span class="verb">POST</span><span class="path">/api/segments/allocate <em>· Bearer · → { vlan_id, segment, epg_name, … }</em></span></div>
+          </div>
+          <p class="note">An empty pool (503) fails loudly as <code>SegmentPoolExhaustedError</code> — a drained
+          pool is refilled by an operator creating segments, not by retrying every minute forever.</p>
+        </div>
+      </div>
+
+      <!-- 3 -->
+      <div class="step">
+        <div class="marker">3</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>get_segment</h3>
+            <span class="phase">phase <b>verifying-allocation</b></span>
+          </div>
+          <p>Reads the allocated CIDR back and requires <code>status == Allocated</code>, the exact cluster name,
+          and the exact VLAN. Any mismatch is <code>AllocationNotConfirmed</code> — and because this sits
+          <b>before</b> the git write, the values repo never records a VLAN the Segments Manager doesn't confirm.</p>
+          <div class="calls">
+            <div class="call sm"><span class="verb">GET</span><span class="path">/api/segments/by-segment?segment=… <em>· public GET</em></span></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 4 -->
+      <div class="step">
+        <div class="marker">4</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>append_allocation_to_cluster_values</h3>
+            <span class="phase">phase <b>updating-values-repo</b></span>
+          </div>
+          <p>Fresh clone, append the marker block (see below), commit, push to <code>main</code>.
+          <b>Safe to run twice:</b> the identical block already present is a no-op success
+          (<code>values_updated:&nbsp;false</code>, nothing pushed); a block with <em>different</em> values — or a
+          <code>dhcp_values</code>/<code>vlanId</code> key some human wrote without the marker — is a hard
+          <code>ClusterValuesConflictError</code>, because a duplicate top-level YAML key silently discards the
+          first block. A rejected non-fast-forward push simply retries from a fresh clone and converges.</p>
+          <div class="calls">
+            <div class="call nxt"><span class="verb">GIT</span><span class="path">clone → append → commit → push origin main <em>· token scrubbed from every error</em></span></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 5 wait -->
+      <div class="step wait">
+        <div class="marker">⏸</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>Wait for the DHCP scope</h3>
+            <span class="phase">phase <b>awaiting-dhcp-scope</b></span>
+          </div>
+          <p>Argo CD syncs the commit; the hostedclusters chart renders a Crossplane <code>Request</code>;
+          Crossplane creates the scope on the DHCP server. The workflow <b>observes, read-only</b> — polling the
+          DHCP API on durable timers until the scope exists with exactly the range it wrote.</p>
+          <div class="loopbox">
+            <div class="loop-title">Poll loop — machine convergence, so the wait is BOUNDED</div>
+            <ol>
+              <li><code>get_dhcp_scope</code> → <code>GET /api/v1/scopes/{network}</code>; a 404 is a normal “not yet”, never an error.</li>
+              <li>Scope found <em>and</em> <code>startRange</code>/<code>endRange</code> match the block → done.</li>
+              <li>Every 15 s on a durable <code>workflow.sleep</code> timer, up to <b>15 minutes</b>.</li>
+              <li>Deadline exceeded → <code>DhcpScopeNotConverged</code>. The commit stands — check the Argo Application and the Crossplane Request.</li>
+            </ol>
+          </div>
+          <p class="note"><b>Why poll instead of POSTing the scope?</b> Posting would make two writers for one
+          resource: Crossplane keeps reconciling from git, so any disagreement (exclusion order, the derived
+          gateway) becomes a PUT every 60 seconds, forever. Read-only observation keeps git the single source of
+          truth, Crossplane the only writer — and needs no write credential.</p>
+        </div>
+      </div>
+
+      <!-- done -->
+      <div class="step done">
+        <div class="marker">✓</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>Done</h3>
+            <span class="phase">phase <b>completed</b></span>
+          </div>
+          <p>The result carries the segment, VLAN, EPG, the commit sha (or <code>null</code> on a no-op re-run),
+          and <code>dhcp_scope_ready: true</code>.</p>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ======================= THE BLOCK ======================= -->
+  <section id="block">
+    <div class="sec-head">
+      <div class="eyebrow">What gets written</div>
+      <h2>The block appended to <code>&lt;cluster&gt;.yaml</code></h2>
+      <p class="lede">One blank line always separates the file's last content line from the marker; an empty file
+      gets the marker as its first line. Everything else the DHCP stack needs — <code>leaseDurationDays</code>,
+      <code>dns</code>, <code>subnetMask</code>, <code>failover</code> — is inherited from the upstream values
+      layers; <code>scopeName</code> derives from the file name.</p>
+    </div>
+
+    <div class="endpoint">
+      <div class="endpoint-head">
+        <span class="method">YAML</span>
+        <span class="path">sites/&lt;site&gt;/mces/&lt;mce&gt;/hostedClusters/&lt;cluster&gt;.yaml</span>
+      </div>
+      <div class="endpoint-body">
+        <pre>description: "prep workers"
+                                  <span class="c">&lt;- blank line, always present</span>
+# === Added By Segment-Allocation Workflow ===
+vlanId: 23                        <span class="c">// audit only — no chart reads it</span>
+
+dhcp_values:
+  network: "10.20.90.0"           <span class="c">// mask stripped — the scope's identity</span>
+  startRange: "10.20.90.11"       <span class="c">// derived: first non-excluded octet</span>
+  endRange: "10.20.90.240"        <span class="c">// derived: last non-excluded octet</span>
+
+  exclusions:                     <span class="c">// ascending — required by the DHCP API</span>
+    - startAddress: "10.20.90.1"
+      endAddress: "10.20.90.10"
+    - startAddress: "10.20.90.241"
+      endAddress: "10.20.90.254"</pre>
+      </div>
+    </div>
+
+    <div class="grid-2" style="margin-top:16px">
+      <div class="panel alarm">
+        <h3>⚠ The DHCP block assumes a /24 — asserted, not silent</h3>
+        <p style="font-size:var(--fs-14);color:var(--ink-2)"><code>DHCP_EXCLUSION_OCTET_RANGES</code> (the ONE
+        policy knob, e.g. <code>[[1,10],[241,254]]</code>) speaks in <b>last-octet</b> values, and
+        <code>startRange</code>/<code>endRange</code> derive from it: every host octet of the /24 that is not
+        excluded is distributable. A non-/24 segment is rejected with <code>UnsupportedSegmentPrefix</code>
+        rather than mis-rendered with half its addresses stranded.</p>
+        <p style="font-size:var(--fs-14);color:var(--ink-2)">Supporting another mask is a <b>deliberate
+        refactor</b>, not a config change — it must also start emitting <code>subnetMask</code> and
+        <code>gateway</code>, since the DHCP stack derives the <code>.254</code> gateway for a /24 only and
+        rejects any other mask without both keys explicit.</p>
+      </div>
+      <div class="panel alarm">
+        <h3>⚠ HC segments only</h3>
+        <p style="font-size:var(--fs-14);color:var(--ink-2)">Any other segment type is rejected up front with
+        <code>UnsupportedSegmentType</code> — the values-repo layout only defines file locations (and therefore
+        sites and DHCP scopes) for hosted clusters. Future types will arrive as their own functions, not as
+        flags on this one.</p>
+        <h3 style="margin-top:6px">Why one knob instead of three</h3>
+        <p style="font-size:var(--fs-14);color:var(--ink-2)">Deriving the range from the exclusions removes the
+        class of bug where the two contradict each other — and a mid-range exclusion like <code>[100,110]</code>
+        still yields <code>.11</code>–<code>.240</code> with a hole punched in it, exactly how DHCP scopes work.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================= API ======================= -->
+  <section id="api">
+    <div class="sec-head">
+      <div class="eyebrow">HTTP surface</div>
+      <h2>How you start it and how you watch it</h2>
+      <p class="lede">Served by <code>workflows-orchestrator-api</code> (Swagger at <code>/docs</code>). Starting is
+      always async: the run outlives the request by design.</p>
+    </div>
+
+    <div class="api">
+
+      <div class="endpoint">
+        <div class="endpoint-head">
+          <span class="method">POST</span>
+          <span class="path">/workflows/segment-lifecycle/allocate-segment</span>
+          <span class="ret">202 · 409 if already running</span>
+        </div>
+        <div class="endpoint-body">
+          <p>The body names the <b>cluster</b>, nothing else — the site is derived from the values repo, the
+          segment is whatever the Segments Manager reserves.</p>
+          <pre><span class="c">// request</span>
+{
+  "cluster": "ocp4-prep-herzi-site1-a",
+  "type":    "HC"                  <span class="c">// optional — HC is the default and the only supported value</span>
+}
+
+<span class="c">// 202 response</span>
+{ "workflow_id": "allocate-segment-HC-ocp4-prep-herzi-site1-a", "run_id": "…" }</pre>
+          <p class="note"><b>The id carries the type on purpose.</b> Allocation is scoped by
+          <code>(cluster, site, type)</code> — one cluster can hold one segment per type at a site — so a
+          type-less id would make two legitimate allocations collide. Re-triggering while a run is in flight
+          answers <b>409</b>.</p>
+        </div>
+      </div>
+
+      <div class="endpoint">
+        <div class="endpoint-head">
+          <span class="method">GET</span>
+          <span class="path">/workflows/runs/{workflow_id}</span>
+          <span class="ret">200 · 404 if unknown id</span>
+        </div>
+        <div class="endpoint-body">
+          <p>The same domain-agnostic status endpoint every workflow uses. While RUNNING it returns the live
+          <code>phase</code>; when COMPLETED, the result.</p>
+          <pre><span class="c">// RUNNING</span>
+{ "workflow_id": "allocate-segment-HC-ocp4-prep-herzi-site1-a",
+  "workflow_type": "AllocateSegmentWorkflow", "status": "RUNNING",
+  "progress": { "phase": "awaiting-dhcp-scope" } }
+
+<span class="c">// COMPLETED</span>
+{ …, "status": "COMPLETED",
+  "result": { "cluster": "ocp4-prep-herzi-site1-a", "site": "site1", "type": "HC",
+              "vlan_id": 23, "segment": "10.20.90.0/24", "epg_name": "EPG_HC_23",
+              "commit_sha": "8f2…", "values_updated": true, "dhcp_scope_ready": true } }</pre>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ======================= FAILURE ======================= -->
+  <section id="failure">
+    <div class="sec-head">
+      <div class="eyebrow">When things go wrong</div>
+      <h2>Outages are out-waited. Real errors stop the run.</h2>
+      <p class="lede">Same rule as every workflow here: <b>retries are unbounded</b> (1 s → doubling → capped at
+      1 min), so a Segments Manager, git-remote or DHCP-API outage never fails a run. Retrying stops <em>only</em>
+      for errors explicitly classified as permanent — with one deliberate exception: the DHCP wait itself is
+      bounded, because it is machine convergence, not human approval.</p>
+    </div>
+
+    <div class="grid-2">
+      <div class="panel alarm">
+        <h3>Classified as permanent — these fail the run</h3>
+        <ul>
+          <li><code>UnsupportedSegmentType</code> — not HC (workflow-raised, before anything runs)</li>
+          <li><code>ClusterFileNotFoundError</code> — no <code>&lt;cluster&gt;.yaml</code> in the values repo</li>
+          <li><code>AmbiguousClusterFileError</code> — more than one <code>&lt;cluster&gt;.yaml</code></li>
+          <li><code>UnknownSite</code> — the file's site isn't in <code>GET /api/sites</code></li>
+          <li><code>SegmentValidationError</code> — the Segments Manager rejected the request (e.g. bad cluster name)</li>
+          <li><code>SegmentPoolExhaustedError</code> — no Available segment of that type at the site</li>
+          <li><code>AllocationNotConfirmed</code> — the read-back didn't match the allocation</li>
+          <li><code>ClusterValuesConflictError</code> — the file already carries a different allocation</li>
+          <li><code>UnsupportedSegmentPrefix</code> / <code>InvalidSegmentCidr</code> — the pool handed back a non-/24</li>
+          <li><code>DhcpScopeNotConverged</code> — the bounded 15-minute DHCP wait expired</li>
+          <li><code>SegmentsManagerAuthError</code> · <code>SegmentNotFoundError</code></li>
+        </ul>
+      </div>
+      <div class="panel">
+        <h3>Transient by classification</h3>
+        <p style="font-size:var(--fs-14);color:var(--ink-2)"><code>ValuesRepoGitError</code> (any git failure,
+        including a rejected non-fast-forward push — the retry re-clones and converges) and
+        <code>DhcpApiError</code> (the DHCP API failing; a scope that simply doesn't exist yet is NOT an error).
+        Both retry forever; an unclassified permanent error shows as a run stuck <b>RUNNING</b> in the Temporal
+        UI — the fix is to classify it, not to add a deadline.</p>
+        <h3 style="margin-top:6px">Nothing to clean up</h3>
+        <p style="font-size:var(--fs-14);color:var(--ink-2)">On failure or cancellation there is deliberately no
+        compensating cleanup: the allocation is kept — a re-run idempotently reclaims it and converges the git
+        write — and unlike open-segment-rules there is no pending-request display to clear.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================= REFERENCE ======================= -->
+  <section id="reference">
+    <div class="sec-head">
+      <div class="eyebrow">Reference</div>
+      <h2>Inputs, phases, and the knobs an operator can turn</h2>
+    </div>
+
+    <h3 style="margin-bottom:10px">Request body — <code>AllocateSegmentInput</code></h3>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>Field</th><th>Type</th><th>Rules</th><th>What it's for</th></tr></thead>
+        <tbody>
+          <tr><td class="k">cluster</td><td class="k">str</td><td class="muted">non-empty</td><td class="muted">The hosted cluster's name — must match its values file name in the day1 repo.</td></tr>
+          <tr><td class="k">type</td><td class="k">enum</td><td class="muted">default <code>HC</code>; only <code>HC</code> supported</td><td class="muted">Scopes the allocation and the workflow id; any other value fails up front.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note" style="margin-top:10px">No <code>site</code> field, on purpose: the site is derived from the
+    values-repo path and cross-checked against the Segments Manager. The repo layout is the source of truth.</p>
+
+    <h3 style="margin:28px 0 10px">Phases you'll see on the status endpoint</h3>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>phase</th><th>Meaning</th><th>Normal duration</th></tr></thead>
+        <tbody>
+          <tr><td class="k">pending</td><td class="muted">Run accepted, type not yet checked</td><td class="muted">instant</td></tr>
+          <tr><td class="k">resolving-site</td><td class="muted">Cloning the values repo + fetching the site list</td><td class="muted">seconds</td></tr>
+          <tr><td class="k">allocating-segment</td><td class="muted">Reserving the segment in the Segments Manager</td><td class="muted">seconds</td></tr>
+          <tr><td class="k">verifying-allocation</td><td class="muted">Reading the allocation back</td><td class="muted">seconds</td></tr>
+          <tr><td class="k">updating-values-repo</td><td class="muted">Clone → append → commit → push</td><td class="muted">seconds</td></tr>
+          <tr><td class="k">awaiting-dhcp-scope</td><td class="muted">Polling the DHCP API — <b>bounded, ≤ 15 min</b></td><td class="muted">1–5 min (Argo sync + Crossplane ~60 s reconcile)</td></tr>
+          <tr><td class="k">completed</td><td class="muted">Done; <code>result</code> is available</td><td class="muted">—</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 style="margin:28px 0 10px">Operator knobs — change these without a rebuild</h3>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>Key</th><th>Lives in</th><th>Effect</th></tr></thead>
+        <tbody>
+          <tr><td class="k">DHCP_EXCLUSION_OCTET_RANGES</td><td class="muted">segment-lifecycle-config</td><td class="muted">The ONE DHCP policy knob. Validated at worker startup; a bad edit crash-loops the pod, never mis-renders a scope.</td></tr>
+          <tr><td class="k">DAY1_REPO_URL · DAY1_BRANCH · DAY1_CLUSTERS_ROOT</td><td class="muted">segment-lifecycle-config</td><td class="muted">Which repo/branch holds the cluster values files, and the root folder the site derives under.</td></tr>
+          <tr><td class="k">DAY1_GIT_USER_NAME · DAY1_GIT_USER_EMAIL</td><td class="muted">segment-lifecycle-config</td><td class="muted">The committer identity on allocation commits.</td></tr>
+          <tr><td class="k">DAY1_GIT_TOKEN</td><td class="muted">Secret (day1-git-token)</td><td class="muted">Push credential for the values repo. Never logged — scrubbed from every git error.</td></tr>
+          <tr><td class="k">DHCP_API_URL · DHCP_API_TOKEN</td><td class="muted">segment-lifecycle-config / Secret</td><td class="muted">Where the DHCP scope API lives; the read token for the convergence poll.</td></tr>
+          <tr><td class="k">SEGMENTS_MANAGER_URL · SEGMENTS_MANAGER_API_TOKEN</td><td class="muted">workflows-orchestrator-config / Secret</td><td class="muted">Shared with the rest of the domain.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ======================= RE-RUNNING ======================= -->
+  <section id="rerun">
+    <div class="sec-head">
+      <div class="eyebrow">Operating it</div>
+      <h2>What happens if you run the same cluster again</h2>
+      <p class="lede">Idempotency is a rule of the orchestrator — see
+      <a href="/#principles">the three rules that surprise people</a>. Here it is unusually cheap: a full re-run
+      converges with no human in the loop at all.</p>
+    </div>
+
+    <div class="grid-2">
+      <div class="panel ok">
+        <h3>Re-run after completion — everything converges</h3>
+        <p>The Segments Manager returns the <em>same</em> allocation (idempotent per cluster/site/type), the
+        values file already ends in the identical block so nothing is pushed
+        (<code>values_updated: false</code>, <code>commit_sha: null</code>), and the DHCP scope already exists so
+        the wait finishes on the first poll.</p>
+      </div>
+      <div class="panel warn">
+        <h3>The one thing a re-run will not do</h3>
+        <p>Fix a conflict. If the values file carries a <em>different</em> allocation — an edited marker block, or
+        a hand-written <code>dhcp_values</code> — every run refuses with <code>ClusterValuesConflictError</code>
+        until a human reconciles the file. That is the point: the workflow must never guess which of two
+        allocations is the real one.</p>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <span>workflow_domains/segment_lifecycle/allocate_segment.py</span>
+    <span>activities/segment_lifecycle/activities.py</span>
+    <span>activities/segment_lifecycle/values_repo.py</span>
+    <span>shared/models/segment_lifecycle.py</span>
+  </footer>
+
+</div>
+</main>
+
+<script src="/assets/nav.js" defer></script>
+</body>
+</html>

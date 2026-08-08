@@ -27,13 +27,21 @@ from pydantic import BaseModel, Field
 from temporalio.client import Client
 from temporalio.exceptions import WorkflowAlreadyStartedError
 
-from shared.consts import OPEN_SEGMENT_RULES_WORKFLOW_QUEUE
+from shared.consts import (
+    ALLOCATE_SEGMENT_WORKFLOW_QUEUE,
+    OPEN_SEGMENT_RULES_WORKFLOW_QUEUE,
+)
 from shared.models.segment_lifecycle import (
+    AllocateSegmentInput,
+    AllocateSegmentRunArgs,
     OpenSegmentRulesInput,
     OpenSegmentRulesRunArgs,
 )
 from workflow_domains.routers.deps import get_temporal_client
 from workflow_domains.routers.models import StartWorkflowResponse
+from workflow_domains.segment_lifecycle.allocate_segment import (
+    AllocateSegmentWorkflow,
+)
 from workflow_domains.segment_lifecycle.open_segment_rules import (
     OpenSegmentRulesWorkflow,
 )
@@ -42,6 +50,7 @@ router = APIRouter(prefix="/workflows/segment-lifecycle", tags=["segment-lifecyc
 
 # One workflow of this domain = one path under the domain prefix.
 _OPEN_SEGMENT_RULES_PATH = "/open-segment-rules"
+_ALLOCATE_SEGMENT_PATH = "/allocate-segment"
 
 
 # API-layer request/response models — these never cross the workflow boundary.
@@ -192,4 +201,52 @@ async def start_open_segment_rules_bulk(
         already_running=counts["already_running"],
         failed=counts["failed"],
         results=results,
+    )
+
+
+def _allocate_segment_workflow_id(allocate_input: AllocateSegmentInput) -> str:
+    """Deterministic, URL-safe id: natural dedup per (type, cluster).
+
+    The id MUST carry the type: allocation is scoped by (cluster, site, type)
+    in the Segments Manager — one cluster can hold one segment per type at a
+    site — so a type-less id would make two legitimate allocations collide.
+    Mirrors open-segment-rules-<TYPE>-<network>.
+    """
+    return f"allocate-segment-{allocate_input.type.value}-{allocate_input.cluster}"
+
+
+@router.post(
+    _ALLOCATE_SEGMENT_PATH,
+    response_model=StartWorkflowResponse,
+    status_code=202,
+)
+async def start_allocate_segment(
+    allocate_input: AllocateSegmentInput,
+    client: Client = Depends(get_temporal_client),
+) -> StartWorkflowResponse:
+    """Allocate a VLAN segment for a hosted cluster — returns immediately (202).
+
+    The body names the CLUSTER, nothing else: the site is derived from where
+    the cluster's values file sits in the day1 values repo, and the segment
+    itself is whatever the Segments Manager reserves. Poll
+    GET /workflows/runs/{workflow_id} for progress/result; a bad cluster name
+    or an exhausted pool surfaces there as a FAILED run, not as a 4xx here.
+    """
+    try:
+        handle = await client.start_workflow(
+            AllocateSegmentWorkflow.run,
+            AllocateSegmentRunArgs(input=allocate_input),
+            id=_allocate_segment_workflow_id(allocate_input),
+            task_queue=ALLOCATE_SEGMENT_WORKFLOW_QUEUE,
+        )
+    except WorkflowAlreadyStartedError:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Segment-lifecycle workflow already running: "
+                f"{_allocate_segment_workflow_id(allocate_input)}"
+            ),
+        )
+    return StartWorkflowResponse(
+        workflow_id=handle.id, run_id=handle.result_run_id or ""
     )

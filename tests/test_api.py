@@ -111,6 +111,7 @@ def test_routes_are_scoped_to_the_workflow_not_the_domain():
     assert paths == {
         "/workflows/segment-lifecycle/open-segment-rules",
         "/workflows/segment-lifecycle/open-segment-rules/bulk",
+        "/workflows/segment-lifecycle/allocate-segment",
     }
 
 

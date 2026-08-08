@@ -75,7 +75,10 @@ tags cross-repo.
   (`open-segment-rules-workflow`), its workflow ids (`open-segment-rules-<TYPE>-<network>`), its
   RunArgs/ResumeState/Progress/Result models, and its ROUTE under the domain prefix. Workflow ids
   MUST carry the workflow name — two workflows acting on the same segment would otherwise collide on
-  one id.
+  one id — and the segment TYPE: allocation is scoped per (cluster, site, type), so
+  `allocate-segment-<TYPE>-<cluster>` without the type would make two legitimate allocations of one
+  cluster collide. The domain currently holds TWO workflows (`open-segment-rules`,
+  `allocate-segment`), each on its own workflow queue, sharing the one limb deployment.
 - **API paths are `/workflows/<domain>/<workflow>`; status is `/workflows/runs/{workflow_id}`.** A
   domain is a prefix, never an endpoint: the bare `/workflows/<domain>` must stay free, or the first
   workflow silently claims the whole domain. Status is domain-agnostic ON PURPOSE — workflow ids are
@@ -162,12 +165,22 @@ tags cross-repo.
 - **Polling loops:** `workflow.sleep(...)` is a durable replay-safe server-side timer (never
   `time.sleep`). For unbounded waits, back off to a capped interval and `continue_as_new` every N
   cycles so history stays bounded. Changing poll constants is a non-deterministic change for in-flight runs.
+  Bounded vs unbounded is a MEANING, not a style: HUMAN approval (open-segment-rules' next requests)
+  gets no deadline ever; MACHINE convergence (allocate-segment's DHCP scope — Argo sync + Crossplane
+  reconcile) gets a real deadline (15 min, 15s durable timer) and fails loudly (`DhcpScopeNotConverged`).
 - **httpx timeout < activity `start_to_close_timeout`** (currently 60s < 90s): give every
   `httpx.AsyncClient` an explicit `timeout=` below the activity timeout so a network hang fails the call
   and frees the worker before Temporal reaps the activity.
 - **Per-invocation HTTP client:** create `httpx.AsyncClient` INSIDE each activity via `async with` so
   auth tokens/cookies scope to one invocation and never leak across concurrent runs; next tokens are
   renewed fresh per invocation.
+- **Git-subprocess activities** (`activities/segment_lifecycle/values_repo.py`): git runs via
+  `asyncio.create_subprocess_exec` (no Python git dependency; the limb Dockerfile installs the binary),
+  each command under a timeout below the git activities' 180s `start_to_close_timeout`, every clone in
+  a fresh `TemporaryDirectory` so retries start clean. The push token is injected into the clone URL in
+  memory only and SCRUBBED from every error message BEFORE the exception is constructed — activity
+  errors are recorded verbatim in Temporal history and the UI, so redacting at the logging layer alone
+  is too late.
 
 ## 6. Idempotency (required for all activities)
 
@@ -176,10 +189,17 @@ tags cross-repo.
   `create_segment` treats an existing segment MATCHING the definition as success and only fails on a
   genuine disagreement (`SegmentConflictError`); `unlock_segment` treats "Segment already unlocked"
   (200) as success; `submit_open_rules` converges (a retried-but-accepted POST leaves only an orphan
-  request id never polled); `publish_request_ids` is a replace-style PUT.
+  request id never polled); `publish_request_ids` is a replace-style PUT; `allocate_segment` is
+  idempotent SERVER-side per (cluster, site, type) — a repeat call returns the existing allocation;
+  `append_allocation_to_cluster_values` treats the identical block already present as success
+  (`changed=False`, nothing pushed) and refuses a DIFFERENT one (`ClusterValuesConflictError`).
+- **Verify after mutate, before recording:** allocate-segment reads the allocation back
+  (`get_segment`: status/cluster/vlan must all match) BEFORE the git write, so the values repo can
+  never record a vlan the Segments Manager does not confirm. A mutation whose outcome another system
+  will act on gets a read-back check between the mutation and the recording.
 - Workflow IDs are deterministic (`open-segment-rules-<TYPE>-<network address, CIDR mask dropped>`,
-  e.g. `open-segment-rules-HC-130.154.20.0`) for natural dedup — a duplicate trigger while running
-  gets HTTP 409 (in the bulk route, an `already_running` item).
+  e.g. `open-segment-rules-HC-130.154.20.0`; `allocate-segment-<TYPE>-<cluster>`) for natural dedup —
+  a duplicate trigger while running gets HTTP 409 (in the bulk route, an `already_running` item).
 
 ## 7. Strict validation & clean typed state
 
@@ -195,8 +215,12 @@ tags cross-repo.
   always-present `helm-charts-workflows-orchestrator` brain release) holds only shared values — `TEMPORAL_HOST`,
   `TEMPORAL_NAMESPACE`, `DOMAIN`, `SEGMENTS_MANAGER_URL`. `<domain>-config` (owned by that domain's
   chart) holds its own endpoints/policy — e.g. `segment-lifecycle-config` = `NEXT_*` URIs +
-  `PORTS_*`. A domain worker mounts BOTH + its Secret, so the brain release must install before any
-  limb (else `CreateContainerConfigError` on the missing global ConfigMap).
+  `PORTS_*` + the allocate-segment keys (`DAY1_REPO_URL/BRANCH/CLUSTERS_ROOT`,
+  `DAY1_GIT_USER_NAME/EMAIL`, `DHCP_EXCLUSION_OCTET_RANGES`, `DHCP_API_URL`; tokens in the
+  `day1-git-token` / `dhcp-api-token` Secrets). A domain worker mounts BOTH + its Secrets, so the
+  brain release must install before any limb (else `CreateContainerConfigError` on the missing
+  global ConfigMap) — and the chart must ship the new keys BEFORE (or with) an image that requires
+  them, or the worker crash-loops on its fail-fast settings.
 - **`shared/settings.py`** groups: `TemporalSettings` (workers + api.py) and
   `SegmentLifecycleActivitySettings` (activity worker only). Field names = Helm ConfigMap/Secret keys
   lowercased — keep aligned with `helm-charts-workflows-orchestrator/templates/config.yaml` (global) and
@@ -206,8 +230,15 @@ tags cross-repo.
   `SegmentLifecycleActivitySettings` fields; the brain ignores extras via `extra="ignore"`). Do NOT
   import settings from inside a workflow definition (sandbox) — only from entrypoints / api.py / activities.
 - **ConfigMaps hold minimum, operator-editable data** — anything changeable without a rebuild (e.g. the
-  `PORTS_*` per-direction port policy, compact JSON per protocol) lives directly in the ConfigMap
-  TEMPLATE (not values.yaml), expanded/validated in code (fail-fast at worker startup).
+  `PORTS_*` per-direction port policy, compact JSON per protocol, and
+  `DHCP_EXCLUSION_OCTET_RANGES`) lives directly in the ConfigMap TEMPLATE (not values.yaml),
+  expanded/validated in code (fail-fast at worker startup).
+- **The DHCP policy is ONE knob, and /24 is ASSERTED:** `DHCP_EXCLUSION_OCTET_RANGES` (last-octet
+  ranges, e.g. `[[1, 10], [241, 254]]`) is the whole DHCP surface — `startRange`/`endRange` are
+  DERIVED as the first/last non-excluded host octet, so the range and the exclusions can never
+  contradict. `build_dhcp_values` rejects any non-/24 segment with `UnsupportedSegmentPrefix`;
+  supporting another mask is a deliberate refactor that must also emit `subnetMask` + `gateway`
+  (the DHCP stack derives the `.254` gateway for a /24 only).
 
 ## 9. Deploy & run (local)
 

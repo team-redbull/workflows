@@ -153,3 +153,143 @@ class OpenSegmentRulesResult(BaseModel):
     type: SegmentType
     peer_segment_count: int
     request_ids: list[int]
+
+
+# --- allocate-segment -------------------------------------------------------
+# The domain's second workflow: allocate a VLAN segment for a hosted cluster
+# and write the dhcp_values block into its values-repo file. Workflow-scoped
+# models carry the workflow name; models any sibling could reuse (the
+# allocation request/response, the segment read-back, the DHCP shapes) do not.
+
+
+class AllocateSegmentInput(BaseModel):
+    """Input to AllocateSegmentWorkflow: which cluster to allocate for.
+
+    Deliberately tiny — the site is DERIVED from where the cluster's values
+    file sits in the repo (sites/<site>/...), cross-checked against the
+    Segments Manager's site list, so a caller can never claim a site the
+    cluster does not live in. `type` defaults to HC, the only supported type;
+    anything else is rejected up front with UnsupportedSegmentType.
+    """
+
+    cluster: str = Field(min_length=1)
+    type: SegmentType = SegmentType.HC
+
+
+class AllocateSegmentRunArgs(BaseModel):
+    """The workflow's single argument (same single-model rule as
+    OpenSegmentRulesRunArgs — typed conversion is silently skipped when
+    payload count differs from the declared parameter count)."""
+
+    input: AllocateSegmentInput
+
+
+class AllocateSegmentProgress(BaseModel):
+    """Returned by the workflow's `progress` query (surfaced by the status API)."""
+
+    phase: str
+
+
+class ClusterFileLocation(BaseModel):
+    """Where the cluster's values file lives in the values repo. The site is
+    the path segment directly beneath the clusters root — the repo layout
+    (sites/<site>/mces/<mce>/hostedClusters/<cluster>.yaml) is the source of
+    truth for which site a cluster belongs to."""
+
+    site: str = Field(min_length=1)
+    relative_path: str = Field(min_length=1)
+
+
+class SegmentAllocationRequest(BaseModel):
+    """Input to allocate_segment: who is asking, where, and for what type.
+    Scoped by (cluster, site, type) exactly like the Segments Manager's
+    idempotency, so a Temporal retry can never double-allocate."""
+
+    cluster: str = Field(min_length=1)
+    site: str = Field(min_length=1)
+    type: SegmentType
+
+
+class SegmentAllocation(BaseModel):
+    """The Segments Manager's answer to an allocation: the reserved segment."""
+
+    vlan_id: int
+    segment: str = Field(min_length=1)  # CIDR
+    epg_name: str
+
+
+class SegmentEntry(BaseModel):
+    """A segment as read back from the Segments Manager (GET
+    /api/segments/by-segment) — what the verification step compares against
+    the allocation it was just handed."""
+
+    segment: str = Field(min_length=1)
+    site: str
+    vlan_id: int
+    status: str
+    cluster_name: str | None = None
+
+
+class DhcpExclusion(BaseModel):
+    """One excluded address range inside the DHCP scope."""
+
+    start_address: str
+    end_address: str
+
+
+class DhcpValues(BaseModel):
+    """The dhcp_values block written to the cluster's values file, derived
+    from the allocated segment + the DHCP_EXCLUSION_OCTET_RANGES policy.
+    `network` is the mask-stripped network address (10.20.90.0, never
+    10.20.90.0/24) — the DHCP scope's identity."""
+
+    network: str = Field(min_length=1)
+    start_range: str = Field(min_length=1)
+    end_range: str = Field(min_length=1)
+    exclusions: list[DhcpExclusion]
+
+
+class ClusterValuesAppendRequest(BaseModel):
+    """Input to append_allocation_to_cluster_values: which file to append to
+    and what was allocated. The dhcp_values block itself is derived
+    activity-side (the DHCP policy lives in the activity worker's config,
+    which the sandboxed workflow cannot read)."""
+
+    cluster: str = Field(min_length=1)
+    relative_path: str = Field(min_length=1)
+    vlan_id: int
+    segment: str = Field(min_length=1)  # CIDR
+
+
+class ValuesCommitRef(BaseModel):
+    """Outcome of the values-repo append. `changed=False` (commit_sha None)
+    means the file already carried this exact allocation — a re-run — and
+    nothing was pushed. `dhcp_values` is returned in BOTH cases so the
+    workflow can poll the DHCP API for convergence against the exact values
+    the file carries."""
+
+    commit_sha: str | None
+    changed: bool
+    dhcp_values: DhcpValues
+
+
+class DhcpScopeState(BaseModel):
+    """A read-only observation of the DHCP API: does the scope exist yet, and
+    with what range? `found=False` is a normal answer while Crossplane has not
+    converged — never an error."""
+
+    found: bool
+    start_range: str | None = None
+    end_range: str | None = None
+
+
+class AllocateSegmentResult(BaseModel):
+    cluster: str
+    site: str
+    type: SegmentType
+    vlan_id: int
+    segment: str
+    epg_name: str
+    commit_sha: str | None
+    values_updated: bool
+    dhcp_scope_ready: bool

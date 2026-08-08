@@ -6,6 +6,11 @@ These run in the `segment-lifecycle-worker` deployment. They talk to:
     GETs are public)
   - the next connectivity service (NEXT_URL) — a black box; we trust its output
     (token renewal, open firewall rules, request status)
+  - the day1 values repo (DAY1_REPO_URL) — git subprocess via
+    activities/segment_lifecycle/values_repo.py (clone, append the allocation
+    block, push; the token is never logged)
+  - the DHCP scope API (DHCP_API_URL) — READ-ONLY: the allocate-segment
+    workflow polls a scope to observe Crossplane's convergence, never writes one
 
 Conventions enforced here:
   * activity.logger only (not the root logger).
@@ -28,10 +33,14 @@ import httpx
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
+from activities.segment_lifecycle import values_repo
+from activities.segment_lifecycle.dhcp_values import build_dhcp_values
 from shared.exceptions import (
     BmcSegmentNotConfiguredError,
+    DhcpApiError,
     NextApiError,
     SegmentConflictError,
+    SegmentPoolExhaustedError,
     SegmentsManagerAuthError,
     SegmentsManagerError,
     SegmentNotFoundError,
@@ -39,14 +48,21 @@ from shared.exceptions import (
 )
 from shared.models.segment_lifecycle import (
     BmcOpenRulesRequest,
+    ClusterFileLocation,
+    ClusterValuesAppendRequest,
+    DhcpScopeState,
     SegmentConnectivityFailureNotice,
     OpenSegmentRulesInput,
     NextRequestRef,
+    SegmentAllocation,
+    SegmentAllocationRequest,
     SegmentConnectivityRequestsUpdate,
+    SegmentEntry,
     OpenRulesRequest,
     PeerSegmentsQuery,
     SegmentRef,
     SegmentType,
+    ValuesCommitRef,
 )
 from shared.settings import SegmentLifecycleActivitySettings
 
@@ -563,6 +579,191 @@ async def unlock_segment(segment: str) -> None:
                 f"Segment {segment} not found in the Segments Manager"
             )
         _raise_segments_manager_error("Unlock", resp)
+
+
+# --- allocate-segment -------------------------------------------------------
+
+
+@activity.defn
+async def get_valid_sites() -> list[str]:
+    """The Segments Manager's configured site list (public GET)."""
+    async with _segments_manager_client() as client:
+        resp = await client.get("/api/sites")
+        if resp.status_code != 200:
+            _raise_segments_manager_error("List sites", resp)
+        sites = resp.json().get("sites")
+    if not isinstance(sites, list) or not sites:
+        raise SegmentsManagerError(f"GET /api/sites returned no site list: {resp.text}")
+    activity.logger.info("Segments Manager knows %d site(s): %s", len(sites), sites)
+    return sites
+
+
+@activity.defn
+async def locate_cluster_file(cluster: str) -> ClusterFileLocation:
+    """Find the cluster's values file in the day1 values repo (fresh shallow
+    clone per invocation; the site is derived from the path under the
+    clusters root)."""
+    location = await values_repo.locate_cluster_file(
+        repo_url=_settings.day1_repo_url,
+        branch=_settings.day1_branch,
+        token=_settings.day1_git_token,
+        clusters_root=_settings.day1_clusters_root,
+        cluster=cluster,
+    )
+    activity.logger.info(
+        "Cluster %s lives at %s (site=%s)", cluster, location.relative_path, location.site
+    )
+    return location
+
+
+@activity.defn
+async def allocate_segment(request: SegmentAllocationRequest) -> SegmentAllocation:
+    """Reserve a segment in the Segments Manager.
+
+    Idempotent server-side per (cluster, site, type): a repeat call returns
+    the existing allocation, so a Temporal retry can never double-allocate.
+    """
+    async with _segments_manager_client() as client:
+        resp = await client.post(
+            "/api/segments/allocate",
+            json={
+                "cluster_name": request.cluster,
+                "site": request.site,
+                "type": request.type.value,
+            },
+            headers=_segments_manager_auth(),
+        )
+        if resp.status_code == 200:
+            allocation = SegmentAllocation.model_validate(resp.json())
+            activity.logger.info(
+                "Allocated segment %s (vlan=%d, epg=%s) to cluster %s",
+                allocation.segment,
+                allocation.vlan_id,
+                allocation.epg_name,
+                request.cluster,
+            )
+            return allocation
+        if resp.status_code == 503:
+            # A drained pool must fail loudly, not retry every minute forever —
+            # it is refilled by an operator creating segments, never by waiting.
+            raise SegmentPoolExhaustedError(
+                f"No available {request.type.value} segment at site "
+                f"{request.site}: {_segments_manager_detail(resp)}"
+            )
+        if resp.status_code in (400, 422):
+            # The manager's own validation (e.g. a bad cluster name) — the
+            # generic classifier below only knows 401/403, so without this
+            # mapping a 400 would retry forever.
+            raise SegmentValidationError(
+                f"Segments Manager rejected the allocation request: "
+                f"{_segments_manager_detail(resp)}"
+            )
+        _raise_segments_manager_error("Allocate segment", resp)
+
+
+@activity.defn
+async def get_segment(segment: str) -> SegmentEntry:
+    """Read one segment back (public GET) — the verification step's read-back."""
+    async with _segments_manager_client() as client:
+        resp = await client.get("/api/segments/by-segment", params={"segment": segment})
+        if resp.status_code == 200:
+            return SegmentEntry.model_validate(resp.json())
+        if resp.status_code == 404:
+            raise SegmentNotFoundError(
+                f"Segment {segment} not found in the Segments Manager"
+            )
+        if resp.status_code in (400, 422):
+            raise SegmentValidationError(
+                f"Segments Manager rejected the segment lookup: "
+                f"{_segments_manager_detail(resp)}"
+            )
+        _raise_segments_manager_error("Look up segment", resp)
+
+
+@activity.defn
+async def append_allocation_to_cluster_values(
+    request: ClusterValuesAppendRequest,
+) -> ValuesCommitRef:
+    """Append the vlanId + dhcp_values block to the cluster's values file and
+    push. The DhcpValues are derived HERE (the policy lives in this worker's
+    config, unreachable from the sandboxed workflow) and returned in both the
+    pushed and the already-present case, for the convergence poll."""
+    dhcp_values = build_dhcp_values(
+        request.segment, _settings.dhcp_exclusion_octet_ranges
+    )
+    commit_sha, changed = await values_repo.append_allocation(
+        repo_url=_settings.day1_repo_url,
+        branch=_settings.day1_branch,
+        token=_settings.day1_git_token,
+        git_user_name=_settings.day1_git_user_name,
+        git_user_email=_settings.day1_git_user_email,
+        relative_path=request.relative_path,
+        cluster=request.cluster,
+        vlan_id=request.vlan_id,
+        dhcp_values=dhcp_values,
+    )
+    if changed:
+        activity.logger.info(
+            "Pushed allocation for %s to %s (commit %s)",
+            request.cluster,
+            request.relative_path,
+            commit_sha,
+        )
+    else:
+        activity.logger.info(
+            "%s already carries this exact allocation — nothing pushed",
+            request.relative_path,
+        )
+    return ValuesCommitRef(commit_sha=commit_sha, changed=changed, dhcp_values=dhcp_values)
+
+
+def _dhcp_api_client() -> httpx.AsyncClient:
+    """A fresh, per-invocation client for the DHCP scope API (read-only)."""
+    headers = {}
+    if _settings.dhcp_api_token:
+        headers["Authorization"] = f"Bearer {_settings.dhcp_api_token}"
+    return httpx.AsyncClient(
+        base_url=_settings.dhcp_api_url, timeout=_HTTP_TIMEOUT, headers=headers
+    )
+
+
+@activity.defn
+async def get_dhcp_scope(network: str) -> DhcpScopeState:
+    """Read-only observation of the DHCP API for the convergence poll.
+
+    404 is a NORMAL answer (Crossplane has not created the scope yet), never
+    an error — raising there would make the unbounded retry policy swallow
+    the workflow's bounded deadline.
+    """
+    async with _dhcp_api_client() as client:
+        try:
+            resp = await client.get(f"/api/v1/scopes/{network}")
+        except httpx.HTTPError as exc:
+            raise DhcpApiError(f"DHCP scope lookup for {network} failed: {exc}") from exc
+        if resp.status_code == 404:
+            activity.logger.info("DHCP scope %s does not exist yet", network)
+            return DhcpScopeState(found=False)
+        if resp.status_code != 200:
+            raise DhcpApiError(
+                f"DHCP scope lookup for {network} returned "
+                f"{resp.status_code}: {resp.text}"
+            )
+        try:
+            body = resp.json()
+            state = DhcpScopeState(
+                found=True,
+                start_range=body["startRange"],
+                end_range=body["endRange"],
+            )
+        except Exception as exc:  # malformed payload from the API
+            raise DhcpApiError(f"Invalid DHCP scope response for {network}: {exc}") from exc
+    activity.logger.info(
+        "DHCP scope %s exists (range %s - %s)",
+        network,
+        state.start_range,
+        state.end_range,
+    )
+    return state
 
 
 @activity.defn

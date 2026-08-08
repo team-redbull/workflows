@@ -27,5 +27,12 @@ os.environ.update(
         "PORTS_MCE_TO_PXE": '{"tcp": ["6443"]}',
         "SITE_NETWORKS": '{"site-a": {"pool": "192.11.0.0/16", "bmc": "10.99.0.0/16"}}',
         "PORTS_MCE_TO_BMC": '{"tcp": ["623"]}',
+        # --- allocate-segment: values repo + DHCP policy/API ---
+        "DAY1_REPO_URL": "https://git.test/team/gitops-day1-platform-config.git",
+        "DAY1_GIT_USER_NAME": "test-bot",
+        "DAY1_GIT_USER_EMAIL": "test-bot@test.invalid",
+        "DAY1_GIT_TOKEN": "test-git-token",
+        "DHCP_EXCLUSION_OCTET_RANGES": "[[1, 10], [241, 254]]",
+        "DHCP_API_URL": "http://dhcp.test",
     }
 )

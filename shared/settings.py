@@ -129,6 +129,34 @@ class SegmentLifecycleActivitySettings(BaseSettings):
     site_networks: dict[str, SiteNetworks]
     ports_mce_to_bmc: dict[str, list[str]]
 
+    # --- allocate-segment: the day1 values repo -----------------------------
+    # Where cluster values files live (sites/<site>/mces/<mce>/hostedClusters/
+    # <cluster>.yaml). The workflow appends the vlanId + dhcp_values block
+    # there and pushes; Argo CD + Crossplane take it from git to a live DHCP
+    # scope. The token authenticates the push (and the clone, for a private
+    # repo) — it is injected into the clone URL in memory only and scrubbed
+    # from every log line and error message.
+    day1_repo_url: str
+    day1_branch: str = "main"
+    day1_clusters_root: str = "sites"
+    day1_git_user_name: str
+    day1_git_user_email: str
+    day1_git_token: str
+
+    # --- allocate-segment: DHCP scope policy + the DHCP API -----------------
+    # The ONE DHCP policy knob: last-octet ranges excluded from distribution,
+    # e.g. [[1, 10], [241, 254]]. startRange/endRange are DERIVED (first/last
+    # non-excluded host octet), so the range and the exclusions can never
+    # contradict each other. /24 segments only — build_dhcp_values asserts the
+    # prefix and rejects anything else as UnsupportedSegmentPrefix.
+    dhcp_exclusion_octet_ranges: list[tuple[int, int]]
+    # The DHCP scope API (read-only here: the workflow only ever GETs a scope
+    # to observe Crossplane's convergence — it never creates one itself).
+    dhcp_api_url: str
+    # Empty means the DHCP API is deployed without a token (its auth is a
+    # no-op then) — the Authorization header is attached only when set.
+    dhcp_api_token: str = ""
+
     @field_validator(
         "ports_hc_to_mce",
         "ports_mce_to_hc",
@@ -172,3 +200,48 @@ class SegmentLifecycleActivitySettings(BaseSettings):
         if not sites:
             raise ValueError("site_networks must not be empty")
         return sites
+
+    @field_validator("day1_clusters_root")
+    @classmethod
+    def _validate_day1_clusters_root(cls, root: str) -> str:
+        """A bare relative directory name — path building assumes no slashes
+        to strip and no absolute escape out of the clone."""
+        if not root or root != root.strip("/").strip():
+            raise ValueError(
+                f"day1_clusters_root must be a bare relative path (got {root!r})"
+            )
+        return root
+
+    @field_validator("dhcp_exclusion_octet_ranges")
+    @classmethod
+    def _validate_dhcp_exclusion_octet_ranges(
+        cls, ranges: list[tuple[int, int]]
+    ) -> list[tuple[int, int]]:
+        """Strict, fail-fast validation of the one DHCP policy knob: every
+        octet a valid /24 host octet, pairs ordered, strictly ascending and
+        non-overlapping, and at least one octet left to distribute."""
+        if not ranges:
+            raise ValueError("dhcp_exclusion_octet_ranges must not be empty")
+        previous_end = 0
+        for start, end in ranges:
+            if not (1 <= start <= 254 and 1 <= end <= 254):
+                raise ValueError(
+                    f"exclusion octets must be in 1..254 (got [{start}, {end}])"
+                )
+            if start > end:
+                raise ValueError(f"inverted exclusion range [{start}, {end}]")
+            if start <= previous_end:
+                raise ValueError(
+                    "exclusion ranges must be strictly ascending and "
+                    f"non-overlapping (got [{start}, {end}] after octet {previous_end})"
+                )
+            previous_end = end
+        excluded = {
+            octet for start, end in ranges for octet in range(start, end + 1)
+        }
+        if len(excluded) >= 254:
+            raise ValueError(
+                "dhcp_exclusion_octet_ranges excludes every host octet — "
+                "nothing left to distribute"
+            )
+        return ranges

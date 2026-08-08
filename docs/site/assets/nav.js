@@ -28,18 +28,20 @@
           blurb: "create → peer → approve → unlock"
         },
         {
+          name: "allocate-segment",
+          href: "/segment-lifecycle/allocate-segment.html",
+          blurb: "reserve a VLAN + write the DHCP block"
+        },
+        {
+          name: "release-segment",
+          href: null,
+          blurb: "give the VLAN back to the pool"
+        },
+        {
           name: "convert-segment",
           href: null,
           blurb: "change a segment's type in place"
         }
-      ]
-    },
-    {
-      domain: "segment-provisioner",
-      queue: "segment-provisioner-activity",
-      workflows: [
-        { name: "allocate-segment", href: null, blurb: "pick a free CIDR + VLAN for a site" },
-        { name: "release-segment",  href: null, blurb: "tear down and return it to the pool" }
       ]
     }
   ];

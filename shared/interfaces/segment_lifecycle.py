@@ -11,13 +11,20 @@ from temporalio import activity
 
 from shared.models.segment_lifecycle import (
     BmcOpenRulesRequest,
+    ClusterFileLocation,
+    ClusterValuesAppendRequest,
+    DhcpScopeState,
     SegmentConnectivityFailureNotice,
     OpenSegmentRulesInput,
     NextRequestRef,
+    SegmentAllocation,
+    SegmentAllocationRequest,
     SegmentConnectivityRequestsUpdate,
+    SegmentEntry,
     OpenRulesRequest,
     PeerSegmentsQuery,
     SegmentRef,
+    ValuesCommitRef,
 )
 
 
@@ -127,4 +134,86 @@ async def publish_segment_connectivity_failure(notice: SegmentConnectivityFailur
     display, then publish a "<workflow> failed" note beside the
     segment's status badge (the Segments Manager's segment-connectivity-failure
     endpoint — the workflow swallows this activity's errors either way)."""
+    ...
+
+
+# --- allocate-segment -------------------------------------------------------
+
+
+@activity.defn
+async def get_valid_sites() -> list[str]:
+    """Return the Segments Manager's configured site list (GET /api/sites).
+
+    The workflow cross-checks the site DERIVED from the values-repo path
+    against this list, so a repo layout mistake fails loudly as UnknownSite
+    before anything is allocated.
+    """
+    ...
+
+
+@activity.defn
+async def locate_cluster_file(cluster: str) -> ClusterFileLocation:
+    """Find the cluster's values file in the day1 values repo.
+
+    Shallow-clones the repo and requires EXACTLY ONE
+    <clusters root>/<site>/**/<cluster>.yaml. Zero raises
+    ClusterFileNotFoundError, more than one AmbiguousClusterFileError — both
+    deterministic and non-retryable. The site is the path segment directly
+    beneath the clusters root.
+    """
+    ...
+
+
+@activity.defn
+async def allocate_segment(request: SegmentAllocationRequest) -> SegmentAllocation:
+    """Reserve a segment in the Segments Manager (POST /api/segments/allocate).
+
+    Idempotent server-side per (cluster, site, type): a repeat call — a
+    Temporal retry, or a re-run — returns the existing allocation rather than
+    reserving a second segment. Raises SegmentPoolExhaustedError (503, no
+    Available segment of that type at the site) or SegmentValidationError
+    (400/422, e.g. a bad cluster name) — both non-retryable.
+    """
+    ...
+
+
+@activity.defn
+async def get_segment(segment: str) -> SegmentEntry:
+    """Read one segment back from the Segments Manager
+    (GET /api/segments/by-segment) — the verification step's read-back.
+
+    Raises SegmentNotFoundError on 404 (the allocation the manager just
+    acknowledged is gone — deterministic, non-retryable).
+    """
+    ...
+
+
+@activity.defn
+async def append_allocation_to_cluster_values(
+    request: ClusterValuesAppendRequest,
+) -> ValuesCommitRef:
+    """Append the marker block (vlanId + dhcp_values) to the cluster's values
+    file and push to the values repo.
+
+    Idempotent by re-clone + content check: the exact block already present is
+    a no-op success (changed=False, nothing pushed); a DIFFERENT allocation —
+    a marker with other values, or an unmarked dhcp_values/vlanId key — raises
+    ClusterValuesConflictError (non-retryable). A rejected push raises the
+    retryable ValuesRepoGitError; the retry starts from a fresh clone and
+    converges. Returns the derived DhcpValues either way, for the workflow's
+    convergence poll.
+    """
+    ...
+
+
+@activity.defn
+async def get_dhcp_scope(network: str) -> DhcpScopeState:
+    """Read-only observation of the DHCP API (GET /api/v1/scopes/{network}).
+
+    404 is NOT an error — it returns found=False, the normal answer while
+    Crossplane has not created the scope yet; the workflow's bounded timer
+    loop owns the waiting. Only a failing/malformed API raises DhcpApiError
+    (transient, retried). This activity never writes: git is the single source
+    of truth and Crossplane the only writer, we merely observe convergence.
+    """
     ...

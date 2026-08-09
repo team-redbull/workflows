@@ -54,6 +54,11 @@ docker build -f docs/Dockerfile -t workflows-docs:dev .
 docker run --rm -p 8081:8080 -e DOC_VERSION=local workflows-docs:dev
 ```
 
+In the container, assets are cached for a year and busted by `DOC_VERSION` (below), so
+give it a fresh value — `-e DOC_VERSION=$(date +%s)` — when iterating on `site.css` or
+`nav.js`, or the browser will keep serving the previous build's copy. The plain-python
+preview caches nothing and needs no such care.
+
 ## The size of everything
 
 `site.css` sets one root font size and expresses every other length in `rem`, so a single
@@ -83,3 +88,8 @@ screen instead of guessing per-screen.
 number in the top-left is by construction the image being served. Running the image by
 hand gives `dev`; serving `site/` directly gives the raw `__DOC_VERSION__` placeholder,
 which is the honest answer for "nothing deployed this".
+
+The same stamp is the asset cache key: every page references `/assets/<file>?v=__DOC_VERSION__`,
+which is what lets `nginx.conf` cache assets for a year without ever serving a stale one.
+Copy that suffix along with the rest of the `<head>` when you add a page — an asset
+referenced without it is cached for a year under a URL that no redeploy will change.

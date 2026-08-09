@@ -1,6 +1,13 @@
 #!/bin/sh
 # Stamp the deployed version into every page at container start.
 #
+# Two jobs, one placeholder: the string shown in the header, AND the ?v= on every
+# /assets/ URL. That second one is load-bearing — nginx.conf caches assets for a
+# year and relies on this rewrite to change their URLs on redeploy. Stop stamping
+# and readers keep last year's CSS; stamp a version that does not change between
+# two different builds (e.g. iterating locally on the default `dev`) and the same
+# thing happens on that machine, so pass a fresh DOC_VERSION when editing assets.
+#
 # Why at start and not at build: the shared CI workflow
 # (team-redbull/.github ghcr-build-push.yml) builds this image with no build
 # args, then bumps `image.tag` in helm-charts-workflows-docs. The chart passes

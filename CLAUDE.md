@@ -195,6 +195,14 @@ tags cross-repo.
   there skips time to the execution timeout and kills the run; the real server answers not-found
   immediately. Tests of such a workflow run it with `UnsandboxedWorkflowRunner` when they patch its
   module constants — the sandbox re-imports the module per run and silently discards monkeypatches.
+- **A cancel result NEVER means "a run was live" — gate on your own state instead.** Temporal ACCEPTS
+  a cancel against an already-CLOSED execution and reports it accepted; it fails only for an id that
+  has NEVER existed. So `cancel()` cannot distinguish "killed a running sibling" from "no-op'd
+  against one that finished days ago", and the answer additionally FLIPS once the closed run ages
+  out of retention. convert-segment therefore only cancels when the segment is `Locked` — an
+  `Available` one was unlocked BY its run completing, so no live run can exist. Deriving the
+  precondition from domain state, not from the cancel's outcome, is the rule; without it the run
+  reported a phantom cancellation and paid its post-cancel grace pause on nearly every segment.
 
 ## 6. Idempotency (required for all activities)
 

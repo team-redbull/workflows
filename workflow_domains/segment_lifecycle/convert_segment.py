@@ -20,12 +20,14 @@ Shape of the run (all MACHINE ops — bounded, fails loudly, no continue_as_new)
                             Fewer matches than requested is NOT an error — the
                             result reports the shortfall.
   3. converting-segments  — sequentially per selected segment:
-       a. best-effort CANCEL the stale `open-segment-rules-<SRC>-<network>`
-          run. A Locked match usually has one, still polling the OLD type's
-          firewall request ids — left alive it would fight the replacement
-          run over the request-ids display (replace semantics, keyed by CIDR)
-          and wrongly unlock the segment when the old approval lands.
-          Not-found is the benign, common case (every Available match).
+       a. for a LOCKED match only, best-effort CANCEL the stale
+          `open-segment-rules-<SRC>-<network>` run. It usually has one, still
+          polling the OLD type's firewall request ids — left alive it would
+          fight the replacement run over the request-ids display (replace
+          semantics, keyed by CIDR) and wrongly unlock the segment when the
+          old approval lands. An AVAILABLE match is skipped outright: it was
+          unlocked BY its run completing, so no live run can exist, and the
+          cancel request cannot tell us that itself (see _convert_one).
        b. convert the type in the Segments Manager (PUT /api/segments/type,
           expected_type=source as a compare-and-set against concurrent
           conversions). The manager re-locks the segment and clears the old
@@ -121,11 +123,17 @@ _CANCEL_RESOLUTION_TIMEOUT = timedelta(seconds=30)
 _CANCEL_CLEANUP_GRACE = timedelta(seconds=30)
 
 
+# The one convertible status that can still have a live open-segment-rules run
+# (an Available segment was unlocked BY that run completing). Drives both the
+# selection order and the cancel gate in _convert_one.
+_LOCKED_STATUS = "Locked"
+
+
 def _selection_order(segment: ConvertibleSegment) -> tuple[int, int]:
     """Deterministic conversion preference: Locked before Available (spend
     not-yet-usable inventory before ready capacity), lowest vlan_id within
     each group."""
-    return (0 if segment.status == "Locked" else 1, segment.vlan_id)
+    return (0 if segment.status == _LOCKED_STATUS else 1, segment.vlan_id)
 
 
 @workflow.defn
@@ -233,35 +241,47 @@ class ConvertSegmentWorkflow:
         self, convert_input: ConvertSegmentInput, segment: ConvertibleSegment
     ) -> ConvertedSegmentReport:
         """Cancel the stale source-type run, convert, start the replacement."""
-        # 3a — the stale run can only be addressed by its deterministic id;
-        # not-found (no such run — every Available match) surfaces as an
-        # exception on the cancel request and is the normal case.
+        # 3a — only a LOCKED match can still have a live source-type run. An
+        # Available one had its open-segment-rules run COMPLETE — that
+        # completion is what unlocked it — so there is nothing to cancel.
+        #
+        # The status gate is what makes the cancel meaningful, because the
+        # cancel request itself cannot tell us: Temporal accepts a cancel
+        # against an already-CLOSED execution and reports it as ACCEPTED,
+        # failing only for an id that has NEVER existed. Since a segment
+        # becomes usable inventory BY running open-segment-rules, virtually
+        # every Available one carries a closed run at exactly this id — so
+        # cancelling unconditionally reported `cancelled_previous_run: true`
+        # for a run that ended days ago, and paid the grace pause below for
+        # it, on nearly every segment converted. (It also flipped silently
+        # once that closed run aged out of Temporal's retention.)
         stale_run_id = open_segment_rules_workflow_id(
             convert_input.source_type, segment.segment
         )
         cancelled = False
-        try:
-            await asyncio.wait_for(
-                workflow.get_external_workflow_handle(stale_run_id).cancel(),
-                timeout=_CANCEL_RESOLUTION_TIMEOUT.total_seconds(),
-            )
-            cancelled = True
-            workflow.logger.info(
-                "Cancelled stale run %s before converting %s",
-                stale_run_id,
-                segment.segment,
-            )
-        except asyncio.TimeoutError:
-            workflow.logger.info(
-                "Cancel handshake for %s unresolved after %ds — proceeding "
-                "(the request stays submitted)",
-                stale_run_id,
-                int(_CANCEL_RESOLUTION_TIMEOUT.total_seconds()),
-            )
-        except Exception:
-            workflow.logger.info(
-                "No running %s to cancel for %s", stale_run_id, segment.segment
-            )
+        if segment.status == _LOCKED_STATUS:
+            try:
+                await asyncio.wait_for(
+                    workflow.get_external_workflow_handle(stale_run_id).cancel(),
+                    timeout=_CANCEL_RESOLUTION_TIMEOUT.total_seconds(),
+                )
+                cancelled = True
+                workflow.logger.info(
+                    "Cancelled stale run %s before converting %s",
+                    stale_run_id,
+                    segment.segment,
+                )
+            except asyncio.TimeoutError:
+                workflow.logger.info(
+                    "Cancel handshake for %s unresolved after %ds — proceeding "
+                    "(the request stays submitted)",
+                    stale_run_id,
+                    int(_CANCEL_RESOLUTION_TIMEOUT.total_seconds()),
+                )
+            except Exception:
+                workflow.logger.info(
+                    "No running %s to cancel for %s", stale_run_id, segment.segment
+                )
         if cancelled:
             # Let the cancelled run's best-effort cleanup land before the
             # conversion wipes the same fields (durable, replay-safe timer).

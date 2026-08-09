@@ -495,7 +495,8 @@
         </div>
         <div class="endpoint-body">
           <p>One status endpoint for every domain and every workflow — workflow ids are globally unique, so the path needs neither.
-          While RUNNING it returns live <code>progress</code>; when COMPLETED, the <code>result</code>; when FAILED, the root-cause <code>error</code>.</p>
+          While RUNNING it returns live <code>progress</code>; when COMPLETED, the <code>result</code>; when FAILED or CANCELED, the root-cause
+          <code>error</code> <em>and</em> the last <code>progress</code> — a run that died part way is exactly when the work already done matters.</p>
           <pre><span class="c">// RUNNING</span>
 { "workflow_id": "open-segment-rules-HC-130.154.20.0",
   "workflow_type": "OpenSegmentRulesWorkflow", "status": "RUNNING",

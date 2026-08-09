@@ -49,9 +49,22 @@ class WorkflowRunStatusResponse(BaseModel):
     workflow_id: str
     workflow_type: str  # e.g. "OpenSegmentRulesWorkflow" — which workflow this id belongs to
     status: str  # RUNNING / COMPLETED / FAILED / TERMINATED / ...
-    progress: dict[str, Any] | None = None  # while RUNNING (workflow query)
+    progress: dict[str, Any] | None = None  # workflow query — while RUNNING, and after a failure/cancellation
     result: Any | None = None  # when COMPLETED
     error: str | None = None  # when FAILED/CANCELED/TERMINATED/TIMED_OUT
+
+
+async def _query_progress(handle: Any) -> dict[str, Any] | None:
+    """The optional `progress` query, best effort.
+
+    Degrades to None when the workflow worker is down, the workflow exposes no
+    such query, or the query times out — so this endpoint never hangs and never
+    500s on a workflow that simply doesn't report progress.
+    """
+    try:
+        return await handle.query(_PROGRESS_QUERY, rpc_timeout=_PROGRESS_QUERY_TIMEOUT)
+    except Exception:  # noqa: BLE001 — worker unavailable / no such query / timeout
+        return None
 
 
 @router.get(
@@ -78,18 +91,17 @@ async def get_workflow_run_status(
     error: str | None = None
 
     if description.status == WorkflowExecutionStatus.RUNNING:
-        # Best effort — degrade to status-only when the workflow worker is down
-        # or the workflow exposes no `progress` query, so this endpoint never
-        # hangs and never 500s on a workflow that simply doesn't report progress.
-        try:
-            progress = await handle.query(
-                _PROGRESS_QUERY, rpc_timeout=_PROGRESS_QUERY_TIMEOUT
-            )
-        except Exception:  # noqa: BLE001 — worker unavailable / no such query / timeout
-            progress = None
+        progress = await _query_progress(handle)
     elif description.status == WorkflowExecutionStatus.COMPLETED:
         result = await handle.result()
     elif description.status in _TERMINAL_FAILURE_STATUSES:
+        # A run that died PART WAY is exactly when progress matters most: it is
+        # the only place the work already done is reported (convert-segment's
+        # per-segment list, for instance, names the segments it converted and
+        # the sibling runs it started — all of which outlive this run). Temporal
+        # answers queries on closed workflows by replaying their history, so
+        # this costs the same best-effort call as a live one.
+        progress = await _query_progress(handle)
         # Surface why it ended: walk the cause chain to the root failure —
         # WorkflowFailureError and ActivityError are generic wrappers; the
         # ApplicationError underneath carries the real message.

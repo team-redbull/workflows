@@ -14,11 +14,11 @@ import uuid
 
 import pytest
 from temporalio import activity
-from temporalio.client import Client, WorkflowFailureError
+from temporalio.client import Client, WorkflowExecutionStatus, WorkflowFailureError
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.exceptions import ActivityError, ApplicationError
 from temporalio.testing import WorkflowEnvironment
-from temporalio.worker import UnsandboxedWorkflowRunner, Worker
+from temporalio.worker import Worker
 
 from shared.consts import (
     CONVERT_SEGMENT_WORKFLOW_QUEUE,
@@ -37,7 +37,6 @@ from shared.models.segment_lifecycle import (
     SegmentTypeUpdate,
 )
 from shared.workflow_ids import open_segment_rules_workflow_id
-from workflow_domains.segment_lifecycle import convert_segment as convert_segment_module
 from workflow_domains.segment_lifecycle.convert_segment import (
     ConvertSegmentWorkflow,
     _selection_order,
@@ -45,19 +44,6 @@ from workflow_domains.segment_lifecycle.convert_segment import (
 
 SITE = "site1"
 
-
-@pytest.fixture(autouse=True)
-def fast_cancel_handshake(monkeypatch):
-    """The Java time-skipping test server never resolves a cancel request for
-    a NONEXISTENT external workflow (the real server answers not-found
-    immediately), so on it the bounded handshake always runs its full course —
-    in real time, un-skipped. Shrink the bound so those paths cost ~1s per
-    segment instead of 30s."""
-    from datetime import timedelta
-
-    monkeypatch.setattr(
-        convert_segment_module, "_CANCEL_RESOLUTION_TIMEOUT", timedelta(seconds=1)
-    )
 
 CONVERT_INPUT = ConvertSegmentInput(
     site=SITE,
@@ -67,12 +53,15 @@ CONVERT_INPUT = ConvertSegmentInput(
 )
 
 
-def _hit(segment: str, vlan_id: int, status: str, dhcp: bool = True) -> ConvertibleSegment:
+def _hit(segment: str, vlan_id: int, dhcp: bool = True) -> ConvertibleSegment:
+    """A search hit. Always Available — list_convertible_segments returns
+    nothing else, and the workflow's whole no-cancellation design rests on
+    that (see convert_segment.py's module docstring)."""
     return ConvertibleSegment(
         segment=segment,
         vlan_id=vlan_id,
         epg_name=f"EPG_HC_{vlan_id}",
-        status=status,
+        status="Available",
         dhcp=dhcp,
     )
 
@@ -128,14 +117,13 @@ class _Harness:
         config = self._env.client.config()
         config["data_converter"] = pydantic_data_converter
         client = Client(**config)
+        # Sandboxed, exactly as the brain runs it: nothing here patches the
+        # workflow module's constants any more, so there is no reason to give
+        # up that fidelity.
         self._workflow_worker = Worker(
             client,
             task_queue=CONVERT_SEGMENT_WORKFLOW_QUEUE,
             workflows=[ConvertSegmentWorkflow],
-            # Unsandboxed so the fast_cancel_handshake fixture's patched
-            # constant is actually seen — the sandbox re-imports the workflow
-            # module per run, which would silently discard the patch.
-            workflow_runner=UnsandboxedWorkflowRunner(),
         )
         self._activity_worker = Worker(
             client,
@@ -197,15 +185,15 @@ async def _prestart_open_rules(client: Client, segment_type: SegmentType, segmen
     )
 
 
-def test_selection_prefers_locked_then_lowest_vlan():
+def test_selection_prefers_lowest_vlan():
     hits = [
-        _hit("10.0.10.0/24", 10, "Available"),
-        _hit("10.0.40.0/24", 40, "Locked"),
-        _hit("10.0.20.0/24", 20, "Available"),
-        _hit("10.0.30.0/24", 30, "Locked"),
+        _hit("10.0.10.0/24", 10),
+        _hit("10.0.40.0/24", 40),
+        _hit("10.0.20.0/24", 20),
+        _hit("10.0.30.0/24", 30),
     ]
     ordered = sorted(hits, key=_selection_order)
-    assert [s.vlan_id for s in ordered] == [30, 40, 10, 20]
+    assert [s.vlan_id for s in ordered] == [10, 20, 30, 40]
 
 
 def test_input_rejects_identical_source_and_destination():
@@ -218,12 +206,12 @@ def test_input_rejects_identical_source_and_destination():
         )
 
 
-async def test_happy_path_converts_locked_first_and_starts_children():
+async def test_happy_path_converts_lowest_vlans_and_starts_children():
     hits = [
-        _hit("10.0.10.0/24", 10, "Available"),
-        _hit("10.0.40.0/24", 40, "Locked"),
-        _hit("10.0.20.0/24", 20, "Available", dhcp=False),
-        _hit("10.0.30.0/24", 30, "Locked"),
+        _hit("10.0.10.0/24", 10),
+        _hit("10.0.40.0/24", 40),
+        _hit("10.0.20.0/24", 20, dhcp=False),
+        _hit("10.0.30.0/24", 30),
     ]
     calls, mocks = make_mock_activities(hits=hits)
     async with _Harness(mocks) as client:
@@ -238,16 +226,9 @@ async def test_happy_path_converts_locked_first_and_starts_children():
 
     assert result.matched == 4
     assert result.shortfall == 0
-    # Locked before Available, lowest vlan first, cut at quantity=3.
-    assert [r.vlan_id for r in result.converted] == [30, 40, 10]
-    assert [r.previous_status for r in result.converted] == [
-        "Locked",
-        "Locked",
-        "Available",
-    ]
+    # Lowest vlan first, cut at quantity=3.
+    assert [r.vlan_id for r in result.converted] == [10, 20, 30]
     assert all(r.open_rules_status == "started" for r in result.converted)
-    # No stale source-type runs existed, so nothing was cancelled.
-    assert all(r.cancelled_previous_run is False for r in result.converted)
     # The search asked for the SOURCE type; every conversion named the source
     # as the compare-and-set guard and the destination as the new type.
     assert calls["list_convertible_segments"] == [
@@ -256,18 +237,18 @@ async def test_happy_path_converts_locked_first_and_starts_children():
     assert [
         (u.segment, u.type, u.expected_type) for u in calls["convert_segment_type"]
     ] == [
-        ("10.0.30.0/24", SegmentType.MCE, SegmentType.HC),
-        ("10.0.40.0/24", SegmentType.MCE, SegmentType.HC),
         ("10.0.10.0/24", SegmentType.MCE, SegmentType.HC),
+        ("10.0.20.0/24", SegmentType.MCE, SegmentType.HC),
+        ("10.0.30.0/24", SegmentType.MCE, SegmentType.HC),
     ]
     # Child ids carry the DESTINATION type.
     assert result.converted[0].open_segment_rules_workflow_id == (
-        "open-segment-rules-MCE-10.0.30.0"
+        "open-segment-rules-MCE-10.0.10.0"
     )
 
 
 async def test_shortfall_converts_everything_that_matched():
-    hits = [_hit("10.0.30.0/24", 30, "Locked"), _hit("10.0.10.0/24", 10, "Available")]
+    hits = [_hit("10.0.30.0/24", 30), _hit("10.0.10.0/24", 10)]
     calls, mocks = make_mock_activities(hits=hits)
     async with _Harness(mocks) as client:
         result = await _execute(
@@ -306,49 +287,21 @@ async def test_unknown_site_fails_before_searching():
     assert calls["convert_segment_type"] == []
 
 
-async def test_stale_source_type_run_is_cancelled_before_converting():
-    segment = "10.0.30.0/24"
-    calls, mocks = make_mock_activities(
-        hits=[_hit(segment, 30, "Locked")]
-    )
-    async with _Harness(mocks) as client:
-        stale = await _prestart_open_rules(client, SegmentType.HC, segment)
-        result = await _execute(
-            client,
-            ConvertSegmentRunArgs(input=CONVERT_INPUT.model_copy(update={"quantity": 1})),
-        )
+async def test_source_type_run_is_never_cancelled():
+    """convert-segment cancels NOTHING — the guarantee the Available-only
+    selection buys, and the reason no grace pause exists.
 
-        (report,) = result.converted
-        assert report.cancelled_previous_run is True
-        assert report.open_rules_status == "started"
-        # The stale run received the cancellation request (no worker polls its
-        # queue, so it cannot have finished cancelling — the recorded request
-        # is the strongest server-side statement available here).
-        stale_events = [event async for event in stale.fetch_history_events()]
-        assert any(
-            event.HasField("workflow_execution_cancel_requested_event_attributes")
-            for event in stale_events
-        )
-    assert len(calls["convert_segment_type"]) == 1
-
-
-async def test_available_segment_never_cancels_its_closed_source_type_run():
-    """An Available hit is skipped by the cancel step outright.
-
-    It was unlocked BY its open-segment-rules run completing, so no live run
-    can exist — and the cancel request cannot establish that itself: Temporal
-    ACCEPTS a cancel against an already-closed execution, failing only for an
-    id that never existed. Cancelling unconditionally therefore reported
-    `cancelled_previous_run: true` for a run that had already finished, and
-    paid the grace pause for it, on virtually every segment converted.
+    A source-type run for the selected segment is left completely untouched,
+    whether it is running or long closed. Temporal ACCEPTS a cancel against an
+    already-closed execution and reports it accepted, failing only for an id
+    that never existed — so a cancel here could never have told a live sibling
+    from a finished one. Not issuing one is what makes that moot.
     """
     segment = "10.0.30.0/24"
-    calls, mocks = make_mock_activities(hits=[_hit(segment, 30, "Available")])
+    calls, mocks = make_mock_activities(hits=[_hit(segment, 30)])
     async with _Harness(mocks) as client:
-        # A CLOSED source-type run for this exact segment — the normal state of
-        # any Available segment in production.
-        stale = await _prestart_open_rules(client, SegmentType.HC, segment)
-        await stale.terminate()
+        # A live run at exactly the id the old cancel step addressed.
+        untouched = await _prestart_open_rules(client, SegmentType.HC, segment)
 
         result = await _execute(
             client,
@@ -356,18 +309,33 @@ async def test_available_segment_never_cancels_its_closed_source_type_run():
         )
 
         (report,) = result.converted
-        assert report.cancelled_previous_run is False
-        stale_events = [event async for event in stale.fetch_history_events()]
+        assert report.open_rules_status == "started"
+        events = [event async for event in untouched.fetch_history_events()]
         assert not any(
             event.HasField("workflow_execution_cancel_requested_event_attributes")
-            for event in stale_events
+            for event in events
         )
+        assert (await untouched.describe()).status == WorkflowExecutionStatus.RUNNING
     assert len(calls["convert_segment_type"]) == 1
+
+
+async def test_run_has_no_timers_at_all():
+    """No cancel handshake, no grace pause — so a conversion loop records not
+    one timer. This is the whole performance case for Available-only: the
+    previous shape paid a 30 s durable pause per segment."""
+    hits = [_hit("10.0.10.0/24", 10), _hit("10.0.20.0/24", 20), _hit("10.0.30.0/24", 30)]
+    _, mocks = make_mock_activities(hits=hits)
+    async with _Harness(mocks) as client:
+        handle = await _start(client, ConvertSegmentRunArgs(input=CONVERT_INPUT))
+        await asyncio.wait_for(handle.result(), timeout=60)
+        events = [event async for event in handle.fetch_history_events()]
+
+    assert not any(event.HasField("timer_started_event_attributes") for event in events)
 
 
 async def test_existing_destination_run_is_reported_not_failed():
     segment = "10.0.30.0/24"
-    calls, mocks = make_mock_activities(hits=[_hit(segment, 30, "Available")])
+    calls, mocks = make_mock_activities(hits=[_hit(segment, 30)])
     async with _Harness(mocks) as client:
         await _prestart_open_rules(client, SegmentType.MCE, segment)
         result = await _execute(
@@ -383,7 +351,7 @@ async def test_existing_destination_run_is_reported_not_failed():
 
 
 async def test_conversion_conflict_fails_loudly_but_earlier_conversions_stand():
-    hits = [_hit("10.0.30.0/24", 30, "Locked"), _hit("10.0.40.0/24", 40, "Locked")]
+    hits = [_hit("10.0.30.0/24", 30), _hit("10.0.40.0/24", 40)]
     calls, mocks = make_mock_activities(hits=hits, convert_error_on="10.0.40.0/24")
     async with _Harness(mocks) as client:
         handle = await _start(client, ConvertSegmentRunArgs(input=CONVERT_INPUT))

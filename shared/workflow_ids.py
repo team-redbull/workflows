@@ -4,8 +4,8 @@ Workflow ids are the dedup key for the whole system (a duplicate trigger while
 running is rejected as already-started), so the scheme for each workflow must
 exist in exactly one place. These builders are needed on BOTH sides of the
 sandbox boundary — the routers build ids to start workflows, and workflows
-build SIBLING ids (convert-segment cancels the stale open-segment-rules run
-and starts the replacement as a child) — which is why they live here as pure
+build SIBLING ids (convert-segment starts an open-segment-rules run per
+converted segment, as a detached child) — which is why they live here as pure
 string helpers rather than in a router module: a workflow file can never
 import a router (FastAPI inside the sandbox).
 """

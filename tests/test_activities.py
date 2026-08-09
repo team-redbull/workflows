@@ -523,18 +523,18 @@ def _stored(segment: str, vlan_id: int, status: str, dhcp: bool = True) -> dict:
 
 
 @respx.mock
-async def test_list_convertible_segments_filters_status_client_side(env):
-    """The server filters site+type; Allocated hits must be dropped HERE —
-    the manager's status param takes one value and we need two."""
+async def test_list_convertible_segments_asks_the_server_for_available_only(env):
+    """All three filters are the server's now that "convertible" means one
+    status — so the request itself must carry status=Available."""
     route = respx.get(
-        f"{SM}/api/segments", params={"site": "site-a", "type": "HC"}
+        f"{SM}/api/segments",
+        params={"site": "site-a", "type": "HC", "status": "Available"},
     ).mock(
         return_value=httpx.Response(
             200,
             json=[
                 _stored("10.0.10.0/24", 10, "Available"),
-                _stored("10.0.20.0/24", 20, "Allocated"),
-                _stored("10.0.30.0/24", 30, "Locked", dhcp=False),
+                _stored("10.0.30.0/24", 30, "Available", dhcp=False),
             ],
         )
     )
@@ -545,8 +545,31 @@ async def test_list_convertible_segments_filters_status_client_side(env):
     assert route.called
     assert [(h.segment, h.status, h.dhcp) for h in hits] == [
         ("10.0.10.0/24", "Available", True),
-        ("10.0.30.0/24", "Locked", False),
+        ("10.0.30.0/24", "Available", False),
     ]
+
+
+@respx.mock
+@pytest.mark.parametrize("wrong_status", ["Locked", "Allocated"])
+async def test_list_convertible_segments_rejects_a_wrong_status(env, wrong_status):
+    """Strict, not tolerant (§7): a segment the server should have filtered out
+    would enter the conversion loop, so it fails the activity rather than being
+    quietly skipped. Locked matters most — converting one means disturbing a
+    possibly-live open-segment-rules run, which this workflow never does."""
+    respx.get(f"{SM}/api/segments").mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                _stored("10.0.10.0/24", 10, "Available"),
+                _stored("10.0.20.0/24", 20, wrong_status),
+            ],
+        )
+    )
+    with pytest.raises(SegmentsManagerError):
+        await env.run(
+            list_convertible_segments,
+            ConvertibleSegmentsQuery(site="site-a", type=SegmentType.HC),
+        )
 
 
 @respx.mock

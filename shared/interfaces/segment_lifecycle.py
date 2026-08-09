@@ -230,12 +230,13 @@ async def list_convertible_segments(
     query: ConvertibleSegmentsQuery,
 ) -> list[ConvertibleSegment]:
     """Return every segment of the given type at the site that MAY be
-    converted: status Available or Locked only (GET /api/segments filtered by
-    site+type server-side, status client-side — the manager's status filter
-    takes one value per call). Allocated segments are in use and never appear.
+    converted: status Available ONLY (GET /api/segments filtered by
+    site+type+status, all server-side). Allocated segments are in use;
+    Locked ones have no established connectivity and may still have a live
+    open-segment-rules run, which convert-segment deliberately never disturbs.
 
-    Read-only and unordered by policy: WHICH hits to convert (Locked first,
-    lowest vlan) is the workflow's decision, made deterministically from this
+    Read-only and unordered by policy: WHICH hits to convert (lowest vlan
+    first) is the workflow's decision, made deterministically from this
     recorded result.
     """
     ...

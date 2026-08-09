@@ -298,7 +298,7 @@ class AllocateSegmentResult(BaseModel):
 
 # --- convert-segment --------------------------------------------------------
 # The domain's third workflow: rebalance segment inventory between types by
-# re-typing existing Available/Locked segments of a source type at a site and
+# re-typing existing AVAILABLE segments of a source type at a site and
 # re-running the open-segment-rules flow for each (the new type has different
 # peers, so connectivity must be re-established). Workflow-scoped models carry
 # the workflow name; models a sibling could reuse (the search query/result and
@@ -338,9 +338,10 @@ class ConvertSegmentRunArgs(BaseModel):
 
 class ConvertibleSegmentsQuery(BaseModel):
     """Input to list_convertible_segments: which type to look for, and where.
-    Status is NOT a parameter — "convertible" MEANS Available or Locked
-    (Allocated segments are in use and never converted), and that rule
-    belongs to the activity, not to each caller."""
+    Status is NOT a parameter — "convertible" MEANS Available, and that rule
+    belongs to the activity, not to each caller. Allocated segments are in use;
+    Locked ones have no established connectivity and may still have a live
+    open-segment-rules run, which this workflow deliberately never disturbs."""
 
     site: str = Field(min_length=1)
     type: SegmentType
@@ -349,12 +350,17 @@ class ConvertibleSegmentsQuery(BaseModel):
 class ConvertibleSegment(BaseModel):
     """One search hit: everything the workflow needs to pick it, convert it,
     and hand the open-segment-rules child a full OpenSegmentRulesInput —
-    without a second read-back."""
+    without a second read-back.
+
+    `status` carries no choice for the workflow (every hit is Available) — it
+    is kept so the activity can assert that, rather than trusting the filter it
+    asked for.
+    """
 
     segment: str = Field(min_length=1)  # CIDR
     vlan_id: int = Field(ge=1, le=4094)
     epg_name: str = Field(min_length=1)
-    status: str = Field(min_length=1)  # "Available" | "Locked"
+    status: str = Field(min_length=1)  # always "Available"
     dhcp: bool
 
 
@@ -374,12 +380,16 @@ class ConvertedSegmentReport(BaseModel):
     """Per-segment outcome of the conversion loop. `open_rules_status` reports
     the FAN-OUT only (like the bulk route's items): `started` means Temporal
     accepted the child run, whose own progress/failure lives under its own
-    workflow id."""
+    workflow id.
+
+    No `previous_status`/`cancelled_previous_run`: every converted segment was
+    Available and no stale run is ever cancelled, so both were constants — and
+    a constant dressed up as a per-segment finding is exactly the kind of field
+    an operator reads as meaningful.
+    """
 
     segment: str
     vlan_id: int
-    previous_status: str
-    cancelled_previous_run: bool
     open_segment_rules_workflow_id: str
     open_rules_status: Literal["started", "already_running"]
 

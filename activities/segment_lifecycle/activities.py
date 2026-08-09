@@ -814,26 +814,33 @@ async def publish_segment_connectivity_failure(notice: SegmentConnectivityFailur
 
 # --- convert-segment --------------------------------------------------------
 
-# The statuses a segment may be converted from. Allocated is excluded by
-# definition (in use by a cluster), and the Segments Manager enforces the same
-# rule server-side — this filter just keeps in-use segments out of the
-# workflow's selection instead of failing on them later.
-_CONVERTIBLE_STATUSES = frozenset({"Available", "Locked"})
+# The ONE status a segment may be converted from. "Allocated" is excluded by
+# definition (in use by a cluster). "Locked" is excluded by policy: its
+# connectivity is not established, so it may still have a LIVE
+# open-segment-rules run — converting it would mean cancelling that run, and
+# this workflow deliberately does not go there (see convert_segment.py).
+_CONVERTIBLE_STATUS = "Available"
 
 
 @activity.defn
 async def list_convertible_segments(
     query: ConvertibleSegmentsQuery,
 ) -> list[ConvertibleSegment]:
-    """Every Available/Locked segment of the given type at the site (public GET).
+    """Every Available segment of the given type at the site (public GET).
 
-    site+type filter server-side; status client-side — the manager's status
-    query param takes a single value, and "Available or Locked" is two.
+    All three filters are server-side. Status became one of them once
+    "convertible" narrowed to a SINGLE status — the manager's status query
+    param takes one value, which is why the old Available-or-Locked rule had
+    to be applied client-side over a wider result set.
     """
     async with _segments_manager_client() as client:
         resp = await client.get(
             "/api/segments",
-            params={"site": query.site, "type": query.type.value},
+            params={
+                "site": query.site,
+                "type": query.type.value,
+                "status": _CONVERTIBLE_STATUS,
+            },
         )
         if resp.status_code != 200:
             _raise_segments_manager_error(
@@ -841,8 +848,15 @@ async def list_convertible_segments(
             )
     hits: list[ConvertibleSegment] = []
     for seg in resp.json():
-        if seg.get("status") not in _CONVERTIBLE_STATUSES:
-            continue
+        # Strict, not tolerant (§7): the filter is the manager's to apply, but
+        # a wrong status here would put a segment into the conversion loop that
+        # must never be there, so an unexpected one fails the activity rather
+        # than being silently skipped.
+        if seg.get("status") != _CONVERTIBLE_STATUS:
+            raise SegmentsManagerError(
+                f"GET /api/segments?status={_CONVERTIBLE_STATUS} returned a "
+                f"segment with status {seg.get('status')!r}: {seg}"
+            )
         try:
             hits.append(ConvertibleSegment.model_validate(seg))
         except ValueError as exc:

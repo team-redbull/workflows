@@ -332,6 +332,39 @@ async def test_stale_source_type_run_is_cancelled_before_converting():
     assert len(calls["convert_segment_type"]) == 1
 
 
+async def test_available_segment_never_cancels_its_closed_source_type_run():
+    """An Available hit is skipped by the cancel step outright.
+
+    It was unlocked BY its open-segment-rules run completing, so no live run
+    can exist — and the cancel request cannot establish that itself: Temporal
+    ACCEPTS a cancel against an already-closed execution, failing only for an
+    id that never existed. Cancelling unconditionally therefore reported
+    `cancelled_previous_run: true` for a run that had already finished, and
+    paid the grace pause for it, on virtually every segment converted.
+    """
+    segment = "10.0.30.0/24"
+    calls, mocks = make_mock_activities(hits=[_hit(segment, 30, "Available")])
+    async with _Harness(mocks) as client:
+        # A CLOSED source-type run for this exact segment — the normal state of
+        # any Available segment in production.
+        stale = await _prestart_open_rules(client, SegmentType.HC, segment)
+        await stale.terminate()
+
+        result = await _execute(
+            client,
+            ConvertSegmentRunArgs(input=CONVERT_INPUT.model_copy(update={"quantity": 1})),
+        )
+
+        (report,) = result.converted
+        assert report.cancelled_previous_run is False
+        stale_events = [event async for event in stale.fetch_history_events()]
+        assert not any(
+            event.HasField("workflow_execution_cancel_requested_event_attributes")
+            for event in stale_events
+        )
+    assert len(calls["convert_segment_type"]) == 1
+
+
 async def test_existing_destination_run_is_reported_not_failed():
     segment = "10.0.30.0/24"
     calls, mocks = make_mock_activities(hits=[_hit(segment, 30, "Available")])

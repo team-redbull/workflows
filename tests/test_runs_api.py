@@ -133,6 +133,50 @@ def test_failed_surfaces_the_root_cause(make_client):
     assert "Segment 10.0.0.0/24 not found" in body["error"]
 
 
+@pytest.mark.parametrize(
+    "status",
+    [WorkflowExecutionStatus.FAILED, WorkflowExecutionStatus.CANCELED],
+)
+def test_closed_run_still_reports_the_work_it_did(make_client, status):
+    """A run that died PART WAY is when progress matters most — it is the only
+    report of the work already done (convert-segment's per-segment list names
+    the segments it converted and the sibling runs it started, all of which
+    outlive it). Temporal answers queries on closed workflows, so the endpoint
+    must ask, and still surface the failure alongside."""
+    failure = WorkflowFailureError(
+        cause=ApplicationError("Segments Manager refused", type="SegmentConversionConflictError")
+    )
+    handle = _FakeHandle(
+        status,
+        progress={"phase": "converting-segments", "matched": 4, "selected": 3,
+                  "converted": [{"segment": "10.0.30.0/24"}]},
+        result_error=failure,
+    )
+    response = make_client(handle).get("/workflows/runs/convert-segment-site1-HC-to-MCE")
+
+    body = response.json()
+    assert body["status"] == status.name
+    assert body["progress"]["converted"] == [{"segment": "10.0.30.0/24"}]
+    assert "Segments Manager refused" in body["error"]
+
+
+def test_closed_run_progress_is_best_effort(make_client):
+    """Same degradation rule as a live run: a workflow with no `progress`
+    query must still report its failure, never 500."""
+    failure = WorkflowFailureError(cause=ApplicationError("boom", type="Whatever"))
+    handle = _FakeHandle(
+        WorkflowExecutionStatus.FAILED,
+        query_error=RuntimeError("no such query"),
+        result_error=failure,
+    )
+    response = make_client(handle).get("/workflows/runs/some-other-workflow-1")
+
+    body = response.json()
+    assert response.status_code == 200
+    assert "progress" not in body
+    assert "boom" in body["error"]
+
+
 def test_unknown_workflow_id_is_404(make_client):
     handle = _FakeHandle(None, describe_error=_NOT_FOUND)
     response = make_client(handle).get("/workflows/runs/nope")

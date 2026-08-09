@@ -195,8 +195,11 @@
           polling the OLD type's firewall request ids. Left alive it would fight the replacement run over the
           request-ids display (replace semantics, keyed by CIDR) — and wrongly <em>unlock</em> the segment when
           the old approval finally lands. So the workflow requests its cancellation by deterministic id,
-          tolerating not-found (the normal case for Available matches), with the handshake <b>bounded</b> so one
-          slow answer never hangs the conversion.</p>
+          tolerating not-found, with the handshake <b>bounded</b> so one slow answer never hangs the conversion.</p>
+          <p class="note">This step runs for <b>Locked</b> matches only. An Available segment was unlocked
+          <em>by</em> its own run completing, so no live run can exist — and the cancel request cannot establish
+          that itself: Temporal accepts a cancel against an already-closed execution and reports it accepted,
+          failing only for an id that never existed. The status is the precondition; the cancel's answer is not.</p>
           <p class="note">After a delivered cancel, a 30&nbsp;s durable pause lets the dying run's cleanup land
           before the conversion wipes the same fields. If its failure note still lands late, it is cleared the
           moment the new child publishes its first request ids — a benign, self-healing race.</p>
@@ -390,7 +393,7 @@
           <tr><td class="k">pending</td><td class="muted">Run accepted</td><td class="muted">instant</td></tr>
           <tr><td class="k">validating-site</td><td class="muted">Fetching the site list</td><td class="muted">seconds</td></tr>
           <tr><td class="k">searching-segments</td><td class="muted">Listing + selecting convertible segments</td><td class="muted">seconds</td></tr>
-          <tr><td class="k">converting-segments</td><td class="muted">Per segment: cancel stale run → convert → start child (30 s pause after each delivered cancel)</td><td class="muted">seconds per segment; +30 s per cancelled stale run</td></tr>
+          <tr><td class="k">converting-segments</td><td class="muted">Per segment: cancel a Locked match's stale run → convert → start child (30 s pause after each delivered cancel)</td><td class="muted">seconds per segment; +30 s per cancelled stale run (Available matches pay nothing)</td></tr>
           <tr><td class="k">completed</td><td class="muted">Done; <code>result</code> is available — the children keep running under their own ids</td><td class="muted">—</td></tr>
         </tbody>
       </table>

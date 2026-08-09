@@ -77,8 +77,11 @@ tags cross-repo.
   MUST carry the workflow name — two workflows acting on the same segment would otherwise collide on
   one id — and the segment TYPE: allocation is scoped per (cluster, site, type), so
   `allocate-segment-<TYPE>-<cluster>` without the type would make two legitimate allocations of one
-  cluster collide. The domain currently holds TWO workflows (`open-segment-rules`,
-  `allocate-segment`), each on its own workflow queue, sharing the one limb deployment.
+  cluster collide. The domain currently holds THREE workflows (`open-segment-rules`,
+  `allocate-segment`, `convert-segment`), each on its own workflow queue, sharing the one limb
+  deployment. Id builders live in `shared/workflow_ids.py` — ONE definition per scheme, importable
+  from both routers and workflow code (convert-segment builds open-segment-rules ids to cancel stale
+  runs and start replacements; a workflow file can never import a router, FastAPI ≠ sandbox-safe).
 - **API paths are `/workflows/<domain>/<workflow>`; status is `/workflows/runs/{workflow_id}`.** A
   domain is a prefix, never an endpoint: the bare `/workflows/<domain>` must stay free, or the first
   workflow silently claims the whole domain. Status is domain-agnostic ON PURPOSE — workflow ids are
@@ -181,6 +184,17 @@ tags cross-repo.
   memory only and SCRUBBED from every error message BEFORE the exception is constructed — activity
   errors are recorded verbatim in Temporal history and the UI, so redacting at the logging layer alone
   is too late.
+- **Cross-workflow orchestration (convert-segment is the precedent):** a workflow that spawns sibling
+  runs starts them as DETACHED child workflows — `workflow.start_child_workflow(...,
+  parent_close_policy=ParentClosePolicy.ABANDON)` on the sibling's workflow queue, catching
+  `WorkflowAlreadyStartedError` as an `already_running` report item — never waits on them (each child
+  answers to its own id/approval/failure, the /bulk philosophy), and cancels a stale sibling via
+  `workflow.get_external_workflow_handle(id).cancel()` wrapped in BOTH a tolerant try/except
+  (not-found is normal) AND a bounded `asyncio.wait_for` (maps to a durable timer): the Java
+  time-skipping TEST server never resolves a cancel for a nonexistent workflow — an unbounded await
+  there skips time to the execution timeout and kills the run; the real server answers not-found
+  immediately. Tests of such a workflow run it with `UnsandboxedWorkflowRunner` when they patch its
+  module constants — the sandbox re-imports the module per run and silently discards monkeypatches.
 
 ## 6. Idempotency (required for all activities)
 
@@ -198,8 +212,15 @@ tags cross-repo.
   never record a vlan the Segments Manager does not confirm. A mutation whose outcome another system
   will act on gets a read-back check between the mutation and the recording.
 - Workflow IDs are deterministic (`open-segment-rules-<TYPE>-<network address, CIDR mask dropped>`,
-  e.g. `open-segment-rules-HC-130.154.20.0`; `allocate-segment-<TYPE>-<cluster>`) for natural dedup —
-  a duplicate trigger while running gets HTTP 409 (in the bulk route, an `already_running` item).
+  e.g. `open-segment-rules-HC-130.154.20.0`; `allocate-segment-<TYPE>-<cluster>`;
+  `convert-segment-<site>-<SRC>-to-<DEST>`) for natural dedup — a duplicate trigger while running
+  gets HTTP 409 (in the bulk route, an `already_running` item). Builders in `shared/workflow_ids.py`.
+- **Cross-workflow idempotency via compare-and-set:** convert-segment's `convert_segment_type`
+  passes `expected_type` so two conversions racing for one segment (HC→MCE vs HC→PXE) can't both
+  win — the loser gets the Segments Manager's 409 (`SegmentConversionConflictError`, non-retryable,
+  fails that run loudly), while a plain Temporal retry stays safe (a stored type already equal to
+  the NEW type short-circuits as success before the CAS check). A failed convert-segment re-run is
+  naturally convergent: converted segments no longer match the source type, so the search skips them.
 
 ## 7. Strict validation & clean typed state
 

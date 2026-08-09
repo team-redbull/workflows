@@ -16,7 +16,10 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from temporalio.exceptions import WorkflowAlreadyStartedError
 
-from shared.consts import OPEN_SEGMENT_RULES_WORKFLOW_QUEUE
+from shared.consts import (
+    CONVERT_SEGMENT_WORKFLOW_QUEUE,
+    OPEN_SEGMENT_RULES_WORKFLOW_QUEUE,
+)
 from workflow_domains.routers.deps import get_temporal_client
 from workflow_domains.segment_lifecycle import router as router_module
 
@@ -40,13 +43,19 @@ class _FakeHandle:
 class _FakeClient:
     """Records start_workflow calls; raises for ids in `already_started`."""
 
-    def __init__(self, already_started: set[str] = frozenset(), fail: bool = False) -> None:
+    def __init__(
+        self,
+        already_started: set[str] = frozenset(),
+        fail: bool = False,
+        expected_queue: str = OPEN_SEGMENT_RULES_WORKFLOW_QUEUE,
+    ) -> None:
         self.started: list[str] = []
         self._already_started = set(already_started)
         self._fail = fail
+        self._expected_queue = expected_queue
 
     async def start_workflow(self, _run, _args, *, id: str, task_queue: str):
-        assert task_queue == OPEN_SEGMENT_RULES_WORKFLOW_QUEUE
+        assert task_queue == self._expected_queue
         if self._fail:
             raise RuntimeError("temporal unavailable")
         if id in self._already_started:
@@ -112,6 +121,7 @@ def test_routes_are_scoped_to_the_workflow_not_the_domain():
         "/workflows/segment-lifecycle/open-segment-rules",
         "/workflows/segment-lifecycle/open-segment-rules/bulk",
         "/workflows/segment-lifecycle/allocate-segment",
+        "/workflows/segment-lifecycle/convert-segment",
     }
 
 
@@ -186,5 +196,55 @@ def test_bulk_start_failure_is_reported_not_raised(make_client):
 def test_bulk_rejects_an_empty_batch(make_client):
     response = make_client(_FakeClient()).post(
         "/workflows/segment-lifecycle/open-segment-rules/bulk", json={"segments": []}
+    )
+    assert response.status_code == 422
+
+
+def _conversion(quantity: int = 2) -> dict:
+    return {
+        "site": "site-a",
+        "source_type": "HC",
+        "destination_type": "MCE",
+        "quantity": quantity,
+    }
+
+
+def test_convert_uses_the_deterministic_workflow_id(make_client):
+    fake = _FakeClient(expected_queue=CONVERT_SEGMENT_WORKFLOW_QUEUE)
+    response = make_client(fake).post(
+        "/workflows/segment-lifecycle/convert-segment", json=_conversion()
+    )
+
+    assert response.status_code == 202
+    assert response.json()["workflow_id"] == "convert-segment-site-a-HC-to-MCE"
+    assert fake.started == ["convert-segment-site-a-HC-to-MCE"]
+
+
+def test_convert_conflicts_when_already_running(make_client):
+    fake = _FakeClient(
+        already_started={"convert-segment-site-a-HC-to-MCE"},
+        expected_queue=CONVERT_SEGMENT_WORKFLOW_QUEUE,
+    )
+    response = make_client(fake).post(
+        "/workflows/segment-lifecycle/convert-segment", json=_conversion()
+    )
+    assert response.status_code == 409
+
+
+def test_convert_rejects_identical_source_and_destination(make_client):
+    response = make_client(
+        _FakeClient(expected_queue=CONVERT_SEGMENT_WORKFLOW_QUEUE)
+    ).post(
+        "/workflows/segment-lifecycle/convert-segment",
+        json={**_conversion(), "destination_type": "HC"},
+    )
+    assert response.status_code == 422
+
+
+def test_convert_rejects_a_non_positive_quantity(make_client):
+    response = make_client(
+        _FakeClient(expected_queue=CONVERT_SEGMENT_WORKFLOW_QUEUE)
+    ).post(
+        "/workflows/segment-lifecycle/convert-segment", json=_conversion(quantity=0)
     )
     assert response.status_code == 422

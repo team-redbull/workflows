@@ -29,18 +29,29 @@ from temporalio.exceptions import WorkflowAlreadyStartedError
 
 from shared.consts import (
     ALLOCATE_SEGMENT_WORKFLOW_QUEUE,
+    CONVERT_SEGMENT_WORKFLOW_QUEUE,
     OPEN_SEGMENT_RULES_WORKFLOW_QUEUE,
 )
 from shared.models.segment_lifecycle import (
     AllocateSegmentInput,
     AllocateSegmentRunArgs,
+    ConvertSegmentInput,
+    ConvertSegmentRunArgs,
     OpenSegmentRulesInput,
     OpenSegmentRulesRunArgs,
+)
+from shared.workflow_ids import (
+    allocate_segment_workflow_id,
+    convert_segment_workflow_id,
+    open_segment_rules_workflow_id,
 )
 from workflow_domains.routers.deps import get_temporal_client
 from workflow_domains.routers.models import StartWorkflowResponse
 from workflow_domains.segment_lifecycle.allocate_segment import (
     AllocateSegmentWorkflow,
+)
+from workflow_domains.segment_lifecycle.convert_segment import (
+    ConvertSegmentWorkflow,
 )
 from workflow_domains.segment_lifecycle.open_segment_rules import (
     OpenSegmentRulesWorkflow,
@@ -51,6 +62,7 @@ router = APIRouter(prefix="/workflows/segment-lifecycle", tags=["segment-lifecyc
 # One workflow of this domain = one path under the domain prefix.
 _OPEN_SEGMENT_RULES_PATH = "/open-segment-rules"
 _ALLOCATE_SEGMENT_PATH = "/allocate-segment"
+_CONVERT_SEGMENT_PATH = "/convert-segment"
 
 
 # API-layer request/response models — these never cross the workflow boundary.
@@ -89,20 +101,11 @@ class BulkStartOpenSegmentRulesResponse(BaseModel):
     results: list[BulkOpenSegmentRulesItem]
 
 
+# Deterministic workflow ids come from shared/workflow_ids.py — the ONE
+# definition per scheme, shared with workflow code (convert-segment builds
+# open-segment-rules ids to cancel stale runs and start replacements).
 def _workflow_id(rules_input: OpenSegmentRulesInput) -> str:
-    """Deterministic, URL-safe id: natural dedup per (type, segment).
-
-    Prefixed with the WORKFLOW name, not the domain: a second workflow in this
-    domain acting on the same segment (e.g. a future close-segment-rules) must
-    get a distinct id, or it would collide with this one and be rejected as
-    already-started.
-
-    The CIDR mask is dropped from the id (e.g. 130.154.20.0/24 -> the id ends
-    ...-130.154.20.0), so two requests for the same network address dedup
-    regardless of how the mask was written.
-    """
-    network = rules_input.segment.split("/", 1)[0]
-    return f"open-segment-rules-{rules_input.type.value}-{network}"
+    return open_segment_rules_workflow_id(rules_input.type, rules_input.segment)
 
 
 async def _start(client: Client, rules_input: OpenSegmentRulesInput):
@@ -205,14 +208,7 @@ async def start_open_segment_rules_bulk(
 
 
 def _allocate_segment_workflow_id(allocate_input: AllocateSegmentInput) -> str:
-    """Deterministic, URL-safe id: natural dedup per (type, cluster).
-
-    The id MUST carry the type: allocation is scoped by (cluster, site, type)
-    in the Segments Manager — one cluster can hold one segment per type at a
-    site — so a type-less id would make two legitimate allocations collide.
-    Mirrors open-segment-rules-<TYPE>-<network>.
-    """
-    return f"allocate-segment-{allocate_input.type.value}-{allocate_input.cluster}"
+    return allocate_segment_workflow_id(allocate_input.type, allocate_input.cluster)
 
 
 @router.post(
@@ -245,6 +241,52 @@ async def start_allocate_segment(
             detail=(
                 "Segment-lifecycle workflow already running: "
                 f"{_allocate_segment_workflow_id(allocate_input)}"
+            ),
+        )
+    return StartWorkflowResponse(
+        workflow_id=handle.id, run_id=handle.result_run_id or ""
+    )
+
+
+def _convert_segment_workflow_id(convert_input: ConvertSegmentInput) -> str:
+    return convert_segment_workflow_id(
+        convert_input.site, convert_input.source_type, convert_input.destination_type
+    )
+
+
+@router.post(
+    _CONVERT_SEGMENT_PATH,
+    response_model=StartWorkflowResponse,
+    status_code=202,
+)
+async def start_convert_segment(
+    convert_input: ConvertSegmentInput,
+    client: Client = Depends(get_temporal_client),
+) -> StartWorkflowResponse:
+    """Convert source-type segments to another type — returns immediately (202).
+
+    The workflow searches the site for Available/Locked segments of the source
+    type, re-types up to `quantity` of them in the Segments Manager (each is
+    re-Locked with its stale firewall request ids cleared) and starts one
+    open-segment-rules run per converted segment. Fewer matches than requested
+    is reported as a shortfall in the result, not an error. Poll
+    GET /workflows/runs/{workflow_id} for progress/result — the per-segment
+    report carries each started open-segment-rules workflow id, which is
+    polled the same way. No bulk variant: the request is already batch-shaped.
+    """
+    try:
+        handle = await client.start_workflow(
+            ConvertSegmentWorkflow.run,
+            ConvertSegmentRunArgs(input=convert_input),
+            id=_convert_segment_workflow_id(convert_input),
+            task_queue=CONVERT_SEGMENT_WORKFLOW_QUEUE,
+        )
+    except WorkflowAlreadyStartedError:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Segment-lifecycle workflow already running: "
+                f"{_convert_segment_workflow_id(convert_input)}"
             ),
         )
     return StartWorkflowResponse(

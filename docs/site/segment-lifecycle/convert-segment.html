@@ -1,0 +1,416 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>convert-segment — Redbull Workflows</title>
+<meta name="description" content="The convert-segment workflow: re-type Available/Locked segments of a source type at a site, clear their stale firewall request ids, and start an open-segment-rules run per converted segment.">
+<link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/assets/site.css">
+</head>
+<body data-page="/segment-lifecycle/convert-segment.html">
+
+<a class="skip-link" href="#main">Skip to content</a>
+
+<!-- Topbar: identical on every page. Brand + deployed version upper-left; the
+     "Workflows" menu is built from the catalogue in assets/nav.js. -->
+<header class="topbar">
+  <a class="brand" href="/">
+    <img class="brand-mark" src="/assets/redbull-logo.png" alt="" aria-hidden="true"
+         width="480" height="179">
+    <span class="brand-name">Redbull Workflows</span>
+    <span class="brand-ver" title="deployed image tag of this documentation site">__DOC_VERSION__</span>
+  </a>
+  <nav class="topnav" aria-label="Site">
+    <a class="topnav-link" href="/">Orchestrator guide</a>
+    <div class="wfmenu">
+      <button class="wfmenu-btn" id="wfmenu-btn" type="button"
+              aria-expanded="false" aria-haspopup="true" aria-controls="wfmenu-panel">
+        Workflows <span class="caret" aria-hidden="true">&#9662;</span>
+      </button>
+      <div class="wfmenu-panel" id="wfmenu-panel" role="menu" aria-label="Workflows by domain" hidden></div>
+    </div>
+    <noscript>
+      <a class="topnav-link" href="/segment-lifecycle/convert-segment.html">convert-segment</a>
+    </noscript>
+  </nav>
+</header>
+
+<main id="main">
+<header class="masthead">
+  <div class="masthead-inner">
+    <div class="eyebrow">Temporal workflow · domain: segment-lifecycle</div>
+    <h1>convert-segment<span class="dim"> — what actually happens</span></h1>
+    <p class="lede">
+      One request — <b>site, source type, destination type, quantity</b> — rebalances segment inventory between
+      types. The workflow finds up to <code>quantity</code> <b>Available or Locked</b> segments of the source type
+      at the site, re-types each one in the Segments Manager (which re-locks it and clears the old type's pending
+      firewall request ids), and starts one <a href="/segment-lifecycle/open-segment-rules.html">open-segment-rules</a>
+      run per converted segment — the new type has different peers, so connectivity is re-established from scratch.
+    </p>
+    <p class="lede">Fewer matching segments than requested is <em>not</em> an error: the run converts what exists
+    and reports the <b>shortfall</b> in its result. Allocated segments are in use and are never touched.</p>
+    <div class="facts">
+      <div class="fact"><span class="k">Trigger</span><span class="v">POST /workflows/segment-lifecycle/convert-segment</span></div>
+      <div class="fact"><span class="k">Workflow id</span><span class="v">convert-segment-&lt;site&gt;-&lt;SRC&gt;-to-&lt;DEST&gt;</span></div>
+      <div class="fact"><span class="k">Workflow queue</span><span class="v">convert-segment-workflow</span></div>
+      <div class="fact"><span class="k">Activity queue</span><span class="v">segment-lifecycle-activity</span></div>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <!-- ======================= THE FLOW ======================= -->
+  <section id="flow">
+    <div class="sec-head">
+      <div class="eyebrow">The run, step by step</div>
+      <h2>From “convert N segments” to “N open-segment-rules runs are on their way”</h2>
+      <p class="lede">Three stages plus a per-segment loop. The parent <b>never waits for the firewall
+      approvals</b>: each converted segment gets its own detached open-segment-rules run — its own workflow id,
+      its own human approval, its own failure — exactly like the bulk trigger route, and the parent completes
+      with a fan-out report.</p>
+    </div>
+
+    <div class="diagram rail">
+      <svg viewBox="0 0 1060 330" role="img"
+           aria-label="Horizontal flow: an operator posts site, source type, destination type and quantity; the workflow validates the site, searches and selects convertible segments, then loops per segment — cancel the stale source-type run, convert the type in the Segments Manager, start the destination-type open-segment-rules run as a detached child — and completes with a report including any shortfall.">
+        <defs>
+          <marker id="ah-n"   viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0.5 L8,4 L0,7.5 Z"/></marker>
+          <marker id="ah-nxt" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0.5 L8,4 L0,7.5 Z"/></marker>
+        </defs>
+
+        <!-- entry -->
+        <rect class="entry-pill" x="30" y="18" width="420" height="30" rx="4"/>
+        <text class="entry-t" x="44" y="38">POST /workflows/segment-lifecycle/convert-segment</text>
+        <path class="f-arrow" d="M114,48 V136" marker-end="url(#ah-n)"/>
+
+        <!-- stage 1 -->
+        <rect class="fbox sm" x="30" y="142" width="168" height="112" rx="5"/>
+        <circle class="stepno sm" cx="52" cy="164" r="12"/>
+        <text class="stepno-t" x="52" y="168">1</text>
+        <text class="f-title" x="48" y="202">Validate site</text>
+        <text class="f-sys sm" x="48" y="222">Segments Manager</text>
+        <text class="f-det" x="48" y="240">GET /api/sites</text>
+
+        <path class="f-arrow" d="M202,198 H234" marker-end="url(#ah-n)"/>
+
+        <!-- stage 2 -->
+        <rect class="fbox sm" x="238" y="142" width="168" height="112" rx="5"/>
+        <circle class="stepno sm" cx="260" cy="164" r="12"/>
+        <text class="stepno-t" x="260" y="168">2</text>
+        <text class="f-title" x="256" y="202">Search &amp; select</text>
+        <text class="f-sys sm" x="256" y="222">Segments Manager</text>
+        <text class="f-det" x="256" y="240">Locked first, low vlan</text>
+
+        <path class="f-arrow" d="M410,198 H442" marker-end="url(#ah-n)"/>
+
+        <!-- stage 3: the per-segment loop -->
+        <path class="f-arrow nxt" d="M540,138 C528,96 632,96 620,138" marker-end="url(#ah-nxt)"/>
+        <text class="loop-l" x="580" y="88">for each selected segment</text>
+
+        <rect class="fbox nxt" x="446" y="142" width="222" height="112" rx="5"/>
+        <circle class="stepno nxt" cx="468" cy="164" r="12"/>
+        <text class="stepno-t" x="468" y="168">3</text>
+        <text class="f-title" x="464" y="196">Cancel · convert · start</text>
+        <text class="f-sys nxt" x="464" y="216">Temporal · SM · Temporal</text>
+        <text class="f-det" x="464" y="234">stale run → new type →</text>
+        <text class="f-det" x="464" y="248">detached child run</text>
+
+        <path class="f-arrow" d="M672,198 H704" marker-end="url(#ah-n)"/>
+
+        <!-- stage 4 -->
+        <rect class="fbox nxt" x="708" y="142" width="168" height="112" rx="5"/>
+        <circle class="stepno nxt" cx="730" cy="164" r="12"/>
+        <text class="stepno-t" x="730" y="168">4</text>
+        <text class="f-title" x="726" y="202">Report</text>
+        <text class="f-sys nxt" x="726" y="222">result + shortfall</text>
+        <text class="f-det" x="726" y="240">children run on alone</text>
+
+        <!-- failure strip -->
+        <rect class="failstrip" x="30" y="282" width="1000" height="34" rx="4"/>
+        <text class="fail-t hd" x="46" y="303">IF IT FAILS &#8594;</text>
+        <text class="fail-t" x="152" y="303">completed conversions stand (their child runs proceed); a re-run's search skips them — they no longer match the source type — and picks up the rest.</text>
+      </svg>
+    </div>
+    <div class="diagram-caption">
+      <span class="swatch sm"><i></i>Segments Manager</span>
+      <span class="swatch nxt"><i></i>Temporal itself (stale-run cancel · detached child workflows)</span>
+      <span>All machine ops — the run is bounded and fails loudly; the human approvals live in the children.</span>
+    </div>
+
+    <h3 style="margin:40px 0 10px">The same run, in detail</h3>
+    <p class="lede" style="margin-bottom:24px">Each card carries a <code>phase</code> — read live off a running
+    workflow through a Temporal <b>query</b>. The progress payload also carries the <b>per-segment report so
+    far</b>, so even a run that fails mid-loop shows exactly which segments were already converted.</p>
+
+    <div class="flow">
+
+      <!-- 1 -->
+      <div class="step">
+        <div class="marker">1</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>get_valid_sites</h3>
+            <span class="phase">phase <b>validating-site</b></span>
+          </div>
+          <p>Strict first check: a typo'd site must fail loudly as <code>UnknownSite</code>, not complete as
+          “matched 0 segments, shortfall N”. (Source&nbsp;==&nbsp;destination is rejected even earlier, by the
+          request model — converting a segment to its own type is a no-op.)</p>
+          <div class="calls">
+            <div class="call sm"><span class="verb">GET</span><span class="path">/api/sites <em>· public GET</em></span></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 2 -->
+      <div class="step">
+        <div class="marker">2</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>list_convertible_segments</h3>
+            <span class="phase">phase <b>searching-segments</b></span>
+          </div>
+          <p>Every segment of the source type at the site whose status is <b>Available or Locked</b> — Allocated
+          segments are in use and never appear. Selection is the workflow's deterministic policy over that
+          result: <b>Locked first</b> (not-yet-usable inventory is spent before ready capacity), lowest
+          <code>vlan_id</code> within each group, cut at <code>quantity</code>.</p>
+          <div class="calls">
+            <div class="call sm"><span class="verb">GET</span><span class="path">/api/segments?site=…&amp;type=… <em>· status filtered client-side (the param takes one value)</em></span></div>
+          </div>
+          <p class="note">Fewer matches than requested → convert all of them and report the shortfall.
+          Zero matches → an empty report with <code>shortfall == quantity</code>, still a COMPLETED run.</p>
+        </div>
+      </div>
+
+      <!-- 3a -->
+      <div class="step">
+        <div class="marker">3a</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>Cancel the stale source-type run</h3>
+            <span class="phase">phase <b>converting-segments</b></span>
+          </div>
+          <p>A Locked match usually has a live <code>open-segment-rules-&lt;SRC&gt;-&lt;network&gt;</code> run still
+          polling the OLD type's firewall request ids. Left alive it would fight the replacement run over the
+          request-ids display (replace semantics, keyed by CIDR) — and wrongly <em>unlock</em> the segment when
+          the old approval finally lands. So the workflow requests its cancellation by deterministic id,
+          tolerating not-found (the normal case for Available matches), with the handshake <b>bounded</b> so one
+          slow answer never hangs the conversion.</p>
+          <p class="note">After a delivered cancel, a 30&nbsp;s durable pause lets the dying run's cleanup land
+          before the conversion wipes the same fields. If its failure note still lands late, it is cleared the
+          moment the new child publishes its first request ids — a benign, self-healing race.</p>
+        </div>
+      </div>
+
+      <!-- 3b -->
+      <div class="step">
+        <div class="marker">3b</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>convert_segment_type</h3>
+            <span class="phase">phase <b>converting-segments</b></span>
+          </div>
+          <p>One atomic Segments Manager update: set the new <code>type</code>, set <code>status</code> back to
+          <b>Locked</b>, and clear every <code>segment_connectivity_*</code> field — the pending request ids
+          belong to the old type's requests, and a stale “Workflow failed” note has no other clearing path.
+          Re-locking matters: an Available-looking converted segment could be <em>allocated to a cluster</em>
+          before its new-type firewall rules exist.</p>
+          <div class="calls">
+            <div class="call sm"><span class="verb">PUT</span><span class="path">/api/segments/type <em>· Bearer · { segment, type, expected_type }</em></span></div>
+          </div>
+          <p class="note"><b><code>expected_type</code> is a compare-and-set.</b> Two conversions racing for the
+          same segment (say HC→MCE and HC→PXE at one site) cannot both win: whoever converts first changes the
+          stored type, and the loser's call answers 409 → <code>SegmentConversionConflictError</code>, failing
+          that run loudly instead of silently hijacking the segment.</p>
+        </div>
+      </div>
+
+      <!-- 3c -->
+      <div class="step">
+        <div class="marker">3c</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>Start open-segment-rules, detached</h3>
+            <span class="phase">phase <b>converting-segments</b></span>
+          </div>
+          <p>The replacement run — <code>open-segment-rules-&lt;DEST&gt;-&lt;network&gt;</code> — starts as a
+          <b>detached child workflow</b> (<code>ParentClosePolicy.ABANDON</code>): it survives however this
+          parent ends, because it answers to its own id, its own human approval and its own failure, exactly as
+          if the bulk route had started it. Its <code>create_segment</code> first step accepts the existing
+          (now destination-typed) segment idempotently and proceeds: peers → submit rules → await approval →
+          unlock.</p>
+          <p class="note">If a destination-type run for this segment already exists, that run <em>is</em> the
+          desired outcome — the report marks the item <code>already_running</code> and the loop continues.</p>
+        </div>
+      </div>
+
+      <!-- done -->
+      <div class="step done">
+        <div class="marker">✓</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>Done — the children run on alone</h3>
+            <span class="phase">phase <b>completed</b></span>
+          </div>
+          <p>The result lists every conversion — previous status, whether a stale run was cancelled, the child
+          workflow id to poll — plus <code>matched</code> and <code>shortfall</code>. Poll each child on the same
+          <code>GET /workflows/runs/{workflow_id}</code> endpoint as any other run.</p>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ======================= API ======================= -->
+  <section id="api">
+    <div class="sec-head">
+      <div class="eyebrow">HTTP surface</div>
+      <h2>How you start it and how you watch it</h2>
+      <p class="lede">Served by <code>workflows-orchestrator-api</code> (Swagger at <code>/docs</code>). Starting is
+      always async. There is deliberately <b>no bulk variant</b> — the request is already batch-shaped.</p>
+    </div>
+
+    <div class="api">
+
+      <div class="endpoint">
+        <div class="endpoint-head">
+          <span class="method">POST</span>
+          <span class="path">/workflows/segment-lifecycle/convert-segment</span>
+          <span class="ret">202 · 409 if already running</span>
+        </div>
+        <div class="endpoint-body">
+          <pre><span class="c">// request</span>
+{
+  "site": "site1",
+  "source_type": "HC",
+  "destination_type": "MCE",
+  "quantity": 3
+}
+
+<span class="c">// 202 response</span>
+{ "workflow_id": "convert-segment-site1-HC-to-MCE", "run_id": "…" }</pre>
+          <p class="note"><b>The id carries site and both types.</b> Two identical conversion requests racing
+          would select the same segments, so they dedup onto one id (the second answers <b>409</b>). Conversions
+          differing in either type are legitimately concurrent — the <code>expected_type</code> compare-and-set
+          arbitrates if they grab the same segment.</p>
+        </div>
+      </div>
+
+      <div class="endpoint">
+        <div class="endpoint-head">
+          <span class="method">GET</span>
+          <span class="path">/workflows/runs/{workflow_id}</span>
+          <span class="ret">200 · 404 if unknown id</span>
+        </div>
+        <div class="endpoint-body">
+          <pre><span class="c">// RUNNING</span>
+{ "workflow_id": "convert-segment-site1-HC-to-MCE",
+  "workflow_type": "ConvertSegmentWorkflow", "status": "RUNNING",
+  "progress": { "phase": "converting-segments", "matched": 2, "selected": 2,
+                "converted": [ { "segment": "130.154.20.0/24", "vlan_id": 23,
+                                 "previous_status": "Locked",
+                                 "cancelled_previous_run": true,
+                                 "open_segment_rules_workflow_id": "open-segment-rules-MCE-130.154.20.0",
+                                 "open_rules_status": "started" } ] } }
+
+<span class="c">// COMPLETED — quantity was 3, only 2 matched</span>
+{ …, "status": "COMPLETED",
+  "result": { "site": "site1", "source_type": "HC", "destination_type": "MCE",
+              "requested_quantity": 3, "matched": 2, "shortfall": 1,
+              "converted": [ …two items as above… ] } }</pre>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ======================= FAILURE ======================= -->
+  <section id="failure">
+    <div class="sec-head">
+      <div class="eyebrow">When things go wrong</div>
+      <h2>Outages are out-waited. Real errors stop the run — cleanly.</h2>
+      <p class="lede">Same rule as every workflow here: <b>retries are unbounded</b> (1 s → doubling → capped at
+      1 min), so a Segments Manager outage never fails a run. Retrying stops only for classified errors — and a
+      mid-loop stop always lands on a clean per-segment boundary.</p>
+    </div>
+
+    <div class="grid-2">
+      <div class="panel alarm">
+        <h3>Classified as permanent — these fail the run</h3>
+        <ul>
+          <li><code>UnknownSite</code> — the site isn't in <code>GET /api/sites</code></li>
+          <li><code>SegmentConversionConflictError</code> — the Segments Manager answered 409: the segment became
+              Allocated, or a concurrent conversion re-typed it first (<code>expected_type</code> mismatch)</li>
+          <li><code>SegmentNotFoundError</code> — a selected segment vanished between search and convert</li>
+          <li><code>SegmentsManagerAuthError</code> — bad <code>SEGMENTS_MANAGER_API_TOKEN</code></li>
+        </ul>
+        <p style="font-size:var(--fs-14);color:var(--ink-2)">Source == destination and <code>quantity &lt; 1</code>
+        never reach the workflow — the request model rejects them with a 422.</p>
+      </div>
+      <div class="panel ok">
+        <h3>A failed or cancelled run needs no compensation</h3>
+        <p style="font-size:var(--fs-14);color:var(--ink-2)">Conversions already performed <b>stand</b>: their
+        detached children run on regardless of the parent, and each converted segment is exactly where a freshly
+        created one would be (Locked, awaiting its rules). Nothing pending is half-applied — the per-segment loop
+        is sequential on purpose.</p>
+        <h3 style="margin-top:6px">Re-running is the recovery path</h3>
+        <p style="font-size:var(--fs-14);color:var(--ink-2)">A re-run's search no longer matches the segments that
+        were already converted (their type changed), so it picks up exactly the remainder. If a child run already
+        exists for a segment, the report says <code>already_running</code> and moves on.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================= REFERENCE ======================= -->
+  <section id="reference">
+    <div class="sec-head">
+      <div class="eyebrow">Reference</div>
+      <h2>Inputs and phases</h2>
+    </div>
+
+    <h3 style="margin-bottom:10px">Request body — <code>ConvertSegmentInput</code></h3>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>Field</th><th>Type</th><th>Rules</th><th>What it's for</th></tr></thead>
+        <tbody>
+          <tr><td class="k">site</td><td class="k">str</td><td class="muted">non-empty; must be a configured site</td><td class="muted">Where to look for convertible segments.</td></tr>
+          <tr><td class="k">source_type</td><td class="k">enum</td><td class="muted">MCE · HC · INVENTORY · PXE</td><td class="muted">The type being converted FROM — also the <code>expected_type</code> compare-and-set guard.</td></tr>
+          <tr><td class="k">destination_type</td><td class="k">enum</td><td class="muted">must differ from source_type</td><td class="muted">The type being converted TO — carried into each child's workflow id.</td></tr>
+          <tr><td class="k">quantity</td><td class="k">int</td><td class="muted">≥ 1 — a TARGET, not a requirement</td><td class="muted">How many segments to convert; fewer matches → shortfall in the result.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 style="margin:28px 0 10px">Phases you'll see on the status endpoint</h3>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>phase</th><th>Meaning</th><th>Normal duration</th></tr></thead>
+        <tbody>
+          <tr><td class="k">pending</td><td class="muted">Run accepted</td><td class="muted">instant</td></tr>
+          <tr><td class="k">validating-site</td><td class="muted">Fetching the site list</td><td class="muted">seconds</td></tr>
+          <tr><td class="k">searching-segments</td><td class="muted">Listing + selecting convertible segments</td><td class="muted">seconds</td></tr>
+          <tr><td class="k">converting-segments</td><td class="muted">Per segment: cancel stale run → convert → start child (30 s pause after each delivered cancel)</td><td class="muted">seconds per segment; +30 s per cancelled stale run</td></tr>
+          <tr><td class="k">completed</td><td class="muted">Done; <code>result</code> is available — the children keep running under their own ids</td><td class="muted">—</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note" style="margin-top:10px">No new operator knobs: the workflow reuses the domain's
+    <code>SEGMENTS_MANAGER_URL</code> + token, and everything else is per-request input. Deploy ordering matters
+    once: the Segments Manager release with <code>PUT /api/segments/type</code> must be live <b>before</b> this
+    workflow ships — on an older manager the missing route answers 404, which reads as “segment not found”.</p>
+  </section>
+
+  <footer>
+    <span>workflow_domains/segment_lifecycle/convert_segment.py</span>
+    <span>activities/segment_lifecycle/activities.py</span>
+    <span>shared/workflow_ids.py</span>
+    <span>shared/models/segment_lifecycle.py</span>
+  </footer>
+
+</div>
+</main>
+
+<script src="/assets/nav.js" defer></script>
+</body>
+</html>

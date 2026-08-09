@@ -8,8 +8,9 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
+from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class SegmentType(str, Enum):
@@ -293,3 +294,117 @@ class AllocateSegmentResult(BaseModel):
     commit_sha: str | None
     values_updated: bool
     dhcp_scope_ready: bool
+
+
+# --- convert-segment --------------------------------------------------------
+# The domain's third workflow: rebalance segment inventory between types by
+# re-typing existing Available/Locked segments of a source type at a site and
+# re-running the open-segment-rules flow for each (the new type has different
+# peers, so connectivity must be re-established). Workflow-scoped models carry
+# the workflow name; models a sibling could reuse (the search query/result and
+# the type-update request, which mirror Segments Manager endpoints) do not.
+
+
+class ConvertSegmentInput(BaseModel):
+    """Input to ConvertSegmentWorkflow: what to convert, where, and how many.
+
+    `quantity` is a TARGET, not a requirement: fewer matching segments than
+    requested converts what exists and reports the shortfall in the result —
+    an operator rebalancing inventory wants the partial conversion either way.
+    """
+
+    site: str = Field(min_length=1)
+    source_type: SegmentType
+    destination_type: SegmentType
+    quantity: int = Field(ge=1)
+
+    @model_validator(mode="after")
+    def _distinct_types(self) -> "ConvertSegmentInput":
+        if self.source_type == self.destination_type:
+            raise ValueError(
+                "source_type and destination_type must differ — converting a "
+                "segment to its own type is a no-op"
+            )
+        return self
+
+
+class ConvertSegmentRunArgs(BaseModel):
+    """The workflow's single argument (same single-model rule as
+    OpenSegmentRulesRunArgs — typed conversion is silently skipped when
+    payload count differs from the declared parameter count)."""
+
+    input: ConvertSegmentInput
+
+
+class ConvertibleSegmentsQuery(BaseModel):
+    """Input to list_convertible_segments: which type to look for, and where.
+    Status is NOT a parameter — "convertible" MEANS Available or Locked
+    (Allocated segments are in use and never converted), and that rule
+    belongs to the activity, not to each caller."""
+
+    site: str = Field(min_length=1)
+    type: SegmentType
+
+
+class ConvertibleSegment(BaseModel):
+    """One search hit: everything the workflow needs to pick it, convert it,
+    and hand the open-segment-rules child a full OpenSegmentRulesInput —
+    without a second read-back."""
+
+    segment: str = Field(min_length=1)  # CIDR
+    vlan_id: int = Field(ge=1, le=4094)
+    epg_name: str = Field(min_length=1)
+    status: str = Field(min_length=1)  # "Available" | "Locked"
+    dhcp: bool
+
+
+class SegmentTypeUpdate(BaseModel):
+    """Input to convert_segment_type, mirroring the Segments Manager's
+    PUT /api/segments/type body. `type` is the NEW type; `expected_type` is
+    the compare-and-set guard — the type being converted FROM — so a
+    concurrent conversion that re-typed the segment first turns this call
+    into a refusal instead of a silent hijack."""
+
+    segment: str = Field(min_length=1)
+    type: SegmentType
+    expected_type: SegmentType
+
+
+class ConvertedSegmentReport(BaseModel):
+    """Per-segment outcome of the conversion loop. `open_rules_status` reports
+    the FAN-OUT only (like the bulk route's items): `started` means Temporal
+    accepted the child run, whose own progress/failure lives under its own
+    workflow id."""
+
+    segment: str
+    vlan_id: int
+    previous_status: str
+    cancelled_previous_run: bool
+    open_segment_rules_workflow_id: str
+    open_rules_status: Literal["started", "already_running"]
+
+
+class ConvertSegmentProgress(BaseModel):
+    """Returned by the workflow's `progress` query (surfaced by the status
+    API). Carries the full per-segment report list — not just counts — so a
+    mid-loop failure still shows which segments WERE converted (their child
+    runs exist and proceed regardless)."""
+
+    phase: str
+    matched: int
+    selected: int
+    converted: list[ConvertedSegmentReport]
+
+
+class ConvertSegmentResult(BaseModel):
+    """`shortfall` = how many requested conversions had no matching segment
+    (0 when enough matched); the conversions that did happen are in
+    `converted` either way."""
+
+    site: str
+    source_type: SegmentType
+    destination_type: SegmentType
+    requested_quantity: int
+    matched: int
+    shortfall: int
+    converted: list[ConvertedSegmentReport]

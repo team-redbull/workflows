@@ -39,8 +39,8 @@
         },
         {
           name: "convert-segment",
-          href: null,
-          blurb: "change a segment's type in place"
+          href: "/segment-lifecycle/convert-segment.html",
+          blurb: "re-type segments + reopen their rules"
         }
       ]
     }

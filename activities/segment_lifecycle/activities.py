@@ -40,6 +40,7 @@ from shared.exceptions import (
     DhcpApiError,
     NextApiError,
     SegmentConflictError,
+    SegmentConversionConflictError,
     SegmentPoolExhaustedError,
     SegmentsManagerAuthError,
     SegmentsManagerError,
@@ -50,6 +51,8 @@ from shared.models.segment_lifecycle import (
     BmcOpenRulesRequest,
     ClusterFileLocation,
     ClusterValuesAppendRequest,
+    ConvertibleSegment,
+    ConvertibleSegmentsQuery,
     DhcpScopeState,
     SegmentConnectivityFailureNotice,
     OpenSegmentRulesInput,
@@ -58,6 +61,7 @@ from shared.models.segment_lifecycle import (
     SegmentAllocationRequest,
     SegmentConnectivityRequestsUpdate,
     SegmentEntry,
+    SegmentTypeUpdate,
     OpenRulesRequest,
     PeerSegmentsQuery,
     SegmentRef,
@@ -806,3 +810,90 @@ async def publish_segment_connectivity_failure(notice: SegmentConnectivityFailur
         notice.segment,
         notice.message,
     )
+
+
+# --- convert-segment --------------------------------------------------------
+
+# The statuses a segment may be converted from. Allocated is excluded by
+# definition (in use by a cluster), and the Segments Manager enforces the same
+# rule server-side — this filter just keeps in-use segments out of the
+# workflow's selection instead of failing on them later.
+_CONVERTIBLE_STATUSES = frozenset({"Available", "Locked"})
+
+
+@activity.defn
+async def list_convertible_segments(
+    query: ConvertibleSegmentsQuery,
+) -> list[ConvertibleSegment]:
+    """Every Available/Locked segment of the given type at the site (public GET).
+
+    site+type filter server-side; status client-side — the manager's status
+    query param takes a single value, and "Available or Locked" is two.
+    """
+    async with _segments_manager_client() as client:
+        resp = await client.get(
+            "/api/segments",
+            params={"site": query.site, "type": query.type.value},
+        )
+        if resp.status_code != 200:
+            _raise_segments_manager_error(
+                f"List {query.type.value} segments at {query.site}", resp
+            )
+    hits: list[ConvertibleSegment] = []
+    for seg in resp.json():
+        if seg.get("status") not in _CONVERTIBLE_STATUSES:
+            continue
+        try:
+            hits.append(ConvertibleSegment.model_validate(seg))
+        except ValueError as exc:
+            raise SegmentsManagerError(
+                f"Malformed segment entry from GET /api/segments: {seg}: {exc}"
+            ) from exc
+    activity.logger.info(
+        "Found %d convertible %s segment(s) at site=%s",
+        len(hits),
+        query.type.value,
+        query.site,
+    )
+    return hits
+
+
+@activity.defn
+async def convert_segment_type(update: SegmentTypeUpdate) -> None:
+    """Convert the segment's type in the Segments Manager (PUT /api/segments/type).
+
+    The manager applies the whole conversion atomically: new type, status back
+    to Locked, and every segment_connectivity_* field cleared. Idempotent
+    server-side (a retry finds the type already set and converges); a 409 —
+    Allocated segment, or the expected_type compare-and-set lost to a
+    concurrent conversion — is deterministic and non-retryable.
+    """
+    async with _segments_manager_client() as client:
+        resp = await client.put(
+            "/api/segments/type",
+            json={
+                "segment": update.segment,
+                "type": update.type.value,
+                "expected_type": update.expected_type.value,
+            },
+            headers=_segments_manager_auth(),
+        )
+        if resp.status_code == 200:
+            activity.logger.info(
+                "Converted segment %s: type %s -> %s (%s)",
+                update.segment,
+                update.expected_type.value,
+                update.type.value,
+                _segments_manager_detail(resp),
+            )
+            return
+        if resp.status_code == 404:
+            raise SegmentNotFoundError(
+                f"Segment {update.segment} not found in the Segments Manager"
+            )
+        if resp.status_code == 409:
+            raise SegmentConversionConflictError(
+                f"Segments Manager refused to convert {update.segment} to "
+                f"{update.type.value}: {_segments_manager_detail(resp)}"
+            )
+        _raise_segments_manager_error("Convert segment type", resp)

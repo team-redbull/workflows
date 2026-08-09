@@ -18,9 +18,11 @@ from activities.segment_lifecycle.activities import (
     _expand_ports,
     _peer_types,
     check_next_requests,
+    convert_segment_type,
     create_segment,
     get_bmc_segment,
     get_next_checking_request_interval,
+    list_convertible_segments,
     list_peer_segments,
     publish_segment_connectivity_failure,
     publish_request_ids,
@@ -32,6 +34,7 @@ from shared.exceptions import (
     BmcSegmentNotConfiguredError,
     NextApiError,
     SegmentConflictError,
+    SegmentConversionConflictError,
     SegmentNotFoundError,
     SegmentsManagerAuthError,
     SegmentsManagerError,
@@ -39,9 +42,11 @@ from shared.exceptions import (
 )
 from shared.models.segment_lifecycle import (
     BmcOpenRulesRequest,
+    ConvertibleSegmentsQuery,
     SegmentConnectivityFailureNotice,
     OpenSegmentRulesInput,
     SegmentConnectivityRequestsUpdate,
+    SegmentTypeUpdate,
     OpenRulesRequest,
     PeerSegmentsQuery,
     SegmentRef,
@@ -498,3 +503,131 @@ async def test_publish_connectivity_failure_missing_note_endpoint_still_clears(e
             SegmentConnectivityFailureNotice(segment="10.0.0.0/24", message="boom"),
         )
     assert clear.called
+
+
+# --- convert-segment: list_convertible_segments / convert_segment_type ---
+
+
+def _stored(segment: str, vlan_id: int, status: str, dhcp: bool = True) -> dict:
+    return {
+        "segment": segment,
+        "type": "HC",
+        "site": "site-a",
+        "vlan_id": vlan_id,
+        "epg_name": f"EPG_HC_{vlan_id}",
+        "dhcp": dhcp,
+        "status": status,
+        "cluster_name": None,
+        "segment_connectivity_requests": None,
+    }
+
+
+@respx.mock
+async def test_list_convertible_segments_filters_status_client_side(env):
+    """The server filters site+type; Allocated hits must be dropped HERE —
+    the manager's status param takes one value and we need two."""
+    route = respx.get(
+        f"{SM}/api/segments", params={"site": "site-a", "type": "HC"}
+    ).mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                _stored("10.0.10.0/24", 10, "Available"),
+                _stored("10.0.20.0/24", 20, "Allocated"),
+                _stored("10.0.30.0/24", 30, "Locked", dhcp=False),
+            ],
+        )
+    )
+    hits = await env.run(
+        list_convertible_segments,
+        ConvertibleSegmentsQuery(site="site-a", type=SegmentType.HC),
+    )
+    assert route.called
+    assert [(h.segment, h.status, h.dhcp) for h in hits] == [
+        ("10.0.10.0/24", "Available", True),
+        ("10.0.30.0/24", "Locked", False),
+    ]
+
+
+@respx.mock
+async def test_list_convertible_segments_malformed_entry_is_retryable(env):
+    respx.get(f"{SM}/api/segments").mock(
+        return_value=httpx.Response(200, json=[{"status": "Available"}])
+    )
+    with pytest.raises(SegmentsManagerError):
+        await env.run(
+            list_convertible_segments,
+            ConvertibleSegmentsQuery(site="site-a", type=SegmentType.HC),
+        )
+
+
+@respx.mock
+async def test_convert_segment_type_puts_new_and_expected_type(env):
+    route = respx.put(f"{SM}/api/segments/type").mock(
+        return_value=httpx.Response(200, json={"message": "Segment type updated"})
+    )
+    await env.run(
+        convert_segment_type,
+        SegmentTypeUpdate(
+            segment="10.0.30.0/24",
+            type=SegmentType.MCE,
+            expected_type=SegmentType.HC,
+        ),
+    )
+    import json
+
+    body = json.loads(route.calls.last.request.content)
+    assert body == {
+        "segment": "10.0.30.0/24",
+        "type": "MCE",
+        "expected_type": "HC",
+    }
+    assert route.calls.last.request.headers["Authorization"] == "Bearer test-token"
+
+
+@respx.mock
+async def test_convert_segment_type_conflict_is_classified(env):
+    respx.put(f"{SM}/api/segments/type").mock(
+        return_value=httpx.Response(
+            409, json={"detail": "Cannot convert allocated segment"}
+        )
+    )
+    with pytest.raises(SegmentConversionConflictError) as exc_info:
+        await env.run(
+            convert_segment_type,
+            SegmentTypeUpdate(
+                segment="10.0.30.0/24",
+                type=SegmentType.MCE,
+                expected_type=SegmentType.HC,
+            ),
+        )
+    # The manager's own wording is what the operator has to act on.
+    assert "Cannot convert allocated segment" in str(exc_info.value)
+
+
+@respx.mock
+async def test_convert_segment_type_404_is_not_found(env):
+    respx.put(f"{SM}/api/segments/type").mock(return_value=httpx.Response(404))
+    with pytest.raises(SegmentNotFoundError):
+        await env.run(
+            convert_segment_type,
+            SegmentTypeUpdate(
+                segment="10.0.30.0/24",
+                type=SegmentType.MCE,
+                expected_type=SegmentType.HC,
+            ),
+        )
+
+
+@respx.mock
+async def test_convert_segment_type_forbidden_is_auth_error(env):
+    respx.put(f"{SM}/api/segments/type").mock(return_value=httpx.Response(403))
+    with pytest.raises(SegmentsManagerAuthError):
+        await env.run(
+            convert_segment_type,
+            SegmentTypeUpdate(
+                segment="10.0.30.0/24",
+                type=SegmentType.MCE,
+                expected_type=SegmentType.HC,
+            ),
+        )

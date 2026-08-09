@@ -13,6 +13,8 @@ from shared.models.segment_lifecycle import (
     BmcOpenRulesRequest,
     ClusterFileLocation,
     ClusterValuesAppendRequest,
+    ConvertibleSegment,
+    ConvertibleSegmentsQuery,
     DhcpScopeState,
     SegmentConnectivityFailureNotice,
     OpenSegmentRulesInput,
@@ -21,6 +23,7 @@ from shared.models.segment_lifecycle import (
     SegmentAllocationRequest,
     SegmentConnectivityRequestsUpdate,
     SegmentEntry,
+    SegmentTypeUpdate,
     OpenRulesRequest,
     PeerSegmentsQuery,
     SegmentRef,
@@ -215,5 +218,41 @@ async def get_dhcp_scope(network: str) -> DhcpScopeState:
     loop owns the waiting. Only a failing/malformed API raises DhcpApiError
     (transient, retried). This activity never writes: git is the single source
     of truth and Crossplane the only writer, we merely observe convergence.
+    """
+    ...
+
+
+# --- convert-segment --------------------------------------------------------
+
+
+@activity.defn
+async def list_convertible_segments(
+    query: ConvertibleSegmentsQuery,
+) -> list[ConvertibleSegment]:
+    """Return every segment of the given type at the site that MAY be
+    converted: status Available or Locked only (GET /api/segments filtered by
+    site+type server-side, status client-side — the manager's status filter
+    takes one value per call). Allocated segments are in use and never appear.
+
+    Read-only and unordered by policy: WHICH hits to convert (Locked first,
+    lowest vlan) is the workflow's decision, made deterministically from this
+    recorded result.
+    """
+    ...
+
+
+@activity.defn
+async def convert_segment_type(update: SegmentTypeUpdate) -> None:
+    """Convert the segment to update.type in the Segments Manager
+    (PUT /api/segments/type). The manager re-locks the segment and clears the
+    old type's segment-connectivity fields (pending request ids + any stale
+    failure note) in the same atomic update — the converted segment is reset
+    to born-Locked, ready for its open-segment-rules re-run.
+
+    Idempotent server-side: a retried call finds the type already set and
+    converges (an Allocated segment is never re-locked by a stale repeat).
+    Raises SegmentConversionConflictError on 409 — the segment is Allocated,
+    or expected_type no longer matches (a concurrent conversion won) — and
+    SegmentNotFoundError on 404; both deterministic, non-retryable.
     """
     ...

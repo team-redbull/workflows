@@ -80,8 +80,8 @@ tags cross-repo.
   cluster collide. The domain currently holds THREE workflows (`open-segment-rules`,
   `allocate-segment`, `convert-segment`), each on its own workflow queue, sharing the one limb
   deployment. Id builders live in `shared/workflow_ids.py` — ONE definition per scheme, importable
-  from both routers and workflow code (convert-segment builds open-segment-rules ids to cancel stale
-  runs and start replacements; a workflow file can never import a router, FastAPI ≠ sandbox-safe).
+  from both routers and workflow code (convert-segment builds open-segment-rules ids to start its
+  replacement runs; a workflow file can never import a router, FastAPI ≠ sandbox-safe).
 - **API paths are `/workflows/<domain>/<workflow>`; status is `/workflows/runs/{workflow_id}`.** A
   domain is a prefix, never an endpoint: the bare `/workflows/<domain>` must stay free, or the first
   workflow silently claims the whole domain. Status is domain-agnostic ON PURPOSE — workflow ids are
@@ -187,22 +187,21 @@ tags cross-repo.
 - **Cross-workflow orchestration (convert-segment is the precedent):** a workflow that spawns sibling
   runs starts them as DETACHED child workflows — `workflow.start_child_workflow(...,
   parent_close_policy=ParentClosePolicy.ABANDON)` on the sibling's workflow queue, catching
-  `WorkflowAlreadyStartedError` as an `already_running` report item — never waits on them (each child
-  answers to its own id/approval/failure, the /bulk philosophy), and cancels a stale sibling via
-  `workflow.get_external_workflow_handle(id).cancel()` wrapped in BOTH a tolerant try/except
-  (not-found is normal) AND a bounded `asyncio.wait_for` (maps to a durable timer): the Java
-  time-skipping TEST server never resolves a cancel for a nonexistent workflow — an unbounded await
-  there skips time to the execution timeout and kills the run; the real server answers not-found
-  immediately. Tests of such a workflow run it with `UnsandboxedWorkflowRunner` when they patch its
-  module constants — the sandbox re-imports the module per run and silently discards monkeypatches.
-- **A cancel result NEVER means "a run was live" — gate on your own state instead.** Temporal ACCEPTS
-  a cancel against an already-CLOSED execution and reports it accepted; it fails only for an id that
-  has NEVER existed. So `cancel()` cannot distinguish "killed a running sibling" from "no-op'd
-  against one that finished days ago", and the answer additionally FLIPS once the closed run ages
-  out of retention. convert-segment therefore only cancels when the segment is `Locked` — an
-  `Available` one was unlocked BY its run completing, so no live run can exist. Deriving the
-  precondition from domain state, not from the cancel's outcome, is the rule; without it the run
-  reported a phantom cancellation and paid its post-cancel grace pause on nearly every segment.
+  `WorkflowAlreadyStartedError` as an `already_running` report item — and never waits on them (each
+  child answers to its own id/approval/failure, the /bulk philosophy).
+- **NEVER cancel a sibling to make room for your own work — choose inputs that cannot have one.**
+  A cancel result cannot tell you whether anything was running: Temporal ACCEPTS a cancel against an
+  already-CLOSED execution and reports it accepted, failing only for an id that has NEVER existed. So
+  `cancel()` cannot distinguish "killed a live sibling" from "no-op'd against one that finished days
+  ago", and the answer FLIPS once the closed run ages out of retention. convert-segment used to
+  cancel the stale `open-segment-rules-<SRC>-<network>` run before re-typing a segment; it now selects
+  `Available` segments ONLY, whose own run has by definition COMPLETED (that completion is what
+  unlocked them), so no cancel, no post-cancel grace pause and no stale-cleanup race exist at all.
+  Narrowing the input to eliminate the interaction beat every attempt to detect it — the version that
+  cancelled unconditionally reported a phantom cancellation and paid a 30 s pause on nearly every
+  segment; the version that gated the cancel on status was correct but kept the machinery. The cost
+  is explicit and accepted: a Locked segment cannot be re-typed by this workflow, including one whose
+  run failed terminally.
 
 ## 6. Idempotency (required for all activities)
 

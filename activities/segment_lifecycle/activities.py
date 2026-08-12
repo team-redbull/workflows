@@ -722,13 +722,13 @@ async def append_allocation_to_cluster_values(
 
 
 def _dhcp_api_client() -> httpx.AsyncClient:
-    """A fresh, per-invocation client for the DHCP scope API (read-only)."""
-    headers = {}
-    if _settings.dhcp_api_token:
-        headers["Authorization"] = f"Bearer {_settings.dhcp_api_token}"
-    return httpx.AsyncClient(
-        base_url=_settings.dhcp_api_url, timeout=_HTTP_TIMEOUT, headers=headers
-    )
+    """A fresh, per-invocation client for the DHCP scope API (read-only).
+
+    No Authorization header: that API leaves its scope GETs anonymous so this poll
+    needs no credential of its own. Anything that has to WRITE there still needs a
+    token — Crossplane does, and holds one per cluster.
+    """
+    return httpx.AsyncClient(base_url=_settings.dhcp_api_url, timeout=_HTTP_TIMEOUT)
 
 
 @activity.defn

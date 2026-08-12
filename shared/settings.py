@@ -152,10 +152,13 @@ class SegmentLifecycleActivitySettings(BaseSettings):
     dhcp_exclusion_octet_ranges: list[tuple[int, int]]
     # The DHCP scope API (read-only here: the workflow only ever GETs a scope
     # to observe Crossplane's convergence — it never creates one itself).
+    #
+    # No token setting: that API leaves its scope GETs unauthenticated precisely
+    # so this poll needs no credential. Secrets are namespace-scoped and envFrom
+    # resolves per-pod, so authenticating here meant a copy of the API's token
+    # living in redbull-workflows that had to rotate in step with the original.
+    # Writes there are still authenticated — this worker just never makes one.
     dhcp_api_url: str
-    # Empty means the DHCP API is deployed without a token (its auth is a
-    # no-op then) — the Authorization header is attached only when set.
-    dhcp_api_token: str = ""
 
     @field_validator(
         "ports_hc_to_mce",

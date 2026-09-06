@@ -114,18 +114,19 @@ jobs:
     with:
       image-name: workflows
       dockerfile: workflow_domains/Dockerfile
-      # Chart lives in its own repo now (Argo CD). The bump + tag land there.
-      # Repo name follows the Argo service name (workflows-orchestrator), not
-      # this repo's name — the ApplicationSet derives it as helm-charts-<service>.
-      chart-repo: team-redbull/helm-charts-workflows-orchestrator
-      helm-values-path: values.yaml
+      # Chart lives in the redbull-platform repo now (Argo CD). The bump + tag land
+      # there. The chart DIRECTORY follows the Argo service name
+      # (workflows-orchestrator), not this repo's name.
+      chart-repo: team-redbull/redbull-platform
+      helm-values-path: gitops/charts/workflows-orchestrator/values.yaml
       helm-image-path: image
     secrets: inherit
 
   build-segment-lifecycle-worker:
-    # Kept sequential after the brain only to avoid two jobs pushing the mock/code
-    # repo at once; the two Argo charts bump SEPARATE helm-charts repos so they no
-    # longer race on a shared tag.
+    # Kept sequential after the brain: both now push to the same redbull-platform
+    # branch, so running them in parallel makes them race on that push. (Their VERSION
+    # sequences no longer collide — tags there are namespaced per chart directory — but
+    # the branch is still one branch.)
     #
     # The two status guards are what let the chain SURVIVE a skip: a job whose
     # `needs` was skipped is itself skipped by default, so without a status
@@ -138,16 +139,17 @@ jobs:
     with:
       image-name: segment-lifecycle-worker
       dockerfile: activities/segment_lifecycle/Dockerfile
-      chart-repo: team-redbull/helm-charts-segment-lifecycle-worker
-      helm-values-path: values.yaml
+      chart-repo: team-redbull/redbull-platform
+      helm-values-path: gitops/charts/segment-lifecycle-worker/values.yaml
       helm-image-path: activityWorker.image
     secrets: inherit
 
   build-mock-segment-connectivity:
-    # Sequential, not parallel: all three calls bump the same shared vX.Y.Z git
-    # tag and commit+push to the same branch; running in parallel races. That is
-    # still true of any two that DO run together, so the chain stays — the
-    # filters just make it common for only one link to be live.
+    # Sequential, not parallel: every call in this chain commits and pushes to a shared
+    # branch (this repo's, for the mock; redbull-platform's, for the three Argo charts),
+    # so running them in parallel races. The filters just make it common for only one
+    # link to be live. This one is the odd one out: its chart is still vendored HERE, so
+    # it bumps this repo and consumes this repo's bare vX.Y.Z tag sequence.
     needs: [changes, build-segment-lifecycle-worker]
     if: ${{ !cancelled() && !failure() && needs.changes.outputs.mock == 'true' }}
     uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
@@ -159,8 +161,7 @@ jobs:
     secrets: inherit
 
   build-workflows-docs:
-    # Same sequential chain as the others: every one of these calls bumps the
-    # same shared vX.Y.Z git tag in this repo, so they cannot run in parallel.
+    # Same sequential chain as the others — see build-mock-segment-connectivity for why.
     # Last in the chain, so it is the job that most needed the skip guards —
     # a docs-only push skips all three ahead of it.
     needs: [changes, build-mock-segment-connectivity]
@@ -172,8 +173,8 @@ jobs:
       # readable when the orchestrator itself is down or being redeployed.
       image-name: workflows-docs
       dockerfile: docs/Dockerfile
-      chart-repo: team-redbull/helm-charts-workflows-docs
-      helm-values-path: values.yaml
+      chart-repo: team-redbull/redbull-platform
+      helm-values-path: gitops/charts/workflows-docs/values.yaml
       helm-image-path: image
     secrets: inherit
 

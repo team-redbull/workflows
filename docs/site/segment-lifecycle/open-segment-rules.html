@@ -109,7 +109,7 @@
         <text class="stepno-t" x="468" y="168">3</text>
         <text class="f-title" x="464" y="202">Submit rules</text>
         <text class="f-sys nxt" x="464" y="222">NEXT</text>
-        <text class="f-det" x="464" y="240">2 per peer, +4 BMC</text>
+        <text class="f-det" x="464" y="240">2 per peer, +2 per BMC vendor</text>
 
         <path class="f-arrow" d="M618,198 H650" marker-end="url(#ah-n)"/>
 
@@ -235,15 +235,17 @@
           <div class="card-title">
             <h3>get_bmc_segments <span class="chip cfg" style="vertical-align:middle">MCE only</span></h3>
           </div>
-          <p>MCE segments also need rules to their site's BMC networks — <b>two of them</b>: server out-of-band
-          management sits on a different /16 for Dell and for Cisco hardware, and nothing at segment level says which
-          vendor sits under a given MCE, so both are opened. BMC isn't tracked by the Segments Manager, so this is a
-          pure config lookup from the shared <code>SITE_NETWORKS</code> topology. Both CIDRs come back from
-          <em>one</em> call, resolved <em>before</em> any submission — a site missing either vendor fails cleanly
-          instead of leaving an MCE reaching one vendor's BMCs and not the other's.</p>
+          <p>MCE segments also need rules to their site's BMC networks — <b>one per server hardware vendor the
+          site hosts</b>: out-of-band management sits on a different /16 for Dell and for Cisco hardware, and nothing
+          at segment level says which vendor sits under a given MCE, so every configured one is opened. A site may
+          host both vendors or only one. BMC isn't tracked by the Segments Manager, so this is a pure config lookup
+          from the shared <code>SITE_NETWORKS</code> topology. Every CIDR comes back from <em>one</em> call, resolved
+          <em>before</em> any submission, so the site's whole BMC surface is known up front. A site with <em>no</em>
+          BMC entry at all fails cleanly here; a site with neither vendor key, or a misspelt one, never gets that
+          far — it crash-loops the activity worker at startup.</p>
           <div class="calls">
-            <div class="call cfg"><span class="verb">CONFIG</span><span class="path">SITE_NETWORKS[&lt;site&gt;].dell-bmc <em>· missing → BmcSegmentNotConfiguredError</em></span></div>
-            <div class="call cfg"><span class="verb">CONFIG</span><span class="path">SITE_NETWORKS[&lt;site&gt;].cisco-bmc <em>· missing → BmcSegmentNotConfiguredError</em></span></div>
+            <div class="call cfg"><span class="verb">CONFIG</span><span class="path">SITE_NETWORKS[&lt;site&gt;].dell-bmc <em>· and/or ↓</em></span></div>
+            <div class="call cfg"><span class="verb">CONFIG</span><span class="path">SITE_NETWORKS[&lt;site&gt;].cisco-bmc <em>· site absent → BmcSegmentNotConfiguredError</em></span></div>
           </div>
         </div>
       </div>
@@ -256,7 +258,7 @@
             <h3>submit_open_rules × N</h3>
             <span class="phase">phase <b>submitting-rules</b></span>
           </div>
-          <p><b>Two requests per peer</b> — one in each direction — plus <b>four</b> <code>MCE ↔ BMC</code> requests (Dell and Cisco, each way) if the segment is MCE.
+          <p><b>Two requests per peer</b> — one in each direction — plus <b>two per BMC vendor the site hosts</b> (<code>MCE ↔ BMC</code>, each way) if the segment is MCE: four at a Dell-and-Cisco site, two at a single-vendor one.
           All submitted in parallel. Each submission renews a token to NEXT first, then posts the rule with the port profile
           for that direction. NEXT answers with a request id.</p>
           <div class="calls">
@@ -333,13 +335,13 @@
       <div class="eyebrow">Who connects to whom</div>
       <h2>Peering matrix — one cell = one open-rules request</h2>
       <p class="lede">Read a row as the source. Every ✓ is a separate submission to NEXT with its own request id and its own approval;
-      the BMC cells are <code>×2</code> because the site has one BMC network per hardware vendor.
+      the BMC cells are <code>per vendor</code> because the site has one BMC network per hardware vendor it hosts — both, or just one.
       The matrix is not written in code — for the tracked types it is exactly the set of <code>PORTS_*</code> keys present in the
       ConfigMap, and BMC is the one row and column that comes from <code>SITE_NETWORKS</code> instead.</p>
     </div>
     <div class="diagram topology">
       <svg viewBox="0 0 660 380" role="img"
-           aria-label="Topology diagram: MCE sits at the centre and peers bidirectionally with HC, INVENTORY and PXE segments on the same site, two open-rules requests each. MCE additionally peers bidirectionally with the site's two static BMC networks, one for Dell hardware and one for Cisco, two requests each.">
+           aria-label="Topology diagram: MCE sits at the centre and peers bidirectionally with HC, INVENTORY and PXE segments on the same site, two open-rules requests each. MCE additionally peers bidirectionally with each of the site's static BMC networks — one for Dell hardware and one for Cisco, whichever the site hosts — two requests each.">
         <defs>
           <marker id="ah-e2" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0.5 L8,4 L0,7.5 Z"/></marker>
           <marker id="ah-e1" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0.5 L8,4 L0,7.5 Z"/></marker>
@@ -374,8 +376,8 @@
         <text class="node-s" x="575" y="72">same site only</text>
 
         <rect class="node-box bmc"  x="510" y="294" width="130" height="52" rx="4"/>
-        <text class="node-t" x="575" y="316">BMC × 2</text>
-        <text class="node-s" x="575" y="332">dell-bmc · cisco-bmc</text>
+        <text class="node-t" x="575" y="316">BMC per vendor</text>
+        <text class="node-s" x="575" y="332">dell-bmc and/or cisco-bmc</text>
 
         <rect class="node-box mce"  x="265" y="164" width="130" height="52" rx="4"/>
         <text class="node-t" x="330" y="186">MCE</text>
@@ -392,7 +394,7 @@
         <thead>
           <tr>
             <th>from ↓ &nbsp; to →</th>
-            <th>MCE</th><th>HC</th><th>INVENTORY</th><th>PXE</th><th>BMC <span style="text-transform:none;letter-spacing:0">(static, ×2)</span></th>
+            <th>MCE</th><th>HC</th><th>INVENTORY</th><th>PXE</th><th>BMC <span style="text-transform:none;letter-spacing:0">(static, per vendor)</span></th>
           </tr>
         </thead>
         <tbody>
@@ -400,7 +402,7 @@
             <th>MCE</th>
             <td class="self">—</td>
             <td class="yes">✓</td><td class="yes">✓</td><td class="yes">✓</td>
-            <td class="oneway">✓ ×2 <span style="text-transform:none;letter-spacing:0">(per vendor)</span></td>
+            <td class="oneway">✓ <span style="text-transform:none;letter-spacing:0">(per vendor hosted)</span></td>
           </tr>
           <tr>
             <th>HC</th>
@@ -416,7 +418,7 @@
           </tr>
           <tr>
             <th>BMC <span style="text-transform:none;letter-spacing:0">(static)</span></th>
-            <td class="oneway">✓ ×2 <span style="text-transform:none;letter-spacing:0">(per vendor)</span></td>
+            <td class="oneway">✓ <span style="text-transform:none;letter-spacing:0">(per vendor hosted)</span></td>
             <td class="no">·</td><td class="no">·</td><td class="no">·</td><td class="self">—</td>
           </tr>
         </tbody>
@@ -434,8 +436,8 @@
       </div>
       <div class="panel">
         <h3>How many requests will a run make?</h3>
-        <p style="font-size:var(--fs-14);color:var(--ink-2)"><span class="mono">2 × (same-site peers found)</span>, plus <span class="mono">4</span> if the segment is MCE (the Dell and Cisco BMC rules, each way).
-        A new HC segment on a site with 3 MCE segments submits 6 requests; a new MCE segment on a site with 2 HC + 1 PXE submits 10.</p>
+        <p style="font-size:var(--fs-14);color:var(--ink-2)"><span class="mono">2 × (same-site peers found)</span>, plus <span class="mono">2 × (BMC vendors the site hosts)</span> if the segment is MCE (each vendor's rules, each way).
+        A new HC segment on a site with 3 MCE segments submits 6 requests; a new MCE segment on a site with 2 HC + 1 PXE submits 10 where the site hosts both vendors, 8 where it hosts one.</p>
       </div>
     </div>
   </section>
@@ -588,7 +590,7 @@
         <tbody>
           <tr><td class="k">segment</td><td class="k">str</td><td class="muted">non-empty, CIDR</td><td class="muted">The network, e.g. <code>130.154.20.0/24</code>. Also the identity used everywhere downstream.</td></tr>
           <tr><td class="k">type</td><td class="k">enum</td><td class="muted">MCE · HC · INVENTORY · PXE</td><td class="muted">Decides which peers are discovered and which port profiles apply.</td></tr>
-          <tr><td class="k">site</td><td class="k">str</td><td class="muted">non-empty</td><td class="muted">Peering is strictly same-site. Also selects the two BMC networks for MCE.</td></tr>
+          <tr><td class="k">site</td><td class="k">str</td><td class="muted">non-empty</td><td class="muted">Peering is strictly same-site. Also selects the site's BMC networks for MCE.</td></tr>
           <tr><td class="k">vlan_id</td><td class="k">int</td><td class="muted nums">1–4094</td><td class="muted">Passed straight through to the Segments Manager.</td></tr>
           <tr><td class="k">epg_name</td><td class="k">str</td><td class="muted">non-empty</td><td class="muted">Passed straight through to the Segments Manager.</td></tr>
           <tr><td class="k">dhcp</td><td class="k">bool</td><td class="muted">default <code>true</code></td><td class="muted">Editable later, so it's ignored when matching an already-existing segment.</td></tr>
@@ -605,7 +607,7 @@
         <tbody>
           <tr><td class="k">pending</td><td class="muted">Run accepted, type not yet checked</td><td class="muted">instant</td></tr>
           <tr><td class="k">creating-segment</td><td class="muted">Creating the segment in the Segments Manager</td><td class="muted">seconds</td></tr>
-          <tr><td class="k">listing-peer-segments</td><td class="muted">Discovering same-site peers (+ both BMC networks for MCE)</td><td class="muted">seconds</td></tr>
+          <tr><td class="k">listing-peer-segments</td><td class="muted">Discovering same-site peers (+ the site's BMC networks for MCE)</td><td class="muted">seconds</td></tr>
           <tr><td class="k">submitting-rules</td><td class="muted">Posting open-rules requests to NEXT in parallel</td><td class="muted">seconds</td></tr>
           <tr><td class="k">awaiting-completion</td><td class="muted">Polling NEXT — <b>waiting on a human</b></td><td class="muted">minutes → hours+</td></tr>
           <tr><td class="k">unlocking-segment</td><td class="muted">Flipping Locked → Available</td><td class="muted">seconds</td></tr>

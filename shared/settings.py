@@ -33,8 +33,9 @@ from __future__ import annotations
 
 import ipaddress
 import re
+from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # "9000" or "30000-32767"
@@ -54,32 +55,81 @@ class SiteNetworks(BaseModel):
     segments must fall inside) and this service must never depend on it, nor
     break when another consumer adds a sub-key.
 
-    A site has TWO BMC networks, one per server hardware vendor — out-of-band
-    management sits on a different /16 for Dell and for Cisco hardware — and an
-    MCE segment opens rules to BOTH (see BmcVendor). The keys are hyphenated
-    (`dell-bmc`, `cisco-bmc`) because they are operator-facing config, matching
-    the Helm values verbatim; the aliases below map them onto valid Python
-    field names, and populate_by_name keeps construction by field name (tests,
-    call sites) working.
+    Out-of-band management sits on a different /16 per server hardware vendor,
+    so a site has ONE BMC network per vendor it actually has hardware from —
+    both, or only Dell, or only Cisco (see BmcVendor). An MCE segment opens
+    rules to whichever are configured. The keys are hyphenated (`dell-bmc`,
+    `cisco-bmc`) because they are operator-facing config, matching the Helm
+    values verbatim; the aliases below map them onto valid Python field names,
+    and populate_by_name keeps construction by field name (tests, call sites)
+    working.
 
-    Both are required rather than optional on purpose — a typo ("dell-bcm")
-    then crash-loops the worker at startup instead of failing a workflow hours
-    in, and half-configured BMC connectivity is worse than none.
+    AT LEAST ONE is required. A site with neither is a config gap, not a
+    single-vendor site — an MCE there would open no BMC rules at all and look
+    healthy — so it crash-loops the worker at startup instead of failing a
+    workflow hours in. Which vendors a site has is real topology; having none
+    of them is not.
+
+    That relaxation costs the typo guard the both-required shape used to give
+    for free (`dell-bcm` next to a valid `cisco-bmc` would now read as a
+    legitimately Cisco-only site), so _reject_bmc_typos puts it back: an
+    unrecognised key that LOOKS like a BMC key is rejected, while `pool` and
+    any future consumer's sub-keys stay ignored.
     """
 
     model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
-    dell_bmc: str = Field(alias="dell-bmc")
-    cisco_bmc: str = Field(alias="cisco-bmc")
+    dell_bmc: str | None = Field(default=None, alias="dell-bmc")
+    cisco_bmc: str | None = Field(default=None, alias="cisco-bmc")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_bmc_typos(cls, data: Any) -> Any:
+        """Reject an unknown sub-key that looks like a misspelt BMC key.
+
+        extra="ignore" is load-bearing (`pool` is the Segments Manager's, and
+        another consumer may add its own), so this cannot be a blanket
+        extra="forbid": only keys carrying a BMC/vendor token are judged. It
+        catches `dell-bcm`, `dellbmc`, `cisco_bmc` and the pre-vendor-split
+        `bmc` — each of which would otherwise be silently dropped and read as
+        a single-vendor (or unconfigured) site.
+        """
+        if not isinstance(data, dict):
+            return data
+        # The field names are known too: populate_by_name accepts them, so
+        # rejecting them here would break a construction path the model
+        # otherwise supports (tests, call sites).
+        known = {"dell-bmc", "cisco-bmc", "dell_bmc", "cisco_bmc"}
+        for key in data:
+            if not isinstance(key, str) or key in known:
+                continue
+            lowered = key.lower()
+            if any(token in lowered for token in ("bmc", "bcm", "dell", "cisco")):
+                raise ValueError(
+                    f"unrecognised BMC key {key!r} — expected 'dell-bmc' and/or "
+                    "'cisco-bmc'"
+                )
+        return data
 
     @field_validator("dell_bmc", "cisco_bmc")
     @classmethod
-    def _validate_bmc(cls, cidr: str) -> str:
+    def _validate_bmc(cls, cidr: str | None) -> str | None:
+        if cidr is None:
+            return None
         try:
             ipaddress.ip_network(cidr, strict=True)
         except ValueError as exc:
             raise ValueError(f"invalid BMC CIDR {cidr!r}: {exc}") from exc
         return cidr
+
+    @model_validator(mode="after")
+    def _require_a_bmc_network(self) -> "SiteNetworks":
+        """A site may have one vendor or both, never neither."""
+        if self.dell_bmc is None and self.cisco_bmc is None:
+            raise ValueError(
+                "at least one of 'dell-bmc' / 'cisco-bmc' must be set for every site"
+            )
+        return self
 
 
 class TemporalSettings(BaseSettings):

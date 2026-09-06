@@ -362,10 +362,12 @@ class OpenSegmentRulesWorkflow:
                 )
 
         if bmc_segments is not None:
-            # Two vendors x two directions = four requests. .pairs() is a FIXED
-            # (dell, cisco) order and the directions are a literal tuple for
-            # the same reason: activity scheduling order is recorded in history
-            # and replayed, so it must never depend on dict/set iteration.
+            # Two directions per vendor the site HAS — four requests at a
+            # two-vendor site, two at a Dell-only or Cisco-only one. .pairs()
+            # is a FIXED (dell, cisco) order with unconfigured vendors skipped,
+            # and the directions are a literal tuple for the same reason:
+            # activity scheduling order is recorded in history and replayed, so
+            # it must never depend on dict/set iteration.
             for vendor, bmc_segment in bmc_segments.pairs():
                 for direction in (
                     BmcRuleDirection.MCE_TO_BMC,

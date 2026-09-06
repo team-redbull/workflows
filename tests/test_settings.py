@@ -6,9 +6,12 @@ redbull-platform. These tests pin the two properties that arrangement depends
 on — unknown sub-keys never break us, and a missing/typo'd `dell-bmc` /
 `cisco-bmc` fails at startup rather than mid-workflow.
 
-A site carries one BMC network per server hardware vendor, and BOTH are
-required: an MCE that reached Dell BMCs but not Cisco ones would look healthy
-and be half-broken.
+A site carries one BMC network per server hardware vendor it HOSTS: both, or
+Dell-only, or Cisco-only. At least one is required — a site with neither is a
+config gap, and an MCE there would open no BMC rules at all and look healthy.
+A key that only LOOKS like a BMC key is rejected too: with single-vendor sites
+legitimate, `dell-bcm` beside a valid `cisco-bmc` would otherwise be
+indistinguishable from a real Cisco-only site.
 """
 
 from __future__ import annotations
@@ -52,26 +55,41 @@ class TestSharedTopologyContract:
         assert s.site_networks["site1"].dell_bmc == "10.50.0.0/16"
         assert s.site_networks["site1"].cisco_bmc == "10.60.0.0/16"
 
+    @pytest.mark.parametrize("vendor", ["dell-bmc", "cisco-bmc"])
+    def test_a_single_vendor_site_is_accepted(self, vendor):
+        """Sites exist with only Dell or only Cisco hardware. The other
+        vendor's field is None, and pairs() will fan out over the one."""
+        s = build({"site1": {"pool": "192.10.0.0/16", vendor: "10.50.0.0/16"}})
+        site = s.site_networks["site1"]
+        present, absent = (
+            (site.dell_bmc, site.cisco_bmc)
+            if vendor == "dell-bmc"
+            else (site.cisco_bmc, site.dell_bmc)
+        )
+        assert present == "10.50.0.0/16"
+        assert absent is None
+
 
 class TestFailFast:
 
     def test_missing_both_bmc_keys_is_rejected(self):
-        with pytest.raises(ValidationError, match="bmc"):
+        """One vendor is a site shape; none is a config gap."""
+        with pytest.raises(ValidationError, match="at least one"):
             build({"site1": {"pool": "192.10.0.0/16"}})
 
-    @pytest.mark.parametrize("missing", ["dell-bmc", "cisco-bmc"])
-    def test_one_missing_vendor_is_rejected(self, missing):
-        """Half a topology is the failure this guards: an MCE reaching one
-        vendor's BMCs and not the other's looks healthy and is not."""
-        site = {k: v for k, v in _SITE.items() if k != missing}
-        with pytest.raises(ValidationError, match=missing.split("-")[0]):
-            build({"site1": site})
-
     def test_typo_in_a_bmc_key_is_rejected(self):
-        """The reason both keys are required and not Optional: catch this at
-        startup. `bmc` alone is the pre-vendor-split key — equally rejected."""
-        with pytest.raises(ValidationError, match="bmc"):
+        """What replaces both-required as the typo guard. Without it, this
+        would parse as a legitimate Cisco-only site and silently halve an
+        MCE's BMC connectivity."""
+        with pytest.raises(ValidationError, match="dell-bcm"):
             build({"site1": {"dell-bcm": "10.50.0.0/16", "cisco-bmc": "10.60.0.0/16"}})
+
+    @pytest.mark.parametrize("typo", ["dellbmc", "ciscobmc", "DELL-BMC", "bmc-dell"])
+    def test_other_bmc_lookalike_keys_are_rejected(self, typo):
+        """The guard keys off a BMC/vendor token anywhere in the name, not off
+        an exact expected spelling."""
+        with pytest.raises(ValidationError, match="unrecognised BMC key"):
+            build({"site1": dict(_SITE, **{typo: "10.50.0.0/16"})})
 
     def test_legacy_single_bmc_key_is_rejected(self):
         """A ConfigMap still on the pre-split shape must crash-loop the worker,

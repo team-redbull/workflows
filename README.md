@@ -17,10 +17,10 @@ run.
 
 All four types are implemented: `HC`, `INVENTORY` and `PXE` each peer with same-site
 `MCE` segments, and `MCE` peers with all three of them — symmetric, driven by the
-`PORTS_*` config rather than hardcoded per type. `MCE` segments additionally get four
+`PORTS_*` config rather than hardcoded per type. `MCE` segments additionally get
 mandatory rules to their site's static BMC networks — one per direction per server
-hardware vendor, Dell and Cisco, which sit on separate /16s (not tracked by the
-Segments Manager — see the Flow section below).
+hardware vendor the site hosts, Dell and/or Cisco, which sit on separate /16s (not
+tracked by the Segments Manager — see the Flow section below).
 
 ## Layout
 
@@ -58,13 +58,14 @@ Worker-file naming convention: the workflow (brain) worker is
    `PORTS_*` profiles (e.g. `HC` -> only `MCE`; `MCE` -> `HC` + `INVENTORY` + `PXE`).
 3. `submit_open_rules(...)` x2 per peer segment (both directions), all in parallel.
    Port policy per direction comes from the ConfigMap (`PORTS_HC_TO_MCE`, ...).
-   `MCE` segments additionally get four mandatory `submit_bmc_open_rules(...)` —
-   both directions for each hardware vendor — against the two CIDRs
-   `get_bmc_segments(site)` returns: the site's static `dell-bmc` and `cisco-bmc`
+   `MCE` segments additionally get mandatory `submit_bmc_open_rules(...)` — both
+   directions for each hardware vendor the site hosts, so four requests at a
+   two-vendor site and two at a single-vendor one — against the CIDRs
+   `get_bmc_segments(site)` returns: the site's static `dell-bmc` and/or `cisco-bmc`
    networks from `SITE_NETWORKS` (BMC is not tracked by the Segments Manager, so
    this is a ConfigMap lookup, never a Segments Manager query, and never a
-   discovered peer). Both come from ONE lookup, so a site missing either vendor
-   fails before any rule is submitted rather than leaving an MCE half-connected.
+   discovered peer). They come from ONE lookup, so the site's whole BMC surface is
+   known before any rule is submitted.
 4. `publish_request_ids(segment, ids, submitted_at)` — `PUT /api/segments/segment-connectivity-requests`
    so the Segments Manager UI shows the pending request ids beside the segment's
    status while approval is awaited. `submitted_at` (captured once via
@@ -126,16 +127,19 @@ segments actually got a workflow.
   compact JSON per protocol; the activity layer expands them into the next API's
   structure and validates the syntax at worker startup. Changing ports = edit the
   ConfigMap + restart the activity workers. No rebuild.
-- **BMC is ConfigMap-only, not Segments-Manager-tracked, and there are TWO per
-  site:** `SITE_NETWORKS` maps site name -> `{pool, dell-bmc, cisco-bmc}`; this
-  service reads only the two BMC keys (the Segments Manager owns `pool`). Server
-  out-of-band management lives on a different /16 per hardware vendor, and nothing
-  at segment level says which vendor sits under a given MCE — so every `MCE`
-  segment opens rules in BOTH directions against EACH, four requests in all, and
-  never a peer-discovery query. Both keys are required: a missing or typo'd one
-  crash-loops the activity worker at startup instead of half-opening connectivity
-  hours into a run. `PORTS_MCE_TO_BMC` is the port policy for all four (same IPMI
-  ports whichever way the rule runs), same shape as every other `PORTS_*` key —
+- **BMC is ConfigMap-only, not Segments-Manager-tracked, and there is one per
+  hardware VENDOR the site hosts:** `SITE_NETWORKS` maps site name ->
+  `{pool, dell-bmc, cisco-bmc}`; this service reads only the BMC keys (the Segments
+  Manager owns `pool`). Server out-of-band management lives on a different /16 per
+  hardware vendor, and nothing at segment level says which vendor sits under a
+  given MCE — so every `MCE` segment opens rules in BOTH directions against EACH
+  configured vendor (four requests at a two-vendor site, two at a Dell-only or
+  Cisco-only one), and never a peer-discovery query. A site may have one vendor or
+  both; **at least one key is required**, and an unrecognised BMC-looking key
+  (`dell-bcm`, or the pre-split `bmc`) is rejected — either way the activity worker
+  crash-loops at startup instead of quietly opening connectivity for fewer vendors
+  than the site has. `PORTS_MCE_TO_BMC` is the port policy for all of them (same
+  IPMI ports whichever way the rule runs), same shape as every other `PORTS_*` key —
   it keeps its `MCE_TO_BMC` name because renaming it would mean shipping a new
   ConfigMap key ahead of the image.
 - **Pydantic data converter** is registered on every `Client.connect` (workers + api).

@@ -82,10 +82,11 @@ class BmcVendor(str, Enum):
     """Server hardware vendor, which is what picks a BMC network.
 
     Out-of-band management lives on a different /16 per vendor, so a site has
-    TWO BMC networks, not one, and an MCE segment must reach both — an MCE
-    manages whatever hardware happens to sit under it, and nothing at segment
-    level says which vendor that is. NOT a SegmentType: these networks are
-    static config, never Segments-Manager-tracked (see get_bmc_segments).
+    one BMC network per vendor whose hardware it actually hosts — both, or
+    only one. An MCE segment must reach every one of them: an MCE manages
+    whatever hardware happens to sit under it, and nothing at segment level
+    says which vendor that is. NOT a SegmentType: these networks are static
+    config, never Segments-Manager-tracked (see get_bmc_segments).
     """
 
     DELL = "dell"
@@ -95,8 +96,9 @@ class BmcVendor(str, Enum):
 class BmcRuleDirection(str, Enum):
     """Which way one MCE <-> BMC rule runs.
 
-    Both directions are opened for every vendor, so an MCE run submits four
-    BMC requests (2 vendors x 2 directions). They share ONE port profile
+    Both directions are opened for every vendor the site has, so an MCE run
+    submits two BMC requests per configured vendor — four at a two-vendor
+    site, two at a single-vendor one. They share ONE port profile
     (PORTS_MCE_TO_BMC): the traffic is the same IPMI ports either way, and the
     key keeps its name because renaming it would mean shipping a new ConfigMap
     key before the image — cost this split deliberately avoids.
@@ -107,23 +109,39 @@ class BmcRuleDirection(str, Enum):
 
 
 class BmcSegments(BaseModel):
-    """One site's two static BMC networks, keyed by hardware vendor.
+    """One site's static BMC networks, keyed by hardware vendor.
+
+    A field is None for a vendor the site has no hardware from — sites are
+    Dell-only, Cisco-only, or both. Neither is a config gap rather than a
+    site shape, and never reaches here: SITE_NETWORKS rejects it at worker
+    startup, and the validator below is the same rule restated at the
+    boundary this model crosses.
 
     Returned whole rather than one CIDR at a time so a site's BMC config is
-    resolved in ONE activity call: either both networks are configured or the
-    run fails before anything is submitted (a half-open MCE — reaching Dell
-    BMCs but not Cisco ones — is the failure mode worth designing out).
+    resolved in ONE activity call, before any rule is submitted.
     """
 
-    dell: str = Field(min_length=1)  # CIDR, e.g. "10.50.0.0/16"
-    cisco: str = Field(min_length=1)
+    dell: str | None = Field(default=None, min_length=1)  # CIDR, e.g. "10.50.0.0/16"
+    cisco: str | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def _require_a_bmc_network(self) -> "BmcSegments":
+        if self.dell is None and self.cisco is None:
+            raise ValueError("a site must have at least one BMC network")
+        return self
 
     def pairs(self) -> list[tuple[BmcVendor, str]]:
-        """(vendor, CIDR) in a FIXED order. The workflow fans open-rules
-        activities out over this list, and Temporal replays every run against
-        the same schedule — so the order is part of the contract, not a
-        formatting detail. Never sort or derive it from a dict/set."""
-        return [(BmcVendor.DELL, self.dell), (BmcVendor.CISCO, self.cisco)]
+        """(vendor, CIDR) for the vendors this site HAS, in a FIXED order.
+
+        The workflow fans open-rules activities out over this list, and
+        Temporal replays every run against the same schedule — so the order is
+        part of the contract, not a formatting detail. Never sort or derive it
+        from a dict/set: it is a literal dell-then-cisco sequence with the
+        unconfigured vendors skipped, which also keeps a both-vendor site
+        replaying exactly as it did before single-vendor sites existed.
+        """
+        configured = ((BmcVendor.DELL, self.dell), (BmcVendor.CISCO, self.cisco))
+        return [(vendor, cidr) for vendor, cidr in configured if cidr is not None]
 
 
 class BmcOpenRulesRequest(BaseModel):

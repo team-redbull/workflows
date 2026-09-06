@@ -81,10 +81,12 @@ class NextApiError(OrchestratorError):
 class BmcSegmentNotConfiguredError(OrchestratorError):
     """The site has no BMC networks configured (SITE_NETWORKS).
 
-    A site carries one BMC network per hardware vendor (`dell-bmc`,
-    `cisco-bmc`) and both are required, so this covers the whole entry being
-    absent; a site present but missing one vendor's key never reaches here —
-    it fails the worker at startup instead.
+    A site carries one BMC network per hardware vendor it hosts (`dell-bmc`,
+    `cisco-bmc`) and at least one is required, so this means the whole site
+    entry is absent. A site present with only ONE vendor is legitimate
+    topology, not this error — it opens rules against that vendor alone. A
+    site present with NEITHER (or with a misspelt key) never reaches here: it
+    fails the worker at startup instead.
 
     Deterministic — a missing ConfigMap entry never fixes itself, so workflows
     list this type in non_retryable_error_types.

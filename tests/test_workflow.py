@@ -340,8 +340,9 @@ async def test_mce_source_peers_with_hc_inventory_and_pxe():
         (SegmentType.MCE, SegmentType.PXE),
         (SegmentType.PXE, SegmentType.MCE),
     }
-    # Plus the mandatory BMC legs — one request per hardware vendor per
-    # direction, all four from a single get_bmc_segments call.
+    # Plus the mandatory BMC legs — one request per configured hardware vendor
+    # per direction, all four (this site has both) from a single
+    # get_bmc_segments call.
     assert calls["get_bmc_segments"] == [SITE]
     # Set comparison: the submissions run concurrently, so the order they are
     # RECORDED in races (same reason the ids above are sorted). The fixed
@@ -365,7 +366,8 @@ async def test_mce_source_with_no_peers_still_submits_bmc_rules():
         result = await _execute(client, OpenSegmentRulesRunArgs(input=MCE_INPUT))
 
     assert result.peer_segment_count == 0
-    # Two vendors x two directions — the BMC legs alone keep the run alive.
+    # Two vendors x two directions at this site — the BMC legs alone keep the
+    # run alive.
     assert len(result.request_ids) == 4
     assert calls["submit_open_rules"] == []
     assert {(r.vendor, r.direction) for r in calls["submit_bmc_open_rules"]} == {
@@ -373,6 +375,26 @@ async def test_mce_source_with_no_peers_still_submits_bmc_rules():
         for vendor in BmcVendor
         for direction in BmcRuleDirection
     }
+    assert calls["publish_segment_connectivity_failure"] == []
+
+
+async def test_mce_source_at_a_single_vendor_site_opens_that_vendor_only():
+    """A site with only Dell hardware carries only `dell-bmc`, and the MCE run
+    opens both directions against it — two BMC requests, not four. The absent
+    vendor is a site shape, not a config gap: nothing fails."""
+    calls, mocks = make_mock_activities(
+        peer_segments=(),
+        bmc_segments=BmcSegments(dell="10.98.0.0/16"),
+        check_script=[[]],
+    )
+    async with _Harness(mocks) as client:
+        result = await _execute(client, OpenSegmentRulesRunArgs(input=MCE_INPUT))
+
+    assert len(result.request_ids) == 2
+    assert {
+        (r.vendor, r.direction, r.bmc_segment)
+        for r in calls["submit_bmc_open_rules"]
+    } == {(BmcVendor.DELL, d, "10.98.0.0/16") for d in BmcRuleDirection}
     assert calls["publish_segment_connectivity_failure"] == []
 
 

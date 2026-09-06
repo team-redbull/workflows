@@ -454,17 +454,18 @@ async def submit_open_rules(request: OpenRulesRequest) -> NextRequestRef:
 
 @activity.defn
 async def get_bmc_segments(site: str) -> BmcSegments:
-    """Return the site's two static BMC CIDRs (per hardware vendor) from
-    ConfigMap (SITE_NETWORKS).
+    """Return the site's static BMC CIDRs (one per hardware vendor the site
+    hosts) from ConfigMap (SITE_NETWORKS).
 
     A pure config lookup, not an API call: BMC is not a Segments-Manager-
     tracked segment type. SITE_NETWORKS is the shared site topology — the same
     structure the Segments Manager reads `pool` from — so an unknown site here
     means the site is genuinely unconfigured, not that the two drifted apart.
 
-    Both vendors are returned together: SiteNetworks requires both keys, so a
-    site that resolves here is fully configured, and an MCE never ends up with
-    connectivity to one vendor's BMC network but not the other's.
+    A vendor key may legitimately be absent (a site with only Dell or only
+    Cisco hardware); SiteNetworks requires at least one and rejects a misspelt
+    key, so a site that resolves here has exactly the BMC networks it should,
+    and the MCE opens rules against all of them in one fan-out.
     """
     networks = _settings.site_networks.get(site)
     if networks is None:

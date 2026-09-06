@@ -116,14 +116,15 @@ async def unlock_segment(segment: str) -> None:
 
 @activity.defn
 async def get_bmc_segments(site: str) -> BmcSegments:
-    """Return the site's two static BMC CIDRs (one per hardware vendor) from
-    ConfigMap (SITE_NETWORKS).
+    """Return the site's static BMC CIDRs — one per hardware vendor the site
+    hosts, so both, or only Dell, or only Cisco — from ConfigMap
+    (SITE_NETWORKS).
 
     BMC is not a Segments-Manager-tracked segment type, so this is a pure
-    config lookup, not an API call. Both vendors come back in one call so a
-    partially configured site fails before any rule is submitted. Raises
-    BmcSegmentNotConfiguredError if the site has no configured entry —
-    deterministic, non-retryable.
+    config lookup, not an API call. Every configured vendor comes back in one
+    call, so the whole site's BMC surface is known before any rule is
+    submitted. Raises BmcSegmentNotConfiguredError if the site has no
+    configured entry at all — deterministic, non-retryable.
     """
     ...
 

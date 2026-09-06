@@ -130,9 +130,9 @@ async def get_bmc_segments(site: str) -> BmcSegments:
 
 @activity.defn
 async def submit_bmc_open_rules(request: BmcOpenRulesRequest) -> NextRequestRef:
-    """Submit ONE one-directional MCE -> BMC open-rules request, for the
-    vendor named on the request (PORTS_MCE_TO_BMC covers both). An MCE run
-    calls this once per vendor. Idempotent in the same sense as
+    """Submit ONE MCE <-> BMC open-rules request, for the vendor and direction
+    named on the request (PORTS_MCE_TO_BMC covers all four). An MCE run calls
+    this once per vendor per direction. Idempotent in the same sense as
     submit_open_rules."""
     ...
 

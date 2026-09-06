@@ -109,7 +109,7 @@
         <text class="stepno-t" x="468" y="168">3</text>
         <text class="f-title" x="464" y="202">Submit rules</text>
         <text class="f-sys nxt" x="464" y="222">NEXT</text>
-        <text class="f-det" x="464" y="240">2 per peer, +2 BMC</text>
+        <text class="f-det" x="464" y="240">2 per peer, +4 BMC</text>
 
         <path class="f-arrow" d="M618,198 H650" marker-end="url(#ah-n)"/>
 
@@ -235,7 +235,7 @@
           <div class="card-title">
             <h3>get_bmc_segments <span class="chip cfg" style="vertical-align:middle">MCE only</span></h3>
           </div>
-          <p>MCE segments also need a rule to their site's BMC networks — <b>two of them</b>: server out-of-band
+          <p>MCE segments also need rules to their site's BMC networks — <b>two of them</b>: server out-of-band
           management sits on a different /16 for Dell and for Cisco hardware, and nothing at segment level says which
           vendor sits under a given MCE, so both are opened. BMC isn't tracked by the Segments Manager, so this is a
           pure config lookup from the shared <code>SITE_NETWORKS</code> topology. Both CIDRs come back from
@@ -256,7 +256,7 @@
             <h3>submit_open_rules × N</h3>
             <span class="phase">phase <b>submitting-rules</b></span>
           </div>
-          <p><b>Two requests per peer</b> — one in each direction — plus <b>two</b> <code>MCE → BMC</code> requests (Dell and Cisco) if the segment is MCE.
+          <p><b>Two requests per peer</b> — one in each direction — plus <b>four</b> <code>MCE ↔ BMC</code> requests (Dell and Cisco, each way) if the segment is MCE.
           All submitted in parallel. Each submission renews a token to NEXT first, then posts the rule with the port profile
           for that direction. NEXT answers with a request id.</p>
           <div class="calls">
@@ -332,12 +332,14 @@
     <div class="sec-head">
       <div class="eyebrow">Who connects to whom</div>
       <h2>Peering matrix — one cell = one open-rules request</h2>
-      <p class="lede">Read a row as the source. Every ✓ is a separate submission to NEXT with its own request id and its own approval.
-      The matrix is not written in code — it is exactly the set of <code>PORTS_*</code> keys present in the ConfigMap.</p>
+      <p class="lede">Read a row as the source. Every ✓ is a separate submission to NEXT with its own request id and its own approval;
+      the BMC cells are <code>×2</code> because the site has one BMC network per hardware vendor.
+      The matrix is not written in code — for the tracked types it is exactly the set of <code>PORTS_*</code> keys present in the
+      ConfigMap, and BMC is the one row and column that comes from <code>SITE_NETWORKS</code> instead.</p>
     </div>
     <div class="diagram topology">
       <svg viewBox="0 0 660 380" role="img"
-           aria-label="Topology diagram: MCE sits at the centre and peers bidirectionally with HC, INVENTORY and PXE segments on the same site, two open-rules requests each. MCE additionally has one-way links to the site's two static BMC networks, one for Dell hardware and one for Cisco.">
+           aria-label="Topology diagram: MCE sits at the centre and peers bidirectionally with HC, INVENTORY and PXE segments on the same site, two open-rules requests each. MCE additionally peers bidirectionally with the site's two static BMC networks, one for Dell hardware and one for Cisco, two requests each.">
         <defs>
           <marker id="ah-e2" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0.5 L8,4 L0,7.5 Z"/></marker>
           <marker id="ah-e1" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0.5 L8,4 L0,7.5 Z"/></marker>
@@ -347,7 +349,7 @@
         <path class="edge two" d="M281,164 L134,86"  marker-start="url(#ah-e2)" marker-end="url(#ah-e2)"/>
         <path class="edge two" d="M281,216 L134,294" marker-start="url(#ah-e2)" marker-end="url(#ah-e2)"/>
         <path class="edge two" d="M379,164 L526,86"  marker-start="url(#ah-e2)" marker-end="url(#ah-e2)"/>
-        <path class="edge one" d="M379,216 L526,294" marker-end="url(#ah-e1)"/>
+        <path class="edge one" d="M379,216 L526,294" marker-start="url(#ah-e1)" marker-end="url(#ah-e1)"/>
 
         <rect x="164" y="110" width="86" height="17" rx="2" class="edge-mask"/>
         <text class="edge-l" x="207" y="123">2 requests</text>
@@ -356,7 +358,7 @@
         <rect x="410" y="110" width="86" height="17" rx="2" class="edge-mask"/>
         <text class="edge-l" x="453" y="123">2 requests</text>
         <rect x="404" y="245" width="98" height="17" rx="2" class="edge-mask"/>
-        <text class="edge-l" x="453" y="258">2 requests</text>
+        <text class="edge-l" x="453" y="258">2 × 2 requests</text>
 
         <!-- nodes -->
         <rect class="node-box peer" x="20"  y="34"  width="130" height="52" rx="4"/>
@@ -382,7 +384,7 @@
     </div>
     <div class="diagram-caption">
       <span class="swatch sm"><i></i>bidirectional — a rule is opened each way</span>
-      <span class="swatch nxt"><i class="dash"></i>one-way, MCE runs only</span>
+      <span class="swatch nxt"><i class="dash"></i>bidirectional, MCE runs only · static config</span>
     </div>
 
     <div class="table-scroll" style="margin-top:20px">
@@ -398,7 +400,7 @@
             <th>MCE</th>
             <td class="self">—</td>
             <td class="yes">✓</td><td class="yes">✓</td><td class="yes">✓</td>
-            <td class="oneway">✓ one-way ×2</td>
+            <td class="oneway">✓ ×2 <span style="text-transform:none;letter-spacing:0">(per vendor)</span></td>
           </tr>
           <tr>
             <th>HC</th>
@@ -411,6 +413,11 @@
           <tr>
             <th>PXE</th>
             <td class="yes">✓</td><td class="no">·</td><td class="no">·</td><td class="self">—</td><td class="no">·</td>
+          </tr>
+          <tr>
+            <th>BMC <span style="text-transform:none;letter-spacing:0">(static)</span></th>
+            <td class="oneway">✓ ×2 <span style="text-transform:none;letter-spacing:0">(per vendor)</span></td>
+            <td class="no">·</td><td class="no">·</td><td class="no">·</td><td class="self">—</td>
           </tr>
         </tbody>
       </table>
@@ -427,8 +434,8 @@
       </div>
       <div class="panel">
         <h3>How many requests will a run make?</h3>
-        <p style="font-size:var(--fs-14);color:var(--ink-2)"><span class="mono">2 × (same-site peers found)</span>, plus <span class="mono">2</span> if the segment is MCE (the Dell and Cisco BMC rules).
-        A new HC segment on a site with 3 MCE segments submits 6 requests; a new MCE segment on a site with 2 HC + 1 PXE submits 8.</p>
+        <p style="font-size:var(--fs-14);color:var(--ink-2)"><span class="mono">2 × (same-site peers found)</span>, plus <span class="mono">4</span> if the segment is MCE (the Dell and Cisco BMC rules, each way).
+        A new HC segment on a site with 3 MCE segments submits 6 requests; a new MCE segment on a site with 2 HC + 1 PXE submits 10.</p>
       </div>
     </div>
   </section>

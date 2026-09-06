@@ -25,6 +25,7 @@ from shared.consts import SEGMENT_LIFECYCLE_ACTIVITY_QUEUE, OPEN_SEGMENT_RULES_W
 from shared.exceptions import BmcSegmentNotConfiguredError, SegmentValidationError
 from shared.models.segment_lifecycle import (
     BmcOpenRulesRequest,
+    BmcRuleDirection,
     BmcSegments,
     BmcVendor,
     SegmentConnectivityFailureNotice,
@@ -339,20 +340,23 @@ async def test_mce_source_peers_with_hc_inventory_and_pxe():
         (SegmentType.MCE, SegmentType.PXE),
         (SegmentType.PXE, SegmentType.MCE),
     }
-    # Plus the mandatory one-directional BMC leg — one request per hardware
-    # vendor, both resolved from a single get_bmc_segments call.
+    # Plus the mandatory BMC legs — one request per hardware vendor per
+    # direction, all four from a single get_bmc_segments call.
     assert calls["get_bmc_segments"] == [SITE]
     # Set comparison: the submissions run concurrently, so the order they are
     # RECORDED in races (same reason the ids above are sorted). The fixed
     # SCHEDULING order that replay depends on is BmcSegments.pairs()'s job.
     assert {
-        (r.vendor, r.mce_segment, r.bmc_segment)
+        (r.vendor, r.direction, r.mce_segment, r.bmc_segment)
         for r in calls["submit_bmc_open_rules"]
     } == {
-        (BmcVendor.DELL, SEGMENT, "10.98.0.0/16"),
-        (BmcVendor.CISCO, SEGMENT, "10.99.0.0/16"),
+        (BmcVendor.DELL, d, SEGMENT, "10.98.0.0/16")
+        for d in BmcRuleDirection
+    } | {
+        (BmcVendor.CISCO, d, SEGMENT, "10.99.0.0/16")
+        for d in BmcRuleDirection
     }
-    assert len(result.request_ids) == 8
+    assert len(result.request_ids) == 10
 
 
 async def test_mce_source_with_no_peers_still_submits_bmc_rules():
@@ -361,12 +365,13 @@ async def test_mce_source_with_no_peers_still_submits_bmc_rules():
         result = await _execute(client, OpenSegmentRulesRunArgs(input=MCE_INPUT))
 
     assert result.peer_segment_count == 0
-    # One per vendor — the BMC leg alone is enough to keep the run alive.
-    assert len(result.request_ids) == 2
+    # Two vendors x two directions — the BMC legs alone keep the run alive.
+    assert len(result.request_ids) == 4
     assert calls["submit_open_rules"] == []
-    assert {r.vendor for r in calls["submit_bmc_open_rules"]} == {
-        BmcVendor.DELL,
-        BmcVendor.CISCO,
+    assert {(r.vendor, r.direction) for r in calls["submit_bmc_open_rules"]} == {
+        (vendor, direction)
+        for vendor in BmcVendor
+        for direction in BmcRuleDirection
     }
     assert calls["publish_segment_connectivity_failure"] == []
 

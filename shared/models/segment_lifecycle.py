@@ -92,6 +92,20 @@ class BmcVendor(str, Enum):
     CISCO = "cisco"
 
 
+class BmcRuleDirection(str, Enum):
+    """Which way one MCE <-> BMC rule runs.
+
+    Both directions are opened for every vendor, so an MCE run submits four
+    BMC requests (2 vendors x 2 directions). They share ONE port profile
+    (PORTS_MCE_TO_BMC): the traffic is the same IPMI ports either way, and the
+    key keeps its name because renaming it would mean shipping a new ConfigMap
+    key before the image — cost this split deliberately avoids.
+    """
+
+    MCE_TO_BMC = "mce_to_bmc"
+    BMC_TO_MCE = "bmc_to_mce"
+
+
 class BmcSegments(BaseModel):
     """One site's two static BMC networks, keyed by hardware vendor.
 
@@ -113,19 +127,25 @@ class BmcSegments(BaseModel):
 
 
 class BmcOpenRulesRequest(BaseModel):
-    """One-directional MCE -> BMC firewall-rule request, for ONE vendor's BMC
+    """ONE firewall-rule request between an MCE segment and ONE vendor's BMC
     network. BMC is not a Segments-Manager-tracked SegmentType — its CIDRs are
     static, ConfigMap-sourced values per site — so this is a deliberately
     separate, narrower model from OpenRulesRequest.
 
+    The two segments are named by ROLE, not by source/destination: `direction`
+    says which way this particular rule runs, and the activity layer swaps them
+    accordingly. That keeps one model for both legs of the pair, the same way
+    the peer legs reuse OpenRulesRequest with the fields swapped.
+
     `vendor` carries which of the site's two BMC networks this is: the activity
     layer keys the next-API system_name and the request comment off it, so the
-    two requests an MCE run submits are distinguishable in next's UI.
+    four requests an MCE run submits are distinguishable in next's UI.
     """
 
     mce_segment: str = Field(min_length=1)
     bmc_segment: str = Field(min_length=1)
     vendor: BmcVendor
+    direction: BmcRuleDirection
 
 
 class NextRequestRef(BaseModel):

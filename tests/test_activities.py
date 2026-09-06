@@ -42,6 +42,7 @@ from shared.exceptions import (
 )
 from shared.models.segment_lifecycle import (
     BmcOpenRulesRequest,
+    BmcRuleDirection,
     BmcVendor,
     ConvertibleSegmentsQuery,
     SegmentConnectivityFailureNotice,
@@ -350,11 +351,15 @@ async def test_get_bmc_segments_missing_site_raises(env):
 
 @respx.mock
 @pytest.mark.parametrize(
-    "vendor, system_name",
+    "vendor, bmc_system_name",
     [(BmcVendor.DELL, "dell-bmc"), (BmcVendor.CISCO, "cisco-bmc")],
 )
-async def test_submit_bmc_open_rules_builds_one_directional_payload(
-    env, vendor, system_name
+@pytest.mark.parametrize(
+    "direction, expect_mce_source",
+    [(BmcRuleDirection.MCE_TO_BMC, True), (BmcRuleDirection.BMC_TO_MCE, False)],
+)
+async def test_submit_bmc_open_rules_builds_payload_for_each_direction(
+    env, vendor, bmc_system_name, direction, expect_mce_source
 ):
     respx.post(f"{NEXT}/token-renewal-uri").mock(
         return_value=httpx.Response(200, json={"access_token": "tok-1"})
@@ -366,7 +371,10 @@ async def test_submit_bmc_open_rules_builds_one_directional_payload(
     ref = await env.run(
         submit_bmc_open_rules,
         BmcOpenRulesRequest(
-            mce_segment="10.0.0.0/24", bmc_segment="10.99.0.0/16", vendor=vendor
+            mce_segment="10.0.0.0/24",
+            bmc_segment="10.99.0.0/16",
+            vendor=vendor,
+            direction=direction,
         ),
     )
 
@@ -375,17 +383,24 @@ async def test_submit_bmc_open_rules_builds_one_directional_payload(
 
     payload = json.loads(open_rules.calls.last.request.content)
     assert payload["ad_groups"] == ["test-group"]
-    assert payload["properties"]["source"]["system_name"] == "mce"
-    assert payload["properties"]["source"]["addresses"] == [
-        {"type": "segment", "segment": "10.0.0.0/24"}
-    ]
-    # The vendor is what makes the two requests an MCE run submits
-    # distinguishable in next's UI.
-    assert payload["properties"]["destination"]["system_name"] == system_name
-    assert payload["properties"]["destination"]["addresses"] == [
-        {"type": "segment", "segment": "10.99.0.0/16"}
-    ]
-    # One profile covers both vendors. PORTS_MCE_TO_BMC from conftest: tcp 623.
+
+    # The model names the two segments by ROLE; `direction` is what decides
+    # which of them next is told is the source.
+    mce_side = {"system_name": "mce", "segment": "10.0.0.0/24"}
+    bmc_side = {"system_name": bmc_system_name, "segment": "10.99.0.0/16"}
+    source, destination = (
+        (mce_side, bmc_side) if expect_mce_source else (bmc_side, mce_side)
+    )
+    for role, expected in (("source", source), ("destination", destination)):
+        assert payload["properties"][role]["system_name"] == expected["system_name"]
+        assert payload["properties"][role]["addresses"] == [
+            {"type": "segment", "segment": expected["segment"]}
+        ]
+    # The vendor in the system name is what makes the four requests an MCE run
+    # submits distinguishable in next's UI.
+
+    # ONE profile covers both vendors AND both directions.
+    # PORTS_MCE_TO_BMC from conftest: tcp 623.
     assert payload["properties"]["ports"] == [
         {"type": "port", "port": 623, "protocol": "TCP"}
     ]

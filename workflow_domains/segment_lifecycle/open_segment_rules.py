@@ -27,10 +27,10 @@ every existing same-site HC/INVENTORY/PXE segment, exactly as adding a new
 HC/INVENTORY/PXE segment already discovers same-site MCE segments. The input
 accepts any segment type; unsupported ones fail loudly.
 
-MCE segments additionally get two mandatory, one-directional MCE -> BMC rules
-per run (submit_bmc_open_rules once per hardware vendor — server BMCs live on
-a different /16 for Dell and for Cisco, and an MCE manages whatever hardware
-sits under it), independent of peer discovery: BMC is a
+MCE segments additionally get four mandatory MCE <-> BMC rules per run
+(submit_bmc_open_rules once per hardware vendor per direction — server BMCs
+live on a different /16 for Dell and for Cisco, and an MCE manages whatever
+hardware sits under it), independent of peer discovery: BMC is a
 static, ConfigMap-sourced network per site (not Segments-Manager-tracked),
 so this never peers back and is submitted unconditionally whenever the input
 type is MCE.
@@ -72,6 +72,7 @@ with workflow.unsafe.imports_passed_through():
     )
     from shared.models.segment_lifecycle import (
         BmcOpenRulesRequest,
+        BmcRuleDirection,
         BmcSegments,
         SegmentConnectivityFailureNotice,
         OpenSegmentRulesInput,
@@ -313,8 +314,8 @@ class OpenSegmentRulesWorkflow:
             retry_policy=_RETRY_POLICY,
         )
 
-        # Every MCE segment also gets a mandatory, one-directional rule to
-        # EACH of its site's static BMC networks — one per hardware vendor —
+        # Every MCE segment also gets mandatory rules to EACH of its site's
+        # static BMC networks — one per hardware vendor, both directions —
         # unconditional and independent of whether any peers were found above
         # (BMC is not a discovered peer). Both CIDRs are resolved in ONE
         # activity call, before building any submission below, so a missing or
@@ -361,23 +362,29 @@ class OpenSegmentRulesWorkflow:
                 )
 
         if bmc_segments is not None:
-            # .pairs() is a FIXED (dell, cisco) order: activity scheduling
-            # order is recorded in history and replayed, so it must never
-            # depend on dict/set iteration.
+            # Two vendors x two directions = four requests. .pairs() is a FIXED
+            # (dell, cisco) order and the directions are a literal tuple for
+            # the same reason: activity scheduling order is recorded in history
+            # and replayed, so it must never depend on dict/set iteration.
             for vendor, bmc_segment in bmc_segments.pairs():
-                submissions.append(
-                    workflow.execute_activity(
-                        submit_bmc_open_rules,
-                        BmcOpenRulesRequest(
-                            mce_segment=rules_input.segment,
-                            bmc_segment=bmc_segment,
-                            vendor=vendor,
-                        ),
-                        task_queue=SEGMENT_LIFECYCLE_ACTIVITY_QUEUE,
-                        start_to_close_timeout=_ACTIVITY_TIMEOUT,
-                        retry_policy=_RETRY_POLICY,
+                for direction in (
+                    BmcRuleDirection.MCE_TO_BMC,
+                    BmcRuleDirection.BMC_TO_MCE,
+                ):
+                    submissions.append(
+                        workflow.execute_activity(
+                            submit_bmc_open_rules,
+                            BmcOpenRulesRequest(
+                                mce_segment=rules_input.segment,
+                                bmc_segment=bmc_segment,
+                                vendor=vendor,
+                                direction=direction,
+                            ),
+                            task_queue=SEGMENT_LIFECYCLE_ACTIVITY_QUEUE,
+                            start_to_close_timeout=_ACTIVITY_TIMEOUT,
+                            retry_policy=_RETRY_POLICY,
+                        )
                     )
-                )
 
         if not submissions:
             raise ApplicationError(

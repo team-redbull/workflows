@@ -49,6 +49,7 @@ from shared.exceptions import (
 )
 from shared.models.segment_lifecycle import (
     BmcOpenRulesRequest,
+    BmcRuleDirection,
     BmcSegments,
     BmcVendor,
     ClusterFileLocation,
@@ -475,17 +476,38 @@ async def get_bmc_segments(site: str) -> BmcSegments:
 
 @activity.defn
 async def submit_bmc_open_rules(request: BmcOpenRulesRequest) -> NextRequestRef:
-    """Submit one one-directional MCE -> BMC open-rules request, for the
-    vendor named on the request (PORTS_MCE_TO_BMC covers both vendors — the
-    ports are the same, only the destination network differs)."""
+    """Submit ONE open-rules request between an MCE segment and one vendor's
+    BMC network, in the direction the request names.
+
+    PORTS_MCE_TO_BMC is the profile for all four requests an MCE run makes:
+    both vendors and both directions. The ports are the same IPMI ports
+    whichever way the rule runs, and the key keeps its MCE_TO_BMC name because
+    renaming it would mean shipping a new ConfigMap key ahead of the image.
+    """
+    mce = (
+        _SYSTEM_NAMES[SegmentType.MCE],
+        request.mce_segment,
+        _COMMENT_LABELS[SegmentType.MCE],
+    )
+    bmc = (
+        _BMC_SYSTEM_NAMES[request.vendor],
+        request.bmc_segment,
+        _BMC_COMMENT_LABELS[request.vendor],
+    )
+    source, destination = (
+        (mce, bmc) if request.direction is BmcRuleDirection.MCE_TO_BMC else (bmc, mce)
+    )
+    (source_system, source_segment, source_label) = source
+    (destination_system, destination_segment, destination_label) = destination
+
     return await _submit_next_open_rules(
-        source_segment=request.mce_segment,
-        source_system_name=_SYSTEM_NAMES[SegmentType.MCE],
-        destination_segment=request.bmc_segment,
-        destination_system_name=_BMC_SYSTEM_NAMES[request.vendor],
+        source_segment=source_segment,
+        source_system_name=source_system,
+        destination_segment=destination_segment,
+        destination_system_name=destination_system,
         comment=(
-            f"{_COMMENT_LABELS[SegmentType.MCE]}: {request.mce_segment} -> "
-            f"{_BMC_COMMENT_LABELS[request.vendor]}: {request.bmc_segment}"
+            f"{source_label}: {source_segment} -> "
+            f"{destination_label}: {destination_segment}"
         ),
         profile=_settings.ports_mce_to_bmc,
     )

@@ -11,6 +11,7 @@ from temporalio import activity
 
 from shared.models.segment_lifecycle import (
     BmcOpenRulesRequest,
+    BmcSegments,
     ClusterFileLocation,
     ClusterValuesAppendRequest,
     ConvertibleSegment,
@@ -114,20 +115,25 @@ async def unlock_segment(segment: str) -> None:
 
 
 @activity.defn
-async def get_bmc_segment(site: str) -> str:
-    """Return the site's static BMC CIDR from ConfigMap (SITE_NETWORKS).
+async def get_bmc_segments(site: str) -> BmcSegments:
+    """Return the site's two static BMC CIDRs (one per hardware vendor) from
+    ConfigMap (SITE_NETWORKS).
 
     BMC is not a Segments-Manager-tracked segment type, so this is a pure
-    config lookup, not an API call. Raises BmcSegmentNotConfiguredError if the
-    site has no configured entry — deterministic, non-retryable.
+    config lookup, not an API call. Both vendors come back in one call so a
+    partially configured site fails before any rule is submitted. Raises
+    BmcSegmentNotConfiguredError if the site has no configured entry —
+    deterministic, non-retryable.
     """
     ...
 
 
 @activity.defn
 async def submit_bmc_open_rules(request: BmcOpenRulesRequest) -> NextRequestRef:
-    """Submit the one-directional MCE -> BMC open-rules request
-    (PORTS_MCE_TO_BMC). Idempotent in the same sense as submit_open_rules."""
+    """Submit ONE one-directional MCE -> BMC open-rules request, for the
+    vendor named on the request (PORTS_MCE_TO_BMC covers both). An MCE run
+    calls this once per vendor. Idempotent in the same sense as
+    submit_open_rules."""
     ...
 
 

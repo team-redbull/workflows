@@ -34,7 +34,7 @@ from __future__ import annotations
 import ipaddress
 import re
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # "9000" or "30000-32767"
@@ -54,15 +54,25 @@ class SiteNetworks(BaseModel):
     segments must fall inside) and this service must never depend on it, nor
     break when another consumer adds a sub-key.
 
-    `bmc` is required rather than optional on purpose — a typo ("bcm") then
-    crash-loops the worker at startup instead of failing a workflow hours in.
+    A site has TWO BMC networks, one per server hardware vendor — out-of-band
+    management sits on a different /16 for Dell and for Cisco hardware — and an
+    MCE segment opens rules to BOTH (see BmcVendor). The keys are hyphenated
+    (`dell-bmc`, `cisco-bmc`) because they are operator-facing config, matching
+    the Helm values verbatim; the aliases below map them onto valid Python
+    field names, and populate_by_name keeps construction by field name (tests,
+    call sites) working.
+
+    Both are required rather than optional on purpose — a typo ("dell-bcm")
+    then crash-loops the worker at startup instead of failing a workflow hours
+    in, and half-configured BMC connectivity is worse than none.
     """
 
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
-    bmc: str
+    dell_bmc: str = Field(alias="dell-bmc")
+    cisco_bmc: str = Field(alias="cisco-bmc")
 
-    @field_validator("bmc")
+    @field_validator("dell_bmc", "cisco_bmc")
     @classmethod
     def _validate_bmc(cls, cidr: str) -> str:
         try:
@@ -122,11 +132,16 @@ class SegmentLifecycleActivitySettings(BaseSettings):
     ports_mce_to_pxe: dict[str, list[str]]
 
     # --- The shared site topology (SITE_NETWORKS). This service reads only
-    # each site's `bmc`: every MCE segment also opens a one-directional rule to
-    # its site's static BMC network. BMC is NOT a Segments-Manager-tracked
-    # segment type, so its CIDR is operator-configured rather than queried at
-    # runtime. The Segments Manager reads `pool` out of the same structure. ---
+    # each site's `dell-bmc` and `cisco-bmc`: every MCE segment opens a
+    # one-directional rule to BOTH of its site's static BMC networks (server
+    # BMCs live on a different /16 per hardware vendor). BMC is NOT a
+    # Segments-Manager-tracked segment type, so those CIDRs are
+    # operator-configured rather than queried at runtime. The Segments Manager
+    # reads `pool` out of the same structure. ---
     site_networks: dict[str, SiteNetworks]
+    # ONE port profile for both vendors: an MCE reaches a Dell BMC and a
+    # Cisco BMC over the same IPMI ports, and two knobs that must be kept
+    # equal are a drift source, not a feature.
     ports_mce_to_bmc: dict[str, list[str]]
 
     # --- allocate-segment: the day1 values repo -----------------------------

@@ -25,6 +25,8 @@ from shared.consts import SEGMENT_LIFECYCLE_ACTIVITY_QUEUE, OPEN_SEGMENT_RULES_W
 from shared.exceptions import BmcSegmentNotConfiguredError, SegmentValidationError
 from shared.models.segment_lifecycle import (
     BmcOpenRulesRequest,
+    BmcSegments,
+    BmcVendor,
     SegmentConnectivityFailureNotice,
     OpenSegmentRulesInput,
     NextRequestRef,
@@ -64,7 +66,9 @@ MCE_INPUT = _input(SegmentType.MCE)
 def make_mock_activities(
     *,
     peer_segments: tuple[SegmentRef, ...] = (SegmentRef(segment="10.1.0.0/24", type=SegmentType.MCE),),
-    bmc_segment: str | None = "10.99.0.0/16",
+    bmc_segments: BmcSegments | None = BmcSegments(
+        dell="10.98.0.0/16", cisco="10.99.0.0/16"
+    ),
     check_script: list[list[int]] | None = None,
     check_always_pending: bool = False,
     create_fail_times: int = 0,
@@ -74,7 +78,7 @@ def make_mock_activities(
 
     check_script: per-poll return values; once exhausted (and not
     check_always_pending) every subsequent poll returns [] (all complete).
-    bmc_segment=None simulates an unconfigured site (get_bmc_segment raises).
+    bmc_segments=None simulates an unconfigured site (get_bmc_segments raises).
     """
     calls: dict[str, list] = {
         name: []
@@ -82,7 +86,7 @@ def make_mock_activities(
             "create_segment",
             "list_peer_segments",
             "submit_open_rules",
-            "get_bmc_segment",
+            "get_bmc_segments",
             "submit_bmc_open_rules",
             "publish_request_ids",
             "check_next_requests",
@@ -115,11 +119,11 @@ def make_mock_activities(
         return NextRequestRef(id=next(ids), status="pending")
 
     @activity.defn
-    async def get_bmc_segment(site_arg: str) -> str:
-        calls["get_bmc_segment"].append(site_arg)
-        if bmc_segment is None:
-            raise BmcSegmentNotConfiguredError(f"No BMC segment configured for site={site_arg}")
-        return bmc_segment
+    async def get_bmc_segments(site_arg: str) -> BmcSegments:
+        calls["get_bmc_segments"].append(site_arg)
+        if bmc_segments is None:
+            raise BmcSegmentNotConfiguredError(f"No BMC segments configured for site={site_arg}")
+        return bmc_segments
 
     @activity.defn
     async def submit_bmc_open_rules(request: BmcOpenRulesRequest) -> NextRequestRef:
@@ -156,7 +160,7 @@ def make_mock_activities(
         create_segment,
         list_peer_segments,
         submit_open_rules,
-        get_bmc_segment,
+        get_bmc_segments,
         submit_bmc_open_rules,
         publish_request_ids,
         check_next_requests,
@@ -232,7 +236,7 @@ async def test_happy_path_submits_polls_publishes_and_unlocks():
     ]
     assert len(calls["submit_open_rules"]) == 2
     # The BMC leg is MCE-only: an HC input never touches it.
-    assert calls["get_bmc_segment"] == []
+    assert calls["get_bmc_segments"] == []
     assert calls["submit_bmc_open_rules"] == []
     assert calls["unlock_segment"] == [SEGMENT]
     # Publish trail: all ids after submit, shrink to [2], then the clearing [].
@@ -335,28 +339,40 @@ async def test_mce_source_peers_with_hc_inventory_and_pxe():
         (SegmentType.MCE, SegmentType.PXE),
         (SegmentType.PXE, SegmentType.MCE),
     }
-    # Plus the mandatory one-directional BMC leg.
-    assert calls["get_bmc_segment"] == [SITE]
-    (bmc_request,) = calls["submit_bmc_open_rules"]
-    assert bmc_request.mce_segment == SEGMENT
-    assert bmc_request.bmc_segment == "10.99.0.0/16"
-    assert len(result.request_ids) == 7
+    # Plus the mandatory one-directional BMC leg — one request per hardware
+    # vendor, both resolved from a single get_bmc_segments call.
+    assert calls["get_bmc_segments"] == [SITE]
+    # Set comparison: the submissions run concurrently, so the order they are
+    # RECORDED in races (same reason the ids above are sorted). The fixed
+    # SCHEDULING order that replay depends on is BmcSegments.pairs()'s job.
+    assert {
+        (r.vendor, r.mce_segment, r.bmc_segment)
+        for r in calls["submit_bmc_open_rules"]
+    } == {
+        (BmcVendor.DELL, SEGMENT, "10.98.0.0/16"),
+        (BmcVendor.CISCO, SEGMENT, "10.99.0.0/16"),
+    }
+    assert len(result.request_ids) == 8
 
 
-async def test_mce_source_with_no_peers_still_submits_bmc_rule():
+async def test_mce_source_with_no_peers_still_submits_bmc_rules():
     calls, mocks = make_mock_activities(peer_segments=(), check_script=[[]])
     async with _Harness(mocks) as client:
         result = await _execute(client, OpenSegmentRulesRunArgs(input=MCE_INPUT))
 
     assert result.peer_segment_count == 0
-    assert len(result.request_ids) == 1
+    # One per vendor — the BMC leg alone is enough to keep the run alive.
+    assert len(result.request_ids) == 2
     assert calls["submit_open_rules"] == []
-    assert len(calls["submit_bmc_open_rules"]) == 1
+    assert {r.vendor for r in calls["submit_bmc_open_rules"]} == {
+        BmcVendor.DELL,
+        BmcVendor.CISCO,
+    }
     assert calls["publish_segment_connectivity_failure"] == []
 
 
 async def test_mce_source_missing_bmc_config_fails_non_retryable():
-    calls, mocks = make_mock_activities(bmc_segment=None)
+    calls, mocks = make_mock_activities(bmc_segments=None)
     async with _Harness(mocks) as client:
         with pytest.raises(WorkflowFailureError) as exc_info:
             await _execute(client, OpenSegmentRulesRunArgs(input=MCE_INPUT))
@@ -365,7 +381,7 @@ async def test_mce_source_missing_bmc_config_fails_non_retryable():
     assert isinstance(cause, ApplicationError)
     assert cause.type == "BmcSegmentNotConfiguredError"
     # Non-retryable classification: exactly one attempt.
-    assert len(calls["get_bmc_segment"]) == 1
+    assert len(calls["get_bmc_segments"]) == 1
     assert calls["submit_bmc_open_rules"] == []
     assert calls["submit_open_rules"] == []
     (notice,) = calls["publish_segment_connectivity_failure"]

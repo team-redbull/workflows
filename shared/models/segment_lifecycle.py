@@ -78,14 +78,54 @@ class PeerSegmentsQuery(BaseModel):
     site: str = Field(min_length=1)
 
 
+class BmcVendor(str, Enum):
+    """Server hardware vendor, which is what picks a BMC network.
+
+    Out-of-band management lives on a different /16 per vendor, so a site has
+    TWO BMC networks, not one, and an MCE segment must reach both — an MCE
+    manages whatever hardware happens to sit under it, and nothing at segment
+    level says which vendor that is. NOT a SegmentType: these networks are
+    static config, never Segments-Manager-tracked (see get_bmc_segments).
+    """
+
+    DELL = "dell"
+    CISCO = "cisco"
+
+
+class BmcSegments(BaseModel):
+    """One site's two static BMC networks, keyed by hardware vendor.
+
+    Returned whole rather than one CIDR at a time so a site's BMC config is
+    resolved in ONE activity call: either both networks are configured or the
+    run fails before anything is submitted (a half-open MCE — reaching Dell
+    BMCs but not Cisco ones — is the failure mode worth designing out).
+    """
+
+    dell: str = Field(min_length=1)  # CIDR, e.g. "10.50.0.0/16"
+    cisco: str = Field(min_length=1)
+
+    def pairs(self) -> list[tuple[BmcVendor, str]]:
+        """(vendor, CIDR) in a FIXED order. The workflow fans open-rules
+        activities out over this list, and Temporal replays every run against
+        the same schedule — so the order is part of the contract, not a
+        formatting detail. Never sort or derive it from a dict/set."""
+        return [(BmcVendor.DELL, self.dell), (BmcVendor.CISCO, self.cisco)]
+
+
 class BmcOpenRulesRequest(BaseModel):
-    """One-directional MCE -> BMC firewall-rule request. BMC is not a
-    Segments-Manager-tracked SegmentType — its CIDR is a static,
-    ConfigMap-sourced value per site — so this is a deliberately separate,
-    narrower model from OpenRulesRequest."""
+    """One-directional MCE -> BMC firewall-rule request, for ONE vendor's BMC
+    network. BMC is not a Segments-Manager-tracked SegmentType — its CIDRs are
+    static, ConfigMap-sourced values per site — so this is a deliberately
+    separate, narrower model from OpenRulesRequest.
+
+    `vendor` carries which of the site's two BMC networks this is: the activity
+    layer keys the next-API system_name and the request comment off it, so the
+    two requests an MCE run submits are distinguishable in next's UI.
+    """
 
     mce_segment: str = Field(min_length=1)
     bmc_segment: str = Field(min_length=1)
+    vendor: BmcVendor
 
 
 class NextRequestRef(BaseModel):

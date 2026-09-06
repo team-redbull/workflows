@@ -17,9 +17,10 @@ run.
 
 All four types are implemented: `HC`, `INVENTORY` and `PXE` each peer with same-site
 `MCE` segments, and `MCE` peers with all three of them — symmetric, driven by the
-`PORTS_*` config rather than hardcoded per type. `MCE` segments additionally get one
-mandatory, one-directional rule to their site's static BMC network (not tracked by
-the Segments Manager — see the Flow section below).
+`PORTS_*` config rather than hardcoded per type. `MCE` segments additionally get two
+mandatory, one-directional rules to their site's static BMC networks — one per server
+hardware vendor, Dell and Cisco, which sit on separate /16s (not tracked by the
+Segments Manager — see the Flow section below).
 
 ## Layout
 
@@ -57,11 +58,13 @@ Worker-file naming convention: the workflow (brain) worker is
    `PORTS_*` profiles (e.g. `HC` -> only `MCE`; `MCE` -> `HC` + `INVENTORY` + `PXE`).
 3. `submit_open_rules(...)` x2 per peer segment (both directions), all in parallel.
    Port policy per direction comes from the ConfigMap (`PORTS_HC_TO_MCE`, ...).
-   `MCE` segments additionally get one mandatory, one-directional
-   `submit_bmc_open_rules(...)` toward `get_bmc_segment(site)` — the site's
-   static BMC CIDR from `SITE_NETWORKS` (BMC is not tracked by the
-   Segments Manager, so this is a ConfigMap lookup, never a Segments Manager
-   query, and never peers back).
+   `MCE` segments additionally get two mandatory, one-directional
+   `submit_bmc_open_rules(...)` — one per hardware vendor — toward the two CIDRs
+   `get_bmc_segments(site)` returns: the site's static `dell-bmc` and `cisco-bmc`
+   networks from `SITE_NETWORKS` (BMC is not tracked by the Segments Manager, so
+   this is a ConfigMap lookup, never a Segments Manager query, and never peers
+   back). Both come from ONE lookup, so a site missing either vendor fails before
+   any rule is submitted rather than leaving an MCE half-connected.
 4. `publish_request_ids(segment, ids, submitted_at)` — `PUT /api/segments/segment-connectivity-requests`
    so the Segments Manager UI shows the pending request ids beside the segment's
    status while approval is awaited. `submitted_at` (captured once via
@@ -77,7 +80,7 @@ Worker-file naming convention: the workflow (brain) worker is
 Activity retries are unbounded (transient outages of the Segments Manager or the
 next service are out-waited); only classified deterministic errors — rejected
 segment definition, conflicting existing segment, segment not found, bad API
-token, missing port profile, unconfigured BMC segment, unsupported type,
+token, missing port profile, unconfigured BMC segments, unsupported type,
 unexpected request status — fail the workflow. On such a terminal failure
 (or cancellation) the workflow best-effort clears the pending-ids display and
 publishes a "workflow failed" note beside the segment's status (the segment stays
@@ -123,12 +126,16 @@ segments actually got a workflow.
   compact JSON per protocol; the activity layer expands them into the next API's
   structure and validates the syntax at worker startup. Changing ports = edit the
   ConfigMap + restart the activity workers. No rebuild.
-- **BMC is ConfigMap-only, not Segments-Manager-tracked:** `SITE_NETWORKS` maps
-  site name -> `{pool, bmc}`; this service reads only `bmc` (the Segments Manager
-  owns `pool`). `PORTS_MCE_TO_BMC` is its port policy, same
-  shape as every other `PORTS_*` key. Every `MCE` segment opens exactly one
-  one-directional rule toward it — never the reverse, and never a peer-discovery
-  query.
+- **BMC is ConfigMap-only, not Segments-Manager-tracked, and there are TWO per
+  site:** `SITE_NETWORKS` maps site name -> `{pool, dell-bmc, cisco-bmc}`; this
+  service reads only the two BMC keys (the Segments Manager owns `pool`). Server
+  out-of-band management lives on a different /16 per hardware vendor, and nothing
+  at segment level says which vendor sits under a given MCE — so every `MCE`
+  segment opens exactly one one-directional rule toward EACH, never the reverse,
+  and never a peer-discovery query. Both keys are required: a missing or typo'd one
+  crash-loops the activity worker at startup instead of half-opening connectivity
+  hours into a run. `PORTS_MCE_TO_BMC` is the port policy for both (same IPMI
+  ports, only the destination differs), same shape as every other `PORTS_*` key.
 - **Pydantic data converter** is registered on every `Client.connect` (workers + api).
 - **httpx timeout (10s) < activity start_to_close_timeout (30s)** so a network hang
   frees the worker before Temporal reaps the activity. Each `httpx.AsyncClient` is

@@ -79,7 +79,12 @@ class NextApiError(OrchestratorError):
 
 
 class BmcSegmentNotConfiguredError(OrchestratorError):
-    """No BMC segment is configured for the given site (SITE_NETWORKS).
+    """The site has no BMC networks configured (SITE_NETWORKS).
+
+    A site carries one BMC network per hardware vendor (`dell-bmc`,
+    `cisco-bmc`) and both are required, so this covers the whole entry being
+    absent; a site present but missing one vendor's key never reaches here —
+    it fails the worker at startup instead.
 
     Deterministic — a missing ConfigMap entry never fixes itself, so workflows
     list this type in non_retryable_error_types.

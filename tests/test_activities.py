@@ -20,7 +20,7 @@ from activities.segment_lifecycle.activities import (
     check_next_requests,
     convert_segment_type,
     create_segment,
-    get_bmc_segment,
+    get_bmc_segments,
     get_next_checking_request_interval,
     list_convertible_segments,
     list_peer_segments,
@@ -42,6 +42,7 @@ from shared.exceptions import (
 )
 from shared.models.segment_lifecycle import (
     BmcOpenRulesRequest,
+    BmcVendor,
     ConvertibleSegmentsQuery,
     SegmentConnectivityFailureNotice,
     OpenSegmentRulesInput,
@@ -322,21 +323,39 @@ async def test_submit_open_rules_missing_port_profile_is_non_retryable(env):
     assert exc_info.value.non_retryable is True
 
 
-# --- get_bmc_segment / submit_bmc_open_rules ---
+# --- get_bmc_segments / submit_bmc_open_rules ---
 
 
-async def test_get_bmc_segment_returns_configured_cidr(env):
-    # SITE_NETWORKS from conftest: site-a's bmc is 10.99.0.0/16.
-    assert await env.run(get_bmc_segment, "site-a") == "10.99.0.0/16"
+async def test_get_bmc_segments_returns_both_vendor_cidrs(env):
+    # SITE_NETWORKS from conftest: site-a's dell-bmc/cisco-bmc.
+    segments = await env.run(get_bmc_segments, "site-a")
+    assert segments.dell == "10.98.0.0/16"
+    assert segments.cisco == "10.99.0.0/16"
 
 
-async def test_get_bmc_segment_missing_site_raises(env):
+async def test_get_bmc_segments_pairs_are_in_a_fixed_order(env):
+    """The workflow schedules one activity per pair, and Temporal replays that
+    schedule — so the order is a contract, not a formatting detail."""
+    segments = await env.run(get_bmc_segments, "site-a")
+    assert segments.pairs() == [
+        (BmcVendor.DELL, "10.98.0.0/16"),
+        (BmcVendor.CISCO, "10.99.0.0/16"),
+    ]
+
+
+async def test_get_bmc_segments_missing_site_raises(env):
     with pytest.raises(BmcSegmentNotConfiguredError):
-        await env.run(get_bmc_segment, "site-unknown")
+        await env.run(get_bmc_segments, "site-unknown")
 
 
 @respx.mock
-async def test_submit_bmc_open_rules_builds_one_directional_payload(env):
+@pytest.mark.parametrize(
+    "vendor, system_name",
+    [(BmcVendor.DELL, "dell-bmc"), (BmcVendor.CISCO, "cisco-bmc")],
+)
+async def test_submit_bmc_open_rules_builds_one_directional_payload(
+    env, vendor, system_name
+):
     respx.post(f"{NEXT}/token-renewal-uri").mock(
         return_value=httpx.Response(200, json={"access_token": "tok-1"})
     )
@@ -346,7 +365,9 @@ async def test_submit_bmc_open_rules_builds_one_directional_payload(env):
 
     ref = await env.run(
         submit_bmc_open_rules,
-        BmcOpenRulesRequest(mce_segment="10.0.0.0/24", bmc_segment="10.99.0.0/16"),
+        BmcOpenRulesRequest(
+            mce_segment="10.0.0.0/24", bmc_segment="10.99.0.0/16", vendor=vendor
+        ),
     )
 
     assert ref.id == 99
@@ -358,11 +379,13 @@ async def test_submit_bmc_open_rules_builds_one_directional_payload(env):
     assert payload["properties"]["source"]["addresses"] == [
         {"type": "segment", "segment": "10.0.0.0/24"}
     ]
-    assert payload["properties"]["destination"]["system_name"] == "bmc"
+    # The vendor is what makes the two requests an MCE run submits
+    # distinguishable in next's UI.
+    assert payload["properties"]["destination"]["system_name"] == system_name
     assert payload["properties"]["destination"]["addresses"] == [
         {"type": "segment", "segment": "10.99.0.0/16"}
     ]
-    # PORTS_MCE_TO_BMC from conftest: tcp 623.
+    # One profile covers both vendors. PORTS_MCE_TO_BMC from conftest: tcp 623.
     assert payload["properties"]["ports"] == [
         {"type": "port", "port": 623, "protocol": "TCP"}
     ]

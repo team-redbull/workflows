@@ -49,6 +49,8 @@ from shared.exceptions import (
 )
 from shared.models.segment_lifecycle import (
     BmcOpenRulesRequest,
+    BmcSegments,
+    BmcVendor,
     ClusterFileLocation,
     ClusterValuesAppendRequest,
     ConvertibleSegment,
@@ -92,18 +94,26 @@ _COMMENT_LABELS: dict[SegmentType, str] = {
 }
 
 # BMC is not a SegmentType (it's not Segments-Manager-tracked — see
-# get_bmc_segment), so its labels live outside the SegmentType-keyed dicts
+# get_bmc_segments), so its labels live outside the SegmentType-keyed dicts
 # above rather than stretching those dicts to cover a type that can never be
-# queried, listed, or given as workflow input.
-_BMC_SYSTEM_NAME = "bmc"
-_BMC_COMMENT_LABEL = "BMC"
+# queried, listed, or given as workflow input. They are keyed by hardware
+# VENDOR: a site has one BMC network per vendor, and naming them apart is what
+# makes the two requests an MCE run submits distinguishable in next's UI.
+_BMC_SYSTEM_NAMES: dict[BmcVendor, str] = {
+    BmcVendor.DELL: "dell-bmc",
+    BmcVendor.CISCO: "cisco-bmc",
+}
+_BMC_COMMENT_LABELS: dict[BmcVendor, str] = {
+    BmcVendor.DELL: "Dell BMC",
+    BmcVendor.CISCO: "Cisco BMC",
+}
 
 # Port policy per (source, destination) type pair, straight from the ConfigMap
 # (syntax validated fail-fast at worker startup by SegmentLifecycleActivitySettings).
 # New type pairs: add a PORTS_<SRC>_TO_<DST> settings field + an entry here.
 # Deliberately excludes BMC: _peer_types() derives Segments-Manager-queryable
 # peer types from this dict's keys, and BMC segments are never queryable from
-# the Segments Manager (see get_bmc_segment) — an (MCE, BMC) entry here would
+# the Segments Manager (see get_bmc_segments) — an (MCE, BMC) entry here would
 # make list_peer_segments wrongly try `GET /api/segments?type=BMC`.
 _PORT_PROFILES: dict[tuple[SegmentType, SegmentType], dict[str, list[str]]] = {
     (SegmentType.HC, SegmentType.MCE): _settings.ports_hc_to_mce,
@@ -442,34 +452,40 @@ async def submit_open_rules(request: OpenRulesRequest) -> NextRequestRef:
 
 
 @activity.defn
-async def get_bmc_segment(site: str) -> str:
-    """Return the site's static BMC CIDR from ConfigMap (SITE_NETWORKS).
+async def get_bmc_segments(site: str) -> BmcSegments:
+    """Return the site's two static BMC CIDRs (per hardware vendor) from
+    ConfigMap (SITE_NETWORKS).
 
     A pure config lookup, not an API call: BMC is not a Segments-Manager-
     tracked segment type. SITE_NETWORKS is the shared site topology — the same
     structure the Segments Manager reads `pool` from — so an unknown site here
     means the site is genuinely unconfigured, not that the two drifted apart.
+
+    Both vendors are returned together: SiteNetworks requires both keys, so a
+    site that resolves here is fully configured, and an MCE never ends up with
+    connectivity to one vendor's BMC network but not the other's.
     """
     networks = _settings.site_networks.get(site)
     if networks is None:
         raise BmcSegmentNotConfiguredError(
-            f"No BMC segment configured for site={site} (check SITE_NETWORKS)"
+            f"No BMC segments configured for site={site} (check SITE_NETWORKS)"
         )
-    return networks.bmc
+    return BmcSegments(dell=networks.dell_bmc, cisco=networks.cisco_bmc)
 
 
 @activity.defn
 async def submit_bmc_open_rules(request: BmcOpenRulesRequest) -> NextRequestRef:
-    """Submit the one-directional MCE -> BMC open-rules request
-    (PORTS_MCE_TO_BMC)."""
+    """Submit one one-directional MCE -> BMC open-rules request, for the
+    vendor named on the request (PORTS_MCE_TO_BMC covers both vendors — the
+    ports are the same, only the destination network differs)."""
     return await _submit_next_open_rules(
         source_segment=request.mce_segment,
         source_system_name=_SYSTEM_NAMES[SegmentType.MCE],
         destination_segment=request.bmc_segment,
-        destination_system_name=_BMC_SYSTEM_NAME,
+        destination_system_name=_BMC_SYSTEM_NAMES[request.vendor],
         comment=(
             f"{_COMMENT_LABELS[SegmentType.MCE]}: {request.mce_segment} -> "
-            f"{_BMC_COMMENT_LABEL}: {request.bmc_segment}"
+            f"{_BMC_COMMENT_LABELS[request.vendor]}: {request.bmc_segment}"
         ),
         profile=_settings.ports_mce_to_bmc,
     )

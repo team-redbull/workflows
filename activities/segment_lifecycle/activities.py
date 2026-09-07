@@ -23,6 +23,8 @@ Conventions enforced here:
     start_to_close_timeout (30s). This frees the worker on a network hang
     before Temporal times the activity out, and keeps auth tokens scoped to a
     single invocation (no global leak).
+  * TLS verification is disabled on every client (_TLS_VERIFY) because the
+    airgapped environment's internal CA cannot be injected into this image.
 """
 
 from __future__ import annotations
@@ -79,6 +81,20 @@ _settings = SegmentLifecycleActivitySettings()
 # Must stay strictly below the activity start_to_close_timeout (90s) so a hung
 # connection fails the HTTP call and releases the worker before Temporal reaps it.
 _HTTP_TIMEOUT = httpx.Timeout(60.0)
+
+# TLS verification is OFF for every outbound call this worker makes.
+#
+# The airgapped environment serves its endpoints (starting with the next
+# connectivity service) from an internal CA, and that CA cannot be injected
+# into this pod's trust store — so httpx's default certifi bundle rejects
+# every handshake with CERTIFICATE_VERIFY_FAILED and the retry policy, being
+# unbounded, retries it forever. A deliberate, environment-driven decision
+# recorded in ONE place: flip this to True (and mount a CA bundle, e.g. via
+# SSL_CERT_FILE) the day the certificates can be trusted properly.
+#
+# The git subprocess has its own trust store and is switched off separately —
+# see values_repo._run_git.
+_TLS_VERIFY = False
 
 # STUB — Phase 1: system names / comment labels for the next payload. Replace
 # with real values (or configuration) when the next-service contract is final.
@@ -158,7 +174,9 @@ def _expand_ports(profile: dict[str, list[str]]) -> list[dict]:
 
 def _segments_manager_client() -> httpx.AsyncClient:
     """A fresh, per-invocation client for the Segments Manager."""
-    return httpx.AsyncClient(base_url=_settings.segments_manager_url, timeout=_HTTP_TIMEOUT)
+    return httpx.AsyncClient(
+        base_url=_settings.segments_manager_url, timeout=_HTTP_TIMEOUT, verify=_TLS_VERIFY
+    )
 
 
 def _segments_manager_auth() -> dict[str, str]:
@@ -180,7 +198,9 @@ def _raise_segments_manager_error(action: str, resp: httpx.Response) -> None:
 
 def _next_client() -> httpx.AsyncClient:
     """A fresh, per-invocation client for the next connectivity service."""
-    return httpx.AsyncClient(base_url=_settings.next_url, timeout=_HTTP_TIMEOUT)
+    return httpx.AsyncClient(
+        base_url=_settings.next_url, timeout=_HTTP_TIMEOUT, verify=_TLS_VERIFY
+    )
 
 
 async def _fetch_next_token(client: httpx.AsyncClient) -> str:
@@ -783,7 +803,9 @@ def _dhcp_api_client() -> httpx.AsyncClient:
     needs no credential of its own. Anything that has to WRITE there still needs a
     token — Crossplane does, and holds one per cluster.
     """
-    return httpx.AsyncClient(base_url=_settings.dhcp_api_url, timeout=_HTTP_TIMEOUT)
+    return httpx.AsyncClient(
+        base_url=_settings.dhcp_api_url, timeout=_HTTP_TIMEOUT, verify=_TLS_VERIFY
+    )
 
 
 @activity.defn

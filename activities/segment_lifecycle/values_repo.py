@@ -7,7 +7,9 @@ the real configuration in.
 
 Rules this module enforces:
   * git runs via asyncio.create_subprocess_exec — no new Python dependency,
-    but the limb image must install the git binary (see the Dockerfile).
+    but the limb image must install the git binary (see the Dockerfile). Every command
+    runs with http.sslVerify=false — the airgapped environment's internal CA
+    cannot be injected into this image (see activities._TLS_VERIFY).
   * The push token is injected into the clone URL in memory only
     (https://x-access-token:<token>@...) and NEVER logged: every command echo
     and every error message passes through _redact() BEFORE an exception is
@@ -175,6 +177,13 @@ async def _run_git(args: list[str], *, cwd: Path | None, secrets: list[str]) -> 
     exists (it will be recorded in Temporal history)."""
     process = await asyncio.create_subprocess_exec(
         "git",
+        # TLS verification off, matching the httpx clients (activities._TLS_VERIFY):
+        # git keeps its OWN trust store, so the airgapped environment's
+        # un-injectable internal CA has to be waived here separately. Passed on the
+        # exec line rather than inside `args` so it never appears in the redacted
+        # command echo recorded in Temporal history.
+        "-c",
+        "http.sslVerify=false",
         *args,
         cwd=cwd,
         stdout=asyncio.subprocess.PIPE,

@@ -26,11 +26,15 @@ dev/mock-segment-connectivity/    Test-only stand-in for the external next servi
 helm/mock-segment-connectivity/   The ONLY chart still in this repo (e2e only)
 ```
 
-Prod charts live in their OWN repos (Argo CD, one per service — the ApplicationSet
-derives `helm-charts-<service>` from the service folder name in redbull-platform):
-`helm-charts-workflows-orchestrator` (brain: ONE release for all domains) and
-`helm-charts-segment-lifecycle-worker` (limb: one per domain). CI here bumps their image
-tags cross-repo.
+Prod charts are VENDORED into the Argo CD repo, at
+`redbull-platform/gitops/charts/<service>/`: `workflows-orchestrator` (brain: ONE release for
+all domains) and `segment-lifecycle-worker` (limb: one per domain). One generic ApplicationSet
+sweeps `gitops/services/<service>/app.yaml`, so the service FOLDER NAME is the Argo app name,
+the chart path and the release name at once. There is no per-environment values layer — a
+chart's own `values.yaml` is exactly what the cluster runs — and pushing redbull-platform's
+`main` DEPLOYS. CI here bumps the image tag cross-repo INTO that file. The archived
+`github.com/team-redbull/helm-charts-<service>` repos are the superseded shape: read them for
+nothing, edit them never (GitHub rejects the push anyway — read-only).
 
 - **Workflows and activities are fundamentally separate:** code, deployments, images, task queues,
   RBAC/Secrets. Brain = one lightweight deployment; each `activities/<domain>/` = its own deployment
@@ -54,9 +58,10 @@ tags cross-repo.
   (one dep+cred set: Segments Manager HTTP + bearer token, next HTTP).
 - Keep `shared/interfaces/` signatures clean so an activity (e.g. "unlock segment") can be
   re-registered on another queue by a future sub-workflow without moving code.
-- **Brain is ONE deployment for every domain**, not one per workflow — `helm-charts-workflows-orchestrator` is
-  standalone, deployed once. Each new domain adds `activities/<domain>/` + a `helm-charts-<domain>` chart repo and
-  registers against the already-running brain.
+- **Brain is ONE deployment for every domain**, not one per workflow — the `workflows-orchestrator`
+  chart is standalone, deployed once. Each new domain adds `activities/<domain>/` + a
+  `gitops/charts/<domain>-worker/` chart folder (plus its `gitops/services/` app.yaml) and registers
+  against the already-running brain.
 - **Resource naming — `-worker` names the POD, the bare domain names the DOMAIN.** Brain Deployment +
   ServiceAccount = `workflows-orchestrator`; its trigger API = `workflows-orchestrator-api` (reuses the
   `workflows-orchestrator` SA). Each domain's Deployment + SA is `<domain>-worker` — e.g.
@@ -246,19 +251,21 @@ tags cross-repo.
 
 - Env vars are the config surface (`.env.example` documents them; `.env` gitignored).
 - **ConfigMaps split by scope, not chart-convenience:** `workflows-orchestrator-config` (GLOBAL; owned by the
-  always-present `helm-charts-workflows-orchestrator` brain release) holds only shared values — `TEMPORAL_HOST`,
+  always-present `workflows-orchestrator` brain release) holds only shared values — `TEMPORAL_HOST`,
   `TEMPORAL_NAMESPACE`, `DOMAIN`, `SEGMENTS_MANAGER_URL`. `<domain>-config` (owned by that domain's
   chart) holds its own endpoints/policy — e.g. `segment-lifecycle-config` = `NEXT_*` URIs +
   `PORTS_*` + the allocate-segment keys (`DAY1_REPO_URL/BRANCH`,
-  `DHCP_EXCLUSION_OCTET_RANGES`, `DHCP_API_URL`; tokens in the
-  `day1-git-token` / `dhcp-api-token` Secrets). A domain worker mounts BOTH + its Secrets, so the
+  `DHCP_EXCLUSION_OCTET_RANGES`, `DHCP_API_URL`; credentials in the `day1-git-token` and
+  `next-api-credentials` Secrets — the DHCP scope API needs none, its GETs are anonymous). A
+  domain worker mounts BOTH + its Secrets, so the
   brain release must install before any limb (else `CreateContainerConfigError` on the missing
   global ConfigMap) — and the chart must ship the new keys BEFORE (or with) an image that requires
   them, or the worker crash-loops on its fail-fast settings.
 - **`shared/settings.py`** groups: `TemporalSettings` (workers + api.py) and
   `SegmentLifecycleActivitySettings` (activity worker only). Field names = Helm ConfigMap/Secret keys
-  lowercased — keep aligned with `helm-charts-workflows-orchestrator/templates/config.yaml` (global) and
-  `helm-charts-segment-lifecycle-worker/templates/config.yaml` (connectivity keys + token Secret). Which ConfigMap
+  lowercased — keep aligned with redbull-platform's `gitops/charts/workflows-orchestrator/templates/config.yaml`
+  (global) and `gitops/charts/segment-lifecycle-worker/templates/config.yaml` (connectivity keys +
+  credential Secrets). Which ConfigMap
   a key lives in is INDEPENDENT of which settings class declares it (pydantic reads the flat merged pod
   env — `DOMAIN`/`SEGMENTS_MANAGER_URL` sit in the global ConfigMap yet stay
   `SegmentLifecycleActivitySettings` fields; the brain ignores extras via `extra="ignore"`). Do NOT
@@ -297,8 +304,9 @@ tags cross-repo.
 
 - Three charts, NONE creates a Namespace (all deploy into whichever namespace the release targets —
   `helm install -n <ns> [--create-namespace]`, or redbull-platform's `namespaces` release pre-creates
-  it): `helm-charts-workflows-orchestrator` (ConfigMap + brain + SA), `helm-charts-segment-lifecycle-worker` (ConfigMap + Secret +
-  limb + SA), `helm/mock-segment-connectivity/` (ConfigMap + Deployment + Service + SA) — the last for
+  it): redbull-platform's `gitops/charts/workflows-orchestrator/` (ConfigMap + brain + SA) and
+  `gitops/charts/segment-lifecycle-worker/` (ConfigMap + Secrets + limb + SA), plus this repo's
+  `helm/mock-segment-connectivity/` (ConfigMap + Deployment + Service + SA) — the last for
   e2e/test ONLY, never alongside a prod `segment-lifecycle-worker` release. For a bare kind/uvicorn run
   without a chart, run the mock directly (`uvicorn app:app` in `dev/mock-segment-connectivity/`) and
   point `config.nextUrl` at it.
@@ -311,6 +319,6 @@ tags cross-repo.
   segment has its own dedup id, its own human approval and its own failure), answering 202 with a
   per-item report rather than a single pass/fail code.
 - In-cluster the API is `workflows-orchestrator-api` (ClusterIP:8080) plus an OpenShift **Route**
-  (`workflowsApi.route.*` in helm-charts-workflows-orchestrator) — it needs a hostname because starting a workflow
+  (`workflowsApi.route.*` in the `workflows-orchestrator` chart) — it needs a hostname because starting a workflow
   is now an operator action. NOTE: `workflow_domains/api.py` has NO auth of its own; anyone who can reach
   that hostname can start a workflow. Disable the Route (and port-forward) where that matters.

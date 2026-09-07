@@ -274,11 +274,13 @@ tags cross-repo.
   `DHCP_EXCLUSION_OCTET_RANGES` (a type -> last-octet-ranges map, e.g.
   `{"HC": [[1, 10], [241, 254]]}`) is the whole DHCP surface. Per type because each type reserves a
   different slice of its /24 and the lookup is DYNAMIC (the allocation's type) — a map like
-  `SITE_NETWORKS`, not flat keys like the statically-referenced `PORTS_*`. Only `HC` is required
-  (the only type allocate-segment accepts); every other listed type is validated at startup all the
-  same, so it can be configured ahead of the code that allocates it. A type's list may be EMPTY —
-  that type excludes nothing. The type travels to the activity on `ClusterValuesAppendRequest.type`;
-  `build_dhcp_values` takes ONE type's ranges — the lookup lives in the activity.
+  `SITE_NETWORKS`, not flat keys like the statically-referenced `PORTS_*`. A type that is NOT LISTED
+  excludes nothing — a type earns an entry by reserving part of its /24, and nobody should have to
+  write `MCE: []` to say "nothing". `HC` is the one required key: the only type allocate-segment
+  allocates today, where a forgotten policy would quietly hand out the addresses production reserves
+  instead of failing. Types listed ahead of the code that allocates them are validated the same way
+  now. The type travels to the activity on `ClusterValuesAppendRequest.type`; `build_dhcp_values`
+  takes ONE type's ranges — the lookup lives in the activity.
 - **The written block is NETWORK + EXCLUSIONS, never a distribution range.** `startRange`/`endRange`
   are deliberately omitted: absent both, `dhcp_scope_manager` derives `.1-.253` (stopping short of
   the `.254` gateway it derives for a /24), and the exclusions carve the ends back out of that —

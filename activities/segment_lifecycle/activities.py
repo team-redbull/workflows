@@ -184,9 +184,20 @@ def _next_client() -> httpx.AsyncClient:
 
 
 async def _fetch_next_token(client: httpx.AsyncClient) -> str:
-    """Renew a next API access token; fetched fresh inside every invocation."""
+    """Renew a next API access token; fetched fresh inside every invocation.
+
+    Authenticates with the client id + password from the `next-api-credentials`
+    Secret. Failures here are NextApiError (retryable) — a wrong credential is
+    indistinguishable from an outage at this layer.
+    """
     try:
-        resp = await client.post(_settings.next_token_renewal_uri, json={})
+        resp = await client.post(
+            _settings.next_token_renewal_uri,
+            json={
+                "client_id": _settings.next_client_id,
+                "password": _settings.next_password,
+            },
+        )
     except httpx.HTTPError as exc:
         raise NextApiError(f"Token renewal call failed: {exc}") from exc
     if resp.status_code != 200:
@@ -733,22 +744,14 @@ async def append_allocation_to_cluster_values(
     push. The DhcpValues are derived HERE (the policy lives in this worker's
     config, unreachable from the sandboxed workflow) and returned in both the
     pushed and the already-present case, for the convergence poll."""
-    # The exclusion policy is per segment type — pick this allocation's. The
-    # settings validator guarantees a policy for HC at startup, and the
-    # workflow rejects every other type up front, so a miss here is
-    # unreachable today; it stays a loud non-retryable failure rather than a
-    # KeyError for the day a new type reaches this activity ahead of its
-    # ConfigMap entry.
-    exclusion_octet_ranges = _settings.dhcp_exclusion_octet_ranges.get(request.type)
-    if exclusion_octet_ranges is None:
-        raise ApplicationError(
-            f"No DHCP exclusion policy configured for segment type "
-            f"{request.type.value} (DHCP_EXCLUSION_OCTET_RANGES carries "
-            f"{sorted(t.value for t in _settings.dhcp_exclusion_octet_ranges)})",
-            type="MissingDhcpPolicyForType",
-            non_retryable=True,
-        )
-    dhcp_values = build_dhcp_values(request.segment, exclusion_octet_ranges)
+    # The exclusion policy is per segment type — pick this allocation's. A type
+    # the map does not list excludes NOTHING: an operator lists a type when it
+    # reserves part of its /24 and leaves it out otherwise, rather than writing
+    # an empty list to say "nothing". The block then carries a network alone
+    # and the scope distributes the DHCP API's whole derived .1-.253.
+    dhcp_values = build_dhcp_values(
+        request.segment, _settings.dhcp_exclusion_octet_ranges.get(request.type, [])
+    )
     commit_sha, changed = await values_repo.append_allocation(
         repo_url=_settings.day1_repo_url,
         branch=_settings.day1_branch,

@@ -159,6 +159,14 @@ class SegmentLifecycleActivitySettings(BaseSettings):
     next_open_rules_uri: str = "/open-rules-uri"
     next_check_status_uri: str = "/check-request-status"
 
+    # Credentials next's token-renewal endpoint authenticates with (POSTed as
+    # the renewal body; the access token it returns is what the open-rules and
+    # status calls carry). No code defaults — they live in the
+    # `next-api-credentials` Secret, so a missing one must crash the worker at
+    # startup rather than surface as a 401 mid-workflow.
+    next_client_id: str
+    next_password: str
+
     # The AD group next attributes every open-rules request to (payload
     # `ad_groups`). It names a group in NEXT's own directory, so it is theirs to
     # define and differs per environment — no code default, an operator must set
@@ -229,10 +237,13 @@ class SegmentLifecycleActivitySettings(BaseSettings):
     # segment reserves a different slice of its /24 than an HC one), and the
     # lookup is dynamic (the allocation's type) — the same reason site_networks
     # is a map while the statically-referenced PORTS_* directions are flat keys.
-    # Only HC is REQUIRED: allocate-segment rejects every other type up front,
-    # so demanding a policy for types no run can reach would force operators to
-    # invent config for a code path that does not exist yet. Extra type keys
-    # are allowed and fully validated now, ready for those types.
+    #
+    # A type that is NOT LISTED excludes nothing — a type earns an entry by
+    # reserving part of its /24, and no operator should have to write an empty
+    # list to say "nothing". HC is the one REQUIRED key: it is the only type
+    # allocate-segment allocates today, and a forgotten HC policy would quietly
+    # hand out the addresses production reserves rather than fail. Types listed
+    # ahead of the code that allocates them are validated the same way now.
     dhcp_exclusion_octet_ranges: dict[SegmentType, list[tuple[int, int]]]
     # The DHCP scope API (read-only here: the workflow only ever GETs a scope
     # to observe Crossplane's convergence — it never creates one itself).

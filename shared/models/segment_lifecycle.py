@@ -23,8 +23,8 @@ class SegmentType(str, Enum):
     PXE = "PXE"
 
 
-class OpenSegmentRulesInput(BaseModel):
-    """Input to OpenSegmentRulesWorkflow: the segment to CREATE in the
+class InitializeSegmentInput(BaseModel):
+    """Input to InitializeSegmentWorkflow: the segment to CREATE in the
     Segments Manager, then open firewall rules for.
 
     This workflow is the single entry point for a segment's whole lifecycle —
@@ -196,7 +196,7 @@ class SegmentConnectivityFailureNotice(BaseModel):
     message: str = Field(min_length=1)
 
 
-class OpenSegmentRulesResumeState(BaseModel):
+class InitializeSegmentResumeState(BaseModel):
     """Polling state carried across continue_as_new runs of the workflow."""
 
     request_ids: list[int]
@@ -205,7 +205,7 @@ class OpenSegmentRulesResumeState(BaseModel):
     submitted_at: datetime
 
 
-class OpenSegmentRulesRunArgs(BaseModel):
+class InitializeSegmentRunArgs(BaseModel):
     """The workflow's single argument: public input + internal resume state.
 
     A single-model argument is the Temporal-recommended shape. It also avoids
@@ -215,11 +215,11 @@ class OpenSegmentRulesRunArgs(BaseModel):
     a raw dict instead of a Pydantic model.
     """
 
-    input: OpenSegmentRulesInput
-    resume: OpenSegmentRulesResumeState | None = None
+    input: InitializeSegmentInput
+    resume: InitializeSegmentResumeState | None = None
 
 
-class OpenSegmentRulesProgress(BaseModel):
+class InitializeSegmentProgress(BaseModel):
     """Returned by the workflow's `progress` query (surfaced by the status API)."""
 
     phase: str
@@ -227,7 +227,7 @@ class OpenSegmentRulesProgress(BaseModel):
     pending_requests: int
 
 
-class OpenSegmentRulesResult(BaseModel):
+class InitializeSegmentResult(BaseModel):
     segment: str
     type: SegmentType
     peer_segment_count: int
@@ -257,7 +257,7 @@ class AllocateSegmentInput(BaseModel):
 
 class AllocateSegmentRunArgs(BaseModel):
     """The workflow's single argument (same single-model rule as
-    OpenSegmentRulesRunArgs — typed conversion is silently skipped when
+    InitializeSegmentRunArgs — typed conversion is silently skipped when
     payload count differs from the declared parameter count)."""
 
     input: AllocateSegmentInput
@@ -390,7 +390,7 @@ class AllocateSegmentResult(BaseModel):
 # --- convert-segment --------------------------------------------------------
 # The domain's third workflow: rebalance segment inventory between types by
 # re-typing existing AVAILABLE segments of a source type at a site and
-# re-running the open-segment-rules flow for each (the new type has different
+# re-running the initialize-segment flow for each (the new type has different
 # peers, so connectivity must be re-established). Workflow-scoped models carry
 # the workflow name; models a sibling could reuse (the search query/result and
 # the type-update request, which mirror Segments Manager endpoints) do not.
@@ -421,7 +421,7 @@ class ConvertSegmentInput(BaseModel):
 
 class ConvertSegmentRunArgs(BaseModel):
     """The workflow's single argument (same single-model rule as
-    OpenSegmentRulesRunArgs — typed conversion is silently skipped when
+    InitializeSegmentRunArgs — typed conversion is silently skipped when
     payload count differs from the declared parameter count)."""
 
     input: ConvertSegmentInput
@@ -432,7 +432,7 @@ class ConvertibleSegmentsQuery(BaseModel):
     Status is NOT a parameter — "convertible" MEANS Available, and that rule
     belongs to the activity, not to each caller. Allocated segments are in use;
     Locked ones have no established connectivity and may still have a live
-    open-segment-rules run, which this workflow deliberately never disturbs."""
+    initialize-segment run, which this workflow deliberately never disturbs."""
 
     site: str = Field(min_length=1)
     type: SegmentType
@@ -440,7 +440,7 @@ class ConvertibleSegmentsQuery(BaseModel):
 
 class ConvertibleSegment(BaseModel):
     """One search hit: everything the workflow needs to pick it, convert it,
-    and hand the open-segment-rules child a full OpenSegmentRulesInput —
+    and hand the initialize-segment child a full InitializeSegmentInput —
     without a second read-back.
 
     `status` carries no choice for the workflow (every hit is Available) — it
@@ -481,7 +481,7 @@ class ConvertedSegmentReport(BaseModel):
 
     segment: str
     vlan_id: int
-    open_segment_rules_workflow_id: str
+    initialize_segment_workflow_id: str
     open_rules_status: Literal["started", "already_running"]
 
 

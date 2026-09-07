@@ -1,7 +1,7 @@
 """API-layer models shared by EVERY domain router — never cross the workflow boundary.
 
 A domain router owns the models that describe its own workflows' inputs and
-outcomes (those carry the WORKFLOW name, e.g. BulkOpenSegmentRulesInput). What
+outcomes (those carry the WORKFLOW name, e.g. BulkInitializeSegmentInput). What
 lands here is the opposite: shapes with nothing domain- or workflow-specific
 left in them, so a second domain reuses them instead of redeclaring an
 identical model under its own name.

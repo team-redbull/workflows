@@ -4,7 +4,7 @@ Workflow ids are the dedup key for the whole system (a duplicate trigger while
 running is rejected as already-started), so the scheme for each workflow must
 exist in exactly one place. These builders are needed on BOTH sides of the
 sandbox boundary — the routers build ids to start workflows, and workflows
-build SIBLING ids (convert-segment starts an open-segment-rules run per
+build SIBLING ids (convert-segment starts an initialize-segment run per
 converted segment, as a detached child) — which is why they live here as pure
 string helpers rather than in a router module: a workflow file can never
 import a router (FastAPI inside the sandbox).
@@ -15,8 +15,8 @@ from __future__ import annotations
 from shared.models.segment_lifecycle import SegmentType
 
 
-def open_segment_rules_workflow_id(segment_type: SegmentType, segment: str) -> str:
-    """`open-segment-rules-<TYPE>-<network>`: natural dedup per (type, segment).
+def initialize_segment_workflow_id(segment_type: SegmentType, segment: str) -> str:
+    """`initialize-segment-<TYPE>-<network>`: natural dedup per (type, segment).
 
     Prefixed with the WORKFLOW name, not the domain: a second workflow in this
     domain acting on the same segment (e.g. a future close-segment-rules) must
@@ -28,7 +28,7 @@ def open_segment_rules_workflow_id(segment_type: SegmentType, segment: str) -> s
     regardless of how the mask was written.
     """
     network = segment.split("/", 1)[0]
-    return f"open-segment-rules-{segment_type.value}-{network}"
+    return f"initialize-segment-{segment_type.value}-{network}"
 
 
 def allocate_segment_workflow_id(segment_type: SegmentType, cluster: str) -> str:

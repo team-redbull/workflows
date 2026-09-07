@@ -1,7 +1,7 @@
 """Workflow tests: real ConvertSegmentWorkflow, mock activities, time-skipping env.
 
 Same harness shape as test_allocate_segment_workflow.py — two workers, one per
-queue, exactly like the real brain/limb split. The open-segment-rules children
+queue, exactly like the real brain/limb split. The initialize-segment children
 are REAL workflow starts against the test server (that fan-out is the
 workflow's whole point), but no worker polls their queue: `started` means
 Temporal accepted the run, which is also all the workflow itself claims.
@@ -22,7 +22,7 @@ from temporalio.worker import Worker
 
 from shared.consts import (
     CONVERT_SEGMENT_WORKFLOW_QUEUE,
-    OPEN_SEGMENT_RULES_WORKFLOW_QUEUE,
+    INITIALIZE_SEGMENT_WORKFLOW_QUEUE,
     SEGMENT_LIFECYCLE_ACTIVITY_QUEUE,
 )
 from shared.exceptions import SegmentConversionConflictError
@@ -31,12 +31,12 @@ from shared.models.segment_lifecycle import (
     ConvertibleSegmentsQuery,
     ConvertSegmentInput,
     ConvertSegmentRunArgs,
-    OpenSegmentRulesInput,
-    OpenSegmentRulesRunArgs,
+    InitializeSegmentInput,
+    InitializeSegmentRunArgs,
     SegmentType,
     SegmentTypeUpdate,
 )
-from shared.workflow_ids import open_segment_rules_workflow_id
+from shared.workflow_ids import initialize_segment_workflow_id
 from workflow_domains.segment_lifecycle.convert_segment import (
     ConvertSegmentWorkflow,
     _selection_order,
@@ -166,13 +166,13 @@ async def _execute(client: Client, args: ConvertSegmentRunArgs):
 
 
 async def _prestart_open_rules(client: Client, segment_type: SegmentType, segment: str):
-    """Occupy an open-segment-rules workflow id, exactly as the trigger API
+    """Occupy an initialize-segment workflow id, exactly as the trigger API
     would (no worker polls the queue — the id being taken is all that
     matters)."""
     return await client.start_workflow(
-        "OpenSegmentRulesWorkflow",
-        OpenSegmentRulesRunArgs(
-            input=OpenSegmentRulesInput(
+        "InitializeSegmentWorkflow",
+        InitializeSegmentRunArgs(
+            input=InitializeSegmentInput(
                 segment=segment,
                 type=segment_type,
                 site=SITE,
@@ -180,8 +180,8 @@ async def _prestart_open_rules(client: Client, segment_type: SegmentType, segmen
                 epg_name="EPG_PRIOR",
             )
         ),
-        id=open_segment_rules_workflow_id(segment_type, segment),
-        task_queue=OPEN_SEGMENT_RULES_WORKFLOW_QUEUE,
+        id=initialize_segment_workflow_id(segment_type, segment),
+        task_queue=INITIALIZE_SEGMENT_WORKFLOW_QUEUE,
     )
 
 
@@ -220,9 +220,9 @@ async def test_happy_path_converts_lowest_vlans_and_starts_children():
         # Every reported child run really exists on the test server.
         for report in result.converted:
             description = await client.get_workflow_handle(
-                report.open_segment_rules_workflow_id
+                report.initialize_segment_workflow_id
             ).describe()
-            assert description.id == report.open_segment_rules_workflow_id
+            assert description.id == report.initialize_segment_workflow_id
 
     assert result.matched == 4
     assert result.shortfall == 0
@@ -242,8 +242,8 @@ async def test_happy_path_converts_lowest_vlans_and_starts_children():
         ("10.0.30.0/24", SegmentType.MCE, SegmentType.HC),
     ]
     # Child ids carry the DESTINATION type.
-    assert result.converted[0].open_segment_rules_workflow_id == (
-        "open-segment-rules-MCE-10.0.10.0"
+    assert result.converted[0].initialize_segment_workflow_id == (
+        "initialize-segment-MCE-10.0.10.0"
     )
 
 
@@ -369,6 +369,6 @@ async def test_conversion_conflict_fails_loudly_but_earlier_conversions_stand():
         # query — and that child run exists and proceeds regardless.
         progress = await handle.query(ConvertSegmentWorkflow.progress)
         assert [r.vlan_id for r in progress.converted] == [30]
-        child = progress.converted[0].open_segment_rules_workflow_id
+        child = progress.converted[0].initialize_segment_workflow_id
         description = await client.get_workflow_handle(child).describe()
         assert description.id == child

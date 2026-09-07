@@ -11,7 +11,7 @@ complete, then flips the segment's status `Locked -> Available`.
 then fire a best-effort HTTP trigger at this service — which put creation outside
 Temporal (invisible in the UI, silently skipped whenever that call failed). The
 direction is reversed: callers POST the definition to
-`POST /workflows/segment-lifecycle/open-segment-rules`, and the workflow calls the
+`POST /workflows/segment-lifecycle/initialize-segment`, and the workflow calls the
 Segments Manager itself. Every step of a segment's life is now one durable, replayable
 run.
 
@@ -32,7 +32,7 @@ shared/                           Contract layer (temporalio + pydantic only)
   interfaces/segment_lifecycle.py Activity signatures (no bodies)
   settings.py / exceptions.py / consts.py / logging_config.py
 workflow_domains/                 The brain — one folder per domain, plus main_worker_init.py + api.py
-  segment_lifecycle/              OpenSegmentRulesWorkflow + that domain's router.py
+  segment_lifecycle/              InitializeSegmentWorkflow + that domain's router.py
   routers/                        What no domain owns: deps, shared models, runs.py (status)
 activities/segment_lifecycle/     The limb (activity impls + worker_init.py)
 dev/mock-segment-connectivity/    LOCAL-DEV stand-in for the next service (black box)
@@ -89,7 +89,7 @@ unexpected request status — fail the workflow. On such a terminal failure
 publishes a "workflow failed" note beside the segment's status (the segment stays
 Locked; best-effort — the note endpoint exists in the Segments Manager).
 
-The trigger is async: `POST /workflows/segment-lifecycle/open-segment-rules` returns
+The trigger is async: `POST /workflows/segment-lifecycle/initialize-segment` returns
 **202 + workflow id** immediately; poll `GET /workflows/runs/{workflow_id}` for
 phase/pending counts (workflow query) and the final result. Because creation happens
 inside the workflow, an invalid definition surfaces as a FAILED run on that status
@@ -97,14 +97,14 @@ endpoint, not as a 4xx on the trigger.
 
 ### Paths: `/workflows/<domain>/<workflow>`, status on `/workflows/runs`
 
-A domain holds MANY workflows, so it is never itself an endpoint — `open-segment-rules`
+A domain holds MANY workflows, so it is never itself an endpoint — `initialize-segment`
 owns its own path under the `segment-lifecycle` prefix, and a sibling (say a future
 `close-segment-rules`) is then just another route. Status is deliberately NOT under the
 domain: Temporal workflow ids are globally unique, so one `GET /workflows/runs/{id}`
 serves every domain — and a `{workflow_id}` catch-all under the domain prefix would
 swallow every sibling workflow's path.
 
-`POST /workflows/segment-lifecycle/open-segment-rules/bulk` takes `{"segments": [...]}` and starts
+`POST /workflows/segment-lifecycle/initialize-segment/bulk` takes `{"segments": [...]}` and starts
 **one workflow per segment** — each gets its own deterministic id, its own
 independently-approved firewall requests, and its own failure, so a bad row can
 neither delay nor fail the others. It always answers 202 with a per-item report
@@ -151,7 +151,7 @@ segments actually got a workflow.
 - **Idempotency:** unlock treats "already unlocked" as success; re-submitting
   identical open-rules requests converges to the same firewall state;
   `publish_request_ids` is a replace-style PUT (re-sends are a no-op); workflow ids
-  are deterministic (`open-segment-rules-<TYPE>-<segment network address, CIDR mask
+  are deterministic (`initialize-segment-<TYPE>-<segment network address, CIDR mask
   dropped>`), so a duplicate trigger while running gets HTTP 409.
 
 ## Run locally
@@ -175,10 +175,10 @@ PYTHONPATH=. python -m activities.segment_lifecycle.worker_init &
 pip install -r requirements.txt
 PYTHONPATH=. uvicorn workflow_domains.api:app --port 8080
 # Swagger UI: http://localhost:8080/docs
-# curl -X POST localhost:8080/workflows/segment-lifecycle/open-segment-rules \
+# curl -X POST localhost:8080/workflows/segment-lifecycle/initialize-segment \
 #   -H 'content-type: application/json' \
 #   -d '{"segment":"130.154.20.0/24","type":"HC","site":"site1","vlan_id":100,"epg_name":"EPG_PROD_01"}'
-# curl localhost:8080/workflows/runs/open-segment-rules-HC-130.154.20.0
+# curl localhost:8080/workflows/runs/initialize-segment-HC-130.154.20.0
 ```
 
 Inspect runs in the Temporal UI and verify the segment's `status` in the manager:

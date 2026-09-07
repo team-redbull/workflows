@@ -18,7 +18,7 @@ from shared.models.segment_lifecycle import (
     ConvertibleSegmentsQuery,
     DhcpScopeState,
     SegmentConnectivityFailureNotice,
-    OpenSegmentRulesInput,
+    InitializeSegmentInput,
     NextRequestRef,
     SegmentAllocation,
     SegmentAllocationRequest,
@@ -33,7 +33,7 @@ from shared.models.segment_lifecycle import (
 
 
 @activity.defn
-async def create_segment(rules_input: OpenSegmentRulesInput) -> None:
+async def create_segment(rules_input: InitializeSegmentInput) -> None:
     """Create the segment in the Segments Manager (POST /api/segments).
 
     Step 1 of the workflow, and the reason the workflow owns the whole
@@ -242,7 +242,7 @@ async def list_convertible_segments(
     converted: status Available ONLY (GET /api/segments filtered by
     site+type+status, all server-side). Allocated segments are in use;
     Locked ones have no established connectivity and may still have a live
-    open-segment-rules run, which convert-segment deliberately never disturbs.
+    initialize-segment run, which convert-segment deliberately never disturbs.
 
     Read-only and unordered by policy: WHICH hits to convert (lowest vlan
     first) is the workflow's decision, made deterministically from this
@@ -257,7 +257,7 @@ async def convert_segment_type(update: SegmentTypeUpdate) -> None:
     (PUT /api/segments/type). The manager re-locks the segment and clears the
     old type's segment-connectivity fields (pending request ids + any stale
     failure note) in the same atomic update — the converted segment is reset
-    to born-Locked, ready for its open-segment-rules re-run.
+    to born-Locked, ready for its initialize-segment re-run.
 
     Idempotent server-side: a retried call finds the type already set and
     converges (an Allocated segment is never re-locked by a stale repeat).

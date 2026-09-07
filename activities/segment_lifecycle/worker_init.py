@@ -60,7 +60,7 @@ async def main() -> None:
         client,
         task_queue=SEGMENT_LIFECYCLE_ACTIVITY_QUEUE,
         activities=[
-            # open-segment-rules
+            # initialize-segment
             create_segment,
             list_peer_segments,
             submit_open_rules,

@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>convert-segment — Redbull Workflows</title>
-<meta name="description" content="The convert-segment workflow: re-type Available segments of a source type at a site, clear their stale firewall request ids, and start an open-segment-rules run per converted segment.">
+<meta name="description" content="The convert-segment workflow: re-type Available segments of a source type at a site, clear their stale firewall request ids, and start an initialize-segment run per converted segment.">
 <link rel="icon" href="/assets/favicon.svg?v=__DOC_VERSION__" type="image/svg+xml">
 <link rel="stylesheet" href="/assets/site.css?v=__DOC_VERSION__">
 </head>
@@ -45,12 +45,12 @@
       One request — <b>site, source type, destination type, quantity</b> — rebalances segment inventory between
       types. The workflow finds up to <code>quantity</code> <b>Available</b> segments of the source type
       at the site, re-types each one in the Segments Manager (which re-locks it and clears the old type's pending
-      firewall request ids), and starts one <a href="/segment-lifecycle/open-segment-rules.html">open-segment-rules</a>
+      firewall request ids), and starts one <a href="/segment-lifecycle/initialize-segment.html">initialize-segment</a>
       run per converted segment — the new type has different peers, so connectivity is re-established from scratch.
     </p>
     <p class="lede">Fewer matching segments than requested is <em>not</em> an error: the run converts what exists
     and reports the <b>shortfall</b> in its result. <b>Available only</b> is deliberate: Allocated segments are
-    in use, and Locked ones may still have a live open-segment-rules run — re-typing under it would mean
+    in use, and Locked ones may still have a live initialize-segment run — re-typing under it would mean
     cancelling it, which this workflow never does. See <a href="#available-only">why</a>.</p>
     <div class="facts">
       <div class="fact"><span class="k">Trigger</span><span class="v">POST /workflows/segment-lifecycle/convert-segment</span></div>
@@ -67,16 +67,16 @@
   <section id="flow">
     <div class="sec-head">
       <div class="eyebrow">The run, step by step</div>
-      <h2>From “convert N segments” to “N open-segment-rules runs are on their way”</h2>
+      <h2>From “convert N segments” to “N initialize-segment runs are on their way”</h2>
       <p class="lede">Three stages plus a per-segment loop. The parent <b>never waits for the firewall
-      approvals</b>: each converted segment gets its own detached open-segment-rules run — its own workflow id,
+      approvals</b>: each converted segment gets its own detached initialize-segment run — its own workflow id,
       its own human approval, its own failure — exactly like the bulk trigger route, and the parent completes
       with a fan-out report.</p>
     </div>
 
     <div class="diagram rail">
       <svg viewBox="0 0 1060 330" role="img"
-           aria-label="Horizontal flow: an operator posts site, source type, destination type and quantity; the workflow validates the site, searches and selects Available segments, then loops per segment — convert the type in the Segments Manager, start the destination-type open-segment-rules run as a detached child — and completes with a report including any shortfall.">
+           aria-label="Horizontal flow: an operator posts site, source type, destination type and quantity; the workflow validates the site, searches and selects Available segments, then loops per segment — convert the type in the Segments Manager, start the destination-type initialize-segment run as a detached child — and completes with a report including any shortfall.">
         <defs>
           <marker id="ah-n"   viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0.5 L8,4 L0,7.5 Z"/></marker>
           <marker id="ah-nxt" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0.5 L8,4 L0,7.5 Z"/></marker>
@@ -215,10 +215,10 @@
         <div class="marker">3b</div>
         <div class="card">
           <div class="card-title">
-            <h3>Start open-segment-rules, detached</h3>
+            <h3>Start initialize-segment, detached</h3>
             <span class="phase">phase <b>converting-segments</b></span>
           </div>
-          <p>The replacement run — <code>open-segment-rules-&lt;DEST&gt;-&lt;network&gt;</code> — starts as a
+          <p>The replacement run — <code>initialize-segment-&lt;DEST&gt;-&lt;network&gt;</code> — starts as a
           <b>detached child workflow</b> (<code>ParentClosePolicy.ABANDON</code>): it survives however this
           parent ends, because it answers to its own id, its own human approval and its own failure, exactly as
           if the bulk route had started it. Its <code>create_segment</code> first step accepts the existing
@@ -293,7 +293,7 @@
   "workflow_type": "ConvertSegmentWorkflow", "status": "RUNNING",
   "progress": { "phase": "converting-segments", "matched": 2, "selected": 2,
                 "converted": [ { "segment": "130.154.20.0/24", "vlan_id": 23,
-                                 "open_segment_rules_workflow_id": "open-segment-rules-MCE-130.154.20.0",
+                                 "initialize_segment_workflow_id": "initialize-segment-MCE-130.154.20.0",
                                  "open_rules_status": "started" } ] } }
 
 <span class="c">// COMPLETED — quantity was 3, only 2 matched</span>
@@ -344,7 +344,7 @@
       <div class="panel" id="available-only">
         <h3>Why Available only — and what it costs</h3>
         <p style="font-size:var(--fs-14);color:var(--ink-2)">A <b>Locked</b> segment has no established
-        connectivity and may still have a <em>live</em> <code>open-segment-rules-&lt;SRC&gt;-&lt;network&gt;</code>
+        connectivity and may still have a <em>live</em> <code>initialize-segment-&lt;SRC&gt;-&lt;network&gt;</code>
         run. Re-typing it underneath that run would leave the old run fighting the replacement over the
         request-ids display (replace semantics, keyed by CIDR) and wrongly <em>unlocking</em> the segment when the
         old approval finally lands. Handling that means cancelling the sibling and waiting out its cleanup.</p>
@@ -354,9 +354,9 @@
         the source — every match is a segment whose own run has <em>completed</em>, since that completion is what
         unlocked it. No cancellation, no grace pause, no stale-note race, and not a single timer in the loop.</p>
         <p style="font-size:var(--fs-14);color:var(--ink-2)"><b>The cost, stated plainly:</b> a Locked segment
-        cannot be re-typed by this workflow at all — including one whose open-segment-rules run failed terminally,
+        cannot be re-typed by this workflow at all — including one whose initialize-segment run failed terminally,
         which stays Locked by design. Such a segment is neither allocatable nor convertible; re-driving it through
-        <a href="/segment-lifecycle/open-segment-rules.html">open-segment-rules</a> for its current type is the
+        <a href="/segment-lifecycle/initialize-segment.html">initialize-segment</a> for its current type is the
         way back.</p>
       </div>
     </div>

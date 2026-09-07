@@ -6,7 +6,7 @@ describes any run started by any domain router.
 
 Keeping it out of the domain routers is also what makes a domain hold several
 workflows. A `GET /workflows/<domain>/{workflow_id}` catch-all swallows every
-sibling's path segment — with `open-segment-rules` and a future
+sibling's path segment — with `initialize-segment` and a future
 `close-segment-rules` under the same domain, `GET
 /workflows/segment-lifecycle/close-segment-rules` is a status lookup for a
 workflow id that happens to be spelled like a route.
@@ -47,7 +47,7 @@ _TERMINAL_FAILURE_STATUSES = (
 
 class WorkflowRunStatusResponse(BaseModel):
     workflow_id: str
-    workflow_type: str  # e.g. "OpenSegmentRulesWorkflow" — which workflow this id belongs to
+    workflow_type: str  # e.g. "InitializeSegmentWorkflow" — which workflow this id belongs to
     status: str  # RUNNING / COMPLETED / FAILED / TERMINATED / ...
     progress: dict[str, Any] | None = None  # workflow query — while RUNNING, and after a failure/cancellation
     result: Any | None = None  # when COMPLETED

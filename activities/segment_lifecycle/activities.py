@@ -61,7 +61,7 @@ from shared.models.segment_lifecycle import (
     DhcpExclusion,
     DhcpScopeState,
     SegmentConnectivityFailureNotice,
-    OpenSegmentRulesInput,
+    InitializeSegmentInput,
     NextRequestRef,
     SegmentAllocation,
     SegmentAllocationRequest,
@@ -254,7 +254,7 @@ def _segments_manager_detail(resp: httpx.Response) -> str:
 
 async def _accept_existing_segment(
     client: httpx.AsyncClient,
-    rules_input: OpenSegmentRulesInput,
+    rules_input: InitializeSegmentInput,
     create_resp: httpx.Response,
 ) -> None:
     """Resolve a rejected create: idempotent replay, or a real failure?
@@ -309,7 +309,7 @@ async def _accept_existing_segment(
 
 
 @activity.defn
-async def create_segment(rules_input: OpenSegmentRulesInput) -> None:
+async def create_segment(rules_input: InitializeSegmentInput) -> None:
     """Create the segment in the Segments Manager (born Locked).
 
     Idempotent: see _accept_existing_segment — a create rejected because the
@@ -899,7 +899,7 @@ async def publish_segment_connectivity_failure(notice: SegmentConnectivityFailur
 # The ONE status a segment may be converted from. "Allocated" is excluded by
 # definition (in use by a cluster). "Locked" is excluded by policy: its
 # connectivity is not established, so it may still have a LIVE
-# open-segment-rules run — converting it would mean cancelling that run, and
+# initialize-segment run — converting it would mean cancelling that run, and
 # this workflow deliberately does not go there (see convert_segment.py).
 _CONVERTIBLE_STATUS = "Available"
 

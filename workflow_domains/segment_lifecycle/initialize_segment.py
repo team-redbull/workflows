@@ -1,4 +1,4 @@
-"""open-segment-rules — creates a segment in the Segments Manager, opens its
+"""initialize-segment — creates a segment in the Segments Manager, opens its
 firewall rules via the next API, then flips it Locked -> Available.
 
 The FIRST workflow of the `segment-lifecycle` domain, named for what it does
@@ -76,13 +76,13 @@ with workflow.unsafe.imports_passed_through():
         BmcRuleDirection,
         BmcSegments,
         SegmentConnectivityFailureNotice,
-        OpenSegmentRulesInput,
-        OpenSegmentRulesProgress,
+        InitializeSegmentInput,
+        InitializeSegmentProgress,
         NextRequestRef,
         SegmentConnectivityRequestsUpdate,
-        OpenSegmentRulesResult,
-        OpenSegmentRulesResumeState,
-        OpenSegmentRulesRunArgs,
+        InitializeSegmentResult,
+        InitializeSegmentResumeState,
+        InitializeSegmentRunArgs,
         OpenRulesRequest,
         PeerSegmentsQuery,
         SegmentRef,
@@ -147,23 +147,23 @@ _CONTINUE_AS_NEW_AFTER = timedelta(hours=48)
 
 
 @workflow.defn
-class OpenSegmentRulesWorkflow:
+class InitializeSegmentWorkflow:
     def __init__(self) -> None:
         self._phase = "pending"
         self._total_requests = 0
         self._pending_request_ids: list[int] = []
 
     @workflow.query
-    def progress(self) -> OpenSegmentRulesProgress:
+    def progress(self) -> InitializeSegmentProgress:
         """Cheap progress surface for the async caller (GET status endpoint)."""
-        return OpenSegmentRulesProgress(
+        return InitializeSegmentProgress(
             phase=self._phase,
             total_requests=self._total_requests,
             pending_requests=len(self._pending_request_ids),
         )
 
     @workflow.run
-    async def run(self, run_args: OpenSegmentRulesRunArgs) -> OpenSegmentRulesResult:
+    async def run(self, run_args: InitializeSegmentRunArgs) -> InitializeSegmentResult:
         rules_input = run_args.input
         resume = run_args.resume
         if resume is None:
@@ -206,9 +206,9 @@ class OpenSegmentRulesWorkflow:
 
     async def _run_created(
         self,
-        rules_input: OpenSegmentRulesInput,
-        resume: OpenSegmentRulesResumeState | None,
-    ) -> OpenSegmentRulesResult:
+        rules_input: InitializeSegmentInput,
+        resume: InitializeSegmentResumeState | None,
+    ) -> InitializeSegmentResult:
         if resume is None:
             state = await self._open_rules(rules_input)
         else:
@@ -244,9 +244,9 @@ class OpenSegmentRulesWorkflow:
                     len(pending_request_ids),
                 )
                 workflow.continue_as_new(
-                    OpenSegmentRulesRunArgs(
+                    InitializeSegmentRunArgs(
                         input=rules_input,
-                        resume=OpenSegmentRulesResumeState(
+                        resume=InitializeSegmentResumeState(
                             request_ids=request_ids,
                             pending_request_ids=pending_request_ids,
                             peer_segment_count=state.peer_segment_count,
@@ -293,7 +293,7 @@ class OpenSegmentRulesWorkflow:
             rules_input.segment,
             len(request_ids),
         )
-        return OpenSegmentRulesResult(
+        return InitializeSegmentResult(
             segment=rules_input.segment,
             type=rules_input.type,
             peer_segment_count=state.peer_segment_count,
@@ -301,8 +301,8 @@ class OpenSegmentRulesWorkflow:
         )
 
     async def _open_rules(
-        self, rules_input: OpenSegmentRulesInput
-    ) -> OpenSegmentRulesResumeState:
+        self, rules_input: InitializeSegmentInput
+    ) -> InitializeSegmentResumeState:
         """Step 2 of a fresh run: list peers, fan out submissions, publish ids.
 
         The site is taken straight from the input rather than read back from
@@ -419,7 +419,7 @@ class OpenSegmentRulesWorkflow:
             rules_input.segment, request_ids, submitted_at
         )
 
-        return OpenSegmentRulesResumeState(
+        return InitializeSegmentResumeState(
             request_ids=request_ids,
             pending_request_ids=list(request_ids),
             peer_segment_count=len(peer_segments),
@@ -454,7 +454,7 @@ class OpenSegmentRulesWorkflow:
         # Names the WORKFLOW, not the domain: the endpoint and the UI display
         # are domain-level and shared, so the message is the only thing telling
         # an operator which of the domain's workflows died on this segment.
-        message = f"open-segment-rules workflow failed: {reason}"
+        message = f"initialize-segment workflow failed: {reason}"
         if self._pending_request_ids:
             message += f" (orphaned next request ids: {self._pending_request_ids})"
         try:

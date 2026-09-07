@@ -24,7 +24,7 @@ _NOT_FOUND = RPCError("not found", RPCStatusCode.NOT_FOUND, b"")
 class _FakeDescription:
     def __init__(self, status: WorkflowExecutionStatus | None) -> None:
         self.status = status
-        self.workflow_type = "OpenSegmentRulesWorkflow"
+        self.workflow_type = "InitializeSegmentWorkflow"
 
 
 class _FakeHandle:
@@ -86,12 +86,12 @@ def test_running_reports_live_progress(make_client):
         WorkflowExecutionStatus.RUNNING,
         progress={"phase": "awaiting-completion", "total_requests": 4, "pending_requests": 2},
     )
-    response = make_client(handle).get("/workflows/runs/open-segment-rules-HC-10.0.0.0")
+    response = make_client(handle).get("/workflows/runs/initialize-segment-HC-10.0.0.0")
 
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == "RUNNING"
-    assert body["workflow_type"] == "OpenSegmentRulesWorkflow"
+    assert body["workflow_type"] == "InitializeSegmentWorkflow"
     assert body["progress"]["pending_requests"] == 2
 
 
@@ -114,7 +114,7 @@ def test_completed_returns_the_result(make_client):
         WorkflowExecutionStatus.COMPLETED,
         result={"segment": "10.0.0.0/24", "request_ids": [1, 2]},
     )
-    response = make_client(handle).get("/workflows/runs/open-segment-rules-HC-10.0.0.0")
+    response = make_client(handle).get("/workflows/runs/initialize-segment-HC-10.0.0.0")
 
     assert response.json()["result"]["request_ids"] == [1, 2]
 
@@ -126,7 +126,7 @@ def test_failed_surfaces_the_root_cause(make_client):
         cause=ApplicationError("Segment 10.0.0.0/24 not found", type="SegmentNotFoundError")
     )
     handle = _FakeHandle(WorkflowExecutionStatus.FAILED, result_error=failure)
-    response = make_client(handle).get("/workflows/runs/open-segment-rules-HC-10.0.0.0")
+    response = make_client(handle).get("/workflows/runs/initialize-segment-HC-10.0.0.0")
 
     body = response.json()
     assert body["status"] == "FAILED"

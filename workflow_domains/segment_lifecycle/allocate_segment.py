@@ -48,7 +48,7 @@ when they arrive.
 On cancellation there is deliberately no compensating cleanup: the
 allocation is kept (a re-run idempotently reclaims it and converges the git
 write), and this workflow has no external pending-display to clear — the
-open-segment-rules failure-note machinery has no counterpart here.
+initialize-segment failure-note machinery has no counterpart here.
 """
 
 from __future__ import annotations
@@ -80,7 +80,7 @@ with workflow.unsafe.imports_passed_through():
         SegmentType,
     )
 
-# Same budget rules as open-segment-rules: bounded attempts (with the HTTP
+# Same budget rules as initialize-segment: bounded attempts (with the HTTP
 # client timing out below), UNBOUNDED retries so transient outages are
 # out-waited, and every known-permanent error classified. Git activities
 # (clone + push) get a larger per-attempt budget.
@@ -104,7 +104,7 @@ _RETRY_POLICY = RetryPolicy(
 )
 
 # The DHCP wait is machine convergence (Argo sync + Crossplane's ~60s
-# reconcile), not human approval — so unlike open-segment-rules it gets a
+# reconcile), not human approval — so unlike initialize-segment it gets a
 # real deadline. Changing either constant is a non-deterministic change for
 # in-flight runs.
 _DHCP_POLL_INTERVAL = timedelta(seconds=15)

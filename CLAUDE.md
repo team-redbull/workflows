@@ -76,16 +76,16 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   ConfigMap (`<domain>-config`), `shared/models|interfaces/<domain>.py`, and the API PREFIX
   `/workflows/<domain>` — NOT the limb Deployment/SA, which are the process and take `-worker` per
   the rule above. Anything belonging to ONE workflow is named after the WORKFLOW: its module
-  (`workflow_domains/segment_lifecycle/open_segment_rules.py`), its class, its own task queue
-  (`open-segment-rules-workflow`), its workflow ids (`open-segment-rules-<TYPE>-<network>`), its
+  (`workflow_domains/segment_lifecycle/initialize_segment.py`), its class, its own task queue
+  (`initialize-segment-workflow`), its workflow ids (`initialize-segment-<TYPE>-<network>`), its
   RunArgs/ResumeState/Progress/Result models, and its ROUTE under the domain prefix. Workflow ids
   MUST carry the workflow name — two workflows acting on the same segment would otherwise collide on
   one id — and the segment TYPE: allocation is scoped per (cluster, site, type), so
   `allocate-segment-<TYPE>-<cluster>` without the type would make two legitimate allocations of one
-  cluster collide. The domain currently holds THREE workflows (`open-segment-rules`,
+  cluster collide. The domain currently holds THREE workflows (`initialize-segment`,
   `allocate-segment`, `convert-segment`), each on its own workflow queue, sharing the one limb
   deployment. Id builders live in `shared/workflow_ids.py` — ONE definition per scheme, importable
-  from both routers and workflow code (convert-segment builds open-segment-rules ids to start its
+  from both routers and workflow code (convert-segment builds initialize-segment ids to start its
   replacement runs; a workflow file can never import a router, FastAPI ≠ sandbox-safe).
 - **API paths are `/workflows/<domain>/<workflow>`; status is `/workflows/runs/{workflow_id}`.** A
   domain is a prefix, never an endpoint: the bare `/workflows/<domain>` must stay free, or the first
@@ -109,7 +109,7 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
 ## 4. External dependencies are black boxes
 
 - **The workflow is the ENTRY POINT; the Segments Manager is a dependency, never a trigger.** A
-  caller POSTs the full segment DEFINITION to `POST /workflows/segment-lifecycle/open-segment-rules` and the workflow
+  caller POSTs the full segment DEFINITION to `POST /workflows/segment-lifecycle/initialize-segment` and the workflow
   creates the segment itself (`create_segment`, step 1) before opening any rules. The reverse used to
   be true — the Segments Manager created the segment then fired a best-effort HTTP trigger at us —
   which left creation outside Temporal: invisible in the UI and silently skipped whenever that call
@@ -129,7 +129,7 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   replace semantics), republishes whenever the pending set shrinks; the final EMPTY list removes the
   display (behind the UI's "Requests ID" button), then the segment unlocks. `workflow.now()` is
   captured once at submission (`_open_rules`) and sent as `submitted_at` on every publish (incl.
-  republishes and across `continue_as_new`, via `OpenSegmentRulesResumeState.submitted_at`) for
+  republishes and across `continue_as_new`, via `InitializeSegmentResumeState.submitted_at`) for
   the UI's elapsed-time popover.
 - **Terminal failure is surfaced, not silent:** on a post-validation non-retryable failure or
   cancellation, best-effort `publish_segment_connectivity_failure` clears the pending-ids display and
@@ -169,11 +169,11 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
 - **Single-model workflow argument only:** typed conversion is silently SKIPPED when payload count ≠
   declared `run()` param count (a `run(input, resume=None)` started with one payload gets a raw dict).
   Give `run()` exactly ONE Pydantic arg, wrapping extra/internal state (e.g.
-  `OpenSegmentRulesRunArgs{input, resume}`).
+  `InitializeSegmentRunArgs{input, resume}`).
 - **Polling loops:** `workflow.sleep(...)` is a durable replay-safe server-side timer (never
   `time.sleep`). For unbounded waits, back off to a capped interval and `continue_as_new` every N
   cycles so history stays bounded. Changing poll constants is a non-deterministic change for in-flight runs.
-  Bounded vs unbounded is a MEANING, not a style: HUMAN approval (open-segment-rules' next requests)
+  Bounded vs unbounded is a MEANING, not a style: HUMAN approval (initialize-segment's next requests)
   gets no deadline ever; MACHINE convergence (allocate-segment's DHCP scope — Argo sync + Crossplane
   reconcile) gets a real deadline (15 min, 15s durable timer) and fails loudly (`DhcpScopeNotConverged`).
 - **httpx timeout < activity `start_to_close_timeout`** (currently 60s < 90s): give every
@@ -199,7 +199,7 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   already-CLOSED execution and reports it accepted, failing only for an id that has NEVER existed. So
   `cancel()` cannot distinguish "killed a live sibling" from "no-op'd against one that finished days
   ago", and the answer FLIPS once the closed run ages out of retention. convert-segment used to
-  cancel the stale `open-segment-rules-<SRC>-<network>` run before re-typing a segment; it now selects
+  cancel the stale `initialize-segment-<SRC>-<network>` run before re-typing a segment; it now selects
   `Available` segments ONLY, whose own run has by definition COMPLETED (that completion is what
   unlocked them), so no cancel, no post-cancel grace pause and no stale-cleanup race exist at all.
   Narrowing the input to eliminate the interaction beat every attempt to detect it — the version that
@@ -229,8 +229,8 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   (`get_segment`: status/cluster/vlan must all match) BEFORE the git write, so the values repo can
   never record a vlan the Segments Manager does not confirm. A mutation whose outcome another system
   will act on gets a read-back check between the mutation and the recording.
-- Workflow IDs are deterministic (`open-segment-rules-<TYPE>-<network address, CIDR mask dropped>`,
-  e.g. `open-segment-rules-HC-130.154.20.0`; `allocate-segment-<TYPE>-<cluster>`;
+- Workflow IDs are deterministic (`initialize-segment-<TYPE>-<network address, CIDR mask dropped>`,
+  e.g. `initialize-segment-HC-130.154.20.0`; `allocate-segment-<TYPE>-<cluster>`;
   `convert-segment-<site>-<SRC>-to-<DEST>`) for natural dedup — a duplicate trigger while running
   gets HTTP 409 (in the bulk route, an `already_running` item). Builders in `shared/workflow_ids.py`.
 - **Cross-workflow idempotency via compare-and-set:** convert-segment's `convert_segment_type`
@@ -313,7 +313,7 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
 - Assumed already running: a Temporal server and the Segments Manager (via OpenShift routes or
   localhost — no port assumptions in code).
 - Trigger via the unified API: `uvicorn workflow_domains.api:app --port 8080`, Swagger at `/docs`.
-  `POST /workflows/segment-lifecycle/open-segment-rules` is ASYNC (202 + workflow id) and takes
+  `POST /workflows/segment-lifecycle/initialize-segment` is ASYNC (202 + workflow id) and takes
   the full segment definition; poll `GET /workflows/runs/{workflow_id}` for progress/result. The
   `/bulk` variant takes a list and starts ONE WORKFLOW PER SEGMENT (never one batch workflow — each
   segment has its own dedup id, its own human approval and its own failure), answering 202 with a

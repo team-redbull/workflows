@@ -10,7 +10,7 @@ Activities are NOT registered here: they run in their own per-domain deployment
 on a separate queue (see activities/segment_lifecycle/worker_init.py).
 
 Connects with the Pydantic data converter so that Pydantic models
-(OpenSegmentRulesInput, OpenSegmentRulesResult, ...) serialize correctly across the
+(InitializeSegmentInput, InitializeSegmentResult, ...) serialize correctly across the
 workflow boundary.
 """
 
@@ -27,7 +27,7 @@ from temporalio.worker import Worker
 from shared.consts import (
     ALLOCATE_SEGMENT_WORKFLOW_QUEUE,
     CONVERT_SEGMENT_WORKFLOW_QUEUE,
-    OPEN_SEGMENT_RULES_WORKFLOW_QUEUE,
+    INITIALIZE_SEGMENT_WORKFLOW_QUEUE,
 )
 from shared.logging_config import configure_logging
 from shared.settings import TemporalSettings
@@ -38,8 +38,8 @@ from workflow_domains.segment_lifecycle.allocate_segment import (
 from workflow_domains.segment_lifecycle.convert_segment import (
     ConvertSegmentWorkflow,
 )
-from workflow_domains.segment_lifecycle.open_segment_rules import (
-    OpenSegmentRulesWorkflow,
+from workflow_domains.segment_lifecycle.initialize_segment import (
+    InitializeSegmentWorkflow,
 )
 
 _settings = TemporalSettings()
@@ -48,7 +48,7 @@ _settings = TemporalSettings()
 # — in this domain or a brand-new one — is one entry here plus its queue name in
 # shared/consts.py; no new deployment, image or chart.
 _WORKER_SPECS: list[tuple[str, list[type]]] = [
-    (OPEN_SEGMENT_RULES_WORKFLOW_QUEUE, [OpenSegmentRulesWorkflow]),
+    (INITIALIZE_SEGMENT_WORKFLOW_QUEUE, [InitializeSegmentWorkflow]),
     (ALLOCATE_SEGMENT_WORKFLOW_QUEUE, [AllocateSegmentWorkflow]),
     (CONVERT_SEGMENT_WORKFLOW_QUEUE, [ConvertSegmentWorkflow]),
 ]

@@ -1,6 +1,6 @@
 """convert-segment — rebalances segment inventory between types: re-types up
 to `quantity` AVAILABLE segments of a source type at a site, then re-runs the
-open-segment-rules flow for each (the new type has different peers, so its
+initialize-segment flow for each (the new type has different peers, so its
 firewall connectivity must be established from scratch).
 
 The THIRD workflow of the `segment-lifecycle` domain: it reuses the running
@@ -9,7 +9,7 @@ this module, its own workflow queue and its route are new.
 
 AVAILABLE ONLY, and that is the design, not a filter detail. A Locked segment
 has no established connectivity and may still have a LIVE
-`open-segment-rules-<SRC>-<network>` run: re-typing it under a running sibling
+`initialize-segment-<SRC>-<network>` run: re-typing it under a running sibling
 would leave that run fighting the replacement over the request-ids display
 (replace semantics, keyed by CIDR) and wrongly unlocking the segment when the
 old approval lands. Handling that means cancelling the sibling and waiting out
@@ -38,7 +38,7 @@ Shape of the run (all MACHINE ops — bounded, fails loudly, no continue_as_new)
           conversions). The manager re-locks the segment and clears the old
           type's connectivity fields atomically — a converted segment is
           born-Locked again, and never allocatable before its new rules open.
-       b. start `open-segment-rules-<DEST>-<network>` as a DETACHED child
+       b. start `initialize-segment-<DEST>-<network>` as a DETACHED child
           (ParentClosePolicy.ABANDON). Exactly the bulk-route philosophy: one
           run per segment, each with its own dedup id, its own human approval
           and its own failure — which is also why this parent COMPLETES with
@@ -59,13 +59,13 @@ from temporalio import workflow
 from temporalio.common import RetryPolicy
 from temporalio.exceptions import ApplicationError, WorkflowAlreadyStartedError
 
-from workflow_domains.segment_lifecycle.open_segment_rules import (
-    OpenSegmentRulesWorkflow,
+from workflow_domains.segment_lifecycle.initialize_segment import (
+    InitializeSegmentWorkflow,
 )
 
 with workflow.unsafe.imports_passed_through():
     from shared.consts import (
-        OPEN_SEGMENT_RULES_WORKFLOW_QUEUE,
+        INITIALIZE_SEGMENT_WORKFLOW_QUEUE,
         SEGMENT_LIFECYCLE_ACTIVITY_QUEUE,
     )
     from shared.interfaces.segment_lifecycle import (
@@ -81,11 +81,11 @@ with workflow.unsafe.imports_passed_through():
         ConvertSegmentProgress,
         ConvertSegmentResult,
         ConvertSegmentRunArgs,
-        OpenSegmentRulesInput,
-        OpenSegmentRulesRunArgs,
+        InitializeSegmentInput,
+        InitializeSegmentRunArgs,
         SegmentTypeUpdate,
     )
-    from shared.workflow_ids import open_segment_rules_workflow_id
+    from shared.workflow_ids import initialize_segment_workflow_id
 
 # Same budget rules as the sibling workflows: bounded attempts (the HTTP
 # client times out below), UNBOUNDED retries so transient outages are
@@ -219,7 +219,7 @@ class ConvertSegmentWorkflow:
         """Convert the type, then start the destination-type replacement run.
 
         No stale-run cancellation step: the search returns Available segments
-        only, and an Available segment's own open-segment-rules run has
+        only, and an Available segment's own initialize-segment run has
         COMPLETED — that completion is what unlocked it. See the module
         docstring for why that restriction is the design rather than a filter.
         """
@@ -242,15 +242,15 @@ class ConvertSegmentWorkflow:
         # destination-type run for this segment already exists (e.g. a re-run
         # after a mid-loop failure) — that run IS the desired outcome, so it
         # is reported rather than treated as an error.
-        child_id = open_segment_rules_workflow_id(
+        child_id = initialize_segment_workflow_id(
             convert_input.destination_type, segment.segment
         )
         open_rules_status = "started"
         try:
             await workflow.start_child_workflow(
-                OpenSegmentRulesWorkflow.run,
-                OpenSegmentRulesRunArgs(
-                    input=OpenSegmentRulesInput(
+                InitializeSegmentWorkflow.run,
+                InitializeSegmentRunArgs(
+                    input=InitializeSegmentInput(
                         segment=segment.segment,
                         type=convert_input.destination_type,
                         site=convert_input.site,
@@ -260,13 +260,13 @@ class ConvertSegmentWorkflow:
                     )
                 ),
                 id=child_id,
-                task_queue=OPEN_SEGMENT_RULES_WORKFLOW_QUEUE,
+                task_queue=INITIALIZE_SEGMENT_WORKFLOW_QUEUE,
                 parent_close_policy=workflow.ParentClosePolicy.ABANDON,
             )
         except WorkflowAlreadyStartedError:
             open_rules_status = "already_running"
             workflow.logger.info(
-                "open-segment-rules run %s already exists for %s",
+                "initialize-segment run %s already exists for %s",
                 child_id,
                 segment.segment,
             )
@@ -274,6 +274,6 @@ class ConvertSegmentWorkflow:
         return ConvertedSegmentReport(
             segment=segment.segment,
             vlan_id=segment.vlan_id,
-            open_segment_rules_workflow_id=child_id,
+            initialize_segment_workflow_id=child_id,
             open_rules_status=open_rules_status,
         )

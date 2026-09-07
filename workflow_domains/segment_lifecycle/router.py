@@ -30,20 +30,20 @@ from temporalio.exceptions import WorkflowAlreadyStartedError
 from shared.consts import (
     ALLOCATE_SEGMENT_WORKFLOW_QUEUE,
     CONVERT_SEGMENT_WORKFLOW_QUEUE,
-    OPEN_SEGMENT_RULES_WORKFLOW_QUEUE,
+    INITIALIZE_SEGMENT_WORKFLOW_QUEUE,
 )
 from shared.models.segment_lifecycle import (
     AllocateSegmentInput,
     AllocateSegmentRunArgs,
     ConvertSegmentInput,
     ConvertSegmentRunArgs,
-    OpenSegmentRulesInput,
-    OpenSegmentRulesRunArgs,
+    InitializeSegmentInput,
+    InitializeSegmentRunArgs,
 )
 from shared.workflow_ids import (
     allocate_segment_workflow_id,
     convert_segment_workflow_id,
-    open_segment_rules_workflow_id,
+    initialize_segment_workflow_id,
 )
 from workflow_domains.routers.deps import get_temporal_client
 from workflow_domains.routers.models import StartWorkflowResponse
@@ -53,14 +53,14 @@ from workflow_domains.segment_lifecycle.allocate_segment import (
 from workflow_domains.segment_lifecycle.convert_segment import (
     ConvertSegmentWorkflow,
 )
-from workflow_domains.segment_lifecycle.open_segment_rules import (
-    OpenSegmentRulesWorkflow,
+from workflow_domains.segment_lifecycle.initialize_segment import (
+    InitializeSegmentWorkflow,
 )
 
 router = APIRouter(prefix="/workflows/segment-lifecycle", tags=["segment-lifecycle"])
 
 # One workflow of this domain = one path under the domain prefix.
-_OPEN_SEGMENT_RULES_PATH = "/open-segment-rules"
+_INITIALIZE_SEGMENT_PATH = "/initialize-segment"
 _ALLOCATE_SEGMENT_PATH = "/allocate-segment"
 _CONVERT_SEGMENT_PATH = "/convert-segment"
 
@@ -70,7 +70,7 @@ _CONVERT_SEGMENT_PATH = "/convert-segment"
 # and its per-segment outcome, so a sibling workflow in this domain could not
 # reuse them. The domain-agnostic StartWorkflowResponse comes from
 # workflow_domains/routers/models.py instead.
-class BulkOpenSegmentRulesInput(BaseModel):
+class BulkInitializeSegmentInput(BaseModel):
     """Many segment definitions in one request (e.g. a CSV import).
 
     Fans out to one workflow PER SEGMENT rather than one workflow for the
@@ -80,10 +80,10 @@ class BulkOpenSegmentRulesInput(BaseModel):
     workflow could offer none of that.
     """
 
-    segments: list[OpenSegmentRulesInput] = Field(min_length=1)
+    segments: list[InitializeSegmentInput] = Field(min_length=1)
 
 
-class BulkOpenSegmentRulesItem(BaseModel):
+class BulkInitializeSegmentItem(BaseModel):
     """Per-segment outcome of the FAN-OUT only — not of the workflow, which by
     definition has barely begun. `started` means Temporal accepted the run."""
 
@@ -94,38 +94,38 @@ class BulkOpenSegmentRulesItem(BaseModel):
     error: str | None = None
 
 
-class BulkStartOpenSegmentRulesResponse(BaseModel):
+class BulkStartInitializeSegmentResponse(BaseModel):
     started: int
     already_running: int
     failed: int
-    results: list[BulkOpenSegmentRulesItem]
+    results: list[BulkInitializeSegmentItem]
 
 
 # Deterministic workflow ids come from shared/workflow_ids.py — the ONE
 # definition per scheme, shared with workflow code (convert-segment builds
-# open-segment-rules ids to cancel stale runs and start replacements).
-def _workflow_id(rules_input: OpenSegmentRulesInput) -> str:
-    return open_segment_rules_workflow_id(rules_input.type, rules_input.segment)
+# initialize-segment ids to cancel stale runs and start replacements).
+def _workflow_id(rules_input: InitializeSegmentInput) -> str:
+    return initialize_segment_workflow_id(rules_input.type, rules_input.segment)
 
 
-async def _start(client: Client, rules_input: OpenSegmentRulesInput):
+async def _start(client: Client, rules_input: InitializeSegmentInput):
     """Start one run. The single and bulk routes differ only in how they
     report the outcome, never in how the workflow is started."""
     return await client.start_workflow(
-        OpenSegmentRulesWorkflow.run,
-        OpenSegmentRulesRunArgs(input=rules_input),
+        InitializeSegmentWorkflow.run,
+        InitializeSegmentRunArgs(input=rules_input),
         id=_workflow_id(rules_input),
-        task_queue=OPEN_SEGMENT_RULES_WORKFLOW_QUEUE,
+        task_queue=INITIALIZE_SEGMENT_WORKFLOW_QUEUE,
     )
 
 
 @router.post(
-    _OPEN_SEGMENT_RULES_PATH,
+    _INITIALIZE_SEGMENT_PATH,
     response_model=StartWorkflowResponse,
     status_code=202,
 )
-async def start_open_segment_rules(
-    rules_input: OpenSegmentRulesInput,
+async def start_initialize_segment(
+    rules_input: InitializeSegmentInput,
     client: Client = Depends(get_temporal_client),
 ) -> StartWorkflowResponse:
     """Create a segment and open its connectivity — returns immediately (202).
@@ -151,14 +151,14 @@ async def start_open_segment_rules(
 
 
 @router.post(
-    f"{_OPEN_SEGMENT_RULES_PATH}/bulk",
-    response_model=BulkStartOpenSegmentRulesResponse,
+    f"{_INITIALIZE_SEGMENT_PATH}/bulk",
+    response_model=BulkStartInitializeSegmentResponse,
     status_code=202,
 )
-async def start_open_segment_rules_bulk(
-    bulk_input: BulkOpenSegmentRulesInput,
+async def start_initialize_segment_bulk(
+    bulk_input: BulkInitializeSegmentInput,
     client: Client = Depends(get_temporal_client),
-) -> BulkStartOpenSegmentRulesResponse:
+) -> BulkStartInitializeSegmentResponse:
     """Start one workflow per segment definition — returns immediately (202).
 
     Always 202 with a per-item report, never a single pass/fail status: the
@@ -170,25 +170,25 @@ async def start_open_segment_rules_bulk(
     """
 
     async def _start_one(
-        rules_input: OpenSegmentRulesInput,
-    ) -> BulkOpenSegmentRulesItem:
+        rules_input: InitializeSegmentInput,
+    ) -> BulkInitializeSegmentItem:
         workflow_id = _workflow_id(rules_input)
         try:
             handle = await _start(client, rules_input)
         except WorkflowAlreadyStartedError:
-            return BulkOpenSegmentRulesItem(
+            return BulkInitializeSegmentItem(
                 segment=rules_input.segment,
                 workflow_id=workflow_id,
                 status="already_running",
             )
         except Exception as exc:  # noqa: BLE001 — one bad row must not sink the batch
-            return BulkOpenSegmentRulesItem(
+            return BulkInitializeSegmentItem(
                 segment=rules_input.segment,
                 workflow_id=workflow_id,
                 status="failed",
                 error=str(exc),
             )
-        return BulkOpenSegmentRulesItem(
+        return BulkInitializeSegmentItem(
             segment=rules_input.segment,
             workflow_id=handle.id,
             status="started",
@@ -199,7 +199,7 @@ async def start_open_segment_rules_bulk(
     counts = {status: 0 for status in ("started", "already_running", "failed")}
     for item in results:
         counts[item.status] += 1
-    return BulkStartOpenSegmentRulesResponse(
+    return BulkStartInitializeSegmentResponse(
         started=counts["started"],
         already_running=counts["already_running"],
         failed=counts["failed"],
@@ -268,10 +268,10 @@ async def start_convert_segment(
     The workflow searches the site for Available/Locked segments of the source
     type, re-types up to `quantity` of them in the Segments Manager (each is
     re-Locked with its stale firewall request ids cleared) and starts one
-    open-segment-rules run per converted segment. Fewer matches than requested
+    initialize-segment run per converted segment. Fewer matches than requested
     is reported as a shortfall in the result, not an error. Poll
     GET /workflows/runs/{workflow_id} for progress/result — the per-segment
-    report carries each started open-segment-rules workflow id, which is
+    report carries each started initialize-segment workflow id, which is
     polled the same way. No bulk variant: the request is already batch-shaped.
     """
     try:

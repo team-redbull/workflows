@@ -31,7 +31,7 @@
       <div class="wfmenu-panel" id="wfmenu-panel" role="menu" aria-label="Workflows by domain" hidden></div>
     </div>
     <noscript>
-      <a class="topnav-link" href="/segment-lifecycle/open-segment-rules.html">open-segment-rules</a>
+      <a class="topnav-link" href="/segment-lifecycle/initialize-segment.html">initialize-segment</a>
     </noscript>
   </nav>
 </header>
@@ -51,7 +51,7 @@
       <div class="fact"><span class="k">Stack</span><span class="v">Python 3.12 · temporalio · pydantic · FastAPI</span></div>
       <div class="fact"><span class="k">Deployables</span><span class="v">1 brain + 1 limb per domain (+ trigger API)</span></div>
       <div class="fact"><span class="k">Domains today</span><span class="v">segment-lifecycle</span></div>
-      <div class="fact"><span class="k">Workflows today</span><span class="v">open-segment-rules</span></div>
+      <div class="fact"><span class="k">Workflows today</span><span class="v">initialize-segment</span></div>
     </div>
   </div>
 </header>
@@ -125,11 +125,11 @@
       <table>
         <thead><tr><th>Term</th><th>What it means</th><th>Where you'll see it</th></tr></thead>
         <tbody>
-          <tr><td class="k">Workflow</td><td class="muted">The orchestration function — the plan. Decides <em>what</em> happens and in what order. Contains no I/O.</td><td class="k">workflow_domains/segment_lifecycle/open_segment_rules.py</td></tr>
+          <tr><td class="k">Workflow</td><td class="muted">The orchestration function — the plan. Decides <em>what</em> happens and in what order. Contains no I/O.</td><td class="k">workflow_domains/segment_lifecycle/initialize_segment.py</td></tr>
           <tr><td class="k">Activity</td><td class="muted">One unit of real work: an HTTP call, a config read. Everything that can fail or touch the outside world.</td><td class="k">activities/&lt;domain&gt;/activities.py</td></tr>
           <tr><td class="k">Worker</td><td class="muted">A process that connects to Temporal, says "I can run these workflows / these activities", and polls for work.</td><td class="k">*_worker_init.py</td></tr>
           <tr><td class="k">Task queue</td><td class="muted">A named mailbox. Workers poll a queue; work addressed to that queue reaches those workers. This is our routing.</td><td class="k">shared/consts.py</td></tr>
-          <tr><td class="k">Workflow ID</td><td class="muted">Our name for one logical run — we derive it from the input, so a duplicate trigger collides on purpose.</td><td class="k">open-segment-rules-HC-10.0.0.0</td></tr>
+          <tr><td class="k">Workflow ID</td><td class="muted">Our name for one logical run — we derive it from the input, so a duplicate trigger collides on purpose.</td><td class="k">initialize-segment-HC-10.0.0.0</td></tr>
           <tr><td class="k">Run ID</td><td class="muted">Temporal's ID for one attempt at that workflow ID. Changes on continue-as-new; you rarely need it.</td><td class="muted">returned by the trigger API</td></tr>
           <tr><td class="k">History</td><td class="muted">The append-only log of everything that happened in a run. The source of truth for replay.</td><td class="muted">Temporal UI, per run</td></tr>
           <tr><td class="k">Replay</td><td class="muted">Re-running your workflow code against a recorded history to rebuild state. Why determinism matters.</td><td class="muted">happens automatically</td></tr>
@@ -334,7 +334,7 @@
 
         <path class="arw tmp" d="M474,100 H676" marker-end="url(#a-tmp)"/>
         <text class="l" x="480" y="92">workflow task queue</text>
-        <text class="l dim" x="480" y="118">open-segment-rules-workflow</text>
+        <text class="l dim" x="480" y="118">initialize-segment-workflow</text>
         <path class="arw tmp" d="M676,150 H474" marker-end="url(#a-tmp)"/>
         <text class="l" x="480" y="143">schedule activity · start timer</text>
 
@@ -405,7 +405,7 @@
         <text class="hd" x="890" y="24">ONE LIMB PER DOMAIN</text>
 
         <rect class="box sm"    x="20" y="40"  width="210" height="42" rx="4"/>
-        <text class="s" x="34" y="59">open-segment-rules</text>
+        <text class="s" x="34" y="59">initialize-segment</text>
         <text class="s" x="34" y="74">-workflow</text>
 
         <rect class="box ghost" x="20" y="100" width="210" height="42" rx="4"/>
@@ -479,13 +479,13 @@
   </section>
 
   <!-- ================= 5. PRINCIPLES ================= -->
-  <!-- Moved here from the open-segment-rules page: these hold for every workflow
+  <!-- Moved here from the initialize-segment page: these hold for every workflow
        in every domain, so they belong to the orchestrator, not to one example. -->
   <section id="principles">
     <div class="sec-head">
       <div class="eyebrow">Design decisions worth knowing</div>
       <h2>Three rules that surprise people</h2>
-      <p class="lede">These are not open-segment-rules trivia — they apply to every workflow you will write here, and
+      <p class="lede">These are not initialize-segment trivia — they apply to every workflow you will write here, and
       each one is the opposite of the instinct you arrive with.</p>
     </div>
     <div class="stack">
@@ -546,23 +546,23 @@
         <tbody>
           <tr>
             <td class="kw">segment-lifecycle-activity <span style="color:var(--ink-3)">(activity queue)</span></td>
-            <td class="kw">open-segment-rules-workflow <span style="color:var(--ink-3)">(workflow queue)</span></td>
+            <td class="kw">initialize-segment-workflow <span style="color:var(--ink-3)">(workflow queue)</span></td>
           </tr>
           <tr>
             <td class="kw">activities/segment_lifecycle/</td>
-            <td class="kw">segment_lifecycle/open_segment_rules.py</td>
+            <td class="kw">segment_lifecycle/initialize_segment.py</td>
           </tr>
           <tr>
             <td class="kw">shared/models|interfaces/segment_lifecycle.py</td>
-            <td class="kw">OpenSegmentRulesRunArgs / ResumeState / Progress / Result</td>
+            <td class="kw">InitializeSegmentRunArgs / ResumeState / Progress / Result</td>
           </tr>
           <tr>
             <td class="kw">/workflows/segment-lifecycle <span style="color:var(--ink-3)">(route prefix)</span></td>
-            <td class="kw">/open-segment-rules <span style="color:var(--ink-3)">(route under it)</span></td>
+            <td class="kw">/initialize-segment <span style="color:var(--ink-3)">(route under it)</span></td>
           </tr>
           <tr>
             <td class="kw">the Deployment, ServiceAccount, ConfigMap, Secret</td>
-            <td class="kw">open-segment-rules-&lt;TYPE&gt;-&lt;network&gt; <span style="color:var(--ink-3)">(workflow ids)</span></td>
+            <td class="kw">initialize-segment-&lt;TYPE&gt;-&lt;network&gt; <span style="color:var(--ink-3)">(workflow ids)</span></td>
           </tr>
         </tbody>
       </table>

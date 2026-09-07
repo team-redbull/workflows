@@ -46,7 +46,7 @@ from shared.models.segment_lifecycle import (
     BmcVendor,
     ConvertibleSegmentsQuery,
     SegmentConnectivityFailureNotice,
-    OpenSegmentRulesInput,
+    InitializeSegmentInput,
     SegmentConnectivityRequestsUpdate,
     SegmentTypeUpdate,
     OpenRulesRequest,
@@ -58,7 +58,7 @@ from shared.models.segment_lifecycle import (
 SM = "http://segments-manager.test"
 NEXT = "http://next.test"
 
-HC_INPUT = OpenSegmentRulesInput(
+HC_INPUT = InitializeSegmentInput(
     segment="10.0.0.0/24",
     type=SegmentType.HC,
     site="site-a",
@@ -599,7 +599,7 @@ async def test_list_convertible_segments_rejects_a_wrong_status(env, wrong_statu
     """Strict, not tolerant (§7): a segment the server should have filtered out
     would enter the conversion loop, so it fails the activity rather than being
     quietly skipped. Locked matters most — converting one means disturbing a
-    possibly-live open-segment-rules run, which this workflow never does."""
+    possibly-live initialize-segment run, which this workflow never does."""
     respx.get(f"{SM}/api/segments").mock(
         return_value=httpx.Response(
             200,

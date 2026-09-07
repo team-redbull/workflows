@@ -23,8 +23,8 @@
       queue: "segment-lifecycle-activity",
       workflows: [
         {
-          name: "open-segment-rules",
-          href: "/segment-lifecycle/open-segment-rules.html",
+          name: "initialize-segment",
+          href: "/segment-lifecycle/initialize-segment.html",
           blurb: "create → peer → approve → unlock"
         },
         {

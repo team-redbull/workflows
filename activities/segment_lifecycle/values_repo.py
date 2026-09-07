@@ -59,7 +59,9 @@ GIT_USER_EMAIL = "segment-allocation-workflow@redbull.local"
 # The one definition of the appended block. Everything the DHCP stack needs
 # beyond this (leaseDurationDays, dns, subnetMask, failover) is inherited from
 # the upstream values layers; scopeName derives from the file name; gateway is
-# deliberately omitted so the chart derives the /24's .254. vlanId has no
+# deliberately omitted so the chart derives the /24's .254, and startRange/
+# endRange are omitted for the same reason — absent, dhcp_scope_manager derives
+# .1-.253, which the exclusions then carve the ends out of. vlanId has no
 # consumer in any chart — it is an audit annotation, as the old CI script
 # wrote it.
 _ALLOCATION_BLOCK_TEMPLATE = """\
@@ -67,9 +69,13 @@ _ALLOCATION_BLOCK_TEMPLATE = """\
 vlanId: {vlan_id}
 
 dhcp_values:
-  network: "{network}"
-  startRange: "{start_range}"
-  endRange: "{end_range}"
+  network: "{network}"{exclusions}"""
+
+# Appended only when the type's policy defines exclusions. A type with none
+# leaves the key out entirely rather than writing an empty list: the block then
+# reads exactly like a hand-written minimal cluster file, and any exclusions a
+# site layer defines keep applying.
+_EXCLUSIONS_SECTION_TEMPLATE = """
 
   exclusions:
 {exclusions}"""
@@ -87,20 +93,22 @@ _FOREIGN_ALLOCATION_KEY_RE = re.compile(r"^(vlanId|dhcp_values)\s*:", re.MULTILI
 
 def render_allocation_block(vlan_id: int, dhcp_values: DhcpValues) -> str:
     """The exact text appended to a cluster values file (no trailing newline)."""
-    exclusions = "\n".join(
-        _EXCLUSION_TEMPLATE.format(
-            start_address=exclusion.start_address,
-            end_address=exclusion.end_address,
+    exclusions_section = ""
+    if dhcp_values.exclusions:
+        exclusions_section = _EXCLUSIONS_SECTION_TEMPLATE.format(
+            exclusions="\n".join(
+                _EXCLUSION_TEMPLATE.format(
+                    start_address=exclusion.start_address,
+                    end_address=exclusion.end_address,
+                )
+                for exclusion in dhcp_values.exclusions
+            )
         )
-        for exclusion in dhcp_values.exclusions
-    )
     return _ALLOCATION_BLOCK_TEMPLATE.format(
         marker=MARKER,
         vlan_id=vlan_id,
         network=dhcp_values.network,
-        start_range=dhcp_values.start_range,
-        end_range=dhcp_values.end_range,
-        exclusions=exclusions,
+        exclusions=exclusions_section,
     )
 
 

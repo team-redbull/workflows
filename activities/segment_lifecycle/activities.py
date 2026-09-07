@@ -56,6 +56,7 @@ from shared.models.segment_lifecycle import (
     ClusterValuesAppendRequest,
     ConvertibleSegment,
     ConvertibleSegmentsQuery,
+    DhcpExclusion,
     DhcpScopeState,
     SegmentConnectivityFailureNotice,
     OpenSegmentRulesInput,
@@ -732,9 +733,22 @@ async def append_allocation_to_cluster_values(
     push. The DhcpValues are derived HERE (the policy lives in this worker's
     config, unreachable from the sandboxed workflow) and returned in both the
     pushed and the already-present case, for the convergence poll."""
-    dhcp_values = build_dhcp_values(
-        request.segment, _settings.dhcp_exclusion_octet_ranges
-    )
+    # The exclusion policy is per segment type — pick this allocation's. The
+    # settings validator guarantees a policy for HC at startup, and the
+    # workflow rejects every other type up front, so a miss here is
+    # unreachable today; it stays a loud non-retryable failure rather than a
+    # KeyError for the day a new type reaches this activity ahead of its
+    # ConfigMap entry.
+    exclusion_octet_ranges = _settings.dhcp_exclusion_octet_ranges.get(request.type)
+    if exclusion_octet_ranges is None:
+        raise ApplicationError(
+            f"No DHCP exclusion policy configured for segment type "
+            f"{request.type.value} (DHCP_EXCLUSION_OCTET_RANGES carries "
+            f"{sorted(t.value for t in _settings.dhcp_exclusion_octet_ranges)})",
+            type="MissingDhcpPolicyForType",
+            non_retryable=True,
+        )
+    dhcp_values = build_dhcp_values(request.segment, exclusion_octet_ranges)
     commit_sha, changed = await values_repo.append_allocation(
         repo_url=_settings.day1_repo_url,
         branch=_settings.day1_branch,
@@ -792,18 +806,23 @@ async def get_dhcp_scope(network: str) -> DhcpScopeState:
             )
         try:
             body = resp.json()
+            # The API's own camelCase; it always returns exclusions sorted
+            # ascending, matching the order the policy validator enforces, so
+            # the workflow can compare the lists directly. Absent means none.
             state = DhcpScopeState(
                 found=True,
-                start_range=body["startRange"],
-                end_range=body["endRange"],
+                exclusions=[
+                    DhcpExclusion(
+                        start_address=exclusion["startAddress"],
+                        end_address=exclusion["endAddress"],
+                    )
+                    for exclusion in body.get("exclusions") or []
+                ],
             )
         except Exception as exc:  # malformed payload from the API
             raise DhcpApiError(f"Invalid DHCP scope response for {network}: {exc}") from exc
     activity.logger.info(
-        "DHCP scope %s exists (range %s - %s)",
-        network,
-        state.start_range,
-        state.end_range,
+        "DHCP scope %s exists (%d exclusion(s))", network, len(state.exclusions)
     )
     return state
 

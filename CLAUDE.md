@@ -264,10 +264,24 @@ tags cross-repo.
   `config.dhcpExclusionOctetRanges`) and the ConfigMap template only renders it — an operator knob is
   reviewed as structured YAML next to every other tunable, not as JSON embedded in a template. (This
   reverses the earlier rule that ports/exclusions sat in the template itself.)
-- **The DHCP policy is ONE knob, and /24 is ASSERTED:** `DHCP_EXCLUSION_OCTET_RANGES` (last-octet
-  ranges, e.g. `[[1, 10], [241, 254]]`) is the whole DHCP surface — `startRange`/`endRange` are
-  DERIVED as the first/last non-excluded host octet, so the range and the exclusions can never
-  contradict. `build_dhcp_values` rejects any non-/24 segment with `UnsupportedSegmentPrefix`;
+- **The DHCP policy is ONE knob KEYED BY SEGMENT TYPE, and /24 is ASSERTED:**
+  `DHCP_EXCLUSION_OCTET_RANGES` (a type -> last-octet-ranges map, e.g.
+  `{"HC": [[1, 10], [241, 254]]}`) is the whole DHCP surface. Per type because each type reserves a
+  different slice of its /24 and the lookup is DYNAMIC (the allocation's type) — a map like
+  `SITE_NETWORKS`, not flat keys like the statically-referenced `PORTS_*`. Only `HC` is required
+  (the only type allocate-segment accepts); every other listed type is validated at startup all the
+  same, so it can be configured ahead of the code that allocates it. A type's list may be EMPTY —
+  that type excludes nothing. The type travels to the activity on `ClusterValuesAppendRequest.type`;
+  `build_dhcp_values` takes ONE type's ranges — the lookup lives in the activity.
+- **The written block is NETWORK + EXCLUSIONS, never a distribution range.** `startRange`/`endRange`
+  are deliberately omitted: absent both, `dhcp_scope_manager` derives `.1-.253` (stopping short of
+  the `.254` gateway it derives for a /24), and the exclusions carve the ends back out of that —
+  which is what the real day1 files do, and what production expects. Deriving bounds here instead
+  would duplicate a derivation that already exists in the DHCP API, its CI validator and the chart,
+  and all three would have to agree forever. It also makes "no exclusions" a non-case rather than a
+  special one: the block is just a network, exactly like a hand-written minimal cluster file. The
+  convergence poll therefore compares the live scope's EXCLUSIONS against what the run pushed —
+  comparing the derived range would only confirm the DHCP API agrees with itself. `build_dhcp_values` rejects any non-/24 segment with `UnsupportedSegmentPrefix`;
   supporting another mask is a deliberate refactor that must also emit `subnetMask` + `gateway`
   (the DHCP stack derives the `.254` gateway for a /24 only).
 

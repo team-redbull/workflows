@@ -75,6 +75,7 @@ with workflow.unsafe.imports_passed_through():
         AllocateSegmentResult,
         AllocateSegmentRunArgs,
         ClusterValuesAppendRequest,
+        DhcpExclusion,
         SegmentAllocationRequest,
         SegmentType,
     )
@@ -108,6 +109,13 @@ _RETRY_POLICY = RetryPolicy(
 # in-flight runs.
 _DHCP_POLL_INTERVAL = timedelta(seconds=15)
 _DHCP_CONVERGENCE_DEADLINE = timedelta(minutes=15)
+
+
+def _format_exclusions(exclusions: list[DhcpExclusion]) -> str:
+    """Render an exclusion list for the not-converged failure message."""
+    if not exclusions:
+        return "none"
+    return ", ".join(f"{e.start_address}-{e.end_address}" for e in exclusions)
 
 
 @workflow.defn
@@ -216,6 +224,7 @@ class AllocateSegmentWorkflow:
                 relative_path=location.relative_path,
                 vlan_id=allocation.vlan_id,
                 segment=allocation.segment,
+                type=allocate_input.type,
             ),
             task_queue=SEGMENT_LIFECYCLE_ACTIVITY_QUEUE,
             start_to_close_timeout=_GIT_ACTIVITY_TIMEOUT,
@@ -235,17 +244,17 @@ class AllocateSegmentWorkflow:
                 start_to_close_timeout=_ACTIVITY_TIMEOUT,
                 retry_policy=_RETRY_POLICY,
             )
-            if (
-                scope.found
-                and scope.start_range == dhcp_values.start_range
-                and scope.end_range == dhcp_values.end_range
-            ):
+            # Convergence means the live scope carries the exclusions this run
+            # pushed — the thing we wrote. Its distribution range is the DHCP
+            # API's own derivation (.1-.253 for an absent pair), so matching it
+            # would only confirm that service agrees with itself.
+            if scope.found and scope.exclusions == dhcp_values.exclusions:
                 break
             if workflow.now() - wait_started_at >= _DHCP_CONVERGENCE_DEADLINE:
                 observed = (
-                    f"scope exists with range {scope.start_range} - "
-                    f"{scope.end_range} (expected {dhcp_values.start_range} - "
-                    f"{dhcp_values.end_range})"
+                    f"scope exists with exclusions "
+                    f"{_format_exclusions(scope.exclusions)} (expected "
+                    f"{_format_exclusions(dhcp_values.exclusions)})"
                     if scope.found
                     else "scope was never created"
                 )

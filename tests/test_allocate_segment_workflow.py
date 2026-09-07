@@ -48,16 +48,14 @@ HC_INPUT = AllocateSegmentInput(cluster=CLUSTER)  # type defaults to HC
 
 DHCP_VALUES = DhcpValues(
     network="10.20.90.0",
-    start_range="10.20.90.11",
-    end_range="10.20.90.240",
     exclusions=[
         DhcpExclusion(start_address="10.20.90.1", end_address="10.20.90.10"),
         DhcpExclusion(start_address="10.20.90.241", end_address="10.20.90.254"),
     ],
 )
-CONVERGED_SCOPE = DhcpScopeState(
-    found=True, start_range=DHCP_VALUES.start_range, end_range=DHCP_VALUES.end_range
-)
+# Convergence is checked against the exclusions the run pushed — the scope's
+# distribution range is the DHCP API's own derivation, not ours.
+CONVERGED_SCOPE = DhcpScopeState(found=True, exclusions=DHCP_VALUES.exclusions)
 
 
 def make_mock_activities(
@@ -233,6 +231,9 @@ async def test_happy_path_allocates_verifies_pushes_and_awaits_dhcp():
     (append_request,) = calls["append_allocation_to_cluster_values"]
     assert append_request.relative_path == RELATIVE_PATH
     assert append_request.vlan_id == VLAN_ID
+    # The type travels with the append: the exclusion policy is per type, and
+    # the activity selects that type's ranges out of the ConfigMap.
+    assert append_request.type == SegmentType.HC
     # Both polls asked for the mask-stripped network address.
     assert calls["get_dhcp_scope"] == ["10.20.90.0", "10.20.90.0"]
 
@@ -340,10 +341,16 @@ async def test_dhcp_scope_never_appearing_fails_bounded():
     assert len(calls["get_dhcp_scope"]) == 61
 
 
-async def test_scope_with_wrong_range_does_not_count_as_converged():
-    # A scope existing is NOT enough — the range must match the block we
-    # wrote, else some other writer owns it and the deadline calls it out.
-    wrong = DhcpScopeState(found=True, start_range="10.20.90.50", end_range="10.20.90.60")
+async def test_scope_with_wrong_exclusions_does_not_count_as_converged():
+    # A scope existing is NOT enough — its exclusions must match the block we
+    # wrote (Crossplane may still be carrying an older revision), else the
+    # deadline calls it out.
+    wrong = DhcpScopeState(
+        found=True,
+        exclusions=[
+            DhcpExclusion(start_address="10.20.90.50", end_address="10.20.90.60")
+        ],
+    )
     calls, mocks = make_mock_activities(
         scope_script=[wrong], scope_never_converges=False
     )

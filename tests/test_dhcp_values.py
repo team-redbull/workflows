@@ -1,9 +1,10 @@
-"""build_dhcp_values: the derived DHCP range and the /24 assertion.
+"""build_dhcp_values: the emitted block and the /24 assertion.
 
-The one policy knob is the exclusion octet ranges; startRange/endRange are
-DERIVED (first/last non-excluded host octet). These tests pin the exact
-example from the values-repo fixtures and the properties the DHCP stack
-depends on (ascending exclusions, the assertion that stops non-/24 segments).
+The one policy knob is that type's exclusion octet ranges. startRange/endRange
+are deliberately NOT emitted — dhcp_scope_manager derives .1-.253 when both are
+absent — so these tests pin what IS written: the mask-stripped network, the
+exclusions in ascending order, the empty-policy case, and the assertion that
+stops a non-/24 segment.
 """
 
 from __future__ import annotations
@@ -19,34 +20,44 @@ STANDARD_RANGES = [(1, 10), (241, 254)]
 def test_standard_exclusions_reproduce_the_fixture_block():
     values = build_dhcp_values("10.20.90.0/24", STANDARD_RANGES)
     assert values.network == "10.20.90.0"  # mask stripped — the scope identity
-    assert values.start_range == "10.20.90.11"
-    assert values.end_range == "10.20.90.240"
     assert [(e.start_address, e.end_address) for e in values.exclusions] == [
         ("10.20.90.1", "10.20.90.10"),
         ("10.20.90.241", "10.20.90.254"),
     ]
 
 
-def test_ranges_are_derived_not_configured():
-    # Shrinking the head exclusion moves startRange with it — no second knob
-    # to forget updating.
-    values = build_dhcp_values("10.20.90.0/24", [(1, 5), (250, 254)])
-    assert values.start_range == "10.20.90.6"
-    assert values.end_range == "10.20.90.249"
+def test_no_distribution_bounds_are_emitted():
+    # The DHCP API owns that derivation (.1-.253); duplicating it here would
+    # mean two derivations that must stay identical forever.
+    values = build_dhcp_values("10.20.90.0/24", STANDARD_RANGES)
+    assert not hasattr(values, "start_range")
+    assert not hasattr(values, "end_range")
+    assert set(values.model_dump()) == {"network", "exclusions"}
 
 
-def test_mid_range_exclusion_keeps_the_outer_range():
-    # A hole inside the range stays a hole — the range still spans the first
-    # to the last distributable octet, which is exactly how DHCP scopes work.
+def test_an_empty_policy_yields_a_block_with_no_exclusions():
+    # A type that excludes nothing is a legitimate configuration: the scope
+    # distributes the whole derived .1-.253.
+    values = build_dhcp_values("10.20.90.0/24", [])
+    assert values.network == "10.20.90.0"
+    assert values.exclusions == []
+
+
+def test_a_mid_range_exclusion_is_emitted_like_any_other():
+    # A hole inside the range stays a hole — the DHCP scope holds one
+    # contiguous range with the exclusions carved out of it.
     values = build_dhcp_values("10.20.90.0/24", [(1, 10), (100, 110), (241, 254)])
-    assert values.start_range == "10.20.90.11"
-    assert values.end_range == "10.20.90.240"
-    assert len(values.exclusions) == 3
+    assert [(e.start_address, e.end_address) for e in values.exclusions] == [
+        ("10.20.90.1", "10.20.90.10"),
+        ("10.20.90.100", "10.20.90.110"),
+        ("10.20.90.241", "10.20.90.254"),
+    ]
 
 
 def test_exclusions_are_emitted_ascending():
     # The DHCP API returns exclusions sorted; any other order in the values
-    # file makes Crossplane diff and PUT on every reconcile poll.
+    # file makes Crossplane diff and PUT on every reconcile poll — and the
+    # workflow compares the two lists directly when polling for convergence.
     values = build_dhcp_values("10.20.90.0/24", [(1, 10), (100, 110), (241, 254)])
     starts = [int(e.start_address.rsplit(".", 1)[1]) for e in values.exclusions]
     assert starts == sorted(starts)

@@ -256,12 +256,14 @@
           </div>
           <p>Argo CD syncs the commit; the hostedclusters chart renders a Crossplane <code>Request</code>;
           Crossplane creates the scope on the DHCP server. The workflow <b>observes, read-only</b> — polling the
-          DHCP API on durable timers until the scope exists with exactly the range it wrote.</p>
+          DHCP API on durable timers until the scope exists with exactly the exclusions it wrote.</p>
           <div class="loopbox">
             <div class="loop-title">Poll loop — machine convergence, so the wait is BOUNDED</div>
             <ol>
               <li><code>get_dhcp_scope</code> → <code>GET /api/v1/scopes/{network}</code>; a 404 is a normal “not yet”, never an error.</li>
-              <li>Scope found <em>and</em> <code>startRange</code>/<code>endRange</code> match the block → done.</li>
+              <li>Scope found <em>and</em> its <code>exclusions</code> match the block → done. (The exclusions, not
+              the range: the range is the DHCP API's own <code>.1-.253</code> derivation, so matching it would only
+              confirm that service agrees with itself.)</li>
               <li>Every 15 s on a durable <code>workflow.sleep</code> timer, up to <b>15 minutes</b>.</li>
               <li>Deadline exceeded → <code>DhcpScopeNotConverged</code>. The commit stands — check the Argo Application and the Crossplane Request.</li>
             </ol>
@@ -313,14 +315,15 @@ vlanId: 23                        <span class="c">// audit only — no chart rea
 
 dhcp_values:
   network: "10.20.90.0"           <span class="c">// mask stripped — the scope's identity</span>
-  startRange: "10.20.90.11"       <span class="c">// derived: first non-excluded octet</span>
-  endRange: "10.20.90.240"        <span class="c">// derived: last non-excluded octet</span>
-
+                                  <span class="c">// no startRange/endRange: the DHCP API derives .1-.253</span>
   exclusions:                     <span class="c">// ascending — required by the DHCP API</span>
     - startAddress: "10.20.90.1"
       endAddress: "10.20.90.10"
     - startAddress: "10.20.90.241"
       endAddress: "10.20.90.254"</pre>
+        <p class="note" style="margin-top:12px">A type whose policy excludes nothing drops the
+        <code>exclusions</code> key too — the block is then just <code>vlanId</code> + <code>network</code>, and the
+        scope distributes the whole derived range.</p>
       </div>
     </div>
 
@@ -328,10 +331,11 @@ dhcp_values:
       <div class="panel alarm">
         <h3>⚠ The DHCP block assumes a /24 — asserted, not silent</h3>
         <p style="font-size:var(--fs-14);color:var(--ink-2)"><code>DHCP_EXCLUSION_OCTET_RANGES</code> (the ONE
-        policy knob, e.g. <code>[[1,10],[241,254]]</code>) speaks in <b>last-octet</b> values, and
-        <code>startRange</code>/<code>endRange</code> derive from it: every host octet of the /24 that is not
-        excluded is distributable. A non-/24 segment is rejected with <code>UnsupportedSegmentPrefix</code>
-        rather than mis-rendered with half its addresses stranded.</p>
+        policy knob, keyed by segment type, e.g. <code>{"HC":[[1,10],[241,254]]}</code>) speaks in
+        <b>last-octet</b> values, and the workflow writes nothing but the network and those exclusions: the DHCP
+        API derives <code>.1-.253</code> when both bounds are absent, and the exclusions carve the ends back out
+        of it. A non-/24 segment is rejected with <code>UnsupportedSegmentPrefix</code> rather than mis-rendered
+        with half its addresses stranded.</p>
         <p style="font-size:var(--fs-14);color:var(--ink-2)">Supporting another mask is a <b>deliberate
         refactor</b>, not a config change — it must also start emitting <code>subnetMask</code> and
         <code>gateway</code>, since the DHCP stack derives the <code>.254</code> gateway for a /24 only and
@@ -495,7 +499,7 @@ dhcp_values:
       <table>
         <thead><tr><th>Key</th><th>Lives in</th><th>Effect</th></tr></thead>
         <tbody>
-          <tr><td class="k">DHCP_EXCLUSION_OCTET_RANGES</td><td class="muted">segment-lifecycle-config</td><td class="muted">The ONE DHCP policy knob. Validated at worker startup; a bad edit crash-loops the pod, never mis-renders a scope.</td></tr>
+          <tr><td class="k">DHCP_EXCLUSION_OCTET_RANGES</td><td class="muted">segment-lifecycle-config</td><td class="muted">The ONE DHCP policy knob, per segment type (each type reserves a different slice of its /24; HC required). Validated at worker startup; a bad edit crash-loops the pod, never mis-renders a scope.</td></tr>
           <tr><td class="k">DAY1_REPO_URL · DAY1_BRANCH</td><td class="muted">segment-lifecycle-config</td><td class="muted">Which repo and branch hold the cluster values files.</td></tr>
           <tr><td class="k">DAY1_GIT_TOKEN</td><td class="muted">Secret (day1-git-token)</td><td class="muted">Push credential for the values repo. Never logged — scrubbed from every git error.</td></tr>
           <tr><td class="k">DHCP_API_URL · DHCP_API_TOKEN</td><td class="muted">segment-lifecycle-config / Secret</td><td class="muted">Where the DHCP scope API lives; the read token for the convergence poll.</td></tr>

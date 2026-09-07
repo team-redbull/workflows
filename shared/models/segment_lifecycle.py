@@ -318,26 +318,35 @@ class DhcpExclusion(BaseModel):
 
 class DhcpValues(BaseModel):
     """The dhcp_values block written to the cluster's values file, derived
-    from the allocated segment + the DHCP_EXCLUSION_OCTET_RANGES policy.
-    `network` is the mask-stripped network address (10.20.90.0, never
-    10.20.90.0/24) — the DHCP scope's identity."""
+    from the allocated segment + that type's DHCP_EXCLUSION_OCTET_RANGES
+    policy. `network` is the mask-stripped network address (10.20.90.0, never
+    10.20.90.0/24) — the DHCP scope's identity.
+
+    No startRange/endRange: dhcp_scope_manager derives .1-.253 when both are
+    absent, and the exclusions carve the ends back out of it. `exclusions` is
+    empty for a type whose policy defines none — a legitimate block, not a
+    missing one."""
 
     network: str = Field(min_length=1)
-    start_range: str = Field(min_length=1)
-    end_range: str = Field(min_length=1)
-    exclusions: list[DhcpExclusion]
+    exclusions: list[DhcpExclusion] = Field(default_factory=list)
 
 
 class ClusterValuesAppendRequest(BaseModel):
     """Input to append_allocation_to_cluster_values: which file to append to
     and what was allocated. The dhcp_values block itself is derived
     activity-side (the DHCP policy lives in the activity worker's config,
-    which the sandboxed workflow cannot read)."""
+    which the sandboxed workflow cannot read).
+
+    `type` travels with the request because the exclusion policy is PER TYPE:
+    the activity selects that type's ranges out of DHCP_EXCLUSION_OCTET_RANGES.
+    It is the workflow's typed input, not something re-derived from the segment
+    read-back, so the file records the policy for the type actually allocated."""
 
     cluster: str = Field(min_length=1)
     relative_path: str = Field(min_length=1)
     vlan_id: int
     segment: str = Field(min_length=1)  # CIDR
+    type: SegmentType
 
 
 class ValuesCommitRef(BaseModel):
@@ -354,12 +363,16 @@ class ValuesCommitRef(BaseModel):
 
 class DhcpScopeState(BaseModel):
     """A read-only observation of the DHCP API: does the scope exist yet, and
-    with what range? `found=False` is a normal answer while Crossplane has not
-    converged — never an error."""
+    with which exclusions? `found=False` is a normal answer while Crossplane
+    has not converged — never an error.
+
+    Exclusions rather than the distribution range: the range is the DHCP API's
+    own derivation (.1-.253), so comparing it would only confirm that service
+    agrees with itself. The exclusions are what this workflow actually wrote to
+    git, so they are what convergence is checked against."""
 
     found: bool
-    start_range: str | None = None
-    end_range: str | None = None
+    exclusions: list[DhcpExclusion] = Field(default_factory=list)
 
 
 class AllocateSegmentResult(BaseModel):

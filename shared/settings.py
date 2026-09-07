@@ -38,6 +38,8 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from shared.models.segment_lifecycle import SegmentType
+
 # "9000" or "30000-32767"
 _PORT_ENTRY_RE = re.compile(r"^(\d{1,5})(?:-(\d{1,5}))?$")
 _SUPPORTED_PROTOCOLS = ("tcp", "udp")
@@ -215,12 +217,23 @@ class SegmentLifecycleActivitySettings(BaseSettings):
     day1_git_token: str
 
     # --- allocate-segment: DHCP scope policy + the DHCP API -----------------
-    # The ONE DHCP policy knob: last-octet ranges excluded from distribution,
-    # e.g. [[1, 10], [241, 254]]. startRange/endRange are DERIVED (first/last
-    # non-excluded host octet), so the range and the exclusions can never
-    # contradict each other. /24 segments only — build_dhcp_values asserts the
-    # prefix and rejects anything else as UnsupportedSegmentPrefix.
-    dhcp_exclusion_octet_ranges: list[tuple[int, int]]
+    # The ONE DHCP policy knob, PER SEGMENT TYPE: last-octet ranges excluded
+    # from distribution, e.g. {"HC": [[1, 10], [241, 254]]}. Together with the
+    # network they are the WHOLE written block: no startRange/endRange, so the
+    # DHCP API derives .1-.253 and these exclusions carve the ends out of it —
+    # one derivation, in the service that owns it. /24 segments only —
+    # build_dhcp_values asserts the prefix and rejects anything else as
+    # UnsupportedSegmentPrefix. A type's list may be EMPTY (excludes nothing).
+    #
+    # Keyed by TYPE because the policy genuinely differs per type (a PXE
+    # segment reserves a different slice of its /24 than an HC one), and the
+    # lookup is dynamic (the allocation's type) — the same reason site_networks
+    # is a map while the statically-referenced PORTS_* directions are flat keys.
+    # Only HC is REQUIRED: allocate-segment rejects every other type up front,
+    # so demanding a policy for types no run can reach would force operators to
+    # invent config for a code path that does not exist yet. Extra type keys
+    # are allowed and fully validated now, ready for those types.
+    dhcp_exclusion_octet_ranges: dict[SegmentType, list[tuple[int, int]]]
     # The DHCP scope API (read-only here: the workflow only ever GETs a scope
     # to observe Crossplane's convergence — it never creates one itself).
     #
@@ -276,33 +289,55 @@ class SegmentLifecycleActivitySettings(BaseSettings):
     @field_validator("dhcp_exclusion_octet_ranges")
     @classmethod
     def _validate_dhcp_exclusion_octet_ranges(
-        cls, ranges: list[tuple[int, int]]
-    ) -> list[tuple[int, int]]:
-        """Strict, fail-fast validation of the one DHCP policy knob: every
-        octet a valid /24 host octet, pairs ordered, strictly ascending and
-        non-overlapping, and at least one octet left to distribute."""
-        if not ranges:
+        cls, policy: dict[SegmentType, list[tuple[int, int]]]
+    ) -> dict[SegmentType, list[tuple[int, int]]]:
+        """Strict, fail-fast validation of the one DHCP policy knob: a policy
+        for HC at minimum, and within EVERY type's ranges each octet a valid
+        /24 host octet, pairs ordered, strictly ascending and non-overlapping,
+        and at least one distributable octet left. A type's list may be EMPTY
+        (that type excludes nothing); the map itself may not be."""
+        if not policy:
             raise ValueError("dhcp_exclusion_octet_ranges must not be empty")
-        previous_end = 0
-        for start, end in ranges:
-            if not (1 <= start <= 254 and 1 <= end <= 254):
-                raise ValueError(
-                    f"exclusion octets must be in 1..254 (got [{start}, {end}])"
-                )
-            if start > end:
-                raise ValueError(f"inverted exclusion range [{start}, {end}]")
-            if start <= previous_end:
-                raise ValueError(
-                    "exclusion ranges must be strictly ascending and "
-                    f"non-overlapping (got [{start}, {end}] after octet {previous_end})"
-                )
-            previous_end = end
-        excluded = {
-            octet for start, end in ranges for octet in range(start, end + 1)
-        }
-        if len(excluded) >= 254:
+        if SegmentType.HC not in policy:
             raise ValueError(
-                "dhcp_exclusion_octet_ranges excludes every host octet — "
-                "nothing left to distribute"
+                "dhcp_exclusion_octet_ranges must carry a policy for type "
+                f"{SegmentType.HC.value!r} (the only type allocate-segment "
+                "supports); got "
+                f"{sorted(segment_type.value for segment_type in policy)}"
             )
-        return ranges
+        for segment_type, ranges in policy.items():
+            label = segment_type.value
+            # An EMPTY list is legal and meaningful: that type excludes
+            # nothing, so its block carries a network and no exclusions and the
+            # scope distributes the DHCP API's whole derived .1-.253. Written
+            # explicitly, it says an operator decided — unlike a missing key.
+            previous_end = 0
+            for start, end in ranges:
+                if not (1 <= start <= 254 and 1 <= end <= 254):
+                    raise ValueError(
+                        f"exclusion octets must be in 1..254 "
+                        f"(got [{start}, {end}] for {label})"
+                    )
+                if start > end:
+                    raise ValueError(
+                        f"inverted exclusion range [{start}, {end}] for {label}"
+                    )
+                if start <= previous_end:
+                    raise ValueError(
+                        "exclusion ranges must be strictly ascending and "
+                        f"non-overlapping (got [{start}, {end}] after octet "
+                        f"{previous_end} for {label})"
+                    )
+                previous_end = end
+            # The DHCP API distributes .1-.253 (it stops short of the .254
+            # gateway it derives), so that is what the exclusions eat into — a
+            # policy covering all of it leaves nothing to lease.
+            excluded = {
+                octet for start, end in ranges for octet in range(start, end + 1)
+            }
+            if excluded >= set(range(1, 254)):
+                raise ValueError(
+                    f"dhcp_exclusion_octet_ranges[{label}] excludes every "
+                    "distributable octet (.1-.253) — nothing left to distribute"
+                )
+        return policy

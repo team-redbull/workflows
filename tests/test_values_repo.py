@@ -32,14 +32,21 @@ vlanId: 23
 
 dhcp_values:
   network: "10.20.90.0"
-  startRange: "10.20.90.11"
-  endRange: "10.20.90.240"
 
   exclusions:
     - startAddress: "10.20.90.1"
       endAddress: "10.20.90.10"
     - startAddress: "10.20.90.241"
       endAddress: "10.20.90.254\""""
+
+# A type whose policy excludes nothing: network only, no exclusions key. The
+# DHCP API distributes its derived .1-.253 whole.
+EXPECTED_BLOCK_NO_EXCLUSIONS = """\
+# === Added By Segment-Allocation Workflow ===
+vlanId: 23
+
+dhcp_values:
+  network: "10.20.90.0\""""
 
 
 def _git(*args: str, cwd: Path) -> str:
@@ -198,6 +205,14 @@ def test_token_is_injected_only_into_https_urls():
     assert values_repo.authenticated_url(
         "https://github.com/org/repo.git", ""
     ) == "https://github.com/org/repo.git"
+
+
+def test_a_type_without_exclusions_renders_network_only():
+    # No exclusions key at all rather than an empty list: the block reads like
+    # a hand-written minimal cluster file, and a site layer's exclusions (if
+    # one ever defines any) keep applying.
+    values = build_dhcp_values("10.20.90.0/24", [])
+    assert values_repo.render_allocation_block(23, values) == EXPECTED_BLOCK_NO_EXCLUSIONS
 
 
 def test_split_marker_block_roundtrips_for_the_future_remover():

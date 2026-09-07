@@ -21,6 +21,7 @@ import json
 import pytest
 from pydantic import ValidationError
 
+from shared.models.segment_lifecycle import SegmentType
 from shared.settings import SegmentLifecycleActivitySettings
 
 
@@ -113,39 +114,79 @@ class TestFailFast:
 
 
 class TestDhcpExclusionOctetRanges:
-    """The ONE DHCP policy knob — a bad edit must crash-loop the worker at
-    startup, never mis-render a scope hours later."""
+    """The ONE DHCP policy knob, keyed by segment type — a bad edit must
+    crash-loop the worker at startup, never mis-render a scope hours later.
+    Every per-range rule is enforced for EVERY type in the map, not just HC:
+    a type configured ahead of the code that uses it is validated now."""
 
-    def test_parses_from_the_configmap_json_string(self, monkeypatch):
-        monkeypatch.setenv("DHCP_EXCLUSION_OCTET_RANGES", "[[1, 10], [100, 110], [241, 254]]")
+    def test_parses_the_per_type_configmap_json_object(self, monkeypatch):
+        monkeypatch.setenv(
+            "DHCP_EXCLUSION_OCTET_RANGES",
+            '{"HC": [[1, 10], [100, 110], [241, 254]], "PXE": [[1, 20]]}',
+        )
         s = SegmentLifecycleActivitySettings()
-        assert s.dhcp_exclusion_octet_ranges == [(1, 10), (100, 110), (241, 254)]
+        assert s.dhcp_exclusion_octet_ranges == {
+            SegmentType.HC: [(1, 10), (100, 110), (241, 254)],
+            SegmentType.PXE: [(1, 20)],
+        }
 
-    def test_empty_list_is_rejected(self, monkeypatch):
+    def test_empty_policy_is_rejected(self, monkeypatch):
         # Same env-not-kwarg rule as the empty topology above.
-        monkeypatch.setenv("DHCP_EXCLUSION_OCTET_RANGES", "[]")
+        monkeypatch.setenv("DHCP_EXCLUSION_OCTET_RANGES", "{}")
         with pytest.raises(ValidationError, match="must not be empty"):
             SegmentLifecycleActivitySettings()
 
+    def test_a_policy_without_hc_is_rejected(self, monkeypatch):
+        # HC is the only type allocate-segment supports, so a map that omits it
+        # configures nothing any run can reach.
+        monkeypatch.setenv("DHCP_EXCLUSION_OCTET_RANGES", '{"PXE": [[1, 10]]}')
+        with pytest.raises(ValidationError, match="must carry a policy for type 'HC'"):
+            SegmentLifecycleActivitySettings()
+
+    def test_an_unknown_type_key_is_rejected(self, monkeypatch):
+        monkeypatch.setenv(
+            "DHCP_EXCLUSION_OCTET_RANGES", '{"HC": [[1, 10]], "BMC": [[1, 10]]}'
+        )
+        with pytest.raises(ValidationError):
+            SegmentLifecycleActivitySettings()
+
+    def test_a_types_empty_range_list_means_no_exclusions(self, monkeypatch):
+        # A type that excludes nothing is a real configuration: its block
+        # carries a network and no exclusions, and the scope distributes the
+        # DHCP API's whole derived .1-.253.
+        monkeypatch.setenv("DHCP_EXCLUSION_OCTET_RANGES", '{"HC": [], "PXE": []}')
+        s = SegmentLifecycleActivitySettings()
+        assert s.dhcp_exclusion_octet_ranges == {SegmentType.HC: [], SegmentType.PXE: []}
+
     @pytest.mark.parametrize("ranges", ["[[0, 10]]", "[[1, 255]]", "[[241, 300]]"])
     def test_octets_outside_the_slash_24_host_range_are_rejected(self, monkeypatch, ranges):
-        monkeypatch.setenv("DHCP_EXCLUSION_OCTET_RANGES", ranges)
-        with pytest.raises(ValidationError, match="1..254"):
+        monkeypatch.setenv("DHCP_EXCLUSION_OCTET_RANGES", '{"HC": %s}' % ranges)
+        with pytest.raises(ValidationError, match=r"1\.\.254"):
             SegmentLifecycleActivitySettings()
 
     def test_inverted_pair_is_rejected(self, monkeypatch):
-        monkeypatch.setenv("DHCP_EXCLUSION_OCTET_RANGES", "[[10, 1]]")
+        monkeypatch.setenv("DHCP_EXCLUSION_OCTET_RANGES", '{"HC": [[10, 1]]}')
         with pytest.raises(ValidationError, match="inverted"):
             SegmentLifecycleActivitySettings()
 
     @pytest.mark.parametrize("ranges", ["[[241, 254], [1, 10]]", "[[1, 10], [5, 20]]"])
     def test_descending_or_overlapping_pairs_are_rejected(self, monkeypatch, ranges):
-        monkeypatch.setenv("DHCP_EXCLUSION_OCTET_RANGES", ranges)
+        monkeypatch.setenv("DHCP_EXCLUSION_OCTET_RANGES", '{"HC": %s}' % ranges)
         with pytest.raises(ValidationError, match="ascending"):
             SegmentLifecycleActivitySettings()
 
-    def test_excluding_every_octet_is_rejected(self, monkeypatch):
-        monkeypatch.setenv("DHCP_EXCLUSION_OCTET_RANGES", "[[1, 254]]")
+    @pytest.mark.parametrize("ranges", ["[[1, 254]]", "[[1, 253]]"])
+    def test_excluding_every_distributable_octet_is_rejected(self, monkeypatch, ranges):
+        # .1-.253 is what the DHCP API distributes, so covering all of it
+        # leaves nothing to lease — whether or not .254 is named too.
+        monkeypatch.setenv("DHCP_EXCLUSION_OCTET_RANGES", '{"HC": %s}' % ranges)
         with pytest.raises(ValidationError, match="nothing left to distribute"):
+            SegmentLifecycleActivitySettings()
+
+    def test_a_non_hc_types_ranges_are_validated_too(self, monkeypatch):
+        monkeypatch.setenv(
+            "DHCP_EXCLUSION_OCTET_RANGES", '{"HC": [[1, 10]], "PXE": [[10, 1]]}'
+        )
+        with pytest.raises(ValidationError, match="inverted"):
             SegmentLifecycleActivitySettings()
 

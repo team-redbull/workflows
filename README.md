@@ -212,7 +212,7 @@ Push the two worker images to a registry the cluster can pull from, then:
 ```bash
 # The brain owns workflows-orchestrator-config (the global values), so install it first.
 helm install workflows-orchestrator ../helm-charts-workflows-orchestrator -n redbull-workflows --create-namespace \
-  --set image.repository=<registry>/workflows \
+  --set image.repository=<registry>/workflows-orchestrator \
   --set config.temporalHost=<temporal-host>:7233 \
   --set config.segmentsManagerUrl=https://<segments-manager-route> \
   --set config.domain=<domain>

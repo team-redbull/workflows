@@ -112,11 +112,14 @@ jobs:
     if: ${{ needs.changes.outputs.brain == 'true' }}
     uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
     with:
-      image-name: workflows
+      # Named for the Argo service / Deployment it becomes, not for this repo:
+      # the image, the chart directory and the running Deployment all read
+      # `workflows-orchestrator`. Was plain `workflows` (the repo name), which
+      # matched nothing that runs in the cluster.
+      image-name: workflows-orchestrator
       dockerfile: workflow_domains/Dockerfile
       # Chart lives in the redbull-platform repo now (Argo CD). The bump + tag land
-      # there. The chart DIRECTORY follows the Argo service name
-      # (workflows-orchestrator), not this repo's name.
+      # there, in gitops/charts/<service>/.
       chart-repo: team-redbull/redbull-platform
       helm-values-path: gitops/charts/workflows-orchestrator/values.yaml
       helm-image-path: image
@@ -182,7 +185,7 @@ jobs:
     if: github.event_name == 'delete'
     uses: team-redbull/.github/.github/workflows/ghcr-cleanup-on-delete.yml@main
     with:
-      image-name: workflows
+      image-name: workflows-orchestrator
     secrets: inherit
 
   cleanup-segment-lifecycle-worker-on-delete:

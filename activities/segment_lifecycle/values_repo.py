@@ -47,6 +47,15 @@ _GIT_COMMAND_TIMEOUT_SECONDS = 150.0
 
 MARKER = "# === Added By Segment-Allocation Workflow ==="
 
+# The day1 repo's layout and this workflow's committer identity. Hardcoded, not
+# configured: the clusters root is the repo's own structure (a wrong value finds
+# no cluster file at all, so there is nothing an operator would usefully tune),
+# and the commit identity names THIS workflow — it identifies the writer, so it
+# must not vary per environment.
+CLUSTERS_ROOT = "sites"
+GIT_USER_NAME = "segment-allocation-workflow"
+GIT_USER_EMAIL = "segment-allocation-workflow@redbull.local"
+
 # The one definition of the appended block. Everything the DHCP stack needs
 # beyond this (leaseDurationDays, dns, subnetMask, failover) is inherited from
 # the upstream values layers; scopeName derives from the file name; gateway is
@@ -183,23 +192,21 @@ async def _clone(
     )
 
 
-def _find_cluster_file(
-    clone_dir: Path, clusters_root: str, cluster: str
-) -> ClusterFileLocation:
-    """Exactly one <clusters_root>/<site>/**/<cluster>.yaml, or a loud,
+def _find_cluster_file(clone_dir: Path, cluster: str) -> ClusterFileLocation:
+    """Exactly one CLUSTERS_ROOT/<site>/**/<cluster>.yaml, or a loud,
     deterministic failure. The site is the path segment directly beneath the
     clusters root — the repo layout is the source of truth for it."""
-    root = clone_dir / clusters_root
+    root = clone_dir / CLUSTERS_ROOT
     matches = sorted(root.glob(f"*/**/{cluster}.yaml")) if root.is_dir() else []
     if not matches:
         raise ClusterFileNotFoundError(
-            f"No {cluster}.yaml found under {clusters_root}/ in the values "
+            f"No {cluster}.yaml found under {CLUSTERS_ROOT}/ in the values "
             "repo — the cluster has no values file to record an allocation in"
         )
     if len(matches) > 1:
         relative = [str(path.relative_to(clone_dir)) for path in matches]
         raise AmbiguousClusterFileError(
-            f"{len(matches)} files named {cluster}.yaml under {clusters_root}/ "
+            f"{len(matches)} files named {cluster}.yaml under {CLUSTERS_ROOT}/ "
             f"in the values repo ({relative}) — cluster file names are the "
             "identity the day1 stack keys on, so a human must resolve this"
         )
@@ -211,12 +218,12 @@ def _find_cluster_file(
 
 
 async def locate_cluster_file(
-    *, repo_url: str, branch: str, token: str, clusters_root: str, cluster: str
+    *, repo_url: str, branch: str, token: str, cluster: str
 ) -> ClusterFileLocation:
     with tempfile.TemporaryDirectory(prefix="day1-locate-") as tmp:
         clone_dir = Path(tmp) / "repo"
         await _clone(repo_url=repo_url, branch=branch, token=token, dest=clone_dir)
-        return _find_cluster_file(clone_dir, clusters_root, cluster)
+        return _find_cluster_file(clone_dir, cluster)
 
 
 async def append_allocation(
@@ -224,8 +231,6 @@ async def append_allocation(
     repo_url: str,
     branch: str,
     token: str,
-    git_user_name: str,
-    git_user_email: str,
     relative_path: str,
     cluster: str,
     vlan_id: int,
@@ -278,9 +283,9 @@ async def append_allocation(
         await _run_git(
             [
                 "-c",
-                f"user.name={git_user_name}",
+                f"user.name={GIT_USER_NAME}",
                 "-c",
-                f"user.email={git_user_email}",
+                f"user.email={GIT_USER_EMAIL}",
                 "commit",
                 "-m",
                 f"chore: allocate segment for {cluster} [segment-allocation-workflow]",

@@ -496,8 +496,7 @@ dhcp_values:
         <thead><tr><th>Key</th><th>Lives in</th><th>Effect</th></tr></thead>
         <tbody>
           <tr><td class="k">DHCP_EXCLUSION_OCTET_RANGES</td><td class="muted">segment-lifecycle-config</td><td class="muted">The ONE DHCP policy knob. Validated at worker startup; a bad edit crash-loops the pod, never mis-renders a scope.</td></tr>
-          <tr><td class="k">DAY1_REPO_URL · DAY1_BRANCH · DAY1_CLUSTERS_ROOT</td><td class="muted">segment-lifecycle-config</td><td class="muted">Which repo/branch holds the cluster values files, and the root folder the site derives under.</td></tr>
-          <tr><td class="k">DAY1_GIT_USER_NAME · DAY1_GIT_USER_EMAIL</td><td class="muted">segment-lifecycle-config</td><td class="muted">The committer identity on allocation commits.</td></tr>
+          <tr><td class="k">DAY1_REPO_URL · DAY1_BRANCH</td><td class="muted">segment-lifecycle-config</td><td class="muted">Which repo and branch hold the cluster values files.</td></tr>
           <tr><td class="k">DAY1_GIT_TOKEN</td><td class="muted">Secret (day1-git-token)</td><td class="muted">Push credential for the values repo. Never logged — scrubbed from every git error.</td></tr>
           <tr><td class="k">DHCP_API_URL · DHCP_API_TOKEN</td><td class="muted">segment-lifecycle-config / Secret</td><td class="muted">Where the DHCP scope API lives; the read token for the convergence poll.</td></tr>
           <tr><td class="k">SEGMENTS_MANAGER_URL · SEGMENTS_MANAGER_API_TOKEN</td><td class="muted">workflows-orchestrator-config / Secret</td><td class="muted">Shared with the rest of the domain.</td></tr>

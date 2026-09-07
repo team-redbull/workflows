@@ -149,14 +149,3 @@ class TestDhcpExclusionOctetRanges:
         with pytest.raises(ValidationError, match="nothing left to distribute"):
             SegmentLifecycleActivitySettings()
 
-
-class TestDay1ClustersRoot:
-
-    def test_default_is_sites(self):
-        assert SegmentLifecycleActivitySettings().day1_clusters_root == "sites"
-
-    @pytest.mark.parametrize("root", ["/sites", "sites/", " sites"])
-    def test_non_bare_paths_are_rejected(self, monkeypatch, root):
-        monkeypatch.setenv("DAY1_CLUSTERS_ROOT", root)
-        with pytest.raises(ValidationError, match="bare relative path"):
-            SegmentLifecycleActivitySettings()

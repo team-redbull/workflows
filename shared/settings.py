@@ -201,11 +201,14 @@ class SegmentLifecycleActivitySettings(BaseSettings):
     # scope. The token authenticates the push (and the clone, for a private
     # repo) — it is injected into the clone URL in memory only and scrubbed
     # from every log line and error message.
+    #
+    # The clusters root and the committer identity are NOT config: they are
+    # hardcoded in activities/segment_lifecycle/values_repo.py (CLUSTERS_ROOT,
+    # GIT_USER_NAME, GIT_USER_EMAIL). The root is the day1 repo's own layout —
+    # a wrong value simply finds no cluster file — and the identity names THIS
+    # workflow, so neither is something an operator tunes per environment.
     day1_repo_url: str
     day1_branch: str = "main"
-    day1_clusters_root: str = "sites"
-    day1_git_user_name: str
-    day1_git_user_email: str
     day1_git_token: str
 
     # --- allocate-segment: DHCP scope policy + the DHCP API -----------------
@@ -268,17 +271,6 @@ class SegmentLifecycleActivitySettings(BaseSettings):
         if not sites:
             raise ValueError("site_networks must not be empty")
         return sites
-
-    @field_validator("day1_clusters_root")
-    @classmethod
-    def _validate_day1_clusters_root(cls, root: str) -> str:
-        """A bare relative directory name — path building assumes no slashes
-        to strip and no absolute escape out of the clone."""
-        if not root or root != root.strip("/").strip():
-            raise ValueError(
-                f"day1_clusters_root must be a bare relative path (got {root!r})"
-            )
-        return root
 
     @field_validator("dhcp_exclusion_octet_ranges")
     @classmethod

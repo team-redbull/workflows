@@ -243,8 +243,8 @@ tags cross-repo.
   always-present `helm-charts-workflows-orchestrator` brain release) holds only shared values — `TEMPORAL_HOST`,
   `TEMPORAL_NAMESPACE`, `DOMAIN`, `SEGMENTS_MANAGER_URL`. `<domain>-config` (owned by that domain's
   chart) holds its own endpoints/policy — e.g. `segment-lifecycle-config` = `NEXT_*` URIs +
-  `PORTS_*` + the allocate-segment keys (`DAY1_REPO_URL/BRANCH/CLUSTERS_ROOT`,
-  `DAY1_GIT_USER_NAME/EMAIL`, `DHCP_EXCLUSION_OCTET_RANGES`, `DHCP_API_URL`; tokens in the
+  `PORTS_*` + the allocate-segment keys (`DAY1_REPO_URL/BRANCH`,
+  `DHCP_EXCLUSION_OCTET_RANGES`, `DHCP_API_URL`; tokens in the
   `day1-git-token` / `dhcp-api-token` Secrets). A domain worker mounts BOTH + its Secrets, so the
   brain release must install before any limb (else `CreateContainerConfigError` on the missing
   global ConfigMap) — and the chart must ship the new keys BEFORE (or with) an image that requires

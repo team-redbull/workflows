@@ -650,7 +650,6 @@ async def locate_cluster_file(cluster: str) -> ClusterFileLocation:
         repo_url=_settings.day1_repo_url,
         branch=_settings.day1_branch,
         token=_settings.day1_git_token,
-        clusters_root=_settings.day1_clusters_root,
         cluster=cluster,
     )
     activity.logger.info(
@@ -738,8 +737,6 @@ async def append_allocation_to_cluster_values(
         repo_url=_settings.day1_repo_url,
         branch=_settings.day1_branch,
         token=_settings.day1_git_token,
-        git_user_name=_settings.day1_git_user_name,
-        git_user_email=_settings.day1_git_user_email,
         relative_path=request.relative_path,
         cluster=request.cluster,
         vlan_id=request.vlan_id,

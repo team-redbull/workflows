@@ -75,8 +75,6 @@ async def _append(origin: Path, **overrides):
         repo_url=str(origin),
         branch="main",
         token="",
-        git_user_name="test-bot",
-        git_user_email="test-bot@test.invalid",
         relative_path=CLUSTER_FILE,
         cluster=CLUSTER,
         vlan_id=23,
@@ -97,7 +95,10 @@ async def test_clone_append_commit_push_roundtrip(origin, tmp_path):
     # The pushed sha is origin's HEAD.
     assert commit_sha == _git("rev-parse", "main", cwd=origin).strip()
     log = _git("log", "-1", "--format=%s %an", "main", cwd=origin).strip()
-    assert log == f"chore: allocate segment for {CLUSTER} [segment-allocation-workflow] test-bot"
+    assert log == (
+        f"chore: allocate segment for {CLUSTER} [segment-allocation-workflow] "
+        f"{values_repo.GIT_USER_NAME}"
+    )
 
 
 async def test_empty_file_gets_the_marker_first(origin, tmp_path):
@@ -158,8 +159,7 @@ async def test_preexisting_bare_vlan_id_is_refused(origin, tmp_path):
 
 async def test_locate_finds_the_single_cluster_file(origin):
     location = await values_repo.locate_cluster_file(
-        repo_url=str(origin), branch="main", token="",
-        clusters_root="sites", cluster=CLUSTER,
+        repo_url=str(origin), branch="main", token="", cluster=CLUSTER,
     )
     assert location.site == "site1"  # the path segment beneath the clusters root
     assert location.relative_path == CLUSTER_FILE
@@ -169,7 +169,7 @@ async def test_locate_unknown_cluster_raises(origin):
     with pytest.raises(ClusterFileNotFoundError):
         await values_repo.locate_cluster_file(
             repo_url=str(origin), branch="main", token="",
-            clusters_root="sites", cluster="no-such-cluster",
+            cluster="no-such-cluster",
         )
 
 
@@ -185,8 +185,7 @@ async def test_locate_duplicate_cluster_file_raises(origin, tmp_path):
 
     with pytest.raises(AmbiguousClusterFileError):
         await values_repo.locate_cluster_file(
-            repo_url=str(origin), branch="main", token="",
-            clusters_root="sites", cluster=CLUSTER,
+            repo_url=str(origin), branch="main", token="", cluster=CLUSTER,
         )
 
 

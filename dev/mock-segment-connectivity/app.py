@@ -8,7 +8,12 @@ exercise the full submit -> poll -> complete cycle. In production you point
 NEXT_URL at the real service and ignore this folder entirely.
 
 Behavior:
-  * POST /token-renewal-uri returns a static mock token.
+  * POST /token-renewal-uri requires a client_id + password body (exercises
+    the orchestrator's credential wiring) and returns a static mock token.
+    The VALUES are not checked against anything — any non-empty pair is
+    accepted, exactly as open-rules accepts any Authorization header. Checking
+    them would mean this chart and helm-charts-segment-lifecycle-worker had to
+    be kept in sync on a shared secret, which is drift, not coverage.
   * POST /open-rules-uri requires an Authorization header (exercises the
     orchestrator's token wiring), validates the payload shape, stores the
     request in memory and returns {"id", "status": "pending"}.
@@ -41,6 +46,11 @@ _requests: dict[int, float] = {}
 
 
 # --- payload models mirroring the next API contract (validation only) --------
+class _TokenRenewalPayload(BaseModel):
+    client_id: str = Field(min_length=1)
+    password: str = Field(min_length=1)
+
+
 class _Address(BaseModel):
     type: Literal["segment"]
     segment: str = Field(min_length=1)
@@ -78,7 +88,7 @@ async def health() -> dict[str, str]:
 
 
 @app.post("/token-renewal-uri")
-async def renew_token() -> dict[str, str]:
+async def renew_token(payload: _TokenRenewalPayload) -> dict[str, str]:
     return {"access_token": "mock-next-token"}
 
 

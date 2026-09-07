@@ -30,6 +30,8 @@ os.environ.update(
         "NEXT_URL": "http://next.test",
         "NEXT_CHECKING_REQUEST_INTERVAL_SECONDS": "15",
         "NEXT_GROUP": "test-group",
+        "NEXT_CLIENT_ID": "test-client",
+        "NEXT_PASSWORD": "test-password",
         "PORTS_HC_TO_MCE": '{"tcp": ["30000-32767"], "udp": ["9000"]}',
         "PORTS_MCE_TO_HC": '{"tcp": ["6443", "30000-32767"]}',
         "PORTS_INVENTORY_TO_MCE": '{"tcp": ["30000-32767"]}',

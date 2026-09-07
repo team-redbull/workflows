@@ -268,7 +268,7 @@ async def test_list_peer_segments_mce_source_queries_all_peer_types_and_merges(e
 
 @respx.mock
 async def test_submit_open_rules_builds_payload_and_returns_ref(env):
-    respx.post(f"{NEXT}/token-renewal-uri").mock(
+    renewal = respx.post(f"{NEXT}/token-renewal-uri").mock(
         return_value=httpx.Response(200, json={"access_token": "tok-1"})
     )
     open_rules = respx.post(f"{NEXT}/open-rules-uri").mock(
@@ -289,6 +289,13 @@ async def test_submit_open_rules_builds_payload_and_returns_ref(env):
     request = open_rules.calls.last.request
     assert request.headers["Authorization"] == "Bearer tok-1"
     import json
+
+    # The token itself is bought with the credentials from the
+    # next-api-credentials Secret (NEXT_CLIENT_ID / NEXT_PASSWORD in conftest).
+    assert json.loads(renewal.calls.last.request.content) == {
+        "client_id": "test-client",
+        "password": "test-password",
+    }
 
     payload = json.loads(request.content)
     # NEXT_GROUP from conftest.

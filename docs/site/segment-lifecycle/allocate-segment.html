@@ -235,11 +235,13 @@
             <span class="phase">phase <b>updating-values-repo</b></span>
           </div>
           <p>Fresh clone, append the marker block (see below), commit, push to <code>main</code>.
-          <b>Safe to run twice:</b> the identical block already present is a no-op success
-          (<code>values_updated:&nbsp;false</code>, nothing pushed); a block with <em>different</em> values — or a
-          <code>dhcp_values</code>/<code>vlanId</code> key some human wrote without the marker — is a hard
-          <code>ClusterValuesConflictError</code>, because a duplicate top-level YAML key silently discards the
-          first block. A rejected non-fast-forward push simply retries from a fresh clone and converges.</p>
+          <b>Safe to run twice:</b> a marker block already recording this <code>vlanId</code> on this
+          <code>network</code> is a no-op success (<code>values_updated:&nbsp;false</code>, nothing pushed) —
+          the comparison is the <em>allocation</em>, not the block's text, so a cluster whose scope an operator
+          tuned by hand keeps that edit through every re-run. A <em>different</em> allocation — another vlan or
+          network, a marker block too mangled to read one out of, or a <code>dhcp_values</code>/<code>vlanId</code>
+          key some human wrote without the marker — is a hard <code>ClusterValuesConflictError</code>, because a
+          duplicate top-level YAML key silently discards the first block. A rejected non-fast-forward push simply retries from a fresh clone and converges.</p>
           <div class="calls">
             <div class="call nxt"><span class="verb">GIT</span><span class="path">clone → append → commit → push origin main <em>· token scrubbed from every error</em></span></div>
           </div>
@@ -523,15 +525,17 @@ dhcp_values:
       <div class="panel ok">
         <h3>Re-run after completion — everything converges</h3>
         <p>The Segments Manager returns the <em>same</em> allocation (idempotent per cluster/site/type), the
-        values file already ends in the identical block so nothing is pushed
+        values file already records that vlan and network so nothing is pushed
         (<code>values_updated: false</code>, <code>commit_sha: null</code>), and the DHCP scope already exists so
-        the wait finishes on the first poll.</p>
+        the wait finishes on the first poll. Anything an operator tuned inside the block stays as written —
+        which also means a later change to the exclusion policy is never retrofitted onto an allocated
+        cluster.</p>
       </div>
       <div class="panel warn">
         <h3>The one thing a re-run will not do</h3>
-        <p>Fix a conflict. If the values file carries a <em>different</em> allocation — an edited marker block, or
-        a hand-written <code>dhcp_values</code> — every run refuses with <code>ClusterValuesConflictError</code>
-        until a human reconciles the file. That is the point: the workflow must never guess which of two
+        <p>Fix a conflict. If the values file carries a <em>different</em> allocation — another vlan or network
+        under the marker, or a hand-written top-level <code>dhcp_values</code> — every run refuses with
+        <code>ClusterValuesConflictError</code> until a human reconciles the file. That is the point: the workflow must never guess which of two
         allocations is the real one.</p>
       </div>
     </div>

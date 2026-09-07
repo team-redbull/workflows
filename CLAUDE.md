@@ -212,8 +212,14 @@ tags cross-repo.
   (200) as success; `submit_open_rules` converges (a retried-but-accepted POST leaves only an orphan
   request id never polled); `publish_request_ids` is a replace-style PUT; `allocate_segment` is
   idempotent SERVER-side per (cluster, site, type) — a repeat call returns the existing allocation;
-  `append_allocation_to_cluster_values` treats the identical block already present as success
-  (`changed=False`, nothing pushed) and refuses a DIFFERENT one (`ClusterValuesConflictError`).
+  `append_allocation_to_cluster_values` compares the ALLOCATION, not the block text — a marker block
+  already recording this `vlanId` on this `network` is success (`changed=False`, nothing pushed)
+  whatever else it contains, and any other allocation (or a block too mangled to read one out of)
+  raises `ClusterValuesConflictError`. Text equality was the earlier rule and it made a per-cluster
+  operator edit — a hand-picked `startRange`/`endRange`, an extra exclusion — fail every later
+  re-run as a phantom conflict. The workflow's promise is that the file records the vlan and network
+  the Segments Manager confirmed; the DHCP detail around them belongs to day1 and to the operator,
+  which also means a changed exclusion POLICY is never retrofitted onto an allocated cluster.
 - **Verify after mutate, before recording:** allocate-segment reads the allocation back
   (`get_segment`: status/cluster/vlan must all match) BEFORE the git write, so the values repo can
   never record a vlan the Segments Manager does not confirm. A mutation whose outcome another system

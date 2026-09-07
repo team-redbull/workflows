@@ -90,6 +90,16 @@ _EXCLUSION_TEMPLATE = """\
 # the first (taking scopeName/pxe/gateway/failover with it) — refuse instead.
 _FOREIGN_ALLOCATION_KEY_RE = re.compile(r"^(vlanId|dhcp_values)\s*:", re.MULTILINE)
 
+# The two values that IDENTIFY the allocation inside an existing marker block.
+# A re-run compares these — not the block's text — so an operator may tune the
+# scope in place (a hand-picked startRange/endRange for one cluster, an extra
+# exclusion) without the next run calling their edit a conflicting allocation.
+# What this workflow guarantees is that the file records the vlan and network
+# the Segments Manager confirmed; the DHCP detail around them is day1's, and
+# the operator's.
+_RECORDED_VLAN_RE = re.compile(r"^vlanId:\s*(\d+)\s*$", re.MULTILINE)
+_RECORDED_NETWORK_RE = re.compile(r'^\s+network:\s*"([^"]+)"\s*$', re.MULTILINE)
+
 
 def render_allocation_block(vlan_id: int, dhcp_values: DhcpValues) -> str:
     """The exact text appended to a cluster values file (no trailing newline)."""
@@ -123,6 +133,16 @@ def split_marker_block(content: str) -> tuple[str, str | None]:
     if index == -1:
         return content, None
     return content[:index], content[index:]
+
+
+def read_allocation_identity(block: str) -> tuple[int, str] | None:
+    """The (vlanId, network) an existing marker block records, or None when the
+    block does not carry both — a mangled block a human has to look at."""
+    vlan_match = _RECORDED_VLAN_RE.search(block)
+    network_match = _RECORDED_NETWORK_RE.search(block)
+    if vlan_match is None or network_match is None:
+        return None
+    return int(vlan_match.group(1)), network_match.group(1)
 
 
 def append_block(content: str, block: str) -> str:
@@ -246,12 +266,16 @@ async def append_allocation(
 ) -> tuple[str | None, bool]:
     """Append the allocation block to the cluster's file, commit and push.
 
-    Returns (commit_sha, changed): (None, False) when the file already ends in
-    this exact block — a re-run, nothing to push. Raises the non-retryable
-    ClusterValuesConflictError when the file carries a DIFFERENT allocation
-    (marker with other values, or an unmarked dhcp_values/vlanId key), and the
-    retryable ValuesRepoGitError for any git failure — including a rejected
-    non-fast-forward push, which the retry resolves by re-cloning.
+    Returns (commit_sha, changed): (None, False) when the file already records
+    THIS allocation — a re-run, nothing to push. "This allocation" means the
+    marker block's vlanId and network match; the rest of the block is left
+    exactly as it stands, so a cluster whose scope an operator tuned by hand
+    (its own startRange/endRange, an extra exclusion) survives every later
+    re-run untouched. Raises the non-retryable ClusterValuesConflictError when
+    the file carries a DIFFERENT allocation (another vlan or network, a marker
+    block too mangled to read one out of, or an unmarked dhcp_values/vlanId
+    key), and the retryable ValuesRepoGitError for any git failure — including
+    a rejected non-fast-forward push, which the retry resolves by re-cloning.
     """
     block = render_allocation_block(vlan_id, dhcp_values)
     with tempfile.TemporaryDirectory(prefix="day1-append-") as tmp:
@@ -270,12 +294,23 @@ async def append_allocation(
 
         head, existing_block = split_marker_block(content)
         if existing_block is not None:
-            if existing_block.strip() == block.strip():
+            # Compare the allocation, not the text. The vlan and the network
+            # are what this workflow put on record and what a second, clashing
+            # allocation would change; everything else in the block is DHCP
+            # detail an operator is allowed to have adjusted for this cluster.
+            recorded = read_allocation_identity(existing_block)
+            if recorded == (vlan_id, dhcp_values.network):
                 return None, False
+            found = (
+                f"vlan {recorded[0]} on {recorded[1]}"
+                if recorded is not None
+                else "a block with no readable vlanId/network"
+            )
             raise ClusterValuesConflictError(
                 f"{relative_path} already carries a segment-allocation block "
-                "with DIFFERENT values — refusing to overwrite; a human must "
-                "decide which allocation is right"
+                f"for {found}, not vlan {vlan_id} on {dhcp_values.network} — "
+                "refusing to overwrite; a human must decide which allocation "
+                "is right"
             )
         if _FOREIGN_ALLOCATION_KEY_RE.search(head):
             raise ClusterValuesConflictError(

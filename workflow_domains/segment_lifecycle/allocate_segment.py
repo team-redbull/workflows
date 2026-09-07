@@ -215,7 +215,8 @@ class AllocateSegmentWorkflow:
             )
 
         # Step 4 — record the allocation in the values repo (idempotent: a
-        # re-run finds the identical block and pushes nothing).
+        # re-run finds this vlan/network already recorded and pushes nothing,
+        # leaving any operator-tuned detail in that block alone).
         self._phase = "updating-values-repo"
         commit_ref = await workflow.execute_activity(
             append_allocation_to_cluster_values,

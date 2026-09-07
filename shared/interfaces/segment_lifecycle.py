@@ -205,10 +205,12 @@ async def append_allocation_to_cluster_values(
     """Append the marker block (vlanId + dhcp_values) to the cluster's values
     file and push to the values repo.
 
-    Idempotent by re-clone + content check: the exact block already present is
-    a no-op success (changed=False, nothing pushed); a DIFFERENT allocation —
-    a marker with other values, or an unmarked dhcp_values/vlanId key — raises
-    ClusterValuesConflictError (non-retryable). A rejected push raises the
+    Idempotent by re-clone + allocation check: a marker block already recording
+    this vlanId on this network is a no-op success (changed=False, nothing
+    pushed) whatever else an operator has tuned inside it; a DIFFERENT
+    allocation — another vlan or network, an unreadable marker block, or an
+    unmarked dhcp_values/vlanId key — raises ClusterValuesConflictError
+    (non-retryable). A rejected push raises the
     retryable ValuesRepoGitError; the retry starts from a fresh clone and
     converges. Returns the derived DhcpValues either way, for the workflow's
     convergence poll.

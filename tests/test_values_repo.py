@@ -132,10 +132,59 @@ async def test_identical_block_is_a_no_op(origin):
     assert _git("rev-parse", "main", cwd=origin).strip() == before  # nothing pushed
 
 
-async def test_marker_with_different_values_is_refused(origin):
+async def test_marker_with_a_different_vlan_is_refused(origin):
     await _append(origin)
-    with pytest.raises(ClusterValuesConflictError, match="DIFFERENT values"):
+    with pytest.raises(ClusterValuesConflictError, match="already carries"):
         await _append(origin, vlan_id=99)
+
+
+async def test_marker_with_a_different_network_is_refused(origin):
+    await _append(origin)
+    other_network = build_dhcp_values("10.20.91.0/24", [(1, 10)])
+    with pytest.raises(ClusterValuesConflictError, match="already carries"):
+        await _append(origin, dhcp_values=other_network)
+
+
+async def test_an_operator_tuned_block_survives_a_re_run(origin, tmp_path):
+    # The whole point of comparing the allocation rather than the text: an
+    # operator may give ONE cluster its own distribution range (or an extra
+    # exclusion) inside the block. A later re-run records the same vlan on the
+    # same network, so it must leave that edit exactly as it stands.
+    await _append(origin)
+    seed = tmp_path / "tuned-seed"
+    _git("clone", str(origin), str(seed), cwd=tmp_path)
+    tuned = (seed / CLUSTER_FILE).read_text().replace(
+        '  network: "10.20.90.0"\n',
+        '  network: "10.20.90.0"\n  startRange: "10.20.90.60"\n'
+        '  endRange: "10.20.90.90"\n',
+    )
+    (seed / CLUSTER_FILE).write_text(tuned)
+    _git("add", ".", cwd=seed)
+    _git("-c", "user.name=s", "-c", "user.email=s@t", "commit", "-m", "tune", cwd=seed)
+    _git("push", "origin", "main", cwd=seed)
+    before = _git("rev-parse", "main", cwd=origin).strip()
+
+    commit_sha, changed = await _append(origin)
+    assert not changed
+    assert commit_sha is None
+    assert _git("rev-parse", "main", cwd=origin).strip() == before  # nothing pushed
+    assert _origin_file(origin, tmp_path, "verify-tuned") == tuned
+
+
+async def test_an_unreadable_marker_block_is_refused(origin, tmp_path):
+    # A block a human mangled past the point of naming its allocation is not
+    # silently adopted — the run stops and says so.
+    seed = tmp_path / "mangled-seed"
+    _git("clone", str(origin), str(seed), cwd=tmp_path)
+    (seed / CLUSTER_FILE).write_text(
+        f"{values_repo.MARKER}\ndhcp_values:\n  description: \"half a block\"\n"
+    )
+    _git("add", ".", cwd=seed)
+    _git("-c", "user.name=s", "-c", "user.email=s@t", "commit", "-m", "mangle", cwd=seed)
+    _git("push", "origin", "main", cwd=seed)
+
+    with pytest.raises(ClusterValuesConflictError, match="no readable vlanId/network"):
+        await _append(origin)
 
 
 async def test_preexisting_unmarked_dhcp_values_is_refused(origin, tmp_path):

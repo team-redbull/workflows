@@ -259,8 +259,11 @@ tags cross-repo.
   import settings from inside a workflow definition (sandbox) — only from entrypoints / api.py / activities.
 - **ConfigMaps hold minimum, operator-editable data** — anything changeable without a rebuild (e.g. the
   `PORTS_*` per-direction port policy, compact JSON per protocol, and
-  `DHCP_EXCLUSION_OCTET_RANGES`) lives directly in the ConfigMap TEMPLATE (not values.yaml),
-  expanded/validated in code (fail-fast at worker startup).
+  `DHCP_EXCLUSION_OCTET_RANGES`) is expanded/validated in code (fail-fast at worker startup) rather
+  than baked into an image. Its VALUE lives in the chart's `values.yaml` (`config.ports.*`,
+  `config.dhcpExclusionOctetRanges`) and the ConfigMap template only renders it — an operator knob is
+  reviewed as structured YAML next to every other tunable, not as JSON embedded in a template. (This
+  reverses the earlier rule that ports/exclusions sat in the template itself.)
 - **The DHCP policy is ONE knob, and /24 is ASSERTED:** `DHCP_EXCLUSION_OCTET_RANGES` (last-octet
   ranges, e.g. `[[1, 10], [241, 254]]`) is the whole DHCP surface — `startRange`/`endRange` are
   DERIVED as the first/last non-excluded host octet, so the range and the exclusions can never

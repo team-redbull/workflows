@@ -34,8 +34,6 @@ os.environ.update(
         "PORTS_MCE_TO_HC": '{"tcp": ["6443", "30000-32767"]}',
         "PORTS_INVENTORY_TO_MCE": '{"tcp": ["30000-32767"]}',
         "PORTS_MCE_TO_INVENTORY": '{"tcp": ["6443"]}',
-        "PORTS_PXE_TO_MCE": '{"udp": ["69"]}',
-        "PORTS_MCE_TO_PXE": '{"tcp": ["6443"]}',
         "SITE_NETWORKS": (
             '{"site-a": {"pool": "192.11.0.0/16", '
             '"dell-bmc": "10.98.0.0/16", "cisco-bmc": "10.99.0.0/16"}}'

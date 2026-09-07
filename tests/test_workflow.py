@@ -248,19 +248,33 @@ async def test_happy_path_submits_polls_publishes_and_unlocks():
     assert calls["publish_segment_connectivity_failure"] == []
 
 
-def test_supported_types_covers_every_segment_type():
-    # All 4 real SegmentType members are supported today, so the
-    # "UnsupportedSegmentType" fail-fast path can no longer be exercised
-    # through the public API with a real SegmentType value (the enum is
-    # closed, and Temporal's workflow sandbox re-executes this module in
-    # isolation, so monkeypatching _SUPPORTED_TYPES from the test process
-    # doesn't reach the sandboxed copy either). This locks in the gate's
-    # current coverage instead: if a 5th SegmentType is ever added without
-    # updating _SUPPORTED_TYPES, this test fails loudly and prompts an
-    # explicit decision, exactly as the gate is meant to.
+def test_supported_types_is_every_type_except_pxe():
+    # The gate's coverage, locked in: PXE is a real SegmentType (the Segments
+    # Manager still creates PXE segments) that this workflow deliberately does
+    # NOT open connectivity for. If a 5th SegmentType is ever added without an
+    # explicit decision here, this fails loudly — exactly as the gate intends.
     from workflow_domains.segment_lifecycle.open_segment_rules import _SUPPORTED_TYPES
 
-    assert _SUPPORTED_TYPES == frozenset(SegmentType)
+    assert _SUPPORTED_TYPES == frozenset(SegmentType) - {SegmentType.PXE}
+
+
+async def test_pxe_input_is_rejected_before_the_segment_is_created():
+    """The unsupported-type gate runs BEFORE create_segment and OUTSIDE the
+    failure-note try block: a PXE run must leave nothing behind — no segment
+    in the Segments Manager, and no failure note about a segment that was
+    never created."""
+    calls, mocks = make_mock_activities()
+    async with _Harness(mocks) as client:
+        with pytest.raises(WorkflowFailureError) as exc_info:
+            await _execute(client, OpenSegmentRulesRunArgs(input=_input(SegmentType.PXE)))
+
+    cause = _workflow_cause(exc_info)
+    assert isinstance(cause, ApplicationError)
+    assert cause.type == "UnsupportedSegmentType"
+    assert calls["create_segment"] == []
+    assert calls["list_peer_segments"] == []
+    assert calls["submit_open_rules"] == []
+    assert calls["publish_segment_connectivity_failure"] == []
 
 
 async def test_creation_is_the_first_step_and_carries_the_full_definition():
@@ -316,29 +330,26 @@ async def test_empty_peer_pool_fails_and_publishes_failure_note():
     assert "No same-site peer segments" in notice.message
 
 
-async def test_mce_source_peers_with_hc_inventory_and_pxe():
+async def test_mce_source_peers_with_hc_and_inventory():
     peers = (
         SegmentRef(segment="10.1.0.0/24", type=SegmentType.HC),
         SegmentRef(segment="10.2.0.0/24", type=SegmentType.INVENTORY),
-        SegmentRef(segment="10.3.0.0/24", type=SegmentType.PXE),
     )
     calls, mocks = make_mock_activities(peer_segments=peers, check_script=[[]])
     async with _Harness(mocks) as client:
         result = await _execute(client, OpenSegmentRulesRunArgs(input=MCE_INPUT))
 
-    assert result.peer_segment_count == 3
+    assert result.peer_segment_count == 2
     assert calls["list_peer_segments"] == [
         PeerSegmentsQuery(source_type=SegmentType.MCE, site=SITE)
     ]
-    assert len(calls["submit_open_rules"]) == 6
+    assert len(calls["submit_open_rules"]) == 4
     pairs = {(r.source_type, r.destination_type) for r in calls["submit_open_rules"]}
     assert pairs == {
         (SegmentType.MCE, SegmentType.HC),
         (SegmentType.HC, SegmentType.MCE),
         (SegmentType.MCE, SegmentType.INVENTORY),
         (SegmentType.INVENTORY, SegmentType.MCE),
-        (SegmentType.MCE, SegmentType.PXE),
-        (SegmentType.PXE, SegmentType.MCE),
     }
     # Plus the mandatory BMC legs — one request per configured hardware vendor
     # per direction, all four (this site has both) from a single
@@ -357,7 +368,7 @@ async def test_mce_source_peers_with_hc_inventory_and_pxe():
         (BmcVendor.CISCO, d, SEGMENT, "10.99.0.0/16")
         for d in BmcRuleDirection
     }
-    assert len(result.request_ids) == 10
+    assert len(result.request_ids) == 8
 
 
 async def test_mce_source_with_no_peers_still_submits_bmc_rules():

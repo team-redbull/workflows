@@ -65,7 +65,7 @@ class OpenRulesRequest(BaseModel):
 class SegmentRef(BaseModel):
     """A same-site segment eligible to peer with some source type — carries
     its own type because one source type can peer with several destination
-    types at once (e.g. MCE peers with HC, INVENTORY and PXE)."""
+    types at once (e.g. MCE peers with both HC and INVENTORY)."""
 
     segment: str = Field(min_length=1)  # CIDR
     type: SegmentType

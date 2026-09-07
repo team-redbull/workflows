@@ -178,8 +178,11 @@ class SegmentLifecycleActivitySettings(BaseSettings):
     ports_mce_to_hc: dict[str, list[str]]
     ports_inventory_to_mce: dict[str, list[str]]
     ports_mce_to_inventory: dict[str, list[str]]
-    ports_pxe_to_mce: dict[str, list[str]]
-    ports_mce_to_pxe: dict[str, list[str]]
+    # No PORTS_*_PXE / PORTS_PXE_*: PXE is a real Segments Manager type, but
+    # connectivity is DELIBERATELY not opened for it (see _SUPPORTED_TYPES in
+    # workflow_domains/segment_lifecycle/open_segment_rules.py). These profiles
+    # ARE the peering topology, so leaving a placeholder profile here would make
+    # every MCE run discover same-site PXE segments and open MCE<->PXE rules.
 
     # --- The shared site topology (SITE_NETWORKS). This service reads only
     # each site's `dell-bmc` and `cisco-bmc`: every MCE segment opens a
@@ -233,8 +236,6 @@ class SegmentLifecycleActivitySettings(BaseSettings):
         "ports_mce_to_hc",
         "ports_inventory_to_mce",
         "ports_mce_to_inventory",
-        "ports_pxe_to_mce",
-        "ports_mce_to_pxe",
         "ports_mce_to_bmc",
     )
     @classmethod

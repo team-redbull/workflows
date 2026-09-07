@@ -208,11 +208,12 @@ async def test_create_segment_unreadable_lookup_stays_retryable(env):
 def test_peer_types_derived_from_port_profiles():
     assert _peer_types(SegmentType.HC) == [SegmentType.MCE]
     assert _peer_types(SegmentType.INVENTORY) == [SegmentType.MCE]
-    assert _peer_types(SegmentType.PXE) == [SegmentType.MCE]
+    # PXE has no configured profiles (connectivity deliberately not opened for
+    # it), so it neither peers with MCE nor appears among MCE's peers.
+    assert _peer_types(SegmentType.PXE) == []
     assert _peer_types(SegmentType.MCE) == [
         SegmentType.HC,
         SegmentType.INVENTORY,
-        SegmentType.PXE,
     ]
 
 
@@ -251,16 +252,14 @@ async def test_list_peer_segments_mce_source_queries_all_peer_types_and_merges(e
     respx.get(f"{SM}/api/segments", params={"type": "INVENTORY"}).mock(
         return_value=httpx.Response(200, json=[{"segment": "10.2.0.0/24", "site": "site-a"}])
     )
-    respx.get(f"{SM}/api/segments", params={"type": "PXE"}).mock(
-        return_value=httpx.Response(200, json=[{"segment": "10.3.0.0/24", "site": "site-a"}])
-    )
+    # No PXE route is mocked on purpose: an MCE source must never query
+    # `?type=PXE`, and respx fails an unmatched request loudly if it regresses.
     result = await env.run(
         list_peer_segments, PeerSegmentsQuery(source_type=SegmentType.MCE, site="site-a")
     )
     assert sorted(result, key=lambda r: r.segment) == [
         SegmentRef(segment="10.1.0.0/24", type=SegmentType.HC),
         SegmentRef(segment="10.2.0.0/24", type=SegmentType.INVENTORY),
-        SegmentRef(segment="10.3.0.0/24", type=SegmentType.PXE),
     ]
 
 

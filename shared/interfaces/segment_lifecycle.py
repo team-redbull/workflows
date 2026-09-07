@@ -61,8 +61,8 @@ async def list_peer_segments(query: PeerSegmentsQuery) -> list[SegmentRef]:
     Peer types are derived from the activity layer's configured
     PORTS_<SRC>_TO_<DST> port profiles — the port policy IS the peering
     topology (e.g. an HC source currently returns only MCE peers, while an
-    MCE source returns HC + INVENTORY + PXE peers). Site-scoped: only
-    same-site segments are valid peers.
+    MCE source returns HC + INVENTORY peers). Site-scoped: only same-site
+    segments are valid peers.
     """
     ...
 

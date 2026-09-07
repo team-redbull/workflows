@@ -18,14 +18,15 @@ and then fired a best-effort HTTP trigger at us — which left creation outside
 Temporal: invisible in the UI, and silently skipped whenever that call failed.
 Now every step is one durable, replayable run.
 
-HC, INVENTORY, PXE and MCE segments each peer with every same-site segment of
+HC, INVENTORY and MCE segments each peer with every same-site segment of
 the OTHER types the port policy defines for them (list_peer_segments + a
-bidirectional OpenRulesRequest per peer). Today HC/INVENTORY/PXE each peer
-only with MCE, and MCE peers with all three of them — symmetric by
-construction: adding a new MCE segment discovers and opens rules against
-every existing same-site HC/INVENTORY/PXE segment, exactly as adding a new
-HC/INVENTORY/PXE segment already discovers same-site MCE segments. The input
-accepts any segment type; unsupported ones fail loudly.
+bidirectional OpenRulesRequest per peer). Today HC/INVENTORY each peer only
+with MCE, and MCE peers with both of them — symmetric by construction: adding
+a new MCE segment discovers and opens rules against every existing same-site
+HC/INVENTORY segment, exactly as adding a new HC/INVENTORY segment already
+discovers same-site MCE segments. PXE is deliberately excluded (see
+_SUPPORTED_TYPES). The input accepts any segment type; unsupported ones fail
+loudly.
 
 MCE segments additionally get four mandatory MCE <-> BMC rules per run
 (submit_bmc_open_rules once per hardware vendor per direction — server BMCs
@@ -122,13 +123,20 @@ _FAILURE_NOTE_RETRY_POLICY = RetryPolicy(
 
 # Types connectivity is implemented for. Which OTHER types each one peers
 # with is derived entirely from the activity layer's PORTS_* profiles
-# (_PORT_PROFILES) — HC/INVENTORY/PXE currently peer only with MCE, and MCE
-# peers with all three of them (symmetric, driven by config not code). New
-# peer-based types: add the member here plus its PORTS_<SRC>_TO_<DST> /
+# (_PORT_PROFILES) — HC/INVENTORY currently peer only with MCE, and MCE peers
+# with both of them (symmetric, driven by config not code). New peer-based
+# types: add the member here plus its PORTS_<SRC>_TO_<DST> /
 # PORTS_<DST>_TO_<SRC> config in the activity layer.
-_SUPPORTED_TYPES = frozenset(
-    {SegmentType.HC, SegmentType.INVENTORY, SegmentType.PXE, SegmentType.MCE}
-)
+#
+# PXE is a valid Segments Manager type and stays in the SegmentType enum (the
+# Segments Manager UI still creates and lists PXE segments) — it is left OUT
+# here DELIBERATELY: no connectivity is opened for PXE today, so a PXE input
+# is rejected BEFORE create_segment rather than creating the segment and then
+# dying with PeerTypesNotConfigured half-way through. Re-enabling it is two
+# edits with no other code change: add the member back here and add the
+# PORTS_PXE_TO_MCE / PORTS_MCE_TO_PXE profiles in the activity layer (the
+# system-name and comment-label maps there still carry PXE).
+_SUPPORTED_TYPES = frozenset({SegmentType.HC, SegmentType.INVENTORY, SegmentType.MCE})
 
 # Endless-poll pacing: the interval itself is operator-configured (fast
 # locally against the mock, slow in prod against the real human-driven

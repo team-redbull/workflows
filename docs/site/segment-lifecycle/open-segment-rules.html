@@ -177,8 +177,11 @@
             <span class="phase">phase <b>pending</b></span>
           </div>
           <p>Runs before anything is created. Supported types are <code>HC</code>, <code>INVENTORY</code>,
-          <code>PXE</code>, <code>MCE</code> — anything else fails the run immediately with
+          <code>MCE</code> — anything else fails the run immediately with
           <code>UnsupportedSegmentType</code>. Nothing exists yet, so there is nothing to clean up.</p>
+          <p><code>PXE</code> is a valid Segments Manager type but is <b>deliberately not supported here</b>:
+          no connectivity is opened for PXE segments today, so a PXE run is rejected at this gate rather
+          than creating a segment that has nothing to peer with.</p>
         </div>
       </div>
 
@@ -341,7 +344,7 @@
     </div>
     <div class="diagram topology">
       <svg viewBox="0 0 660 380" role="img"
-           aria-label="Topology diagram: MCE sits at the centre and peers bidirectionally with HC, INVENTORY and PXE segments on the same site, two open-rules requests each. MCE additionally peers bidirectionally with each of the site's static BMC networks — one for Dell hardware and one for Cisco, whichever the site hosts — two requests each.">
+           aria-label="Topology diagram: MCE sits at the centre and peers bidirectionally with HC and INVENTORY segments on the same site, two open-rules requests each. MCE additionally peers bidirectionally with each of the site's static BMC networks — one for Dell hardware and one for Cisco, whichever the site hosts — two requests each.">
         <defs>
           <marker id="ah-e2" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0.5 L8,4 L0,7.5 Z"/></marker>
           <marker id="ah-e1" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0.5 L8,4 L0,7.5 Z"/></marker>
@@ -350,17 +353,14 @@
         <!-- edges -->
         <path class="edge two" d="M281,164 L134,86"  marker-start="url(#ah-e2)" marker-end="url(#ah-e2)"/>
         <path class="edge two" d="M281,216 L134,294" marker-start="url(#ah-e2)" marker-end="url(#ah-e2)"/>
-        <path class="edge two" d="M379,164 L526,86"  marker-start="url(#ah-e2)" marker-end="url(#ah-e2)"/>
-        <path class="edge one" d="M379,216 L526,294" marker-start="url(#ah-e1)" marker-end="url(#ah-e1)"/>
+        <path class="edge one" d="M399,190 L506,190" marker-start="url(#ah-e1)" marker-end="url(#ah-e1)"/>
 
         <rect x="164" y="110" width="86" height="17" rx="2" class="edge-mask"/>
         <text class="edge-l" x="207" y="123">2 requests</text>
         <rect x="164" y="245" width="86" height="17" rx="2" class="edge-mask"/>
         <text class="edge-l" x="207" y="258">2 requests</text>
-        <rect x="410" y="110" width="86" height="17" rx="2" class="edge-mask"/>
-        <text class="edge-l" x="453" y="123">2 requests</text>
-        <rect x="404" y="245" width="98" height="17" rx="2" class="edge-mask"/>
-        <text class="edge-l" x="453" y="258">2 × 2 requests</text>
+        <rect x="404" y="181" width="98" height="17" rx="2" class="edge-mask"/>
+        <text class="edge-l" x="453" y="194">2 × 2 requests</text>
 
         <!-- nodes -->
         <rect class="node-box peer" x="20"  y="34"  width="130" height="52" rx="4"/>
@@ -371,17 +371,13 @@
         <text class="node-t" x="85"  y="316">INVENTORY</text>
         <text class="node-s" x="85"  y="332">same site only</text>
 
-        <rect class="node-box peer" x="510" y="34"  width="130" height="52" rx="4"/>
-        <text class="node-t" x="575" y="56">PXE</text>
-        <text class="node-s" x="575" y="72">same site only</text>
-
-        <rect class="node-box bmc"  x="510" y="294" width="130" height="52" rx="4"/>
-        <text class="node-t" x="575" y="316">BMC per vendor</text>
-        <text class="node-s" x="575" y="332">dell-bmc and/or cisco-bmc</text>
+        <rect class="node-box bmc"  x="510" y="164" width="130" height="52" rx="4"/>
+        <text class="node-t" x="575" y="186">BMC per vendor</text>
+        <text class="node-s" x="575" y="202">dell-bmc and/or cisco-bmc</text>
 
         <rect class="node-box mce"  x="265" y="164" width="130" height="52" rx="4"/>
         <text class="node-t" x="330" y="186">MCE</text>
-        <text class="node-s" x="330" y="202">peers with all three</text>
+        <text class="node-s" x="330" y="202">peers with both</text>
       </svg>
     </div>
     <div class="diagram-caption">
@@ -394,32 +390,28 @@
         <thead>
           <tr>
             <th>from ↓ &nbsp; to →</th>
-            <th>MCE</th><th>HC</th><th>INVENTORY</th><th>PXE</th><th>BMC <span style="text-transform:none;letter-spacing:0">(static, per vendor)</span></th>
+            <th>MCE</th><th>HC</th><th>INVENTORY</th><th>BMC <span style="text-transform:none;letter-spacing:0">(static, per vendor)</span></th>
           </tr>
         </thead>
         <tbody>
           <tr>
             <th>MCE</th>
             <td class="self">—</td>
-            <td class="yes">✓</td><td class="yes">✓</td><td class="yes">✓</td>
+            <td class="yes">✓</td><td class="yes">✓</td>
             <td class="oneway">✓ <span style="text-transform:none;letter-spacing:0">(per vendor hosted)</span></td>
           </tr>
           <tr>
             <th>HC</th>
-            <td class="yes">✓</td><td class="self">—</td><td class="no">·</td><td class="no">·</td><td class="no">·</td>
+            <td class="yes">✓</td><td class="self">—</td><td class="no">·</td><td class="no">·</td>
           </tr>
           <tr>
             <th>INVENTORY</th>
-            <td class="yes">✓</td><td class="no">·</td><td class="self">—</td><td class="no">·</td><td class="no">·</td>
-          </tr>
-          <tr>
-            <th>PXE</th>
-            <td class="yes">✓</td><td class="no">·</td><td class="no">·</td><td class="self">—</td><td class="no">·</td>
+            <td class="yes">✓</td><td class="no">·</td><td class="self">—</td><td class="no">·</td>
           </tr>
           <tr>
             <th>BMC <span style="text-transform:none;letter-spacing:0">(static)</span></th>
             <td class="oneway">✓ <span style="text-transform:none;letter-spacing:0">(per vendor hosted)</span></td>
-            <td class="no">·</td><td class="no">·</td><td class="no">·</td><td class="self">—</td>
+            <td class="no">·</td><td class="no">·</td><td class="self">—</td>
           </tr>
         </tbody>
       </table>
@@ -428,16 +420,16 @@
       <div class="panel">
         <h3>It works in both directions, by construction</h3>
         <p style="font-size:var(--fs-14);color:var(--ink-2)">Adding an <b>HC</b> segment discovers the site's existing MCE segments and opens
-        <code>HC↔MCE</code> for each. Adding an <b>MCE</b> segment discovers every existing HC, INVENTORY and PXE segment on that site
+        <code>HC↔MCE</code> for each. Adding an <b>MCE</b> segment discovers every existing HC and INVENTORY segment on that site
         and opens all of those pairs. So a site converges to full connectivity whatever order segments are added in.</p>
         <p style="font-size:var(--fs-14);color:var(--ink-2)"><b>With one exception: a site needs its MCE segment first.</b>
-        HC, INVENTORY and PXE peer only with MCE, so on a site that has none there is nothing to open rules against —
+        HC and INVENTORY peer only with MCE, so on a site that has none there is nothing to open rules against —
         the run fails with <code>NoPeerSegments</code> rather than creating a segment nothing can reach.</p>
       </div>
       <div class="panel">
         <h3>How many requests will a run make?</h3>
         <p style="font-size:var(--fs-14);color:var(--ink-2)"><span class="mono">2 × (same-site peers found)</span>, plus <span class="mono">2 × (BMC vendors the site hosts)</span> if the segment is MCE (each vendor's rules, each way).
-        A new HC segment on a site with 3 MCE segments submits 6 requests; a new MCE segment on a site with 2 HC + 1 PXE submits 10 where the site hosts both vendors, 8 where it hosts one.</p>
+        A new HC segment on a site with 3 MCE segments submits 6 requests; a new MCE segment on a site with 2 HC + 1 INVENTORY submits 10 where the site hosts both vendors, 8 where it hosts one.</p>
       </div>
     </div>
   </section>
@@ -464,7 +456,7 @@
           <pre><span class="c">// request</span>
 {
   "segment":  "130.154.20.0/24",   <span class="c">// CIDR</span>
-  "type":     "HC",                <span class="c">// MCE | HC | INVENTORY | PXE</span>
+  "type":     "HC",                <span class="c">// MCE | HC | INVENTORY (PXE is rejected)</span>
   "site":     "site-a",
   "vlan_id":  412,                 <span class="c">// 1–4094</span>
   "epg_name": "epg-hc-412",
@@ -589,7 +581,7 @@
         <thead><tr><th>Field</th><th>Type</th><th>Rules</th><th>What it's for</th></tr></thead>
         <tbody>
           <tr><td class="k">segment</td><td class="k">str</td><td class="muted">non-empty, CIDR</td><td class="muted">The network, e.g. <code>130.154.20.0/24</code>. Also the identity used everywhere downstream.</td></tr>
-          <tr><td class="k">type</td><td class="k">enum</td><td class="muted">MCE · HC · INVENTORY · PXE</td><td class="muted">Decides which peers are discovered and which port profiles apply.</td></tr>
+          <tr><td class="k">type</td><td class="k">enum</td><td class="muted">MCE · HC · INVENTORY</td><td class="muted">Decides which peers are discovered and which port profiles apply. <code>PXE</code> parses but is rejected by the type check.</td></tr>
           <tr><td class="k">site</td><td class="k">str</td><td class="muted">non-empty</td><td class="muted">Peering is strictly same-site. Also selects the site's BMC networks for MCE.</td></tr>
           <tr><td class="k">vlan_id</td><td class="k">int</td><td class="muted nums">1–4094</td><td class="muted">Passed straight through to the Segments Manager.</td></tr>
           <tr><td class="k">epg_name</td><td class="k">str</td><td class="muted">non-empty</td><td class="muted">Passed straight through to the Segments Manager.</td></tr>

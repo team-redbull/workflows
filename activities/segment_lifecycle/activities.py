@@ -116,13 +116,15 @@ _BMC_COMMENT_LABELS: dict[BmcVendor, str] = {
 # peer types from this dict's keys, and BMC segments are never queryable from
 # the Segments Manager (see get_bmc_segments) — an (MCE, BMC) entry here would
 # make list_peer_segments wrongly try `GET /api/segments?type=BMC`.
+# Also excludes PXE, deliberately: PXE segments exist in the Segments Manager,
+# but no connectivity is opened for them (the workflow rejects a PXE input at
+# _SUPPORTED_TYPES). An (MCE, PXE) entry here would re-introduce it from the
+# other side — every MCE run would discover same-site PXE peers.
 _PORT_PROFILES: dict[tuple[SegmentType, SegmentType], dict[str, list[str]]] = {
     (SegmentType.HC, SegmentType.MCE): _settings.ports_hc_to_mce,
     (SegmentType.MCE, SegmentType.HC): _settings.ports_mce_to_hc,
     (SegmentType.INVENTORY, SegmentType.MCE): _settings.ports_inventory_to_mce,
     (SegmentType.MCE, SegmentType.INVENTORY): _settings.ports_mce_to_inventory,
-    (SegmentType.PXE, SegmentType.MCE): _settings.ports_pxe_to_mce,
-    (SegmentType.MCE, SegmentType.PXE): _settings.ports_mce_to_pxe,
 }
 
 

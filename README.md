@@ -15,9 +15,11 @@ direction is reversed: callers POST the definition to
 Segments Manager itself. Every step of a segment's life is now one durable, replayable
 run.
 
-All four types are implemented: `HC`, `INVENTORY` and `PXE` each peer with same-site
-`MCE` segments, and `MCE` peers with all three of them — symmetric, driven by the
-`PORTS_*` config rather than hardcoded per type. `MCE` segments additionally get
+Three of the four types are implemented: `HC` and `INVENTORY` each peer with same-site
+`MCE` segments, and `MCE` peers with both of them — symmetric, driven by the
+`PORTS_*` config rather than hardcoded per type. `PXE` is a valid Segments Manager
+type but connectivity is deliberately NOT opened for it: it has no `PORTS_*` profiles
+and is rejected up front (`UnsupportedSegmentType`), before the segment is created. `MCE` segments additionally get
 mandatory rules to their site's static BMC networks — one per direction per server
 hardware vendor the site hosts, Dell and/or Cisco, which sit on separate /16s (not
 tracked by the Segments Manager — see the Flow section below).
@@ -55,7 +57,7 @@ Worker-file naming convention: the workflow (brain) worker is
    non-retryable `SegmentConflictError`.
 2. `list_peer_segments(source_type, site)` — every same-site segment of the
    other types `source_type` peers with, derived from the configured
-   `PORTS_*` profiles (e.g. `HC` -> only `MCE`; `MCE` -> `HC` + `INVENTORY` + `PXE`).
+   `PORTS_*` profiles (e.g. `HC` -> only `MCE`; `MCE` -> `HC` + `INVENTORY`).
 3. `submit_open_rules(...)` x2 per peer segment (both directions), all in parallel.
    Port policy per direction comes from the ConfigMap (`PORTS_HC_TO_MCE`, ...).
    `MCE` segments additionally get mandatory `submit_bmc_open_rules(...)` — both

@@ -206,22 +206,33 @@ def _next_client() -> httpx.AsyncClient:
 async def _fetch_next_token(client: httpx.AsyncClient) -> str:
     """Renew a next API access token; fetched fresh inside every invocation.
 
-    Authenticates with the client id + password from the `next-api-credentials`
-    Secret. Failures here are NextApiError (retryable) — a wrong credential is
+    The endpoint is an OAuth2 client-credentials token URL, so the client id +
+    password from the `next-api-credentials` Secret travel as HTTP BASIC in the
+    Authorization header — NOT as a body (a request body is ignored, and one
+    without the header answers 401 `{"detail": "Not authenticated"}` with
+    `WWW-Authenticate: Basic`). Any `grant_type` rides along in the configured
+    NEXT_TOKEN_RENEWAL_URI as a query param, which httpx's base_url join keeps.
+    `auth=` is per-request on purpose: only renewal is Basic, while open-rules
+    and status carry the Bearer token this returns.
+
+    Failures here are NextApiError (retryable) — a wrong credential is
     indistinguishable from an outage at this layer.
     """
     try:
         resp = await client.post(
             _settings.next_token_renewal_uri,
-            json={
-                "client_id": _settings.next_client_id,
-                "password": _settings.next_password,
-            },
+            auth=(_settings.next_client_id, _settings.next_password),
         )
     except httpx.HTTPError as exc:
         raise NextApiError(f"Token renewal call failed: {exc}") from exc
     if resp.status_code != 200:
-        raise NextApiError(f"Token renewal returned {resp.status_code}: {resp.text}")
+        # The URL is in the message because an air-gapped operator reading this
+        # in the Temporal UI otherwise cannot tell a wrong NEXT_TOKEN_RENEWAL_URI
+        # from a credential problem. No secrets in it — the creds are a header.
+        raise NextApiError(
+            f"Token renewal to {resp.request.url} returned "
+            f"{resp.status_code}: {resp.text}"
+        )
     token = resp.json().get("access_token")
     if not token:
         raise NextApiError(f"Token renewal response missing access_token: {resp.text}")

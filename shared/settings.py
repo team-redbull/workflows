@@ -159,9 +159,10 @@ class SegmentLifecycleActivitySettings(BaseSettings):
     next_open_rules_uri: str = "/open-rules-uri"
     next_check_status_uri: str = "/check-request-status"
 
-    # Credentials next's token-renewal endpoint authenticates with (POSTed as
-    # the renewal body; the access token it returns is what the open-rules and
-    # status calls carry). No code defaults — they live in the
+    # Credentials next's token-renewal endpoint authenticates with, sent as HTTP
+    # BASIC (it is an OAuth2 client-credentials token URL — any grant_type rides
+    # in NEXT_TOKEN_RENEWAL_URI as a query param; the access token it returns is
+    # what the open-rules and status calls carry). No code defaults — they live in the
     # `next-api-credentials` Secret, so a missing one must crash the worker at
     # startup rather than surface as a 401 mid-workflow.
     next_client_id: str

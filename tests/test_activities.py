@@ -8,6 +8,8 @@ everything else -> retryable SegmentsManagerError/NextApiError.
 
 from __future__ import annotations
 
+import base64
+
 import httpx
 import pytest
 import respx
@@ -291,11 +293,11 @@ async def test_submit_open_rules_builds_payload_and_returns_ref(env):
     import json
 
     # The token itself is bought with the credentials from the
-    # next-api-credentials Secret (NEXT_CLIENT_ID / NEXT_PASSWORD in conftest).
-    assert json.loads(renewal.calls.last.request.content) == {
-        "client_id": "test-client",
-        "password": "test-password",
-    }
+    # next-api-credentials Secret (NEXT_CLIENT_ID / NEXT_PASSWORD in conftest),
+    # sent as HTTP Basic — the real endpoint is an OAuth2 client-credentials
+    # token URL and ignores a body (see _fetch_next_token).
+    expected = base64.b64encode(b"test-client:test-password").decode()
+    assert renewal.calls.last.request.headers["Authorization"] == f"Basic {expected}"
 
     payload = json.loads(request.content)
     # NEXT_GROUP from conftest.

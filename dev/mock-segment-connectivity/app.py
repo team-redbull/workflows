@@ -8,12 +8,15 @@ exercise the full submit -> poll -> complete cycle. In production you point
 NEXT_URL at the real service and ignore this folder entirely.
 
 Behavior:
-  * POST /token-renewal-uri requires a client_id + password body (exercises
-    the orchestrator's credential wiring) and returns a static mock token.
-    The VALUES are not checked against anything — any non-empty pair is
-    accepted, exactly as open-rules accepts any Authorization header. Checking
-    them would mean this chart and helm-charts-segment-lifecycle-worker had to
-    be kept in sync on a shared secret, which is drift, not coverage.
+  * POST /token-renewal-uri requires HTTP BASIC credentials (exercises the
+    orchestrator's credential wiring) and returns a static mock token. Basic,
+    not a body: the real service is an OAuth2 client-credentials token
+    endpoint, and answering a credential-less call with 401
+    {"detail": "Not authenticated"} + WWW-Authenticate: Basic is exactly its
+    observed behavior. The VALUES are not checked against anything — any pair
+    is accepted, exactly as open-rules accepts any Authorization header.
+    Checking them would mean this chart and the segment-lifecycle-worker chart
+    had to be kept in sync on a shared secret, which is drift, not coverage.
   * POST /open-rules-uri requires an Authorization header (exercises the
     orchestrator's token wiring), validates the payload shape, stores the
     request in memory and returns {"id", "status": "pending"}.
@@ -31,7 +34,8 @@ import random
 import time
 from typing import Literal
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, Field
 
 # Simulated human-approval delay before a request turns "complete".
@@ -41,16 +45,16 @@ COMPLETION_DELAY_SECONDS = float(os.environ.get("COMPLETION_DELAY_SECONDS", "60"
 
 app = FastAPI(title="Mock next connectivity service (dev only)")
 
+# Presence-only: a credential-less renewal call gets FastAPI's 401
+# {"detail": "Not authenticated"} + WWW-Authenticate: Basic, the real
+# service's observed shape. The values are never compared.
+_basic = HTTPBasic()
+
 # request id -> submission time (monotonic)
 _requests: dict[int, float] = {}
 
 
 # --- payload models mirroring the next API contract (validation only) --------
-class _TokenRenewalPayload(BaseModel):
-    client_id: str = Field(min_length=1)
-    password: str = Field(min_length=1)
-
-
 class _Address(BaseModel):
     type: Literal["segment"]
     segment: str = Field(min_length=1)
@@ -88,7 +92,9 @@ async def health() -> dict[str, str]:
 
 
 @app.post("/token-renewal-uri")
-async def renew_token(payload: _TokenRenewalPayload) -> dict[str, str]:
+async def renew_token(
+    credentials: HTTPBasicCredentials = Depends(_basic),
+) -> dict[str, str]:
     return {"access_token": "mock-next-token"}
 
 

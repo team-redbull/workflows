@@ -98,8 +98,15 @@ _TLS_VERIFY = False
 
 # STUB — Phase 1: system names / comment labels for the next payload. Replace
 # with real values (or configuration) when the next-service contract is final.
+#
+# next VALIDATES system_name against ^[a-z0-9]([a-z0-9_.-]{0,9}[a-z0-9])?$ —
+# at most 11 chars, lowercase alphanumeric at both ends, `_ . -` interior only.
+# A longer name is rejected with a 400 OrderBadRequest at submit time, i.e.
+# AFTER the segment is created and locked, so keep every name here short. The
+# human-readable identity belongs in _COMMENT_LABELS below, which next does
+# not constrain — HC is "hc" here and "Hosted Cluster" there.
 _SYSTEM_NAMES: dict[SegmentType, str] = {
-    SegmentType.HC: "hosted-cluster",
+    SegmentType.HC: "hc",
     SegmentType.MCE: "mce",
     SegmentType.INVENTORY: "inventory",
     SegmentType.PXE: "pxe",

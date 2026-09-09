@@ -41,6 +41,9 @@ os.environ.update(
             '"dell-bmc": "10.98.0.0/16", "cisco-bmc": "10.99.0.0/16"}}'
         ),
         "PORTS_MCE_TO_BMC": '{"tcp": ["623"]}',
+        # No site skips the firewall by default; the open-site tests set their
+        # own value (site-a is the only site SITE_NETWORKS above knows).
+        "SITES_WITH_OPEN_CONNECTIVITY": "[]",
         # --- allocate-segment: values repo + DHCP policy/API ---
         "DAY1_REPO_URL": "https://git.test/team/gitops-day1-platform-config.git",
         "DAY1_GIT_TOKEN": "test-git-token",

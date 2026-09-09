@@ -134,6 +134,11 @@ async def start_initialize_segment(
     Segments Manager as its first step. Semantic validation (site, CIDR,
     overlap, VLAN) happens there, so an invalid definition surfaces as a FAILED
     workflow on GET /workflows/runs/{workflow_id}, not as a 4xx here.
+
+    At a site whose connectivity is always open (SITES_WITH_OPEN_CONNECTIVITY
+    in the worker's config), there is no firewall and nothing to approve: the
+    run creates the segment and unlocks it straight away, so it is Available
+    within seconds instead of waiting on a human approval.
     """
     try:
         handle = await _start(client, rules_input)

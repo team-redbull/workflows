@@ -228,10 +228,18 @@ class InitializeSegmentProgress(BaseModel):
 
 
 class InitializeSegmentResult(BaseModel):
+    """The run's outcome. `open_connectivity_site` says WHY a run can carry
+    zero peers and zero request ids: the site's connectivity is always open
+    (SITES_WITH_OPEN_CONNECTIVITY), so the segment was created and unlocked
+    without involving the next service at all. Without it, that result reads
+    as a run that opened nothing — the one outcome the normal path refuses to
+    produce (it fails as NoPeerSegments instead)."""
+
     segment: str
     type: SegmentType
     peer_segment_count: int
     request_ids: list[int]
+    open_connectivity_site: bool = False
 
 
 # --- allocate-segment -------------------------------------------------------

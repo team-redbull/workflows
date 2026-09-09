@@ -36,6 +36,13 @@ static, ConfigMap-sourced network per site (not Segments-Manager-tracked),
 so this never peers back and is submitted unconditionally whenever the input
 type is MCE.
 
+Some sites are flat — connectivity between their segments is ALWAYS OPEN, so
+there is no firewall and nothing for next to approve. They are listed in
+SITES_WITH_OPEN_CONNECTIVITY (asked once, via site_has_open_connectivity,
+before any peer is listed), and a run there is just create + unlock: the
+segment is Available in the Segments Manager by the time the run returns. Type
+support is unchanged — an open site is not a back door for PXE.
+
 Completion of next requests depends on a HUMAN approval and can take minutes,
 hours or more — the workflow therefore polls indefinitely (durable timers at a
 constant, operator-configured interval) and rolls its history over with
@@ -67,6 +74,7 @@ with workflow.unsafe.imports_passed_through():
         list_peer_segments,
         publish_segment_connectivity_failure,
         publish_request_ids,
+        site_has_open_connectivity,
         submit_bmc_open_rules,
         submit_open_rules,
         unlock_segment,
@@ -210,6 +218,26 @@ class InitializeSegmentWorkflow:
         resume: InitializeSegmentResumeState | None,
     ) -> InitializeSegmentResult:
         if resume is None:
+            # Some sites are flat: no firewall stands between their segments,
+            # so there is nothing for the next service to approve. Asked ONCE,
+            # here, before any peer is listed — the whole next flow (peer
+            # discovery, BMC rules, submission, the endless approval poll)
+            # collapses to "create, then unlock", and the segment is Available
+            # by the time this run returns.
+            #
+            # A resumed run never asks: it only exists because requests WERE
+            # submitted and are still pending, which an open site can never
+            # produce.
+            self._phase = "checking-site-connectivity"
+            connectivity_is_open = await workflow.execute_activity(
+                site_has_open_connectivity,
+                rules_input.site,
+                task_queue=SEGMENT_LIFECYCLE_ACTIVITY_QUEUE,
+                start_to_close_timeout=_ACTIVITY_TIMEOUT,
+                retry_policy=_RETRY_POLICY,
+            )
+            if connectivity_is_open:
+                return await self._complete_open_connectivity_site(rules_input)
             state = await self._open_rules(rules_input)
         else:
             # Resumed after continue_as_new: rules are already submitted,
@@ -278,14 +306,7 @@ class InitializeSegmentWorkflow:
             )
 
         # Step 4 — all rules open: unlock the segment (Locked -> Available).
-        self._phase = "unlocking-segment"
-        await workflow.execute_activity(
-            unlock_segment,
-            rules_input.segment,
-            task_queue=SEGMENT_LIFECYCLE_ACTIVITY_QUEUE,
-            start_to_close_timeout=_ACTIVITY_TIMEOUT,
-            retry_policy=_RETRY_POLICY,
-        )
+        await self._unlock(rules_input.segment)
 
         self._phase = "completed"
         workflow.logger.info(
@@ -298,6 +319,48 @@ class InitializeSegmentWorkflow:
             type=rules_input.type,
             peer_segment_count=state.peer_segment_count,
             request_ids=request_ids,
+        )
+
+    async def _complete_open_connectivity_site(
+        self, rules_input: InitializeSegmentInput
+    ) -> InitializeSegmentResult:
+        """The whole run for a site whose connectivity is always open: the
+        segment was created above, so all that is left is to unlock it.
+
+        Reported as a normal success with zero peers and zero request ids —
+        the result's open_connectivity_site flag is what distinguishes it from
+        the (impossible) case of a run that found nothing to open, which
+        _open_rules fails outright as NoPeerSegments.
+
+        No request-ids display is published either: nothing is ever pending,
+        and the display exists to be waited on.
+        """
+        await self._unlock(rules_input.segment)
+        self._phase = "completed"
+        workflow.logger.info(
+            "Site %s has open connectivity — segment=%s created and unlocked "
+            "without any next request",
+            rules_input.site,
+            rules_input.segment,
+        )
+        return InitializeSegmentResult(
+            segment=rules_input.segment,
+            type=rules_input.type,
+            peer_segment_count=0,
+            request_ids=[],
+            open_connectivity_site=True,
+        )
+
+    async def _unlock(self, segment: str) -> None:
+        """Flip the segment Locked -> Available — the last step of every path
+        through this workflow, so both paths flip it the same way."""
+        self._phase = "unlocking-segment"
+        await workflow.execute_activity(
+            unlock_segment,
+            segment,
+            task_queue=SEGMENT_LIFECYCLE_ACTIVITY_QUEUE,
+            start_to_close_timeout=_ACTIVITY_TIMEOUT,
+            retry_policy=_RETRY_POLICY,
         )
 
     async def _open_rules(

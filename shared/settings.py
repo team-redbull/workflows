@@ -208,6 +208,28 @@ class SegmentLifecycleActivitySettings(BaseSettings):
     # equal are a drift source, not a feature.
     ports_mce_to_bmc: dict[str, list[str]]
 
+    # --- sites whose connectivity is ALWAYS OPEN ---------------------------
+    # Sites where the network is flat: no firewall sits between segments, so
+    # there is nothing for the next service to approve. initialize-segment
+    # creates a segment at one of these sites and unlocks it straight away
+    # (no peer discovery, no open-rules submission, no polling) — it is born
+    # Available in the Segments Manager within one run.
+    #
+    # A LIST, not a per-site flag inside SITE_NETWORKS: this is our own policy
+    # about next, while SITE_NETWORKS is the shared topology rendered into
+    # both this chart's ConfigMap and the Segments Manager's — a key only we
+    # understand does not belong in a structure another service also reads.
+    #
+    # REQUIRED with no code default, like every other policy knob here: with a
+    # default, a typo'd key name (SITES_WITH_OPEN_CONECTIVITY) would silently
+    # read as "every site needs rules" and a segment at an open site would sit
+    # waiting for a human approval that is never coming. An operator with no
+    # such site writes an explicit empty list.
+    #
+    # Every entry must be a site in SITE_NETWORKS — a misspelt site name is
+    # the same silent failure, so it crash-loops the worker at startup.
+    sites_with_open_connectivity: list[str]
+
     # --- allocate-segment: the day1 values repo -----------------------------
     # Where cluster values files live (sites/<site>/mces/<mce>/hostedClusters/
     # <cluster>.yaml). The workflow appends the vlanId + dhcp_values block
@@ -297,6 +319,33 @@ class SegmentLifecycleActivitySettings(BaseSettings):
         if not sites:
             raise ValueError("site_networks must not be empty")
         return sites
+
+    @model_validator(mode="after")
+    def _validate_sites_with_open_connectivity(self) -> "SegmentLifecycleActivitySettings":
+        """Every open-connectivity site must be a real, known site.
+
+        The list may be EMPTY (no site skips the firewall — the behaviour
+        before this knob existed), but a name in it that SITE_NETWORKS does
+        not know is a typo, and a typo here is invisible at runtime: that site
+        simply falls back to submitting open-rules requests and waiting
+        forever for an approval nobody will give. Duplicates are rejected for
+        the same reason — a list repeating a site was edited carelessly.
+        """
+        seen: set[str] = set()
+        for site in self.sites_with_open_connectivity:
+            if not site:
+                raise ValueError(
+                    "sites_with_open_connectivity must not contain an empty site name"
+                )
+            if site in seen:
+                raise ValueError(f"duplicate site {site!r} in sites_with_open_connectivity")
+            seen.add(site)
+            if site not in self.site_networks:
+                raise ValueError(
+                    f"unknown site {site!r} in sites_with_open_connectivity — "
+                    f"expected one of {sorted(self.site_networks)}"
+                )
+        return self
 
     @field_validator("dhcp_exclusion_octet_ranges")
     @classmethod

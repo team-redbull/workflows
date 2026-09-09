@@ -254,7 +254,9 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   always-present `workflows-orchestrator` brain release) holds only shared values — `TEMPORAL_HOST`,
   `TEMPORAL_NAMESPACE`, `DOMAIN`, `SEGMENTS_MANAGER_URL`. `<domain>-config` (owned by that domain's
   chart) holds its own endpoints/policy — e.g. `segment-lifecycle-config` = `NEXT_*` URIs +
-  `PORTS_*` + the allocate-segment keys (`DAY1_REPO_URL/BRANCH`,
+  `PORTS_*` + `SITES_WITH_OPEN_CONNECTIVITY` (the sites with no firewall, where initialize-segment
+  skips the whole next flow and unlocks the segment straight after creating it) + the
+  allocate-segment keys (`DAY1_REPO_URL/BRANCH`,
   `DHCP_EXCLUSION_OCTET_RANGES`, `DHCP_API_URL`; credentials in the `day1-git-token` and
   `next-api-credentials` Secrets — the DHCP scope API needs none, its GETs are anonymous). A
   domain worker mounts BOTH + its Secrets, so the

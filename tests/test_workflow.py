@@ -74,17 +74,21 @@ def make_mock_activities(
     check_always_pending: bool = False,
     create_fail_times: int = 0,
     create_error: Exception | None = None,
+    open_connectivity: bool = False,
 ):
     """Build the full mock activity set + a call recorder.
 
     check_script: per-poll return values; once exhausted (and not
     check_always_pending) every subsequent poll returns [] (all complete).
     bmc_segments=None simulates an unconfigured site (get_bmc_segments raises).
+    open_connectivity=True makes the site one whose connectivity is always
+    open (SITES_WITH_OPEN_CONNECTIVITY), so the whole next flow is skipped.
     """
     calls: dict[str, list] = {
         name: []
         for name in (
             "create_segment",
+            "site_has_open_connectivity",
             "list_peer_segments",
             "submit_open_rules",
             "get_bmc_segments",
@@ -108,6 +112,11 @@ def make_mock_activities(
         if create_failures_left[0] > 0:
             create_failures_left[0] -= 1
             raise RuntimeError("simulated transient Segments Manager outage")
+
+    @activity.defn
+    async def site_has_open_connectivity(site_arg: str) -> bool:
+        calls["site_has_open_connectivity"].append(site_arg)
+        return open_connectivity
 
     @activity.defn
     async def list_peer_segments(query: PeerSegmentsQuery) -> list[SegmentRef]:
@@ -159,6 +168,7 @@ def make_mock_activities(
 
     return calls, [
         create_segment,
+        site_has_open_connectivity,
         list_peer_segments,
         submit_open_rules,
         get_bmc_segments,
@@ -232,6 +242,9 @@ async def test_happy_path_submits_polls_publishes_and_unlocks():
     assert result.peer_segment_count == 1
     # 2 directions x 1 MCE segment; the mock's ids race, so order-insensitive.
     assert sorted(result.request_ids) == [1, 2]
+    assert result.open_connectivity_site is False
+    # Asked exactly once, before any peer is listed.
+    assert calls["site_has_open_connectivity"] == [SITE]
     assert calls["list_peer_segments"] == [
         PeerSegmentsQuery(source_type=SegmentType.HC, site=SITE)
     ]
@@ -246,6 +259,78 @@ async def test_happy_path_submits_polls_publishes_and_unlocks():
     # submitted_at captured once and reused verbatim on every republish.
     assert len({u.submitted_at for u in calls["publish_request_ids"]}) == 1
     assert calls["publish_segment_connectivity_failure"] == []
+
+
+async def test_open_connectivity_site_creates_and_unlocks_without_any_next_request():
+    """A site whose connectivity is always open: the segment is created and
+    unlocked in one run, and the next service is never involved — no peer
+    discovery, no submission, no polling, and no request-ids display (nothing
+    is ever pending for an operator to wait on)."""
+    calls, mocks = make_mock_activities(open_connectivity=True)
+    async with _Harness(mocks) as client:
+        result = await _execute(client, InitializeSegmentRunArgs(input=HC_INPUT))
+
+    assert result.open_connectivity_site is True
+    assert result.request_ids == []
+    assert result.peer_segment_count == 0
+    # The segment IS still created here — the workflow stays the single entry
+    # point; only the connectivity half is skipped.
+    assert calls["create_segment"] == [HC_INPUT]
+    assert calls["site_has_open_connectivity"] == [SITE]
+    assert calls["unlock_segment"] == [SEGMENT]
+    for skipped in (
+        "list_peer_segments",
+        "submit_open_rules",
+        "get_bmc_segments",
+        "submit_bmc_open_rules",
+        "publish_request_ids",
+        "check_next_requests",
+        "get_next_checking_request_interval",
+        "publish_segment_connectivity_failure",
+    ):
+        assert calls[skipped] == [], skipped
+
+
+async def test_open_connectivity_site_skips_the_next_flow_for_mce_too():
+    """MCE is the type with mandatory BMC rules on the normal path — an open
+    site must skip those as well, not just peer discovery."""
+    calls, mocks = make_mock_activities(open_connectivity=True)
+    async with _Harness(mocks) as client:
+        result = await _execute(client, InitializeSegmentRunArgs(input=MCE_INPUT))
+
+    assert result.open_connectivity_site is True
+    assert calls["get_bmc_segments"] == []
+    assert calls["submit_bmc_open_rules"] == []
+    assert calls["unlock_segment"] == [SEGMENT]
+
+
+async def test_open_connectivity_site_re_run_is_idempotent():
+    """Re-running for a segment that already exists and is already unlocked is
+    a no-op success — both activities absorb it server-side, so the open path
+    needs no state of its own to be safely repeatable."""
+    calls, mocks = make_mock_activities(open_connectivity=True)
+    async with _Harness(mocks) as client:
+        first = await _execute(client, InitializeSegmentRunArgs(input=HC_INPUT))
+        second = await _execute(client, InitializeSegmentRunArgs(input=HC_INPUT))
+
+    assert first == second
+    assert calls["create_segment"] == [HC_INPUT, HC_INPUT]
+    assert calls["unlock_segment"] == [SEGMENT, SEGMENT]
+
+
+async def test_open_connectivity_site_still_rejects_an_unsupported_type():
+    """The open-site short-circuit sits AFTER the type gate: PXE is rejected
+    everywhere, so an open site cannot become a back door for a type this
+    workflow does not support."""
+    calls, mocks = make_mock_activities(open_connectivity=True)
+    async with _Harness(mocks) as client:
+        with pytest.raises(WorkflowFailureError) as exc_info:
+            await _execute(client, InitializeSegmentRunArgs(input=_input(SegmentType.PXE)))
+
+    assert _workflow_cause(exc_info).type == "UnsupportedSegmentType"
+    assert calls["create_segment"] == []
+    assert calls["site_has_open_connectivity"] == []
+    assert calls["unlock_segment"] == []
 
 
 def test_supported_types_is_every_type_except_pxe():
@@ -442,8 +527,9 @@ async def test_resume_path_skips_submission_and_finishes():
 
     assert result.request_ids == [11, 12]
     assert result.peer_segment_count == 3
-    # Resume never re-creates or re-submits.
+    # Resume never re-creates, re-checks the site, or re-submits.
     assert calls["create_segment"] == []
+    assert calls["site_has_open_connectivity"] == []
     assert calls["list_peer_segments"] == []
     assert calls["submit_open_rules"] == []
     # The original submission time survives continue_as_new.

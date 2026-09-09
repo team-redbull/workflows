@@ -387,6 +387,27 @@ async def _list_segments_by_type(
 
 
 @activity.defn
+async def site_has_open_connectivity(site: str) -> bool:
+    """Is connectivity always open at this site (nothing to ask next for)?
+
+    A pure config lookup, not an API call — the same shape as
+    get_next_checking_request_interval. An UNKNOWN site is simply False, not
+    an error: the site names are cross-checked against SITE_NETWORKS at worker
+    startup, so by the time this runs the list holds only real sites and
+    anything else genuinely is a site that needs its rules opened. Whether the
+    site exists at all stays the Segments Manager's call, made in
+    create_segment before this is ever reached.
+    """
+    is_open = site in _settings.sites_with_open_connectivity
+    activity.logger.info(
+        "site=%s connectivity is %s",
+        site,
+        "always open (skipping the next flow)" if is_open else "firewalled",
+    )
+    return is_open
+
+
+@activity.defn
 async def list_peer_segments(query: PeerSegmentsQuery) -> list[SegmentRef]:
     """Return every same-site segment eligible to peer with query.source_type."""
     peer_types = _peer_types(query.source_type)

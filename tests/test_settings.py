@@ -190,3 +190,45 @@ class TestDhcpExclusionOctetRanges:
         with pytest.raises(ValidationError, match="inverted"):
             SegmentLifecycleActivitySettings()
 
+
+
+class TestSitesWithOpenConnectivity:
+    """SITES_WITH_OPEN_CONNECTIVITY: the sites where no firewall stands between
+    segments, so initialize-segment never involves the next service.
+
+    Empty is legal and is the default posture; a name SITE_NETWORKS does not
+    know is a typo, and a typo is the one failure this knob cannot survive
+    quietly — the site would silently fall back to submitting open-rules
+    requests and waiting forever for an approval nobody will give.
+    """
+
+    def test_empty_list_means_every_site_is_firewalled(self, monkeypatch):
+        monkeypatch.setenv("SITES_WITH_OPEN_CONNECTIVITY", "[]")
+        assert SegmentLifecycleActivitySettings().sites_with_open_connectivity == []
+
+    def test_listed_sites_are_kept(self, monkeypatch):
+        monkeypatch.setenv("SITE_NETWORKS", json.dumps({"site-a": _SITE, "site-b": _SITE}))
+        monkeypatch.setenv("SITES_WITH_OPEN_CONNECTIVITY", '["site-b"]')
+        assert SegmentLifecycleActivitySettings().sites_with_open_connectivity == ["site-b"]
+
+    def test_a_site_missing_from_site_networks_is_rejected(self, monkeypatch):
+        monkeypatch.setenv("SITES_WITH_OPEN_CONNECTIVITY", '["site-typo"]')
+        with pytest.raises(ValidationError, match="unknown site"):
+            SegmentLifecycleActivitySettings()
+
+    def test_duplicates_are_rejected(self, monkeypatch):
+        monkeypatch.setenv("SITES_WITH_OPEN_CONNECTIVITY", '["site-a", "site-a"]')
+        with pytest.raises(ValidationError, match="duplicate site"):
+            SegmentLifecycleActivitySettings()
+
+    def test_an_empty_site_name_is_rejected(self, monkeypatch):
+        monkeypatch.setenv("SITES_WITH_OPEN_CONNECTIVITY", '[""]')
+        with pytest.raises(ValidationError, match="empty site name"):
+            SegmentLifecycleActivitySettings()
+
+    def test_the_key_is_required(self, monkeypatch):
+        # No code default: a missing (or misspelt) ConfigMap key must crash the
+        # worker at startup rather than read as "every site is firewalled".
+        monkeypatch.delenv("SITES_WITH_OPEN_CONNECTIVITY")
+        with pytest.raises(ValidationError, match="sites_with_open_connectivity"):
+            SegmentLifecycleActivitySettings()

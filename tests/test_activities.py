@@ -28,6 +28,7 @@ from activities.segment_lifecycle.activities import (
     list_peer_segments,
     publish_segment_connectivity_failure,
     publish_request_ids,
+    site_has_open_connectivity,
     submit_bmc_open_rules,
     submit_open_rules,
     unlock_segment,
@@ -460,6 +461,29 @@ async def test_check_connectivity_requests_next_error_is_retryable_type(env):
 
 async def test_get_next_checking_request_interval_returns_configured_value(env):
     assert await env.run(get_next_checking_request_interval) == 15  # from conftest
+
+
+# --- site_has_open_connectivity ---
+
+
+async def test_site_has_open_connectivity_reads_the_configured_list(env, monkeypatch):
+    from activities.segment_lifecycle import activities as activities_module
+
+    monkeypatch.setattr(
+        activities_module._settings, "sites_with_open_connectivity", ["site-a"]
+    )
+    assert await env.run(site_has_open_connectivity, "site-a") is True
+    # A firewalled site, and an unknown one, both take the normal next flow:
+    # the list is cross-checked against SITE_NETWORKS at startup, so nothing
+    # unknown can be IN it, and anything outside it needs its rules opened.
+    assert await env.run(site_has_open_connectivity, "site-b") is False
+    assert await env.run(site_has_open_connectivity, "nowhere") is False
+
+
+async def test_site_has_open_connectivity_is_false_when_no_site_is_listed(env):
+    # The conftest default: every site is firewalled (the behaviour before the
+    # knob existed).
+    assert await env.run(site_has_open_connectivity, "site-a") is False
 
 
 # --- publish_request_ids / unlock_segment ---

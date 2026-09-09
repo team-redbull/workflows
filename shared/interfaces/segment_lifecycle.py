@@ -55,6 +55,20 @@ async def create_segment(rules_input: InitializeSegmentInput) -> None:
 
 
 @activity.defn
+async def site_has_open_connectivity(site: str) -> bool:
+    """Is this a site whose connectivity is ALWAYS OPEN (no firewall between
+    segments, so nothing for the next service to approve)?
+
+    A pure config lookup (SITES_WITH_OPEN_CONNECTIVITY), like
+    get_next_checking_request_interval: the policy lives in the activity
+    worker's ConfigMap, which the sandboxed workflow cannot read. True short-
+    circuits the whole next flow — the segment is created and unlocked in the
+    same run.
+    """
+    ...
+
+
+@activity.defn
 async def list_peer_segments(query: PeerSegmentsQuery) -> list[SegmentRef]:
     """Return every same-site segment eligible to peer with query.source_type.
 

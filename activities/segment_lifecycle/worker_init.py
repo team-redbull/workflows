@@ -36,6 +36,7 @@ from activities.segment_lifecycle.activities import (
     locate_cluster_file,
     publish_segment_connectivity_failure,
     publish_request_ids,
+    site_has_open_connectivity,
     submit_bmc_open_rules,
     submit_open_rules,
     unlock_segment,
@@ -62,6 +63,7 @@ async def main() -> None:
         activities=[
             # initialize-segment
             create_segment,
+            site_has_open_connectivity,
             list_peer_segments,
             submit_open_rules,
             get_bmc_segments,

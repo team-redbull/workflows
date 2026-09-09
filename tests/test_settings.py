@@ -48,6 +48,21 @@ class TestSharedTopologyContract:
         s = build({"site1": dict(_SITE, invented_later={"a": 1})})
         assert s.site_networks["site1"].dell_bmc == "10.50.0.0/16"
 
+    def test_pool_exceptions_sub_key_is_ignored(self):
+        """Pinned by name, not just by the generic unknown-key case above.
+
+        `pool-exceptions` is the Segments Manager's list of out-of-pool CIDRs it
+        accepts at a site; it rides in the SAME shared topology, so this worker
+        must drop it. Named explicitly because it is a NESTED LIST — the first
+        sub-key that is not a string — and because a future tightening of
+        _reject_bmc_typos into a broader guard would break the shared ConfigMap
+        rather than just this worker.
+        """
+        s = build({"site1": dict(_SITE, pool="192.10.0.0/16",
+                                 **{"pool-exceptions": ["172.20.4.0/22"]})})
+        assert s.site_networks["site1"].dell_bmc == "10.50.0.0/16"
+        assert not hasattr(s.site_networks["site1"], "pool_exceptions")
+
     def test_parses_from_a_json_string(self):
         """This is how the ConfigMap actually delivers it — hyphenated keys and
         all, which is why the model aliases them."""

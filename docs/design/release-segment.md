@@ -15,7 +15,7 @@ Building the release half now risks building the wrong half. Nothing in the
 allocate path forecloses it:
 
 - the Segments Manager already has `POST /api/segments/release` (keyed by the
-  CIDR alone, idempotent for an already-Available segment, 409 for Locked);
+  CIDR alone, idempotent for an already-Available segment);
 - the block allocate-segment appends to a cluster's values file is designed to
   be strippable — it starts at a fixed marker line and runs to end of file,
   and `values_repo.split_marker_block` /

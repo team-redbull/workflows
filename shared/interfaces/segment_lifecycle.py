@@ -10,24 +10,16 @@ from __future__ import annotations
 from temporalio import activity
 
 from shared.models.segment_lifecycle import (
-    BmcOpenRulesRequest,
-    BmcSegments,
     ClusterFileLocation,
     ClusterValuesAppendRequest,
     ConvertibleSegment,
     ConvertibleSegmentsQuery,
     DhcpScopeState,
-    SegmentConnectivityFailureNotice,
     InitializeSegmentInput,
-    NextRequestRef,
     SegmentAllocation,
     SegmentAllocationRequest,
-    SegmentConnectivityRequestsUpdate,
     SegmentEntry,
     SegmentTypeUpdate,
-    OpenRulesRequest,
-    PeerSegmentsQuery,
-    SegmentRef,
     ValuesCommitRef,
 )
 
@@ -36,14 +28,14 @@ from shared.models.segment_lifecycle import (
 async def create_segment(rules_input: InitializeSegmentInput) -> None:
     """Create the segment in the Segments Manager (POST /api/segments).
 
-    Step 1 of the workflow, and the reason the workflow owns the whole
-    lifecycle: the segment is born Locked here and unlocked by the last step,
-    with every firewall request in between recorded in the same Temporal run.
+    The whole of initialize-segment, and the reason that workflow exists: the
+    segment is created here, Available immediately, with the creation recorded
+    in a durable Temporal run instead of a caller's fire-and-forget call.
 
     Idempotent by check-after-conflict: a create rejected because the CIDR
     already exists is looked up and, if the stored segment matches this
     definition, treated as success — which covers both a Temporal retry of an
-    accepted-but-unacknowledged POST and an operator re-running connectivity
+    accepted-but-unacknowledged POST and an operator re-running the workflow
     for a segment that already exists.
 
     Raises SegmentValidationError (definition rejected) or SegmentConflictError
@@ -51,113 +43,6 @@ async def create_segment(rules_input: InitializeSegmentInput) -> None:
     non-retryable by the workflow so a bad input fails fast instead of
     retrying forever.
     """
-    ...
-
-
-@activity.defn
-async def site_has_open_connectivity(site: str) -> bool:
-    """Is this a site whose connectivity is ALWAYS OPEN (no firewall between
-    segments, so nothing for the next service to approve)?
-
-    A pure config lookup (SITES_WITH_OPEN_CONNECTIVITY), like
-    get_next_checking_request_interval: the policy lives in the activity
-    worker's ConfigMap, which the sandboxed workflow cannot read. True short-
-    circuits the whole next flow — the segment is created and unlocked in the
-    same run.
-    """
-    ...
-
-
-@activity.defn
-async def list_peer_segments(query: PeerSegmentsQuery) -> list[SegmentRef]:
-    """Return every same-site segment eligible to peer with query.source_type.
-
-    Peer types are derived from the activity layer's configured
-    PORTS_<SRC>_TO_<DST> port profiles — the port policy IS the peering
-    topology (e.g. an HC source currently returns only MCE peers, while an
-    MCE source returns HC + INVENTORY peers). Site-scoped: only same-site
-    segments are valid peers.
-    """
-    ...
-
-
-@activity.defn
-async def submit_open_rules(request: OpenRulesRequest) -> NextRequestRef:
-    """Submit one open-firewall-rules request to the next API.
-
-    Idempotent in effect: a retried submission opens identical rules, which
-    converge to the same firewall state (worst case an orphan request id).
-    """
-    ...
-
-
-@activity.defn
-async def check_next_requests(request_ids: list[int]) -> list[int]:
-    """Batch-check next request statuses; return the ids STILL PENDING.
-
-    Named after NEXT, not after the workflow that submitted them: it takes bare
-    request ids, so every workflow in this domain polls its own next requests
-    through this one activity.
-    """
-    ...
-
-
-@activity.defn
-async def get_next_checking_request_interval() -> int:
-    """Seconds the workflow should wait between polls of next request status
-    (operator-configured; differs between local/dev and prod)."""
-    ...
-
-
-@activity.defn
-async def publish_request_ids(update: SegmentConnectivityRequestsUpdate) -> None:
-    """Replace the pending request ids shown beside the segment's status in the
-    Segments Manager UI. An empty list removes the display. Idempotent (PUT
-    semantics: re-sending the same ids is a no-op).
-    """
-    ...
-
-
-@activity.defn
-async def unlock_segment(segment: str) -> None:
-    """Flip the segment's status Locked -> Available in the Segments Manager.
-
-    Identified by CIDR (POST /api/segments/unlock). Idempotent: an
-    already-unlocked segment is treated as success.
-    """
-    ...
-
-
-@activity.defn
-async def get_bmc_segments(site: str) -> BmcSegments:
-    """Return the site's static BMC CIDRs — one per hardware vendor the site
-    hosts, so both, or only Dell, or only Cisco — from ConfigMap
-    (SITE_NETWORKS).
-
-    BMC is not a Segments-Manager-tracked segment type, so this is a pure
-    config lookup, not an API call. Every configured vendor comes back in one
-    call, so the whole site's BMC surface is known before any rule is
-    submitted. Raises BmcSegmentNotConfiguredError if the site has no
-    configured entry at all — deterministic, non-retryable.
-    """
-    ...
-
-
-@activity.defn
-async def submit_bmc_open_rules(request: BmcOpenRulesRequest) -> NextRequestRef:
-    """Submit ONE MCE <-> BMC open-rules request, for the vendor and direction
-    named on the request (PORTS_MCE_TO_BMC covers all four). An MCE run calls
-    this once per vendor per direction. Idempotent in the same sense as
-    submit_open_rules."""
-    ...
-
-
-@activity.defn
-async def publish_segment_connectivity_failure(notice: SegmentConnectivityFailureNotice) -> None:
-    """Best-effort terminal-failure surface: clear the pending request-ids
-    display, then publish a "<workflow> failed" note beside the
-    segment's status badge (the Segments Manager's segment-connectivity-failure
-    endpoint — the workflow swallows this activity's errors either way)."""
     ...
 
 
@@ -254,9 +139,13 @@ async def list_convertible_segments(
 ) -> list[ConvertibleSegment]:
     """Return every segment of the given type at the site that MAY be
     converted: status Available ONLY (GET /api/segments filtered by
-    site+type+status, all server-side). Allocated segments are in use;
-    Locked ones have no established connectivity and may still have a live
-    initialize-segment run, which convert-segment deliberately never disturbs.
+    site+type+status, all server-side). Allocated segments are in use, so
+    re-typing one under the cluster holding it is never valid.
+
+    Both halves of "convertible" are ASSERTED on every hit rather than trusted
+    from the filter: a non-Available status, or a cluster_name on an Available
+    segment, is a Segments Manager invariant violation and raises
+    SegmentsManagerError rather than being silently converted.
 
     Read-only and unordered by policy: WHICH hits to convert (lowest vlan
     first) is the workflow's decision, made deterministically from this
@@ -268,15 +157,16 @@ async def list_convertible_segments(
 @activity.defn
 async def convert_segment_type(update: SegmentTypeUpdate) -> None:
     """Convert the segment to update.type in the Segments Manager
-    (PUT /api/segments/type). The manager re-locks the segment and clears the
-    old type's segment-connectivity fields (pending request ids + any stale
-    failure note) in the same atomic update — the converted segment is reset
-    to born-Locked, ready for its initialize-segment re-run.
+    (PUT /api/segments/type). A re-type and nothing else: the segment stays
+    Available and is immediately allocatable under its new type.
+
+    The manager's own guard is Available AND unassigned — it refuses a segment
+    that is Allocated or carries a cluster, so a conversion can never pull a
+    segment out from under a cluster holding it.
 
     Idempotent server-side: a retried call finds the type already set and
-    converges (an Allocated segment is never re-locked by a stale repeat).
-    Raises SegmentConversionConflictError on 409 — the segment is Allocated,
-    or expected_type no longer matches (a concurrent conversion won) — and
-    SegmentNotFoundError on 404; both deterministic, non-retryable.
+    converges. Raises SegmentConversionConflictError on 409 — the segment is
+    in use, or expected_type no longer matches (a concurrent conversion won) —
+    and SegmentNotFoundError on 404; both deterministic, non-retryable.
     """
     ...

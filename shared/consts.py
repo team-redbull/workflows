@@ -2,9 +2,9 @@
 # Queue names are scoped differently ON PURPOSE. The ACTIVITY queue belongs to
 # the DOMAIN: one activity-worker deployment (`segment-lifecycle-worker`) owns that
 # domain's dependency + credential set, and every workflow in the domain routes
-# its activities there. Each WORKFLOW gets its OWN workflow queue, so a second
-# workflow in this domain (e.g. a future close-segment-rules) registers on its
-# own queue while reusing the same limb.
+# its activities there. Each WORKFLOW gets its OWN workflow queue, so a fourth
+# workflow in this domain (e.g. a future release-segment) registers on its own
+# queue while reusing the same limb.
 INITIALIZE_SEGMENT_WORKFLOW_QUEUE = "initialize-segment-workflow"
 ALLOCATE_SEGMENT_WORKFLOW_QUEUE = "allocate-segment-workflow"
 CONVERT_SEGMENT_WORKFLOW_QUEUE = "convert-segment-workflow"

@@ -34,8 +34,7 @@ Shape of the run:
                             created the scope. Posting the scope ourselves
                             would make two writers for one resource and a PUT
                             on every reconcile loop forever; observing keeps
-                            Crossplane the only writer. Unlike open-segment-
-                            rules' human approval this is machine
+                            Crossplane the only writer. This is MACHINE
                             convergence, so the wait is BOUNDED and a miss
                             fails with DhcpScopeNotConverged.
 
@@ -104,9 +103,9 @@ _RETRY_POLICY = RetryPolicy(
 )
 
 # The DHCP wait is machine convergence (Argo sync + Crossplane's ~60s
-# reconcile), not human approval — so unlike initialize-segment it gets a
-# real deadline. Changing either constant is a non-deterministic change for
-# in-flight runs.
+# reconcile), so it gets a REAL deadline and fails loudly: a scope that has not
+# appeared in 15 minutes is a broken pipeline, not a slow one. Changing either
+# constant is a non-deterministic change for in-flight runs.
 _DHCP_POLL_INTERVAL = timedelta(seconds=15)
 _DHCP_CONVERGENCE_DEADLINE = timedelta(minutes=15)
 

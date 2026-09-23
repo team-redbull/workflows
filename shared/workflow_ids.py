@@ -2,12 +2,15 @@
 
 Workflow ids are the dedup key for the whole system (a duplicate trigger while
 running is rejected as already-started), so the scheme for each workflow must
-exist in exactly one place. These builders are needed on BOTH sides of the
-sandbox boundary — the routers build ids to start workflows, and workflows
-build SIBLING ids (convert-segment starts an initialize-segment run per
-converted segment, as a detached child) — which is why they live here as pure
-string helpers rather than in a router module: a workflow file can never
-import a router (FastAPI inside the sandbox).
+exist in exactly one place.
+
+The routers are the only callers today. They stay HERE, as pure string helpers,
+rather than in a router module, because an id scheme must be importable from
+BOTH sides of the sandbox boundary: a workflow file can never import a router
+(FastAPI is not sandbox-safe), so the moment any workflow needs to build a
+sibling's id — as convert-segment once did, starting an initialize-segment run
+per converted segment — a scheme defined router-side would have to be
+duplicated. One definition, reachable from either side, costs nothing to keep.
 """
 
 from __future__ import annotations

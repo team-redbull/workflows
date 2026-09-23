@@ -69,30 +69,6 @@ class SegmentConversionConflictError(OrchestratorError):
     """
 
 
-class NextApiError(OrchestratorError):
-    """The next (connectivity) service failed or returned a malformed payload.
-
-    Strictly for problems with the next service itself — transient, retried by
-    the activity RetryPolicy. Configuration problems (e.g. port policy) are NOT
-    this error: they fail the worker at startup instead.
-    """
-
-
-class BmcSegmentNotConfiguredError(OrchestratorError):
-    """The site has no BMC networks configured (SITE_NETWORKS).
-
-    A site carries one BMC network per hardware vendor it hosts (`dell-bmc`,
-    `cisco-bmc`) and at least one is required, so this means the whole site
-    entry is absent. A site present with only ONE vendor is legitimate
-    topology, not this error — it opens rules against that vendor alone. A
-    site present with NEITHER (or with a misspelt key) never reaches here: it
-    fails the worker at startup instead.
-
-    Deterministic — a missing ConfigMap entry never fixes itself, so workflows
-    list this type in non_retryable_error_types.
-    """
-
-
 class ClusterFileNotFoundError(OrchestratorError):
     """No `<cluster>.yaml` exists anywhere under the values repo's clusters
     root — the cluster the caller asked to allocate a segment for has no

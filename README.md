@@ -1,28 +1,29 @@
 # Cluster Orchestrator — Segment-lifecycle
 
-Segment-lifecycle sub-workflow of an OpenShift cluster lifecycle orchestrator built on
-Temporal. Given a segment DEFINITION (CIDR, type, site, VLAN, EPG), it **creates the
-segment** in the team's **Segments Manager** (born `Locked`), opens firewall rules
-against every same-site segment of the other types its type peers with, via the
-black-box **next** connectivity service, waits for the (human-approved) requests to
-complete, then flips the segment's status `Locked -> Available`.
+Segment-lifecycle domain of an OpenShift cluster lifecycle orchestrator built on
+Temporal. It owns the segments a hosted cluster runs on: **creating** them in the
+team's **Segments Manager**, **allocating** one to a cluster and writing its DHCP
+block into the day1 values repo, and **converting** spare inventory from one
+segment type to another.
 
 **One entry point, one Temporal run.** The Segments Manager used to own creation and
 then fire a best-effort HTTP trigger at this service — which put creation outside
 Temporal (invisible in the UI, silently skipped whenever that call failed). The
 direction is reversed: callers POST the definition to
 `POST /workflows/segment-lifecycle/initialize-segment`, and the workflow calls the
-Segments Manager itself. Every step of a segment's life is now one durable, replayable
-run.
+Segments Manager itself. The Segments Manager is a dependency, never a trigger.
 
-Three of the four types are implemented: `HC` and `INVENTORY` each peer with same-site
-`MCE` segments, and `MCE` peers with both of them — symmetric, driven by the
-`PORTS_*` config rather than hardcoded per type. `PXE` is a valid Segments Manager
-type but connectivity is deliberately NOT opened for it: it has no `PORTS_*` profiles
-and is rejected up front (`UnsupportedSegmentType`), before the segment is created. `MCE` segments additionally get
-mandatory rules to their site's static BMC networks — one per direction per server
-hardware vendor the site hosts, Dell and/or Cisco, which sit on separate /16s (not
-tracked by the Segments Manager — see the Flow section below).
+Every segment type is accepted — `HC`, `MCE`, `INVENTORY` and `PXE` alike. The
+orchestrator does not narrow that set: the Segments Manager is the validator of
+record for what a segment may be.
+
+> **Firewall rules are gone.** initialize-segment used to open firewall rules
+> against every same-site peer via the black-box **next** connectivity service,
+> mirror the pending request ids into the Segments Manager UI, poll for a HUMAN
+> approval indefinitely, and only then flip the segment `Locked -> Available`.
+> Every firewall between segments is open now, so the whole flow — and the
+> `Locked` status it existed to clear — has been removed. A segment is born
+> Available.
 
 ## Layout
 
@@ -30,129 +31,144 @@ tracked by the Segments Manager — see the Flow section below).
 shared/                           Contract layer (temporalio + pydantic only)
   models/segment_lifecycle.py     Typed state across the workflow/activity boundary
   interfaces/segment_lifecycle.py Activity signatures (no bodies)
-  settings.py / exceptions.py / consts.py / logging_config.py
+  settings.py / exceptions.py / consts.py / workflow_ids.py / logging_config.py
 workflow_domains/                 The brain — one folder per domain, plus main_worker_init.py + api.py
-  segment_lifecycle/              InitializeSegmentWorkflow + that domain's router.py
+  segment_lifecycle/              The three workflows + that domain's router.py
   routers/                        What no domain owns: deps, shared models, runs.py (status)
 activities/segment_lifecycle/     The limb (activity impls + worker_init.py)
-dev/mock-segment-connectivity/    LOCAL-DEV stand-in for the next service (black box)
-(chart: helm-charts-workflows-orchestrator repo)  the brain — ONE release, shared by every domain
-(chart: helm-charts-segment-lifecycle-worker)     the segment-lifecycle-worker limb
+docs/                             The static documentation site (its own image)
 ```
+
+The prod charts are vendored into the Argo CD repo, not this one:
+
+| chart | what it deploys |
+| --- | --- |
+| `redbull-platform/gitops/charts/workflows-orchestrator/` | the brain — ONE release, shared by every domain |
+| `redbull-platform/gitops/charts/segment-lifecycle-worker/` | the `segment-lifecycle-worker` limb |
 
 Worker-file naming convention: the workflow (brain) worker is
 `workflow_domains/main_worker_init.py`; each activity domain's worker is
 `activities/<domain>/worker_init.py`.
 
-## Flow
+## The three workflows
 
-1. `create_segment(definition)` — `POST /api/segments`, creating the segment
-   `Locked`. The Segments Manager is the validator of record (site configured,
-   CIDR matches the site prefix, no overlap, VLAN free), so a bad definition
-   fails here, before any firewall rule is touched. Idempotent: a create
-   rejected because the CIDR already exists is looked up and accepted when the
-   stored segment matches — which covers both a Temporal retry of an
-   accepted-but-unacknowledged POST and an operator re-running connectivity for
-   an existing segment. A stored segment that DISAGREES with the definition is a
-   non-retryable `SegmentConflictError`.
-2. `list_peer_segments(source_type, site)` — every same-site segment of the
-   other types `source_type` peers with, derived from the configured
-   `PORTS_*` profiles (e.g. `HC` -> only `MCE`; `MCE` -> `HC` + `INVENTORY`).
-3. `submit_open_rules(...)` x2 per peer segment (both directions), all in parallel.
-   Port policy per direction comes from the ConfigMap (`PORTS_HC_TO_MCE`, ...).
-   `MCE` segments additionally get mandatory `submit_bmc_open_rules(...)` — both
-   directions for each hardware vendor the site hosts, so four requests at a
-   two-vendor site and two at a single-vendor one — against the CIDRs
-   `get_bmc_segments(site)` returns: the site's static `dell-bmc` and/or `cisco-bmc`
-   networks from `SITE_NETWORKS` (BMC is not tracked by the Segments Manager, so
-   this is a ConfigMap lookup, never a Segments Manager query, and never a
-   discovered peer). They come from ONE lookup, so the site's whole BMC surface is
-   known before any rule is submitted.
-4. `publish_request_ids(segment, ids, submitted_at)` — `PUT /api/segments/segment-connectivity-requests`
-   so the Segments Manager UI shows the pending request ids beside the segment's
-   status while approval is awaited. `submitted_at` (captured once via
-   `workflow.now()` when the rules were submitted) drives the "time since submit"
-   header in the UI popover.
-5. Poll `check_next_requests(ids)` until every request is `complete`.
-   Approval is HUMAN-driven (minutes -> hours+): the workflow polls forever with
-   backoff (15s -> 5m cap) and rolls history over with `continue_as_new` — it
-   never fails on a slow approval. Whenever requests complete, the published id
-   list shrinks accordingly; the final empty update removes the display.
-6. `unlock_segment(segment)` — `POST /api/segments/unlock` (status Locked -> Available).
+Each has its own workflow queue and its own deterministic id; all three share the
+one `segment-lifecycle-activity` queue and therefore the one limb deployment.
 
-Activity retries are unbounded (transient outages of the Segments Manager or the
-next service are out-waited); only classified deterministic errors — rejected
-segment definition, conflicting existing segment, segment not found, bad API
-token, missing port profile, unconfigured BMC segments, unsupported type,
-unexpected request status — fail the workflow. On such a terminal failure
-(or cancellation) the workflow best-effort clears the pending-ids display and
-publishes a "workflow failed" note beside the segment's status (the segment stays
-Locked; best-effort — the note endpoint exists in the Segments Manager).
+### `initialize-segment` — create a segment
 
-The trigger is async: `POST /workflows/segment-lifecycle/initialize-segment` returns
-**202 + workflow id** immediately; poll `GET /workflows/runs/{workflow_id}` for
-phase/pending counts (workflow query) and the final result. Because creation happens
-inside the workflow, an invalid definition surfaces as a FAILED run on that status
-endpoint, not as a 4xx on the trigger.
+One step. `create_segment(definition)` — `POST /api/segments` — and the segment is
+Available. The Segments Manager is the validator of record (site configured, CIDR
+matches the site prefix, no overlap, VLAN free), so a bad definition fails there,
+as a FAILED run on the status endpoint rather than a 4xx on the trigger.
+
+Idempotent: a create rejected because the CIDR already exists is looked up and
+accepted when the stored segment matches — which covers both a Temporal retry of
+an accepted-but-unacknowledged POST and an operator re-submitting the same
+definition. A stored segment that DISAGREES is a non-retryable
+`SegmentConflictError`.
+
+Still a Temporal workflow rather than a bare HTTP call, for three reasons: durable
+unbounded retries (a Segments Manager outage is out-waited, and the request
+survives an orchestrator restart), ONE place owning the dedup id, and a pollable
+per-segment status — which is what lets the bulk route start N of them.
+
+### `allocate-segment` — give a cluster a segment
+
+Locate the cluster's values file in the day1 repo (the path gives the site,
+cross-checked against `GET /api/sites`), allocate a segment from the Segments
+Manager, **read it back** to verify status/cluster/vlan all match, append the
+`vlanId` + `dhcp_values` block to the file and push, then poll the DHCP API
+read-only until Crossplane has created the scope.
+
+That wait is MACHINE convergence, so unlike the old approval poll it has a real
+deadline (15 min) and fails loudly with `DhcpScopeNotConverged`. HC only for now;
+any other type is rejected up front.
+
+### `convert-segment` — rebalance inventory between types
+
+Re-types up to `quantity` segments of a source type at a site, lowest vlan first.
+Convertible means **Available AND no cluster assigned**, asserted on every hit
+rather than trusted from the filter. `expected_type` is a compare-and-set guard, so
+two conversions racing for one segment (HC→MCE against HC→PXE) cannot both win —
+the loser gets a 409.
+
+Re-typing is the whole operation: a converted segment stays Available and is
+immediately allocatable as its new type.
+
+## API
+
+The trigger is async throughout: POST returns **202 + workflow id** immediately;
+poll `GET /workflows/runs/{workflow_id}` for phase (workflow query) and the final
+result.
+
+| route | starts |
+| --- | --- |
+| `POST /workflows/segment-lifecycle/initialize-segment` | one segment |
+| `POST /workflows/segment-lifecycle/initialize-segment/bulk` | one workflow PER segment |
+| `POST /workflows/segment-lifecycle/allocate-segment` | one allocation |
+| `POST /workflows/segment-lifecycle/convert-segment` | one conversion batch |
+| `GET  /workflows/runs/{workflow_id}` | (status, every domain) |
 
 ### Paths: `/workflows/<domain>/<workflow>`, status on `/workflows/runs`
 
-A domain holds MANY workflows, so it is never itself an endpoint — `initialize-segment`
-owns its own path under the `segment-lifecycle` prefix, and a sibling (say a future
-`close-segment-rules`) is then just another route. Status is deliberately NOT under the
-domain: Temporal workflow ids are globally unique, so one `GET /workflows/runs/{id}`
-serves every domain — and a `{workflow_id}` catch-all under the domain prefix would
-swallow every sibling workflow's path.
+A domain holds MANY workflows, so it is never itself an endpoint — each workflow
+owns its own path under the `segment-lifecycle` prefix, and a fourth is then just
+another route. Status is deliberately NOT under the domain: Temporal workflow ids
+are globally unique, so one `GET /workflows/runs/{id}` serves every domain — and a
+`{workflow_id}` catch-all under the domain prefix would swallow every sibling
+workflow's path.
 
-`POST /workflows/segment-lifecycle/initialize-segment/bulk` takes `{"segments": [...]}` and starts
-**one workflow per segment** — each gets its own deterministic id, its own
-independently-approved firewall requests, and its own failure, so a bad row can
-neither delay nor fail the others. It always answers 202 with a per-item report
-(`started` / `already_running` / `failed`); a single status code would hide which
-segments actually got a workflow.
+The bulk route takes `{"segments": [...]}` and starts **one workflow per segment**
+— each gets its own deterministic id, its own run status and its own failure, so a
+bad row can neither delay nor fail the others. It always answers 202 with a
+per-item report (`started` / `already_running` / `failed`); a single status code
+would hide which segments actually got a workflow.
 
 ## Design notes
 
 - **Deployment-agnostic:** endpoints come from env (`TEMPORAL_HOST`,
-  `SEGMENTS_MANAGER_URL`, `NEXT_URL`, `NEXT_*_URI`). The same images run on kind or
-  OpenShift; only the Helm `values.yaml` (`config.*`) changes.
+  `SEGMENTS_MANAGER_URL`, `DAY1_REPO_URL`, `DHCP_API_URL`). The same images run on
+  kind or OpenShift; only the chart's `values.yaml` (`config.*`) changes.
   `host.docker.internal` appears only there, never in code.
 - **ConfigMap split by scope:** `workflows-orchestrator-config` (owned by the
-  `workflows` chart) holds the values every domain shares — `TEMPORAL_*`,
-  `DOMAIN`, `SEGMENTS_MANAGER_URL`. Each workflow adds its own `<domain>-config`
-  (here `segment-lifecycle-config`: the `NEXT_*` endpoints + port policy). A domain's
-  activity worker mounts both, so install `workflows` before the limb.
-- **next is a black box:** the orchestrator token-renews and HTTP-calls `NEXT_URL`;
-  `dev/mock-segment-connectivity` is the dev-only stand-in and is NOT deployed by the chart —
-  `config.nextUrl` simply points at it in dev and at the real service in prod.
-- **Ports live in the ConfigMap** (`helm-charts-segment-lifecycle-worker/templates/config.yaml`), as
-  compact JSON per protocol; the activity layer expands them into the next API's
-  structure and validates the syntax at worker startup. Changing ports = edit the
-  ConfigMap + restart the activity workers. No rebuild.
-- **BMC is ConfigMap-only, not Segments-Manager-tracked, and there is one per
-  hardware VENDOR the site hosts:** `SITE_NETWORKS` maps site name ->
-  `{pool, dell-bmc, cisco-bmc}`; this service reads only the BMC keys (the Segments
-  Manager owns `pool`). Server out-of-band management lives on a different /16 per
-  hardware vendor, and nothing at segment level says which vendor sits under a
-  given MCE — so every `MCE` segment opens rules in BOTH directions against EACH
-  configured vendor (four requests at a two-vendor site, two at a Dell-only or
-  Cisco-only one), and never a peer-discovery query. A site may have one vendor or
-  both; **at least one key is required**, and an unrecognised BMC-looking key
-  (`dell-bcm`, or the pre-split `bmc`) is rejected — either way the activity worker
-  crash-loops at startup instead of quietly opening connectivity for fewer vendors
-  than the site has. `PORTS_MCE_TO_BMC` is the port policy for all of them (same
-  IPMI ports whichever way the rule runs), same shape as every other `PORTS_*` key —
-  it keeps its `MCE_TO_BMC` name because renaming it would mean shipping a new
-  ConfigMap key ahead of the image.
+  always-present brain release) holds what every domain shares — `TEMPORAL_*` and
+  `SEGMENTS_MANAGER_URL`. Each domain adds its own `<domain>-config` (here
+  `segment-lifecycle-config`: the `DAY1_*` and `DHCP_*` keys). A domain's activity
+  worker mounts both, so the brain must install before any limb.
+- **ConfigMaps hold operator-editable data**, expanded and validated in code at
+  worker startup rather than baked into an image. `DHCP_EXCLUSION_OCTET_RANGES` is
+  the one structured knob left: a type → last-octet-ranges map, so changing the
+  DHCP policy is a values edit plus a restart, no rebuild.
 - **Pydantic data converter** is registered on every `Client.connect` (workers + api).
-- **httpx timeout (10s) < activity start_to_close_timeout (30s)** so a network hang
-  frees the worker before Temporal reaps the activity. Each `httpx.AsyncClient` is
-  per-invocation (`async with`), so next tokens never leak across concurrent runs.
-- **Idempotency:** unlock treats "already unlocked" as success; re-submitting
-  identical open-rules requests converges to the same firewall state;
-  `publish_request_ids` is a replace-style PUT (re-sends are a no-op); workflow ids
-  are deterministic (`initialize-segment-<TYPE>-<segment network address, CIDR mask
-  dropped>`), so a duplicate trigger while running gets HTTP 409.
+- **httpx timeout (60s) < activity `start_to_close_timeout` (90s)** so a network
+  hang frees the worker before Temporal reaps the activity. Each
+  `httpx.AsyncClient` is per-invocation (`async with`), so credentials never leak
+  across concurrent runs.
+- **Retries are unbounded** so transient outages are out-waited; only CLASSIFIED
+  deterministic errors fail a run. An unclassified permanent error retries every
+  minute forever, leaving the run RUNNING rather than FAILED — which is why every
+  known-permanent error is named in a `non_retryable_error_types` list.
+- **Idempotency:** `create_segment` accepts a matching existing segment;
+  `allocate_segment` is idempotent server-side per (cluster, site, type); the
+  values-repo append is a no-op for a file already recording this allocation; a
+  re-typed segment converges on retry. Workflow ids are deterministic
+  (`initialize-segment-<TYPE>-<network>`, `allocate-segment-<TYPE>-<cluster>`,
+  `convert-segment-<site>-<SRC>-to-<DEST>`), so a duplicate trigger while running
+  gets HTTP 409.
+
+## Configuration
+
+| key | ConfigMap | notes |
+| --- | --- | --- |
+| `TEMPORAL_HOST`, `TEMPORAL_NAMESPACE` | `workflows-orchestrator-config` | shared by every domain |
+| `SEGMENTS_MANAGER_URL` | `workflows-orchestrator-config` | shared by every domain |
+| `DAY1_REPO_URL`, `DAY1_BRANCH` | `segment-lifecycle-config` | allocate-segment's values repo |
+| `DHCP_EXCLUSION_OCTET_RANGES`, `DHCP_API_URL` | `segment-lifecycle-config` | DHCP policy + read-only API |
+| `SEGMENTS_MANAGER_API_TOKEN` | Secret | mutating calls only; GETs are public |
+| `DAY1_GIT_TOKEN` | Secret `day1-git-token` | push rights; scrubbed from every error |
+
+The DHCP scope API needs no credential — its scope GETs are anonymous.
 
 ## Run locally
 
@@ -162,9 +178,6 @@ matching `SEGMENTS_MANAGER_API_TOKEN`.
 
 ```bash
 cp .env.example .env    # then point it at your Temporal / Segments Manager
-
-# The mock next service (dev only; approval delay configurable)
-cd dev/mock-segment-connectivity && COMPLETION_DELAY_SECONDS=60 uvicorn app:app --port 9000 &
 
 # Workers (from the repo root)
 pip install -r activities/segment_lifecycle/requirements.txt
@@ -181,25 +194,21 @@ PYTHONPATH=. uvicorn workflow_domains.api:app --port 8080
 # curl localhost:8080/workflows/runs/initialize-segment-HC-130.154.20.0
 ```
 
-Inspect runs in the Temporal UI and verify the segment's `status` in the manager:
-`curl "$SEGMENTS_MANAGER_URL/api/segments?type=HC"`.
-
-While the workflow waits for approval (~60s with the mock's default delay), the
-Segments Manager UI shows a **Requests ID** button beside the segment's status —
-click it for a popover showing time elapsed since submission plus the pending
-next request ids. The button disappears on its own once every request completes
-and the segment unlocks.
+Inspect runs in the Temporal UI and verify the segment in the manager:
+`curl "$SEGMENTS_MANAGER_URL/api/segments?type=HC"` — a completed run leaves it
+`Available`.
 
 ### kind
 
 ```bash
 docker build -f workflow_domains/Dockerfile -t workflows:dev .
 docker build -f activities/segment_lifecycle/Dockerfile -t segment-lifecycle-worker:dev .
-docker build -t mock-segment-connectivity:dev dev/mock-segment-connectivity   # run outside the chart
 
 kind load docker-image workflows:dev segment-lifecycle-worker:dev --name prep-temporal
-helm install workflows-orchestrator ../helm-charts-workflows-orchestrator -n redbull-workflows --create-namespace
-helm install segment-lifecycle-worker ../helm-charts-segment-lifecycle-worker -n redbull-workflows
+helm install workflows-orchestrator \
+  ../redbull-platform/gitops/charts/workflows-orchestrator -n redbull-workflows --create-namespace
+helm install segment-lifecycle-worker \
+  ../redbull-platform/gitops/charts/segment-lifecycle-worker -n redbull-workflows
 ```
 
 Neither chart creates the namespace itself — `--create-namespace` on the first
@@ -209,27 +218,28 @@ are installed there with plain `-n redbull-workflows` (no `--create-namespace`).
 
 ## Deploying elsewhere (e.g. air-gapped OpenShift)
 
-Push the two worker images to a registry the cluster can pull from, then:
+In the cluster this is Argo CD's job: the charts are vendored in redbull-platform
+and pushing its `main` deploys. To install by hand, push the two worker images to
+a registry the cluster can pull from, then:
 
 ```bash
 # The brain owns workflows-orchestrator-config (the global values), so install it first.
-helm install workflows-orchestrator ../helm-charts-workflows-orchestrator -n redbull-workflows --create-namespace \
+helm install workflows-orchestrator \
+  ../redbull-platform/gitops/charts/workflows-orchestrator -n redbull-workflows --create-namespace \
   --set image.repository=<registry>/workflows-orchestrator \
   --set config.temporalHost=<temporal-host>:7233 \
-  --set config.segmentsManagerUrl=https://<segments-manager-route> \
-  --set config.domain=<domain>
+  --set config.segmentsManagerUrl=https://<segments-manager-route>
 
-# The limb only sets its own next endpoints + token; it reads the global values
-# from workflows-orchestrator-config above.
-helm install segment-lifecycle-worker ../helm-charts-segment-lifecycle-worker -n redbull-workflows \
+# The limb sets its own day1/DHCP config; it reads the global values from
+# workflows-orchestrator-config above.
+helm install segment-lifecycle-worker \
+  ../redbull-platform/gitops/charts/segment-lifecycle-worker -n redbull-workflows \
   --set activityWorker.image.repository=<registry>/segment-lifecycle-worker \
-  --set config.nextUrl=https://<real-next-service> \
-  --set config.nextTokenRenewalUri=<real-path> \
-  --set config.nextOpenRulesUri=<real-path> \
-  --set config.nextCheckStatusUri=<real-path> \
-  --set secrets.segmentsManagerApiToken=<real-token>
+  --set config.day1RepoUrl=https://<values-repo> \
+  --set config.dhcpApiUrl=https://<dhcp-scope-api> \
+  --set secrets.segmentsManagerApiToken=<real-token> \
+  --set secrets.day1GitToken=<real-token>
 ```
 
-No mock is ever deployed by either chart — `config.nextUrl` is the only knob. Edit
-the `PORTS_*` keys in the live `workflows-orchestrator-config` ConfigMap (then restart the
-activity workers) to change the port policy without a rebuild.
+Edit `config.dhcpExclusionOctetRanges` in the chart's `values.yaml` (then restart
+the activity workers) to change the DHCP policy without a rebuild.

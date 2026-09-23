@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>convert-segment — Redbull Workflows</title>
-<meta name="description" content="The convert-segment workflow: re-type Available segments of a source type at a site, clear their stale firewall request ids, and start an initialize-segment run per converted segment.">
+<meta name="description" content="The convert-segment workflow: re-type Available, unassigned segments of a source type at a site. A converted segment stays Available and is immediately allocatable as its new type.">
 <link rel="icon" href="/assets/favicon.svg?v=__DOC_VERSION__" type="image/svg+xml">
 <link rel="stylesheet" href="/assets/site.css?v=__DOC_VERSION__">
 </head>
@@ -43,15 +43,13 @@
     <h1>convert-segment<span class="dim"> — what actually happens</span></h1>
     <p class="lede">
       One request — <b>site, source type, destination type, quantity</b> — rebalances segment inventory between
-      types. The workflow finds up to <code>quantity</code> <b>Available</b> segments of the source type
-      at the site, re-types each one in the Segments Manager (which re-locks it and clears the old type's pending
-      firewall request ids), and starts one <a href="/segment-lifecycle/initialize-segment.html">initialize-segment</a>
-      run per converted segment — the new type has different peers, so connectivity is re-established from scratch.
+      types. The workflow finds up to <code>quantity</code> <b>Available, unassigned</b> segments of the source
+      type at the site and re-types each one in the Segments Manager. That is the whole operation: a converted
+      segment stays Available and is <b>immediately allocatable</b> as its new type.
     </p>
     <p class="lede">Fewer matching segments than requested is <em>not</em> an error: the run converts what exists
-    and reports the <b>shortfall</b> in its result. <b>Available only</b> is deliberate: Allocated segments are
-    in use, and Locked ones may still have a live initialize-segment run — re-typing under it would mean
-    cancelling it, which this workflow never does. See <a href="#available-only">why</a>.</p>
+    and reports the <b>shortfall</b> in its result. <b>Available and unassigned</b> is the guard, asserted on
+    every search hit rather than trusted from the filter. See <a href="#available-only">why</a>.</p>
     <div class="facts">
       <div class="fact"><span class="k">Trigger</span><span class="v">POST /workflows/segment-lifecycle/convert-segment</span></div>
       <div class="fact"><span class="k">Workflow id</span><span class="v">convert-segment-&lt;site&gt;-&lt;SRC&gt;-to-&lt;DEST&gt;</span></div>
@@ -67,16 +65,16 @@
   <section id="flow">
     <div class="sec-head">
       <div class="eyebrow">The run, step by step</div>
-      <h2>From “convert N segments” to “N initialize-segment runs are on their way”</h2>
-      <p class="lede">Three stages plus a per-segment loop. The parent <b>never waits for the firewall
-      approvals</b>: each converted segment gets its own detached initialize-segment run — its own workflow id,
-      its own human approval, its own failure — exactly like the bulk trigger route, and the parent completes
-      with a fan-out report.</p>
+      <h2>From “convert N segments” to “N segments now carry the new type”</h2>
+      <p class="lede">Three stages plus a per-segment loop. Every step is a machine op, so the run is
+      bounded, fast and fails loudly — there is nothing to wait for. Selection is the workflow's own
+      deterministic policy over the recorded search result: lowest vlan first, cut at
+      <code>quantity</code>.</p>
     </div>
 
     <div class="diagram rail">
       <svg viewBox="0 0 1060 330" role="img"
-           aria-label="Horizontal flow: an operator posts site, source type, destination type and quantity; the workflow validates the site, searches and selects Available segments, then loops per segment — convert the type in the Segments Manager, start the destination-type initialize-segment run as a detached child — and completes with a report including any shortfall.">
+           aria-label="Horizontal flow: an operator posts site, source type, destination type and quantity; the workflow validates the site, searches and selects Available unassigned segments, then loops per segment converting the type in the Segments Manager with a compare-and-set guard, and completes with a report including any shortfall.">
         <defs>
           <marker id="ah-n"   viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0.5 L8,4 L0,7.5 Z"/></marker>
           <marker id="ah-nxt" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0.5 L8,4 L0,7.5 Z"/></marker>
@@ -111,13 +109,13 @@
         <path class="f-arrow nxt" d="M540,138 C528,96 632,96 620,138" marker-end="url(#ah-nxt)"/>
         <text class="loop-l" x="580" y="88">for each selected segment</text>
 
-        <rect class="fbox nxt" x="446" y="142" width="222" height="112" rx="5"/>
-        <circle class="stepno nxt" cx="468" cy="164" r="12"/>
+        <rect class="fbox sm" x="446" y="142" width="222" height="112" rx="5"/>
+        <circle class="stepno sm" cx="468" cy="164" r="12"/>
         <text class="stepno-t" x="468" y="168">3</text>
-        <text class="f-title" x="464" y="196">Convert · start</text>
-        <text class="f-sys nxt" x="464" y="216">Segments Manager · Temporal</text>
-        <text class="f-det" x="464" y="234">new type (CAS) →</text>
-        <text class="f-det" x="464" y="248">detached child run</text>
+        <text class="f-title" x="464" y="196">Convert</text>
+        <text class="f-sys sm" x="464" y="216">Segments Manager</text>
+        <text class="f-det" x="464" y="234">new type, guarded by</text>
+        <text class="f-det" x="464" y="248">compare-and-set</text>
 
         <path class="f-arrow" d="M672,198 H704" marker-end="url(#ah-n)"/>
 
@@ -127,18 +125,17 @@
         <text class="stepno-t" x="730" y="168">4</text>
         <text class="f-title" x="726" y="202">Report</text>
         <text class="f-sys nxt" x="726" y="222">result + shortfall</text>
-        <text class="f-det" x="726" y="240">children run on alone</text>
+        <text class="f-det" x="726" y="240">converted + shortfall</text>
 
         <!-- failure strip -->
         <rect class="failstrip" x="30" y="282" width="1000" height="34" rx="4"/>
         <text class="fail-t hd" x="46" y="303">IF IT FAILS &#8594;</text>
-        <text class="fail-t" x="152" y="303">completed conversions stand (their child runs proceed); a re-run's search skips them — they no longer match the source type — and picks up the rest.</text>
+        <text class="fail-t" x="152" y="303">completed conversions stand; a re-run's search skips them — they no longer match the source type — and picks up the rest.</text>
       </svg>
     </div>
     <div class="diagram-caption">
       <span class="swatch sm"><i></i>Segments Manager</span>
-      <span class="swatch nxt"><i></i>Temporal itself (detached child workflows)</span>
-      <span>All machine ops — the run is bounded and fails loudly; the human approvals live in the children.</span>
+      <span>All machine ops — the run is bounded, records not a single timer, and fails loudly.</span>
     </div>
 
     <h3 style="margin:40px 0 10px">The same run, in detail</h3>
@@ -173,15 +170,18 @@
             <h3>list_convertible_segments</h3>
             <span class="phase">phase <b>searching-segments</b></span>
           </div>
-          <p>Every segment of the source type at the site whose status is <b>Available</b> — Allocated segments
-          are in use, and Locked ones are excluded by design (<a href="#available-only">why</a>). Selection is
+          <p>Every segment of the source type at the site whose status is <b>Available</b> — Allocated
+          segments are in use (<a href="#available-only">why that is the whole rule</a>). Selection is
           the workflow's deterministic policy over that result: lowest <code>vlan_id</code> first, cut at
           <code>quantity</code>.</p>
           <div class="calls">
             <div class="call sm"><span class="verb">GET</span><span class="path">/api/segments?site=…&amp;type=…&amp;status=Available <em>· all three filters server-side</em></span></div>
           </div>
-          <p class="note">A returned segment in any other status <b>fails the activity</b> rather than being
-          quietly skipped — it would otherwise enter the conversion loop, which is exactly what must not happen.</p>
+          <p class="note">Both halves of “convertible” are <b>asserted on every hit</b>, not trusted from the
+          filter. A segment in any other status fails the activity, and so does an Available segment carrying a
+          <code>cluster_name</code> — that combination is a Segments Manager invariant violation (allocation
+          assigns the cluster and sets the status in one update), and converting it would re-type a segment a
+          cluster is actually using.</p>
           <p class="note">Fewer matches than requested → convert all of them and report the shortfall.
           Zero matches → an empty report with <code>shortfall == quantity</code>, still a COMPLETED run.</p>
         </div>
@@ -195,11 +195,10 @@
             <h3>convert_segment_type</h3>
             <span class="phase">phase <b>converting-segments</b></span>
           </div>
-          <p>One atomic Segments Manager update: set the new <code>type</code>, set <code>status</code> back to
-          <b>Locked</b>, and clear every <code>segment_connectivity_*</code> field — the pending request ids
-          belong to the old type's requests, and a stale “Workflow failed” note has no other clearing path.
-          Re-locking matters: an Available-looking converted segment could be <em>allocated to a cluster</em>
-          before its new-type firewall rules exist.</p>
+          <p>One Segments Manager update, and the entire operation: set the new <code>type</code>. The
+          segment stays <b>Available</b>, so it is allocatable as its new type the moment the call returns —
+          which is the point of converting it. The manager applies the same Available-and-unassigned guard
+          server-side, so the two agree.</p>
           <div class="calls">
             <div class="call sm"><span class="verb">PUT</span><span class="path">/api/segments/type <em>· Bearer · { segment, type, expected_type }</em></span></div>
           </div>
@@ -212,20 +211,21 @@
 
       <!-- 3b -->
       <div class="step">
-        <div class="marker">3b</div>
+        <div class="marker">!</div>
         <div class="card">
           <div class="card-title">
-            <h3>Start initialize-segment, detached</h3>
-            <span class="phase">phase <b>converting-segments</b></span>
+            <h3>There is no step 3b any more</h3>
+            <span class="phase">removed</span>
           </div>
-          <p>The replacement run — <code>initialize-segment-&lt;DEST&gt;-&lt;network&gt;</code> — starts as a
-          <b>detached child workflow</b> (<code>ParentClosePolicy.ABANDON</code>): it survives however this
-          parent ends, because it answers to its own id, its own human approval and its own failure, exactly as
-          if the bulk route had started it. Its <code>create_segment</code> first step accepts the existing
-          (now destination-typed) segment idempotently and proceeds: peers → submit rules → await approval →
-          unlock.</p>
-          <p class="note">If a destination-type run for this segment already exists, that run <em>is</em> the
-          desired outcome — the report marks the item <code>already_running</code> and the loop continues.</p>
+          <p>This loop used to have a second half: start
+          <code>initialize-segment-&lt;DEST&gt;-&lt;network&gt;</code> as a <b>detached child workflow</b>
+          (<code>ParentClosePolicy.ABANDON</code>) for every converted segment. The new type had different
+          firewall peers, so its connectivity had to be opened from scratch — and the converted segment sat
+          <b>Locked</b> until a human approved those rules.</p>
+          <p class="note">Every firewall between segments is open now, so there is nothing to re-open and
+          nothing to wait for. The fan-out, the <code>already_running</code> item and the
+          <code>Locked</code> status all went with it. A converted segment is simply Available under its new
+          type.</p>
         </div>
       </div>
 
@@ -234,12 +234,13 @@
         <div class="marker">✓</div>
         <div class="card">
           <div class="card-title">
-            <h3>Done — the children run on alone</h3>
+            <h3>Done — the segments carry their new type</h3>
             <span class="phase">phase <b>completed</b></span>
           </div>
-          <p>The result lists every conversion — the segment, its vlan, and the child workflow id to poll —
-          plus <code>matched</code> and <code>shortfall</code>. Poll each child on the same
-          <code>GET /workflows/runs/{workflow_id}</code> endpoint as any other run.</p>
+          <p>The result lists every conversion — the segment and its vlan — plus <code>matched</code> and
+          <code>shortfall</code>. Each converted segment is now Available under the destination type and can
+          be picked up by <a href="/segment-lifecycle/allocate-segment.html">allocate-segment</a>
+          immediately.</p>
         </div>
       </div>
 
@@ -292,9 +293,7 @@
 { "workflow_id": "convert-segment-site1-HC-to-MCE",
   "workflow_type": "ConvertSegmentWorkflow", "status": "RUNNING",
   "progress": { "phase": "converting-segments", "matched": 2, "selected": 2,
-                "converted": [ { "segment": "130.154.20.0/24", "vlan_id": 23,
-                                 "initialize_segment_workflow_id": "initialize-segment-MCE-130.154.20.0",
-                                 "open_rules_status": "started" } ] } }
+                "converted": [ { "segment": "130.154.20.0/24", "vlan_id": 23 } ] } }
 
 <span class="c">// COMPLETED — quantity was 3, only 2 matched</span>
 { …, "status": "COMPLETED",
@@ -332,32 +331,33 @@
       </div>
       <div class="panel ok">
         <h3>A failed or cancelled run needs no compensation</h3>
-        <p style="font-size:var(--fs-14);color:var(--ink-2)">Conversions already performed <b>stand</b>: their
-        detached children run on regardless of the parent, and each converted segment is exactly where a freshly
-        created one would be (Locked, awaiting its rules). Nothing pending is half-applied — the per-segment loop
-        is sequential on purpose.</p>
+        <p style="font-size:var(--fs-14);color:var(--ink-2)">Conversions already performed <b>stand</b>: each
+        converted segment is Available under its new type, exactly where a freshly created one would be. Nothing
+        pending is half-applied — the per-segment loop is sequential on purpose, so a conflict stops the run at a
+        clean boundary.</p>
         <h3 style="margin-top:6px">Re-running is the recovery path</h3>
         <p style="font-size:var(--fs-14);color:var(--ink-2)">A re-run's search no longer matches the segments that
-        were already converted (their type changed), so it picks up exactly the remainder. If a child run already
-        exists for a segment, the report says <code>already_running</code> and moves on.</p>
+        were already converted (their type changed), so it picks up exactly the remainder. Naturally
+        convergent — no bookkeeping needed.</p>
       </div>
       <div class="panel" id="available-only">
-        <h3>Why Available only — and what it costs</h3>
-        <p style="font-size:var(--fs-14);color:var(--ink-2)">A <b>Locked</b> segment has no established
-        connectivity and may still have a <em>live</em> <code>initialize-segment-&lt;SRC&gt;-&lt;network&gt;</code>
-        run. Re-typing it underneath that run would leave the old run fighting the replacement over the
-        request-ids display (replace semantics, keyed by CIDR) and wrongly <em>unlocking</em> the segment when the
-        old approval finally lands. Handling that means cancelling the sibling and waiting out its cleanup.</p>
-        <p style="font-size:var(--fs-14);color:var(--ink-2)">And a cancel cannot even tell you whether a run was
-        live: Temporal <b>accepts</b> a cancel against an already-closed execution and reports it accepted, failing
-        only for an id that never existed. Restricting the search to <b>Available</b> removes the interaction at
-        the source — every match is a segment whose own run has <em>completed</em>, since that completion is what
-        unlocked it. No cancellation, no grace pause, no stale-note race, and not a single timer in the loop.</p>
-        <p style="font-size:var(--fs-14);color:var(--ink-2)"><b>The cost, stated plainly:</b> a Locked segment
-        cannot be re-typed by this workflow at all — including one whose initialize-segment run failed terminally,
-        which stays Locked by design. Such a segment is neither allocatable nor convertible; re-driving it through
-        <a href="/segment-lifecycle/initialize-segment.html">initialize-segment</a> for its current type is the
-        way back.</p>
+        <h3>Why Available and unassigned</h3>
+        <p style="font-size:var(--fs-14);color:var(--ink-2)">An <b>Allocated</b> segment is in use by a cluster:
+        re-typing it would change what that cluster is running on, underneath it. So the search asks the Segments
+        Manager for Available segments only, and the manager applies the same guard server-side when the
+        conversion itself arrives — belt and braces, because the two checks are seconds apart and a segment can be
+        allocated in between.</p>
+        <p style="font-size:var(--fs-14);color:var(--ink-2)">The <b>unassigned</b> half is the interesting one. An
+        Available segment carrying a <code>cluster_name</code> should be impossible — allocation sets the cluster
+        and the status in one update — so finding one means an invariant has broken somewhere. The activity fails
+        loudly rather than converting it, on the principle that a segment a cluster is actually using must never
+        be re-typed just because a status field disagrees.</p>
+        <p style="font-size:var(--fs-14);color:var(--ink-2)"><b>This rule used to cost more.</b> A third status,
+        <code>Locked</code>, once existed for segments whose firewall rules were not yet approved, and those were
+        excluded too — because re-typing one meant cancelling its live initialize-segment run, and a Temporal
+        cancel cannot tell you whether anything was actually running (it is <em>accepted</em> against an
+        already-closed execution). Narrowing the selection removed that interaction rather than trying to detect
+        it — a move worth remembering. With the firewall flow gone, no such segment exists any more.</p>
       </div>
     </div>
   </section>
@@ -376,7 +376,7 @@
         <tbody>
           <tr><td class="k">site</td><td class="k">str</td><td class="muted">non-empty; must be a configured site</td><td class="muted">Where to look for convertible segments.</td></tr>
           <tr><td class="k">source_type</td><td class="k">enum</td><td class="muted">MCE · HC · INVENTORY · PXE</td><td class="muted">The type being converted FROM — also the <code>expected_type</code> compare-and-set guard.</td></tr>
-          <tr><td class="k">destination_type</td><td class="k">enum</td><td class="muted">must differ from source_type</td><td class="muted">The type being converted TO — carried into each child's workflow id.</td></tr>
+          <tr><td class="k">destination_type</td><td class="k">enum</td><td class="muted">must differ from source_type</td><td class="muted">The type being converted TO — and part of this run's own workflow id.</td></tr>
           <tr><td class="k">quantity</td><td class="k">int</td><td class="muted">≥ 1 — a TARGET, not a requirement</td><td class="muted">How many segments to convert; fewer matches → shortfall in the result.</td></tr>
         </tbody>
       </table>
@@ -390,8 +390,8 @@
           <tr><td class="k">pending</td><td class="muted">Run accepted</td><td class="muted">instant</td></tr>
           <tr><td class="k">validating-site</td><td class="muted">Fetching the site list</td><td class="muted">seconds</td></tr>
           <tr><td class="k">searching-segments</td><td class="muted">Listing + selecting convertible segments</td><td class="muted">seconds</td></tr>
-          <tr><td class="k">converting-segments</td><td class="muted">Per segment: convert the type → start the detached child. No timers anywhere in the loop</td><td class="muted">well under a second per segment</td></tr>
-          <tr><td class="k">completed</td><td class="muted">Done; <code>result</code> is available — the children keep running under their own ids</td><td class="muted">—</td></tr>
+          <tr><td class="k">converting-segments</td><td class="muted">Per segment: one compare-and-set re-type. No timers anywhere in the loop</td><td class="muted">well under a second per segment</td></tr>
+          <tr><td class="k">completed</td><td class="muted">Done; <code>result</code> is available and every converted segment is allocatable</td><td class="muted">—</td></tr>
         </tbody>
       </table>
     </div>

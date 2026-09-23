@@ -1,10 +1,11 @@
 """Workflow tests: real ConvertSegmentWorkflow, mock activities, time-skipping env.
 
 Same harness shape as test_allocate_segment_workflow.py — two workers, one per
-queue, exactly like the real brain/limb split. The initialize-segment children
-are REAL workflow starts against the test server (that fan-out is the
-workflow's whole point), but no worker polls their queue: `started` means
-Temporal accepted the run, which is also all the workflow itself claims.
+queue, exactly like the real brain/limb split.
+
+Re-typing is the whole operation now, so these tests pin that the run is
+exactly a search plus N conversions: no child workflows, no timers, nothing
+started on any other queue.
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ import uuid
 
 import pytest
 from temporalio import activity
-from temporalio.client import Client, WorkflowExecutionStatus, WorkflowFailureError
+from temporalio.client import Client, WorkflowFailureError
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.exceptions import ActivityError, ApplicationError
 from temporalio.testing import WorkflowEnvironment
@@ -22,7 +23,6 @@ from temporalio.worker import Worker
 
 from shared.consts import (
     CONVERT_SEGMENT_WORKFLOW_QUEUE,
-    INITIALIZE_SEGMENT_WORKFLOW_QUEUE,
     SEGMENT_LIFECYCLE_ACTIVITY_QUEUE,
 )
 from shared.exceptions import SegmentConversionConflictError
@@ -31,12 +31,9 @@ from shared.models.segment_lifecycle import (
     ConvertibleSegmentsQuery,
     ConvertSegmentInput,
     ConvertSegmentRunArgs,
-    InitializeSegmentInput,
-    InitializeSegmentRunArgs,
     SegmentType,
     SegmentTypeUpdate,
 )
-from shared.workflow_ids import initialize_segment_workflow_id
 from workflow_domains.segment_lifecycle.convert_segment import (
     ConvertSegmentWorkflow,
     _selection_order,
@@ -53,16 +50,14 @@ CONVERT_INPUT = ConvertSegmentInput(
 )
 
 
-def _hit(segment: str, vlan_id: int, dhcp: bool = True) -> ConvertibleSegment:
-    """A search hit. Always Available — list_convertible_segments returns
-    nothing else, and the workflow's whole no-cancellation design rests on
-    that (see convert_segment.py's module docstring)."""
+def _hit(segment: str, vlan_id: int) -> ConvertibleSegment:
+    """A search hit: Available and unassigned, the only thing
+    list_convertible_segments returns (it asserts both)."""
     return ConvertibleSegment(
         segment=segment,
         vlan_id=vlan_id,
-        epg_name=f"EPG_HC_{vlan_id}",
         status="Available",
-        dhcp=dhcp,
+        cluster_name=None,
     )
 
 
@@ -165,26 +160,6 @@ async def _execute(client: Client, args: ConvertSegmentRunArgs):
     )
 
 
-async def _prestart_open_rules(client: Client, segment_type: SegmentType, segment: str):
-    """Occupy an initialize-segment workflow id, exactly as the trigger API
-    would (no worker polls the queue — the id being taken is all that
-    matters)."""
-    return await client.start_workflow(
-        "InitializeSegmentWorkflow",
-        InitializeSegmentRunArgs(
-            input=InitializeSegmentInput(
-                segment=segment,
-                type=segment_type,
-                site=SITE,
-                vlan_id=1,
-                epg_name="EPG_PRIOR",
-            )
-        ),
-        id=initialize_segment_workflow_id(segment_type, segment),
-        task_queue=INITIALIZE_SEGMENT_WORKFLOW_QUEUE,
-    )
-
-
 def test_selection_prefers_lowest_vlan():
     hits = [
         _hit("10.0.10.0/24", 10),
@@ -206,29 +181,33 @@ def test_input_rejects_identical_source_and_destination():
         )
 
 
-async def test_happy_path_converts_lowest_vlans_and_starts_children():
+async def test_happy_path_converts_lowest_vlans_and_starts_no_children():
     hits = [
         _hit("10.0.10.0/24", 10),
         _hit("10.0.40.0/24", 40),
-        _hit("10.0.20.0/24", 20, dhcp=False),
+        _hit("10.0.20.0/24", 20),
         _hit("10.0.30.0/24", 30),
     ]
     calls, mocks = make_mock_activities(hits=hits)
     async with _Harness(mocks) as client:
-        result = await _execute(client, ConvertSegmentRunArgs(input=CONVERT_INPUT))
-
-        # Every reported child run really exists on the test server.
-        for report in result.converted:
-            description = await client.get_workflow_handle(
-                report.initialize_segment_workflow_id
-            ).describe()
-            assert description.id == report.initialize_segment_workflow_id
+        handle = await _start(client, ConvertSegmentRunArgs(input=CONVERT_INPUT))
+        result = await asyncio.wait_for(handle.result(), timeout=60)
+        events = [event async for event in handle.fetch_history_events()]
 
     assert result.matched == 4
     assert result.shortfall == 0
     # Lowest vlan first, cut at quantity=3.
     assert [r.vlan_id for r in result.converted] == [10, 20, 30]
-    assert all(r.open_rules_status == "started" for r in result.converted)
+    assert [r.segment for r in result.converted] == [
+        "10.0.10.0/24",
+        "10.0.20.0/24",
+        "10.0.30.0/24",
+    ]
+    # Re-typing is the WHOLE operation: nothing is spawned on any other queue.
+    assert not any(
+        event.HasField("start_child_workflow_execution_initiated_event_attributes")
+        for event in events
+    )
     # The search asked for the SOURCE type; every conversion named the source
     # as the compare-and-set guard and the destination as the new type.
     assert calls["list_convertible_segments"] == [
@@ -241,10 +220,6 @@ async def test_happy_path_converts_lowest_vlans_and_starts_children():
         ("10.0.20.0/24", SegmentType.MCE, SegmentType.HC),
         ("10.0.30.0/24", SegmentType.MCE, SegmentType.HC),
     ]
-    # Child ids carry the DESTINATION type.
-    assert result.converted[0].initialize_segment_workflow_id == (
-        "initialize-segment-MCE-10.0.10.0"
-    )
 
 
 async def test_shortfall_converts_everything_that_matched():
@@ -287,42 +262,12 @@ async def test_unknown_site_fails_before_searching():
     assert calls["convert_segment_type"] == []
 
 
-async def test_source_type_run_is_never_cancelled():
-    """convert-segment cancels NOTHING — the guarantee the Available-only
-    selection buys, and the reason no grace pause exists.
-
-    A source-type run for the selected segment is left completely untouched,
-    whether it is running or long closed. Temporal ACCEPTS a cancel against an
-    already-closed execution and reports it accepted, failing only for an id
-    that never existed — so a cancel here could never have told a live sibling
-    from a finished one. Not issuing one is what makes that moot.
-    """
-    segment = "10.0.30.0/24"
-    calls, mocks = make_mock_activities(hits=[_hit(segment, 30)])
-    async with _Harness(mocks) as client:
-        # A live run at exactly the id the old cancel step addressed.
-        untouched = await _prestart_open_rules(client, SegmentType.HC, segment)
-
-        result = await _execute(
-            client,
-            ConvertSegmentRunArgs(input=CONVERT_INPUT.model_copy(update={"quantity": 1})),
-        )
-
-        (report,) = result.converted
-        assert report.open_rules_status == "started"
-        events = [event async for event in untouched.fetch_history_events()]
-        assert not any(
-            event.HasField("workflow_execution_cancel_requested_event_attributes")
-            for event in events
-        )
-        assert (await untouched.describe()).status == WorkflowExecutionStatus.RUNNING
-    assert len(calls["convert_segment_type"]) == 1
-
-
 async def test_run_has_no_timers_at_all():
-    """No cancel handshake, no grace pause — so a conversion loop records not
-    one timer. This is the whole performance case for Available-only: the
-    previous shape paid a 30 s durable pause per segment."""
+    """A conversion loop is pure machine work: it records not one timer.
+
+    No approval to wait on, no cancel handshake, no grace pause — an earlier
+    shape paid a 30 s durable pause per segment, and this pins that none of it
+    can come back unnoticed."""
     hits = [_hit("10.0.10.0/24", 10), _hit("10.0.20.0/24", 20), _hit("10.0.30.0/24", 30)]
     _, mocks = make_mock_activities(hits=hits)
     async with _Harness(mocks) as client:
@@ -331,23 +276,6 @@ async def test_run_has_no_timers_at_all():
         events = [event async for event in handle.fetch_history_events()]
 
     assert not any(event.HasField("timer_started_event_attributes") for event in events)
-
-
-async def test_existing_destination_run_is_reported_not_failed():
-    segment = "10.0.30.0/24"
-    calls, mocks = make_mock_activities(hits=[_hit(segment, 30)])
-    async with _Harness(mocks) as client:
-        await _prestart_open_rules(client, SegmentType.MCE, segment)
-        result = await _execute(
-            client,
-            ConvertSegmentRunArgs(input=CONVERT_INPUT.model_copy(update={"quantity": 1})),
-        )
-
-    (report,) = result.converted
-    assert report.open_rules_status == "already_running"
-    # The conversion itself still happened — the existing run is the desired
-    # outcome, not an error.
-    assert len(calls["convert_segment_type"]) == 1
 
 
 async def test_conversion_conflict_fails_loudly_but_earlier_conversions_stand():
@@ -366,9 +294,7 @@ async def test_conversion_conflict_fails_loudly_but_earlier_conversions_stand():
         assert len(calls["convert_segment_type"]) == 2
 
         # The failed run still shows what WAS converted, via the progress
-        # query — and that child run exists and proceeds regardless.
+        # query — those conversions stand.
         progress = await handle.query(ConvertSegmentWorkflow.progress)
         assert [r.vlan_id for r in progress.converted] == [30]
-        child = progress.converted[0].initialize_segment_workflow_id
-        description = await client.get_workflow_handle(child).describe()
-        assert description.id == child
+        assert [r.segment for r in progress.converted] == ["10.0.30.0/24"]

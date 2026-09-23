@@ -6,8 +6,8 @@ the environment BEFORE any test module imports it.
 
 The repo's .env is switched OFF for the whole suite. Real env vars do NOT
 simply win over it: pydantic-settings DEEP-MERGES dict fields across sources,
-so a developer's local .env leaks its SITE_NETWORKS sites and PORTS_* protocols
-into the values set below — turning "this config is rejected" tests green
+so a developer's local .env would leak its own DHCP_EXCLUSION_OCTET_RANGES
+types into the value set below — turning "this config is rejected" tests green
 because the .env quietly supplied the missing key. Tests must depend only on
 what this file sets, on a laptop and in CI alike.
 """
@@ -26,24 +26,6 @@ os.environ.update(
         "TEMPORAL_HOST": "localhost:7233",
         "SEGMENTS_MANAGER_URL": "http://segments-manager.test",
         "SEGMENTS_MANAGER_API_TOKEN": "test-token",
-        "DOMAIN": "test-domain",
-        "NEXT_URL": "http://next.test",
-        "NEXT_CHECKING_REQUEST_INTERVAL_SECONDS": "15",
-        "NEXT_GROUP": "test-group",
-        "NEXT_CLIENT_ID": "test-client",
-        "NEXT_PASSWORD": "test-password",
-        "PORTS_HC_TO_MCE": '{"tcp": ["30000-32767"], "udp": ["9000"]}',
-        "PORTS_MCE_TO_HC": '{"tcp": ["6443", "30000-32767"]}',
-        "PORTS_INVENTORY_TO_MCE": '{"tcp": ["30000-32767"]}',
-        "PORTS_MCE_TO_INVENTORY": '{"tcp": ["6443"]}',
-        "SITE_NETWORKS": (
-            '{"site-a": {"pool": "192.11.0.0/16", '
-            '"dell-bmc": "10.98.0.0/16", "cisco-bmc": "10.99.0.0/16"}}'
-        ),
-        "PORTS_MCE_TO_BMC": '{"tcp": ["623"]}',
-        # No site skips the firewall by default; the open-site tests set their
-        # own value (site-a is the only site SITE_NETWORKS above knows).
-        "SITES_WITH_OPEN_CONNECTIVITY": "[]",
         # --- allocate-segment: values repo + DHCP policy/API ---
         "DAY1_REPO_URL": "https://git.test/team/gitops-day1-platform-config.git",
         "DAY1_GIT_TOKEN": "test-git-token",

@@ -1,9 +1,7 @@
 name: Build and Push
 
-# Four images from this one repo: the workflow "brain" (workflow_domains/Dockerfile),
+# Three images from this one repo: the workflow "brain" (workflow_domains/Dockerfile),
 # the segment-lifecycle activity worker "limb" (activities/segment_lifecycle/Dockerfile),
-# the test-only mock of the next service (dev/mock-segment-connectivity/Dockerfile),
-# deployed via helm/mock-segment-connectivity for e2e testing (see CLAUDE.md section 4),
 # and the documentation site (docs/Dockerfile), which carries no code at all.
 
 on:
@@ -17,12 +15,12 @@ permissions:
 
 jobs:
   # Which images does this push actually affect? Without this, EVERY push
-  # rebuilt, re-tagged and redeployed all four — a CSS tweak in docs/ rolled
+  # rebuilt, re-tagged and redeployed all three — a CSS tweak in docs/ rolled
   # the orchestrator and the worker pods for an image whose content had not
   # changed at all.
   #
   # Per-JOB filtering, so it cannot be `on.push.paths`: that gates the whole
-  # workflow, which is the opposite of what is wanted when four independent
+  # workflow, which is the opposite of what is wanted when three independent
   # images share one file. Hence a cheap job that diffs the push range and
   # publishes a boolean per image.
   #
@@ -37,7 +35,6 @@ jobs:
     outputs:
       brain: ${{ steps.filter.outputs.brain }}
       limb:  ${{ steps.filter.outputs.limb }}
-      mock:  ${{ steps.filter.outputs.mock }}
       docs:  ${{ steps.filter.outputs.docs }}
     steps:
       - uses: actions/checkout@v4
@@ -54,7 +51,7 @@ jobs:
           # precision. The fallbacks matter: the obvious "no base → build
           # everything" rule sounds safe but fires on the FIRST push of every
           # new branch (github.event.before is all-zeros there), which turns
-          # an ordinary "branch, tweak docs, push" into all four images.
+          # an ordinary "branch, tweak docs, push" into all three images.
           all=false
           if [ -n "${BEFORE}" ] \
              && [ "${BEFORE}" != "0000000000000000000000000000000000000000" ] \
@@ -70,7 +67,7 @@ jobs:
             echo "base: branch point off ${DEFAULT_BRANCH} (${base})"
           else
             # Only reachable when the default branch itself has no usable
-            # base — i.e. it was force-pushed. Rare, and rebuilding all four
+            # base — i.e. it was force-pushed. Rare, and rebuilding all three
             # is the right answer there: a skipped build that was needed
             # ships a stale image to PROD and is invisible, whereas a
             # redundant build only costs minutes.
@@ -95,15 +92,11 @@ jobs:
           #   · both Python images bake in shared/, so it triggers both;
           #   · the limb copies the WHOLE activities/ tree, not just
           #     activities/segment_lifecycle/;
-          #   · the mock copies only dev/mock-segment-connectivity/ — and
-          #     deliberately NOT helm/mock-segment-connectivity/, which is
-          #     where CI writes its own version bump;
-          #   · this file changes what gets built, so it triggers all four.
+          #   · this file changes what gets built, so it triggers all three.
           SELF='\.github/workflows/build\.yml$'
           {
             echo "brain=$(match "^(workflow_domains/|shared/|${SELF})")"
             echo "limb=$(match "^(activities/|shared/|${SELF})")"
-            echo "mock=$(match "^(dev/mock-segment-connectivity/|${SELF})")"
             echo "docs=$(match "^(docs/|${SELF})")"
           } | tee -a "${GITHUB_OUTPUT}"
 
@@ -147,27 +140,11 @@ jobs:
       helm-image-path: activityWorker.image
     secrets: inherit
 
-  build-mock-segment-connectivity:
-    # Sequential, not parallel: every call in this chain commits and pushes to a shared
-    # branch (this repo's, for the mock; redbull-platform's, for the three Argo charts),
-    # so running them in parallel races. The filters just make it common for only one
-    # link to be live. This one is the odd one out: its chart is still vendored HERE, so
-    # it bumps this repo and consumes this repo's bare vX.Y.Z tag sequence.
-    needs: [changes, build-segment-lifecycle-worker]
-    if: ${{ !cancelled() && !failure() && needs.changes.outputs.mock == 'true' }}
-    uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
-    with:
-      image-name: mock-segment-connectivity
-      dockerfile: dev/mock-segment-connectivity/Dockerfile
-      helm-values-path: helm/mock-segment-connectivity/values.yaml
-      helm-image-path: image
-    secrets: inherit
-
   build-workflows-docs:
-    # Same sequential chain as the others — see build-mock-segment-connectivity for why.
+    # Same sequential chain as the others — see build-segment-lifecycle-worker for why.
     # Last in the chain, so it is the job that most needed the skip guards —
-    # a docs-only push skips all three ahead of it.
-    needs: [changes, build-mock-segment-connectivity]
+    # a docs-only push skips both jobs ahead of it.
+    needs: [changes, build-segment-lifecycle-worker]
     if: ${{ !cancelled() && !failure() && needs.changes.outputs.docs == 'true' }}
     uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
     with:
@@ -193,13 +170,6 @@ jobs:
     uses: team-redbull/.github/.github/workflows/ghcr-cleanup-on-delete.yml@main
     with:
       image-name: segment-lifecycle-worker
-    secrets: inherit
-
-  cleanup-mock-segment-connectivity-on-delete:
-    if: github.event_name == 'delete'
-    uses: team-redbull/.github/.github/workflows/ghcr-cleanup-on-delete.yml@main
-    with:
-      image-name: mock-segment-connectivity
     secrets: inherit
 
   cleanup-workflows-docs-on-delete:

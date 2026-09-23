@@ -23,23 +23,13 @@ from temporalio.worker import Worker
 from activities.segment_lifecycle.activities import (
     allocate_segment,
     append_allocation_to_cluster_values,
-    check_next_requests,
     convert_segment_type,
     create_segment,
-    get_bmc_segments,
     get_dhcp_scope,
-    get_next_checking_request_interval,
     get_segment,
     get_valid_sites,
     list_convertible_segments,
-    list_peer_segments,
     locate_cluster_file,
-    publish_segment_connectivity_failure,
-    publish_request_ids,
-    site_has_open_connectivity,
-    submit_bmc_open_rules,
-    submit_open_rules,
-    unlock_segment,
 )
 from shared.consts import SEGMENT_LIFECYCLE_ACTIVITY_QUEUE
 from shared.logging_config import configure_logging
@@ -63,16 +53,6 @@ async def main() -> None:
         activities=[
             # initialize-segment
             create_segment,
-            site_has_open_connectivity,
-            list_peer_segments,
-            submit_open_rules,
-            get_bmc_segments,
-            submit_bmc_open_rules,
-            publish_request_ids,
-            check_next_requests,
-            get_next_checking_request_interval,
-            unlock_segment,
-            publish_segment_connectivity_failure,
             # allocate-segment
             get_valid_sites,
             locate_cluster_file,

@@ -1,20 +1,22 @@
 """Segment-lifecycle HTTP surface — the domain's workflows, one path each.
 
 This is where a segment's life starts: the caller POSTs the segment
-DEFINITION here, and the workflow creates it in the Segments Manager itself
-(create_segment, step 1) before opening its firewall rules. The Segments
-Manager no longer triggers anything — so the whole flow, creation included,
-is one Temporal run visible in the Temporal UI.
+DEFINITION here, and the workflow creates it in the Segments Manager itself.
+The Segments Manager never triggers anything — so creation is one Temporal
+run, visible in the Temporal UI and retried until it succeeds.
 
-ASYNC trigger: POST returns 202 with the workflow id immediately (next-request
-approval is human-driven and can take hours); the caller polls
-GET /workflows/runs/{workflow_id} (workflow_domains/routers/runs.py) for status/result.
+ASYNC trigger throughout: POST returns 202 with the workflow id immediately and
+the caller polls GET /workflows/runs/{workflow_id}
+(workflow_domains/routers/runs.py) for status/result. Async even though the
+workflows are short now — the id IS the dedup key, so handing it back at once
+is what lets a caller re-poll (or recognise a duplicate) rather than depending
+on holding one HTTP connection open.
 
 PATHS ARE `/workflows/<domain>/<workflow>`. The DOMAIN prefix lives in exactly
 one place (this router, mounted by workflow_domains/api.py) and every workflow in the
 domain adds its own path under it — a domain holds many workflows, so it can
-never be the endpoint of one of them. Adding, say, a close-segment-rules
-workflow here is then a new route, not a redesign.
+never be the endpoint of one of them. Adding a fourth workflow here is then a
+new route, not a redesign.
 """
 
 from __future__ import annotations
@@ -75,9 +77,8 @@ class BulkInitializeSegmentInput(BaseModel):
 
     Fans out to one workflow PER SEGMENT rather than one workflow for the
     batch: each segment gets its own deterministic id (natural dedup), its own
-    independently-approved firewall requests, and its own failure — a bad
-    definition in row 7 must not hold up or fail row 8, and a batch-shaped
-    workflow could offer none of that.
+    run status and its own failure — a bad definition in row 7 must not hold up
+    or fail row 8, and a batch-shaped workflow could offer none of that.
     """
 
     segments: list[InitializeSegmentInput] = Field(min_length=1)
@@ -102,8 +103,8 @@ class BulkStartInitializeSegmentResponse(BaseModel):
 
 
 # Deterministic workflow ids come from shared/workflow_ids.py — the ONE
-# definition per scheme, shared with workflow code (convert-segment builds
-# initialize-segment ids to cancel stale runs and start replacements).
+# definition per scheme, so the id a route builds and the id anything else
+# builds for the same segment can never drift apart.
 def _workflow_id(rules_input: InitializeSegmentInput) -> str:
     return initialize_segment_workflow_id(rules_input.type, rules_input.segment)
 
@@ -128,17 +129,18 @@ async def start_initialize_segment(
     rules_input: InitializeSegmentInput,
     client: Client = Depends(get_temporal_client),
 ) -> StartWorkflowResponse:
-    """Create a segment and open its connectivity — returns immediately (202).
+    """Create a segment — returns immediately (202).
 
     The body is the full segment definition; the workflow creates it in the
-    Segments Manager as its first step. Semantic validation (site, CIDR,
-    overlap, VLAN) happens there, so an invalid definition surfaces as a FAILED
-    workflow on GET /workflows/runs/{workflow_id}, not as a 4xx here.
+    Segments Manager, and the segment is Available as soon as the run
+    completes. Semantic validation (site, CIDR, overlap, VLAN) belongs to the
+    Segments Manager, so an invalid definition surfaces as a FAILED workflow on
+    GET /workflows/runs/{workflow_id}, not as a 4xx here — this route only
+    rejects a body that does not fit InitializeSegmentInput at all.
 
-    At a site whose connectivity is always open (SITES_WITH_OPEN_CONNECTIVITY
-    in the worker's config), there is no firewall and nothing to approve: the
-    run creates the segment and unlocks it straight away, so it is Available
-    within seconds instead of waiting on a human approval.
+    Every segment type is accepted, PXE included. Re-POSTing a definition for a
+    segment that already exists is harmless (the activity is idempotent); doing
+    so while its run is still going gets a 409 on the dedup id.
     """
     try:
         handle = await _start(client, rules_input)
@@ -270,14 +272,13 @@ async def start_convert_segment(
 ) -> StartWorkflowResponse:
     """Convert source-type segments to another type — returns immediately (202).
 
-    The workflow searches the site for Available/Locked segments of the source
-    type, re-types up to `quantity` of them in the Segments Manager (each is
-    re-Locked with its stale firewall request ids cleared) and starts one
-    initialize-segment run per converted segment. Fewer matches than requested
-    is reported as a shortfall in the result, not an error. Poll
-    GET /workflows/runs/{workflow_id} for progress/result — the per-segment
-    report carries each started initialize-segment workflow id, which is
-    polled the same way. No bulk variant: the request is already batch-shaped.
+    The workflow searches the site for Available, unassigned segments of the
+    source type and re-types up to `quantity` of them (lowest vlan first) in
+    the Segments Manager. Each converted segment stays Available and is
+    immediately allocatable as its new type — the conversion is the whole
+    operation. Fewer matches than requested is reported as a shortfall in the
+    result, not an error. Poll GET /workflows/runs/{workflow_id} for
+    progress/result. No bulk variant: the request is already batch-shaped.
     """
     try:
         handle = await client.start_workflow(

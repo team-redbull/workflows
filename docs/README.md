@@ -38,7 +38,7 @@ A workflow that has no page yet gets `href: null`. It renders as a non-clickable
 *planned* row in both places — visible, but never a dead link.
 
 Domains and workflows in the catalogue that are not built yet
-(`convert-segment`, the whole `segment-provisioner` domain) are there to show the shape
+(`release-segment`, the whole `segment-provisioner` domain) are there to show the shape
 the catalogue takes as it grows; delete them once real ones replace them.
 
 ## Local preview

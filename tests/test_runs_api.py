@@ -112,11 +112,11 @@ def test_progress_is_best_effort(make_client):
 def test_completed_returns_the_result(make_client):
     handle = _FakeHandle(
         WorkflowExecutionStatus.COMPLETED,
-        result={"segment": "10.0.0.0/24", "request_ids": [1, 2]},
+        result={"segment": "10.0.0.0/24", "type": "HC"},
     )
     response = make_client(handle).get("/workflows/runs/initialize-segment-HC-10.0.0.0")
 
-    assert response.json()["result"]["request_ids"] == [1, 2]
+    assert response.json()["result"] == {"segment": "10.0.0.0/24", "type": "HC"}
 
 
 def test_failed_surfaces_the_root_cause(make_client):

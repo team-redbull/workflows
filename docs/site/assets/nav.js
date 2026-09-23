@@ -25,7 +25,7 @@
         {
           name: "initialize-segment",
           href: "/segment-lifecycle/initialize-segment.html",
-          blurb: "create → peer → approve → unlock"
+          blurb: "create a segment — born Available"
         },
         {
           name: "allocate-segment",
@@ -40,7 +40,7 @@
         {
           name: "convert-segment",
           href: "/segment-lifecycle/convert-segment.html",
-          blurb: "re-type segments + reopen their rules"
+          blurb: "re-type spare segments between types"
         }
       ]
     }

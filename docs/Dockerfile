@@ -1,9 +1,9 @@
-# The documentation site — a 4th image out of this repo, alongside the brain,
-# the segment-lifecycle-worker limb and the NEXT mock. Static pages only: it holds
+# The documentation site — a 3rd image out of this repo, alongside the brain and
+# the segment-lifecycle-worker limb. Static pages only: it holds
 # no credentials, talks to nothing, and is deployed by Argo CD from
-# helm-charts-workflows-docs into the redbull-workflows namespace.
+# redbull-platform's gitops/charts/workflows-docs into the redbull-workflows namespace.
 #
-# Build from the REPO ROOT, like the other three images (the shared CI workflow
+# Build from the REPO ROOT, like the other two images (the shared CI workflow
 # always passes the repo root as the build context):
 #   docker build -f docs/Dockerfile -t workflows-docs:dev .
 #

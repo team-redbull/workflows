@@ -87,13 +87,13 @@
     <div class="stack">
       <div class="panel">
         <h3>The problem it solves</h3>
-        <p>Take a real job from this repo: create a network segment, ask another team's firewall service to open
-        rules for it, <b>wait for a human to approve them</b>, then unlock the segment. That wait is minutes, hours,
-        sometimes days.</p>
+        <p>Take a real job from this repo: allocate a network segment for a hosted cluster, verify the
+        reservation, write its DHCP block into a git repo, then <b>wait for Argo and Crossplane to turn that
+        commit into a live DHCP scope</b>. Minutes, usually. Sometimes not.</p>
         <p>Write that as a normal script and every one of these sinks it: the pod restarts mid-job and the state is
-        gone; a dependency is down for five minutes and the job dies; the script is run twice and opens duplicate
-        firewall rules; something fails at 3am and nobody can see how far it got. You end up hand-building retries,
-        a state table, a scheduler and an audit trail — badly.</p>
+        gone; a dependency is down for five minutes and the job dies; the script is run twice and allocates a
+        second segment; something fails at 3am and nobody can see how far it got. You end up hand-building
+        retries, a state table, a scheduler and an audit trail — badly.</p>
       </div>
 
       <div class="panel accent">
@@ -109,8 +109,9 @@
       <div class="panel">
         <h3>Why it fits us specifically</h3>
         <ul>
-          <li><b>The wait is unbounded.</b> Approval is human. A durable timer costs nothing while it waits and
-          survives every deploy — no cron, no polling table.</li>
+          <li><b>We wait on other systems.</b> A durable timer costs nothing while it waits and survives every
+          deploy — no cron, no polling table. It also makes the <em>kind</em> of wait explicit: machine
+          convergence gets a deadline and fails loudly, a wait on a human would get none.</li>
           <li><b>Our dependencies wobble.</b> Retries with backoff are configuration, not code we write.</li>
           <li><b>Every run must be visible.</b> The Temporal UI shows each step, its input, its result, and exactly
           where a failed run stopped — that's our audit trail and our debugger.</li>
@@ -256,27 +257,27 @@
         <span class="cap">1 · shared/interfaces/&lt;domain&gt;.py</span>
         <pre><span class="c"># signature only — no body</span>
 <span class="kwd">@activity.defn</span>
-<span class="kwd">async def</span> unlock_segment(
+<span class="kwd">async def</span> get_segment(
     segment: str
-) -> <span class="kwd">None</span>:
-    <span class="c">"""Locked -> Available."""</span>
+) -> SegmentEntry:
+    <span class="c">"""Read one segment back."""</span>
     ...</pre>
       </div>
       <div class="codecard">
         <span class="cap">2 · activities/&lt;domain&gt;/activities.py</span>
         <pre><span class="c"># the real thing, same name</span>
 <span class="kwd">@activity.defn</span>
-<span class="kwd">async def</span> unlock_segment(
+<span class="kwd">async def</span> get_segment(
     segment: str
-) -> <span class="kwd">None</span>:
+) -> SegmentEntry:
     <span class="kwd">async with</span> _client() <span class="kwd">as</span> c:
-        <span class="kwd">await</span> c.post(...)</pre>
+        <span class="kwd">await</span> c.get(...)</pre>
       </div>
       <div class="codecard">
         <span class="cap">3 · workflow_domains/&lt;domain&gt;/&lt;workflow&gt;.py</span>
         <pre><span class="c"># imports the SIGNATURE</span>
 <span class="kwd">await</span> workflow.execute_activity(
-    unlock_segment,
+    get_segment,
     segment,
     task_queue=<span class="str">SC_ACTIVITY_QUEUE</span>,
     start_to_close_timeout=...,
@@ -458,9 +459,10 @@
         <h3>Why the activity queue follows the domain</h3>
         <p>A queue maps one-to-one onto a <b>deployment</b>, and what forces a separate deployment is a shared
         <b>dependency and credential set</b> — not where one workflow ends and the next begins.</p>
-        <p>Every <code>segment-lifecycle</code> activity needs the same two things: a Segments Manager URL with a
-        bearer token, and the NEXT firewall endpoints. That set is the deployment, so that set is the queue. A second
-        workflow in the domain reuses the same limb rather than duplicating the credentials.</p>
+        <p>Every <code>segment-lifecycle</code> activity draws on the same set: a Segments Manager URL with a
+        bearer token, a git push token for the day1 values repo, and the DHCP scope API. That set is the
+        deployment, so that set is the queue. All three workflows in the domain reuse the one limb rather than
+        duplicating the credentials.</p>
       </div>
       <div class="panel">
         <h3>Why the workflow queue follows the workflow</h3>
@@ -581,10 +583,10 @@
       <div class="panel">
         <h3>A third case: named after the external system</h3>
         <p>Some things are neither — they're defined by whoever is on the other end of the wire.
-        <code>check_next_requests</code> and <code>NextRequestRef</code> are named after NEXT because they speak
-        NEXT's API and every workflow in the domain shares them.</p>
-        <p>Meanwhile anything mirroring a Segments Manager endpoint keeps that endpoint's name, because renaming it
-        here would silently desync two repos.</p>
+        <code>SegmentTypeUpdate</code> mirrors the Segments Manager's <code>PUT /api/segments/type</code> body, and
+        <code>DhcpScopeState</code> is shaped by the DHCP API, not by the workflow that reads it.</p>
+        <p>Anything mirroring an external endpoint keeps that endpoint's name, because renaming it here would
+        silently desync two repos.</p>
       </div>
     </div>
   </section>
@@ -602,6 +604,7 @@
           <tr><td class="k">shared/models/</td><td class="muted">Pydantic models crossing the brain/limb boundary</td><td class="muted">a step needs new typed state</td></tr>
           <tr><td class="k">shared/interfaces/</td><td class="muted">Activity signatures, bodies are <code>...</code></td><td class="muted">adding or re-typing an activity</td></tr>
           <tr><td class="k">shared/consts.py</td><td class="muted">Task-queue names</td><td class="muted">adding a workflow or a domain</td></tr>
+          <tr><td class="k">shared/workflow_ids.py</td><td class="muted">Deterministic workflow-id builders — one definition per scheme</td><td class="muted">adding a workflow</td></tr>
           <tr><td class="k">shared/settings.py</td><td class="muted">Typed env config, validated at worker startup</td><td class="muted">adding a ConfigMap or Secret key</td></tr>
           <tr><td class="k">shared/exceptions.py</td><td class="muted">Error classes — the ones you classify as non-retryable</td><td class="muted">a new permanent failure mode appears</td></tr>
           <tr><td class="k">workflow_domains/&lt;domain&gt;/&lt;name&gt;.py</td><td class="muted">One workflow's orchestration logic</td><td class="muted">changing what happens, or in what order</td></tr>
@@ -611,14 +614,13 @@
           <tr><td class="k">workflow_domains/routers/</td><td class="muted">What no domain owns: deps, shared models, the <code>runs</code> status route</td><td class="muted">rarely — it is domain-agnostic on purpose</td></tr>
           <tr><td class="k">activities/&lt;domain&gt;/activities.py</td><td class="muted">The real implementations</td><td class="muted">changing how we call an external service</td></tr>
           <tr><td class="k">activities/&lt;domain&gt;/worker_init.py</td><td class="muted">Limb entrypoint — registers that domain's activities</td><td class="muted">adding an activity</td></tr>
-          <tr><td class="k">dev/mock-segment-connectivity/</td><td class="muted">Stand-in for NEXT, with a configurable approval delay</td><td class="muted">running end-to-end locally</td></tr>
           <tr><td class="k">tests/</td><td class="muted">Workflow tests on the time-skipping test environment, activity tests with mocked HTTP, plus a contract test</td><td class="muted">always</td></tr>
         </tbody>
       </table>
     </div>
-    <p class="note" style="margin-top:12px"><b>Not here:</b> production Helm charts. Each service has its own
-    <code>helm-charts-&lt;service&gt;</code> repo that Argo CD watches; CI in this repo bumps their image tags. The only
-    chart still living here is the test-only mock.</p>
+    <p class="note" style="margin-top:12px"><b>Not here:</b> Helm charts. They are vendored into the Argo CD
+    repo at <code>redbull-platform/gitops/charts/&lt;service&gt;/</code>, where pushing <code>main</code> deploys;
+    CI in this repo bumps their image tags across repos. This repo ships no chart at all.</p>
   </section>
 
   <!-- ================= 8. ADDING ================= -->
@@ -652,7 +654,7 @@
           <li>A settings group in <code>shared/settings.py</code> for its endpoints and credentials.</li>
           <li>A new <code>workflow_domains/&lt;domain&gt;/</code> folder with its workflows and a <code>router.py</code>, included in <code>api.py</code>.</li>
           <li>A build job in <code>.github/workflows/build.yml</code> and a new
-          <code>helm-charts-&lt;domain&gt;</code> repo for Argo CD.</li>
+          <code>gitops/charts/&lt;domain&gt;-worker/</code> chart in the redbull-platform repo for Argo CD.</li>
         </ol>
         <p class="note">The brain is already deployed — a new domain registers against it, it doesn't fork it.</p>
       </div>
@@ -713,8 +715,8 @@
     <div class="sec-head">
       <div class="eyebrow">Getting hands-on</div>
       <h2>Running it on your machine</h2>
-      <p class="lede">Four processes: a Temporal dev server, the brain, the limb, and the trigger API — plus the mock
-      when you want a full end-to-end run.</p>
+      <p class="lede">Four processes: a Temporal dev server, the brain, the limb, and the trigger API. Point it
+      at a Segments Manager and you have a full end-to-end run.</p>
     </div>
     <pre><span class="c"># 0 · deps + a local Temporal (UI on :8233)</span>
 pip install -r requirements-dev.txt
@@ -729,15 +731,11 @@ PYTHONPATH=. python -m activities.segment_lifecycle.worker_init
 <span class="c"># 3 · the trigger API — Swagger on http://localhost:8080/docs</span>
 PYTHONPATH=. uvicorn workflow_domains.api:app --port 8080
 
-<span class="c"># 4 · optional: stand in for the NEXT firewall service</span>
-cd dev/mock-segment-connectivity &amp;&amp; uvicorn app:app --port 9000
-
 <span class="c"># tests — no server needed, the SDK ships a time-skipping test env</span>
 pytest -q</pre>
     <p class="note" style="margin-top:14px">Config comes from <code>.env</code> (see <code>.env.example</code>); the
     settings classes fail fast at startup, so a missing or malformed key crashes the worker immediately rather than
-    mid-run. In the mock, <code>COMPLETION_DELAY_SECONDS</code> stands in for the human approval — set it low and a
-    full run finishes in seconds.</p>
+    mid-run. Only the limb needs the full set — the brain holds no credentials at all.</p>
   </section>
 
   <footer>

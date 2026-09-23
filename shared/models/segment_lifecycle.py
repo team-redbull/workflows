@@ -6,16 +6,21 @@ list of primitives), never an untyped dict.
 
 from __future__ import annotations
 
-from datetime import datetime
 from enum import Enum
-from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
 
 class SegmentType(str, Enum):
-    """Segment types known to the Segments Manager. Any type is valid input;
-    the workflow decides which ones connectivity is implemented for."""
+    """Segment types known to the Segments Manager.
+
+    Every one of them is valid input to every workflow in this domain — the
+    Segments Manager is the validator of record for what a segment may be, and
+    nothing in the orchestrator narrows that set. (There used to be a gate here:
+    firewall rules were defined for HC/INVENTORY/MCE only, so a PXE input was
+    rejected before creation. The firewalls are open now, so the gate is gone
+    with the flow that needed it.)
+    """
 
     MCE = "MCE"
     HC = "HC"
@@ -25,13 +30,13 @@ class SegmentType(str, Enum):
 
 class InitializeSegmentInput(BaseModel):
     """Input to InitializeSegmentWorkflow: the segment to CREATE in the
-    Segments Manager, then open firewall rules for.
+    Segments Manager.
 
-    This workflow is the single entry point for a segment's whole lifecycle —
-    the Segments Manager no longer triggers it on segment creation, it is a
-    dependency the workflow calls (create_segment is step 1). So the input is
-    the full segment definition, not just a reference to an existing one, and
-    every step of the flow is visible in one Temporal run.
+    This workflow is the single entry point for bringing a segment into
+    existence — the Segments Manager is a dependency the workflow calls
+    (create_segment), never the trigger. So the input is the full segment
+    definition, not a reference to an existing one, and creation is visible in
+    one Temporal run instead of happening outside it.
 
     Field names and constraints mirror the Segments Manager's own Segment
     schema (POST /api/segments, extra="forbid"): the shapes must match for the
@@ -49,197 +54,35 @@ class InitializeSegmentInput(BaseModel):
     dhcp: bool = True
 
 
-class OpenRulesRequest(BaseModel):
-    """The brain's intent to open firewall rules for one source -> destination pair.
-
-    Deliberately free of next-API payload shape: port profiles, system names and
-    the domain are the activity layer's concern, keyed off the type pair.
-    """
-
-    source_segment: str = Field(min_length=1)
-    destination_segment: str = Field(min_length=1)
-    source_type: SegmentType
-    destination_type: SegmentType
-
-
-class SegmentRef(BaseModel):
-    """A same-site segment eligible to peer with some source type — carries
-    its own type because one source type can peer with several destination
-    types at once (e.g. MCE peers with both HC and INVENTORY)."""
-
-    segment: str = Field(min_length=1)  # CIDR
-    type: SegmentType
-
-
-class PeerSegmentsQuery(BaseModel):
-    """Input to list_peer_segments: which type is asking, and where."""
-
-    source_type: SegmentType
-    site: str = Field(min_length=1)
-
-
-class BmcVendor(str, Enum):
-    """Server hardware vendor, which is what picks a BMC network.
-
-    Out-of-band management lives on a different /16 per vendor, so a site has
-    one BMC network per vendor whose hardware it actually hosts — both, or
-    only one. An MCE segment must reach every one of them: an MCE manages
-    whatever hardware happens to sit under it, and nothing at segment level
-    says which vendor that is. NOT a SegmentType: these networks are static
-    config, never Segments-Manager-tracked (see get_bmc_segments).
-    """
-
-    DELL = "dell"
-    CISCO = "cisco"
-
-
-class BmcRuleDirection(str, Enum):
-    """Which way one MCE <-> BMC rule runs.
-
-    Both directions are opened for every vendor the site has, so an MCE run
-    submits two BMC requests per configured vendor — four at a two-vendor
-    site, two at a single-vendor one. They share ONE port profile
-    (PORTS_MCE_TO_BMC): the traffic is the same IPMI ports either way, and the
-    key keeps its name because renaming it would mean shipping a new ConfigMap
-    key before the image — cost this split deliberately avoids.
-    """
-
-    MCE_TO_BMC = "mce_to_bmc"
-    BMC_TO_MCE = "bmc_to_mce"
-
-
-class BmcSegments(BaseModel):
-    """One site's static BMC networks, keyed by hardware vendor.
-
-    A field is None for a vendor the site has no hardware from — sites are
-    Dell-only, Cisco-only, or both. Neither is a config gap rather than a
-    site shape, and never reaches here: SITE_NETWORKS rejects it at worker
-    startup, and the validator below is the same rule restated at the
-    boundary this model crosses.
-
-    Returned whole rather than one CIDR at a time so a site's BMC config is
-    resolved in ONE activity call, before any rule is submitted.
-    """
-
-    dell: str | None = Field(default=None, min_length=1)  # CIDR, e.g. "10.50.0.0/16"
-    cisco: str | None = Field(default=None, min_length=1)
-
-    @model_validator(mode="after")
-    def _require_a_bmc_network(self) -> "BmcSegments":
-        if self.dell is None and self.cisco is None:
-            raise ValueError("a site must have at least one BMC network")
-        return self
-
-    def pairs(self) -> list[tuple[BmcVendor, str]]:
-        """(vendor, CIDR) for the vendors this site HAS, in a FIXED order.
-
-        The workflow fans open-rules activities out over this list, and
-        Temporal replays every run against the same schedule — so the order is
-        part of the contract, not a formatting detail. Never sort or derive it
-        from a dict/set: it is a literal dell-then-cisco sequence with the
-        unconfigured vendors skipped, which also keeps a both-vendor site
-        replaying exactly as it did before single-vendor sites existed.
-        """
-        configured = ((BmcVendor.DELL, self.dell), (BmcVendor.CISCO, self.cisco))
-        return [(vendor, cidr) for vendor, cidr in configured if cidr is not None]
-
-
-class BmcOpenRulesRequest(BaseModel):
-    """ONE firewall-rule request between an MCE segment and ONE vendor's BMC
-    network. BMC is not a Segments-Manager-tracked SegmentType — its CIDRs are
-    static, ConfigMap-sourced values per site — so this is a deliberately
-    separate, narrower model from OpenRulesRequest.
-
-    The two segments are named by ROLE, not by source/destination: `direction`
-    says which way this particular rule runs, and the activity layer swaps them
-    accordingly. That keeps one model for both legs of the pair, the same way
-    the peer legs reuse OpenRulesRequest with the fields swapped.
-
-    `vendor` carries which of the site's two BMC networks this is: the activity
-    layer keys the next-API system_name and the request comment off it, so the
-    four requests an MCE run submits are distinguishable in next's UI.
-    """
-
-    mce_segment: str = Field(min_length=1)
-    bmc_segment: str = Field(min_length=1)
-    vendor: BmcVendor
-    direction: BmcRuleDirection
-
-
-class NextRequestRef(BaseModel):
-    """The next API's acknowledgement of a submitted request.
-
-    Named after NEXT rather than after this domain or workflow: it is whatever
-    next hands back for ANY submitted request, so a future workflow submitting
-    a different kind of rule change gets the same shape back.
-    """
-
-    id: int
-    status: str
-
-
-class SegmentConnectivityRequestsUpdate(BaseModel):
-    """The pending next request ids to surface beside the segment's status in
-    the Segments Manager UI. An empty list removes the display (all complete)."""
-
-    segment: str = Field(min_length=1)
-    request_ids: list[int]
-    submitted_at: datetime  # drives the "time since submit" header in the UI popover
-
-
-class SegmentConnectivityFailureNotice(BaseModel):
-    """Published to the Segments Manager when the workflow fails terminally:
-    clears the pending request-ids display and surfaces a failure note beside
-    the segment's status badge (the segment intentionally stays Locked)."""
-
-    segment: str = Field(min_length=1)
-    message: str = Field(min_length=1)
-
-
-class InitializeSegmentResumeState(BaseModel):
-    """Polling state carried across continue_as_new runs of the workflow."""
-
-    request_ids: list[int]
-    pending_request_ids: list[int]
-    peer_segment_count: int
-    submitted_at: datetime
-
-
 class InitializeSegmentRunArgs(BaseModel):
-    """The workflow's single argument: public input + internal resume state.
+    """The workflow's single argument.
 
     A single-model argument is the Temporal-recommended shape. It also avoids
     an SDK gotcha: typed payload conversion is silently SKIPPED whenever the
     number of payloads differs from the number of declared run() parameters —
     a two-parameter run(input, resume=None) started with one payload receives
-    a raw dict instead of a Pydantic model.
+    a raw dict instead of a Pydantic model. The wrapper stays even though
+    `input` is now its only field: it is the shape the run() signature is
+    pinned to, and the next piece of internal state has somewhere to go.
     """
 
     input: InitializeSegmentInput
-    resume: InitializeSegmentResumeState | None = None
 
 
 class InitializeSegmentProgress(BaseModel):
     """Returned by the workflow's `progress` query (surfaced by the status API)."""
 
     phase: str
-    total_requests: int
-    pending_requests: int
 
 
 class InitializeSegmentResult(BaseModel):
-    """The run's outcome. `open_connectivity_site` says WHY a run can carry
-    zero peers and zero request ids: the site's connectivity is always open
-    (SITES_WITH_OPEN_CONNECTIVITY), so the segment was created and unlocked
-    without involving the next service at all. Without it, that result reads
-    as a run that opened nothing — the one outcome the normal path refuses to
-    produce (it fails as NoPeerSegments instead)."""
+    """The run's outcome: the segment that now exists, and its type.
+
+    A completed run means the segment is in the Segments Manager and
+    Available — there is no second thing to report."""
 
     segment: str
     type: SegmentType
-    peer_segment_count: int
-    request_ids: list[int]
-    open_connectivity_site: bool = False
 
 
 # --- allocate-segment -------------------------------------------------------
@@ -397,11 +240,11 @@ class AllocateSegmentResult(BaseModel):
 
 # --- convert-segment --------------------------------------------------------
 # The domain's third workflow: rebalance segment inventory between types by
-# re-typing existing AVAILABLE segments of a source type at a site and
-# re-running the initialize-segment flow for each (the new type has different
-# peers, so connectivity must be re-established). Workflow-scoped models carry
-# the workflow name; models a sibling could reuse (the search query/result and
-# the type-update request, which mirror Segments Manager endpoints) do not.
+# re-typing existing AVAILABLE, unassigned segments of a source type at a site.
+# Re-typing is the whole operation — a converted segment stays Available and is
+# immediately allocatable as its new type. Workflow-scoped models carry the
+# workflow name; models a sibling could reuse (the search query/result and the
+# type-update request, which mirror Segments Manager endpoints) do not.
 
 
 class ConvertSegmentInput(BaseModel):
@@ -437,30 +280,28 @@ class ConvertSegmentRunArgs(BaseModel):
 
 class ConvertibleSegmentsQuery(BaseModel):
     """Input to list_convertible_segments: which type to look for, and where.
-    Status is NOT a parameter — "convertible" MEANS Available, and that rule
-    belongs to the activity, not to each caller. Allocated segments are in use;
-    Locked ones have no established connectivity and may still have a live
-    initialize-segment run, which this workflow deliberately never disturbs."""
+    Status is NOT a parameter — "convertible" MEANS Available and unassigned,
+    and that rule belongs to the activity, not to each caller. Allocated
+    segments are in use, and an Available segment carrying a cluster is a
+    manager invariant violation the activity refuses to convert."""
 
     site: str = Field(min_length=1)
     type: SegmentType
 
 
 class ConvertibleSegment(BaseModel):
-    """One search hit: everything the workflow needs to pick it, convert it,
-    and hand the initialize-segment child a full InitializeSegmentInput —
-    without a second read-back.
+    """One search hit: everything the workflow needs to pick it, convert it and
+    report it.
 
-    `status` carries no choice for the workflow (every hit is Available) — it
-    is kept so the activity can assert that, rather than trusting the filter it
-    asked for.
+    Neither `status` nor `cluster_name` carries a choice for the workflow
+    (every hit is Available and unassigned) — they are kept so the activity can
+    ASSERT both, rather than trusting the filter it asked for.
     """
 
     segment: str = Field(min_length=1)  # CIDR
     vlan_id: int = Field(ge=1, le=4094)
-    epg_name: str = Field(min_length=1)
     status: str = Field(min_length=1)  # always "Available"
-    dhcp: bool
+    cluster_name: str | None = None  # always empty on a convertible hit
 
 
 class SegmentTypeUpdate(BaseModel):
@@ -476,28 +317,24 @@ class SegmentTypeUpdate(BaseModel):
 
 
 class ConvertedSegmentReport(BaseModel):
-    """Per-segment outcome of the conversion loop. `open_rules_status` reports
-    the FAN-OUT only (like the bulk route's items): `started` means Temporal
-    accepted the child run, whose own progress/failure lives under its own
-    workflow id.
+    """Per-segment outcome of the conversion loop: which segment was re-typed.
 
-    No `previous_status`/`cancelled_previous_run`: every converted segment was
-    Available and no stale run is ever cancelled, so both were constants — and
-    a constant dressed up as a per-segment finding is exactly the kind of field
-    an operator reads as meaningful.
+    Nothing else to report — the conversion IS the operation, and every
+    converted segment ends it Available under its new type. No
+    `previous_status`/`cancelled_previous_run`/`open_rules_status`: each was a
+    constant, and a constant dressed up as a per-segment finding is exactly the
+    kind of field an operator reads as meaningful.
     """
 
     segment: str
     vlan_id: int
-    initialize_segment_workflow_id: str
-    open_rules_status: Literal["started", "already_running"]
 
 
 class ConvertSegmentProgress(BaseModel):
     """Returned by the workflow's `progress` query (surfaced by the status
     API). Carries the full per-segment report list — not just counts — so a
-    mid-loop failure still shows which segments WERE converted (their child
-    runs exist and proceed regardless)."""
+    mid-loop failure still shows which segments WERE converted (those
+    conversions stand)."""
 
     phase: str
     matched: int

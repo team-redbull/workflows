@@ -65,6 +65,7 @@ def make_mock_activities(
     locate_error: Exception | None = None,
     allocate_fail_times: int = 0,
     entry_overrides: dict | None = None,
+    entry_omits_type: bool = False,
     append_changed: bool = True,
     scope_script: list[DhcpScopeState] | None = None,
     scope_never_converges: bool = False,
@@ -75,6 +76,9 @@ def make_mock_activities(
     scope_never_converges) every subsequent poll reports the converged scope.
     entry_overrides: fields of the read-back SegmentEntry to distort — the
     default read-back matches the allocation exactly.
+    entry_omits_type: return the read-back WITHOUT a `type` key at all, the
+    way a limb built before SegmentEntry.type existed (or history recorded by
+    the previous brain) serializes it.
     """
     calls: dict[str, list] = {
         name: []
@@ -95,6 +99,7 @@ def make_mock_activities(
         "site": SITE,
         "vlan_id": VLAN_ID,
         "status": "Allocated",
+        "type": SegmentType.HC.value,
         "cluster_name": CLUSTER,
         **(entry_overrides or {}),
     }
@@ -124,6 +129,9 @@ def make_mock_activities(
     @activity.defn
     async def get_segment(segment: str) -> SegmentEntry:
         calls["get_segment"].append(segment)
+        if entry_omits_type:
+            # A plain dict serializes exactly as it is — no `type` key.
+            return {k: v for k, v in entry_fields.items() if k != "type"}
         return SegmentEntry(**entry_fields)
 
     @activity.defn
@@ -304,6 +312,36 @@ async def test_read_back_mismatch_fails_with_no_git_commit():
     # Verification sits BEFORE the git write: nothing was pushed.
     assert calls["append_allocation_to_cluster_values"] == []
     assert calls["get_dhcp_scope"] == []
+
+
+@pytest.mark.parametrize("read_back_type", ["MCE", None])
+async def test_read_back_type_mismatch_fails_with_no_git_commit(read_back_type):
+    """The allocation stamps the type onto the segment, so the read-back must
+    show the requested one. A null is a failure too: an Allocated segment
+    always has a type."""
+    calls, mocks = make_mock_activities(entry_overrides={"type": read_back_type})
+    async with _Harness(mocks) as client:
+        with pytest.raises(WorkflowFailureError) as exc_info:
+            await _execute(client, AllocateSegmentRunArgs(input=HC_INPUT))
+
+    cause = _workflow_cause(exc_info)
+    assert isinstance(cause, ApplicationError)
+    assert cause.type == "AllocationNotConfirmed"
+    assert "type: expected 'HC'" in str(cause)
+    assert calls["append_allocation_to_cluster_values"] == []
+
+
+async def test_read_back_without_a_type_field_is_not_held_against_the_run():
+    """A read-back with no `type` key predates the field — history replayed
+    from the previous brain, or a limb one rollout behind (build.yml ships the
+    brain first). It says nothing about the allocation, so it must not fail the
+    run; the rest of the read-back is still verified."""
+    calls, mocks = make_mock_activities(entry_omits_type=True)
+    async with _Harness(mocks) as client:
+        result = await _execute(client, AllocateSegmentRunArgs(input=HC_INPUT))
+
+    assert result.dhcp_scope_ready is True
+    assert len(calls["append_allocation_to_cluster_values"]) == 1
 
 
 async def test_transient_activity_failures_are_outwaited():

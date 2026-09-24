@@ -76,13 +76,14 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   `/workflows/<domain>` — NOT the limb Deployment/SA, which are the process and take `-worker` per
   the rule above. Anything belonging to ONE workflow is named after the WORKFLOW: its module
   (`workflow_domains/segment_lifecycle/initialize_segment.py`), its class, its own task queue
-  (`initialize-segment-workflow`), its workflow ids (`initialize-segment-<TYPE>-<network>`), its
+  (`initialize-segment-workflow`), its workflow ids (`initialize-segment-<network>`), its
   RunArgs/Progress/Result models, and its ROUTE under the domain prefix. Workflow ids
   MUST carry the workflow name — two workflows acting on the same segment would otherwise collide on
-  one id — and the segment TYPE: allocation is scoped per (cluster, site, type), so
-  `allocate-segment-<TYPE>-<cluster>` without the type would make two legitimate allocations of one
-  cluster collide. The domain currently holds THREE workflows (`initialize-segment`,
-  `allocate-segment`, `convert-segment`), each on its own workflow queue, sharing the one limb
+  one id — and, where the workflow's scope includes one, the segment TYPE: allocation is scoped per
+  (cluster, site, type), so `allocate-segment-<TYPE>-<cluster>` without the type would make two
+  legitimate allocations of one cluster collide. (initialize-segment's id has no type because a
+  segment is created without one — §4.) The domain currently holds TWO workflows
+  (`initialize-segment`, `allocate-segment`), each on its own workflow queue, sharing the one limb
   deployment. Id builders live in `shared/workflow_ids.py` — ONE definition per scheme, importable
   from both routers and workflow code. The routers are the only callers today, but the location is
   deliberate: a workflow file can never import a router (FastAPI ≠ sandbox-safe), so the moment a
@@ -118,8 +119,17 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   it this way: anything a workflow's outcome depends on belongs INSIDE the run, as a retried
   activity, not in a caller's fire-and-forget call. New domains follow the same shape.
 - **The Segments Manager is the VALIDATOR OF RECORD.** Site known, CIDR inside the site pool, no
-  overlap, VLAN free, type legal — all its rules, none re-derived here. A rejected definition
+  overlap, VLAN free — all its rules, none re-derived here. A rejected definition
   surfaces as a FAILED run, not a 4xx on the trigger, because creation happens inside the workflow.
+- **A segment's TYPE is ALLOCATION state, not part of its definition.** A segment is created with
+  NO type (`InitializeSegmentInput` has no `type`; the Segments Manager rejects one on create), joins
+  one shared Available pool per site, and gets its type only when allocate-segment reserves it —
+  `AllocateSegmentInput.type` is the ONE place a type enters the system, and the Segments Manager
+  stamps it onto whichever Available segment it hands out, in the same atomic update. Release clears
+  it again. So there are no per-type pools and no inventory to rebalance between them, which is why
+  **convert-segment was removed — do not re-add it** (with `PUT /api/segments/type`, its models, its
+  queue and `SegmentConversionConflictError`). The per-type things that remain are all about an
+  ALLOCATION: the allocate id, the SM's (cluster, site, type) idempotency, the DHCP exclusion policy.
 - **The DHCP scope API is READ-ONLY to us** (`DHCP_API_URL`): allocate-segment GETs a scope to
   observe Crossplane's convergence and never writes one. Git is the single source of truth and
   Crossplane the only writer — posting the scope ourselves would make two writers for one resource.
@@ -196,8 +206,9 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   parent_close_policy=ParentClosePolicy.ABANDON)` on the sibling's workflow queue, catching
   `WorkflowAlreadyStartedError` as an `already_running` report item — and never waits on them (each
   child answers to its own id and its own failure, the /bulk philosophy). NO CURRENT WORKFLOW SPAWNS
-  SIBLINGS: convert-segment was the precedent, starting an initialize-segment run per converted
-  segment to re-open its firewall rules, and that fan-out went with the firewall flow (§4). The rule
+  SIBLINGS: convert-segment (since removed, §4) was the precedent, starting an initialize-segment run
+  per converted segment to re-open its firewall rules, and that fan-out went with the firewall flow
+  (§4) before the workflow itself went. The rule
   stands for the next workflow that needs one — as does the builders-in-`shared/workflow_ids.py`
   arrangement that made it possible (a workflow can never import a router).
 - **NEVER cancel a sibling to make room for your own work — choose inputs that cannot have one.**
@@ -205,20 +216,32 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   already-CLOSED execution and reports it accepted, failing only for an id that has NEVER existed. So
   `cancel()` cannot distinguish "killed a live sibling" from "no-op'd against one that finished days
   ago", and the answer FLIPS once the closed run ages out of retention. NARROWING THE INPUT to
-  eliminate the interaction beats every attempt to detect it. Learned on convert-segment, which used
-  to cancel a stale sibling run before re-typing a segment: the version that cancelled unconditionally
+  eliminate the interaction beats every attempt to detect it. Learned on convert-segment (since
+  removed, §4), which used to cancel a stale sibling run before re-typing a segment: the version that cancelled unconditionally
   reported a phantom cancellation and paid a 30 s pause on nearly every segment, and the version that
   gated the cancel on status was correct but kept the machinery — while restricting the SELECTION to
   segments that could not have a live sibling removed the problem outright. Apply the same move to the
   next such interaction rather than adding detection.
+- **Evolving a model that crosses the boundary — history and a lagging limb both hold OLD payloads.**
+  CI ships the brain BEFORE the limb (`build.yml`: the limb job `needs` the brain's), and every
+  in-flight run replays payloads recorded by the previous code. So (a) a field ADDED to a model an
+  activity RETURNS is simply absent from those payloads: a workflow check on it gates on
+  `"field" in model.model_fields_set` — the key's presence — never on its value, or replay fails the
+  run where the original didn't (nondeterminism) and a new brain fails every run against an old limb.
+  allocate-segment's read-back `type` check is the precedent; the limb always emits the key (a null
+  included), which is what keeps the gate honest. (b) A model decoded from history (workflow input,
+  activity input/result) never gets `extra="forbid"` — a removed field still sits in old payloads and
+  would wedge the run. Strictness about unknown fields goes on an API-edge subclass instead
+  (`InitializeSegmentRequest` in the router, refusing the retired `type`).
 
 ## 6. Idempotency (required for all activities)
 
 - Network calls fail and Temporal retries — activities must be strictly idempotent: UPSERTs,
   check-before-create, idempotency keys; treat "already exists / already done" as success. Examples:
   `create_segment` treats an existing segment MATCHING the definition as success and only fails on a
-  genuine disagreement (`SegmentConflictError`); `convert_segment_type` converges when the stored
-  type already equals the NEW type; `allocate_segment` is
+  genuine disagreement (`SegmentConflictError`) — comparing identity only (site, vlan, epg), never
+  allocation state (type, status, cluster), so a segment allocated since it was created still
+  matches; `allocate_segment` is
   idempotent SERVER-side per (cluster, site, type) — a repeat call returns the existing allocation;
   `append_allocation_to_cluster_values` compares the ALLOCATION, not the block text — a marker block
   already recording this `vlanId` on this `network` is success (`changed=False`, nothing pushed)
@@ -229,19 +252,20 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   the Segments Manager confirmed; the DHCP detail around them belongs to day1 and to the operator,
   which also means a changed exclusion POLICY is never retrofitted onto an allocated cluster.
 - **Verify after mutate, before recording:** allocate-segment reads the allocation back
-  (`get_segment`: status/cluster/vlan must all match) BEFORE the git write, so the values repo can
+  (`get_segment`: status/cluster/vlan/type must all match — the allocation WROTE the type) BEFORE the
+  git write, so the values repo can
   never record a vlan the Segments Manager does not confirm. A mutation whose outcome another system
   will act on gets a read-back check between the mutation and the recording.
-- Workflow IDs are deterministic (`initialize-segment-<TYPE>-<network address, CIDR mask dropped>`,
-  e.g. `initialize-segment-HC-130.154.20.0`; `allocate-segment-<TYPE>-<cluster>`;
-  `convert-segment-<site>-<SRC>-to-<DEST>`) for natural dedup — a duplicate trigger while running
-  gets HTTP 409 (in the bulk route, an `already_running` item). Builders in `shared/workflow_ids.py`.
-- **Cross-workflow idempotency via compare-and-set:** convert-segment's `convert_segment_type`
-  passes `expected_type` so two conversions racing for one segment (HC→MCE vs HC→PXE) can't both
-  win — the loser gets the Segments Manager's 409 (`SegmentConversionConflictError`, non-retryable,
-  fails that run loudly), while a plain Temporal retry stays safe (a stored type already equal to
-  the NEW type short-circuits as success before the CAS check). A failed convert-segment re-run is
-  naturally convergent: converted segments no longer match the source type, so the search skips them.
+- Workflow IDs are deterministic (`initialize-segment-<network address, CIDR mask dropped>`,
+  e.g. `initialize-segment-130.154.20.0`; `allocate-segment-<TYPE>-<cluster>`) for natural dedup — a
+  duplicate trigger while running gets HTTP 409 (in the bulk route, an `already_running` item).
+  Builders in `shared/workflow_ids.py`.
+- **Cross-workflow races on one record: compare-and-set, server-side.** When two runs may mutate the
+  same record, the mutation carries the value it expects to replace and the owning service applies it
+  atomically, so the loser gets a 409 (classified non-retryable) instead of silently overwriting the
+  winner — while a plain Temporal retry must still short-circuit as success when the stored value
+  already equals the NEW one. Precedent: convert-segment's `expected_type` (removed with the
+  workflow, §4). No current workflow needs it; the rule stands for the next one that does.
 
 ## 7. Strict validation & clean typed state
 

@@ -25,7 +25,7 @@
         {
           name: "initialize-segment",
           href: "/segment-lifecycle/initialize-segment.html",
-          blurb: "create a segment — born Available"
+          blurb: "create a segment — born Available, typeless"
         },
         {
           name: "allocate-segment",
@@ -36,11 +36,6 @@
           name: "release-segment",
           href: null,
           blurb: "give the VLAN back to the pool"
-        },
-        {
-          name: "convert-segment",
-          href: "/segment-lifecycle/convert-segment.html",
-          blurb: "re-type spare segments between types"
         }
       ]
     }

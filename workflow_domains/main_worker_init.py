@@ -26,7 +26,6 @@ from temporalio.worker import Worker
 
 from shared.consts import (
     ALLOCATE_SEGMENT_WORKFLOW_QUEUE,
-    CONVERT_SEGMENT_WORKFLOW_QUEUE,
     INITIALIZE_SEGMENT_WORKFLOW_QUEUE,
 )
 from shared.logging_config import configure_logging
@@ -34,9 +33,6 @@ from shared.settings import TemporalSettings
 from shared.shutdown import install_shutdown_handler
 from workflow_domains.segment_lifecycle.allocate_segment import (
     AllocateSegmentWorkflow,
-)
-from workflow_domains.segment_lifecycle.convert_segment import (
-    ConvertSegmentWorkflow,
 )
 from workflow_domains.segment_lifecycle.initialize_segment import (
     InitializeSegmentWorkflow,
@@ -50,7 +46,6 @@ _settings = TemporalSettings()
 _WORKER_SPECS: list[tuple[str, list[type]]] = [
     (INITIALIZE_SEGMENT_WORKFLOW_QUEUE, [InitializeSegmentWorkflow]),
     (ALLOCATE_SEGMENT_WORKFLOW_QUEUE, [AllocateSegmentWorkflow]),
-    (CONVERT_SEGMENT_WORKFLOW_QUEUE, [ConvertSegmentWorkflow]),
 ]
 
 

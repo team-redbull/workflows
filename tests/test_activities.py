@@ -2,7 +2,6 @@
 
 Covers the strict-validation and error-classification contracts: 401/403 ->
 SegmentsManagerAuthError (non-retryable), 404 -> SegmentNotFoundError
-(non-retryable), 409 on a conversion -> SegmentConversionConflictError
 (non-retryable), everything else -> retryable SegmentsManagerError.
 """
 
@@ -13,45 +12,40 @@ import pytest
 import respx
 from temporalio.testing import ActivityEnvironment
 
+from temporalio.contrib.pydantic import pydantic_data_converter
+
 from activities.segment_lifecycle.activities import (
-    convert_segment_type,
     create_segment,
-    list_convertible_segments,
+    get_segment,
 )
 from shared.exceptions import (
     SegmentConflictError,
-    SegmentConversionConflictError,
     SegmentNotFoundError,
     SegmentsManagerAuthError,
     SegmentsManagerError,
     SegmentValidationError,
 )
-from shared.models.segment_lifecycle import (
-    ConvertibleSegmentsQuery,
-    InitializeSegmentInput,
-    SegmentTypeUpdate,
-    SegmentType,
-)
+from shared.models.segment_lifecycle import InitializeSegmentInput
 
 SM = "http://segments-manager.test"
 
-HC_INPUT = InitializeSegmentInput(
+SEGMENT_INPUT = InitializeSegmentInput(
     segment="10.0.0.0/24",
-    type=SegmentType.HC,
     site="site-a",
     vlan_id=100,
     epg_name="EPG_TEST_01",
 )
-# What the Segments Manager stores for HC_INPUT once created — Available
-# immediately: there is no Locked status any more.
-STORED_HC_SEGMENT = {
+# What the Segments Manager stores for SEGMENT_INPUT once created — Available
+# immediately and typeless: the type is stamped on at allocation.
+STORED_SEGMENT = {
     "segment": "10.0.0.0/24",
-    "type": "HC",
+    "type": None,
     "site": "site-a",
     "vlan_id": 100,
     "epg_name": "EPG_TEST_01",
     "dhcp": True,
     "status": "Available",
+    "cluster_name": None,
 }
 
 
@@ -68,16 +62,16 @@ async def test_create_segment_posts_the_full_definition(env):
     route = respx.post(f"{SM}/api/segments").mock(
         return_value=httpx.Response(200, json={"message": "Segment created", "id": "abc"})
     )
-    await env.run(create_segment, HC_INPUT)
+    await env.run(create_segment, SEGMENT_INPUT)
 
     assert route.called
     import json
 
     body = json.loads(route.calls.last.request.content)
     # Exactly the Segments Manager's Segment schema (which is extra="forbid").
+    # No type: the manager rejects one on create.
     assert body == {
         "segment": "10.0.0.0/24",
-        "type": "HC",
         "site": "site-a",
         "vlan_id": 100,
         "epg_name": "EPG_TEST_01",
@@ -94,9 +88,9 @@ async def test_create_segment_existing_identical_segment_is_success(env):
         return_value=httpx.Response(400, json={"detail": "VLAN 100 already exists at site 'site-a'"})
     )
     respx.get(f"{SM}/api/segments/by-segment").mock(
-        return_value=httpx.Response(200, json=STORED_HC_SEGMENT)
+        return_value=httpx.Response(200, json=STORED_SEGMENT)
     )
-    await env.run(create_segment, HC_INPUT)  # no raise
+    await env.run(create_segment, SEGMENT_INPUT)  # no raise
 
 
 @respx.mock
@@ -107,9 +101,31 @@ async def test_create_segment_existing_segment_with_different_dhcp_is_success(en
         return_value=httpx.Response(400, json={"detail": "already exists"})
     )
     respx.get(f"{SM}/api/segments/by-segment").mock(
-        return_value=httpx.Response(200, json={**STORED_HC_SEGMENT, "dhcp": False})
+        return_value=httpx.Response(200, json={**STORED_SEGMENT, "dhcp": False})
     )
-    await env.run(create_segment, HC_INPUT)  # no raise
+    await env.run(create_segment, SEGMENT_INPUT)  # no raise
+
+
+@respx.mock
+async def test_create_segment_existing_segment_since_allocated_is_success(env):
+    """Type, cluster and status are allocation state the manager sets and
+    clears — a segment allocated since it was created still matches the
+    definition that created it."""
+    respx.post(f"{SM}/api/segments").mock(
+        return_value=httpx.Response(400, json={"detail": "already exists"})
+    )
+    respx.get(f"{SM}/api/segments/by-segment").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                **STORED_SEGMENT,
+                "type": "HC",
+                "status": "Allocated",
+                "cluster_name": "cluster-a",
+            },
+        )
+    )
+    await env.run(create_segment, SEGMENT_INPUT)  # no raise
 
 
 @respx.mock
@@ -118,10 +134,10 @@ async def test_create_segment_existing_segment_with_different_identity_conflicts
         return_value=httpx.Response(400, json={"detail": "already exists"})
     )
     respx.get(f"{SM}/api/segments/by-segment").mock(
-        return_value=httpx.Response(200, json={**STORED_HC_SEGMENT, "vlan_id": 999})
+        return_value=httpx.Response(200, json={**STORED_SEGMENT, "vlan_id": 999})
     )
     with pytest.raises(SegmentConflictError) as exc_info:
-        await env.run(create_segment, HC_INPUT)
+        await env.run(create_segment, SEGMENT_INPUT)
     assert "vlan_id" in str(exc_info.value)
 
 
@@ -138,7 +154,7 @@ async def test_create_segment_rejected_definition_is_validation_error(env):
         return_value=httpx.Response(404, json={"detail": "Segment not found"})
     )
     with pytest.raises(SegmentValidationError) as exc_info:
-        await env.run(create_segment, HC_INPUT)
+        await env.run(create_segment, SEGMENT_INPUT)
     assert "overlaps with existing segment" in str(exc_info.value)
 
 
@@ -146,14 +162,14 @@ async def test_create_segment_rejected_definition_is_validation_error(env):
 async def test_create_segment_auth_failure_is_classified(env):
     respx.post(f"{SM}/api/segments").mock(return_value=httpx.Response(401))
     with pytest.raises(SegmentsManagerAuthError):
-        await env.run(create_segment, HC_INPUT)
+        await env.run(create_segment, SEGMENT_INPUT)
 
 
 @respx.mock
 async def test_create_segment_server_error_is_retryable_type(env):
     respx.post(f"{SM}/api/segments").mock(return_value=httpx.Response(503))
     with pytest.raises(SegmentsManagerError):
-        await env.run(create_segment, HC_INPUT)
+        await env.run(create_segment, SEGMENT_INPUT)
 
 
 @respx.mock
@@ -165,200 +181,38 @@ async def test_create_segment_unreadable_lookup_stays_retryable(env):
     )
     respx.get(f"{SM}/api/segments/by-segment").mock(return_value=httpx.Response(503))
     with pytest.raises(SegmentsManagerError):
-        await env.run(create_segment, HC_INPUT)
+        await env.run(create_segment, SEGMENT_INPUT)
 
 
-# --- convert-segment: list_convertible_segments / convert_segment_type ---
+# --- get_segment ---
 
 
-def _stored(
-    segment: str, vlan_id: int, status: str, cluster_name: str | None = None
-) -> dict:
-    return {
-        "segment": segment,
-        "type": "HC",
-        "site": "site-a",
-        "vlan_id": vlan_id,
-        "epg_name": f"EPG_HC_{vlan_id}",
-        "dhcp": True,
-        "status": status,
-        "cluster_name": cluster_name,
-    }
-
-
+@pytest.mark.parametrize("stored_type", ["HC", None])
 @respx.mock
-async def test_list_convertible_segments_asks_the_server_for_available_only(env):
-    """All three filters are the server's now that "convertible" means one
-    status — so the request itself must carry status=Available."""
-    route = respx.get(
-        f"{SM}/api/segments",
-        params={"site": "site-a", "type": "HC", "status": "Available"},
-    ).mock(
+async def test_get_segment_always_reports_the_type_key(env, stored_type):
+    """allocate-segment verifies the read-back type only when the payload
+    HAS a `type` key — its absence means a limb that predates the field. So
+    this limb must emit the key on every read-back, a null one included, or
+    the check would silently switch itself off."""
+    respx.get(f"{SM}/api/segments/by-segment").mock(
         return_value=httpx.Response(
             200,
-            json=[
-                _stored("10.0.10.0/24", 10, "Available"),
-                _stored("10.0.30.0/24", 30, "Available"),
-            ],
+            json={
+                **STORED_SEGMENT,
+                "type": stored_type,
+                "status": "Allocated" if stored_type else "Available",
+            },
         )
     )
-    hits = await env.run(
-        list_convertible_segments,
-        ConvertibleSegmentsQuery(site="site-a", type=SegmentType.HC),
-    )
-    assert route.called
-    assert [(h.segment, h.vlan_id, h.status, h.cluster_name) for h in hits] == [
-        ("10.0.10.0/24", 10, "Available", None),
-        ("10.0.30.0/24", 30, "Available", None),
-    ]
+    entry = await env.run(get_segment, "10.0.0.0/24")
+
+    assert entry.type == stored_type
+    [payload] = pydantic_data_converter.payload_converter.to_payloads([entry])
+    assert b'"type":' in payload.data
 
 
 @respx.mock
-@pytest.mark.parametrize("wrong_status", ["Allocated", "Reserved"])
-async def test_list_convertible_segments_rejects_a_wrong_status(env, wrong_status):
-    """Strict, not tolerant (§7): a segment the server should have filtered out
-    would enter the conversion loop, so it fails the activity rather than being
-    quietly skipped."""
-    respx.get(f"{SM}/api/segments").mock(
-        return_value=httpx.Response(
-            200,
-            json=[
-                _stored("10.0.10.0/24", 10, "Available"),
-                _stored("10.0.20.0/24", 20, wrong_status),
-            ],
-        )
-    )
-    with pytest.raises(SegmentsManagerError):
-        await env.run(
-            list_convertible_segments,
-            ConvertibleSegmentsQuery(site="site-a", type=SegmentType.HC),
-        )
-
-
-@respx.mock
-@pytest.mark.parametrize("cluster_name", ["hub-cluster-01", " "])
-async def test_list_convertible_segments_rejects_a_cluster_assigned_hit(
-    env, cluster_name
-):
-    """The OTHER half of "convertible", asserted for the same reason as the
-    status: an Available segment carrying a cluster is a Segments Manager
-    invariant violation (allocation assigns the cluster and sets the status in
-    one update), and converting it would re-type a segment a cluster is
-    actually using.
-    """
-    respx.get(f"{SM}/api/segments").mock(
-        return_value=httpx.Response(
-            200,
-            json=[
-                _stored("10.0.10.0/24", 10, "Available"),
-                _stored("10.0.20.0/24", 20, "Available", cluster_name=cluster_name),
-            ],
-        )
-    )
-    with pytest.raises(SegmentsManagerError, match="assigned to cluster"):
-        await env.run(
-            list_convertible_segments,
-            ConvertibleSegmentsQuery(site="site-a", type=SegmentType.HC),
-        )
-
-
-@respx.mock
-@pytest.mark.parametrize("empty", [None, ""])
-async def test_list_convertible_segments_accepts_an_empty_cluster_name(env, empty):
-    """Unassigned is both None and "" — the manager has used both spellings,
-    and neither means "a cluster holds this"."""
-    respx.get(f"{SM}/api/segments").mock(
-        return_value=httpx.Response(
-            200,
-            json=[_stored("10.0.10.0/24", 10, "Available", cluster_name=empty)],
-        )
-    )
-    hits = await env.run(
-        list_convertible_segments,
-        ConvertibleSegmentsQuery(site="site-a", type=SegmentType.HC),
-    )
-    assert [h.segment for h in hits] == ["10.0.10.0/24"]
-
-
-@respx.mock
-async def test_list_convertible_segments_malformed_entry_is_retryable(env):
-    respx.get(f"{SM}/api/segments").mock(
-        return_value=httpx.Response(200, json=[{"status": "Available"}])
-    )
-    with pytest.raises(SegmentsManagerError):
-        await env.run(
-            list_convertible_segments,
-            ConvertibleSegmentsQuery(site="site-a", type=SegmentType.HC),
-        )
-
-
-@respx.mock
-async def test_convert_segment_type_puts_new_and_expected_type(env):
-    route = respx.put(f"{SM}/api/segments/type").mock(
-        return_value=httpx.Response(200, json={"message": "Segment type updated"})
-    )
-    await env.run(
-        convert_segment_type,
-        SegmentTypeUpdate(
-            segment="10.0.30.0/24",
-            type=SegmentType.MCE,
-            expected_type=SegmentType.HC,
-        ),
-    )
-    import json
-
-    body = json.loads(route.calls.last.request.content)
-    assert body == {
-        "segment": "10.0.30.0/24",
-        "type": "MCE",
-        "expected_type": "HC",
-    }
-    assert route.calls.last.request.headers["Authorization"] == "Bearer test-token"
-
-
-@respx.mock
-async def test_convert_segment_type_conflict_is_classified(env):
-    respx.put(f"{SM}/api/segments/type").mock(
-        return_value=httpx.Response(
-            409, json={"detail": "Cannot convert allocated segment"}
-        )
-    )
-    with pytest.raises(SegmentConversionConflictError) as exc_info:
-        await env.run(
-            convert_segment_type,
-            SegmentTypeUpdate(
-                segment="10.0.30.0/24",
-                type=SegmentType.MCE,
-                expected_type=SegmentType.HC,
-            ),
-        )
-    # The manager's own wording is what the operator has to act on.
-    assert "Cannot convert allocated segment" in str(exc_info.value)
-
-
-@respx.mock
-async def test_convert_segment_type_404_is_not_found(env):
-    respx.put(f"{SM}/api/segments/type").mock(return_value=httpx.Response(404))
+async def test_get_segment_404_is_not_found(env):
+    respx.get(f"{SM}/api/segments/by-segment").mock(return_value=httpx.Response(404))
     with pytest.raises(SegmentNotFoundError):
-        await env.run(
-            convert_segment_type,
-            SegmentTypeUpdate(
-                segment="10.0.30.0/24",
-                type=SegmentType.MCE,
-                expected_type=SegmentType.HC,
-            ),
-        )
-
-
-@respx.mock
-async def test_convert_segment_type_forbidden_is_auth_error(env):
-    respx.put(f"{SM}/api/segments/type").mock(return_value=httpx.Response(403))
-    with pytest.raises(SegmentsManagerAuthError):
-        await env.run(
-            convert_segment_type,
-            SegmentTypeUpdate(
-                segment="10.0.30.0/24",
-                type=SegmentType.MCE,
-                expected_type=SegmentType.HC,
-            ),
-        )
+        await env.run(get_segment, "10.0.0.0/24")

@@ -19,10 +19,14 @@ Shape of the run:
                             the source of truth, and a caller can never claim
                             a site the cluster does not live in.
   2. allocating-segment   — POST /api/segments/allocate, idempotent per
-                            (cluster, site, type) server-side.
+                            (cluster, site, type) server-side. Available
+                            segments carry no type: the Segments Manager hands
+                            out any Available one at the site and stamps the
+                            requested type onto it in the same update.
   3. verifying-allocation — read the segment back and require
                             status=Allocated + the exact cluster + the exact
-                            vlan. Verification sits BEFORE the git write, so
+                            vlan + the requested type (the allocation wrote
+                            it). Verification sits BEFORE the git write, so
                             a vlan is never recorded in the values repo
                             unless the Segments Manager confirms the
                             reservation.
@@ -197,13 +201,24 @@ class AllocateSegmentWorkflow:
             start_to_close_timeout=_ACTIVITY_TIMEOUT,
             retry_policy=_RETRY_POLICY,
         )
+        checks = [
+            ("status", "Allocated", entry.status),
+            ("cluster_name", cluster, entry.cluster_name),
+            ("vlan_id", allocation.vlan_id, entry.vlan_id),
+        ]
+        # The allocation also WROTE the type (Available segments have none), so
+        # it is read back like the rest — but only when the read-back carries
+        # the field at all. A payload WITHOUT the key comes from before it
+        # existed: either a run replaying history recorded by the previous
+        # code (it must take the path it originally took), or a limb one
+        # rollout behind this brain (build.yml ships the brain first). Neither
+        # is evidence about the allocation. A reported null always has the key,
+        # so it still fails the check.
+        if "type" in entry.model_fields_set:
+            checks.append(("type", allocate_input.type.value, entry.type))
         mismatches = [
             f"{field}: expected {expected!r}, read back {actual!r}"
-            for field, expected, actual in (
-                ("status", "Allocated", entry.status),
-                ("cluster_name", cluster, entry.cluster_name),
-                ("vlan_id", allocation.vlan_id, entry.vlan_id),
-            )
+            for field, expected, actual in checks
             if expected != actual
         ]
         if mismatches:

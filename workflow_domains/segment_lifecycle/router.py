@@ -15,7 +15,7 @@ on holding one HTTP connection open.
 PATHS ARE `/workflows/<domain>/<workflow>`. The DOMAIN prefix lives in exactly
 one place (this router, mounted by workflow_domains/api.py) and every workflow in the
 domain adds its own path under it — a domain holds many workflows, so it can
-never be the endpoint of one of them. Adding a fourth workflow here is then a
+never be the endpoint of one of them. Adding a third workflow here is then a
 new route, not a redesign.
 """
 
@@ -25,35 +25,28 @@ import asyncio
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from temporalio.client import Client
 from temporalio.exceptions import WorkflowAlreadyStartedError
 
 from shared.consts import (
     ALLOCATE_SEGMENT_WORKFLOW_QUEUE,
-    CONVERT_SEGMENT_WORKFLOW_QUEUE,
     INITIALIZE_SEGMENT_WORKFLOW_QUEUE,
 )
 from shared.models.segment_lifecycle import (
     AllocateSegmentInput,
     AllocateSegmentRunArgs,
-    ConvertSegmentInput,
-    ConvertSegmentRunArgs,
     InitializeSegmentInput,
     InitializeSegmentRunArgs,
 )
 from shared.workflow_ids import (
     allocate_segment_workflow_id,
-    convert_segment_workflow_id,
     initialize_segment_workflow_id,
 )
 from workflow_domains.routers.deps import get_temporal_client
 from workflow_domains.routers.models import StartWorkflowResponse
 from workflow_domains.segment_lifecycle.allocate_segment import (
     AllocateSegmentWorkflow,
-)
-from workflow_domains.segment_lifecycle.convert_segment import (
-    ConvertSegmentWorkflow,
 )
 from workflow_domains.segment_lifecycle.initialize_segment import (
     InitializeSegmentWorkflow,
@@ -64,7 +57,6 @@ router = APIRouter(prefix="/workflows/segment-lifecycle", tags=["segment-lifecyc
 # One workflow of this domain = one path under the domain prefix.
 _INITIALIZE_SEGMENT_PATH = "/initialize-segment"
 _ALLOCATE_SEGMENT_PATH = "/allocate-segment"
-_CONVERT_SEGMENT_PATH = "/convert-segment"
 
 
 # API-layer request/response models — these never cross the workflow boundary.
@@ -72,6 +64,25 @@ _CONVERT_SEGMENT_PATH = "/convert-segment"
 # and its per-segment outcome, so a sibling workflow in this domain could not
 # reuse them. The domain-agnostic StartWorkflowResponse comes from
 # workflow_domains/routers/models.py instead.
+class InitializeSegmentRequest(InitializeSegmentInput):
+    """The initialize-segment request body: InitializeSegmentInput, refusing
+    unknown fields.
+
+    Chiefly a `type`: a segment is born typeless and allocate-segment stamps
+    the type on, so a caller still sending one expects it to mean something.
+    Ignoring it would create the segment and silently drop what they asked
+    for; the Segments Manager rejects it on create for the same reason.
+
+    The strictness lives HERE, at the edge, not on InitializeSegmentInput:
+    that model is decoded from Temporal history on every replay and from every
+    scheduled activity input, and a run started before the type was removed
+    carries one in its payload — a forbidding model would fail to decode it
+    and wedge the run.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+
 class BulkInitializeSegmentInput(BaseModel):
     """Many segment definitions in one request (e.g. a CSV import).
 
@@ -81,7 +92,7 @@ class BulkInitializeSegmentInput(BaseModel):
     or fail row 8, and a batch-shaped workflow could offer none of that.
     """
 
-    segments: list[InitializeSegmentInput] = Field(min_length=1)
+    segments: list[InitializeSegmentRequest] = Field(min_length=1)
 
 
 class BulkInitializeSegmentItem(BaseModel):
@@ -106,7 +117,7 @@ class BulkStartInitializeSegmentResponse(BaseModel):
 # definition per scheme, so the id a route builds and the id anything else
 # builds for the same segment can never drift apart.
 def _workflow_id(rules_input: InitializeSegmentInput) -> str:
-    return initialize_segment_workflow_id(rules_input.type, rules_input.segment)
+    return initialize_segment_workflow_id(rules_input.segment)
 
 
 async def _start(client: Client, rules_input: InitializeSegmentInput):
@@ -126,7 +137,7 @@ async def _start(client: Client, rules_input: InitializeSegmentInput):
     status_code=202,
 )
 async def start_initialize_segment(
-    rules_input: InitializeSegmentInput,
+    rules_input: InitializeSegmentRequest,
     client: Client = Depends(get_temporal_client),
 ) -> StartWorkflowResponse:
     """Create a segment — returns immediately (202).
@@ -136,11 +147,12 @@ async def start_initialize_segment(
     completes. Semantic validation (site, CIDR, overlap, VLAN) belongs to the
     Segments Manager, so an invalid definition surfaces as a FAILED workflow on
     GET /workflows/runs/{workflow_id}, not as a 4xx here — this route only
-    rejects a body that does not fit InitializeSegmentInput at all.
+    rejects a body that does not fit InitializeSegmentRequest at all.
 
-    Every segment type is accepted, PXE included. Re-POSTing a definition for a
-    segment that already exists is harmless (the activity is idempotent); doing
-    so while its run is still going gets a 409 on the dedup id.
+    The definition carries no type: a segment gets one only when
+    allocate-segment reserves it. Re-POSTing a definition for a segment that
+    already exists is harmless (the activity is idempotent); doing so while its
+    run is still going gets a 409 on the dedup id.
     """
     try:
         handle = await _start(client, rules_input)
@@ -177,7 +189,7 @@ async def start_initialize_segment_bulk(
     """
 
     async def _start_one(
-        rules_input: InitializeSegmentInput,
+        rules_input: InitializeSegmentRequest,
     ) -> BulkInitializeSegmentItem:
         workflow_id = _workflow_id(rules_input)
         try:
@@ -229,9 +241,10 @@ async def start_allocate_segment(
 ) -> StartWorkflowResponse:
     """Allocate a VLAN segment for a hosted cluster — returns immediately (202).
 
-    The body names the CLUSTER, nothing else: the site is derived from where
-    the cluster's values file sits in the day1 values repo, and the segment
-    itself is whatever the Segments Manager reserves. Poll
+    The body names the CLUSTER and the TYPE to allocate it as (default HC):
+    the site is derived from where the cluster's values file sits in the day1
+    values repo, and the segment itself is whichever Available one the
+    Segments Manager reserves — it becomes that type in the same step. Poll
     GET /workflows/runs/{workflow_id} for progress/result; a bad cluster name
     or an exhausted pool surfaces there as a FAILED run, not as a 4xx here.
     """
@@ -248,51 +261,6 @@ async def start_allocate_segment(
             detail=(
                 "Segment-lifecycle workflow already running: "
                 f"{_allocate_segment_workflow_id(allocate_input)}"
-            ),
-        )
-    return StartWorkflowResponse(
-        workflow_id=handle.id, run_id=handle.result_run_id or ""
-    )
-
-
-def _convert_segment_workflow_id(convert_input: ConvertSegmentInput) -> str:
-    return convert_segment_workflow_id(
-        convert_input.site, convert_input.source_type, convert_input.destination_type
-    )
-
-
-@router.post(
-    _CONVERT_SEGMENT_PATH,
-    response_model=StartWorkflowResponse,
-    status_code=202,
-)
-async def start_convert_segment(
-    convert_input: ConvertSegmentInput,
-    client: Client = Depends(get_temporal_client),
-) -> StartWorkflowResponse:
-    """Convert source-type segments to another type — returns immediately (202).
-
-    The workflow searches the site for Available, unassigned segments of the
-    source type and re-types up to `quantity` of them (lowest vlan first) in
-    the Segments Manager. Each converted segment stays Available and is
-    immediately allocatable as its new type — the conversion is the whole
-    operation. Fewer matches than requested is reported as a shortfall in the
-    result, not an error. Poll GET /workflows/runs/{workflow_id} for
-    progress/result. No bulk variant: the request is already batch-shaped.
-    """
-    try:
-        handle = await client.start_workflow(
-            ConvertSegmentWorkflow.run,
-            ConvertSegmentRunArgs(input=convert_input),
-            id=_convert_segment_workflow_id(convert_input),
-            task_queue=CONVERT_SEGMENT_WORKFLOW_QUEUE,
-        )
-    except WorkflowAlreadyStartedError:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "Segment-lifecycle workflow already running: "
-                f"{_convert_segment_workflow_id(convert_input)}"
             ),
         )
     return StartWorkflowResponse(

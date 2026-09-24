@@ -1,8 +1,8 @@
 """Segment-lifecycle activity implementations — the execution limbs.
 
 These run in the `segment-lifecycle-worker` deployment. They talk to:
-  - the team's Segments Manager (SEGMENTS_MANAGER_URL) — create, list and
-    convert segments, allocate one for a cluster (Bearer token via
+  - the team's Segments Manager (SEGMENTS_MANAGER_URL) — create segments,
+    allocate one for a cluster and read it back (Bearer token via
     SEGMENTS_MANAGER_API_TOKEN; GETs are public)
   - the day1 values repo (DAY1_REPO_URL) — git subprocess via
     activities/segment_lifecycle/values_repo.py (clone, append the allocation
@@ -15,7 +15,7 @@ Conventions enforced here:
   * Idempotency: create accepts an existing segment that matches the requested
     definition; allocate is idempotent server-side per (cluster, site, type);
     the values-repo append is a no-op for a file already recording this
-    allocation; a re-typed segment converges on a retry.
+    allocation.
   * Every httpx.AsyncClient is created INSIDE the activity via `async with`,
     with an explicit timeout strictly below the workflow's
     start_to_close_timeout (60s < 90s). This frees the worker on a network hang
@@ -35,7 +35,6 @@ from activities.segment_lifecycle.dhcp_values import build_dhcp_values
 from shared.exceptions import (
     DhcpApiError,
     SegmentConflictError,
-    SegmentConversionConflictError,
     SegmentPoolExhaustedError,
     SegmentsManagerAuthError,
     SegmentsManagerError,
@@ -45,15 +44,12 @@ from shared.exceptions import (
 from shared.models.segment_lifecycle import (
     ClusterFileLocation,
     ClusterValuesAppendRequest,
-    ConvertibleSegment,
-    ConvertibleSegmentsQuery,
     DhcpExclusion,
     DhcpScopeState,
     InitializeSegmentInput,
     SegmentAllocation,
     SegmentAllocationRequest,
     SegmentEntry,
-    SegmentTypeUpdate,
     ValuesCommitRef,
 )
 from shared.settings import SegmentLifecycleActivitySettings
@@ -110,8 +106,10 @@ def _raise_segments_manager_error(action: str, resp: httpx.Response) -> None:
 # creation (PATCH /api/segments), so a flipped dhcp flag is a legitimate later
 # edit, not evidence of a conflicting definition — comparing it would fail
 # re-runs for a segment an operator has since reconfigured. A difference there
-# is logged instead.
-_SEGMENT_IDENTITY_FIELDS = ("type", "site", "vlan_id", "epg_name")
+# is logged instead. `type` is not identity at all: it is allocation state the
+# manager sets and clears, so an existing segment that has since been allocated
+# still matches the definition that created it.
+_SEGMENT_IDENTITY_FIELDS = ("site", "vlan_id", "epg_name")
 
 
 def _segments_manager_detail(resp: httpx.Response) -> str:
@@ -202,9 +200,8 @@ async def create_segment(rules_input: InitializeSegmentInput) -> None:
         )
         if resp.status_code in (200, 201):
             activity.logger.info(
-                "Created segment %s (type=%s, site=%s, vlan=%d) in the Segments Manager",
+                "Created segment %s (site=%s, vlan=%d) in the Segments Manager",
                 rules_input.segment,
-                rules_input.type.value,
                 rules_input.site,
                 rules_input.vlan_id,
             )
@@ -254,10 +251,12 @@ async def locate_cluster_file(cluster: str) -> ClusterFileLocation:
 
 @activity.defn
 async def allocate_segment(request: SegmentAllocationRequest) -> SegmentAllocation:
-    """Reserve a segment in the Segments Manager.
+    """Reserve a segment in the Segments Manager, as request.type.
 
-    Idempotent server-side per (cluster, site, type): a repeat call returns
-    the existing allocation, so a Temporal retry can never double-allocate.
+    Any Available segment at the site qualifies — the manager stamps the type
+    onto the one it hands out. Idempotent server-side per (cluster, site,
+    type): a repeat call returns the existing allocation, so a Temporal retry
+    can never double-allocate.
     """
     async with _segments_manager_client() as client:
         resp = await client.post(
@@ -283,8 +282,8 @@ async def allocate_segment(request: SegmentAllocationRequest) -> SegmentAllocati
             # A drained pool must fail loudly, not retry every minute forever —
             # it is refilled by an operator creating segments, never by waiting.
             raise SegmentPoolExhaustedError(
-                f"No available {request.type.value} segment at site "
-                f"{request.site}: {_segments_manager_detail(resp)}"
+                f"No available segment at site {request.site} to allocate as "
+                f"{request.type.value}: {_segments_manager_detail(resp)}"
             )
         if resp.status_code in (400, 422):
             # The manager's own validation (e.g. a bad cluster name) — the
@@ -410,114 +409,3 @@ async def get_dhcp_scope(network: str) -> DhcpScopeState:
         "DHCP scope %s exists (%d exclusion(s))", network, len(state.exclusions)
     )
     return state
-
-
-# --- convert-segment --------------------------------------------------------
-
-# The ONE status a segment may be converted from: "Allocated" is excluded by
-# definition (in use by a cluster), and Available is the only other status a
-# segment can hold. Availability alone is not the whole guard, though — the
-# cluster_name assertion below is the other half (see list_convertible_segments).
-_CONVERTIBLE_STATUS = "Available"
-
-
-@activity.defn
-async def list_convertible_segments(
-    query: ConvertibleSegmentsQuery,
-) -> list[ConvertibleSegment]:
-    """Every Available, unassigned segment of the given type at the site
-    (public GET).
-
-    All three filters are server-side; both halves of "convertible" are then
-    ASSERTED on every hit rather than trusted, because a segment that reaches
-    the conversion loop wrongly is re-typed under whoever holds it.
-    """
-    async with _segments_manager_client() as client:
-        resp = await client.get(
-            "/api/segments",
-            params={
-                "site": query.site,
-                "type": query.type.value,
-                "status": _CONVERTIBLE_STATUS,
-            },
-        )
-        if resp.status_code != 200:
-            _raise_segments_manager_error(
-                f"List {query.type.value} segments at {query.site}", resp
-            )
-    hits: list[ConvertibleSegment] = []
-    for seg in resp.json():
-        # Strict, not tolerant (§7): the filter is the manager's to apply, but
-        # a wrong status here would put a segment into the conversion loop that
-        # must never be there, so an unexpected one fails the activity rather
-        # than being silently skipped.
-        if seg.get("status") != _CONVERTIBLE_STATUS:
-            raise SegmentsManagerError(
-                f"GET /api/segments?status={_CONVERTIBLE_STATUS} returned a "
-                f"segment with status {seg.get('status')!r}: {seg}"
-            )
-        # An Available segment carrying a cluster is a manager INVARIANT
-        # violation, not a status we merely filtered wrong: allocation is what
-        # assigns a cluster, and it sets the status in the same update. Failing
-        # loudly (§7) is right for the same reason the status check is — the
-        # alternative is re-typing a segment a cluster is actually using.
-        if seg.get("cluster_name"):
-            raise SegmentsManagerError(
-                f"GET /api/segments?status={_CONVERTIBLE_STATUS} returned a "
-                f"segment assigned to cluster {seg.get('cluster_name')!r}: {seg}"
-            )
-        try:
-            hits.append(ConvertibleSegment.model_validate(seg))
-        except ValueError as exc:
-            raise SegmentsManagerError(
-                f"Malformed segment entry from GET /api/segments: {seg}: {exc}"
-            ) from exc
-    activity.logger.info(
-        "Found %d convertible %s segment(s) at site=%s",
-        len(hits),
-        query.type.value,
-        query.site,
-    )
-    return hits
-
-
-@activity.defn
-async def convert_segment_type(update: SegmentTypeUpdate) -> None:
-    """Convert the segment's type in the Segments Manager (PUT /api/segments/type).
-
-    A re-type and nothing else: the segment stays Available, so it is
-    allocatable as its new type the moment this returns. The manager's own
-    guard is Available AND unassigned. Idempotent server-side (a retry finds
-    the type already set and converges); a 409 — segment in use, or the
-    expected_type compare-and-set lost to a concurrent conversion — is
-    deterministic and non-retryable.
-    """
-    async with _segments_manager_client() as client:
-        resp = await client.put(
-            "/api/segments/type",
-            json={
-                "segment": update.segment,
-                "type": update.type.value,
-                "expected_type": update.expected_type.value,
-            },
-            headers=_segments_manager_auth(),
-        )
-        if resp.status_code == 200:
-            activity.logger.info(
-                "Converted segment %s: type %s -> %s (%s)",
-                update.segment,
-                update.expected_type.value,
-                update.type.value,
-                _segments_manager_detail(resp),
-            )
-            return
-        if resp.status_code == 404:
-            raise SegmentNotFoundError(
-                f"Segment {update.segment} not found in the Segments Manager"
-            )
-        if resp.status_code == 409:
-            raise SegmentConversionConflictError(
-                f"Segments Manager refused to convert {update.segment} to "
-                f"{update.type.value}: {_segments_manager_detail(resp)}"
-            )
-        _raise_segments_manager_error("Convert segment type", resp)

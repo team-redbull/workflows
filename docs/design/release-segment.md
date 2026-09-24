@@ -31,7 +31,8 @@ run(ReleaseSegmentRunArgs{input: {cluster, type=HC}})
                                 caller's contract is settled: cluster vs CIDR)
   2. release it                 POST /api/segments/release {segment}
   3. verify by read-back        GET /api/segments/by-segment
-                                → status Available ∧ cluster_name None
+                                → status Available ∧ cluster_name None ∧ type None
+                                  (release clears the type allocation stamped on)
   4. clean the values file      strip the marker block (split_marker_block),
                                 commit, push — same clone/push plumbing as
                                 append_allocation_to_cluster_values

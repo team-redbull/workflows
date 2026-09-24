@@ -55,20 +55,6 @@ class SegmentConflictError(OrchestratorError):
     """
 
 
-class SegmentConversionConflictError(OrchestratorError):
-    """The Segments Manager refused to convert the segment's type (409):
-    either the segment is Allocated (in use — never converted), or its stored
-    type matches neither the requested new type nor the expected_type
-    compare-and-set guard (a concurrent conversion re-typed it first).
-
-    Deterministic — only an operator releasing the segment or re-running the
-    conversion resolves it, so workflows list this type in
-    non_retryable_error_types. Completed conversions from the same run stand:
-    a re-run's search no longer matches them, so it picks up where this one
-    stopped.
-    """
-
-
 class ClusterFileNotFoundError(OrchestratorError):
     """No `<cluster>.yaml` exists anywhere under the values repo's clusters
     root — the cluster the caller asked to allocate a segment for has no
@@ -90,8 +76,8 @@ class AmbiguousClusterFileError(OrchestratorError):
 
 
 class SegmentPoolExhaustedError(OrchestratorError):
-    """The Segments Manager has no Available segment of the requested type at
-    the site (its allocate endpoint answered 503).
+    """The Segments Manager has no Available segment at the site (its allocate
+    endpoint answered 503) — the pool is shared by every type.
 
     Deterministic in practice: a drained pool is refilled by an operator
     creating segments, not by retrying every minute forever — so this fails

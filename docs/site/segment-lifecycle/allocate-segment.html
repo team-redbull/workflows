@@ -198,8 +198,10 @@
             <h3>allocate_segment</h3>
             <span class="phase">phase <b>allocating-segment</b></span>
           </div>
-          <p>Reserves a segment of the requested type for the cluster at the derived site. The Segments Manager
-          is idempotent per <code>(cluster, site, type)</code>: a repeat call — a Temporal retry, or a whole
+          <p>Reserves a segment for the cluster at the derived site, <em>as</em> the requested type. Available
+          segments carry no type, so the pool is shared: the Segments Manager hands out any Available segment
+          at the site and stamps the type onto it in the same atomic update (a release clears it again). It is
+          idempotent per <code>(cluster, site, type)</code>: a repeat call — a Temporal retry, or a whole
           re-run — returns the <em>existing</em> allocation, so double-allocation is impossible by construction.</p>
           <div class="calls">
             <div class="call sm"><span class="verb">POST</span><span class="path">/api/segments/allocate <em>· Bearer · → { vlan_id, segment, epg_name, … }</em></span></div>
@@ -218,8 +220,13 @@
             <span class="phase">phase <b>verifying-allocation</b></span>
           </div>
           <p>Reads the allocated CIDR back and requires <code>status == Allocated</code>, the exact cluster name,
-          and the exact VLAN. Any mismatch is <code>AllocationNotConfirmed</code> — and because this sits
-          <b>before</b> the git write, the values repo never records a VLAN the Segments Manager doesn't confirm.</p>
+          the exact VLAN and the requested type (the allocation wrote it). Any mismatch is
+          <code>AllocationNotConfirmed</code> — and because this sits <b>before</b> the git write, the values
+          repo never records a VLAN the Segments Manager doesn't confirm.</p>
+          <p class="note">The type is checked only when the read-back <em>carries</em> the field. A payload
+          without the key predates it — history replayed from the previous brain, or a limb one rollout behind
+          (CI ships the brain first) — and says nothing about the allocation. A reported <code>null</code> still
+          fails.</p>
           <div class="calls">
             <div class="call sm"><span class="verb">GET</span><span class="path">/api/segments/by-segment?segment=… <em>· public GET</em></span></div>
           </div>
@@ -437,7 +444,7 @@ dhcp_values:
           <li><code>AmbiguousClusterFileError</code> — more than one <code>&lt;cluster&gt;.yaml</code></li>
           <li><code>UnknownSite</code> — the file's site isn't in <code>GET /api/sites</code></li>
           <li><code>SegmentValidationError</code> — the Segments Manager rejected the request (e.g. bad cluster name)</li>
-          <li><code>SegmentPoolExhaustedError</code> — no Available segment of that type at the site</li>
+          <li><code>SegmentPoolExhaustedError</code> — no Available segment at the site (the pool is shared by every type)</li>
           <li><code>AllocationNotConfirmed</code> — the read-back didn't match the allocation</li>
           <li><code>ClusterValuesConflictError</code> — the file already carries a different allocation</li>
           <li><code>UnsupportedSegmentPrefix</code> / <code>InvalidSegmentCidr</code> — the pool handed back a non-/24</li>
@@ -473,7 +480,7 @@ dhcp_values:
         <thead><tr><th>Field</th><th>Type</th><th>Rules</th><th>What it's for</th></tr></thead>
         <tbody>
           <tr><td class="k">cluster</td><td class="k">str</td><td class="muted">non-empty</td><td class="muted">The hosted cluster's name — must match its values file name in the day1 repo.</td></tr>
-          <tr><td class="k">type</td><td class="k">enum</td><td class="muted">default <code>HC</code>; only <code>HC</code> supported</td><td class="muted">Scopes the allocation and the workflow id; any other value fails up front.</td></tr>
+          <tr><td class="k">type</td><td class="k">enum</td><td class="muted">default <code>HC</code>; only <code>HC</code> supported</td><td class="muted">The type the segment is allocated <em>as</em> — the only place a type enters the system. Scopes the allocation and the workflow id; any other value fails up front.</td></tr>
         </tbody>
       </table>
     </div>

@@ -18,13 +18,17 @@ whenever that call failed.
 The Segments Manager is the VALIDATOR OF RECORD: whether a site is known, a
 CIDR fits its pool, a VLAN is free and nothing overlaps are all its rules, and
 this workflow deliberately re-derives none of them. It passes the definition
-through and classifies the answer. Every SegmentType is accepted, PXE included
-— there is no type gate here, because there is nothing left for a type to gate.
+through and classifies the answer.
+
+The definition carries NO type. A segment is not born as any kind: the type
+is allocation state, stamped on by allocate-segment when the segment is
+reserved and cleared when it is released. So a created segment joins one
+shared Available pool that serves every type.
 
 Why a Temporal workflow for a single activity, rather than a bare HTTP call:
   * durable, UNBOUNDED retries — a Segments Manager outage is out-waited, not
     failed, and the operator's request survives an orchestrator restart;
-  * ONE place that owns the dedup id (initialize-segment-<TYPE>-<network>), so
+  * ONE place that owns the dedup id (initialize-segment-<network>), so
     a duplicate trigger is a 409 rather than a second creation attempt;
   * one run per segment, each with its own status the caller can poll — which
     is what lets the bulk route start N of them and report per segment.
@@ -90,9 +94,8 @@ class InitializeSegmentWorkflow:
     async def run(self, run_args: InitializeSegmentRunArgs) -> InitializeSegmentResult:
         segment_input = run_args.input
         workflow.logger.info(
-            "Creating segment=%s (type=%s, site=%s)",
+            "Creating segment=%s (site=%s)",
             segment_input.segment,
-            segment_input.type.value,
             segment_input.site,
         )
 
@@ -112,6 +115,4 @@ class InitializeSegmentWorkflow:
         workflow.logger.info(
             "Segment %s created and Available", segment_input.segment
         )
-        return InitializeSegmentResult(
-            segment=segment_input.segment, type=segment_input.type
-        )
+        return InitializeSegmentResult(segment=segment_input.segment)

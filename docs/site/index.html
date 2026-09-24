@@ -130,7 +130,7 @@
           <tr><td class="k">Activity</td><td class="muted">One unit of real work: an HTTP call, a config read. Everything that can fail or touch the outside world.</td><td class="k">activities/&lt;domain&gt;/activities.py</td></tr>
           <tr><td class="k">Worker</td><td class="muted">A process that connects to Temporal, says "I can run these workflows / these activities", and polls for work.</td><td class="k">*_worker_init.py</td></tr>
           <tr><td class="k">Task queue</td><td class="muted">A named mailbox. Workers poll a queue; work addressed to that queue reaches those workers. This is our routing.</td><td class="k">shared/consts.py</td></tr>
-          <tr><td class="k">Workflow ID</td><td class="muted">Our name for one logical run — we derive it from the input, so a duplicate trigger collides on purpose.</td><td class="k">initialize-segment-HC-10.0.0.0</td></tr>
+          <tr><td class="k">Workflow ID</td><td class="muted">Our name for one logical run — we derive it from the input, so a duplicate trigger collides on purpose.</td><td class="k">initialize-segment-10.0.0.0</td></tr>
           <tr><td class="k">Run ID</td><td class="muted">Temporal's ID for one attempt at that workflow ID. Changes on continue-as-new; you rarely need it.</td><td class="muted">returned by the trigger API</td></tr>
           <tr><td class="k">History</td><td class="muted">The append-only log of everything that happened in a run. The source of truth for replay.</td><td class="muted">Temporal UI, per run</td></tr>
           <tr><td class="k">Replay</td><td class="muted">Re-running your workflow code against a recorded history to rebuild state. Why determinism matters.</td><td class="muted">happens automatically</td></tr>
@@ -461,7 +461,7 @@
         <b>dependency and credential set</b> — not where one workflow ends and the next begins.</p>
         <p>Every <code>segment-lifecycle</code> activity draws on the same set: a Segments Manager URL with a
         bearer token, a git push token for the day1 values repo, and the DHCP scope API. That set is the
-        deployment, so that set is the queue. All three workflows in the domain reuse the one limb rather than
+        deployment, so that set is the queue. Both workflows in the domain reuse the one limb rather than
         duplicating the credentials.</p>
       </div>
       <div class="panel">
@@ -564,7 +564,7 @@
           </tr>
           <tr>
             <td class="kw">the Deployment, ServiceAccount, ConfigMap, Secret</td>
-            <td class="kw">initialize-segment-&lt;TYPE&gt;-&lt;network&gt; <span style="color:var(--ink-3)">(workflow ids)</span></td>
+            <td class="kw">initialize-segment-&lt;network&gt; <span style="color:var(--ink-3)">(workflow ids)</span></td>
           </tr>
         </tbody>
       </table>
@@ -583,7 +583,7 @@
       <div class="panel">
         <h3>A third case: named after the external system</h3>
         <p>Some things are neither — they're defined by whoever is on the other end of the wire.
-        <code>SegmentTypeUpdate</code> mirrors the Segments Manager's <code>PUT /api/segments/type</code> body, and
+        <code>SegmentEntry</code> mirrors the Segments Manager's <code>GET /api/segments/by-segment</code> answer, and
         <code>DhcpScopeState</code> is shaped by the DHCP API, not by the workflow that reads it.</p>
         <p>Anything mirroring an external endpoint keeps that endpoint's name, because renaming it here would
         silently desync two repos.</p>

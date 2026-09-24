@@ -96,11 +96,11 @@ async def get_workflow_run_status(
         result = await handle.result()
     elif description.status in _TERMINAL_FAILURE_STATUSES:
         # A run that died PART WAY is exactly when progress matters most: it is
-        # the only place the work already done is reported (convert-segment's
-        # per-segment list, for instance, names the segments it converted and
-        # the sibling runs it started — all of which outlive this run). Temporal
-        # answers queries on closed workflows by replaying their history, so
-        # this costs the same best-effort call as a live one.
+        # the only place the work already done is reported (allocate-segment's
+        # phase, for instance, says whether it died before the allocation or
+        # after the values-repo push — and a pushed commit outlives this run).
+        # Temporal answers queries on closed workflows by replaying their
+        # history, so this costs the same best-effort call as a live one.
         progress = await _query_progress(handle)
         # Surface why it ended: walk the cause chain to the root failure —
         # WorkflowFailureError and ActivityError are generic wrappers; the

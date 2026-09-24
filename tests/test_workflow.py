@@ -32,7 +32,6 @@ from shared.exceptions import (
 from shared.models.segment_lifecycle import (
     InitializeSegmentInput,
     InitializeSegmentRunArgs,
-    SegmentType,
 )
 from workflow_domains.segment_lifecycle.initialize_segment import (
     InitializeSegmentWorkflow,
@@ -42,20 +41,15 @@ SEGMENT = "10.0.0.0/24"
 SITE = "site-a"
 
 
-def _input(segment_type: SegmentType) -> InitializeSegmentInput:
-    """A complete segment definition — the workflow CREATES the segment, so its
-    input carries every field the Segments Manager needs, not just a reference
-    to an existing one."""
-    return InitializeSegmentInput(
-        segment=SEGMENT,
-        type=segment_type,
-        site=SITE,
-        vlan_id=100,
-        epg_name="EPG_TEST_01",
-    )
-
-
-HC_INPUT = _input(SegmentType.HC)
+# A complete segment definition — the workflow CREATES the segment, so its
+# input carries every field the Segments Manager needs, not just a reference to
+# an existing one. No type: that is stamped on at allocation.
+SEGMENT_INPUT = InitializeSegmentInput(
+    segment=SEGMENT,
+    site=SITE,
+    vlan_id=100,
+    epg_name="EPG_TEST_01",
+)
 
 
 def make_mock_activities(
@@ -142,30 +136,19 @@ async def _execute(client: Client, args: InitializeSegmentRunArgs):
 async def test_happy_path_creates_the_segment_and_completes():
     calls, mocks = make_mock_activities()
     async with _Harness(mocks) as client:
-        result = await _execute(client, InitializeSegmentRunArgs(input=HC_INPUT))
+        result = await _execute(client, InitializeSegmentRunArgs(input=SEGMENT_INPUT))
 
     assert result.segment == SEGMENT
-    assert result.type == SegmentType.HC
     # The FULL definition reaches the activity — the Segments Manager is the
     # validator of record, so nothing may be dropped on the way there.
-    assert calls["create_segment"] == [HC_INPUT]
+    assert calls["create_segment"] == [SEGMENT_INPUT]
 
 
-@pytest.mark.parametrize("segment_type", list(SegmentType))
-async def test_every_segment_type_is_accepted(segment_type):
-    """No type gate: PXE included.
-
-    The gate existed only because no firewall rules were defined for PXE, and
-    a PXE run would have died half-way through opening them. With no rules to
-    open, every type the Segments Manager knows is simply created.
-    """
-    segment_input = _input(segment_type)
-    calls, mocks = make_mock_activities()
-    async with _Harness(mocks) as client:
-        result = await _execute(client, InitializeSegmentRunArgs(input=segment_input))
-
-    assert result.type == segment_type
-    assert calls["create_segment"] == [segment_input]
+def test_the_definition_carries_no_type():
+    """A segment is created typeless — the type is allocation state, stamped on
+    by allocate-segment. The model must not grow one back: the Segments Manager
+    rejects a type on create (extra="forbid"), so every run would fail."""
+    assert "type" not in InitializeSegmentInput.model_fields
 
 
 @pytest.mark.parametrize(
@@ -188,7 +171,7 @@ async def test_classified_failures_fail_the_run_without_retrying(error):
     calls, mocks = make_mock_activities(create_error=error)
     async with _Harness(mocks) as client:
         with pytest.raises(WorkflowFailureError) as exc_info:
-            await _execute(client, InitializeSegmentRunArgs(input=HC_INPUT))
+            await _execute(client, InitializeSegmentRunArgs(input=SEGMENT_INPUT))
 
     assert _workflow_cause(exc_info).type == type(error).__name__
     # Attempted exactly once — no retry.
@@ -200,7 +183,7 @@ async def test_a_transient_failure_is_out_waited():
     be out-waited, not a reason to fail the operator's request."""
     calls, mocks = make_mock_activities(create_fail_times=3)
     async with _Harness(mocks) as client:
-        result = await _execute(client, InitializeSegmentRunArgs(input=HC_INPUT))
+        result = await _execute(client, InitializeSegmentRunArgs(input=SEGMENT_INPUT))
 
     assert result.segment == SEGMENT
     assert len(calls["create_segment"]) == 4  # 3 failures + the success
@@ -215,7 +198,7 @@ async def test_run_has_no_timers_at_all():
     """
     _, mocks = make_mock_activities()
     async with _Harness(mocks) as client:
-        handle = await _start(client, InitializeSegmentRunArgs(input=HC_INPUT))
+        handle = await _start(client, InitializeSegmentRunArgs(input=SEGMENT_INPUT))
         await asyncio.wait_for(handle.result(), timeout=60)
         events = [event async for event in handle.fetch_history_events()]
 
@@ -229,7 +212,7 @@ async def test_run_has_no_timers_at_all():
 async def test_progress_query_reports_the_terminal_phase():
     _, mocks = make_mock_activities()
     async with _Harness(mocks) as client:
-        handle = await _start(client, InitializeSegmentRunArgs(input=HC_INPUT))
+        handle = await _start(client, InitializeSegmentRunArgs(input=SEGMENT_INPUT))
         await asyncio.wait_for(handle.result(), timeout=60)
         progress = await handle.query(InitializeSegmentWorkflow.progress)
 
@@ -242,7 +225,7 @@ async def test_progress_query_reports_the_creating_phase_while_blocked():
     being out-waited."""
     calls, mocks = make_mock_activities(create_error=RuntimeError("outage"))
     async with _Harness(mocks) as client:
-        handle = await _start(client, InitializeSegmentRunArgs(input=HC_INPUT))
+        handle = await _start(client, InitializeSegmentRunArgs(input=SEGMENT_INPUT))
         while not calls["create_segment"]:
             await asyncio.sleep(0.05)
         progress = await handle.query(InitializeSegmentWorkflow.progress)

@@ -2,9 +2,8 @@
 
 Segment-lifecycle domain of an OpenShift cluster lifecycle orchestrator built on
 Temporal. It owns the segments a hosted cluster runs on: **creating** them in the
-team's **Segments Manager**, **allocating** one to a cluster and writing its DHCP
-block into the day1 values repo, and **converting** spare inventory from one
-segment type to another.
+team's **Segments Manager**, and **allocating** one to a cluster and writing its
+DHCP block into the day1 values repo.
 
 **One entry point, one Temporal run.** The Segments Manager used to own creation and
 then fire a best-effort HTTP trigger at this service — which put creation outside
@@ -13,9 +12,13 @@ direction is reversed: callers POST the definition to
 `POST /workflows/segment-lifecycle/initialize-segment`, and the workflow calls the
 Segments Manager itself. The Segments Manager is a dependency, never a trigger.
 
-Every segment type is accepted — `HC`, `MCE`, `INVENTORY` and `PXE` alike. The
-orchestrator does not narrow that set: the Segments Manager is the validator of
-record for what a segment may be.
+**A segment has no type until it is allocated.** The type (`HC`, `MCE`,
+`INVENTORY`, `PXE`) is allocation state, like the cluster: initialize-segment
+creates a typeless segment into one shared Available pool per site, allocate-segment
+passes the type as a parameter and the Segments Manager stamps it onto whichever
+segment it reserves, and a release clears it again. So there is no per-type
+inventory to rebalance, and the `convert-segment` workflow that used to re-type
+spare segments between pools has been removed.
 
 > **Firewall rules are gone.** initialize-segment used to open firewall rules
 > against every same-site peer via the black-box **next** connectivity service,
@@ -33,7 +36,7 @@ shared/                           Contract layer (temporalio + pydantic only)
   interfaces/segment_lifecycle.py Activity signatures (no bodies)
   settings.py / exceptions.py / consts.py / workflow_ids.py / logging_config.py
 workflow_domains/                 The brain — one folder per domain, plus main_worker_init.py + api.py
-  segment_lifecycle/              The three workflows + that domain's router.py
+  segment_lifecycle/              The two workflows + that domain's router.py
   routers/                        What no domain owns: deps, shared models, runs.py (status)
 activities/segment_lifecycle/     The limb (activity impls + worker_init.py)
 docs/                             The static documentation site (its own image)
@@ -50,15 +53,17 @@ Worker-file naming convention: the workflow (brain) worker is
 `workflow_domains/main_worker_init.py`; each activity domain's worker is
 `activities/<domain>/worker_init.py`.
 
-## The three workflows
+## The two workflows
 
-Each has its own workflow queue and its own deterministic id; all three share the
-one `segment-lifecycle-activity` queue and therefore the one limb deployment.
+Each has its own workflow queue and its own deterministic id; both share the one
+`segment-lifecycle-activity` queue and therefore the one limb deployment.
 
 ### `initialize-segment` — create a segment
 
 One step. `create_segment(definition)` — `POST /api/segments` — and the segment is
-Available. The Segments Manager is the validator of record (site configured, CIDR
+Available, with no type. The definition is site, VLAN, EPG, CIDR and DHCP flag; a
+`type` in the body is rejected (422), since the type is only given at allocation.
+The Segments Manager is the validator of record (site configured, CIDR
 matches the site prefix, no overlap, VLAN free), so a bad definition fails there,
 as a FAILED run on the status endpoint rather than a 4xx on the trigger.
 
@@ -75,26 +80,17 @@ per-segment status — which is what lets the bulk route start N of them.
 
 ### `allocate-segment` — give a cluster a segment
 
-Locate the cluster's values file in the day1 repo (the path gives the site,
-cross-checked against `GET /api/sites`), allocate a segment from the Segments
-Manager, **read it back** to verify status/cluster/vlan all match, append the
-`vlanId` + `dhcp_values` block to the file and push, then poll the DHCP API
-read-only until Crossplane has created the scope.
+Takes the cluster and the **type** to allocate as (default `HC`). Locate the
+cluster's values file in the day1 repo (the path gives the site, cross-checked
+against `GET /api/sites`), allocate a segment from the Segments Manager — any
+Available segment at the site, which becomes the requested type in the same step —
+**read it back** to verify status/cluster/vlan/type all match, append the `vlanId`
++ `dhcp_values` block to the file and push, then poll the DHCP API read-only until
+Crossplane has created the scope.
 
 That wait is MACHINE convergence, so unlike the old approval poll it has a real
 deadline (15 min) and fails loudly with `DhcpScopeNotConverged`. HC only for now;
 any other type is rejected up front.
-
-### `convert-segment` — rebalance inventory between types
-
-Re-types up to `quantity` segments of a source type at a site, lowest vlan first.
-Convertible means **Available AND no cluster assigned**, asserted on every hit
-rather than trusted from the filter. `expected_type` is a compare-and-set guard, so
-two conversions racing for one segment (HC→MCE against HC→PXE) cannot both win —
-the loser gets a 409.
-
-Re-typing is the whole operation: a converted segment stays Available and is
-immediately allocatable as its new type.
 
 ## API
 
@@ -107,13 +103,12 @@ result.
 | `POST /workflows/segment-lifecycle/initialize-segment` | one segment |
 | `POST /workflows/segment-lifecycle/initialize-segment/bulk` | one workflow PER segment |
 | `POST /workflows/segment-lifecycle/allocate-segment` | one allocation |
-| `POST /workflows/segment-lifecycle/convert-segment` | one conversion batch |
 | `GET  /workflows/runs/{workflow_id}` | (status, every domain) |
 
 ### Paths: `/workflows/<domain>/<workflow>`, status on `/workflows/runs`
 
 A domain holds MANY workflows, so it is never itself an endpoint — each workflow
-owns its own path under the `segment-lifecycle` prefix, and a fourth is then just
+owns its own path under the `segment-lifecycle` prefix, and a third is then just
 another route. Status is deliberately NOT under the domain: Temporal workflow ids
 are globally unique, so one `GET /workflows/runs/{id}` serves every domain — and a
 `{workflow_id}` catch-all under the domain prefix would swallow every sibling
@@ -151,11 +146,10 @@ would hide which segments actually got a workflow.
   known-permanent error is named in a `non_retryable_error_types` list.
 - **Idempotency:** `create_segment` accepts a matching existing segment;
   `allocate_segment` is idempotent server-side per (cluster, site, type); the
-  values-repo append is a no-op for a file already recording this allocation; a
-  re-typed segment converges on retry. Workflow ids are deterministic
-  (`initialize-segment-<TYPE>-<network>`, `allocate-segment-<TYPE>-<cluster>`,
-  `convert-segment-<site>-<SRC>-to-<DEST>`), so a duplicate trigger while running
-  gets HTTP 409.
+  values-repo append is a no-op for a file already recording this allocation.
+  Workflow ids are deterministic (`initialize-segment-<network>`,
+  `allocate-segment-<TYPE>-<cluster>`), so a duplicate trigger while running gets
+  HTTP 409.
 
 ## Configuration
 
@@ -190,13 +184,13 @@ PYTHONPATH=. uvicorn workflow_domains.api:app --port 8080
 # Swagger UI: http://localhost:8080/docs
 # curl -X POST localhost:8080/workflows/segment-lifecycle/initialize-segment \
 #   -H 'content-type: application/json' \
-#   -d '{"segment":"130.154.20.0/24","type":"HC","site":"site1","vlan_id":100,"epg_name":"EPG_PROD_01"}'
-# curl localhost:8080/workflows/runs/initialize-segment-HC-130.154.20.0
+#   -d '{"segment":"130.154.20.0/24","site":"site1","vlan_id":100,"epg_name":"EPG_PROD_01"}'
+# curl localhost:8080/workflows/runs/initialize-segment-130.154.20.0
 ```
 
 Inspect runs in the Temporal UI and verify the segment in the manager:
-`curl "$SEGMENTS_MANAGER_URL/api/segments?type=HC"` — a completed run leaves it
-`Available`.
+`curl "$SEGMENTS_MANAGER_URL/api/segments/by-segment?segment=130.154.20.0/24"` — a
+completed run leaves it `Available`, with `type: null` until it is allocated.
 
 ### kind
 

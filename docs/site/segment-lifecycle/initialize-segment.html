@@ -49,7 +49,7 @@
     <p class="lede">One segment = one durable Temporal run &mdash; which is the point, not the ceremony.</p>
     <div class="facts">
       <div class="fact"><span class="k">Trigger</span><span class="v">POST /workflows/segment-lifecycle/initialize-segment</span></div>
-      <div class="fact"><span class="k">Workflow id</span><span class="v">initialize-segment-&lt;TYPE&gt;-&lt;network&gt;</span></div>
+      <div class="fact"><span class="k">Workflow id</span><span class="v">initialize-segment-&lt;network&gt;</span></div>
       <div class="fact"><span class="k">Workflow queue</span><span class="v">initialize-segment-workflow</span></div>
       <div class="fact"><span class="k">Activity queue</span><span class="v">segment-lifecycle-activity</span></div>
     </div>
@@ -74,7 +74,7 @@
         survives an orchestrator restart, because the run lives on the Temporal server, not in a
         process.</p>
         <h3 style="margin-top:6px">One place owns the dedup id</h3>
-        <p>The id is built from <code>(type, network)</code>, so a duplicate trigger while a run is in
+        <p>The id is built from the network alone, so a duplicate trigger while a run is in
         flight is a <b>409</b> rather than a second creation attempt.</p>
       </div>
       <div class="panel">
@@ -136,11 +136,12 @@
       </div>
       <div class="panel">
         <h3>What &ldquo;matching&rdquo; compares</h3>
-        <p>The segment's immutable identity: <code>type</code>, <code>site</code>, <code>vlan_id</code>,
+        <p>The segment's immutable identity: <code>site</code>, <code>vlan_id</code>,
         <code>epg_name</code>. Deliberately <em>not</em> <code>dhcp</code> &mdash; the Segments Manager
         models that as the one field editable after creation, so a flipped flag is a legitimate later
         edit, not evidence of a conflicting definition. A difference there is logged and the stored
-        value kept.</p>
+        value kept. Nor <code>type</code>, status or cluster: those are allocation state, so a segment
+        allocated since it was created still matches the definition that created it.</p>
       </div>
     </div>
   </section>
@@ -162,14 +163,15 @@
         time the Segments Manager sees the definition. An invalid one surfaces on
         <code>GET /workflows/runs/{workflow_id}</code> as a failed run carrying the manager's own error
         text. The route itself only rejects a body that does not fit
-        <code>InitializeSegmentInput</code> at all.</p>
+        <code>InitializeSegmentInput</code> at all &mdash; including one carrying a <code>type</code>.</p>
       </div>
       <div class="panel">
-        <h3>Every segment type is accepted</h3>
-        <p><code>HC</code>, <code>MCE</code>, <code>INVENTORY</code> and <code>PXE</code> alike. There
-        used to be a type gate here rejecting PXE &mdash; but only because no firewall rules were
-        defined for it, and a PXE run would have died half-way through opening them. With no rules to
-        open, nothing is left for a type to gate.</p>
+        <h3>A segment is born without a type</h3>
+        <p>The type (<code>HC</code>, <code>MCE</code>, <code>INVENTORY</code>, <code>PXE</code>) is
+        allocation state, like the cluster: <a href="/segment-lifecycle/allocate-segment.html">allocate-segment</a>
+        takes it as a parameter and the Segments Manager stamps it onto whichever Available segment it
+        reserves; a release clears it again. So every created segment joins one shared pool per site, and
+        a <code>type</code> in this body is refused (422) rather than silently dropped.</p>
       </div>
     </div>
   </section>
@@ -197,7 +199,6 @@
           <pre><span class="c">// request</span>
 {
   "segment":  "130.154.20.0/24",
-  "type":     "HC",
   "site":     "site1",
   "vlan_id":  100,
   "epg_name": "EPG_PROD_01",
@@ -205,7 +206,7 @@
 }
 
 <span class="c">// 202 response</span>
-{ "workflow_id": "initialize-segment-HC-130.154.20.0", "run_id": "…" }</pre>
+{ "workflow_id": "initialize-segment-130.154.20.0", "run_id": "…" }</pre>
           <p class="note"><b>The CIDR mask is dropped from the id</b>, so two requests for the same
           network address dedup regardless of how the mask was written. Re-triggering while a run is in
           flight answers <b>409</b>; re-triggering after it finished simply completes again.</p>
@@ -225,8 +226,8 @@
           <pre><span class="c">// 202 response</span>
 { "started": 2, "already_running": 1, "failed": 0,
   "results": [
-    { "segment": "130.154.20.0/24", "workflow_id": "initialize-segment-HC-130.154.20.0", "status": "started",         "run_id": "…" },
-    { "segment": "130.154.21.0/24", "workflow_id": "initialize-segment-HC-130.154.21.0", "status": "already_running" }
+    { "segment": "130.154.20.0/24", "workflow_id": "initialize-segment-130.154.20.0", "status": "started",         "run_id": "…" },
+    { "segment": "130.154.21.0/24", "workflow_id": "initialize-segment-130.154.21.0", "status": "already_running" }
   ] }</pre>
           <p class="note">It answers 202 even when items failed: a single status code for the batch
           would hide <em>which</em> segments actually got a workflow.</p>
@@ -243,13 +244,13 @@
           <p>The same domain-agnostic status endpoint every workflow uses. While RUNNING it returns the
           live <code>phase</code>; when COMPLETED, the result.</p>
           <pre><span class="c">// RUNNING</span>
-{ "workflow_id": "initialize-segment-HC-130.154.20.0",
+{ "workflow_id": "initialize-segment-130.154.20.0",
   "workflow_type": "InitializeSegmentWorkflow", "status": "RUNNING",
   "progress": { "phase": "creating-segment" } }
 
 <span class="c">// COMPLETED</span>
 { …, "status": "COMPLETED",
-  "result": { "segment": "130.154.20.0/24", "type": "HC" } }</pre>
+  "result": { "segment": "130.154.20.0/24" } }</pre>
         </div>
       </div>
 
@@ -310,7 +311,6 @@
         <thead><tr><th>Field</th><th>Type</th><th>Rules</th><th>What it's for</th></tr></thead>
         <tbody>
           <tr><td class="k">segment</td><td class="k">str</td><td class="muted">non-empty; CIDR</td><td class="muted">The network, e.g. <code>130.154.20.0/24</code>. Its network address (mask dropped) becomes part of the workflow id.</td></tr>
-          <tr><td class="k">type</td><td class="k">enum</td><td class="muted">HC &middot; MCE &middot; INVENTORY &middot; PXE</td><td class="muted">The segment type. All four are accepted.</td></tr>
           <tr><td class="k">site</td><td class="k">str</td><td class="muted">non-empty</td><td class="muted">Must be a site the Segments Manager knows &mdash; it checks, not us.</td></tr>
           <tr><td class="k">vlan_id</td><td class="k">int</td><td class="muted">1&ndash;4094</td><td class="muted">Must be free at that site; the Segments Manager enforces it.</td></tr>
           <tr><td class="k">epg_name</td><td class="k">str</td><td class="muted">non-empty</td><td class="muted">The ACI endpoint group the segment belongs to.</td></tr>

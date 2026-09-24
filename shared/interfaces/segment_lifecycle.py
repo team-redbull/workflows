@@ -12,14 +12,11 @@ from temporalio import activity
 from shared.models.segment_lifecycle import (
     ClusterFileLocation,
     ClusterValuesAppendRequest,
-    ConvertibleSegment,
-    ConvertibleSegmentsQuery,
     DhcpScopeState,
     InitializeSegmentInput,
     SegmentAllocation,
     SegmentAllocationRequest,
     SegmentEntry,
-    SegmentTypeUpdate,
     ValuesCommitRef,
 )
 
@@ -29,8 +26,9 @@ async def create_segment(rules_input: InitializeSegmentInput) -> None:
     """Create the segment in the Segments Manager (POST /api/segments).
 
     The whole of initialize-segment, and the reason that workflow exists: the
-    segment is created here, Available immediately, with the creation recorded
-    in a durable Temporal run instead of a caller's fire-and-forget call.
+    segment is created here, Available immediately and with no type (the type
+    is stamped on at allocation), with the creation recorded in a durable
+    Temporal run instead of a caller's fire-and-forget call.
 
     Idempotent by check-after-conflict: a create rejected because the CIDR
     already exists is looked up and, if the stored segment matches this
@@ -77,10 +75,12 @@ async def locate_cluster_file(cluster: str) -> ClusterFileLocation:
 async def allocate_segment(request: SegmentAllocationRequest) -> SegmentAllocation:
     """Reserve a segment in the Segments Manager (POST /api/segments/allocate).
 
-    Idempotent server-side per (cluster, site, type): a repeat call — a
+    Any Available segment at the site qualifies; the manager stamps
+    request.type onto the one it reserves. Idempotent server-side per
+    (cluster, site, type): a repeat call — a
     Temporal retry, or a re-run — returns the existing allocation rather than
     reserving a second segment. Raises SegmentPoolExhaustedError (503, no
-    Available segment of that type at the site) or SegmentValidationError
+    Available segment at the site) or SegmentValidationError
     (400/422, e.g. a bad cluster name) — both non-retryable.
     """
     ...
@@ -126,47 +126,5 @@ async def get_dhcp_scope(network: str) -> DhcpScopeState:
     loop owns the waiting. Only a failing/malformed API raises DhcpApiError
     (transient, retried). This activity never writes: git is the single source
     of truth and Crossplane the only writer, we merely observe convergence.
-    """
-    ...
-
-
-# --- convert-segment --------------------------------------------------------
-
-
-@activity.defn
-async def list_convertible_segments(
-    query: ConvertibleSegmentsQuery,
-) -> list[ConvertibleSegment]:
-    """Return every segment of the given type at the site that MAY be
-    converted: status Available ONLY (GET /api/segments filtered by
-    site+type+status, all server-side). Allocated segments are in use, so
-    re-typing one under the cluster holding it is never valid.
-
-    Both halves of "convertible" are ASSERTED on every hit rather than trusted
-    from the filter: a non-Available status, or a cluster_name on an Available
-    segment, is a Segments Manager invariant violation and raises
-    SegmentsManagerError rather than being silently converted.
-
-    Read-only and unordered by policy: WHICH hits to convert (lowest vlan
-    first) is the workflow's decision, made deterministically from this
-    recorded result.
-    """
-    ...
-
-
-@activity.defn
-async def convert_segment_type(update: SegmentTypeUpdate) -> None:
-    """Convert the segment to update.type in the Segments Manager
-    (PUT /api/segments/type). A re-type and nothing else: the segment stays
-    Available and is immediately allocatable under its new type.
-
-    The manager's own guard is Available AND unassigned — it refuses a segment
-    that is Allocated or carries a cluster, so a conversion can never pull a
-    segment out from under a cluster holding it.
-
-    Idempotent server-side: a retried call finds the type already set and
-    converges. Raises SegmentConversionConflictError on 409 — the segment is
-    in use, or expected_type no longer matches (a concurrent conversion won) —
-    and SegmentNotFoundError on 404; both deterministic, non-retryable.
     """
     ...

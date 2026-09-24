@@ -86,7 +86,7 @@ def test_running_reports_live_progress(make_client):
         WorkflowExecutionStatus.RUNNING,
         progress={"phase": "awaiting-completion", "total_requests": 4, "pending_requests": 2},
     )
-    response = make_client(handle).get("/workflows/runs/initialize-segment-HC-10.0.0.0")
+    response = make_client(handle).get("/workflows/runs/initialize-segment-10.0.0.0")
 
     assert response.status_code == 200
     body = response.json()
@@ -112,11 +112,11 @@ def test_progress_is_best_effort(make_client):
 def test_completed_returns_the_result(make_client):
     handle = _FakeHandle(
         WorkflowExecutionStatus.COMPLETED,
-        result={"segment": "10.0.0.0/24", "type": "HC"},
+        result={"segment": "10.0.0.0/24"},
     )
-    response = make_client(handle).get("/workflows/runs/initialize-segment-HC-10.0.0.0")
+    response = make_client(handle).get("/workflows/runs/initialize-segment-10.0.0.0")
 
-    assert response.json()["result"] == {"segment": "10.0.0.0/24", "type": "HC"}
+    assert response.json()["result"] == {"segment": "10.0.0.0/24"}
 
 
 def test_failed_surfaces_the_root_cause(make_client):
@@ -126,7 +126,7 @@ def test_failed_surfaces_the_root_cause(make_client):
         cause=ApplicationError("Segment 10.0.0.0/24 not found", type="SegmentNotFoundError")
     )
     handle = _FakeHandle(WorkflowExecutionStatus.FAILED, result_error=failure)
-    response = make_client(handle).get("/workflows/runs/initialize-segment-HC-10.0.0.0")
+    response = make_client(handle).get("/workflows/runs/initialize-segment-10.0.0.0")
 
     body = response.json()
     assert body["status"] == "FAILED"
@@ -139,25 +139,24 @@ def test_failed_surfaces_the_root_cause(make_client):
 )
 def test_closed_run_still_reports_the_work_it_did(make_client, status):
     """A run that died PART WAY is when progress matters most — it is the only
-    report of the work already done (convert-segment's per-segment list names
-    the segments it converted and the sibling runs it started, all of which
-    outlive it). Temporal answers queries on closed workflows, so the endpoint
-    must ask, and still surface the failure alongside."""
+    report of the work already done (allocate-segment's phase says whether it
+    died before the allocation or after the values-repo push, whose commit
+    outlives it). Temporal answers queries on closed workflows, so the
+    endpoint must ask, and still surface the failure alongside."""
     failure = WorkflowFailureError(
-        cause=ApplicationError("Segments Manager refused", type="SegmentConversionConflictError")
+        cause=ApplicationError("DHCP scope did not converge", type="DhcpScopeNotConverged")
     )
     handle = _FakeHandle(
         status,
-        progress={"phase": "converting-segments", "matched": 4, "selected": 3,
-                  "converted": [{"segment": "10.0.30.0/24"}]},
+        progress={"phase": "awaiting-dhcp-scope"},
         result_error=failure,
     )
-    response = make_client(handle).get("/workflows/runs/convert-segment-site1-HC-to-MCE")
+    response = make_client(handle).get("/workflows/runs/allocate-segment-HC-cluster-a")
 
     body = response.json()
     assert body["status"] == status.name
-    assert body["progress"]["converted"] == [{"segment": "10.0.30.0/24"}]
-    assert "Segments Manager refused" in body["error"]
+    assert body["progress"] == {"phase": "awaiting-dhcp-scope"}
+    assert "DHCP scope did not converge" in body["error"]
 
 
 def test_closed_run_progress_is_best_effort(make_client):

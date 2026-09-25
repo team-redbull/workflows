@@ -124,3 +124,32 @@ async def append_allocation_to_cluster_values(
     DhcpValues either way, so the run can report what the file records.
     """
     ...
+
+
+# --- shared with the server-lifecycle domain --------------------------------
+
+
+@activity.defn
+async def get_inventory_segment(mce_cluster: str) -> SegmentEntry:
+    """Find the INVENTORY segment allocated to one MCE cluster (GET /api/segments).
+
+    Lives in THIS domain, not server-lifecycle, because it reads the Segments
+    Manager — whose base URL and token already sit on the segment-lifecycle
+    limb. install-server calls it with
+    task_queue=SEGMENT_LIFECYCLE_ACTIVITY_QUEUE rather than a second
+    deployment holding a copy of that credential.
+
+    Each MCE owns one inventory network, so its VLAN is a property of the
+    cluster, not of the server being installed or of the caller's request.
+
+    Filters the listing by (cluster_name, type=INVENTORY) client-side as well
+    as passing them as query params: the Segments Manager's list endpoint is
+    only used here so far and which params it honours is unconfirmed — a server
+    that ignores them must not silently yield some other cluster's segment.
+    Exactly one match is required.
+
+    Raises InventorySegmentNotFoundError when the MCE has no INVENTORY segment,
+    or when several match (ambiguous — a human resolves it); both deterministic
+    and non-retryable.
+    """
+    ...

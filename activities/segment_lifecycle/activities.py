@@ -32,6 +32,7 @@ from temporalio.exceptions import ApplicationError
 from activities.segment_lifecycle import values_repo
 from activities.segment_lifecycle.dhcp_values import build_dhcp_values
 from shared.exceptions import (
+    InventorySegmentNotFoundError,
     SegmentConflictError,
     SegmentPoolExhaustedError,
     SegmentsManagerAuthError,
@@ -378,3 +379,57 @@ async def append_allocation_to_cluster_values(
         )
     return ValuesCommitRef(commit_sha=commit_sha, changed=changed, dhcp_values=dhcp_values)
 
+
+# --- shared with the server-lifecycle domain --------------------------------
+
+# The Segments Manager's own name for an MCE's inventory network. install-server
+# tags every NMStateConfig with the VLAN of the segment carrying this type.
+_INVENTORY_SEGMENT_TYPE = "INVENTORY"
+
+
+@activity.defn
+async def get_inventory_segment(mce_cluster: str) -> SegmentEntry:
+    """Find the INVENTORY segment allocated to one MCE cluster."""
+    async with _segments_manager_client() as client:
+        resp = await client.get(
+            "/api/segments",
+            params={"cluster_name": mce_cluster, "type": _INVENTORY_SEGMENT_TYPE},
+        )
+        if resp.status_code == 404:
+            raise InventorySegmentNotFoundError(
+                f"MCE cluster {mce_cluster!r} has no {_INVENTORY_SEGMENT_TYPE} "
+                "segment in the Segments Manager"
+            )
+        if resp.status_code != 200:
+            _raise_segments_manager_error("List segments", resp)
+
+        payload = resp.json()
+        entries = payload.get("items", payload) if isinstance(payload, dict) else payload
+        if not isinstance(entries, list):
+            raise SegmentsManagerError(
+                f"List segments returned {type(entries).__name__}, expected a list"
+            )
+
+        # Re-filter what the server returned. Only this activity uses the list
+        # endpoint, and which query params it honours is unconfirmed — an
+        # ignored filter would otherwise hand back another cluster's VLAN,
+        # which the caller has no way to detect.
+        matches = [
+            entry
+            for entry in entries
+            if entry.get("cluster_name") == mce_cluster
+            and entry.get("type") == _INVENTORY_SEGMENT_TYPE
+        ]
+        if not matches:
+            raise InventorySegmentNotFoundError(
+                f"MCE cluster {mce_cluster!r} has no {_INVENTORY_SEGMENT_TYPE} "
+                f"segment in the Segments Manager (searched {len(entries)} segment(s))"
+            )
+        if len(matches) > 1:
+            raise InventorySegmentNotFoundError(
+                f"MCE cluster {mce_cluster!r} has {len(matches)} "
+                f"{_INVENTORY_SEGMENT_TYPE} segments "
+                f"({', '.join(str(m.get('segment')) for m in matches)}); "
+                "exactly one is required — resolve the duplicate allocation"
+            )
+        return SegmentEntry.model_validate(matches[0])

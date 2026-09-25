@@ -48,3 +48,26 @@ def allocate_segment_workflow_id(segment_type: SegmentType, cluster: str) -> str
     site — so a type-less id would make two legitimate allocations collide.
     """
     return f"allocate-segment-{segment_type.value}-{cluster}"
+
+
+def install_server_workflow_id(infra_env: str, mce_cluster: str) -> str:
+    """`install-server-<infraEnv>-<mce>`: dedup per target, not per server.
+
+    Keyed on the DESTINATION rather than the machine, because the machine is
+    not known when the run starts: which server gets installed is decided
+    inside the workflow, by asking server-scan. Building the id from the server
+    would mean acquiring it in the router first — putting the decision the
+    run's outcome depends on outside the run, which is exactly the shape
+    initialize-segment was changed to avoid.
+
+    This makes installs into one (InfraEnv, MCE) SERIAL: a second trigger while
+    one is in flight is rejected as already-started. That is deliberate for
+    now. server-scan hands out candidates with no reservation (ADR-0032
+    accepts this explicitly — `$sample` can draw the same server for two
+    concurrent callers, and nothing changes its state until a cluster reports
+    the node minutes later), so serializing per target is what stops two runs
+    racing onto one machine. Installing several servers into one InfraEnv at
+    once needs a real reservation in server-scan first; it is not just a
+    matter of loosening this id.
+    """
+    return f"install-server-{infra_env}-{mce_cluster}"

@@ -26,6 +26,9 @@ from workflow_domains.routers.runs import router as runs_router
 from workflow_domains.segment_lifecycle.router import (
     router as segment_lifecycle_router,
 )
+from workflow_domains.server_lifecycle.router import (
+    router as server_lifecycle_router,
+)
 
 _settings = TemporalSettings()
 
@@ -42,4 +45,5 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Cluster Orchestrator API", lifespan=lifespan)
 app.include_router(segment_lifecycle_router)
+app.include_router(server_lifecycle_router)
 app.include_router(runs_router)

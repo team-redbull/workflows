@@ -119,3 +119,110 @@ class ValuesBranchNotFoundError(OrchestratorError):
     non_retryable_error_types. Any OTHER ls-remote failure (auth, DNS, a
     timeout) stays ValuesRepoGitError and is retried.
     """
+
+
+# --- server-lifecycle -------------------------------------------------------
+
+
+class ServerScanError(OrchestratorError):
+    """server-scan's inventory API failed or returned a malformed payload.
+
+    Transient by classification — retried by the activity RetryPolicy. "No
+    server matched" is NOT this error: that is ServerNotAvailableError below.
+    """
+
+
+class ServerScanAuthError(OrchestratorError):
+    """server-scan rejected our credentials (401/403).
+
+    Deterministic — a bad SERVER_SCAN_API_TOKEN never fixes itself, so the
+    workflow lists this in non_retryable_error_types. Note the token only needs
+    server-scan's VIEWER role: /servers/available is a GET.
+    """
+
+
+class ServerNotAvailableError(OrchestratorError):
+    """server-scan has no assignable server matching the request (404).
+
+    Deterministic for this run: the pool is refilled by hardware being freed or
+    by a collector run, not by retrying every minute forever. Its message
+    carries server-scan's own `detail`, which distinguishes "nothing matched
+    the pattern" from "everything matching is CRITICAL/claimed/unreachable".
+    """
+
+
+class AmbiguousServerNameError(OrchestratorError):
+    """More than one server-scan document carries the requested name (409).
+
+    Server names are not unique — correlation is on (vendor, serial), so one
+    hostname can legitimately span several documents. Only a human can say
+    which machine was meant. Deterministic — non-retryable.
+    """
+
+
+class NoBondableInterfacesError(OrchestratorError):
+    """No candidate offered two link-up NICs on two distinct physical ports.
+
+    Deterministic for the candidates drawn: the interfaces a server reports do
+    not change between retries of the same run. The message names each
+    candidate's provider and the link states observed, because the most common
+    cause is structural rather than a fault — HPE OneView reports no link state
+    at all and Intersight vNICs usually report none, so servers from those
+    collectors cannot satisfy a strict link-up rule.
+    """
+
+
+class UnknownBmcVendorError(OrchestratorError):
+    """server-scan reported no BMC driver vocabulary for this server.
+
+    `bmc_vendor` is null for a STANDALONE machine — server-scan leaves the
+    driver choice to the caller by design — and install-server declines to
+    guess, because an IPMI fallback would be silently wrong for a Redfish-only
+    BMC. Deterministic — non-retryable.
+    """
+
+
+class BmcCredentialsMissingError(OrchestratorError):
+    """No BMC username/password is configured for this server's vendor.
+
+    server-scan never holds BMC credentials; they come from this worker's own
+    Secret. A missing pair is a deployment gap, not a transient fault —
+    non-retryable.
+    """
+
+
+class BmhResourceError(OrchestratorError):
+    """A Kubernetes create/read against the target cluster failed.
+
+    Transient by classification — API-server blips, throttling and rollouts all
+    recover. An ALREADY EXISTS (409) is never this error: creates are
+    idempotent and treat it as success.
+    """
+
+
+class BmhConflictError(OrchestratorError):
+    """A required CRD is absent from the target cluster (404 on the resource type).
+
+    Metal3's BareMetalHost or the Assisted Installer's NMStateConfig is not
+    installed, so nothing this workflow writes can ever take effect.
+    Deterministic — non-retryable.
+    """
+
+
+class BmhNotRegisteredError(OrchestratorError):
+    """The BareMetalHost did not reach a registered state before the deadline.
+
+    Machine convergence with a real deadline: storing the object only means the
+    API server accepted it, while Ironic still has to reach the BMC. A wrong
+    BMC address or credential surfaces only here. The three resources are left
+    in place — they are what an operator needs to diagnose it.
+    """
+
+
+class InventorySegmentNotFoundError(OrchestratorError):
+    """The MCE cluster has no INVENTORY segment allocated in the Segments Manager.
+
+    The VLAN a server's inventory network uses belongs to the MCE, so without
+    that allocation there is no VLAN to tag and the run cannot proceed.
+    Deterministic — an operator allocates the segment, retrying does not.
+    """

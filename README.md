@@ -1,9 +1,15 @@
-# Cluster Orchestrator — Segment-lifecycle
+# Cluster Orchestrator
 
-Segment-lifecycle domain of an OpenShift cluster lifecycle orchestrator built on
-Temporal. It owns the segments a hosted cluster runs on: **creating** them in the
-team's **Segments Manager**, and **allocating** one to a cluster and writing its
-DHCP block into the day1 values repo.
+An OpenShift cluster lifecycle orchestrator built on Temporal. Two domains today:
+
+- **segment-lifecycle** owns the segments a hosted cluster runs on: **creating**
+  them in the team's **Segments Manager**, and **allocating** one to a cluster
+  and writing its DHCP block into the day1 values repo.
+- **server-lifecycle** owns putting physical servers into an MCE inventory:
+  **install-server** takes a healthy, unclaimed server from the **server-scan**
+  inventory platform and creates the `BareMetalHost` + BMC `Secret` +
+  `NMStateConfig` an InfraEnv needs. It replaces `bmh-generator-operator`, a
+  Kopf operator that queried four vendor managers itself.
 
 **One entry point, one Temporal run.** The Segments Manager used to own creation and
 then fire a best-effort HTTP trigger at this service — which put creation outside
@@ -48,15 +54,19 @@ The prod charts are vendored into the Argo CD repo, not this one:
 | --- | --- |
 | `redbull-platform/gitops/charts/workflows-orchestrator/` | the brain — ONE release, shared by every domain |
 | `redbull-platform/gitops/charts/segment-lifecycle-worker/` | the `segment-lifecycle-worker` limb |
+| `redbull-platform/gitops/charts/server-lifecycle-worker/` | the `server-lifecycle-worker` limb |
 
 Worker-file naming convention: the workflow (brain) worker is
 `workflow_domains/main_worker_init.py`; each activity domain's worker is
 `activities/<domain>/worker_init.py`.
 
-## The two workflows
+## The workflows
 
-Each has its own workflow queue and its own deterministic id; both share the one
-`segment-lifecycle-activity` queue and therefore the one limb deployment.
+Each has its own workflow queue and its own deterministic id. The two
+segment-lifecycle workflows share the one `segment-lifecycle-activity` queue and
+therefore the one limb deployment; `install-server` runs on
+`server-lifecycle-activity` and reaches back to the segment-lifecycle queue for
+one activity (below).
 
 ### `initialize-segment` — create a segment
 
@@ -77,6 +87,37 @@ Still a Temporal workflow rather than a bare HTTP call, for three reasons: durab
 unbounded retries (a Segments Manager outage is out-waited, and the request
 survives an orchestrator restart), ONE place owning the dedup id, and a pollable
 per-segment status — which is what lets the bulk route start N of them.
+
+### `install-server` — put a server into an MCE inventory
+
+`POST /workflows/server-lifecycle/install-server` with the **InfraEnv** to fill
+and its **MCE cluster**. The run:
+
+1. **resolving-vlan** — reads the MCE's `INVENTORY` segment from the Segments
+   Manager (`get_inventory_segment`, on the *segment-lifecycle* queue, where
+   that token already lives). There is no `vlan_id` input: a caller-supplied
+   VLAN could contradict the segment the cluster owns.
+2. **acquiring-server** — `GET /servers/available` against server-scan. The
+   InfraEnv's name states which hardware it is for
+   (`cisco-m6-bat-yam-64c-512gb`) and server names carry the same tokens behind
+   an `ocp-` prefix, so the pattern is `^ocp-<infraEnv>`. `HEALTHY` only.
+3. **selecting-bond** — two link-up NICs on two **distinct physical ports**.
+   Members come from `interfaces[]`, never `nic_macs`: server-scan reduces NPAR
+   partitions to one entry per port in the former and leaves the latter whole,
+   so indexing MACs can bond two partitions of one wire. `UP` is required
+   strictly, which no HPE server can satisfy — OneView reports no link state at
+   all — so those fail loudly rather than being silently skipped.
+4. **creating-secret / -baremetalhost / -nmstateconfig** — all idempotent; an
+   existing resource is success, never an overwrite. NIC names in the
+   NMStateConfig are logical placeholders (`nic1`, `nic2`) bonded 802.3ad with
+   the VLAN riding the bond.
+5. **verifying-registration** — a bounded poll. A stored BareMetalHost only
+   means the API server accepted it; a wrong BMC address or credential surfaces
+   nowhere but here.
+
+Its id is `install-server-<infraEnv>-<mce>`, so installs into one target are
+serial — server-scan hands out candidates without reserving them, and two
+concurrent runs could otherwise draw the same machine.
 
 ### `allocate-segment` — give a cluster a segment
 
@@ -113,6 +154,7 @@ result.
 | `POST /workflows/segment-lifecycle/initialize-segment` | one segment |
 | `POST /workflows/segment-lifecycle/initialize-segment/bulk` | one workflow PER segment |
 | `POST /workflows/segment-lifecycle/allocate-segment` | one allocation |
+| `POST /workflows/server-lifecycle/install-server` | one server into an InfraEnv |
 | `GET  /workflows/runs/{workflow_id}` | (status, every domain) |
 
 ### Paths: `/workflows/<domain>/<workflow>`, status on `/workflows/runs`
@@ -171,6 +213,13 @@ would hide which segments actually got a workflow.
 | `DHCP_EXCLUSION_OCTET_RANGES` | `segment-lifecycle-config` | DHCP policy |
 | `SEGMENTS_MANAGER_API_TOKEN` | Secret | mutating calls only; GETs are public |
 | `DAY1_GIT_TOKEN` | Secret `day1-git-token` | push rights; scrubbed from every error |
+| `SERVER_SCAN_URL` | `server-lifecycle-config` | inventory API base, INCLUDING `/api/v1` |
+| `SERVER_SCAN_API_TOKEN` | Secret | a **viewer** token — the lookup is a GET |
+| `{HP,DELL,CISCO,INTERSIGHT}_BMC_USERNAME`/`_PASSWORD` | Secret | what Ironic drives the BMC with |
+
+server-scan holds no BMC credentials by design, so those live here; a vendor
+with none configured fails that server's install rather than writing a Secret
+Ironic cannot authenticate with.
 
 ## Run locally
 

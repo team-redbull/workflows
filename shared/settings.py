@@ -168,3 +168,46 @@ class SegmentLifecycleActivitySettings(BaseSettings):
                     "distributable octet (.1-.253) — nothing left to distribute"
                 )
         return policy
+
+
+class ServerLifecycleActivitySettings(BaseSettings):
+    """Config for the server-lifecycle activity worker only.
+
+    The brain never reads these (it holds no credentials), and neither does the
+    segment-lifecycle limb — except SEGMENTS_MANAGER_URL, which install-server
+    reaches through a segment-lifecycle activity on THAT limb rather than by
+    holding a second copy of its token here.
+
+    Keep aligned with redbull-platform's
+    gitops/charts/server-lifecycle-worker/templates/config.yaml
+    (server-lifecycle-config) and its server-lifecycle-credentials Secret.
+    """
+
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    # --- server-scan: the inventory platform --------------------------------
+    # Base URL INCLUDING the /api/v1 prefix. The token needs server-scan's
+    # VIEWER role only: /servers/available is a GET, and just its four mutation
+    # endpoints require admin. It may be empty — server-scan's auth is disabled
+    # by default, which auto-admits every caller.
+    server_scan_url: str
+    server_scan_api_token: str = ""
+
+    # --- BMC credentials, per vendor ----------------------------------------
+    # server-scan deliberately never holds these: it returns inventory data
+    # only, so the credentials Ironic will use to drive the BMC come from this
+    # worker's own Secret, exactly as the operator's did. A vendor with no pair
+    # configured fails that server's install with BmcCredentialsMissingError
+    # rather than silently writing an unusable Secret.
+    #
+    # No defaults, deliberately — bmhgen defaulted Dell to root/calvin, which
+    # is the factory password: a forgotten Secret then produced a BareMetalHost
+    # that failed at Ironic instead of failing here with a clear reason.
+    hp_bmc_username: str = ""
+    hp_bmc_password: str = ""
+    dell_bmc_username: str = ""
+    dell_bmc_password: str = ""
+    cisco_bmc_username: str = ""
+    cisco_bmc_password: str = ""
+    intersight_bmc_username: str = ""
+    intersight_bmc_password: str = ""

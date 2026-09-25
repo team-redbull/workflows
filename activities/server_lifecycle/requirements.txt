@@ -1,0 +1,9 @@
+temporalio>=1.28,<2
+pydantic>=2,<3
+pydantic-settings>=2,<3
+# server-scan's inventory API.
+httpx>=0.27,<1
+# Creates the BareMetalHost / Secret / NMStateConfig in the target cluster.
+# Synchronous SDK — every call is wrapped in asyncio.to_thread so it never
+# blocks this worker's event loop.
+kubernetes>=29,<32

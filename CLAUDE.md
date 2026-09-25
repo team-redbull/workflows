@@ -27,7 +27,7 @@ docs/                             The static documentation site (its own image, 
 
 Prod charts are VENDORED into the Argo CD repo, at
 `redbull-platform/gitops/charts/<service>/`: `workflows-orchestrator` (brain: ONE release for
-all domains) and `segment-lifecycle-worker` (limb: one per domain). One generic ApplicationSet
+all domains), `segment-lifecycle-worker` and `server-lifecycle-worker` (limbs: one per domain). One generic ApplicationSet
 sweeps `gitops/services/<service>/app.yaml`, so the service FOLDER NAME is the Argo app name,
 the chart path and the release name at once. There is no per-environment values layer — a
 chart's own `values.yaml` is exactly what the cluster runs — and pushing redbull-platform's
@@ -110,6 +110,35 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   they go.
 
 ## 4. External dependencies are black boxes
+
+- **server-scan is the inventory source of record for install-server**
+  (`SERVER_SCAN_URL`). The workflow makes ONE read — `GET /servers/available`
+  — and never queries a vendor manager itself: server-scan already collects HP
+  OneView / UCS Central / Dell OME / Intersight / standalone Redfish on a
+  6-hour cron and knows which servers are unclaimed. This is what replaced the
+  `bmh-generator-operator` Kopf operator and its four vendor SDKs. The endpoint
+  live-rechecks each candidate it returns, so freshness is its problem, not
+  ours; `live_recheck_performed` per item says when it degraded to the stored
+  document. It returns DATA ONLY — never BMC credentials, which server-scan
+  does not hold; those stay in this worker's own Secret.
+- **Select bond members from `interfaces[]`, NEVER from `nic_macs`.**
+  server-scan reduces Dell NPAR partitions to one entry per physical port in
+  `interfaces` but leaves `nic_macs` whole on purpose, so a 4-port partitioned
+  card reports 4 interfaces and 16 MACs. Indexing the MAC list positionally —
+  as bmhgen did — can bond two partitions of ONE physical port: one wire, no
+  redundancy, and it looks correct until that wire fails.
+- **install-server requires link_state UP strictly**, and that excludes whole
+  vendors by construction: HPE OneView's `portMap` carries no link state at
+  all (server-scan stores UNKNOWN unconditionally) and Intersight vNICs
+  usually report none. Those servers fail bond selection with
+  `NoBondableInterfacesError` naming the provider and the states observed —
+  deliberately loud, so the gap is visible rather than looking like an empty
+  inventory. Decided with the operator, 2026-09-25.
+- **The inventory VLAN belongs to the MCE, and is read from the Segments
+  Manager** — `get_inventory_segment` on the SEGMENT-LIFECYCLE queue, not a
+  second copy of that token on the server-lifecycle limb. There is deliberately
+  no `vlan_id` input: a caller-supplied VLAN could contradict the segment the
+  cluster owns.
 
 - **The workflow is the ENTRY POINT; the Segments Manager is a dependency, never a trigger.** A
   caller POSTs the full segment DEFINITION to `POST /workflows/segment-lifecycle/initialize-segment`
@@ -321,8 +350,9 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   brain release must install before any limb (else `CreateContainerConfigError` on the missing
   global ConfigMap) — and the chart must ship the new keys BEFORE (or with) an image that requires
   them, or the worker crash-loops on its fail-fast settings.
-- **`shared/settings.py`** groups: `TemporalSettings` (workers + api.py) and
-  `SegmentLifecycleActivitySettings` (activity worker only). Field names = Helm ConfigMap/Secret keys
+- **`shared/settings.py`** groups: `TemporalSettings` (workers + api.py),
+  `SegmentLifecycleActivitySettings` and `ServerLifecycleActivitySettings`
+  (each that domain's activity worker only). Field names = Helm ConfigMap/Secret keys
   lowercased — keep aligned with redbull-platform's `gitops/charts/workflows-orchestrator/templates/config.yaml`
   (global) and `gitops/charts/segment-lifecycle-worker/templates/config.yaml` (day1 URL + DHCP
   policy + the credential Secret). Which ConfigMap
@@ -362,14 +392,23 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
 
 ## 9. Deploy & run (local)
 
-- Two charts, NEITHER creates a Namespace (both deploy into whichever namespace the release targets —
+- Three charts, NONE creates a Namespace (each deploys into whichever namespace the release targets —
   `helm install -n <ns> [--create-namespace]`, or redbull-platform's `namespaces` release pre-creates
-  it): redbull-platform's `gitops/charts/workflows-orchestrator/` (ConfigMap + brain + SA) and
-  `gitops/charts/segment-lifecycle-worker/` (ConfigMap + Secrets + limb + SA). This repo ships NO
-  chart at all — `helm/` is gone with the mock service it held.
+  it): redbull-platform's `gitops/charts/workflows-orchestrator/` (ConfigMap + brain + SA),
+  `gitops/charts/segment-lifecycle-worker/` and `gitops/charts/server-lifecycle-worker/`
+  (each: ConfigMap + Secrets + limb + SA). This repo ships NO chart at all — `helm/` is gone with
+  the mock service it held. The server-lifecycle limb is the first to need real RBAC: it creates
+  secrets, metal3.io/baremetalhosts and agent-install.openshift.io/nmstateconfigs in the target
+  namespace, where segment-lifecycle only makes HTTP and git calls.
 - Assumed already running: a Temporal server and the Segments Manager (via OpenShift routes or
   localhost — no port assumptions in code).
 - Trigger via the unified API: `uvicorn workflow_domains.api:app --port 8080`, Swagger at `/docs`.
+  `POST /workflows/server-lifecycle/install-server` is ASYNC (202 + workflow id) and takes the
+  InfraEnv to fill plus its MCE cluster; the InfraEnv's name states which hardware it is for
+  (`cisco-m6-bat-yam-64c-512gb`) and server names carry the same tokens behind an `ocp-` prefix,
+  so the InfraEnv IS the server query. Its id keys on (InfraEnv, MCE), which makes installs into
+  one target serial — server-scan hands out candidates without reserving them, so two concurrent
+  runs could otherwise draw the same machine.
   `POST /workflows/segment-lifecycle/initialize-segment` is ASYNC (202 + workflow id) and takes
   the full segment definition; poll `GET /workflows/runs/{workflow_id}` for progress/result. The
   `/bulk` variant takes a list and starts ONE WORKFLOW PER SEGMENT (never one batch workflow — each

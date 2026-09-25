@@ -16,9 +16,17 @@ from __future__ import annotations
 
 import os
 
-from shared.settings import SegmentLifecycleActivitySettings, TemporalSettings
+from shared.settings import (
+    SegmentLifecycleActivitySettings,
+    ServerLifecycleActivitySettings,
+    TemporalSettings,
+)
 
-for _settings_class in (SegmentLifecycleActivitySettings, TemporalSettings):
+for _settings_class in (
+    SegmentLifecycleActivitySettings,
+    ServerLifecycleActivitySettings,
+    TemporalSettings,
+):
     _settings_class.model_config["env_file"] = None
 
 os.environ.update(
@@ -30,5 +38,12 @@ os.environ.update(
         "DAY1_REPO_URL": "https://git.test/team/gitops-day1-platform-config.git",
         "DAY1_GIT_TOKEN": "test-git-token",
         "DHCP_EXCLUSION_OCTET_RANGES": '{"HC": [[1, 10], [241, 254]]}',
+        # --- install-server: server-scan + BMC credentials ---
+        "SERVER_SCAN_URL": "http://server-scan.test/api/v1",
+        "SERVER_SCAN_API_TOKEN": "test-viewer-token",
+        "DELL_BMC_USERNAME": "test-dell-user",
+        "DELL_BMC_PASSWORD": "test-dell-pass",
+        "HP_BMC_USERNAME": "test-hp-user",
+        "HP_BMC_PASSWORD": "test-hp-pass",
     }
 )

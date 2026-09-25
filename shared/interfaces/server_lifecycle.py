@@ -1,0 +1,106 @@
+"""Server-lifecycle activity signatures — the typed contract, no implementations.
+
+The real implementations live in activities/server_lifecycle/activities.py and
+are registered against these names on the server-lifecycle activity queue.
+Workflows import THESE for type-checked activity references.
+
+Note what is NOT here: resolving the inventory VLAN. That reads the Segments
+Manager, whose credential already lives on the segment-lifecycle limb, so
+install-server calls `get_inventory_segment` on the SEGMENT-LIFECYCLE queue
+instead of this domain duplicating the token (see shared/interfaces/
+segment_lifecycle.py).
+"""
+
+from __future__ import annotations
+
+from temporalio import activity
+
+from shared.models.server_lifecycle import (
+    AcquireServerRequest,
+    AcquiredServer,
+    BmhResourceRequest,
+    BmhState,
+    CreatedResource,
+)
+
+
+@activity.defn
+async def acquire_servers(request: AcquireServerRequest) -> list[AcquiredServer]:
+    """Ask server-scan for assignable candidates (GET /servers/available).
+
+    Returns up to `request.count` servers that server-scan considers
+    installable: unclaimed by any cluster, not in maintenance, reachable, and
+    at the requested health. It returns a LIST even in `name` mode (one item),
+    because the workflow's bond selection may reject a candidate and move to
+    the next — drawing several at once is what makes one unusable server a
+    retry rather than a failed run.
+
+    The health filter is applied server-side rather than here: without it the
+    endpoint fills HEALTHY then WARNING then MAJOR, and a WARNING server would
+    be returned — and live-rechecked, at a vendor manager's expense — only to
+    be discarded.
+
+    Raises ServerNotAvailableError (404, nothing assignable matched),
+    AmbiguousServerNameError (409, the name spans several documents) or
+    ServerScanAuthError (401/403) — all deterministic and marked non-retryable
+    by the workflow; anything else is transient ServerScanError.
+    """
+    ...
+
+
+@activity.defn
+async def create_bmc_secret(request: BmhResourceRequest) -> CreatedResource:
+    """Create the BMC credentials Secret (`{vendor}-cred-{server}`).
+
+    The credentials come from this worker's own configuration, per vendor —
+    server-scan never holds them. Idempotent: an existing Secret is success
+    (changed=False), NOT an overwrite, so a re-run never rotates a credential
+    an operator has since corrected by hand.
+
+    Raises BmcCredentialsMissingError when no username/password is configured
+    for the server's vendor — deterministic, non-retryable.
+    """
+    ...
+
+
+@activity.defn
+async def create_baremetal_host(request: BmhResourceRequest) -> CreatedResource:
+    """Create the BareMetalHost (metal3.io/v1alpha1).
+
+    `bootMACAddress` is the first bond member. The `bmc.address` is rebuilt
+    from what server-scan parsed (scheme, host, port, path) mapped onto the
+    matching Ironic driver — never from a fixed per-vendor template, so a BMC
+    behind a Route with a DNS host and its own path works unchanged.
+
+    Idempotent: an existing BareMetalHost of the same name is success
+    (changed=False). Raises BmhConflictError when the CRD itself is absent from
+    the cluster (non-retryable); BmhResourceError otherwise (transient).
+    """
+    ...
+
+
+@activity.defn
+async def create_nmstate_config(request: BmhResourceRequest) -> CreatedResource:
+    """Create the NMStateConfig (`nmstate-config-{server}`).
+
+    Builds an 802.3ad bond over the selected members with the DHCP VLAN riding
+    it. Interface names are logical placeholders (`nic1`, `nic2`): the config
+    binds MAC -> name in `spec.interfaces` and the agent renames the NIC to
+    match before applying `spec.config`, so no per-server-type NIC-name profile
+    is needed.
+
+    Idempotent and error-classified exactly as create_baremetal_host.
+    """
+    ...
+
+
+@activity.defn
+async def get_baremetal_host(request: BmhResourceRequest) -> BmhState:
+    """Read the BareMetalHost's status back — the registration poll's observation.
+
+    A BareMetalHost that does not exist yet is NOT an error: it reports
+    found=False, the normal answer while the API server has stored the object
+    but Ironic has not reached the BMC. The workflow's bounded timer loop owns
+    the waiting and the deadline.
+    """
+    ...

@@ -36,7 +36,9 @@ _INSTALL_SERVER_PATH = "/install-server"
 # scheme, so the id this route builds and the id anything else builds for the
 # same target can never drift apart.
 def _workflow_id(install_input: InstallServerInput) -> str:
-    return install_server_workflow_id(install_input.infra_env, install_input.mce_cluster)
+    return install_server_workflow_id(
+        install_input.infra_env, install_input.server_name
+    )
 
 
 class InstallServerRequest(InstallServerInput):
@@ -75,10 +77,12 @@ async def start_install_server(
     distinct physical ports, or a BareMetalHost that never registers all
     surface there as a FAILED run — not as a 4xx here.
 
-    Installs into one (InfraEnv, MCE) are SERIAL: the workflow id keys on that
-    pair, so a second trigger while one is in flight gets a 409 here. That is
-    deliberate — server-scan hands out candidates without reserving them, so
-    two concurrent runs could otherwise draw the same machine.
+    Installs from one InfraEnv are SERIAL: the workflow id keys on the
+    candidate pool, so a second trigger while one is in flight gets a 409 here
+    — including one aimed at a different MCE, because both draw from the same
+    pool. That is deliberate: server-scan hands out candidates without
+    reserving them, so two concurrent runs could otherwise draw the same
+    machine.
     """
     try:
         handle = await client.start_workflow(
@@ -91,8 +95,12 @@ async def start_install_server(
         raise HTTPException(
             status_code=409,
             detail=(
-                "An install-server run is already in flight for InfraEnv "
-                f"{install_input.infra_env} on MCE {install_input.mce_cluster}"
+                "An install-server run is already in flight for "
+                + (
+                    f"server {install_input.server_name}"
+                    if install_input.server_name
+                    else f"InfraEnv {install_input.infra_env}"
+                )
             ),
         )
     return StartWorkflowResponse(workflow_id=handle.id, run_id=handle.result_run_id or "")

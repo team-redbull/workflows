@@ -11,9 +11,22 @@ Strictness about unknown fields belongs on an API-edge subclass in the router
 
 from __future__ import annotations
 
+import re
 from enum import Enum
 
 from pydantic import BaseModel, Field
+
+_MAC_RE = re.compile(r"(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}")
+
+
+def mac_is_valid(mac: str) -> bool:
+    """Whether a string is a colon-separated MAC.
+
+    Lives in `shared/` because BOTH sides check it: the workflow rejects a bad
+    MAC before the first resource is written, and the resource builders keep
+    the check as a last guard on their own inputs.
+    """
+    return bool(_MAC_RE.fullmatch(mac))
 
 
 class LinkState(str, Enum):
@@ -174,18 +187,50 @@ class CreatedResource(BaseModel):
     changed: bool
 
 
+class BmhRef(BaseModel):
+    """Just enough to name one BareMetalHost: its name and namespace.
+
+    Separate from BmhResourceRequest because reading a host back needs neither
+    a BMC vendor nor a bond nor a VLAN — and the candidate probe that runs
+    BEFORE a server is chosen has none of them to give.
+    """
+
+    server_name: str = Field(min_length=1)
+    namespace: str = Field(min_length=1)
+
+
 class BmhState(BaseModel):
     """A BareMetalHost's observed status, for the registration poll.
 
     `provisioning_state` empty means the API server has stored the object but
     Ironic has not acted on it yet — which is why creating the resource is not
     the same as the host being registered, and why the workflow waits.
+
+    `operational_status` and `error_type` are what distinguish "still working
+    on it" from "tried and failed": Metal3 leaves a host that cannot be
+    registered in the `registering` state indefinitely, marking the failure
+    only in these two fields.
     """
 
     found: bool = False
     provisioning_state: str | None = None
     operational_status: str | None = None
+    error_type: str | None = None
     error_message: str | None = None
+
+    def is_errored(self) -> bool:
+        """Metal3 has recorded a failure rather than work still in progress."""
+        return (self.operational_status or "").lower() == "error"
+
+    def is_registration_error(self) -> bool:
+        """The failure is specifically Ironic failing to reach or log in to the BMC.
+
+        Metal3 sets errorType `registration error` (and `provisioned
+        registration error` once provisioned) for a wrong BMC address, a wrong
+        credential, or an unreachable BMC — the exact faults this workflow can
+        introduce and nothing downstream can correct.
+        """
+        return self.is_errored() and "registration error" in (self.error_type or "").lower()
 
 
 class InstallServerInput(BaseModel):

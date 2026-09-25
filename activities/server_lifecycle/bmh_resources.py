@@ -19,11 +19,26 @@ duplicated by it.
 from __future__ import annotations
 
 import base64
-import re
 from typing import Any
 
-from shared.bmc_address import bmc_secret_name, build_bmc_address, nmstate_config_name
-from shared.models.server_lifecycle import BmhResourceRequest
+from shared.bmc_address import (
+    bmc_secret_name,
+    build_bmc_address,
+    k8s_resource_name,
+    nmstate_config_name,
+)
+from shared.exceptions import InvalidMacError
+from shared.models.server_lifecycle import BmhResourceRequest, mac_is_valid
+
+# Re-exported: the builders are where callers meet this error.
+__all__ = [
+    "InvalidMacError",
+    "build_baremetal_host",
+    "build_bmc_secret",
+    "build_nmstate_config",
+    "baremetal_host_differences",
+    "nmstate_config_differences",
+]
 
 BMH_GROUP = "metal3.io"
 BMH_VERSION = "v1alpha1"
@@ -35,17 +50,6 @@ NMSTATE_PLURAL = "nmstateconfigs"
 
 _INFRAENV_LABEL = "infraenvs.agent-install.openshift.io"
 
-_MAC_RE = re.compile(r"(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}")
-
-
-class InvalidMacError(ValueError):
-    """A MAC that server-scan reported does not parse.
-
-    server-scan normalizes MACs before persisting them, so this is a guard
-    against a malformed payload rather than an expected condition.
-    """
-
-
 def _validate_macs(request: BmhResourceRequest) -> None:
     """Reject a malformed MAC before anything is written to the cluster.
 
@@ -56,7 +60,7 @@ def _validate_macs(request: BmhResourceRequest) -> None:
     the distinction is carried rather than enforced.
     """
     for member in request.bond_members:
-        if not _MAC_RE.fullmatch(member.mac):
+        if not mac_is_valid(member.mac):
             raise InvalidMacError(
                 f"{request.server_name}: interface {member.logical_name} has an "
                 f"invalid MAC {member.mac!r}"
@@ -93,12 +97,19 @@ def build_baremetal_host(request: BmhResourceRequest) -> dict[str, Any]:
         "apiVersion": f"{BMH_GROUP}/{BMH_VERSION}",
         "kind": "BareMetalHost",
         "metadata": {
-            "name": request.server_name,
+            "name": k8s_resource_name(request.server_name),
             "namespace": request.namespace,
-            "labels": {_INFRAENV_LABEL: request.infra_env, **request.labels},
+            # Caller labels FIRST: the InfraEnv label binds this host to the
+            # InfraEnv whose NMStateConfig carries the matching label, so a
+            # caller overriding it would split the two across InfraEnvs.
+            "labels": {**request.labels, _INFRAENV_LABEL: request.infra_env},
             "annotations": {
                 "inspect.metal3.io": "disabled",
-                "bmac.agent-install.openshift.io/hostname": request.server_name,
+                # The node's hostname, so it is DNS-cased for the same
+                # reason the resource name is.
+                "bmac.agent-install.openshift.io/hostname": k8s_resource_name(
+                    request.server_name
+                ),
             },
         },
         "spec": {
@@ -198,3 +209,78 @@ def build_nmstate_config(request: BmhResourceRequest) -> dict[str, Any]:
             ],
         },
     }
+
+
+def _diff(field: str, desired: Any, existing: Any) -> str | None:
+    """One human-readable difference, or None when the two agree."""
+    if desired == existing:
+        return None
+    return f"{field}: want {desired!r}, found {existing!r}"
+
+
+def _infraenv_label(resource: dict[str, Any]) -> Any:
+    return ((resource.get("metadata") or {}).get("labels") or {}).get(_INFRAENV_LABEL)
+
+
+def baremetal_host_differences(
+    desired: dict[str, Any], existing: dict[str, Any]
+) -> list[str]:
+    """Which IDENTITY fields of an existing BareMetalHost disagree with ours.
+
+    Only the fields that decide what machine this is and how it is reached are
+    compared. Everything else — status, an operator's added annotation, a
+    hardware profile corrected by hand — is left alone deliberately: an
+    existing resource is meant to be converged on, not overwritten.
+    """
+    d_spec, e_spec = desired.get("spec") or {}, existing.get("spec") or {}
+    d_bmc, e_bmc = d_spec.get("bmc") or {}, e_spec.get("bmc") or {}
+    checks = [
+        _diff("spec.bmc.address", d_bmc.get("address"), e_bmc.get("address")),
+        _diff(
+            "spec.bmc.credentialsName",
+            d_bmc.get("credentialsName"),
+            e_bmc.get("credentialsName"),
+        ),
+        _diff(
+            "spec.bootMACAddress",
+            d_spec.get("bootMACAddress"),
+            e_spec.get("bootMACAddress"),
+        ),
+        _diff(
+            f"metadata.labels[{_INFRAENV_LABEL}]",
+            _infraenv_label(desired),
+            _infraenv_label(existing),
+        ),
+    ]
+    return [c for c in checks if c is not None]
+
+
+def _vlan_interfaces(resource: dict[str, Any]) -> list[dict[str, Any]]:
+    config = ((resource.get("spec") or {}).get("config") or {}).get("interfaces") or []
+    return [i for i in config if i.get("type") == "vlan"]
+
+
+def nmstate_config_differences(
+    desired: dict[str, Any], existing: dict[str, Any]
+) -> list[str]:
+    """Which identity fields of an existing NMStateConfig disagree with ours.
+
+    The MAC set is compared unordered: the bond is the same wiring whichever
+    member was picked as nic1. The VLAN id is compared because a host tagged
+    onto another MCE's inventory network comes up on the wrong segment and
+    never reaches this cluster's assisted-installer service.
+    """
+    d_macs = {i.get("macAddress") for i in (desired.get("spec") or {}).get("interfaces") or []}
+    e_macs = {i.get("macAddress") for i in (existing.get("spec") or {}).get("interfaces") or []}
+    d_vlans = sorted(str((i.get("vlan") or {}).get("id")) for i in _vlan_interfaces(desired))
+    e_vlans = sorted(str((i.get("vlan") or {}).get("id")) for i in _vlan_interfaces(existing))
+    checks = [
+        _diff("spec.interfaces MAC set", sorted(filter(None, d_macs)), sorted(filter(None, e_macs))),
+        _diff("VLAN id", d_vlans, e_vlans),
+        _diff(
+            f"metadata.labels[{_INFRAENV_LABEL}]",
+            _infraenv_label(desired),
+            _infraenv_label(existing),
+        ),
+    ]
+    return [c for c in checks if c is not None]

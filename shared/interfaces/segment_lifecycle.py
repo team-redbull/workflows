@@ -142,14 +142,14 @@ async def get_inventory_segment(mce_cluster: str) -> SegmentEntry:
     Each MCE owns one inventory network, so its VLAN is a property of the
     cluster, not of the server being installed or of the caller's request.
 
-    Filters the listing by (cluster_name, type=INVENTORY) client-side as well
-    as passing them as query params: the Segments Manager's list endpoint is
-    only used here so far and which params it honours is unconfirmed — a server
-    that ignores them must not silently yield some other cluster's segment.
-    Exactly one match is required.
+The Segments Manager's list endpoint filters by `type` but has no
+    `cluster_name` parameter (verified against its OpenAPI: site, status, type,
+    fresh), so the cluster match is made client-side over the returned list.
+    The type is re-checked there too — a filter the server ignores must not
+    silently yield some other cluster's segment. Exactly one match is required.
 
-    Raises InventorySegmentNotFoundError when the MCE has no INVENTORY segment,
-    or when several match (ambiguous — a human resolves it); both deterministic
-    and non-retryable.
+    Raises InventorySegmentNotFoundError when the MCE has no INVENTORY segment
+    and AmbiguousInventorySegmentError when several do; both deterministic and
+    non-retryable.
     """
     ...

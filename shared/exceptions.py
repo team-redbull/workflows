@@ -201,11 +201,45 @@ class BmhResourceError(OrchestratorError):
 
 
 class BmhConflictError(OrchestratorError):
-    """A required CRD is absent from the target cluster (404 on the resource type).
+    """A resource of this name already exists and does NOT match what we would create.
 
-    Metal3's BareMetalHost or the Assisted Installer's NMStateConfig is not
-    installed, so nothing this workflow writes can ever take effect.
+    An existing resource is normally success — the creates are idempotent, so a
+    re-run converges rather than failing. This is the case that convergence
+    cannot cover: the BareMetalHost or NMStateConfig already on the cluster
+    names a different BMC, boot MAC, InfraEnv or VLAN, so returning success
+    would report an installation that does not match what is actually there.
+    A human decides whether the existing resource or the request is right.
     Deterministic — non-retryable.
+    """
+
+
+class BmhPrerequisiteMissingError(OrchestratorError):
+    """The target cluster cannot accept the write at all (404 or 403).
+
+    404 on a namespaced create means the resource TYPE or the NAMESPACE is
+    absent — Metal3 / the Assisted Installer is not installed, or the InfraEnv's
+    namespace does not exist. 403 means this worker's ServiceAccount lacks RBAC
+    for the resource. Both are deployment gaps that no retry closes, and are
+    classified exactly as SegmentsManagerAuthError already is.
+    """
+
+
+class BmhRequestInvalidError(OrchestratorError):
+    """The API server rejected the resource body as invalid (422).
+
+    Reached through a caller-supplied label that is not a valid label value, or
+    a field the installed CRD version does not accept. The body is built the
+    same way on every attempt, so retrying reproduces it exactly.
+    """
+
+
+class InvalidMacError(OrchestratorError):
+    """A MAC selected for the bond is not a MAC.
+
+    server-scan normalizes MACs before persisting them, so this guards against
+    a malformed payload rather than an expected condition — but it is checked
+    in the workflow BEFORE the first resource is written, so a bad payload
+    costs nothing rather than leaving a Secret behind.
     """
 
 
@@ -225,4 +259,22 @@ class InventorySegmentNotFoundError(OrchestratorError):
     The VLAN a server's inventory network uses belongs to the MCE, so without
     that allocation there is no VLAN to tag and the run cannot proceed.
     Deterministic — an operator allocates the segment, retrying does not.
+    """
+
+
+class AmbiguousInventorySegmentError(OrchestratorError):
+    """More than one INVENTORY segment is allocated to the same MCE cluster.
+
+    Distinct from InventorySegmentNotFoundError: the data is wrong rather than
+    missing, and picking one of the two would tag hosts onto a VLAN chosen by
+    document order. A human resolves the duplicate allocation — non-retryable.
+    """
+
+
+class InvalidServerNameError(OrchestratorError):
+    """A server-scan name cannot be a Kubernetes resource name.
+
+    Lowercasing is applied first, since vendor serials are upper case; what
+    remains is a name carrying characters Kubernetes forbids. Deterministic —
+    the name is renamed in the inventory, not waited out.
     """

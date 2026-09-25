@@ -19,6 +19,9 @@ for the same reason.
 
 from __future__ import annotations
 
+import re
+
+from shared.exceptions import InvalidServerNameError
 from shared.models.server_lifecycle import BmcEndpoint
 
 # BMC driver per server-scan's `bmc_vendor` vocabulary. Cisco splits by how the
@@ -73,16 +76,49 @@ def build_bmc_address(bmc_vendor: str, bmc: BmcEndpoint) -> str:
     return f"{driver}://{authority}{path}"
 
 
+_RFC1123_NAME = re.compile(r"[a-z0-9]([-a-z0-9.]*[a-z0-9])?")
+
+
+def k8s_resource_name(server_name: str) -> str:
+    """One server-scan name as a Kubernetes object name.
+
+    Lowercased, because server-scan names carry an uppercase vendor serial
+    (`ocp-hp-gen11-nyc-64c-128gb-HP0001592`) and Kubernetes rejects any
+    uppercase letter in a resource name outright — a 422 the API server raises
+    identically on every attempt.
+
+    bmhgen never needed this: its names came from a BareMetalHostGenerator CR,
+    where a human had already written something Kubernetes accepts. Taking the
+    name from the vendor's inventory instead is what introduced the gap. The
+    transform is the identity for any name bmhgen could have been given, so
+    resources it created are still converged on rather than duplicated.
+
+    Only case is corrected. A name that is still not a valid RFC 1123 subdomain
+    (an underscore, a leading dash) is a naming-convention problem for a human,
+    not something to paper over by rewriting characters and installing the
+    server under a name nobody can correlate back to the inventory.
+    """
+    lowered = server_name.lower()
+    if not _RFC1123_NAME.fullmatch(lowered) or len(lowered) > 253:
+        raise InvalidServerNameError(
+            f"server-scan name {server_name!r} cannot be a Kubernetes resource "
+            "name even lowercased: it must be alphanumerics, '-' or '.', start "
+            "and end alphanumeric, and be at most 253 characters"
+        )
+    return lowered
+
+
 def bmc_secret_name(bmc_vendor: str, server_name: str) -> str:
     """`{vendor}-cred-{server}` — the Secret the BareMetalHost references.
 
-    Kept byte-identical to what bmhgen produced, so a cluster already holding
-    resources from the operator is converged by this workflow rather than
-    duplicated by it.
+    The stem is byte-identical to what bmhgen produced, so a cluster already
+    holding resources from the operator is converged by this workflow rather
+    than duplicated by it. See k8s_resource_name for the one case bmhgen never
+    met.
     """
-    return f"{bmc_vendor.lower()}-cred-{server_name}"
+    return f"{bmc_vendor.lower()}-cred-{k8s_resource_name(server_name)}"
 
 
 def nmstate_config_name(server_name: str) -> str:
     """`nmstate-config-{server}` — likewise unchanged from bmhgen."""
-    return f"nmstate-config-{server_name}"
+    return f"nmstate-config-{k8s_resource_name(server_name)}"

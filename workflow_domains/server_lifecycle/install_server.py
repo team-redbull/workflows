@@ -40,6 +40,14 @@ indexed that MAC list positionally, which can bond two partitions of ONE
 physical port — a bond with no redundancy over a single wire, which looks
 correct until that wire fails.
 
+ONE WORKER SERVES ONE MCE HUB. `mce_cluster` selects the VLAN, but the three
+resources are written to whichever cluster the worker's in-cluster credentials
+point at — nothing in the request chooses that. Deploying a
+server-lifecycle-worker into a cluster that is not the MCE hub named in the
+request would tag the host with MCE X's inventory VLAN and create it on cluster
+Y, which no error surfaces because both halves individually succeed. The
+deployment, not this workflow, is what binds the two together.
+
 On cancellation there is deliberately no compensating cleanup: the three
 resources are idempotent, so a re-run converges on them, and a half-created set
 is what an operator needs in order to see how far the run got. Removing a
@@ -48,6 +56,7 @@ server is a separate uninstall-server workflow, not a rollback of this one.
 
 from __future__ import annotations
 
+import re
 from datetime import timedelta
 
 from temporalio import workflow
@@ -71,12 +80,14 @@ with workflow.unsafe.imports_passed_through():
     from shared.models.server_lifecycle import (
         AcquiredServer,
         AcquireServerRequest,
+        BmhRef,
         BmhResourceRequest,
         BondMember,
         InstallServerProgress,
         InstallServerResult,
         InstallServerRunArgs,
         LinkState,
+        mac_is_valid,
     )
 
 # Same budget rules as the segment-lifecycle workflows: a bounded per-attempt
@@ -97,7 +108,12 @@ _RETRY_POLICY = RetryPolicy(
         "UnknownBmcVendorError",
         "BmcCredentialsMissingError",
         "BmhConflictError",
+        "BmhPrerequisiteMissingError",
+        "BmhRequestInvalidError",
+        "InvalidMacError",
+        "InvalidServerNameError",
         "InventorySegmentNotFoundError",
+        "AmbiguousInventorySegmentError",
         "SegmentsManagerAuthError",
     ],
 )
@@ -110,11 +126,24 @@ _RETRY_POLICY = RetryPolicy(
 _BMH_POLL_INTERVAL = timedelta(seconds=15)
 _BMH_REGISTRATION_DEADLINE = timedelta(minutes=10)
 
-# A BareMetalHost is registered once Ironic has moved it out of the empty
-# initial state. "inspecting" is included because inspection is disabled on
-# these hosts, so it is a state they pass through rather than settle in.
+# How long a registration error is tolerated before the run gives up on it.
+# Metal3 retries registration itself, so a single observation can be a BMC
+# that was briefly busy; an error still standing after this has a cause no
+# amount of further waiting fixes.
+_BMH_REGISTRATION_ERROR_GRACE = timedelta(minutes=2)
+
+# States that mean Ironic has FINISHED registering the host — it reached the
+# BMC, authenticated, and moved on.
+#
+# `registering` is deliberately NOT here. It is the state Metal3 assigns the
+# moment it picks the host up, before contacting the BMC at all, and a host
+# whose BMC address or credential is wrong STAYS in it — so accepting it would
+# make this poll return on its first iteration for exactly the failure the
+# poll exists to catch. `inspecting` is included because inspection is
+# disabled on these hosts, so it is passed through rather than settled in, and
+# reaching it already proves the BMC was contacted.
 _REGISTERED_STATES = frozenset(
-    {"registering", "inspecting", "preparing", "available", "ready", "provisioning",
+    {"inspecting", "preparing", "available", "ready", "provisioning",
      "provisioned", "externally provisioned"}
 )
 
@@ -239,7 +268,10 @@ class InstallServerWorkflow:
             )
             if install_input.server_name
             else AcquireServerRequest(
-                pattern=f"^ocp-{infra_env}",
+                # Escaped: the InfraEnv name is caller data going into a regex.
+                # Today's names are [a-z0-9-] so it changes nothing, but a `.`
+                # would silently widen the pool without it.
+                pattern=f"^ocp-{re.escape(infra_env)}",
                 count=install_input.candidate_count,
                 health=_REQUIRED_HEALTH,
                 min_nic_macs=_BOND_MEMBER_COUNT,
@@ -253,25 +285,57 @@ class InstallServerWorkflow:
             retry_policy=_RETRY_POLICY,
         )
 
-        # Step 3 — the first candidate that can actually carry a bond. Pure
-        # logic, so no activity and no extra round trip.
+        # Step 3 — the first candidate that can actually carry a bond, and is
+        # not already installed. The bond rule is pure logic, so it costs no
+        # round trip; the installed check is one read per surviving candidate.
+        #
+        # Why the installed check is needed at all: server-scan reports a
+        # machine as unclaimed until a CLUSTER reports the node, minutes after
+        # this workflow finishes. A second run started in that window draws the
+        # same machine, every create answers "already exists", and the run
+        # reports success having added nothing. Skipping candidates that
+        # already have a BareMetalHost is what makes a second run either take a
+        # DIFFERENT machine or fail honestly.
         self._phase = "selecting-bond"
         server: AcquiredServer | None = None
         bond_members: list[BondMember] | None = None
+        already_installed: list[str] = []
         for candidate in candidates:
             members = select_bond_members(candidate)
-            if members is not None:
-                server, bond_members = candidate, members
-                break
+            if members is None:
+                continue
+            # An explicitly named server is a request to converge THAT machine,
+            # so it is never skipped — only an unnamed draw from a pool is.
+            if install_input.server_name is None:
+                existing = await workflow.execute_activity(
+                    get_baremetal_host,
+                    BmhRef(
+                        server_name=candidate.name, namespace=install_input.namespace
+                    ),
+                    task_queue=SERVER_LIFECYCLE_ACTIVITY_QUEUE,
+                    start_to_close_timeout=_ACTIVITY_TIMEOUT,
+                    retry_policy=_RETRY_POLICY,
+                )
+                if existing.found:
+                    already_installed.append(candidate.name)
+                    continue
+            server, bond_members = candidate, members
+            break
         if server is None or bond_members is None:
             raise ApplicationError(
-                f"No candidate for InfraEnv {infra_env} offers two link-up NICs "
-                f"on two distinct physical ports. Checked "
+                f"No candidate for InfraEnv {infra_env} is installable. Checked "
                 f"{len(candidates)} candidate(s): "
                 + "; ".join(_describe_candidate(c) for c in candidates)
-                + ". Note that HPE OneView reports no link state at all and "
-                "Intersight vNICs usually report none, so servers from those "
-                "collectors cannot satisfy a strict link-up requirement",
+                + (
+                    f". Skipped as already having a BareMetalHost in "
+                    f"{install_input.namespace}: {', '.join(already_installed)}"
+                    if already_installed
+                    else ""
+                )
+                + ". The rest offer fewer than two link-up NICs on two distinct "
+                "physical ports. Note that HPE OneView reports no link state at "
+                "all and Intersight vNICs usually report none, so servers from "
+                "those collectors cannot satisfy a strict link-up requirement",
                 type="NoBondableInterfacesError",
             )
         self._server_name = server.name
@@ -284,6 +348,18 @@ class InstallServerWorkflow:
                 "A STANDALONE machine's driver is the caller's decision, and "
                 "guessing IPMI would be silently wrong for a Redfish-only BMC",
                 type="UnknownBmcVendorError",
+            )
+
+        # Validated HERE, before the first resource is written: a malformed MAC
+        # discovered inside create_baremetal_host would already have left a
+        # Secret behind, and an unclassified ValueError there retries forever.
+        bad = [m.mac for m in bond_members if not mac_is_valid(m.mac)]
+        if bad:
+            raise ApplicationError(
+                f"server-scan reported malformed MAC(s) {bad} for {server.name}; "
+                "MACs are normalized on ingest, so this is a bad payload rather "
+                "than a condition to wait out",
+                type="InvalidMacError",
             )
 
         resource_request = BmhResourceRequest(
@@ -314,7 +390,9 @@ class InstallServerWorkflow:
         # to reach the BMC, and a wrong address or credential shows up only
         # here, so the run does not claim success until it has.
         self._phase = "verifying-registration"
-        await self._await_registration(resource_request)
+        await self._await_registration(
+            BmhRef(server_name=server.name, namespace=install_input.namespace)
+        )
 
         self._phase = "completed"
         boot_mac = bond_members[0].mac
@@ -353,29 +431,59 @@ class InstallServerWorkflow:
             retry_policy=_RETRY_POLICY,
         )
 
-    async def _await_registration(self, request: BmhResourceRequest) -> None:
+    async def _await_registration(self, ref: BmhRef) -> None:
         """Poll until Ironic has registered the host, or fail at the deadline."""
         started_at = workflow.now()
+        errored_since = None
         while True:
             state = await workflow.execute_activity(
                 get_baremetal_host,
-                request,
+                ref,
                 task_queue=SERVER_LIFECYCLE_ACTIVITY_QUEUE,
                 start_to_close_timeout=_ACTIVITY_TIMEOUT,
                 retry_policy=_RETRY_POLICY,
             )
-            if state.found and (state.provisioning_state or "").lower() in _REGISTERED_STATES:
+            # An errored host is never registered, whatever state it sits in:
+            # Metal3 reports a failed registration as `registering` plus
+            # operationalStatus=error, so the state alone cannot tell the two
+            # apart.
+            if (
+                state.found
+                and not state.is_errored()
+                and (state.provisioning_state or "").lower() in _REGISTERED_STATES
+            ):
                 return
+
+            # Fail on a registration error that has stopped being transient,
+            # rather than spending the rest of the deadline re-reading it.
+            if state.is_registration_error():
+                errored_since = errored_since or workflow.now()
+                if workflow.now() - errored_since >= _BMH_REGISTRATION_ERROR_GRACE:
+                    raise ApplicationError(
+                        f"Ironic cannot register BareMetalHost "
+                        f"{ref.server_name}: errorType "
+                        f"{state.error_type!r}"
+                        f"{f' — {state.error_message}' if state.error_message else ''}. "
+                        "That is a wrong BMC address, a wrong credential, or a "
+                        "BMC this cluster cannot reach — none of which clear on "
+                        "their own. The Secret, BareMetalHost and NMStateConfig "
+                        "stand for inspection",
+                        type="BmhNotRegisteredError",
+                    )
+            else:
+                errored_since = None
+
             if workflow.now() - started_at >= _BMH_REGISTRATION_DEADLINE:
                 observed = (
                     f"provisioning state {state.provisioning_state!r}, "
                     f"operationalStatus {state.operational_status!r}"
+                    f"{f', errorType {state.error_type!r}' if state.error_type else ''}"
                     f"{f', error: {state.error_message}' if state.error_message else ''}"
                     if state.found
                     else "the BareMetalHost was never observed"
                 )
                 raise ApplicationError(
-                    f"BareMetalHost {request.server_name} did not register within "
+                    f"BareMetalHost {ref.server_name} did not register within "
                     f"{int(_BMH_REGISTRATION_DEADLINE.total_seconds() // 60)} minutes: "
                     f"{observed}. The Secret, BareMetalHost and NMStateConfig "
                     "stand — check the BMC address and credentials, and Ironic's "

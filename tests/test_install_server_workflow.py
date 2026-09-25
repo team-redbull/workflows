@@ -12,6 +12,7 @@ and every retry backoff to milliseconds.
 from __future__ import annotations
 
 import asyncio
+import re
 import uuid
 
 import pytest
@@ -33,6 +34,7 @@ from shared.models.server_lifecycle import (
     AcquiredServer,
     AcquireServerRequest,
     BmcEndpoint,
+    BmhRef,
     BmhResourceRequest,
     BmhState,
     CreatedResource,
@@ -128,8 +130,14 @@ def make_mock_activities(
     resources_exist: bool = False,
     bmh_script: list[BmhState] | None = None,
     bmh_never_registers: bool = False,
+    already_installed: set[str] | None = None,
 ):
     """Build the full mock activity set + a call recorder.
+
+    `get_baremetal_host` serves two callers and this mock answers as the real
+    cluster would: BEFORE the BareMetalHost is created it reports whether that
+    server is in `already_installed` (the candidate probe), and afterwards it
+    answers the registration poll from `bmh_script`.
 
     bmh_script: per-poll returns; once exhausted (and not bmh_never_registers)
     every later poll reports a registered host.
@@ -147,8 +155,11 @@ def make_mock_activities(
     }
     drawn = candidates if candidates is not None else [bondable_server()]
     script = list(bmh_script or [])
+    installed = already_installed or set()
+    # `available`, not `registering`: registering is the state a host with a
+    # WRONG BMC address sits in, so it can never count as proof of registration.
     registered = BmhState(
-        found=True, provisioning_state="registering", operational_status="OK"
+        found=True, provisioning_state="available", operational_status="OK"
     )
 
     @activity.defn
@@ -184,8 +195,15 @@ def make_mock_activities(
         return _created("NMStateConfig", f"nmstate-config-{request.server_name}")
 
     @activity.defn
-    async def get_baremetal_host(request: BmhResourceRequest) -> BmhState:
-        calls["get_baremetal_host"].append(request)
+    async def get_baremetal_host(ref: BmhRef) -> BmhState:
+        calls["get_baremetal_host"].append(ref)
+        created = [c.server_name for c in calls["create_baremetal_host"]]
+        if ref.server_name not in created:
+            # The pre-selection probe: does this candidate already have a host?
+            return BmhState(
+                found=ref.server_name in installed,
+                provisioning_state="provisioned" if ref.server_name in installed else None,
+            )
         if bmh_never_registers:
             return BmhState(found=True, provisioning_state="", operational_status="")
         if script:
@@ -283,7 +301,8 @@ async def test_happy_path_resolves_vlan_acquires_creates_and_verifies():
         "idrac-virtualmedia://10.11.1.229/redfish/v1/Systems/System.Embedded.1"
     )
     assert calls["get_inventory_segment"] == [MCE_CLUSTER]
-    assert len(calls["get_baremetal_host"]) == 2  # not-found, then registered
+    # probe (is this candidate already installed?), then not-found, then registered
+    assert len(calls["get_baremetal_host"]) == 3
 
 
 async def test_the_infraenv_becomes_the_server_query():
@@ -292,7 +311,10 @@ async def test_the_infraenv_becomes_the_server_query():
         await _execute(client, InstallServerRunArgs(input=INPUT))
 
     request = calls["acquire_servers"][0]
-    assert request.pattern == f"^ocp-{INFRA_ENV}"
+    # Escaped, because the InfraEnv name is caller data going into a regex that
+    # server-scan hands to Mongo. `\-` is a literal `-`, so the pool is the
+    # same; an unescaped `.` or `+` in a future name would not be.
+    assert request.pattern == f"^ocp-{re.escape(INFRA_ENV)}"
     assert request.name is None
     assert request.health == "HEALTHY"
     assert request.min_nic_macs == 2
@@ -450,3 +472,137 @@ async def test_resources_are_created_in_dependency_order():
     assert request.infra_env == INFRA_ENV
     assert request.namespace == NAMESPACE
     assert [m.logical_name for m in request.bond_members] == ["nic1", "nic2"]
+
+
+async def test_a_registering_host_is_not_yet_registered():
+    """`registering` is where a host with a WRONG BMC address sits, not proof of success.
+
+    Metal3 assigns it the moment it picks the host up, BEFORE contacting the
+    BMC. Accepting it would make the registration poll return on its first
+    iteration for exactly the failure the poll exists to catch.
+    """
+    calls, segment_acts, server_acts = make_mock_activities(
+        bmh_script=[
+            BmhState(found=True, provisioning_state="registering", operational_status="OK"),
+            BmhState(found=True, provisioning_state="registering", operational_status="OK"),
+            BmhState(found=True, provisioning_state="available", operational_status="OK"),
+        ]
+    )
+    async with _Harness(segment_acts, server_acts) as client:
+        result = await _execute(client, InstallServerRunArgs(input=INPUT))
+
+    assert result.bmh_registered is True
+    # 1 probe + 3 polls: it did not stop at either `registering`.
+    assert len(calls["get_baremetal_host"]) == 4
+
+
+async def test_a_registered_state_with_operational_status_error_does_not_count():
+    """operationalStatus=error is never registration, whatever state accompanies it."""
+    errored = BmhState(
+        found=True,
+        provisioning_state="available",
+        operational_status="error",
+        error_type="provisioning error",
+        error_message="no suitable root device",
+    )
+    calls, segment_acts, server_acts = make_mock_activities(
+        bmh_script=[errored, errored, BmhState(found=True, provisioning_state="available",
+                                               operational_status="OK")]
+    )
+    async with _Harness(segment_acts, server_acts) as client:
+        result = await _execute(client, InstallServerRunArgs(input=INPUT))
+
+    assert result.bmh_registered is True
+    assert len(calls["get_baremetal_host"]) == 4
+
+
+async def test_a_persistent_registration_error_fails_before_the_deadline():
+    """A wrong BMC address or credential is reported, not waited out."""
+    bad_bmc = BmhState(
+        found=True,
+        provisioning_state="registering",
+        operational_status="error",
+        error_type="registration error",
+        error_message="Failed to establish connection to 10.11.1.229",
+    )
+    calls, segment_acts, server_acts = make_mock_activities(bmh_script=[bad_bmc] * 40)
+    async with _Harness(segment_acts, server_acts) as client:
+        with pytest.raises(WorkflowFailureError) as excinfo:
+            await _execute(client, InstallServerRunArgs(input=INPUT))
+
+    error = _application_error(excinfo.value)
+    assert error.type == "BmhNotRegisteredError"
+    assert "registration error" in str(error)
+    assert "wrong BMC address" in str(error)
+    # The 2-minute grace at a 15s poll — nowhere near the 10-minute deadline.
+    assert len(calls["get_baremetal_host"]) < 15
+    # The resources are deliberately left standing for diagnosis.
+    assert len(calls["create_baremetal_host"]) == 1
+
+
+async def test_a_candidate_that_already_has_a_baremetalhost_is_skipped():
+    """server-scan cannot know a machine was just installed; the cluster can.
+
+    Nothing changes a server's lifecycle state until a CLUSTER reports the
+    node, minutes later, so a second run in that window draws the same machine.
+    """
+    taken, free = bondable_server("srv_taken", name="ocp-taken"), bondable_server("srv_free")
+    calls, segment_acts, server_acts = make_mock_activities(
+        candidates=[taken, free], already_installed={"ocp-taken"}
+    )
+    async with _Harness(segment_acts, server_acts) as client:
+        result = await _execute(client, InstallServerRunArgs(input=INPUT))
+
+    assert result.server_name == SERVER_NAME
+    assert [c.server_name for c in calls["create_baremetal_host"]] == [SERVER_NAME]
+
+
+async def test_every_candidate_already_installed_fails_rather_than_reporting_success():
+    """The bug this guards: every create answers 409 and the run 'succeeds' having added nothing."""
+    calls, segment_acts, server_acts = make_mock_activities(
+        candidates=[bondable_server()], already_installed={SERVER_NAME}
+    )
+    async with _Harness(segment_acts, server_acts) as client:
+        with pytest.raises(WorkflowFailureError) as excinfo:
+            await _execute(client, InstallServerRunArgs(input=INPUT))
+
+    error = _application_error(excinfo.value)
+    assert error.type == "NoBondableInterfacesError"
+    assert "already having a BareMetalHost" in str(error)
+    assert calls["create_baremetal_host"] == []
+
+
+async def test_an_explicitly_named_server_is_converged_not_skipped():
+    """Naming a server asks for THAT machine, so an existing host is the point."""
+    named = InstallServerInput(
+        infra_env=INFRA_ENV, mce_cluster=MCE_CLUSTER, namespace=NAMESPACE,
+        server_name=SERVER_NAME,
+    )
+    calls, segment_acts, server_acts = make_mock_activities(
+        candidates=[bondable_server()], already_installed={SERVER_NAME}
+    )
+    async with _Harness(segment_acts, server_acts) as client:
+        result = await _execute(client, InstallServerRunArgs(input=named))
+
+    assert result.server_name == SERVER_NAME
+    assert len(calls["create_baremetal_host"]) == 1
+
+
+async def test_a_malformed_mac_fails_before_any_resource_is_written():
+    """An unclassified ValueError inside the create would retry forever, after leaving a Secret."""
+    broken = bondable_server().model_copy(
+        update={
+            "interfaces": [
+                _nic("NIC.Integrated.1-1-1", "aa:bb:cc:dd:ee:01", "1/1/1", LinkState.UP),
+                _nic("NIC.Integrated.1-2-1", "NOT-A-MAC-AT-ALL", "1/2/1", LinkState.UP),
+            ]
+        }
+    )
+    calls, segment_acts, server_acts = make_mock_activities(candidates=[broken])
+    async with _Harness(segment_acts, server_acts) as client:
+        with pytest.raises(WorkflowFailureError) as excinfo:
+            await _execute(client, InstallServerRunArgs(input=INPUT))
+
+    error = _application_error(excinfo.value)
+    assert error.type == "InvalidMacError"
+    assert calls["create_bmc_secret"] == []

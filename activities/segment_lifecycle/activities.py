@@ -32,6 +32,7 @@ from temporalio.exceptions import ApplicationError
 from activities.segment_lifecycle import values_repo
 from activities.segment_lifecycle.dhcp_values import build_dhcp_values
 from shared.exceptions import (
+    AmbiguousInventorySegmentError,
     InventorySegmentNotFoundError,
     SegmentConflictError,
     SegmentPoolExhaustedError,
@@ -391,15 +392,17 @@ _INVENTORY_SEGMENT_TYPE = "INVENTORY"
 async def get_inventory_segment(mce_cluster: str) -> SegmentEntry:
     """Find the INVENTORY segment allocated to one MCE cluster."""
     async with _segments_manager_client() as client:
+        # `type` is the only filter of the two this endpoint accepts —
+        # verified against its OpenAPI, which declares site/status/type/fresh
+        # and no cluster_name. The cluster match is therefore made below,
+        # client-side, and is not optional.
         resp = await client.get(
-            "/api/segments",
-            params={"cluster_name": mce_cluster, "type": _INVENTORY_SEGMENT_TYPE},
+            "/api/segments", params={"type": _INVENTORY_SEGMENT_TYPE}
         )
         if resp.status_code == 404:
-            raise InventorySegmentNotFoundError(
-                f"MCE cluster {mce_cluster!r} has no {_INVENTORY_SEGMENT_TYPE} "
-                "segment in the Segments Manager"
-            )
+            # A list endpoint answers an empty result with 200 and [], so 404
+            # here means the ROUTE is absent, not that there is no segment.
+            _raise_segments_manager_error("List segments", resp)
         if resp.status_code != 200:
             _raise_segments_manager_error("List segments", resp)
 
@@ -410,10 +413,10 @@ async def get_inventory_segment(mce_cluster: str) -> SegmentEntry:
                 f"List segments returned {type(entries).__name__}, expected a list"
             )
 
-        # Re-filter what the server returned. Only this activity uses the list
-        # endpoint, and which query params it honours is unconfirmed — an
-        # ignored filter would otherwise hand back another cluster's VLAN,
-        # which the caller has no way to detect.
+        # The cluster match, made here because the endpoint cannot make it.
+        # The type is re-checked as well: an ignored or renamed filter would
+        # otherwise hand back another cluster's VLAN, which the caller has no
+        # way to detect.
         matches = [
             entry
             for entry in entries
@@ -426,7 +429,7 @@ async def get_inventory_segment(mce_cluster: str) -> SegmentEntry:
                 f"segment in the Segments Manager (searched {len(entries)} segment(s))"
             )
         if len(matches) > 1:
-            raise InventorySegmentNotFoundError(
+            raise AmbiguousInventorySegmentError(
                 f"MCE cluster {mce_cluster!r} has {len(matches)} "
                 f"{_INVENTORY_SEGMENT_TYPE} segments "
                 f"({', '.join(str(m.get('segment')) for m in matches)}); "

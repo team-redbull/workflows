@@ -101,23 +101,37 @@ and its **MCE cluster**. The run:
    InfraEnv's name states which hardware it is for
    (`cisco-m6-bat-yam-64c-512gb`) and server names carry the same tokens behind
    an `ocp-` prefix, so the pattern is `^ocp-<infraEnv>`. `HEALTHY` only.
-3. **selecting-bond** — two link-up NICs on two **distinct physical ports**.
-   Members come from `interfaces[]`, never `nic_macs`: server-scan reduces NPAR
-   partitions to one entry per port in the former and leaves the latter whole,
-   so indexing MACs can bond two partitions of one wire. `UP` is required
-   strictly, which no HPE server can satisfy — OneView reports no link state at
-   all — so those fail loudly rather than being silently skipped.
+3. **selecting-bond** — two link-up NICs on two **distinct physical ports**,
+   on a candidate that does not already have a BareMetalHost. Members come from
+   `interfaces[]`, never `nic_macs`: server-scan reduces NPAR partitions to one
+   entry per port in the former and leaves the latter whole, so indexing MACs
+   can bond two partitions of one wire. `UP` is required strictly, which no HPE
+   server can satisfy — OneView reports no link state at all — so those fail
+   loudly rather than being silently skipped.
 4. **creating-secret / -baremetalhost / -nmstateconfig** — all idempotent; an
-   existing resource is success, never an overwrite. NIC names in the
+   existing resource is success **once its BMC address, boot MAC, InfraEnv and
+   VLAN match**, and never an overwrite. A resource that differs is a
+   `BmhConflictError` for a human, because reporting success would describe an
+   installation that is not the one on the cluster. NIC names in the
    NMStateConfig are logical placeholders (`nic1`, `nic2`) bonded 802.3ad with
    the VLAN riding the bond.
 5. **verifying-registration** — a bounded poll. A stored BareMetalHost only
    means the API server accepted it; a wrong BMC address or credential surfaces
-   nowhere but here.
+   nowhere but here. `registering` does NOT count: it is the state Metal3
+   assigns before contacting the BMC, and a host it cannot reach stays there.
 
-Its id is `install-server-<infraEnv>-<mce>`, so installs into one target are
-serial — server-scan hands out candidates without reserving them, and two
-concurrent runs could otherwise draw the same machine.
+Its id is `install-server-<infraEnv>` — the **candidate pool**, not the target
+pair, because the pool is `^ocp-<infraEnv>` with no MCE in it. Installs drawing
+from one pool are therefore serial: server-scan hands out candidates without
+reserving them, and two concurrent runs could otherwise draw the same machine.
+The sequential case an id cannot cover — a second run minutes later, before any
+cluster has reported the node — is covered by step 3 skipping candidates that
+already have a BareMetalHost.
+
+**One worker serves one MCE hub.** `mce_cluster` picks the VLAN; the resources
+go to whichever cluster the worker's own credentials point at. Deploy a
+`server-lifecycle-worker` per MCE hub — nothing in a request can correct a
+worker pointed at the wrong cluster.
 
 ### `allocate-segment` — give a cluster a segment
 

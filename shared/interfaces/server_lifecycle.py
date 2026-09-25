@@ -18,6 +18,7 @@ from temporalio import activity
 from shared.models.server_lifecycle import (
     AcquireServerRequest,
     AcquiredServer,
+    BmhRef,
     BmhResourceRequest,
     BmhState,
     CreatedResource,
@@ -95,12 +96,15 @@ async def create_nmstate_config(request: BmhResourceRequest) -> CreatedResource:
 
 
 @activity.defn
-async def get_baremetal_host(request: BmhResourceRequest) -> BmhState:
-    """Read the BareMetalHost's status back — the registration poll's observation.
+async def get_baremetal_host(ref: BmhRef) -> BmhState:
+    """Read one BareMetalHost's status back, by name and namespace.
 
-    A BareMetalHost that does not exist yet is NOT an error: it reports
-    found=False, the normal answer while the API server has stored the object
-    but Ironic has not reached the BMC. The workflow's bounded timer loop owns
-    the waiting and the deadline.
+    Serves two callers. The registration poll uses it as its observation: a
+    BareMetalHost that does not exist yet is NOT an error, it reports
+    found=False, which is the normal answer while the API server has stored the
+    object but Ironic has not reached the BMC, and the workflow's bounded timer
+    loop owns the waiting. Candidate selection uses the same read to skip a
+    server that is ALREADY installed — server-scan cannot report that, because
+    nothing changes its lifecycle state until a cluster reports the node.
     """
     ...

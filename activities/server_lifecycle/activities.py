@@ -43,14 +43,19 @@ from activities.server_lifecycle.bmh_resources import (
     NMSTATE_GROUP,
     NMSTATE_PLURAL,
     NMSTATE_VERSION,
+    baremetal_host_differences,
     build_baremetal_host,
     build_bmc_secret,
     build_nmstate_config,
+    nmstate_config_differences,
 )
+from shared.bmc_address import k8s_resource_name
 from shared.exceptions import (
     AmbiguousServerNameError,
     BmcCredentialsMissingError,
     BmhConflictError,
+    BmhPrerequisiteMissingError,
+    BmhRequestInvalidError,
     BmhResourceError,
     ServerNotAvailableError,
     ServerScanAuthError,
@@ -60,6 +65,7 @@ from shared.models.server_lifecycle import (
     AcquiredServer,
     AcquireServerRequest,
     BmcEndpoint,
+    BmhRef,
     BmhResourceRequest,
     BmhState,
     CreatedResource,
@@ -237,32 +243,62 @@ def _bmc_credentials(bmc_vendor: str) -> tuple[str, str]:
 def _classify_api_error(exc: k8s_client.ApiException, kind: str, name: str) -> Exception:
     """Turn a Kubernetes ApiException into a classified domain error.
 
-    404 on a CREATE means the resource TYPE is missing — Metal3 or the Assisted
-    Installer is not installed in this cluster — which no retry can fix. Every
-    other status is treated as transient.
+    Anything left as BmhResourceError retries every minute forever, so each
+    status that a retry cannot fix has to be named here rather than defaulted.
     """
     if exc.status == 404:
-        return BmhConflictError(
-            f"Cannot create {kind} {name}: its CRD is not installed in the "
-            "target cluster (Metal3 / Assisted Installer missing?)"
+        # Either the resource TYPE or the NAMESPACE is absent — a create
+        # cannot tell them apart, and both are deployment gaps.
+        return BmhPrerequisiteMissingError(
+            f"Cannot create {kind} {name}: the target cluster has no such "
+            f"resource type, or no namespace for it (Metal3 / Assisted "
+            f"Installer not installed, or the InfraEnv namespace is missing)"
+        )
+    if exc.status == 403:
+        return BmhPrerequisiteMissingError(
+            f"Cannot create {kind} {name}: this worker's ServiceAccount is not "
+            f"authorized for it ({exc.reason}). RBAC is a deployment gap, not "
+            "a transient failure"
+        )
+    if exc.status == 422:
+        return BmhRequestInvalidError(
+            f"The API server rejected {kind} {name} as invalid: {exc.reason}. "
+            "The body is identical on every attempt, so this cannot clear"
         )
     return BmhResourceError(f"Failed to create {kind} {name}: {exc.status} {exc.reason}")
 
 
-def _create_namespaced(create_fn, kind: str, name: str) -> CreatedResource:
-    """Run one create, treating ALREADY EXISTS as success.
+def _create_namespaced(
+    create_fn, kind: str, name: str, on_exists=None
+) -> CreatedResource:
+    """Run one create, treating ALREADY EXISTS as success once it MATCHES.
 
-    Not an upsert: an existing resource is left exactly as it is. A re-run must
-    converge without overwriting a BMC credential or a bond an operator has
-    since corrected by hand.
+    Not an upsert: an existing resource is left exactly as it is, so a re-run
+    converges without overwriting a BMC credential or a bond an operator has
+    corrected by hand.
+
+    `on_exists` is what keeps that from becoming a lie. Reporting success for a
+    resource that names a different BMC, boot MAC, InfraEnv or VLAN would
+    return a result describing an installation that is not the one on the
+    cluster. It reads the existing object back and returns the fields that
+    disagree; any difference is a BmhConflictError for a human to settle —
+    the same rule create_segment applies in the segment-lifecycle domain.
     """
     try:
         create_fn()
     except k8s_client.ApiException as exc:
-        if exc.status == 409:
-            activity.logger.info("%s %s already exists — nothing to do", kind, name)
-            return CreatedResource(kind=kind, name=name, changed=False)
-        raise _classify_api_error(exc, kind, name) from exc
+        if exc.status != 409:
+            raise _classify_api_error(exc, kind, name) from exc
+        differences = on_exists() if on_exists is not None else []
+        if differences:
+            raise BmhConflictError(
+                f"{kind} {name} already exists and does not match this request: "
+                + "; ".join(differences)
+                + ". Nothing was overwritten — reconcile the existing resource "
+                "or install a different server"
+            ) from exc
+        activity.logger.info("%s %s already exists and matches — nothing to do", kind, name)
+        return CreatedResource(kind=kind, name=name, changed=False)
     activity.logger.info("Created %s %s", kind, name)
     return CreatedResource(kind=kind, name=name, changed=True)
 
@@ -305,7 +341,19 @@ async def create_baremetal_host(request: BmhResourceRequest) -> CreatedResource:
             body=bmh,
         )
 
-    return await asyncio.to_thread(_create_namespaced, _create, "BareMetalHost", name)
+    def _on_exists() -> list[str]:
+        existing = k8s_client.CustomObjectsApi().get_namespaced_custom_object(
+            group=BMH_GROUP,
+            version=BMH_VERSION,
+            namespace=request.namespace,
+            plural=BMH_PLURAL,
+            name=name,
+        )
+        return baremetal_host_differences(bmh, existing)
+
+    return await asyncio.to_thread(
+        _create_namespaced, _create, "BareMetalHost", name, _on_exists
+    )
 
 
 @activity.defn
@@ -324,12 +372,24 @@ async def create_nmstate_config(request: BmhResourceRequest) -> CreatedResource:
             body=nmstate,
         )
 
-    return await asyncio.to_thread(_create_namespaced, _create, "NMStateConfig", name)
+    def _on_exists() -> list[str]:
+        existing = k8s_client.CustomObjectsApi().get_namespaced_custom_object(
+            group=NMSTATE_GROUP,
+            version=NMSTATE_VERSION,
+            namespace=request.namespace,
+            plural=NMSTATE_PLURAL,
+            name=name,
+        )
+        return nmstate_config_differences(nmstate, existing)
+
+    return await asyncio.to_thread(
+        _create_namespaced, _create, "NMStateConfig", name, _on_exists
+    )
 
 
 @activity.defn
-async def get_baremetal_host(request: BmhResourceRequest) -> BmhState:
-    """Read the BareMetalHost's status back — the registration poll's observation."""
+async def get_baremetal_host(ref: BmhRef) -> BmhState:
+    """Read one BareMetalHost's status back, by name and namespace."""
 
     def _get() -> BmhState:
         _load_kube()
@@ -337,9 +397,9 @@ async def get_baremetal_host(request: BmhResourceRequest) -> BmhState:
             bmh = k8s_client.CustomObjectsApi().get_namespaced_custom_object(
                 group=BMH_GROUP,
                 version=BMH_VERSION,
-                namespace=request.namespace,
+                namespace=ref.namespace,
                 plural=BMH_PLURAL,
-                name=request.server_name,
+                name=k8s_resource_name(ref.server_name),
             )
         except k8s_client.ApiException as exc:
             if exc.status == 404:
@@ -347,7 +407,7 @@ async def get_baremetal_host(request: BmhResourceRequest) -> BmhState:
                 # the host up yet. The workflow's bounded loop owns the waiting.
                 return BmhState(found=False)
             raise BmhResourceError(
-                f"Failed to read BareMetalHost {request.server_name}: "
+                f"Failed to read BareMetalHost {ref.server_name}: "
                 f"{exc.status} {exc.reason}"
             ) from exc
         status = bmh.get("status") or {}
@@ -355,6 +415,7 @@ async def get_baremetal_host(request: BmhResourceRequest) -> BmhState:
             found=True,
             provisioning_state=(status.get("provisioning") or {}).get("state"),
             operational_status=status.get("operationalStatus"),
+            error_type=status.get("errorType") or None,
             error_message=status.get("errorMessage") or None,
         )
 

@@ -144,19 +144,22 @@ def test_closed_run_still_reports_the_work_it_did(make_client, status):
     outlives it). Temporal answers queries on closed workflows, so the
     endpoint must ask, and still surface the failure alongside."""
     failure = WorkflowFailureError(
-        cause=ApplicationError("DHCP scope did not converge", type="DhcpScopeNotConverged")
+        cause=ApplicationError(
+            "cluster-a.yaml already carries a segment-allocation block",
+            type="ClusterValuesConflictError",
+        )
     )
     handle = _FakeHandle(
         status,
-        progress={"phase": "awaiting-dhcp-scope"},
+        progress={"phase": "updating-values-repo"},
         result_error=failure,
     )
     response = make_client(handle).get("/workflows/runs/allocate-segment-HC-cluster-a")
 
     body = response.json()
     assert body["status"] == status.name
-    assert body["progress"] == {"phase": "awaiting-dhcp-scope"}
-    assert "DHCP scope did not converge" in body["error"]
+    assert body["progress"] == {"phase": "updating-values-repo"}
+    assert "already carries a segment-allocation block" in body["error"]
 
 
 def test_closed_run_progress_is_best_effort(make_client):

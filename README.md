@@ -80,17 +80,27 @@ per-segment status — which is what lets the bulk route start N of them.
 
 ### `allocate-segment` — give a cluster a segment
 
-Takes the cluster and the **type** to allocate as (default `HC`). Locate the
-cluster's values file in the day1 repo (the path gives the site, cross-checked
-against `GET /api/sites`), allocate a segment from the Segments Manager — any
-Available segment at the site, which becomes the requested type in the same step —
-**read it back** to verify status/cluster/vlan/type all match, append the `vlanId`
-+ `dhcp_values` block to the file and push, then poll the DHCP API read-only until
-Crossplane has created the scope.
+Takes the cluster, the **values-repo branch** to record on, and the **type** to
+allocate as (default `HC`):
 
-That wait is MACHINE convergence, so unlike the old approval poll it has a real
-deadline (15 min) and fails loudly with `DhcpScopeNotConverged`. HC only for now;
-any other type is rejected up front.
+```json
+{"cluster": "ocp4-prep-herzi-site1-a", "values_branch": "feature/ocp4-prep-herzi-site1-a"}
+```
+
+Locate the cluster's values file on that branch of the day1 repo (the path gives
+the site, cross-checked against `GET /api/sites`), allocate a segment from the
+Segments Manager — any Available segment at the site, which becomes the requested
+type in the same step — **read it back** to verify status/cluster/vlan/type all
+match, then append the `vlanId` + `dhcp_values` block to the file and push it to
+that branch with `[skip ci]`. The run ends there. HC only for now; any other type
+is rejected up front, and a branch the repo does not have fails with
+`ValuesBranchNotFoundError`.
+
+It runs as a step **inside the day1 values repo's CI pipeline**, which runs on a
+temporary branch only: the pipeline passes its own `$CI_COMMIT_BRANCH`, waits for
+the run, then generates the MachineConfig files from the recorded `vlanId`; a
+human merges afterwards. There is no DHCP scope wait: Argo CD reads `main` only,
+so the scope appears after that merge, outside the run (see CLAUDE.md §4).
 
 ## API
 
@@ -123,13 +133,13 @@ would hide which segments actually got a workflow.
 ## Design notes
 
 - **Deployment-agnostic:** endpoints come from env (`TEMPORAL_HOST`,
-  `SEGMENTS_MANAGER_URL`, `DAY1_REPO_URL`, `DHCP_API_URL`). The same images run on
+  `SEGMENTS_MANAGER_URL`, `DAY1_REPO_URL`). The same images run on
   kind or OpenShift; only the chart's `values.yaml` (`config.*`) changes.
   `host.docker.internal` appears only there, never in code.
 - **ConfigMap split by scope:** `workflows-orchestrator-config` (owned by the
   always-present brain release) holds what every domain shares — `TEMPORAL_*` and
   `SEGMENTS_MANAGER_URL`. Each domain adds its own `<domain>-config` (here
-  `segment-lifecycle-config`: the `DAY1_*` and `DHCP_*` keys). A domain's activity
+  `segment-lifecycle-config`: `DAY1_REPO_URL` and the DHCP policy). A domain's activity
   worker mounts both, so the brain must install before any limb.
 - **ConfigMaps hold operator-editable data**, expanded and validated in code at
   worker startup rather than baked into an image. `DHCP_EXCLUSION_OCTET_RANGES` is
@@ -157,12 +167,10 @@ would hide which segments actually got a workflow.
 | --- | --- | --- |
 | `TEMPORAL_HOST`, `TEMPORAL_NAMESPACE` | `workflows-orchestrator-config` | shared by every domain |
 | `SEGMENTS_MANAGER_URL` | `workflows-orchestrator-config` | shared by every domain |
-| `DAY1_REPO_URL`, `DAY1_BRANCH` | `segment-lifecycle-config` | allocate-segment's values repo |
-| `DHCP_EXCLUSION_OCTET_RANGES`, `DHCP_API_URL` | `segment-lifecycle-config` | DHCP policy + read-only API |
+| `DAY1_REPO_URL` | `segment-lifecycle-config` | allocate-segment's values repo (the branch is per run) |
+| `DHCP_EXCLUSION_OCTET_RANGES` | `segment-lifecycle-config` | DHCP policy |
 | `SEGMENTS_MANAGER_API_TOKEN` | Secret | mutating calls only; GETs are public |
 | `DAY1_GIT_TOKEN` | Secret `day1-git-token` | push rights; scrubbed from every error |
-
-The DHCP scope API needs no credential — its scope GETs are anonymous.
 
 ## Run locally
 
@@ -224,13 +232,12 @@ helm install workflows-orchestrator \
   --set config.temporalHost=<temporal-host>:7233 \
   --set config.segmentsManagerUrl=https://<segments-manager-route>
 
-# The limb sets its own day1/DHCP config; it reads the global values from
+# The limb sets its own day1/DHCP-policy config; it reads the global values from
 # workflows-orchestrator-config above.
 helm install segment-lifecycle-worker \
   ../redbull-platform/gitops/charts/segment-lifecycle-worker -n redbull-workflows \
   --set activityWorker.image.repository=<registry>/segment-lifecycle-worker \
   --set config.day1RepoUrl=https://<values-repo> \
-  --set config.dhcpApiUrl=https://<dhcp-scope-api> \
   --set secrets.segmentsManagerApiToken=<real-token> \
   --set secrets.day1GitToken=<real-token>
 ```

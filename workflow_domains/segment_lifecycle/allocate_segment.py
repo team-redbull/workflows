@@ -1,6 +1,6 @@
 """allocate-segment — reserves a VLAN segment for a hosted cluster in the
-Segments Manager and writes the dhcp_values block into the cluster's values
-file, so the cluster gets its network AND its DHCP scope from one durable run.
+Segments Manager and writes the vlanId + dhcp_values block into the cluster's
+values file, on the values-repo branch the run names, from one durable run.
 
 The SECOND workflow of the `segment-lifecycle` domain: it reuses the running
 `segment-lifecycle-worker` limb, its activity queue and its ConfigMap — only
@@ -31,16 +31,21 @@ Shape of the run:
                             unless the Segments Manager confirms the
                             reservation.
   4. updating-values-repo — append the marker block (vlanId + dhcp_values),
-                            commit, push. Git stays the single source of
-                            truth; a re-run finds the block already present
-                            and pushes nothing.
-  5. awaiting-dhcp-scope  — poll the DHCP API READ-ONLY until Crossplane has
-                            created the scope. Posting the scope ourselves
-                            would make two writers for one resource and a PUT
-                            on every reconcile loop forever; observing keeps
-                            Crossplane the only writer. This is MACHINE
-                            convergence, so the wait is BOUNDED and a miss
-                            fails with DhcpScopeNotConverged.
+                            commit with [skip ci], push to `values_branch`.
+                            Git stays the single source of truth; a re-run
+                            finds the block already present and pushes
+                            nothing.
+
+Where it runs: as a step INSIDE the day1 values repo's CI pipeline, which runs
+on a temporary branch only (never on main). The pipeline passes its own branch
+as `values_branch` — the new cluster's file exists only there — and waits for
+this run to complete before generating the MachineConfig files from the vlanId
+it recorded. A human merges the branch afterwards. The run ends at the push.
+
+There is deliberately NO wait for the DHCP scope (there was one — CLAUDE.md §4
+has the history). Argo CD reads main only, so the scope appears only after the
+merge, and the merge comes after the pipeline, which is waiting on this run: a
+scope wait here would deadlock the flow it is a step of.
 
 HC only for now: any other type fails up front with UnsupportedSegmentType.
 Without that gate a non-HC run would still die — only hostedCluster files
@@ -68,7 +73,6 @@ with workflow.unsafe.imports_passed_through():
     from shared.interfaces.segment_lifecycle import (
         allocate_segment,
         append_allocation_to_cluster_values,
-        get_dhcp_scope,
         get_segment,
         get_valid_sites,
         locate_cluster_file,
@@ -77,8 +81,8 @@ with workflow.unsafe.imports_passed_through():
         AllocateSegmentProgress,
         AllocateSegmentResult,
         AllocateSegmentRunArgs,
+        ClusterFileLookupRequest,
         ClusterValuesAppendRequest,
-        DhcpExclusion,
         SegmentAllocationRequest,
         SegmentType,
     )
@@ -103,22 +107,11 @@ _RETRY_POLICY = RetryPolicy(
         "AmbiguousClusterFileError",
         "SegmentPoolExhaustedError",
         "ClusterValuesConflictError",
+        # The branch the caller named is not on the remote — a typo or a
+        # branch deleted after the trigger; retrying cannot make it appear.
+        "ValuesBranchNotFoundError",
     ],
 )
-
-# The DHCP wait is machine convergence (Argo sync + Crossplane's ~60s
-# reconcile), so it gets a REAL deadline and fails loudly: a scope that has not
-# appeared in 15 minutes is a broken pipeline, not a slow one. Changing either
-# constant is a non-deterministic change for in-flight runs.
-_DHCP_POLL_INTERVAL = timedelta(seconds=15)
-_DHCP_CONVERGENCE_DEADLINE = timedelta(minutes=15)
-
-
-def _format_exclusions(exclusions: list[DhcpExclusion]) -> str:
-    """Render an exclusion list for the not-converged failure message."""
-    if not exclusions:
-        return "none"
-    return ", ".join(f"{e.start_address}-{e.end_address}" for e in exclusions)
 
 
 @workflow.defn
@@ -151,6 +144,18 @@ class AllocateSegmentWorkflow:
                 "their own functions when they arrive",
                 type="UnsupportedSegmentType",
             )
+        # The API requires the branch (AllocateSegmentRequest); the boundary
+        # model defaults it to None only so history recorded before the field
+        # existed still decodes. A run without one has no branch to record on,
+        # and there is no configured fallback — that would push to main.
+        values_branch = allocate_input.values_branch
+        if values_branch is None:
+            raise ApplicationError(
+                "allocate-segment needs the values-repo branch to record the "
+                "allocation on (values_branch) — the API requires it, so this "
+                "run was not started through the router",
+                type="ValuesBranchMissing",
+            )
 
         # Step 1 — resolve the site from the values repo, cross-checked
         # against the Segments Manager. Independent lookups, fanned out.
@@ -164,7 +169,7 @@ class AllocateSegmentWorkflow:
             ),
             workflow.execute_activity(
                 locate_cluster_file,
-                cluster,
+                ClusterFileLookupRequest(cluster=cluster, values_branch=values_branch),
                 task_queue=SEGMENT_LIFECYCLE_ACTIVITY_QUEUE,
                 start_to_close_timeout=_GIT_ACTIVITY_TIMEOUT,
                 retry_policy=_RETRY_POLICY,
@@ -240,55 +245,22 @@ class AllocateSegmentWorkflow:
                 vlan_id=allocation.vlan_id,
                 segment=allocation.segment,
                 type=allocate_input.type,
+                values_branch=values_branch,
             ),
             task_queue=SEGMENT_LIFECYCLE_ACTIVITY_QUEUE,
             start_to_close_timeout=_GIT_ACTIVITY_TIMEOUT,
             retry_policy=_RETRY_POLICY,
         )
 
-        # Step 5 — wait (bounded) for Argo + Crossplane to turn the git state
-        # into a live DHCP scope, observing read-only on a durable timer.
-        self._phase = "awaiting-dhcp-scope"
-        dhcp_values = commit_ref.dhcp_values
-        wait_started_at = workflow.now()
-        while True:
-            scope = await workflow.execute_activity(
-                get_dhcp_scope,
-                dhcp_values.network,
-                task_queue=SEGMENT_LIFECYCLE_ACTIVITY_QUEUE,
-                start_to_close_timeout=_ACTIVITY_TIMEOUT,
-                retry_policy=_RETRY_POLICY,
-            )
-            # Convergence means the live scope carries the exclusions this run
-            # pushed — the thing we wrote. Its distribution range is the DHCP
-            # API's own derivation (.1-.253 for an absent pair), so matching it
-            # would only confirm that service agrees with itself.
-            if scope.found and scope.exclusions == dhcp_values.exclusions:
-                break
-            if workflow.now() - wait_started_at >= _DHCP_CONVERGENCE_DEADLINE:
-                observed = (
-                    f"scope exists with exclusions "
-                    f"{_format_exclusions(scope.exclusions)} (expected "
-                    f"{_format_exclusions(dhcp_values.exclusions)})"
-                    if scope.found
-                    else "scope was never created"
-                )
-                raise ApplicationError(
-                    f"DHCP scope {dhcp_values.network} did not converge within "
-                    f"{int(_DHCP_CONVERGENCE_DEADLINE.total_seconds() // 60)} "
-                    f"minutes of the values-repo push: {observed}. The git "
-                    "commit stands — check the Argo Application and the "
-                    "Crossplane Request for this cluster",
-                    type="DhcpScopeNotConverged",
-                )
-            await workflow.sleep(_DHCP_POLL_INTERVAL)  # durable, replay-safe timer
-
         self._phase = "completed"
         workflow.logger.info(
-            "Segment %s (vlan=%d) allocated to %s and its DHCP scope is live",
+            "Segment %s (vlan=%d) allocated to %s and recorded on branch %s "
+            "(network %s)",
             allocation.segment,
             allocation.vlan_id,
             cluster,
+            values_branch,
+            commit_ref.dhcp_values.network,
         )
         return AllocateSegmentResult(
             cluster=cluster,
@@ -297,7 +269,7 @@ class AllocateSegmentWorkflow:
             vlan_id=allocation.vlan_id,
             segment=allocation.segment,
             epg_name=allocation.epg_name,
+            values_branch=values_branch,
             commit_sha=commit_ref.commit_sha,
             values_updated=commit_ref.changed,
-            dhcp_scope_ready=True,
         )

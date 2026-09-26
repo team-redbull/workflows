@@ -17,8 +17,10 @@ from fastapi.testclient import TestClient
 from temporalio.exceptions import WorkflowAlreadyStartedError
 
 from shared.consts import (
+    ALLOCATE_SEGMENT_WORKFLOW_QUEUE,
     INITIALIZE_SEGMENT_WORKFLOW_QUEUE,
 )
+from shared.models.segment_lifecycle import AllocateSegmentRunArgs, SegmentType
 from workflow_domains.routers.deps import get_temporal_client
 from workflow_domains.segment_lifecycle import router as router_module
 
@@ -48,11 +50,12 @@ class _FakeClient:
         expected_queue: str = INITIALIZE_SEGMENT_WORKFLOW_QUEUE,
     ) -> None:
         self.started: list[str] = []
+        self.args: list = []
         self._already_started = set(already_started)
         self._fail = fail
         self._expected_queue = expected_queue
 
-    async def start_workflow(self, _run, _args, *, id: str, task_queue: str):
+    async def start_workflow(self, _run, args, *, id: str, task_queue: str):
         assert task_queue == self._expected_queue
         if self._fail:
             raise RuntimeError("temporal unavailable")
@@ -62,6 +65,7 @@ class _FakeClient:
         # exactly as the server would.
         self._already_started.add(id)
         self.started.append(id)
+        self.args.append(args)
         return _FakeHandle(id)
 
 
@@ -206,3 +210,71 @@ def test_bulk_rejects_an_empty_batch(make_client):
         "/workflows/segment-lifecycle/initialize-segment/bulk", json={"segments": []}
     )
     assert response.status_code == 422
+
+
+# --- allocate-segment ------------------------------------------------------
+
+_ALLOCATE = "/workflows/segment-lifecycle/allocate-segment"
+_ALLOCATE_BODY = {"cluster": "ocp4-prep-a", "values_branch": "feature/ocp4-prep-a"}
+
+
+def test_allocate_start_uses_the_deterministic_id_and_carries_the_branch(make_client):
+    fake = _FakeClient(expected_queue=ALLOCATE_SEGMENT_WORKFLOW_QUEUE)
+    response = make_client(fake).post(_ALLOCATE, json=_ALLOCATE_BODY)
+
+    assert response.status_code == 202
+    assert response.json()["workflow_id"] == "allocate-segment-HC-ocp4-prep-a"
+    (run_args,) = fake.args
+    assert isinstance(run_args, AllocateSegmentRunArgs)
+    assert run_args.input.type == SegmentType.HC
+    assert run_args.input.values_branch == "feature/ocp4-prep-a"
+    # The branch survives the trip through the boundary model — what the
+    # data converter serializes is AllocateSegmentRunArgs, not the request.
+    decoded = AllocateSegmentRunArgs.model_validate_json(run_args.model_dump_json())
+    assert decoded.input.values_branch == "feature/ocp4-prep-a"
+
+
+def test_allocate_requires_the_values_branch(make_client):
+    """No configured fallback exists: a request without a branch would have
+    nowhere to record the allocation, so it never starts a run."""
+    fake = _FakeClient(expected_queue=ALLOCATE_SEGMENT_WORKFLOW_QUEUE)
+    response = make_client(fake).post(_ALLOCATE, json={"cluster": "ocp4-prep-a"})
+    assert response.status_code == 422
+    assert fake.started == []
+
+
+@pytest.mark.parametrize(
+    "branch", ["", "-x", "--upload-pack=touch /tmp/x", "a..b", "has space", "a~1", "x:y"]
+)
+def test_allocate_rejects_a_branch_git_could_misread(make_client, branch):
+    """The branch reaches git as an argument from an API with no auth: an
+    option-shaped or malformed value is refused before any run starts."""
+    fake = _FakeClient(expected_queue=ALLOCATE_SEGMENT_WORKFLOW_QUEUE)
+    response = make_client(fake).post(
+        _ALLOCATE, json={**_ALLOCATE_BODY, "values_branch": branch}
+    )
+    assert response.status_code == 422
+    assert fake.started == []
+
+
+def test_allocate_rejects_unknown_fields(make_client):
+    """A misspelt or retired field (a `site`, a `branch`) is refused rather
+    than silently ignored."""
+    response = make_client(
+        _FakeClient(expected_queue=ALLOCATE_SEGMENT_WORKFLOW_QUEUE)
+    ).post(_ALLOCATE, json={**_ALLOCATE_BODY, "site": "site1"})
+    assert response.status_code == 422
+
+
+def test_allocate_dedups_across_branches(make_client):
+    """The id carries cluster and type, never the branch: the Segments
+    Manager allocates per (cluster, site, type), so two branches for one
+    cluster must collide on one run rather than race for one segment."""
+    fake = _FakeClient(expected_queue=ALLOCATE_SEGMENT_WORKFLOW_QUEUE)
+    client = make_client(fake)
+    assert client.post(_ALLOCATE, json=_ALLOCATE_BODY).status_code == 202
+    response = client.post(
+        _ALLOCATE, json={**_ALLOCATE_BODY, "values_branch": "feature/other"}
+    )
+    assert response.status_code == 409
+    assert fake.started == ["allocate-segment-HC-ocp4-prep-a"]

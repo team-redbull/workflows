@@ -6,9 +6,7 @@ These run in the `segment-lifecycle-worker` deployment. They talk to:
     SEGMENTS_MANAGER_API_TOKEN; GETs are public)
   - the day1 values repo (DAY1_REPO_URL) — git subprocess via
     activities/segment_lifecycle/values_repo.py (clone, append the allocation
-    block, push; the token is never logged)
-  - the DHCP scope API (DHCP_API_URL) — READ-ONLY: the allocate-segment
-    workflow polls a scope to observe Crossplane's convergence, never writes one
+    block, push; the token is never logged), on the branch each run names
 
 Conventions enforced here:
   * activity.logger only (not the root logger).
@@ -29,11 +27,11 @@ from __future__ import annotations
 
 import httpx
 from temporalio import activity
+from temporalio.exceptions import ApplicationError
 
 from activities.segment_lifecycle import values_repo
 from activities.segment_lifecycle.dhcp_values import build_dhcp_values
 from shared.exceptions import (
-    DhcpApiError,
     SegmentConflictError,
     SegmentPoolExhaustedError,
     SegmentsManagerAuthError,
@@ -43,9 +41,8 @@ from shared.exceptions import (
 )
 from shared.models.segment_lifecycle import (
     ClusterFileLocation,
+    ClusterFileLookupRequest,
     ClusterValuesAppendRequest,
-    DhcpExclusion,
-    DhcpScopeState,
     InitializeSegmentInput,
     SegmentAllocation,
     SegmentAllocationRequest,
@@ -71,7 +68,7 @@ _HTTP_TIMEOUT = httpx.Timeout(60.0)
 # trusted properly.
 #
 # The git subprocess has its own trust store and is switched off separately —
-# see values_repo._run_git.
+# see values_repo._exec_git.
 _TLS_VERIFY = False
 
 
@@ -232,19 +229,43 @@ async def get_valid_sites() -> list[str]:
     return sites
 
 
+def _require_values_branch(values_branch: str | None) -> str:
+    """The branch a git activity clones and pushes, or a non-retryable failure.
+
+    The request models default `values_branch` to None only so payloads
+    recorded before the field existed still decode. A request that actually
+    arrives without one has nothing to clone, and retrying cannot invent a
+    branch — so it fails at once instead of falling back to one (there is no
+    configured branch any more: a fallback would push to main by omission).
+    """
+    if not values_branch:
+        raise ApplicationError(
+            "No values_branch on the request — the values-repo branch to clone "
+            "and push is a per-run input, and this request carries none",
+            type="ValuesBranchMissing",
+            non_retryable=True,
+        )
+    return values_branch
+
+
 @activity.defn
-async def locate_cluster_file(cluster: str) -> ClusterFileLocation:
-    """Find the cluster's values file in the day1 values repo (fresh shallow
-    clone per invocation; the site is derived from the path under the
-    clusters root)."""
+async def locate_cluster_file(request: ClusterFileLookupRequest) -> ClusterFileLocation:
+    """Find the cluster's values file in the day1 values repo, on the run's
+    branch (fresh shallow clone per invocation; the site is derived from the
+    path under the clusters root)."""
+    branch = _require_values_branch(request.values_branch)
     location = await values_repo.locate_cluster_file(
         repo_url=_settings.day1_repo_url,
-        branch=_settings.day1_branch,
+        branch=branch,
         token=_settings.day1_git_token,
-        cluster=cluster,
+        cluster=request.cluster,
     )
     activity.logger.info(
-        "Cluster %s lives at %s (site=%s)", cluster, location.relative_path, location.site
+        "Cluster %s lives at %s on branch %s (site=%s)",
+        request.cluster,
+        location.relative_path,
+        branch,
+        location.site,
     )
     return location
 
@@ -320,9 +341,10 @@ async def append_allocation_to_cluster_values(
     request: ClusterValuesAppendRequest,
 ) -> ValuesCommitRef:
     """Append the vlanId + dhcp_values block to the cluster's values file and
-    push. The DhcpValues are derived HERE (the policy lives in this worker's
-    config, unreachable from the sandboxed workflow) and returned in both the
-    pushed and the already-present case, for the convergence poll."""
+    push it to the run's branch. The DhcpValues are derived HERE (the policy
+    lives in this worker's config, unreachable from the sandboxed workflow) and
+    returned in both the pushed and the already-present case."""
+    branch = _require_values_branch(request.values_branch)
     # The exclusion policy is per segment type — pick this allocation's. A type
     # the map does not list excludes NOTHING: an operator lists a type when it
     # reserves part of its /24 and leaves it out otherwise, rather than writing
@@ -333,7 +355,7 @@ async def append_allocation_to_cluster_values(
     )
     commit_sha, changed = await values_repo.append_allocation(
         repo_url=_settings.day1_repo_url,
-        branch=_settings.day1_branch,
+        branch=branch,
         token=_settings.day1_git_token,
         relative_path=request.relative_path,
         cluster=request.cluster,
@@ -342,70 +364,17 @@ async def append_allocation_to_cluster_values(
     )
     if changed:
         activity.logger.info(
-            "Pushed allocation for %s to %s (commit %s)",
+            "Pushed allocation for %s to %s on %s (commit %s)",
             request.cluster,
             request.relative_path,
+            branch,
             commit_sha,
         )
     else:
         activity.logger.info(
-            "%s already carries this exact allocation — nothing pushed",
+            "%s on %s already carries this exact allocation — nothing pushed",
             request.relative_path,
+            branch,
         )
     return ValuesCommitRef(commit_sha=commit_sha, changed=changed, dhcp_values=dhcp_values)
 
-
-def _dhcp_api_client() -> httpx.AsyncClient:
-    """A fresh, per-invocation client for the DHCP scope API (read-only).
-
-    No Authorization header: that API leaves its scope GETs anonymous so this poll
-    needs no credential of its own. Anything that has to WRITE there still needs a
-    token — Crossplane does, and holds one per cluster.
-    """
-    return httpx.AsyncClient(
-        base_url=_settings.dhcp_api_url, timeout=_HTTP_TIMEOUT, verify=_TLS_VERIFY
-    )
-
-
-@activity.defn
-async def get_dhcp_scope(network: str) -> DhcpScopeState:
-    """Read-only observation of the DHCP API for the convergence poll.
-
-    404 is a NORMAL answer (Crossplane has not created the scope yet), never
-    an error — raising there would make the unbounded retry policy swallow
-    the workflow's bounded deadline.
-    """
-    async with _dhcp_api_client() as client:
-        try:
-            resp = await client.get(f"/api/v1/scopes/{network}")
-        except httpx.HTTPError as exc:
-            raise DhcpApiError(f"DHCP scope lookup for {network} failed: {exc}") from exc
-        if resp.status_code == 404:
-            activity.logger.info("DHCP scope %s does not exist yet", network)
-            return DhcpScopeState(found=False)
-        if resp.status_code != 200:
-            raise DhcpApiError(
-                f"DHCP scope lookup for {network} returned "
-                f"{resp.status_code}: {resp.text}"
-            )
-        try:
-            body = resp.json()
-            # The API's own camelCase; it always returns exclusions sorted
-            # ascending, matching the order the policy validator enforces, so
-            # the workflow can compare the lists directly. Absent means none.
-            state = DhcpScopeState(
-                found=True,
-                exclusions=[
-                    DhcpExclusion(
-                        start_address=exclusion["startAddress"],
-                        end_address=exclusion["endAddress"],
-                    )
-                    for exclusion in body.get("exclusions") or []
-                ],
-            )
-        except Exception as exc:  # malformed payload from the API
-            raise DhcpApiError(f"Invalid DHCP scope response for {network}: {exc}") from exc
-    activity.logger.info(
-        "DHCP scope %s exists (%d exclusion(s))", network, len(state.exclusions)
-    )
-    return state

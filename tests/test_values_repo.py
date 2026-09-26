@@ -1,9 +1,12 @@
 """values_repo git plumbing against a REAL local bare repo — fully offline.
 
-A bare repo in tmp_path stands in as `origin`, so clone → append → commit →
-push is exercised end to end with no network, no token and no mocking of git
-itself. The blank-line rule, the marker no-op and both conflict refusals are
-pinned here; the Temporal wiring around these functions is covered by
+A bare repo in tmp_path stands in as `origin`, so ls-remote → clone → append →
+commit → push is exercised end to end with no network, no token and no mocking
+of git itself. It is shaped like the day1 repo mid-pipeline: `main` does NOT
+have the cluster, the pipeline's branch adds its file, and every write must
+land on that branch alone. The blank-line rule, the marker no-op, both
+conflict refusals and the branch classification are pinned here; the Temporal
+wiring around these functions is covered by
 tests/test_allocate_segment_workflow.py with mock activities.
 """
 
@@ -20,8 +23,12 @@ from shared.exceptions import (
     AmbiguousClusterFileError,
     ClusterFileNotFoundError,
     ClusterValuesConflictError,
+    ValuesBranchNotFoundError,
+    ValuesRepoGitError,
 )
 
+# The day1 pipeline's branch — the only place the new cluster's file exists.
+BRANCH = "feature/add-cluster"
 CLUSTER = "ocp4-test-cluster-site1-a"
 CLUSTER_FILE = f"sites/site1/mces/mce-a/hostedClusters/{CLUSTER}.yaml"
 DHCP_VALUES = build_dhcp_values("10.20.90.0/24", [(1, 10), (241, 254)])
@@ -57,30 +64,36 @@ def _git(*args: str, cwd: Path) -> str:
 
 @pytest.fixture
 def origin(tmp_path: Path) -> Path:
-    """A bare `origin` seeded with one cluster values file on branch main."""
+    """A bare `origin` shaped like the day1 repo mid-pipeline: `main` without
+    the cluster, and BRANCH (the pipeline's branch) adding its values file."""
     bare = tmp_path / "origin.git"
     _git("init", "--bare", "--initial-branch=main", str(bare), cwd=tmp_path)
     seed = tmp_path / "seed"
     _git("clone", str(bare), str(seed), cwd=tmp_path)
+    (seed / "README.md").write_text("day1 values\n")
+    _git("add", ".", cwd=seed)
+    _git("-c", "user.name=seed", "-c", "user.email=seed@test", "commit", "-m", "seed main", cwd=seed)
+    _git("push", "origin", "main", cwd=seed)
+    _git("checkout", "-b", BRANCH, cwd=seed)
     file_path = seed / CLUSTER_FILE
     file_path.parent.mkdir(parents=True)
     file_path.write_text('description: "prep workers"\n')
     _git("add", ".", cwd=seed)
-    _git("-c", "user.name=seed", "-c", "user.email=seed@test", "commit", "-m", "seed", cwd=seed)
-    _git("push", "origin", "main", cwd=seed)
+    _git("-c", "user.name=seed", "-c", "user.email=seed@test", "commit", "-m", "add cluster", cwd=seed)
+    _git("push", "origin", BRANCH, cwd=seed)
     return bare
 
 
 def _origin_file(origin: Path, tmp_path: Path, name: str) -> str:
     checkout = tmp_path / name
-    _git("clone", str(origin), str(checkout), cwd=tmp_path)
+    _git("clone", "--branch", BRANCH, str(origin), str(checkout), cwd=tmp_path)
     return (checkout / CLUSTER_FILE).read_text()
 
 
 async def _append(origin: Path, **overrides):
     kwargs = dict(
         repo_url=str(origin),
-        branch="main",
+        branch=BRANCH,
         token="",
         relative_path=CLUSTER_FILE,
         cluster=CLUSTER,
@@ -92,6 +105,7 @@ async def _append(origin: Path, **overrides):
 
 
 async def test_clone_append_commit_push_roundtrip(origin, tmp_path):
+    main_before = _git("rev-parse", "main", cwd=origin).strip()
     commit_sha, changed = await _append(origin)
     assert changed
     assert commit_sha
@@ -99,22 +113,26 @@ async def test_clone_append_commit_push_roundtrip(origin, tmp_path):
     content = _origin_file(origin, tmp_path, "verify")
     # Exactly one blank line between the last content line and the marker.
     assert content == 'description: "prep workers"\n\n' + EXPECTED_BLOCK + "\n"
-    # The pushed sha is origin's HEAD.
-    assert commit_sha == _git("rev-parse", "main", cwd=origin).strip()
-    log = _git("log", "-1", "--format=%s %an", "main", cwd=origin).strip()
+    # The pushed sha is the pipeline branch's HEAD — and main never moved:
+    # the block reaches main only when a human merges the branch.
+    assert commit_sha == _git("rev-parse", BRANCH, cwd=origin).strip()
+    assert _git("rev-parse", "main", cwd=origin).strip() == main_before
+    # `[skip ci]`: our push lands on the pipeline's own branch and must not
+    # start a second pipeline that re-runs the allocator.
+    log = _git("log", "-1", "--format=%s %an", BRANCH, cwd=origin).strip()
     assert log == (
         f"chore: allocate segment for {CLUSTER} [segment-allocation-workflow] "
-        f"{values_repo.GIT_USER_NAME}"
+        f"[skip ci] {values_repo.GIT_USER_NAME}"
     )
 
 
 async def test_empty_file_gets_the_marker_first(origin, tmp_path):
     seed = tmp_path / "empty-seed"
-    _git("clone", str(origin), str(seed), cwd=tmp_path)
+    _git("clone", "--branch", BRANCH, str(origin), str(seed), cwd=tmp_path)
     (seed / CLUSTER_FILE).write_text("\n   \n")  # whitespace-only counts as empty
     _git("add", ".", cwd=seed)
     _git("-c", "user.name=s", "-c", "user.email=s@t", "commit", "-m", "blank", cwd=seed)
-    _git("push", "origin", "main", cwd=seed)
+    _git("push", "origin", BRANCH, cwd=seed)
 
     _, changed = await _append(origin)
     assert changed
@@ -124,12 +142,12 @@ async def test_empty_file_gets_the_marker_first(origin, tmp_path):
 
 async def test_identical_block_is_a_no_op(origin):
     await _append(origin)
-    before = _git("rev-parse", "main", cwd=origin).strip()
+    before = _git("rev-parse", BRANCH, cwd=origin).strip()
 
     commit_sha, changed = await _append(origin)
     assert not changed
     assert commit_sha is None
-    assert _git("rev-parse", "main", cwd=origin).strip() == before  # nothing pushed
+    assert _git("rev-parse", BRANCH, cwd=origin).strip() == before  # nothing pushed
 
 
 async def test_marker_with_a_different_vlan_is_refused(origin):
@@ -152,7 +170,7 @@ async def test_an_operator_tuned_block_survives_a_re_run(origin, tmp_path):
     # same network, so it must leave that edit exactly as it stands.
     await _append(origin)
     seed = tmp_path / "tuned-seed"
-    _git("clone", str(origin), str(seed), cwd=tmp_path)
+    _git("clone", "--branch", BRANCH, str(origin), str(seed), cwd=tmp_path)
     tuned = (seed / CLUSTER_FILE).read_text().replace(
         '  network: "10.20.90.0"\n',
         '  network: "10.20.90.0"\n  startRange: "10.20.90.60"\n'
@@ -161,13 +179,13 @@ async def test_an_operator_tuned_block_survives_a_re_run(origin, tmp_path):
     (seed / CLUSTER_FILE).write_text(tuned)
     _git("add", ".", cwd=seed)
     _git("-c", "user.name=s", "-c", "user.email=s@t", "commit", "-m", "tune", cwd=seed)
-    _git("push", "origin", "main", cwd=seed)
-    before = _git("rev-parse", "main", cwd=origin).strip()
+    _git("push", "origin", BRANCH, cwd=seed)
+    before = _git("rev-parse", BRANCH, cwd=origin).strip()
 
     commit_sha, changed = await _append(origin)
     assert not changed
     assert commit_sha is None
-    assert _git("rev-parse", "main", cwd=origin).strip() == before  # nothing pushed
+    assert _git("rev-parse", BRANCH, cwd=origin).strip() == before  # nothing pushed
     assert _origin_file(origin, tmp_path, "verify-tuned") == tuned
 
 
@@ -175,13 +193,13 @@ async def test_an_unreadable_marker_block_is_refused(origin, tmp_path):
     # A block a human mangled past the point of naming its allocation is not
     # silently adopted — the run stops and says so.
     seed = tmp_path / "mangled-seed"
-    _git("clone", str(origin), str(seed), cwd=tmp_path)
+    _git("clone", "--branch", BRANCH, str(origin), str(seed), cwd=tmp_path)
     (seed / CLUSTER_FILE).write_text(
         f"{values_repo.MARKER}\ndhcp_values:\n  description: \"half a block\"\n"
     )
     _git("add", ".", cwd=seed)
     _git("-c", "user.name=s", "-c", "user.email=s@t", "commit", "-m", "mangle", cwd=seed)
-    _git("push", "origin", "main", cwd=seed)
+    _git("push", "origin", BRANCH, cwd=seed)
 
     with pytest.raises(ClusterValuesConflictError, match="no readable vlanId/network"):
         await _append(origin)
@@ -189,13 +207,13 @@ async def test_an_unreadable_marker_block_is_refused(origin, tmp_path):
 
 async def test_preexisting_unmarked_dhcp_values_is_refused(origin, tmp_path):
     seed = tmp_path / "fixture-seed"
-    _git("clone", str(origin), str(seed), cwd=tmp_path)
+    _git("clone", "--branch", BRANCH, str(origin), str(seed), cwd=tmp_path)
     (seed / CLUSTER_FILE).write_text(
         'dhcp_values:\n  network: "10.20.40.0"\n'
     )
     _git("add", ".", cwd=seed)
     _git("-c", "user.name=s", "-c", "user.email=s@t", "commit", "-m", "fixture", cwd=seed)
-    _git("push", "origin", "main", cwd=seed)
+    _git("push", "origin", BRANCH, cwd=seed)
 
     with pytest.raises(ClusterValuesConflictError, match="not written by this workflow"):
         await _append(origin)
@@ -203,11 +221,11 @@ async def test_preexisting_unmarked_dhcp_values_is_refused(origin, tmp_path):
 
 async def test_preexisting_bare_vlan_id_is_refused(origin, tmp_path):
     seed = tmp_path / "vlan-seed"
-    _git("clone", str(origin), str(seed), cwd=tmp_path)
+    _git("clone", "--branch", BRANCH, str(origin), str(seed), cwd=tmp_path)
     (seed / CLUSTER_FILE).write_text('description: "x"\nvlanId: 7\n')
     _git("add", ".", cwd=seed)
     _git("-c", "user.name=s", "-c", "user.email=s@t", "commit", "-m", "vlan", cwd=seed)
-    _git("push", "origin", "main", cwd=seed)
+    _git("push", "origin", BRANCH, cwd=seed)
 
     with pytest.raises(ClusterValuesConflictError, match="dhcp_values or vlanId"):
         await _append(origin)
@@ -215,7 +233,7 @@ async def test_preexisting_bare_vlan_id_is_refused(origin, tmp_path):
 
 async def test_locate_finds_the_single_cluster_file(origin):
     location = await values_repo.locate_cluster_file(
-        repo_url=str(origin), branch="main", token="", cluster=CLUSTER,
+        repo_url=str(origin), branch=BRANCH, token="", cluster=CLUSTER,
     )
     assert location.site == "site1"  # the path segment beneath the clusters root
     assert location.relative_path == CLUSTER_FILE
@@ -224,24 +242,73 @@ async def test_locate_finds_the_single_cluster_file(origin):
 async def test_locate_unknown_cluster_raises(origin):
     with pytest.raises(ClusterFileNotFoundError):
         await values_repo.locate_cluster_file(
-            repo_url=str(origin), branch="main", token="",
+            repo_url=str(origin), branch=BRANCH, token="",
             cluster="no-such-cluster",
         )
 
 
 async def test_locate_duplicate_cluster_file_raises(origin, tmp_path):
     seed = tmp_path / "dup-seed"
-    _git("clone", str(origin), str(seed), cwd=tmp_path)
+    _git("clone", "--branch", BRANCH, str(origin), str(seed), cwd=tmp_path)
     duplicate = seed / "sites/site2/mces/mce-b/hostedClusters" / f"{CLUSTER}.yaml"
     duplicate.parent.mkdir(parents=True)
     duplicate.write_text('description: "impostor"\n')
     _git("add", ".", cwd=seed)
     _git("-c", "user.name=s", "-c", "user.email=s@t", "commit", "-m", "dup", cwd=seed)
-    _git("push", "origin", "main", cwd=seed)
+    _git("push", "origin", BRANCH, cwd=seed)
 
     with pytest.raises(AmbiguousClusterFileError):
         await values_repo.locate_cluster_file(
+            repo_url=str(origin), branch=BRANCH, token="", cluster=CLUSTER,
+        )
+
+
+async def test_locate_reads_the_requested_branch_not_main(origin):
+    # A new cluster's file exists only on the pipeline's branch: found there,
+    # and genuinely absent from main.
+    location = await values_repo.locate_cluster_file(
+        repo_url=str(origin), branch=BRANCH, token="", cluster=CLUSTER,
+    )
+    assert location.relative_path == CLUSTER_FILE
+    with pytest.raises(ClusterFileNotFoundError):
+        await values_repo.locate_cluster_file(
             repo_url=str(origin), branch="main", token="", cluster=CLUSTER,
+        )
+
+
+async def test_locate_on_a_missing_branch_is_classified(origin):
+    # Deterministic, so the workflow lists it non-retryable — a plain clone
+    # failure would be the retryable ValuesRepoGitError and retry forever.
+    with pytest.raises(ValuesBranchNotFoundError, match="does not exist"):
+        await values_repo.locate_cluster_file(
+            repo_url=str(origin), branch="feature/no-such-branch", token="",
+            cluster=CLUSTER,
+        )
+
+
+async def test_append_on_a_missing_branch_is_classified(origin):
+    main_before = _git("rev-parse", "main", cwd=origin).strip()
+    with pytest.raises(ValuesBranchNotFoundError, match="does not exist"):
+        await _append(origin, branch="feature/no-such-branch")
+    assert _git("rev-parse", "main", cwd=origin).strip() == main_before
+
+
+async def test_a_branch_is_matched_exactly_never_by_suffix(origin):
+    # "add-cluster" is a suffix of "feature/add-cluster"; a bare ls-remote
+    # pattern would tail-match it. The full ref must not.
+    with pytest.raises(ValuesBranchNotFoundError):
+        await values_repo.locate_cluster_file(
+            repo_url=str(origin), branch="add-cluster", token="", cluster=CLUSTER,
+        )
+
+
+async def test_an_unreachable_repo_stays_retryable(tmp_path):
+    # Unreachable is not missing: ls-remote cannot answer at all, so the
+    # branch's existence is unknown and the retryable error is right.
+    with pytest.raises(ValuesRepoGitError):
+        await values_repo.locate_cluster_file(
+            repo_url=str(tmp_path / "no-such-repo.git"), branch=BRANCH, token="",
+            cluster=CLUSTER,
         )
 
 

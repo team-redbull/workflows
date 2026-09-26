@@ -98,19 +98,24 @@ class ClusterValuesConflictError(OrchestratorError):
 
 
 class ValuesRepoGitError(OrchestratorError):
-    """A git operation against the values repo failed (clone, commit, push —
-    including a rejected non-fast-forward push).
+    """A git operation against the values repo failed (ls-remote, clone,
+    commit, push — including a rejected non-fast-forward push).
 
     Transient by classification: the retry re-clones from a temporary
     directory and re-applies the append, so a concurrent push simply converges
-    on the next attempt. Deliberately NOT in non_retryable_error_types.
+    on the next attempt. Deliberately NOT in non_retryable_error_types. A
+    branch that does not exist is NOT this error — see ValuesBranchNotFoundError.
     """
 
 
-class DhcpApiError(OrchestratorError):
-    """The DHCP scope API failed or returned a malformed payload.
+class ValuesBranchNotFoundError(OrchestratorError):
+    """The values-repo branch the run names (`values_branch`) does not exist on
+    the remote: `git ls-remote --exit-code --heads` found no
+    `refs/heads/<branch>`.
 
-    Transient — retried by the activity RetryPolicy. A scope that does not
-    exist yet is NOT this error: get_dhcp_scope reports that as a normal
-    "not found yet" result for the workflow's bounded convergence poll.
+    Deterministic — the caller (the day1 pipeline) passes the branch it runs
+    on, so a missing one is a typo or a branch deleted after the trigger, and
+    retrying cannot make it appear. Workflows list this type in
+    non_retryable_error_types. Any OTHER ls-remote failure (auth, DNS, a
+    timeout) stays ValuesRepoGitError and is retried.
     """

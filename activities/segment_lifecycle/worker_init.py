@@ -24,7 +24,6 @@ from activities.segment_lifecycle.activities import (
     allocate_segment,
     append_allocation_to_cluster_values,
     create_segment,
-    get_dhcp_scope,
     get_segment,
     get_valid_sites,
     locate_cluster_file,
@@ -57,7 +56,6 @@ async def main() -> None:
             allocate_segment,
             get_segment,
             append_allocation_to_cluster_values,
-            get_dhcp_scope,
         ],
         # In-flight activities get this long to finish after shutdown starts
         # before being cancelled — keep it below the pod's

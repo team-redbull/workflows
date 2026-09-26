@@ -26,10 +26,9 @@ os.environ.update(
         "TEMPORAL_HOST": "localhost:7233",
         "SEGMENTS_MANAGER_URL": "http://segments-manager.test",
         "SEGMENTS_MANAGER_API_TOKEN": "test-token",
-        # --- allocate-segment: values repo + DHCP policy/API ---
+        # --- allocate-segment: values repo + DHCP policy ---
         "DAY1_REPO_URL": "https://git.test/team/gitops-day1-platform-config.git",
         "DAY1_GIT_TOKEN": "test-git-token",
         "DHCP_EXCLUSION_OCTET_RANGES": '{"HC": [[1, 10], [241, 254]]}',
-        "DHCP_API_URL": "http://dhcp.test",
     }
 )

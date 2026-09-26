@@ -2,7 +2,7 @@
 
 Same harness shape as tests/test_workflow.py: two workers — one per queue —
 exactly like the real brain/limb split, with the time-skipping environment
-collapsing the DHCP convergence timers and retry backoffs to milliseconds.
+collapsing the retry backoffs to milliseconds.
 """
 
 from __future__ import annotations
@@ -19,14 +19,15 @@ from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
 from shared.consts import ALLOCATE_SEGMENT_WORKFLOW_QUEUE, SEGMENT_LIFECYCLE_ACTIVITY_QUEUE
-from shared.exceptions import ClusterFileNotFoundError
+from shared.exceptions import ClusterFileNotFoundError, ValuesBranchNotFoundError
 from shared.models.segment_lifecycle import (
     AllocateSegmentInput,
+    AllocateSegmentResult,
     AllocateSegmentRunArgs,
     ClusterFileLocation,
+    ClusterFileLookupRequest,
     ClusterValuesAppendRequest,
     DhcpExclusion,
-    DhcpScopeState,
     DhcpValues,
     SegmentAllocation,
     SegmentAllocationRequest,
@@ -43,8 +44,11 @@ SITE = "site1"
 RELATIVE_PATH = f"sites/{SITE}/mces/mce-a/hostedClusters/{CLUSTER}.yaml"
 SEGMENT = "10.20.90.0/24"
 VLAN_ID = 23
+# The day1 pipeline's branch — where the run records the allocation.
+VALUES_BRANCH = f"feature/{CLUSTER}"
 
-HC_INPUT = AllocateSegmentInput(cluster=CLUSTER)  # type defaults to HC
+# type defaults to HC
+HC_INPUT = AllocateSegmentInput(cluster=CLUSTER, values_branch=VALUES_BRANCH)
 
 DHCP_VALUES = DhcpValues(
     network="10.20.90.0",
@@ -53,9 +57,6 @@ DHCP_VALUES = DhcpValues(
         DhcpExclusion(start_address="10.20.90.241", end_address="10.20.90.254"),
     ],
 )
-# Convergence is checked against the exclusions the run pushed — the scope's
-# distribution range is the DHCP API's own derivation, not ours.
-CONVERGED_SCOPE = DhcpScopeState(found=True, exclusions=DHCP_VALUES.exclusions)
 
 
 def make_mock_activities(
@@ -67,13 +68,9 @@ def make_mock_activities(
     entry_overrides: dict | None = None,
     entry_omits_type: bool = False,
     append_changed: bool = True,
-    scope_script: list[DhcpScopeState] | None = None,
-    scope_never_converges: bool = False,
 ):
     """Build the full mock activity set + a call recorder.
 
-    scope_script: per-poll returns; once exhausted (and not
-    scope_never_converges) every subsequent poll reports the converged scope.
     entry_overrides: fields of the read-back SegmentEntry to distort — the
     default read-back matches the allocation exactly.
     entry_omits_type: return the read-back WITHOUT a `type` key at all, the
@@ -88,7 +85,6 @@ def make_mock_activities(
             "allocate_segment",
             "get_segment",
             "append_allocation_to_cluster_values",
-            "get_dhcp_scope",
         )
     }
     resolved_location = location or ClusterFileLocation(
@@ -103,7 +99,6 @@ def make_mock_activities(
         "cluster_name": CLUSTER,
         **(entry_overrides or {}),
     }
-    script = list(scope_script or [])
     allocate_failures_left = [allocate_fail_times]
 
     @activity.defn
@@ -112,8 +107,8 @@ def make_mock_activities(
         return list(valid_sites)
 
     @activity.defn
-    async def locate_cluster_file(cluster: str) -> ClusterFileLocation:
-        calls["locate_cluster_file"].append(cluster)
+    async def locate_cluster_file(request: ClusterFileLookupRequest) -> ClusterFileLocation:
+        calls["locate_cluster_file"].append(request)
         if locate_error is not None:
             raise locate_error
         return resolved_location
@@ -145,22 +140,12 @@ def make_mock_activities(
             )
         return ValuesCommitRef(commit_sha=None, changed=False, dhcp_values=DHCP_VALUES)
 
-    @activity.defn
-    async def get_dhcp_scope(network: str) -> DhcpScopeState:
-        calls["get_dhcp_scope"].append(network)
-        if script:
-            return script.pop(0)
-        if scope_never_converges:
-            return DhcpScopeState(found=False)
-        return CONVERGED_SCOPE
-
     return calls, [
         get_valid_sites,
         locate_cluster_file,
         allocate_segment,
         get_segment,
         append_allocation_to_cluster_values,
-        get_dhcp_scope,
     ]
 
 
@@ -215,10 +200,8 @@ async def _execute(client: Client, args: AllocateSegmentRunArgs):
     )
 
 
-async def test_happy_path_allocates_verifies_pushes_and_awaits_dhcp():
-    # First poll finds no scope yet (Crossplane still reconciling), second
-    # converges — the normal shape of a fresh allocation.
-    calls, mocks = make_mock_activities(scope_script=[DhcpScopeState(found=False)])
+async def test_happy_path_allocates_verifies_and_pushes_to_the_branch():
+    calls, mocks = make_mock_activities()
     async with _Harness(mocks) as client:
         result = await _execute(client, AllocateSegmentRunArgs(input=HC_INPUT))
 
@@ -227,9 +210,21 @@ async def test_happy_path_allocates_verifies_pushes_and_awaits_dhcp():
     assert result.type == SegmentType.HC
     assert result.vlan_id == VLAN_ID
     assert result.segment == SEGMENT
+    assert result.values_branch == VALUES_BRANCH
     assert result.commit_sha == "a" * 40
     assert result.values_updated is True
-    assert result.dhcp_scope_ready is True
+    # The run ends at the push: the scope appears only after a human merges
+    # the branch (Argo reads main only), so the result makes no claim on it.
+    # The day1 pipeline parses this shape — pin it whole.
+    assert set(AllocateSegmentResult.model_fields) == {
+        "cluster", "site", "type", "vlan_id", "segment", "epg_name",
+        "values_branch", "commit_sha", "values_updated",
+    }
+    # The cluster file was looked up on the run's branch — the only place a
+    # new cluster's file exists.
+    assert calls["locate_cluster_file"] == [
+        ClusterFileLookupRequest(cluster=CLUSTER, values_branch=VALUES_BRANCH)
+    ]
     # The allocation request carried the DERIVED site, never a caller's claim.
     assert calls["allocate_segment"] == [
         SegmentAllocationRequest(cluster=CLUSTER, site=SITE, type=SegmentType.HC)
@@ -242,8 +237,42 @@ async def test_happy_path_allocates_verifies_pushes_and_awaits_dhcp():
     # The type travels with the append: the exclusion policy is per type, and
     # the activity selects that type's ranges out of the ConfigMap.
     assert append_request.type == SegmentType.HC
-    # Both polls asked for the mask-stripped network address.
-    assert calls["get_dhcp_scope"] == ["10.20.90.0", "10.20.90.0"]
+    # ...and the block is pushed to the same branch it was located on.
+    assert append_request.values_branch == VALUES_BRANCH
+
+
+async def test_missing_values_branch_is_rejected_before_any_activity():
+    """The API requires the branch; the boundary model defaults it to None only
+    for history. A run that still arrives without one fails at once — there is
+    no configured fallback, which would push to main."""
+    calls, mocks = make_mock_activities()
+    async with _Harness(mocks) as client:
+        with pytest.raises(WorkflowFailureError) as exc_info:
+            await _execute(
+                client, AllocateSegmentRunArgs(input=AllocateSegmentInput(cluster=CLUSTER))
+            )
+
+    cause = _workflow_cause(exc_info)
+    assert isinstance(cause, ApplicationError)
+    assert cause.type == "ValuesBranchMissing"
+    assert all(recorded == [] for recorded in calls.values())
+
+
+async def test_nonexistent_branch_fails_after_exactly_one_attempt():
+    # Attempt count is the proof of the non-retryable classification: a typo'd
+    # or deleted branch must fail the run, not retry every minute forever.
+    calls, mocks = make_mock_activities(
+        locate_error=ValuesBranchNotFoundError(f"Branch {VALUES_BRANCH!r} does not exist")
+    )
+    async with _Harness(mocks) as client:
+        with pytest.raises(WorkflowFailureError) as exc_info:
+            await _execute(client, AllocateSegmentRunArgs(input=HC_INPUT))
+
+    cause = _workflow_cause(exc_info)
+    assert isinstance(cause, ApplicationError)
+    assert cause.type == "ValuesBranchNotFoundError"
+    assert len(calls["locate_cluster_file"]) == 1
+    assert calls["allocate_segment"] == []
 
 
 async def test_non_hc_type_is_rejected_before_any_activity():
@@ -253,7 +282,9 @@ async def test_non_hc_type_is_rejected_before_any_activity():
             await _execute(
                 client,
                 AllocateSegmentRunArgs(
-                    input=AllocateSegmentInput(cluster=CLUSTER, type=SegmentType.MCE)
+                    input=AllocateSegmentInput(
+                        cluster=CLUSTER, type=SegmentType.MCE, values_branch=VALUES_BRANCH
+                    )
                 ),
             )
 
@@ -311,7 +342,6 @@ async def test_read_back_mismatch_fails_with_no_git_commit():
     assert "cluster_name" in str(cause)
     # Verification sits BEFORE the git write: nothing was pushed.
     assert calls["append_allocation_to_cluster_values"] == []
-    assert calls["get_dhcp_scope"] == []
 
 
 @pytest.mark.parametrize("read_back_type", ["MCE", None])
@@ -340,7 +370,7 @@ async def test_read_back_without_a_type_field_is_not_held_against_the_run():
     async with _Harness(mocks) as client:
         result = await _execute(client, AllocateSegmentRunArgs(input=HC_INPUT))
 
-    assert result.dhcp_scope_ready is True
+    assert result.values_updated is True
     assert len(calls["append_allocation_to_cluster_values"]) == 1
 
 
@@ -360,41 +390,6 @@ async def test_rerun_over_already_appended_file_reports_values_unchanged():
 
     assert result.values_updated is False
     assert result.commit_sha is None
-    # The no-op path still returns the DhcpValues, so convergence is polled.
-    assert calls["get_dhcp_scope"] == ["10.20.90.0"]
+    # A no-op re-run still reports the branch that carries the block.
+    assert result.values_branch == VALUES_BRANCH
 
-
-async def test_dhcp_scope_never_appearing_fails_bounded():
-    calls, mocks = make_mock_activities(scope_never_converges=True)
-    async with _Harness(mocks) as client:
-        with pytest.raises(WorkflowFailureError) as exc_info:
-            await _execute(client, AllocateSegmentRunArgs(input=HC_INPUT))
-
-    cause = _workflow_cause(exc_info)
-    assert isinstance(cause, ApplicationError)
-    assert cause.type == "DhcpScopeNotConverged"
-    assert "never created" in str(cause)
-    # 15 min deadline / 15 s durable timer: a poll at t=0 plus one per sleep,
-    # the last at the deadline itself. Pins the pacing constants.
-    assert len(calls["get_dhcp_scope"]) == 61
-
-
-async def test_scope_with_wrong_exclusions_does_not_count_as_converged():
-    # A scope existing is NOT enough — its exclusions must match the block we
-    # wrote (Crossplane may still be carrying an older revision), else the
-    # deadline calls it out.
-    wrong = DhcpScopeState(
-        found=True,
-        exclusions=[
-            DhcpExclusion(start_address="10.20.90.50", end_address="10.20.90.60")
-        ],
-    )
-    calls, mocks = make_mock_activities(
-        scope_script=[wrong], scope_never_converges=False
-    )
-    async with _Harness(mocks) as client:
-        result = await _execute(client, AllocateSegmentRunArgs(input=HC_INPUT))
-
-    # Second poll (the converged default) finished the run.
-    assert len(calls["get_dhcp_scope"]) == 2
-    assert result.dhcp_scope_ready is True

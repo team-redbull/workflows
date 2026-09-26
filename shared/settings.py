@@ -8,7 +8,7 @@ Two settings groups, matching the deployment boundary:
     (both workers and api.py).
   - SegmentLifecycleActivitySettings: needed only by the segment-lifecycle
     activity worker/tasks (the Segments Manager, the day1 values repo and the
-    DHCP scope API). The workflow worker has no business holding these.
+    DHCP exclusion policy). The workflow worker has no business holding these.
 
 Field names deliberately equal the Helm ConfigMap/Secret keys (lowercased) —
 pydantic-settings matches env vars case-insensitively, so SEGMENTS_MANAGER_URL
@@ -25,7 +25,8 @@ charts in the Argo CD repo:
 redbull-platform/gitops/charts/workflows-orchestrator/templates/config.yaml
     (workflows-orchestrator-config: temporal + segments-manager url)
 redbull-platform/gitops/charts/segment-lifecycle-worker/templates/config.yaml
-    (segment-lifecycle-config: the day1 + DHCP keys; + the day1-git-token Secret)
+    (segment-lifecycle-config: the day1 repo URL + the DHCP policy; + the
+    day1-git-token Secret)
 
 Do NOT import this module from inside a workflow definition (it runs in the
 sandbox) — only from worker entrypoints, api.py, and activity
@@ -57,10 +58,15 @@ class SegmentLifecycleActivitySettings(BaseSettings):
     # --- allocate-segment: the day1 values repo -----------------------------
     # Where cluster values files live (sites/<site>/mces/<mce>/hostedClusters/
     # <cluster>.yaml). The workflow appends the vlanId + dhcp_values block
-    # there and pushes; Argo CD + Crossplane take it from git to a live DHCP
-    # scope. The token authenticates the push (and the clone, for a private
-    # repo) — it is injected into the clone URL in memory only and scrubbed
-    # from every log line and error message.
+    # there and pushes. The token authenticates the push (and the clone, for a
+    # private repo) — it is injected into the clone URL in memory only and
+    # scrubbed from every log line and error message.
+    #
+    # The BRANCH is deliberately NOT a setting: every run names it
+    # (`values_branch`), because the day1 pipeline that triggers allocate-segment
+    # runs on a temporary branch only it knows, and a new cluster's file exists
+    # only there. The block reaches Argo CD (which reads main only) when a human
+    # merges that branch — after the run, outside it.
     #
     # The clusters root and the committer identity are NOT config: they are
     # hardcoded in activities/segment_lifecycle/values_repo.py (CLUSTERS_ROOT,
@@ -68,10 +74,9 @@ class SegmentLifecycleActivitySettings(BaseSettings):
     # a wrong value simply finds no cluster file — and the identity names THIS
     # workflow, so neither is something an operator tunes per environment.
     day1_repo_url: str
-    day1_branch: str = "main"
     day1_git_token: str
 
-    # --- allocate-segment: DHCP scope policy + the DHCP API -----------------
+    # --- allocate-segment: DHCP scope policy --------------------------------
     # The ONE DHCP policy knob, PER SEGMENT TYPE: last-octet ranges excluded
     # from distribution, e.g. {"HC": [[1, 10], [241, 254]]}. Together with the
     # network they are the WHOLE written block: no startRange/endRange, so the
@@ -92,15 +97,6 @@ class SegmentLifecycleActivitySettings(BaseSettings):
     # hand out the addresses production reserves rather than fail. Types listed
     # ahead of the code that allocates them are validated the same way now.
     dhcp_exclusion_octet_ranges: dict[SegmentType, list[tuple[int, int]]]
-    # The DHCP scope API (read-only here: the workflow only ever GETs a scope
-    # to observe Crossplane's convergence — it never creates one itself).
-    #
-    # No token setting: that API leaves its scope GETs unauthenticated precisely
-    # so this poll needs no credential. Secrets are namespace-scoped and envFrom
-    # resolves per-pod, so authenticating here meant a copy of the API's token
-    # living in redbull-workflows that had to rotate in step with the original.
-    # Writes there are still authenticated — this worker just never makes one.
-    dhcp_api_url: str
 
     @field_validator("dhcp_exclusion_octet_ranges")
     @classmethod

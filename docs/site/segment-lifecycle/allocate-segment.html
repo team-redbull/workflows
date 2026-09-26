@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>allocate-segment — Redbull Workflows</title>
-<meta name="description" content="The allocate-segment workflow: reserve a VLAN segment for a hosted cluster, write its dhcp_values block to the values repo, and wait for the DHCP scope to converge.">
+<meta name="description" content="The allocate-segment workflow: reserve a VLAN segment for a hosted cluster and write its vlanId + dhcp_values block to the day1 pipeline's branch of the values repo.">
 <link rel="icon" href="/assets/favicon.svg?v=__DOC_VERSION__" type="image/svg+xml">
 <link rel="stylesheet" href="/assets/site.css?v=__DOC_VERSION__">
 </head>
@@ -42,10 +42,11 @@
     <div class="eyebrow">Temporal workflow · domain: segment-lifecycle</div>
     <h1>allocate-segment<span class="dim"> — what actually happens</span></h1>
     <p class="lede">
-      A single request — just a <b>cluster name</b> — reserves a VLAN segment for that hosted cluster in the
-      Segments Manager, verifies the reservation landed, writes the <code>dhcp_values</code> block into the
-      cluster's values file in the day1 repo, and waits until Argo&nbsp;CD + Crossplane have turned that commit
-      into a live DHCP scope. The cluster gets its network <em>and</em> its DHCP scope from one durable run.
+      A single request — a <b>cluster name</b> and the <b>branch</b> its values file lives on — reserves a VLAN
+      segment for that hosted cluster in the Segments Manager, verifies the reservation landed, and writes the
+      <code>vlanId</code> + <code>dhcp_values</code> block into the cluster's values file on that branch of the
+      day1 repo. It runs as a step <em>inside</em> the day1 pipeline and ends at the push; the DHCP scope follows
+      when a human merges the branch.
     </p>
     <div class="facts">
       <div class="fact"><span class="k">Trigger</span><span class="v">POST /workflows/segment-lifecycle/allocate-segment</span></div>
@@ -62,23 +63,25 @@
   <section id="flow">
     <div class="sec-head">
       <div class="eyebrow">The run, step by step</div>
-      <h2>From “allocate for this cluster” to “DHCP scope is live”</h2>
-      <p class="lede">Five stages, left to right. The colour of each box is the system it talks to.
+      <h2>From “allocate for this cluster” to “block pushed to the branch”</h2>
+      <p class="lede">Four stages, left to right, then what happens after the run. The colour of each box is
+      the system it talks to.
       Verification sits <b>before</b> the git write on purpose: a VLAN is never recorded in the values repo
       unless the Segments Manager confirms the reservation.</p>
     </div>
 
     <div class="diagram rail">
       <svg viewBox="0 0 1060 330" role="img"
-           aria-label="Horizontal flow: an operator posts a cluster name, then the workflow runs five stages left to right — resolve the site from the values repo (git plus Segments Manager), allocate a segment (Segments Manager), verify the allocation by read-back (Segments Manager), push the dhcp_values block (git), and wait bounded for the DHCP scope (DHCP API). If it fails, the git history and the allocation both stand and a re-run converges.">
+           aria-label="Horizontal flow: the day1 pipeline posts a cluster name and its branch, then the workflow runs four stages left to right — resolve the site from the cluster file on that branch (git plus Segments Manager), allocate a segment (Segments Manager), verify the allocation by read-back (Segments Manager), and push the vlanId plus dhcp_values block to the branch (git). After the run, outside it, a human merges the branch to main and Argo CD plus Crossplane create the DHCP scope. If it fails, the git history and the allocation both stand and a re-run converges.">
         <defs>
           <marker id="ah-n"   viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0.5 L8,4 L0,7.5 Z"/></marker>
           <marker id="ah-nxt" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0.5 L8,4 L0,7.5 Z"/></marker>
+          <marker id="a-gh" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0.5 L8,4 L0,7.5 Z"/></marker>
         </defs>
 
         <!-- entry -->
         <rect class="entry-pill" x="30" y="18" width="420" height="30" rx="4"/>
-        <text class="entry-t" x="44" y="38">POST /workflows/segment-lifecycle/allocate-segment</text>
+        <text class="entry-t" x="44" y="38">POST …/allocate-segment · cluster + values_branch</text>
         <path class="f-arrow" d="M114,48 V136" marker-end="url(#ah-n)"/>
 
         <!-- stage 1 -->
@@ -87,7 +90,7 @@
         <text class="stepno-t" x="52" y="168">1</text>
         <text class="f-title" x="48" y="202">Resolve site</text>
         <text class="f-sys nxt" x="48" y="222">values repo · SM</text>
-        <text class="f-det" x="48" y="240">from the file path</text>
+        <text class="f-det" x="48" y="240">file on the branch</text>
 
         <path class="f-arrow" d="M202,198 H234" marker-end="url(#ah-n)"/>
 
@@ -116,21 +119,18 @@
         <circle class="stepno nxt" cx="676" cy="164" r="12"/>
         <text class="stepno-t" x="676" y="168">4</text>
         <text class="f-title" x="672" y="202">Push values</text>
-        <text class="f-sys nxt" x="672" y="222">git · day1 repo</text>
+        <text class="f-sys nxt" x="672" y="222">git · pipeline branch</text>
         <text class="f-det" x="672" y="240">vlanId + dhcp_values</text>
 
-        <path class="f-arrow" d="M826,198 H858" marker-end="url(#ah-n)"/>
+        <!-- after the run: not a stage, drawn dashed -->
+        <path class="arw ghost" d="M826,198 H858" marker-end="url(#a-gh)"/>
+        <text class="hd mid" x="946" y="128">AFTER THE RUN</text>
 
-        <!-- stage 5 -->
-        <path class="f-arrow nxt" d="M908,138 C896,96 1000,96 988,138" marker-end="url(#ah-nxt)"/>
-        <text class="loop-l" x="948" y="88">poll ≤ 15 min, every 15 s</text>
-
-        <rect class="fbox nxt" x="862" y="142" width="168" height="112" rx="5"/>
-        <circle class="stepno nxt" cx="884" cy="164" r="12"/>
-        <text class="stepno-t" x="884" y="168">5</text>
-        <text class="f-title" x="880" y="202">Await DHCP scope</text>
-        <text class="f-sys nxt" x="880" y="222">DHCP API · read-only</text>
-        <text class="f-det" x="880" y="240">Crossplane converges</text>
+        <rect class="box ghost" x="862" y="142" width="168" height="112" rx="5"/>
+        <text class="f-title" x="880" y="182">Merge to main</text>
+        <text class="s" x="880" y="204">human, after the</text>
+        <text class="s" x="880" y="218">pipeline finishes</text>
+        <text class="s" x="880" y="240">Argo → Crossplane → scope</text>
 
         <!-- failure strip -->
         <rect class="failstrip" x="30" y="282" width="1000" height="34" rx="4"/>
@@ -140,8 +140,9 @@
     </div>
     <div class="diagram-caption">
       <span class="swatch sm"><i></i>Segments Manager</span>
-      <span class="swatch nxt"><i></i>git / DHCP stack (Argo CD → Crossplane → DHCP API)</span>
-      <span>Stages 1&#8211;5 all run inside one Temporal workflow; each is a retried activity.</span>
+      <span class="swatch nxt"><i></i>git · the day1 values repo</span>
+      <span>Stages 1&#8211;4 run inside one Temporal workflow; each is a retried activity. The dashed box is
+      not part of the run.</span>
     </div>
 
     <h3 style="margin:40px 0 10px">The same run, in detail</h3>
@@ -162,7 +163,9 @@
           <p>Runs before anything is touched. This workflow allocates <b>HC segments only</b>; any other type
           fails immediately with <code>UnsupportedSegmentType</code>. Without the gate a non-HC run would still
           die — only hostedCluster files are named <code>&lt;cluster&gt;.yaml</code> — but as a misleading
-          <code>ClusterFileNotFoundError</code>. Future segment types get their own functions when they arrive.</p>
+          <code>ClusterFileNotFoundError</code>. Future segment types get their own functions when they arrive.
+          A run with no <code>values_branch</code> fails here too, as <code>ValuesBranchMissing</code> — the API
+          requires one, and there is no configured fallback that would quietly push to <code>main</code>.</p>
         </div>
       </div>
 
@@ -175,16 +178,19 @@
             <span class="phase">phase <b>resolving-site</b></span>
           </div>
           <p>There is deliberately <b>no <code>site</code> input</b>. The workflow shallow-clones the day1 values
-          repo and requires <em>exactly one</em> <code>sites/&lt;site&gt;/**/&lt;cluster&gt;.yaml</code>; the site is
+          repo <em>at the run's branch</em> — a new cluster's file exists only there until the merge — and
+          requires <em>exactly one</em> <code>sites/&lt;site&gt;/**/&lt;cluster&gt;.yaml</code>; the site is
           the path segment under <code>sites/</code>, cross-checked against the Segments Manager's site list.
           The repo layout is the source of truth — a caller can never claim a site the cluster does not live in.</p>
           <div class="calls">
             <div class="call sm"><span class="verb">GET</span><span class="path">/api/sites <em>· the cross-check list</em></span></div>
-            <div class="call nxt"><span class="verb">GIT</span><span class="path">clone --depth 1 $DAY1_REPO_URL <em>· fresh temp clone, always discarded</em></span></div>
+            <div class="call nxt"><span class="verb">GIT</span><span class="path">ls-remote refs/heads/&lt;values_branch&gt; → clone --depth 1 --branch &lt;values_branch&gt; <em>· fresh temp clone, always discarded</em></span></div>
           </div>
-          <p class="note">Zero matches → <code>ClusterFileNotFoundError</code>; more than one →
-          <code>AmbiguousClusterFileError</code>; a site the Segments Manager doesn't know →
-          <code>UnknownSite</code>. All three fail the run before anything is allocated.</p>
+          <p class="note">A branch the repo doesn't have → <code>ValuesBranchNotFoundError</code> (checked with
+          <code>ls-remote</code> first, so a typo fails instead of retrying forever as a clone error); zero matches →
+          <code>ClusterFileNotFoundError</code>; more than one → <code>AmbiguousClusterFileError</code>; a site the
+          Segments Manager doesn't know → <code>UnknownSite</code>. All fail the run before anything is
+          allocated.</p>
         </div>
       </div>
 
@@ -239,7 +245,10 @@
             <h3>append_allocation_to_cluster_values</h3>
             <span class="phase">phase <b>updating-values-repo</b></span>
           </div>
-          <p>Fresh clone, append the marker block (see below), commit, push to <code>main</code>.
+          <p>Fresh clone of the run's branch, append the marker block (see below), commit with
+          <code>[skip ci]</code>, push to <b>the same branch</b> — never <code>main</code>. The marker matters:
+          the day1 pipeline runs on every non-main push, so without it our push would start a second pipeline
+          that re-runs the allocator.
           <b>Safe to run twice:</b> a marker block already recording this <code>vlanId</code> on this
           <code>network</code> is a no-op success (<code>values_updated:&nbsp;false</code>, nothing pushed) —
           the comparison is the <em>allocation</em>, not the block's text, so a cluster whose scope an operator
@@ -248,37 +257,27 @@
           key some human wrote without the marker — is a hard <code>ClusterValuesConflictError</code>, because a
           duplicate top-level YAML key silently discards the first block. A rejected non-fast-forward push simply retries from a fresh clone and converges.</p>
           <div class="calls">
-            <div class="call nxt"><span class="verb">GIT</span><span class="path">clone → append → commit → push origin main <em>· token scrubbed from every error</em></span></div>
+            <div class="call nxt"><span class="verb">GIT</span><span class="path">clone → append → commit [skip ci] → push origin &lt;values_branch&gt; <em>· token scrubbed from every error</em></span></div>
           </div>
         </div>
       </div>
 
-      <!-- 5 wait -->
+      <!-- after the run -->
       <div class="step wait">
         <div class="marker">⏸</div>
         <div class="card">
           <div class="card-title">
-            <h3>Wait for the DHCP scope</h3>
-            <span class="phase">phase <b>awaiting-dhcp-scope</b></span>
+            <h3>After the run — not part of it</h3>
+            <span class="phase">no phase</span>
           </div>
-          <p>Argo CD syncs the commit; the hostedclusters chart renders a Crossplane <code>Request</code>;
-          Crossplane creates the scope on the DHCP server. The workflow <b>observes, read-only</b> — polling the
-          DHCP API on durable timers until the scope exists with exactly the exclusions it wrote.</p>
-          <div class="loopbox">
-            <div class="loop-title">Poll loop — machine convergence, so the wait is BOUNDED</div>
-            <ol>
-              <li><code>get_dhcp_scope</code> → <code>GET /api/v1/scopes/{network}</code>; a 404 is a normal “not yet”, never an error.</li>
-              <li>Scope found <em>and</em> its <code>exclusions</code> match the block → done. (The exclusions, not
-              the range: the range is the DHCP API's own <code>.1-.253</code> derivation, so matching it would only
-              confirm that service agrees with itself.)</li>
-              <li>Every 15 s on a durable <code>workflow.sleep</code> timer, up to <b>15 minutes</b>.</li>
-              <li>Deadline exceeded → <code>DhcpScopeNotConverged</code>. The commit stands — check the Argo Application and the Crossplane Request.</li>
-            </ol>
-          </div>
-          <p class="note"><b>Why poll instead of POSTing the scope?</b> Posting would make two writers for one
-          resource: Crossplane keeps reconciling from git, so any disagreement (exclusion order, the derived
-          gateway) becomes a PUT every 60 seconds, forever. Read-only observation keeps git the single source of
-          truth, Crossplane the only writer — and needs no write credential.</p>
+          <p>The pipeline that started the run waits for it to complete, generates the MachineConfig files from
+          the recorded <code>vlanId</code> and finishes. A human then merges the branch to <code>main</code>;
+          Argo&nbsp;CD (which reads <code>main</code> only) renders the Crossplane <code>Request</code>, and
+          Crossplane creates the DHCP scope.</p>
+          <p class="note"><b>Why the run doesn't wait for the scope.</b> It used to — a bounded read-only poll of
+          the DHCP API. But the scope needs the merge, the merge comes after the pipeline, and the pipeline is
+          waiting on this run: a deadlock, not a slow wait. So the run ends at the push. When a create-cluster
+          workflow owns the merge, it will verify the scope after that step.</p>
         </div>
       </div>
 
@@ -290,8 +289,8 @@
             <h3>Done</h3>
             <span class="phase">phase <b>completed</b></span>
           </div>
-          <p>The result carries the segment, VLAN, EPG, the commit sha (or <code>null</code> on a no-op re-run),
-          and <code>dhcp_scope_ready: true</code>.</p>
+          <p>The result carries the segment, VLAN, EPG, the branch the block landed on, and the commit sha (or
+          <code>null</code> on a no-op re-run). This phase is reached as soon as the push succeeds.</p>
         </div>
       </div>
 
@@ -380,12 +379,15 @@ dhcp_values:
           <span class="ret">202 · 409 if already running</span>
         </div>
         <div class="endpoint-body">
-          <p>The body names the <b>cluster</b>, nothing else — the site is derived from the values repo, the
-          segment is whatever the Segments Manager reserves.</p>
+          <p>The body names the <b>cluster</b> and the <b>branch</b> its values file lives on — the site is
+          derived from the values repo, the segment is whatever the Segments Manager reserves. The branch is
+          required: a body without one is a <b>422</b>, as is an unknown field or a branch name git could
+          misread (a leading <code>-</code>, <code>..</code>, whitespace).</p>
           <pre><span class="c">// request</span>
 {
-  "cluster": "ocp4-prep-herzi-site1-a",
-  "type":    "HC"                  <span class="c">// optional — HC is the default and the only supported value</span>
+  "cluster":       "ocp4-prep-herzi-site1-a",
+  "values_branch": "feature/ocp4-prep-herzi-site1-a", <span class="c">// required — the pipeline's $CI_COMMIT_BRANCH</span>
+  "type":          "HC"                                <span class="c">// optional — HC is the default and the only supported value</span>
 }
 
 <span class="c">// 202 response</span>
@@ -393,7 +395,8 @@ dhcp_values:
           <p class="note"><b>The id carries the type on purpose.</b> Allocation is scoped by
           <code>(cluster, site, type)</code> — one cluster can hold one segment per type at a site — so a
           type-less id would make two legitimate allocations collide. Re-triggering while a run is in flight
-          answers <b>409</b>.</p>
+          answers <b>409</b>. The branch is deliberately <em>not</em> in the id: the Segments Manager allocates per
+          cluster whatever the branch, so two branches for one cluster must collide on one run.</p>
         </div>
       </div>
 
@@ -409,16 +412,68 @@ dhcp_values:
           <pre><span class="c">// RUNNING</span>
 { "workflow_id": "allocate-segment-HC-ocp4-prep-herzi-site1-a",
   "workflow_type": "AllocateSegmentWorkflow", "status": "RUNNING",
-  "progress": { "phase": "awaiting-dhcp-scope" } }
+  "progress": { "phase": "updating-values-repo" } }
 
 <span class="c">// COMPLETED</span>
 { …, "status": "COMPLETED",
   "result": { "cluster": "ocp4-prep-herzi-site1-a", "site": "site1", "type": "HC",
               "vlan_id": 23, "segment": "10.20.90.0/24", "epg_name": "EPG_HC_23",
-              "commit_sha": "8f2…", "values_updated": true, "dhcp_scope_ready": true } }</pre>
+              "values_branch": "feature/ocp4-prep-herzi-site1-a",
+              "commit_sha": "8f2…", "values_updated": true } }</pre>
         </div>
       </div>
 
+    </div>
+  </section>
+
+  <!-- ======================= THE PIPELINE ======================= -->
+  <section id="pipeline">
+    <div class="sec-head">
+      <div class="eyebrow">Where it runs</div>
+      <h2>A step inside the day1 pipeline</h2>
+      <p class="lede">Until a create-cluster workflow exists, allocate-segment is called by the day1 values repo's
+      GitLab pipeline, in place of its old in-house VLAN allocator. That pipeline runs on a temporary branch only,
+      never on <code>main</code> — so the run takes the pipeline's branch and records the allocation there.</p>
+    </div>
+
+    <div class="endpoint">
+      <div class="endpoint-head">
+        <span class="method">CI</span>
+        <span class="path">generate_mc_files · for each changed hostedClusters/&lt;cluster&gt;.yaml</span>
+      </div>
+      <div class="endpoint-body">
+        <ol>
+          <li><code>POST /workflows/segment-lifecycle/allocate-segment</code> with
+          <code>{"cluster": "&lt;file stem&gt;", "values_branch": "$CI_COMMIT_BRANCH"}</code>.</li>
+          <li><b>202</b> → poll <code>GET /workflows/runs/{workflow_id}</code> until <code>COMPLETED</code>; fail the
+          job on <code>FAILED</code>, <code>CANCELED</code> or <code>TERMINATED</code>, printing <code>error</code>
+          and the last <code>progress.phase</code>. <b>409</b> → a run is already in flight; its id is
+          <code>allocate-segment-HC-&lt;cluster&gt;</code>, so poll that.</li>
+          <li><code>git pull --ff-only origin "$CI_COMMIT_BRANCH"</code> before generating the MachineConfig
+          files, so the workspace carries the block and its <code>vlanId</code>.</li>
+        </ol>
+        <p class="note" style="margin-top:12px">Re-running the pipeline re-POSTs and converges
+        (<code>values_updated: false</code>). The workflow's commit carries <code>[skip ci]</code>, so it never
+        triggers a pipeline of its own.</p>
+      </div>
+    </div>
+
+    <div class="grid-2" style="margin-top:16px">
+      <div class="panel warn">
+        <h3>The later push-back job must expect our commit</h3>
+        <p style="font-size:var(--fs-14);color:var(--ink-2)">The pipeline's own commit-and-push step checks out
+        the commit the pipeline started from, overlays the edited cluster files from artifacts, then runs
+        <code>git pull</code> — which refuses, because the workflow's commit touched the same file. Pull with
+        <code>--autostash</code>, or <code>git fetch</code> + <code>git reset --soft FETCH_HEAD</code> before the
+        <code>git add</code>.</p>
+      </div>
+      <div class="panel">
+        <h3>One remote for both</h3>
+        <p style="font-size:var(--fs-14);color:var(--ink-2)">The worker pushes to <code>DAY1_REPO_URL</code>; the
+        pipeline pulls from its own <code>origin</code>. They must be the same repository, and that host must
+        accept a token as the password with <code>x-access-token</code> as the user name. If they differ, the fix
+        is the chart's <code>config.day1RepoUrl</code>, not code.</p>
+      </div>
     </div>
   </section>
 
@@ -428,9 +483,8 @@ dhcp_values:
       <div class="eyebrow">When things go wrong</div>
       <h2>Outages are out-waited. Real errors stop the run.</h2>
       <p class="lede">Same rule as every workflow here: <b>retries are unbounded</b> (1 s → doubling → capped at
-      1 min), so a Segments Manager, git-remote or DHCP-API outage never fails a run. Retrying stops <em>only</em>
-      for errors explicitly classified as permanent — with one deliberate exception: the DHCP wait itself is
-      bounded, because it is machine convergence, not human approval.</p>
+      1 min), so a Segments Manager or git-remote outage never fails a run. Retrying stops <em>only</em>
+      for errors explicitly classified as permanent.</p>
     </div>
 
     <div class="grid-2">
@@ -438,6 +492,8 @@ dhcp_values:
         <h3>Classified as permanent — these fail the run</h3>
         <ul>
           <li><code>UnsupportedSegmentType</code> — not HC (workflow-raised, before anything runs)</li>
+          <li><code>ValuesBranchMissing</code> — no <code>values_branch</code> on the run (only possible outside the API)</li>
+          <li><code>ValuesBranchNotFoundError</code> — the values repo has no such branch</li>
           <li><code>ClusterFileNotFoundError</code> — no <code>&lt;cluster&gt;.yaml</code> in the values repo</li>
           <li><code>AmbiguousClusterFileError</code> — more than one <code>&lt;cluster&gt;.yaml</code></li>
           <li><code>UnknownSite</code> — the file's site isn't in <code>GET /api/sites</code></li>
@@ -446,17 +502,15 @@ dhcp_values:
           <li><code>AllocationNotConfirmed</code> — the read-back didn't match the allocation</li>
           <li><code>ClusterValuesConflictError</code> — the file already carries a different allocation</li>
           <li><code>UnsupportedSegmentPrefix</code> / <code>InvalidSegmentCidr</code> — the pool handed back a non-/24</li>
-          <li><code>DhcpScopeNotConverged</code> — the bounded 15-minute DHCP wait expired</li>
           <li><code>SegmentsManagerAuthError</code> · <code>SegmentNotFoundError</code></li>
         </ul>
       </div>
       <div class="panel">
         <h3>Transient by classification</h3>
-        <p style="font-size:var(--fs-14);color:var(--ink-2)"><code>ValuesRepoGitError</code> (any git failure,
-        including a rejected non-fast-forward push — the retry re-clones and converges) and
-        <code>DhcpApiError</code> (the DHCP API failing; a scope that simply doesn't exist yet is NOT an error).
-        Both retry forever; an unclassified permanent error shows as a run stuck <b>RUNNING</b> in the Temporal
-        UI — the fix is to classify it, not to add a deadline.</p>
+        <p style="font-size:var(--fs-14);color:var(--ink-2)"><code>ValuesRepoGitError</code> — any git failure
+        other than a missing branch: an unreachable remote, a rejected non-fast-forward push (the retry re-clones
+        and converges). It retries forever; an unclassified permanent error shows as a run stuck
+        <b>RUNNING</b> in the Temporal UI — the fix is to classify it, not to add a deadline.</p>
         <h3 style="margin-top:6px">Nothing to clean up</h3>
         <p style="font-size:var(--fs-14);color:var(--ink-2)">On failure or cancellation there is deliberately no
         compensating cleanup: the allocation is kept — a re-run idempotently reclaims it and converges the git
@@ -472,12 +526,13 @@ dhcp_values:
       <h2>Inputs, phases, and the knobs an operator can turn</h2>
     </div>
 
-    <h3 style="margin-bottom:10px">Request body — <code>AllocateSegmentInput</code></h3>
+    <h3 style="margin-bottom:10px">Request body — <code>AllocateSegmentRequest</code></h3>
     <div class="table-scroll">
       <table>
         <thead><tr><th>Field</th><th>Type</th><th>Rules</th><th>What it's for</th></tr></thead>
         <tbody>
           <tr><td class="k">cluster</td><td class="k">str</td><td class="muted">non-empty</td><td class="muted">The hosted cluster's name — must match its values file name in the day1 repo.</td></tr>
+          <tr><td class="k">values_branch</td><td class="k">str</td><td class="muted">required; a plain ref name</td><td class="muted">The day1 repo branch the cluster's file lives on and the block is pushed to — the pipeline's <code>$CI_COMMIT_BRANCH</code>. Never <code>main</code> in practice: the pipeline doesn't run there.</td></tr>
           <tr><td class="k">type</td><td class="k">enum</td><td class="muted">default <code>HC</code>; only <code>HC</code> supported</td><td class="muted">The type the segment is allocated <em>as</em> — the only place a type enters the system. Scopes the allocation and the workflow id; any other value fails up front.</td></tr>
         </tbody>
       </table>
@@ -494,8 +549,7 @@ dhcp_values:
           <tr><td class="k">resolving-site</td><td class="muted">Cloning the values repo + fetching the site list</td><td class="muted">seconds</td></tr>
           <tr><td class="k">allocating-segment</td><td class="muted">Reserving the segment in the Segments Manager</td><td class="muted">seconds</td></tr>
           <tr><td class="k">verifying-allocation</td><td class="muted">Reading the allocation back</td><td class="muted">seconds</td></tr>
-          <tr><td class="k">updating-values-repo</td><td class="muted">Clone → append → commit → push</td><td class="muted">seconds</td></tr>
-          <tr><td class="k">awaiting-dhcp-scope</td><td class="muted">Polling the DHCP API — <b>bounded, ≤ 15 min</b></td><td class="muted">1–5 min (Argo sync + Crossplane ~60 s reconcile)</td></tr>
+          <tr><td class="k">updating-values-repo</td><td class="muted">Clone the branch → append → commit → push</td><td class="muted">seconds</td></tr>
           <tr><td class="k">completed</td><td class="muted">Done; <code>result</code> is available</td><td class="muted">—</td></tr>
         </tbody>
       </table>
@@ -507,9 +561,8 @@ dhcp_values:
         <thead><tr><th>Key</th><th>Lives in</th><th>Effect</th></tr></thead>
         <tbody>
           <tr><td class="k">DHCP_EXCLUSION_OCTET_RANGES</td><td class="muted">segment-lifecycle-config</td><td class="muted">The ONE DHCP policy knob, per segment type (each type reserves a different slice of its /24; HC required). Validated at worker startup; a bad edit crash-loops the pod, never mis-renders a scope.</td></tr>
-          <tr><td class="k">DAY1_REPO_URL · DAY1_BRANCH</td><td class="muted">segment-lifecycle-config</td><td class="muted">Which repo and branch hold the cluster values files.</td></tr>
+          <tr><td class="k">DAY1_REPO_URL</td><td class="muted">segment-lifecycle-config</td><td class="muted">Which repo holds the cluster values files. The branch is not a knob: every run names its own.</td></tr>
           <tr><td class="k">DAY1_GIT_TOKEN</td><td class="muted">Secret (day1-git-token)</td><td class="muted">Push credential for the values repo. Never logged — scrubbed from every git error.</td></tr>
-          <tr><td class="k">DHCP_API_URL · DHCP_API_TOKEN</td><td class="muted">segment-lifecycle-config / Secret</td><td class="muted">Where the DHCP scope API lives; the read token for the convergence poll.</td></tr>
           <tr><td class="k">SEGMENTS_MANAGER_URL · SEGMENTS_MANAGER_API_TOKEN</td><td class="muted">workflows-orchestrator-config / Secret</td><td class="muted">Shared with the rest of the domain.</td></tr>
         </tbody>
       </table>
@@ -531,8 +584,8 @@ dhcp_values:
         <h3>Re-run after completion — everything converges</h3>
         <p>The Segments Manager returns the <em>same</em> allocation (idempotent per cluster/site/type), the
         values file already records that vlan and network so nothing is pushed
-        (<code>values_updated: false</code>, <code>commit_sha: null</code>), and the DHCP scope already exists so
-        the wait finishes on the first poll. Anything an operator tuned inside the block stays as written —
+        (<code>values_updated: false</code>, <code>commit_sha: null</code>). A pipeline re-run on the same
+        branch is therefore safe. Anything an operator tuned inside the block stays as written —
         which also means a later change to the exclusion policy is never retrofitted onto an allocated
         cluster.</p>
       </div>

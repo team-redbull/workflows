@@ -54,7 +54,7 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
 
 - Driver for a **separate deployment** is **shared dependency set + RBAC/Secrets**, not the
   sub-workflow boundary. Segment-lifecycle activities live in `activities/segment_lifecycle/`
-  (one dep+cred set: Segments Manager HTTP + bearer token, day1 git push token, DHCP API).
+  (one dep+cred set: Segments Manager HTTP + bearer token, day1 git push token).
 - Keep `shared/interfaces/` signatures clean so an activity (e.g. "get segment") can be
   re-registered on another queue by a future sub-workflow without moving code.
 - **Brain is ONE deployment for every domain**, not one per workflow — the `workflows-orchestrator`
@@ -100,7 +100,7 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
 ## 3. Deployment-target agnostic
 
 - No orchestrator code knows kind vs OpenShift — all endpoints come from env vars (`TEMPORAL_HOST`,
-  `SEGMENTS_MANAGER_URL`, `DAY1_REPO_URL`, `DHCP_API_URL`, ...). Same images run anywhere; only Helm
+  `SEGMENTS_MANAGER_URL`, `DAY1_REPO_URL`, ...). Same images run anywhere; only Helm
   `values.yaml` (`config.*`) differs.
 - Local kind reaches host services via `host.docker.internal` — that string lives ONLY in Helm
   values, never in code.
@@ -130,13 +130,34 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   **convert-segment was removed — do not re-add it** (with `PUT /api/segments/type`, its models, its
   queue and `SegmentConversionConflictError`). The per-type things that remain are all about an
   ALLOCATION: the allocate id, the SM's (cluster, site, type) idempotency, the DHCP exclusion policy.
-- **The DHCP scope API is READ-ONLY to us** (`DHCP_API_URL`): allocate-segment GETs a scope to
-  observe Crossplane's convergence and never writes one. Git is the single source of truth and
-  Crossplane the only writer — posting the scope ourselves would make two writers for one resource.
-  404 is a normal answer (not converged yet), not an error.
 - **The day1 values repo is reached by git subprocess** (`DAY1_REPO_URL`), never a Python git
   dependency — see §5.
-- **THE FIREWALL FLOW IS GONE. Do not re-add it.** There used to be a fourth dependency here: the
+- **allocate-segment writes to the BRANCH THE RUN NAMES, and ends at the push.** Until a
+  create-cluster workflow exists, allocate-segment is a step INSIDE the day1 values repo's GitLab
+  pipeline, which runs only on non-`main` branches: a human pushes a temp branch with the new
+  `<cluster>.yaml`, the pipeline calls allocate-segment (replacing its old in-house VLAN allocator),
+  waits for the run, generates the MachineConfig files from the recorded `vlanId`, and a human merges
+  afterwards. So `values_branch` is a PER-RUN input (the pipeline's `$CI_COMMIT_BRANCH`), never
+  config — `DAY1_BRANCH` was removed, and there is no fallback, because a fallback pushes to `main`
+  by omission. Required on the API edge (`AllocateSegmentRequest`, which also refuses option-shaped
+  or malformed names); a branch the remote lacks is `ValuesBranchNotFoundError` (non-retryable); our
+  commit carries `[skip ci]` or it would start a second pipeline that re-runs the allocator. The
+  branch is NOT in the workflow id: the SM allocates per (cluster, site, type) whatever the branch,
+  so two branches for one cluster must collide on one run. A future create-cluster workflow keeps
+  this shape — it merges AFTER its allocate-segment child returns.
+- **THE DHCP SCOPE WAIT IS GONE. Do not re-add it to allocate-segment.** After the push, the run used
+  to poll the DHCP scope API (`DHCP_API_URL`, `GET /api/v1/scopes/{network}`, anonymous, 404 = not
+  yet) every 15s for up to 15 min until the live scope carried the exclusions it had written, then
+  fail `DhcpScopeNotConverged` (`get_dhcp_scope`, `DhcpScopeState`, `DhcpApiError`,
+  `dhcp_scope_ready`, phase `awaiting-dhcp-scope`). It left because Argo CD reads the day1 repo's
+  `main` ONLY (`hcAppset.yaml` pins `revision`/`targetRevision: main`): the scope appears only after
+  the merge, the merge comes after the pipeline, and the pipeline is waiting on this run — a
+  deadlock, not a slow wait. The principles it embodied still hold: git is the single source of
+  truth and Crossplane the only writer (we never POST a scope), and convergence is judged on the
+  EXCLUSIONS we wrote, never the DHCP API's own derived range. When create-cluster verifies the scope
+  after ITS merge step, lift the removed code (`git log -S get_dhcp_scope`) into that workflow,
+  bounded deadline and all.
+- **THE FIREWALL FLOW IS GONE. Do not re-add it.** There used to be another dependency here: the
   **next** connectivity service, another team's air-gapped firewall approver. initialize-segment
   discovered same-site peers, submitted open-rules requests (plus MCE↔BMC rules from a
   `SITE_NETWORKS` ConfigMap), mirrored the pending request ids into the Segments Manager UI, polled
@@ -184,11 +205,11 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
 - **Polling loops:** `workflow.sleep(...)` is a durable replay-safe server-side timer (never
   `time.sleep`). Changing poll constants is a non-deterministic change for in-flight runs.
   Bounded vs unbounded is a MEANING, not a style. MACHINE convergence gets a real deadline and fails
-  loudly: allocate-segment's DHCP scope wait (Argo sync + Crossplane reconcile) is 15 min on a 15s
-  durable timer, then `DhcpScopeNotConverged`. A wait on a HUMAN gets no deadline ever — back off to
-  a capped interval and `continue_as_new` every N cycles so history stays bounded. allocate-segment
-  is the ONLY workflow that polls today; the unbounded half of the rule is currently unused (it was
-  initialize-segment's firewall-approval wait, §4) and stands for the next workflow that needs it.
+  loudly (precedent: allocate-segment's removed DHCP scope wait, 15 min on a 15s durable timer, then
+  `DhcpScopeNotConverged` — §4). A wait on a HUMAN gets no deadline ever — back off to a capped
+  interval and `continue_as_new` every N cycles so history stays bounded (precedent:
+  initialize-segment's removed firewall-approval wait, §4). NO workflow polls today; both halves of
+  the rule stand for the next workflow that needs one.
 - **httpx timeout < activity `start_to_close_timeout`** (currently 60s < 90s): give every
   `httpx.AsyncClient` an explicit `timeout=` below the activity timeout so a network hang fails the call
   and frees the worker before Temporal reaps the activity.
@@ -200,7 +221,11 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   a fresh `TemporaryDirectory` so retries start clean. The push token is injected into the clone URL in
   memory only and SCRUBBED from every error message BEFORE the exception is constructed — activity
   errors are recorded verbatim in Temporal history and the UI, so redacting at the logging layer alone
-  is too late.
+  is too late. The branch is a parameter from an unauthenticated API, so every clone first runs
+  `git ls-remote --exit-code --heads <url> refs/heads/<branch>` (the FULL ref — a bare pattern
+  tail-matches): exit 2 is the deterministic `ValuesBranchNotFoundError`, any other failure the
+  retryable `ValuesRepoGitError` (unreachable is not missing). Without it a mistyped branch would
+  retry forever as a clone failure.
 - **Cross-workflow orchestration:** a workflow that spawns sibling runs starts them as DETACHED
   child workflows — `workflow.start_child_workflow(...,
   parent_close_policy=ParentClosePolicy.ABANDON)` on the sibling's workflow queue, catching
@@ -232,7 +257,15 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   included), which is what keeps the gate honest. (b) A model decoded from history (workflow input,
   activity input/result) never gets `extra="forbid"` — a removed field still sits in old payloads and
   would wedge the run. Strictness about unknown fields goes on an API-edge subclass instead
-  (`InitializeSegmentRequest` in the router, refusing the retired `type`).
+  (`InitializeSegmentRequest` in the router, refusing the retired `type`). (c) A field ADDED to a
+  model decoded from history defaults to `None` there and is made REQUIRED only on the edge subclass;
+  the reader refuses `None` with a named error rather than guessing (`values_branch`: optional on
+  `AllocateSegmentInput`/`ClusterValuesAppendRequest`/`ClusterFileLookupRequest`, required on
+  `AllocateSegmentRequest`, `ValuesBranchMissing` from the workflow and the activities). (d) Changing
+  an activity's argument from a primitive to a model means a lagging limb cannot decode it — the SDK
+  retries that, so runs in the brain-before-limb window are DELAYED; prefer it when keeping the old
+  shape would let the old limb act on the wrong input and FAIL them (`locate_cluster_file(cluster:
+  str)` would have searched `main` and raised `ClusterFileNotFoundError`).
 
 ## 6. Idempotency (required for all activities)
 
@@ -282,8 +315,8 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   always-present `workflows-orchestrator` brain release) holds only shared values — `TEMPORAL_HOST`,
   `TEMPORAL_NAMESPACE`, `SEGMENTS_MANAGER_URL`. `<domain>-config` (owned by that domain's
   chart) holds its own endpoints/policy — e.g. `segment-lifecycle-config` = the allocate-segment keys
-  (`DAY1_REPO_URL/BRANCH`, `DHCP_EXCLUSION_OCTET_RANGES`, `DHCP_API_URL`; the push credential in the
-  `day1-git-token` Secret — the DHCP scope API needs none, its GETs are anonymous). A
+  (`DAY1_REPO_URL`, `DHCP_EXCLUSION_OCTET_RANGES`; the push credential in the `day1-git-token`
+  Secret). A
   domain worker mounts BOTH + its Secrets, so the
   brain release must install before any limb (else `CreateContainerConfigError` on the missing
   global ConfigMap) — and the chart must ship the new keys BEFORE (or with) an image that requires
@@ -291,8 +324,8 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
 - **`shared/settings.py`** groups: `TemporalSettings` (workers + api.py) and
   `SegmentLifecycleActivitySettings` (activity worker only). Field names = Helm ConfigMap/Secret keys
   lowercased — keep aligned with redbull-platform's `gitops/charts/workflows-orchestrator/templates/config.yaml`
-  (global) and `gitops/charts/segment-lifecycle-worker/templates/config.yaml` (day1 + DHCP keys +
-  the credential Secret). Which ConfigMap
+  (global) and `gitops/charts/segment-lifecycle-worker/templates/config.yaml` (day1 URL + DHCP
+  policy + the credential Secret). Which ConfigMap
   a key lives in is INDEPENDENT of which settings class declares it (pydantic reads the flat merged pod
   env — `SEGMENTS_MANAGER_URL` sits in the global ConfigMap yet stays a
   `SegmentLifecycleActivitySettings` field; the brain ignores extras via `extra="ignore"`). Do NOT
@@ -320,9 +353,10 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   which is what the real day1 files do, and what production expects. Deriving bounds here instead
   would duplicate a derivation that already exists in the DHCP API, its CI validator and the chart,
   and all three would have to agree forever. It also makes "no exclusions" a non-case rather than a
-  special one: the block is just a network, exactly like a hand-written minimal cluster file. The
-  convergence poll therefore compares the live scope's EXCLUSIONS against what the run pushed —
-  comparing the derived range would only confirm the DHCP API agrees with itself. `build_dhcp_values` rejects any non-/24 segment with `UnsupportedSegmentPrefix`;
+  special one: the block is just a network, exactly like a hand-written minimal cluster file. Anything
+  that verifies a live scope (the removed DHCP wait did; a future create-cluster step will) therefore
+  compares its EXCLUSIONS against what was pushed — comparing the derived range would only confirm
+  the DHCP API agrees with itself. `build_dhcp_values` rejects any non-/24 segment with `UnsupportedSegmentPrefix`;
   supporting another mask is a deliberate refactor that must also emit `subnetMask` + `gateway`
   (the DHCP stack derives the `.254` gateway for a /24 only).
 
@@ -340,7 +374,9 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   the full segment definition; poll `GET /workflows/runs/{workflow_id}` for progress/result. The
   `/bulk` variant takes a list and starts ONE WORKFLOW PER SEGMENT (never one batch workflow — each
   segment has its own dedup id, its own run status and its own failure), answering 202 with a
-  per-item report rather than a single pass/fail code.
+  per-item report rather than a single pass/fail code. `POST .../allocate-segment` is normally
+  called by the day1 pipeline (`{"cluster", "values_branch": "$CI_COMMIT_BRANCH"}`), which then
+  polls the same runs endpoint until COMPLETED (§4).
 - In-cluster the API is `workflows-orchestrator-api` (ClusterIP:8080) plus an OpenShift **Route**
   (`workflowsApi.route.*` in the `workflows-orchestrator` chart) — it needs a hostname because starting a workflow
   is now an operator action. NOTE: `workflow_domains/api.py` has NO auth of its own; anyone who can reach

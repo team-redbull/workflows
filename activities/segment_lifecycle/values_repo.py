@@ -19,6 +19,13 @@ Rules this module enforces:
     so a Temporal retry starts clean; a rejected non-fast-forward push raises
     the retryable ValuesRepoGitError and the retry re-clones and re-applies,
     converging with no merge special-casing.
+  * The branch is a PARAMETER — the one the run names (the day1 pipeline's own
+    branch), never configuration. It comes from an unauthenticated API, so no
+    git command sees it before _require_branch has accepted it: ls-remote gets
+    it only as the full ref refs/heads/<branch>, and clone/push get it only
+    after that check passed. A branch the remote does not have is the
+    deterministic ValuesBranchNotFoundError; an unreachable remote stays the
+    retryable ValuesRepoGitError.
 
 The allocation block layout lives in ONE place (_ALLOCATION_BLOCK_TEMPLATE +
 render_allocation_block), and split_marker_block is the parsing counterpart —
@@ -37,6 +44,7 @@ from shared.exceptions import (
     AmbiguousClusterFileError,
     ClusterFileNotFoundError,
     ClusterValuesConflictError,
+    ValuesBranchNotFoundError,
     ValuesRepoGitError,
 )
 from shared.models.segment_lifecycle import ClusterFileLocation, DhcpValues
@@ -44,8 +52,13 @@ from shared.models.segment_lifecycle import ClusterFileLocation, DhcpValues
 # Kept below the git activities' 180s start_to_close_timeout so a hung remote
 # fails the command and frees the worker before Temporal reaps the activity
 # (same budget rule as the HTTP clients'). The clone is the only long command;
-# the local add/commit/rev-parse and the push share the remainder comfortably.
+# the ls-remote branch check that precedes it, the local add/commit/rev-parse
+# and the push share the remainder comfortably.
 _GIT_COMMAND_TIMEOUT_SECONDS = 150.0
+
+# `git ls-remote --exit-code` exits 2 when the remote answered and holds no
+# matching ref — the one answer that means "this branch does not exist".
+_LS_REMOTE_NO_MATCHING_REF = 2
 
 MARKER = "# === Added By Segment-Allocation Workflow ==="
 
@@ -171,10 +184,14 @@ def authenticated_url(repo_url: str, token: str) -> str:
     return repo_url
 
 
-async def _run_git(args: list[str], *, cwd: Path | None, secrets: list[str]) -> str:
-    """Run one git command; raise the retryable ValuesRepoGitError on any
-    failure, with every secret scrubbed from the message BEFORE the exception
-    exists (it will be recorded in Temporal history)."""
+async def _exec_git(
+    args: list[str], *, cwd: Path | None, secrets: list[str]
+) -> tuple[int, str, str]:
+    """Run one git command and return (returncode, stdout, stderr), stderr
+    already scrubbed of every secret. A timeout raises the retryable
+    ValuesRepoGitError, its message scrubbed BEFORE the exception exists (it
+    will be recorded in Temporal history). Callers that need to tell one exit
+    code from another (ls-remote) use this; everything else uses _run_git."""
     process = await asyncio.create_subprocess_exec(
         "git",
         # TLS verification off, matching the httpx clients (activities._TLS_VERIFY):
@@ -200,19 +217,69 @@ async def _run_git(args: list[str], *, cwd: Path | None, secrets: list[str]) -> 
             f"git {_redact(' '.join(args), secrets)} timed out after "
             f"{_GIT_COMMAND_TIMEOUT_SECONDS:.0f}s"
         ) from None
-    if process.returncode != 0:
+    return (
+        process.returncode,
+        stdout.decode(errors="replace"),
+        _redact(stderr.decode(errors="replace").strip(), secrets),
+    )
+
+
+async def _run_git(args: list[str], *, cwd: Path | None, secrets: list[str]) -> str:
+    """Run one git command; raise the retryable ValuesRepoGitError on any
+    failure, with every secret scrubbed from the message BEFORE the exception
+    exists (it will be recorded in Temporal history)."""
+    returncode, stdout, stderr = await _exec_git(args, cwd=cwd, secrets=secrets)
+    if returncode != 0:
         raise ValuesRepoGitError(
             f"git {_redact(' '.join(args), secrets)} failed "
-            f"(exit {process.returncode}): "
-            f"{_redact(stderr.decode(errors='replace').strip(), secrets)}"
+            f"(exit {returncode}): {stderr}"
         )
-    return stdout.decode(errors="replace")
+    return stdout
+
+
+async def _require_branch(*, repo_url: str, branch: str, token: str) -> None:
+    """Fail deterministically when the remote has no such branch.
+
+    Without this, `git clone --branch <missing>` exits non-zero like any other
+    git failure and raises the RETRYABLE ValuesRepoGitError, so a mistyped or
+    deleted branch would retry every minute forever. ls-remote's --exit-code
+    separates the two: exit 2 means the remote answered and holds no such ref
+    (ValuesBranchNotFoundError, non-retryable); anything else — auth, DNS, a
+    missing repo, a timeout — is an unreachable remote and stays retryable.
+
+    The branch is matched as the FULL ref refs/heads/<branch>: a bare pattern
+    would tail-match, so `x` would be "found" as `feature/x`.
+    """
+    args = [
+        "ls-remote",
+        "--exit-code",
+        "--heads",
+        authenticated_url(repo_url, token),
+        f"refs/heads/{branch}",
+    ]
+    returncode, _, stderr = await _exec_git(args, cwd=None, secrets=[token])
+    if returncode == _LS_REMOTE_NO_MATCHING_REF:
+        raise ValuesBranchNotFoundError(
+            f"Branch {branch!r} does not exist in the values repo — the caller "
+            "must pass the branch its cluster file lives on (the day1 "
+            "pipeline's own branch)"
+        )
+    if returncode != 0:
+        raise ValuesRepoGitError(
+            f"git ls-remote for branch {branch!r} failed (exit {returncode}): "
+            f"{stderr}"
+        )
 
 
 async def _clone(
     *, repo_url: str, branch: str, token: str, dest: Path
 ) -> None:
-    """Shallow single-branch clone — retries always start from a clean tree."""
+    """Shallow single-branch clone — retries always start from a clean tree.
+
+    The branch is checked FIRST (_require_branch), so a missing one fails as
+    ValuesBranchNotFoundError and the clone never sees an unchecked branch.
+    Both activities clone through here, so both inherit the check."""
+    await _require_branch(repo_url=repo_url, branch=branch, token=token)
     await _run_git(
         [
             "clone",
@@ -331,6 +398,10 @@ async def append_allocation(
 
         values_file.write_text(append_block(content, block))
         secrets = [token]
+        # `[skip ci]`: the push lands on the day1 pipeline's OWN branch, and
+        # that pipeline runs on every non-main push unless the commit message
+        # says otherwise — without the marker, our push would start a SECOND
+        # pipeline that re-runs the allocator that triggered this run.
         await _run_git(["add", relative_path], cwd=clone_dir, secrets=secrets)
         await _run_git(
             [
@@ -340,7 +411,8 @@ async def append_allocation(
                 f"user.email={GIT_USER_EMAIL}",
                 "commit",
                 "-m",
-                f"chore: allocate segment for {cluster} [segment-allocation-workflow]",
+                f"chore: allocate segment for {cluster} "
+                "[segment-allocation-workflow] [skip ci]",
             ],
             cwd=clone_dir,
             secrets=secrets,

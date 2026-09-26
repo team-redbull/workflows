@@ -87,9 +87,9 @@
     <div class="stack">
       <div class="panel">
         <h3>The problem it solves</h3>
-        <p>Take a real job from this repo: allocate a network segment for a hosted cluster, verify the
-        reservation, write its DHCP block into a git repo, then <b>wait for Argo and Crossplane to turn that
-        commit into a live DHCP scope</b>. Minutes, usually. Sometimes not.</p>
+        <p>Take a real job from this repo: allocate a network segment for a hosted cluster, <b>verify the
+        reservation</b>, then write its DHCP block into a git repo — while a CI pipeline waits on the answer.
+        Seconds, usually. Sometimes a dependency is down for an hour.</p>
         <p>Write that as a normal script and every one of these sinks it: the pod restarts mid-job and the state is
         gone; a dependency is down for five minutes and the job dies; the script is run twice and allocates a
         second segment; something fails at 3am and nobody can see how far it got. You end up hand-building
@@ -460,7 +460,7 @@
         <p>A queue maps one-to-one onto a <b>deployment</b>, and what forces a separate deployment is a shared
         <b>dependency and credential set</b> — not where one workflow ends and the next begins.</p>
         <p>Every <code>segment-lifecycle</code> activity draws on the same set: a Segments Manager URL with a
-        bearer token, a git push token for the day1 values repo, and the DHCP scope API. That set is the
+        bearer token and a git push token for the day1 values repo. That set is the
         deployment, so that set is the queue. Both workflows in the domain reuse the one limb rather than
         duplicating the credentials.</p>
       </div>
@@ -584,7 +584,8 @@
         <h3>A third case: named after the external system</h3>
         <p>Some things are neither — they're defined by whoever is on the other end of the wire.
         <code>SegmentEntry</code> mirrors the Segments Manager's <code>GET /api/segments/by-segment</code> answer, and
-        <code>DhcpScopeState</code> is shaped by the DHCP API, not by the workflow that reads it.</p>
+        <code>SegmentAllocation</code> its <code>POST /api/segments/allocate</code> answer — shaped by that service,
+        not by the workflow that reads them.</p>
         <p>Anything mirroring an external endpoint keeps that endpoint's name, because renaming it here would
         silently desync two repos.</p>
       </div>

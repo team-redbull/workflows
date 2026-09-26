@@ -2,7 +2,9 @@
 
 Covers the strict-validation and error-classification contracts: 401/403 ->
 SegmentsManagerAuthError (non-retryable), 404 -> SegmentNotFoundError
-(non-retryable), everything else -> retryable SegmentsManagerError.
+(non-retryable), everything else -> retryable SegmentsManagerError. The git
+activities' plumbing is tested against real bare repos in test_values_repo.py;
+here only their branch guard, which runs before any git.
 """
 
 from __future__ import annotations
@@ -10,13 +12,17 @@ from __future__ import annotations
 import httpx
 import pytest
 import respx
+from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 
 from temporalio.contrib.pydantic import pydantic_data_converter
 
+from activities.segment_lifecycle import values_repo
 from activities.segment_lifecycle.activities import (
+    append_allocation_to_cluster_values,
     create_segment,
     get_segment,
+    locate_cluster_file,
 )
 from shared.exceptions import (
     SegmentConflictError,
@@ -25,7 +31,12 @@ from shared.exceptions import (
     SegmentsManagerError,
     SegmentValidationError,
 )
-from shared.models.segment_lifecycle import InitializeSegmentInput
+from shared.models.segment_lifecycle import (
+    ClusterFileLookupRequest,
+    ClusterValuesAppendRequest,
+    InitializeSegmentInput,
+    SegmentType,
+)
 
 SM = "http://segments-manager.test"
 
@@ -216,3 +227,45 @@ async def test_get_segment_404_is_not_found(env):
     respx.get(f"{SM}/api/segments/by-segment").mock(return_value=httpx.Response(404))
     with pytest.raises(SegmentNotFoundError):
         await env.run(get_segment, "10.0.0.0/24")
+
+
+# --- git activities: the branch guard ---
+
+
+@pytest.fixture
+def git_must_not_run(monkeypatch):
+    """Any git call fails the test: the guard must stop the request first."""
+
+    async def _forbidden(**_kwargs):
+        raise AssertionError("git ran for a request without a values_branch")
+
+    monkeypatch.setattr(values_repo, "locate_cluster_file", _forbidden)
+    monkeypatch.setattr(values_repo, "append_allocation", _forbidden)
+
+
+def _assert_values_branch_missing(exc_info) -> None:
+    error = exc_info.value
+    assert isinstance(error, ApplicationError)
+    assert error.type == "ValuesBranchMissing"
+    # Non-retryable in the activity itself: retrying cannot invent a branch,
+    # and there is no configured fallback (it would push to main).
+    assert error.non_retryable is True
+
+
+async def test_locate_cluster_file_without_a_branch_is_non_retryable(env, git_must_not_run):
+    with pytest.raises(ApplicationError) as exc_info:
+        await env.run(locate_cluster_file, ClusterFileLookupRequest(cluster="c1"))
+    _assert_values_branch_missing(exc_info)
+
+
+async def test_append_allocation_without_a_branch_is_non_retryable(env, git_must_not_run):
+    request = ClusterValuesAppendRequest(
+        cluster="c1",
+        relative_path="sites/site1/mces/m/hostedClusters/c1.yaml",
+        vlan_id=23,
+        segment="10.20.90.0/24",
+        type=SegmentType.HC,
+    )
+    with pytest.raises(ApplicationError) as exc_info:
+        await env.run(append_allocation_to_cluster_values, request)
+    _assert_values_branch_missing(exc_info)

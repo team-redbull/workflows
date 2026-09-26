@@ -96,8 +96,8 @@ class InitializeSegmentResult(BaseModel):
 
 
 class AllocateSegmentInput(BaseModel):
-    """Input to AllocateSegmentWorkflow: which cluster to allocate for, and as
-    which type.
+    """Input to AllocateSegmentWorkflow: which cluster to allocate for, as
+    which type, and on which branch of the values repo to record it.
 
     Deliberately tiny — the site is DERIVED from where the cluster's values
     file sits in the repo (sites/<site>/...), cross-checked against the
@@ -107,10 +107,19 @@ class AllocateSegmentInput(BaseModel):
     this one onto whichever segment it reserves. It defaults to HC, the only
     supported type; anything else is rejected up front with
     UnsupportedSegmentType.
+
+    `values_branch` is a PER-RUN input, never config: the day1 pipeline that
+    triggers this workflow runs on a temporary branch, and a new cluster's
+    file exists ONLY there until a human merges it. The block is pushed to
+    that branch and the run ends there. It defaults to None solely so history
+    recorded before the field existed still decodes (CLAUDE.md §5): the
+    router's AllocateSegmentRequest makes it required, and the workflow fails
+    ValuesBranchMissing if one ever arrives without it.
     """
 
     cluster: str = Field(min_length=1)
     type: SegmentType = SegmentType.HC
+    values_branch: str | None = Field(default=None, min_length=1)
 
 
 class AllocateSegmentRunArgs(BaseModel):
@@ -125,6 +134,21 @@ class AllocateSegmentProgress(BaseModel):
     """Returned by the workflow's `progress` query (surfaced by the status API)."""
 
     phase: str
+
+
+class ClusterFileLookupRequest(BaseModel):
+    """Input to locate_cluster_file: which cluster, on which values-repo
+    branch. It replaced a bare `cluster: str` argument because the branch has
+    to travel with the name — a new cluster's file exists only on the
+    pipeline branch that created it, so locating it on any other branch finds
+    nothing.
+
+    `values_branch` defaults to None only so a payload recorded before the
+    field existed still decodes; the activity refuses None as
+    ValuesBranchMissing (non-retryable) rather than guess a branch."""
+
+    cluster: str = Field(min_length=1)
+    values_branch: str | None = None
 
 
 class ClusterFileLocation(BaseModel):
@@ -204,48 +228,45 @@ class ClusterValuesAppendRequest(BaseModel):
     `type` travels with the request because the exclusion policy is PER TYPE:
     the activity selects that type's ranges out of DHCP_EXCLUSION_OCTET_RANGES.
     It is the workflow's typed input, not something re-derived from the segment
-    read-back, so the file records the policy for the type actually allocated."""
+    read-back, so the file records the policy for the type actually allocated.
+
+    `values_branch` is the branch the block is pushed to — the one the
+    workflow was started for. It defaults to None only so a payload recorded
+    before the field existed still decodes; the activity refuses None as
+    ValuesBranchMissing (non-retryable) instead of pushing anywhere else."""
 
     cluster: str = Field(min_length=1)
     relative_path: str = Field(min_length=1)
     vlan_id: int
     segment: str = Field(min_length=1)  # CIDR
     type: SegmentType
+    values_branch: str | None = None
 
 
 class ValuesCommitRef(BaseModel):
     """Outcome of the values-repo append. `changed=False` (commit_sha None)
     means the file already carried this exact allocation — a re-run — and
-    nothing was pushed. `dhcp_values` is returned in BOTH cases so the
-    workflow can poll the DHCP API for convergence against the exact values
-    the file carries."""
+    nothing was pushed. `dhcp_values` is returned in BOTH cases so the run can
+    report what the file records. (It used to feed the DHCP convergence poll,
+    since removed — CLAUDE.md §4.)"""
 
     commit_sha: str | None
     changed: bool
     dhcp_values: DhcpValues
 
 
-class DhcpScopeState(BaseModel):
-    """A read-only observation of the DHCP API: does the scope exist yet, and
-    with which exclusions? `found=False` is a normal answer while Crossplane
-    has not converged — never an error.
-
-    Exclusions rather than the distribution range: the range is the DHCP API's
-    own derivation (.1-.253), so comparing it would only confirm that service
-    agrees with itself. The exclusions are what this workflow actually wrote to
-    git, so they are what convergence is checked against."""
-
-    found: bool
-    exclusions: list[DhcpExclusion] = Field(default_factory=list)
-
-
 class AllocateSegmentResult(BaseModel):
+    """What the run did. `values_branch` is where the block landed — or, on a
+    no-op re-run, the branch that already carried it. The DHCP scope is NOT
+    part of this result: it appears only after a human merges that branch to
+    main (Argo CD reads main only), outside this run."""
+
     cluster: str
     site: str
     type: SegmentType
     vlan_id: int
     segment: str
     epg_name: str
+    values_branch: str
     commit_sha: str | None
     values_updated: bool
-    dhcp_scope_ready: bool

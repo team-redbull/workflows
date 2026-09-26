@@ -22,10 +22,11 @@ new route, not a redesign.
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from temporalio.client import Client
 from temporalio.exceptions import WorkflowAlreadyStartedError
 
@@ -81,6 +82,49 @@ class InitializeSegmentRequest(InitializeSegmentInput):
     """
 
     model_config = ConfigDict(extra="forbid")
+
+
+# Characters git refuses in a ref name, plus whitespace and control characters.
+_BRANCH_FORBIDDEN_CHARS = re.compile(r"[\x00-\x20\x7f~^:?*\[\\]")
+
+
+class AllocateSegmentRequest(AllocateSegmentInput):
+    """The allocate-segment request body: AllocateSegmentInput with the
+    values-repo branch REQUIRED and unknown fields refused.
+
+    `values_branch` is required HERE, not on AllocateSegmentInput: that model
+    is decoded from Temporal history on every replay, and a run started before
+    the field existed carries none — a required field there would fail to
+    decode it and wedge the run. At the edge, a caller omitting it gets a 422
+    now instead of a run that fails ValuesBranchMissing later; there is no
+    configured default, so nothing is ever pushed to main by omission.
+
+    The branch reaches git as an argument, from an API with no auth of its
+    own, so it is also held to a ref-name shape here: nothing starting with
+    `-` (git would read it as an option), no `..`, no whitespace, control or
+    git-forbidden characters. The activity checks the remote actually has it.
+
+    `extra="forbid"` refuses a misspelt field (`branch`, `site`) instead of
+    silently allocating as if it had not been sent.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    values_branch: str = Field(min_length=1)
+
+    @field_validator("values_branch")
+    @classmethod
+    def _values_branch_is_a_plain_ref_name(cls, value: str) -> str:
+        if value.startswith("-"):
+            raise ValueError("must not start with '-'")
+        if ".." in value:
+            raise ValueError("must not contain '..'")
+        if _BRANCH_FORBIDDEN_CHARS.search(value):
+            raise ValueError(
+                "must not contain whitespace, control characters or any of "
+                "~ ^ : ? * [ \\"
+            )
+        return value
 
 
 class BulkInitializeSegmentInput(BaseModel):
@@ -227,6 +271,9 @@ async def start_initialize_segment_bulk(
 
 
 def _allocate_segment_workflow_id(allocate_input: AllocateSegmentInput) -> str:
+    # The branch is deliberately NOT part of the id: the Segments Manager's
+    # allocation is per (cluster, site, type) whatever the branch, so two
+    # branches for one cluster must dedup onto one run and one segment.
     return allocate_segment_workflow_id(allocate_input.type, allocate_input.cluster)
 
 
@@ -236,17 +283,21 @@ def _allocate_segment_workflow_id(allocate_input: AllocateSegmentInput) -> str:
     status_code=202,
 )
 async def start_allocate_segment(
-    allocate_input: AllocateSegmentInput,
+    allocate_input: AllocateSegmentRequest,
     client: Client = Depends(get_temporal_client),
 ) -> StartWorkflowResponse:
     """Allocate a VLAN segment for a hosted cluster — returns immediately (202).
 
-    The body names the CLUSTER and the TYPE to allocate it as (default HC):
-    the site is derived from where the cluster's values file sits in the day1
-    values repo, and the segment itself is whichever Available one the
-    Segments Manager reserves — it becomes that type in the same step. Poll
-    GET /workflows/runs/{workflow_id} for progress/result; a bad cluster name
-    or an exhausted pool surfaces there as a FAILED run, not as a 4xx here.
+    The body names the CLUSTER, the values-repo BRANCH its file lives on
+    (`values_branch` — the day1 pipeline passes its own `$CI_COMMIT_BRANCH`)
+    and the TYPE to allocate it as (default HC). The site is derived from
+    where the cluster's values file sits on that branch, and the segment is
+    whichever Available one the Segments Manager reserves — it becomes that
+    type in the same step. The run completes once the block is pushed to the
+    branch; the DHCP scope follows when a human merges it to main, outside the
+    run. Poll GET /workflows/runs/{workflow_id} for progress/result; a bad
+    cluster name, a missing branch or an exhausted pool surfaces there as a
+    FAILED run, not as a 4xx here.
     """
     try:
         handle = await client.start_workflow(

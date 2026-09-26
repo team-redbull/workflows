@@ -24,6 +24,7 @@ from activities.segment_lifecycle.activities import (
     allocate_segment,
     append_allocation_to_cluster_values,
     create_segment,
+    get_inventory_segment,
     get_segment,
     get_valid_sites,
     locate_cluster_file,
@@ -56,6 +57,9 @@ async def main() -> None:
             allocate_segment,
             get_segment,
             append_allocation_to_cluster_values,
+            # install-server (server-lifecycle domain) — routed to THIS queue
+            # because the Segments Manager credential lives on this limb only.
+            get_inventory_segment,
         ],
         # In-flight activities get this long to finish after shutdown starts
         # before being cancelled — keep it below the pod's

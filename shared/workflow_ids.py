@@ -48,3 +48,46 @@ def allocate_segment_workflow_id(segment_type: SegmentType, cluster: str) -> str
     site — so a type-less id would make two legitimate allocations collide.
     """
     return f"allocate-segment-{segment_type.value}-{cluster}"
+
+
+def install_server_workflow_id(infra_env: str, server_name: str | None = None) -> str:
+    """`install-server-<infraEnv>`, or `install-server-name-<server>` when named.
+
+    Keyed on the CANDIDATE POOL, not on the machine and not on the target.
+
+    Not the machine, because it is not known when the run starts: which server
+    gets installed is decided inside the workflow, by asking server-scan.
+    Building the id from it would mean acquiring the server in the router
+    first — putting the decision the run's outcome depends on outside the run,
+    which is exactly the shape initialize-segment was changed to avoid.
+
+    Not the (InfraEnv, MCE) pair either, which is what this keyed on first and
+    was wrong: the pool a run draws from is `^ocp-<infraEnv>`, with no MCE in
+    it. Two MCEs each filling an InfraEnv of the same name would get DIFFERENT
+    ids while drawing from the SAME pool — the one case the serialization
+    exists to prevent. The pool is the InfraEnv, so the id is too.
+
+    Serializing per pool is what stops two runs racing onto one machine, since
+    server-scan hands out candidates with no reservation (ADR-0032 accepts this
+    explicitly — `$sample` can draw the same server for two concurrent callers,
+    and nothing changes its state until a cluster reports the node minutes
+    later). It is not the whole defence: a run also skips candidates that
+    already have a BareMetalHost, which covers the SEQUENTIAL case that an id
+    cannot. Installing several servers from one pool concurrently needs a real
+    reservation in server-scan first; it is not just a matter of loosening this
+    id.
+
+    An explicitly named server draws from a pool of one, so it gets its own id
+    and does not serialize against pattern draws for the same InfraEnv.
+
+    That name is LOWERCASED, which is not cosmetic: server-scan names carry an
+    uppercase vendor serial, the run lowercases it to build the resource names,
+    and an id that kept the original case would give ONE machine TWO ids
+    depending on how a caller typed it. Both runs would then be accepted and
+    both would race onto the same BareMetalHost — the exact collision this id
+    exists to prevent. Two different servers cannot collide by lowercasing:
+    server-scan names differ by more than case.
+    """
+    if server_name:
+        return f"install-server-name-{server_name.lower()}"
+    return f"install-server-{infra_env}"

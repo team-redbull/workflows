@@ -50,8 +50,8 @@
     <div class="facts">
       <div class="fact"><span class="k">Stack</span><span class="v">Python 3.12 · temporalio · pydantic · FastAPI</span></div>
       <div class="fact"><span class="k">Deployables</span><span class="v">1 brain + 1 limb per domain (+ trigger API)</span></div>
-      <div class="fact"><span class="k">Domains today</span><span class="v">segment-lifecycle</span></div>
-      <div class="fact"><span class="k">Workflows today</span><span class="v">initialize-segment</span></div>
+      <div class="fact"><span class="k">Domains today</span><span class="v">segment-lifecycle &middot; server-lifecycle</span></div>
+      <div class="fact"><span class="k">Workflows today</span><span class="v">initialize-segment &middot; allocate-segment &middot; install-server</span></div>
     </div>
   </div>
 </header>
@@ -463,6 +463,9 @@
         bearer token and a git push token for the day1 values repo. That set is the
         deployment, so that set is the queue. Both workflows in the domain reuse the one limb rather than
         duplicating the credentials.</p>
+        <p><code>server-lifecycle</code> is a different set entirely, which is why it is a second limb: a
+        Kubernetes client with RBAC to create BareMetalHosts, Secrets and NMStateConfigs, plus per-vendor
+        BMC credentials and a server-scan token.</p>
       </div>
       <div class="panel">
         <h3>Why the workflow queue follows the workflow</h3>
@@ -478,6 +481,23 @@
     <code>shared/consts.py</code>, and <em>every</em> <code>execute_activity</code> call passes
     <code>task_queue=</code> explicitly. Forgetting it sends the activity to the workflow's own queue, where nothing
     can run it — the run then sits there with an activity that never starts.</p>
+
+    <div class="panel warn" style="margin-top:20px">
+      <h3>One exception: <code>server-lifecycle</code>'s activity queue also carries a CLUSTER</h3>
+      <p>Its activities <b>write to a cluster</b>, and not the one the brain runs on: the brain is on the hub,
+      while the BareMetalHost belongs on the MCE that owns the InfraEnv — a different API server. So the queue
+      is <code>server-lifecycle-activity-&lt;mce_cluster&gt;</code>, one
+      <code>server-lifecycle-worker</code> runs <em>inside</em> each MCE, and the brain picks the target
+      cluster purely by which queue it dispatches to.</p>
+      <p>That is deliberately <b>routing rather than credentials</b>. Each worker talks to its own API server
+      as its own ServiceAccount and dials <em>out</em> to Temporal, so no cross-cluster kubeconfig exists
+      anywhere and the hub never needs inbound access to an MCE. The alternative — one hub worker holding a
+      kubeconfig per MCE — concentrates admin-equivalent credentials for the whole fleet onto one pod.</p>
+      <p class="note">A queue nothing polls is not silently wrong: those activities carry a 5-minute
+      schedule-to-start timeout, so history shows repeated timeouts rather than an invisible backlog, and the
+      run's <code>progress</code> query reports the queue it is waiting on. This is the documented exception
+      to Temporal's general advice against schedule-to-start timeouts — a queue served by specific hosts.</p>
+    </div>
   </section>
 
   <!-- ================= 5. PRINCIPLES ================= -->

@@ -1,8 +1,9 @@
 name: Build and Push
 
-# Three images from this one repo: the workflow "brain" (workflow_domains/Dockerfile),
-# the segment-lifecycle activity worker "limb" (activities/segment_lifecycle/Dockerfile),
-# and the documentation site (docs/Dockerfile), which carries no code at all.
+# Four images from this one repo: the workflow "brain" (workflow_domains/Dockerfile),
+# two activity worker "limbs" — segment-lifecycle and server-lifecycle, one per
+# domain (activities/<domain>/Dockerfile) — and the documentation site
+# (docs/Dockerfile), which carries no code at all.
 
 # A commit message containing "[skip ci]" (or "[ci skip]", "[no ci]", "[skip actions]")
 # makes GitHub skip this WHOLE workflow, the `changes` job included, and the next push
@@ -22,13 +23,13 @@ permissions:
 
 jobs:
   # Which images does this push actually affect? Without this, EVERY push
-  # rebuilt, re-tagged and redeployed all three — a CSS tweak in docs/ rolled
+  # rebuilt, re-tagged and redeployed all of them — a CSS tweak in docs/ rolled
   # the orchestrator and the worker pods for an image whose content had not
   # changed at all.
   #
   # Per-JOB filtering, so it cannot be `on.push.paths`: that gates the whole
-  # workflow, which is the opposite of what is wanted when three independent
-  # images share one file. Hence a cheap job that diffs the push range and
+  # workflow, which is the opposite of what is wanted when independent images
+  # share one file. Hence a cheap job that diffs the push range and
   # publishes a boolean per image.
   #
   # Plain git rather than a marketplace filter action: no third-party
@@ -96,10 +97,10 @@ jobs:
 
           # Paths mirror each Dockerfile's COPY set, NOT the folder that
           # happens to share the image's name:
-          #   · both Python images bake in shared/, so it triggers both;
-          #   · the limb copies the WHOLE activities/ tree, not just
-          #     activities/segment_lifecycle/;
-          #   · this file changes what gets built, so it triggers all three.
+          #   · every Python image bakes in shared/, so it triggers them all;
+          #   · EACH limb copies the WHOLE activities/ tree, not just its own
+          #     domain — which is why one `limb` flag drives both limb jobs;
+          #   · this file changes what gets built, so it triggers everything.
           SELF='\.github/workflows/build\.yml$'
           {
             echo "brain=$(match "^(workflow_domains/|shared/|${SELF})")"
@@ -147,11 +148,30 @@ jobs:
       helm-image-path: activityWorker.image
     secrets: inherit
 
+  build-server-lifecycle-worker:
+    # The install-server limb. Sequential behind the segment-lifecycle one for
+    # the same reason that one is behind the brain: both push to the same
+    # redbull-platform branch, so running them together makes them race.
+    #
+    # Shares the `limb` flag with the other worker deliberately — both
+    # Dockerfiles COPY the whole activities/ tree, so a change under either
+    # domain really does land in both images.
+    needs: [changes, build-segment-lifecycle-worker]
+    if: ${{ !cancelled() && !failure() && needs.changes.outputs.limb == 'true' }}
+    uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
+    with:
+      image-name: server-lifecycle-worker
+      dockerfile: activities/server_lifecycle/Dockerfile
+      chart-repo: team-redbull/redbull-platform
+      helm-values-path: gitops/charts/server-lifecycle-worker/values.yaml
+      helm-image-path: activityWorker.image
+    secrets: inherit
+
   build-workflows-docs:
     # Same sequential chain as the others — see build-segment-lifecycle-worker for why.
     # Last in the chain, so it is the job that most needed the skip guards —
-    # a docs-only push skips both jobs ahead of it.
-    needs: [changes, build-segment-lifecycle-worker]
+    # a docs-only push skips every job ahead of it.
+    needs: [changes, build-server-lifecycle-worker]
     if: ${{ !cancelled() && !failure() && needs.changes.outputs.docs == 'true' }}
     uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
     with:
@@ -177,6 +197,13 @@ jobs:
     uses: team-redbull/.github/.github/workflows/ghcr-cleanup-on-delete.yml@main
     with:
       image-name: segment-lifecycle-worker
+    secrets: inherit
+
+  cleanup-server-lifecycle-worker-on-delete:
+    if: github.event_name == 'delete'
+    uses: team-redbull/.github/.github/workflows/ghcr-cleanup-on-delete.yml@main
+    with:
+      image-name: server-lifecycle-worker
     secrets: inherit
 
   cleanup-workflows-docs-on-delete:

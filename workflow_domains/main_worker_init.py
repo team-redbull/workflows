@@ -27,6 +27,7 @@ from temporalio.worker import Worker
 from shared.consts import (
     ALLOCATE_SEGMENT_WORKFLOW_QUEUE,
     INITIALIZE_SEGMENT_WORKFLOW_QUEUE,
+    INSTALL_SERVER_WORKFLOW_QUEUE,
 )
 from shared.logging_config import configure_logging
 from shared.settings import TemporalSettings
@@ -37,6 +38,7 @@ from workflow_domains.segment_lifecycle.allocate_segment import (
 from workflow_domains.segment_lifecycle.initialize_segment import (
     InitializeSegmentWorkflow,
 )
+from workflow_domains.server_lifecycle.install_server import InstallServerWorkflow
 
 _settings = TemporalSettings()
 
@@ -46,6 +48,7 @@ _settings = TemporalSettings()
 _WORKER_SPECS: list[tuple[str, list[type]]] = [
     (INITIALIZE_SEGMENT_WORKFLOW_QUEUE, [InitializeSegmentWorkflow]),
     (ALLOCATE_SEGMENT_WORKFLOW_QUEUE, [AllocateSegmentWorkflow]),
+    (INSTALL_SERVER_WORKFLOW_QUEUE, [InstallServerWorkflow]),
 ]
 
 

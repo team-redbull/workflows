@@ -19,6 +19,9 @@ docs/
     404.html
     segment-lifecycle/
       initialize-segment.html      one page per workflow, under its domain
+      allocate-segment.html
+    server-lifecycle/
+      install-server.html
     assets/
       site.css                     every page's styling
       nav.js                       THE workflow catalogue + topbar menu behaviour
@@ -37,9 +40,9 @@ docs/
 A workflow that has no page yet gets `href: null`. It renders as a non-clickable
 *planned* row in both places — visible, but never a dead link.
 
-Domains and workflows in the catalogue that are not built yet
-(`release-segment`, the whole `segment-provisioner` domain) are there to show the shape
-the catalogue takes as it grows; delete them once real ones replace them.
+Domains and workflows in the catalogue that are not built yet (`release-segment`,
+`uninstall-server`) are there to show the shape the catalogue takes as it grows; delete
+them once real ones replace them.
 
 ## Local preview
 

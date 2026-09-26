@@ -1,9 +1,15 @@
-# Cluster Orchestrator — Segment-lifecycle
+# Cluster Orchestrator
 
-Segment-lifecycle domain of an OpenShift cluster lifecycle orchestrator built on
-Temporal. It owns the segments a hosted cluster runs on: **creating** them in the
-team's **Segments Manager**, and **allocating** one to a cluster and writing its
-DHCP block into the day1 values repo.
+An OpenShift cluster lifecycle orchestrator built on Temporal. Two domains today:
+
+- **segment-lifecycle** owns the segments a hosted cluster runs on: **creating**
+  them in the team's **Segments Manager**, and **allocating** one to a cluster
+  and writing its DHCP block into the day1 values repo.
+- **server-lifecycle** owns putting physical servers into an MCE inventory:
+  **install-server** takes a healthy, unclaimed server from the **server-scan**
+  inventory platform and creates the `BareMetalHost` + BMC `Secret` +
+  `NMStateConfig` an InfraEnv needs. It replaces `bmh-generator-operator`, a
+  Kopf operator that queried four vendor managers itself.
 
 **One entry point, one Temporal run.** The Segments Manager used to own creation and
 then fire a best-effort HTTP trigger at this service — which put creation outside
@@ -13,7 +19,8 @@ direction is reversed: callers POST the definition to
 Segments Manager itself. The Segments Manager is a dependency, never a trigger.
 
 **A segment has no type until it is allocated.** The type (`HC`, `MCE`,
-`INVENTORY`, `PXE`) is allocation state, like the cluster: initialize-segment
+`INVENTORY_REDFISH`, `INVENTORY_IPMI`, `PXE`) is allocation state, like the
+cluster: initialize-segment
 creates a typeless segment into one shared Available pool per site, allocate-segment
 passes the type as a parameter and the Segments Manager stamps it onto whichever
 segment it reserves, and a release clears it again. So there is no per-type
@@ -32,13 +39,26 @@ spare segments between pools has been removed.
 
 ```
 shared/                           Contract layer (temporalio + pydantic only)
-  models/segment_lifecycle.py     Typed state across the workflow/activity boundary
-  interfaces/segment_lifecycle.py Activity signatures (no bodies)
+  models/<domain>.py              Typed state across the workflow/activity boundary
+  interfaces/<domain>.py          Activity signatures (no bodies)
+  bmc_address.py                  Pure naming/address logic BOTH sides need
   settings.py / exceptions.py / consts.py / workflow_ids.py / logging_config.py
 workflow_domains/                 The brain — one folder per domain, plus main_worker_init.py + api.py
-  segment_lifecycle/              The two workflows + that domain's router.py
+  segment_lifecycle/              initialize_segment.py, allocate_segment.py, router.py
+  server_lifecycle/               install_server.py (the SHAPE of the run),
+                                    bond_selection.py (the pure rule it applies),
+                                    router.py
   routers/                        What no domain owns: deps, shared models, runs.py (status)
-activities/segment_lifecycle/     The limb (activity impls + worker_init.py)
+activities/<domain>/              The limbs
+  activities.py                   The @activity.defn surface ONLY — thin
+  <technology>.py                 One module per dependency, plain parameters, no
+                                    settings and no Temporal, so each is testable
+                                    with no worker: values_repo.py (git),
+                                    server_scan.py (the inventory API),
+                                    cluster_api.py (the Kubernetes API, its
+                                    idempotency rule and error classification),
+                                    bmh_resources.py (the resource bodies)
+  worker_init.py                  Registers this domain's activities, polls its queue
 docs/                             The static documentation site (its own image)
 ```
 
@@ -48,15 +68,19 @@ The prod charts are vendored into the Argo CD repo, not this one:
 | --- | --- |
 | `redbull-platform/gitops/charts/workflows-orchestrator/` | the brain — ONE release, shared by every domain |
 | `redbull-platform/gitops/charts/segment-lifecycle-worker/` | the `segment-lifecycle-worker` limb |
+| `redbull-platform/gitops/charts/server-lifecycle-worker/` | the `server-lifecycle-worker` limb |
 
 Worker-file naming convention: the workflow (brain) worker is
 `workflow_domains/main_worker_init.py`; each activity domain's worker is
 `activities/<domain>/worker_init.py`.
 
-## The two workflows
+## The workflows
 
-Each has its own workflow queue and its own deterministic id; both share the one
-`segment-lifecycle-activity` queue and therefore the one limb deployment.
+Each has its own workflow queue and its own deterministic id. The two
+segment-lifecycle workflows share the one `segment-lifecycle-activity` queue and
+therefore the one limb deployment; `install-server` runs on
+`server-lifecycle-activity` and reaches back to the segment-lifecycle queue for
+one activity (below).
 
 ### `initialize-segment` — create a segment
 
@@ -77,6 +101,126 @@ Still a Temporal workflow rather than a bare HTTP call, for three reasons: durab
 unbounded retries (a Segments Manager outage is out-waited, and the request
 survives an orchestrator restart), ONE place owning the dedup id, and a pollable
 per-segment status — which is what lets the bulk route start N of them.
+
+### `install-server` — put a server into an MCE inventory
+
+`POST /workflows/server-lifecycle/install-server` with the **InfraEnv** to fill
+and its **MCE cluster**. The run:
+
+1. **acquiring-server** — `GET /servers/available` against server-scan. The
+   InfraEnv's name states which hardware it is for
+   (`cisco-m6-bat-yam-64c-512gb`) and server names carry the same tokens behind
+   an `ocp-` prefix, so the pattern is `^ocp-<infraEnv>`. `HEALTHY` only.
+2. **selecting-server** — the first candidate that can actually be installed,
+   and the inventory VLAN it needs. Bond members are two link-up NICs on two
+   **distinct physical ports**, taken from `interfaces[]` and never
+   `nic_macs`: server-scan reduces NPAR partitions to one entry per port in the
+   former and leaves the latter whole, so indexing MACs can bond two partitions
+   of one wire. `UP` is required strictly, which no HPE server can satisfy —
+   OneView reports no link state at all.
+
+   **Every** reason a candidate is unusable is a *skip*, never a failed run —
+   an unusable name, no bond, an unknown `bmc_vendor`, no BMC host, a malformed
+   MAC, an inventory segment this MCE does not hold, or a BareMetalHost it
+   already has. That is what the multi-candidate draw is for. If none survives,
+   the reasons are reported as separate groups and the failure takes the
+   specific error type when they all agree — which they always do for an
+   explicitly named server, whose pool holds one.
+3. **creating-secret / -baremetalhost / -nmstateconfig** — all idempotent; an
+   existing resource is success **once its BMC address, boot MAC, InfraEnv and
+   VLAN match**, and never an overwrite. A resource that differs is a
+   `BmhConflictError` for a human, because reporting success would describe an
+   installation that is not the one on the cluster. NIC names in the
+   NMStateConfig are logical placeholders (`nic1`, `nic2`) bonded 802.3ad with
+   the VLAN riding the bond.
+5. **verifying-registration** — a bounded poll. A stored BareMetalHost only
+   means the API server accepted it; a wrong BMC address or credential surfaces
+   nowhere but here. `registering` does NOT count: it is the state Metal3
+   assigns before contacting the BMC, and a host it cannot reach stays there.
+
+Its id is `install-server-<infraEnv>` — the **candidate pool**, not the target
+pair, because the pool is `^ocp-<infraEnv>` with no MCE in it. Installs drawing
+from one pool are therefore serial: server-scan hands out candidates without
+reserving them, and two concurrent runs could otherwise draw the same machine.
+The sequential case an id cannot cover — a second run minutes later, before any
+cluster has reported the node — is covered by step 3 skipping candidates that
+already have a BareMetalHost.
+
+**The inventory VLAN is split by BMC protocol.** An MCE's inventory network is
+really up to two networks: Ironic reaches a Redfish BMC on one and a
+UCS-managed blade over IPMI on another, allocated in the Segments Manager as
+`INVENTORY_REDFISH` and `INVENTORY_IPMI`.
+
+| server-scan `bmc_vendor` | managed by | Ironic driver | inventory segment |
+| --- | --- | --- | --- |
+| `HP` | OneView | `redfish-virtualmedia` | `INVENTORY_REDFISH` |
+| `DELL` | OpenManage | `idrac-virtualmedia` | `INVENTORY_REDFISH` |
+| `INTERSIGHT` | Intersight | `redfish-virtualmedia` | `INVENTORY_REDFISH` |
+| `CISCO` | UCS Central | `ipmi` | `INVENTORY_IPMI` |
+| `null` | standalone | *refused* | — |
+
+iDRAC is Redfish underneath, so a Dell is not a class of its own. That is why
+the VLAN is resolved **inside** candidate selection rather than as a first
+step: which segment applies is not known until a server is chosen. An MCE holds
+only the classes it serves, so a UCS blade drawn against a Redfish-only MCE is
+passed over — the Dell behind it still installs. There is deliberately no
+`vlan_id` input, and no plain `INVENTORY` type: an allocation naming no class
+serves neither kind of BMC. The lookup runs on the *segment-lifecycle* queue
+where that token already lives, once per class rather than once per candidate.
+
+**One worker per MCE, routed by queue.** The brain runs on the hub; the
+resources belong on the MCE that owns the InfraEnv, which is a different API
+server. `mce_cluster` names both the inventory segment AND the activity queue
+(`server-lifecycle-activity-<mce_cluster>`), and a `server-lifecycle-worker`
+inside each MCE polls only its own queue, authenticating to its own API server
+as its own ServiceAccount.
+
+That is deliberately routing rather than credentials: no cross-cluster
+kubeconfig exists anywhere, and because workers dial OUT to Temporal, the hub
+never needs inbound access to an MCE's API server. It also makes the VLAN's
+cluster and the cluster written to the same string, so they cannot disagree.
+
+A run whose MCE has no worker waits instead of acting; `GET
+/workflows/runs/{workflow_id}` reports `activity_queue`, which says which MCE
+to go and look at.
+
+**Two ways to trigger it.** `server_name` is optional, and leaving it out is the
+normal mode:
+
+| | `server_name` omitted — *"fill this InfraEnv"* | `server_name` given — *"install this machine"* |
+| --- | --- | --- |
+| server-scan query | `?pattern=^ocp-<infraEnv>&count=<candidate_count>` | `?name=<server_name>&count=1` |
+| candidates drawn | `candidate_count` (default 3, 1–20) | one |
+| already has a BareMetalHost | **skipped**, next candidate tried | **converged** — that is the point |
+| workflow id | `install-server-<infraEnv>` | `install-server-name-<server_name>` |
+| use it for | routine capacity: take whatever is free and healthy | re-running a specific host, or repairing one |
+
+Both modes apply every other rule identically: `HEALTHY` only, at least two NIC
+MACs, two link-up NICs on two distinct physical ports, a `bmc_vendor` this
+orchestrator has a driver for, and well-formed MACs. So naming a server does not
+force an unusable one through — it only narrows the pool to one and turns the
+already-installed check off.
+
+Drawing several candidates is what makes one unusable server a retry rather than
+a failed run. When no candidate survives, the failure names every candidate with
+its provider and each interface's link state, and lists separately those skipped
+as already installed and those whose server-scan name cannot be a Kubernetes
+resource name — three different people's problem, so they are never merged.
+
+### Request body — `InstallServerInput`
+
+| field | type | rules | what it is for |
+| --- | --- | --- | --- |
+| `infra_env` | str | non-empty | The InfraEnv to fill. Labels both resources, **and** is the server query (`^ocp-<infra_env>`). Must already exist, in `namespace`. |
+| `mce_cluster` | str | non-empty | Which MCE. Selects the inventory segment the VLAN comes from — `INVENTORY_REDFISH` or `INVENTORY_IPMI`, whichever the chosen server's BMC needs — **and** the activity queue the cluster writes go to. |
+| `namespace` | str | non-empty | Where the three resources go. **Must be the InfraEnv's own namespace** — BMAC looks for the InfraEnv beside the BareMetalHost. |
+| `server_name` | str \| null | default `null` | Install one specific machine instead of drawing from the pool (see above). |
+| `candidate_count` | int | 1–20, default 3 | How many candidates to draw. Ignored when `server_name` is given. |
+| `labels` | map | default `{}` | Extra labels for the BareMetalHost. Cannot override the InfraEnv label — that would split the host from its NMStateConfig. |
+
+There is deliberately **no `vlan_id`**: it belongs to the MCE's segment, and a
+supplied one could contradict it. The request body forbids unknown fields, so
+sending `vlan_id` is a 422 rather than a silently ignored value.
 
 ### `allocate-segment` — give a cluster a segment
 
@@ -113,6 +257,7 @@ result.
 | `POST /workflows/segment-lifecycle/initialize-segment` | one segment |
 | `POST /workflows/segment-lifecycle/initialize-segment/bulk` | one workflow PER segment |
 | `POST /workflows/segment-lifecycle/allocate-segment` | one allocation |
+| `POST /workflows/server-lifecycle/install-server` | one server into an InfraEnv |
 | `GET  /workflows/runs/{workflow_id}` | (status, every domain) |
 
 ### Paths: `/workflows/<domain>/<workflow>`, status on `/workflows/runs`
@@ -139,8 +284,9 @@ would hide which segments actually got a workflow.
 - **ConfigMap split by scope:** `workflows-orchestrator-config` (owned by the
   always-present brain release) holds what every domain shares — `TEMPORAL_*` and
   `SEGMENTS_MANAGER_URL`. Each domain adds its own `<domain>-config` (here
-  `segment-lifecycle-config`: `DAY1_REPO_URL` and the DHCP policy). A domain's activity
-  worker mounts both, so the brain must install before any limb.
+  `segment-lifecycle-config`: `DAY1_REPO_URL` and the DHCP policy;
+  `server-lifecycle-config`: `MCE_CLUSTER` and `SERVER_SCAN_URL`). A domain's
+  activity worker mounts both, so the brain must install before any limb.
 - **ConfigMaps hold operator-editable data**, expanded and validated in code at
   worker startup rather than baked into an image. `DHCP_EXCLUSION_OCTET_RANGES` is
   the one structured knob left: a type → last-octet-ranges map, so changing the
@@ -153,12 +299,18 @@ would hide which segments actually got a workflow.
 - **Retries are unbounded** so transient outages are out-waited; only CLASSIFIED
   deterministic errors fail a run. An unclassified permanent error retries every
   minute forever, leaving the run RUNNING rather than FAILED — which is why every
-  known-permanent error is named in a `non_retryable_error_types` list.
+  known-permanent error is named in a `non_retryable_error_types` list. That list
+  is built from the exception CLASSES, not written out as strings: Temporal
+  matches it by type name, so a literal with a typo in it reads as "retryable"
+  with nothing to notice, while a wrong class name fails at worker startup.
 - **Idempotency:** `create_segment` accepts a matching existing segment;
   `allocate_segment` is idempotent server-side per (cluster, site, type); the
   values-repo append is a no-op for a file already recording this allocation.
+  install-server's three creates each treat an existing resource as success once
+  it matches, and a run skips candidates that already have a BareMetalHost.
   Workflow ids are deterministic (`initialize-segment-<network>`,
-  `allocate-segment-<TYPE>-<cluster>`), so a duplicate trigger while running gets
+  `allocate-segment-<TYPE>-<cluster>`, `install-server-<infraEnv>` or
+  `install-server-name-<server>`), so a duplicate trigger while running gets
   HTTP 409.
 
 ## Configuration
@@ -171,6 +323,14 @@ would hide which segments actually got a workflow.
 | `DHCP_EXCLUSION_OCTET_RANGES` | `segment-lifecycle-config` | DHCP policy |
 | `SEGMENTS_MANAGER_API_TOKEN` | Secret | mutating calls only; GETs are public |
 | `DAY1_GIT_TOKEN` | Secret `day1-git-token` | push rights; scrubbed from every error |
+| `MCE_CLUSTER` | `server-lifecycle-config` | which MCE this worker serves — names its queue, so it must match callers' `mce_cluster` |
+| `SERVER_SCAN_URL` | `server-lifecycle-config` | inventory API base, INCLUDING `/api/v1` |
+| `SERVER_SCAN_API_TOKEN` | Secret | a **viewer** token — the lookup is a GET |
+| `{HP,DELL,CISCO,INTERSIGHT}_BMC_USERNAME`/`_PASSWORD` | Secret | what Ironic drives the BMC with |
+
+server-scan holds no BMC credentials by design, so those live here; a vendor
+with none configured fails that server's install rather than writing a Secret
+Ironic cannot authenticate with.
 
 ## Run locally
 

@@ -11,8 +11,19 @@ from __future__ import annotations
 
 import typing
 
-import activities.segment_lifecycle.activities as impl_module
-import shared.interfaces.segment_lifecycle as interface_module
+import pytest
+
+import activities.segment_lifecycle.activities as segment_impl
+import activities.server_lifecycle.activities as server_impl
+import shared.interfaces.segment_lifecycle as segment_interface
+import shared.interfaces.server_lifecycle as server_interface
+
+# Every domain, not just the first one written: an activity whose stub and
+# implementation disagree converts payloads silently rather than raising.
+_DOMAINS = [
+    pytest.param(segment_interface, segment_impl, id="segment_lifecycle"),
+    pytest.param(server_interface, server_impl, id="server_lifecycle"),
+]
 
 
 def _activity_definitions(module) -> dict[str, object]:
@@ -25,14 +36,18 @@ def _activity_definitions(module) -> dict[str, object]:
     return definitions
 
 
-def test_interfaces_and_implementations_declare_the_same_activities():
+@pytest.mark.parametrize(("interface_module", "impl_module"), _DOMAINS)
+def test_interfaces_and_implementations_declare_the_same_activities(
+    interface_module, impl_module
+):
     interfaces = _activity_definitions(interface_module)
     implementations = _activity_definitions(impl_module)
     assert interfaces, "no @activity.defn stubs found in shared/interfaces"
     assert set(interfaces) == set(implementations)
 
 
-def test_interface_signatures_match_implementations():
+@pytest.mark.parametrize(("interface_module", "impl_module"), _DOMAINS)
+def test_interface_signatures_match_implementations(interface_module, impl_module):
     interfaces = _activity_definitions(interface_module)
     implementations = _activity_definitions(impl_module)
     for name, stub in interfaces.items():

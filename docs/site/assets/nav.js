@@ -38,6 +38,24 @@
           blurb: "give the VLAN back to the pool"
         }
       ]
+    },
+    {
+      domain: "server-lifecycle",
+      // Per MCE: the activity queue carries the target cluster's name, so the
+      // brain picks which cluster to write to purely by where it dispatches.
+      queue: "server-lifecycle-activity-<mce>",
+      workflows: [
+        {
+          name: "install-server",
+          href: "/server-lifecycle/install-server.html",
+          blurb: "put a physical server into an MCE InfraEnv"
+        },
+        {
+          name: "uninstall-server",
+          href: null,
+          blurb: "take a server back out of the InfraEnv"
+        }
+      ]
     }
   ];
 

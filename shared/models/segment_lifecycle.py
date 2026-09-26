@@ -26,7 +26,19 @@ class SegmentType(str, Enum):
 
     MCE = "MCE"
     HC = "HC"
-    INVENTORY = "INVENTORY"
+    # INVENTORY is split by how a server's BMC is DRIVEN, because an MCE's
+    # inventory network is: Ironic reaches a Redfish BMC on one network and a
+    # UCS-managed blade over IPMI on another, so one MCE holds up to two
+    # inventory allocations. Separate types rather than one INVENTORY with a
+    # marker because the Segments Manager's allocation is already idempotent
+    # per (cluster, site, type) — which IS "one per class per cluster".
+    #
+    # There is deliberately no plain INVENTORY. An allocation naming no class
+    # serves neither kind of BMC while reading as "inventory, sorted out", so
+    # the ambiguity would sit in the data rather than be caught. The Segments
+    # Manager's Literal rejects the value for the same reason.
+    INVENTORY_REDFISH = "INVENTORY_REDFISH"
+    INVENTORY_IPMI = "INVENTORY_IPMI"
     PXE = "PXE"
 
 
@@ -195,6 +207,33 @@ class SegmentEntry(BaseModel):
     status: str
     type: str | None = None
     cluster_name: str | None = None
+
+
+class InventorySegmentRequest(BaseModel):
+    """Which MCE's inventory segment to look up, and of which class.
+
+    The class is part of the lookup rather than derived inside the activity:
+    it comes from the BMC of the server install-server has CHOSEN, which the
+    Segments Manager limb knows nothing about.
+    """
+
+    mce_cluster: str = Field(min_length=1)
+    segment_type: SegmentType
+
+
+class InventorySegmentLookup(BaseModel):
+    """The MCE's inventory segment of one class, or the fact that it has none.
+
+    Absent is a NORMAL answer, not an error — an MCE legitimately holds only
+    the class of inventory network it serves — so it is reported the way
+    get_baremetal_host reports absence, and the workflow decides what it
+    means. Raising instead would make "this MCE takes no UCS servers"
+    indistinguishable from "the Segments Manager is broken", and would stop
+    the workflow from simply passing over that candidate.
+    """
+
+    found: bool = False
+    entry: SegmentEntry | None = None
 
 
 class DhcpExclusion(BaseModel):

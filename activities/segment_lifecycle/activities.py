@@ -32,6 +32,7 @@ from temporalio.exceptions import ApplicationError
 from activities.segment_lifecycle import values_repo
 from activities.segment_lifecycle.dhcp_values import build_dhcp_values
 from shared.exceptions import (
+    AmbiguousInventorySegmentError,
     SegmentConflictError,
     SegmentPoolExhaustedError,
     SegmentsManagerAuthError,
@@ -44,6 +45,8 @@ from shared.models.segment_lifecycle import (
     ClusterFileLookupRequest,
     ClusterValuesAppendRequest,
     InitializeSegmentInput,
+    InventorySegmentLookup,
+    InventorySegmentRequest,
     SegmentAllocation,
     SegmentAllocationRequest,
     SegmentEntry,
@@ -378,3 +381,67 @@ async def append_allocation_to_cluster_values(
         )
     return ValuesCommitRef(commit_sha=commit_sha, changed=changed, dhcp_values=dhcp_values)
 
+
+# --- shared with the server-lifecycle domain --------------------------------
+
+# The Segments Manager's own name for an MCE's inventory network. install-server
+# tags every NMStateConfig with the VLAN of the segment carrying this type.
+@activity.defn
+async def get_inventory_segment(
+    request: InventorySegmentRequest,
+) -> InventorySegmentLookup:
+    """Find one MCE cluster's inventory segment of a given class."""
+    segment_type = request.segment_type.value
+    async with _segments_manager_client() as client:
+        # `type` is the only filter of the two this endpoint accepts —
+        # verified against its OpenAPI, which declares site/status/type/fresh
+        # and no cluster_name. The cluster match is therefore made below,
+        # client-side, and is not optional.
+        resp = await client.get("/api/segments", params={"type": segment_type})
+        if resp.status_code == 404:
+            # A list endpoint answers an empty result with 200 and [], so 404
+            # here means the ROUTE is absent, not that there is no segment.
+            _raise_segments_manager_error("List segments", resp)
+        if resp.status_code != 200:
+            _raise_segments_manager_error("List segments", resp)
+
+        payload = resp.json()
+        entries = payload.get("items", payload) if isinstance(payload, dict) else payload
+        if not isinstance(entries, list):
+            raise SegmentsManagerError(
+                f"List segments returned {type(entries).__name__}, expected a list"
+            )
+
+        # The cluster match, made here because the endpoint cannot make it.
+        # The type is re-checked as well: an ignored or renamed filter would
+        # otherwise hand back another cluster's VLAN — or this cluster's OTHER
+        # inventory network, which would boot the host on a segment its BMC
+        # cannot be reached on.
+        matches = [
+            entry
+            for entry in entries
+            if entry.get("cluster_name") == request.mce_cluster
+            and entry.get("type") == segment_type
+        ]
+        if not matches:
+            # NOT an error. An MCE holds only the classes of inventory network
+            # it serves, so "none of this class" is a supported deployment and
+            # the workflow turns it into "this MCE takes no servers driven that
+            # way" — with the candidate passed over rather than the run failed.
+            activity.logger.info(
+                "MCE %s has no %s segment (searched %d)",
+                request.mce_cluster,
+                segment_type,
+                len(entries),
+            )
+            return InventorySegmentLookup(found=False)
+        if len(matches) > 1:
+            raise AmbiguousInventorySegmentError(
+                f"MCE cluster {request.mce_cluster!r} has {len(matches)} "
+                f"{segment_type} segments "
+                f"({', '.join(str(m.get('segment')) for m in matches)}); "
+                "exactly one is required — resolve the duplicate allocation"
+            )
+        return InventorySegmentLookup(
+            found=True, entry=SegmentEntry.model_validate(matches[0])
+        )

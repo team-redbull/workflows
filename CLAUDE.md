@@ -14,20 +14,30 @@ shared/                      Contract layer — the API between brain and limbs
   logging_config.py          Shared worker logging setup
 workflow_domains/            The orchestration "brain" (one lightweight deployment)
   <domain>/                  One folder per domain — mirrors activities/<domain>/
-    <workflow>.py            Workflow logic (one file per workflow)
+    <workflow>.py            Workflow logic (one file per workflow) — the SHAPE of
+                               the run: phases, dispatches, timeouts, failures
+    <policy>.py              Pure sandbox-safe rules that workflow needs and no
+                               limb does (server_lifecycle/bond_selection.py)
     router.py                That domain's APIRouter (prefix /workflows/<domain>)
   routers/                   API pieces owned by NO domain: deps, shared models,
                                runs.py (domain-agnostic run status)
   main_worker_init.py        Registers every workflow, one Worker per workflow queue
   api.py                     Unified FastAPI/Swagger entrypoint (2nd entry, same image)
 activities/<domain>/         The execution "limbs" (one deployment per domain)
-  activities.py / worker_init.py   Concrete impls / registers activities, polls that queue
+  activities.py              The @activity.defn surface ONLY — thin: settings,
+                               activity.logger, and a call into a module below
+  <technology>.py            One module per dependency, taking PLAIN PARAMETERS and
+                               holding no settings and no Temporal, so it is testable
+                               with no worker: values_repo.py (git), server_scan.py
+                               (the inventory API), cluster_api.py (the Kubernetes
+                               API, its idempotency rule and its error classification)
+  worker_init.py             Registers activities, polls that queue
 docs/                             The static documentation site (its own image, no code)
 ```
 
 Prod charts are VENDORED into the Argo CD repo, at
 `redbull-platform/gitops/charts/<service>/`: `workflows-orchestrator` (brain: ONE release for
-all domains) and `segment-lifecycle-worker` (limb: one per domain). One generic ApplicationSet
+all domains), `segment-lifecycle-worker` and `server-lifecycle-worker` (limbs: one per domain). One generic ApplicationSet
 sweeps `gitops/services/<service>/app.yaml`, so the service FOLDER NAME is the Argo app name,
 the chart path and the release name at once. There is no per-environment values layer — a
 chart's own `values.yaml` is exactly what the cluster runs — and pushing redbull-platform's
@@ -111,6 +121,59 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
 
 ## 4. External dependencies are black boxes
 
+- **server-scan is the inventory source of record for install-server**
+  (`SERVER_SCAN_URL`). The workflow makes ONE read — `GET /servers/available`
+  — and never queries a vendor manager itself: server-scan already collects HP
+  OneView / UCS Central / Dell OME / Intersight / standalone Redfish on a
+  6-hour cron and knows which servers are unclaimed. This is what replaced the
+  `bmh-generator-operator` Kopf operator and its four vendor SDKs. The endpoint
+  live-rechecks each candidate it returns, so freshness is its problem, not
+  ours; `live_recheck_performed` per item says when it degraded to the stored
+  document. It returns DATA ONLY — never BMC credentials, which server-scan
+  does not hold; those stay in this worker's own Secret.
+- **Select bond members from `interfaces[]`, NEVER from `nic_macs`.**
+  server-scan reduces Dell NPAR partitions to one entry per physical port in
+  `interfaces` but leaves `nic_macs` whole on purpose, so a 4-port partitioned
+  card reports 4 interfaces and 16 MACs. Indexing the MAC list positionally —
+  as bmhgen did — can bond two partitions of ONE physical port: one wire, no
+  redundancy, and it looks correct until that wire fails.
+- **install-server requires link_state UP strictly**, and that excludes whole
+  vendors by construction: HPE OneView's `portMap` carries no link state at
+  all (server-scan stores UNKNOWN unconditionally) and Intersight vNICs
+  usually report none. Those servers fail bond selection with
+  `NoBondableInterfacesError` naming the provider and the states observed —
+  deliberately loud, so the gap is visible rather than looking like an empty
+  inventory. Decided with the operator, 2026-09-25.
+- **The inventory VLAN belongs to the MCE AND to the chosen server's BMC
+  protocol** — `get_inventory_segment` on the SEGMENT-LIFECYCLE queue, not a
+  second copy of that token on the server-lifecycle limb. There is deliberately
+  no `vlan_id` input: a caller-supplied VLAN could contradict the segment the
+  cluster owns.
+- **An MCE has up to TWO inventory networks, split by how a BMC is DRIVEN.**
+  Ironic reaches a Redfish BMC on one and a UCS-managed blade over IPMI on
+  another, allocated as `INVENTORY_REDFISH` (HP via OneView, Dell via
+  OpenManage's iDRAC — Redfish underneath, so not a class of its own — and
+  Cisco via Intersight) and `INVENTORY_IPMI` (Cisco via UCS Central). So which
+  segment applies is not known until a SERVER is chosen, which is why the
+  lookup sits INSIDE candidate selection rather than being step one, and is
+  memoized per class rather than repeated per candidate. An MCE holds only the
+  classes it serves; a candidate needing a class it has not allocated is passed
+  over like any other unusable one. There is deliberately no plain `INVENTORY`
+  type — an allocation naming no class serves neither kind of BMC. The class is
+  derived in `shared/bmc_address.py` from the driver map, keyed by DRIVER, so
+  the vendor list stays the one place a vendor is named.
+- **In install-server, EVERY reason a candidate is unusable is a SKIP.** The
+  multi-candidate draw exists so one unusable server is a retry rather than a
+  failed run, and a reason handled outside the selection loop silently breaks
+  that promise for part of the fleet — a pool of three dying on a STANDALONE
+  machine at the front while two installable servers sit behind it. The reasons
+  are two tables in `install_server.py` (`_REJECTION_TYPE`, `_REJECTION_SUMMARY`)
+  keyed by the same strings the loop records; when nothing survives they are
+  reported as separate groups and the failure takes the specific type only if
+  they all agree. A reason missing from either table is a KeyError raised in
+  WORKFLOW code, which hangs the run rather than failing it — so a test keeps
+  the loop and both tables in step.
+
 - **The workflow is the ENTRY POINT; the Segments Manager is a dependency, never a trigger.** A
   caller POSTs the full segment DEFINITION to `POST /workflows/segment-lifecycle/initialize-segment`
   and the workflow creates the segment itself (`create_segment`). The reverse used to be true — the
@@ -185,6 +248,16 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   error must be in `non_retryable_error_types` (e.g. `SegmentNotFoundError`, `SegmentsManagerAuthError`)
   or raised by the activity as `ApplicationError(..., non_retryable=True)`. Unclassified permanent errors
   retry every minute forever — run sits RUNNING (not FAILED) with the failure on the activity in the UI.
+- **Name an error type ONCE — build the non-retryable list from the CLASSES.** Temporal matches
+  `non_retryable_error_types` against the error's type NAME, so a string literal with a typo in it
+  reads as "retryable" and there is nothing to notice. install-server keeps a
+  `_PERMANENT_ACTIVITY_ERRORS` tuple of the exception classes and passes
+  `[e.__name__ for e in ...]`; a wrong name is then an ImportError at worker startup. The same
+  applies to the types raised FROM workflow code: `ApplicationError(..., type=ThatError.__name__)`
+  with the class in `shared/exceptions.py` (marked WORKFLOW-RAISED there), never a literal — a
+  literal keeps failing under the old name after the class is renamed, and the status endpoint and
+  any alerting key on that name. Workflow-raised types must NOT appear in
+  `non_retryable_error_types`: it is inert there, and an inert entry reads as a protection.
 - **One Worker PER WORKFLOW, all in the one brain process:** a Temporal `Worker` polls exactly one
   task queue, and each workflow has its own queue — so `main_worker_init.py` holds a `_WORKER_SPECS`
   list of `(queue, [WorkflowClass])` and enters every `Worker` into a single `contextlib.AsyncExitStack`,
@@ -321,8 +394,9 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   brain release must install before any limb (else `CreateContainerConfigError` on the missing
   global ConfigMap) — and the chart must ship the new keys BEFORE (or with) an image that requires
   them, or the worker crash-loops on its fail-fast settings.
-- **`shared/settings.py`** groups: `TemporalSettings` (workers + api.py) and
-  `SegmentLifecycleActivitySettings` (activity worker only). Field names = Helm ConfigMap/Secret keys
+- **`shared/settings.py`** groups: `TemporalSettings` (workers + api.py),
+  `SegmentLifecycleActivitySettings` and `ServerLifecycleActivitySettings`
+  (each that domain's activity worker only). Field names = Helm ConfigMap/Secret keys
   lowercased — keep aligned with redbull-platform's `gitops/charts/workflows-orchestrator/templates/config.yaml`
   (global) and `gitops/charts/segment-lifecycle-worker/templates/config.yaml` (day1 URL + DHCP
   policy + the credential Secret). Which ConfigMap
@@ -362,14 +436,24 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
 
 ## 9. Deploy & run (local)
 
-- Two charts, NEITHER creates a Namespace (both deploy into whichever namespace the release targets —
+- Three charts, NONE creates a Namespace (each deploys into whichever namespace the release targets —
   `helm install -n <ns> [--create-namespace]`, or redbull-platform's `namespaces` release pre-creates
-  it): redbull-platform's `gitops/charts/workflows-orchestrator/` (ConfigMap + brain + SA) and
-  `gitops/charts/segment-lifecycle-worker/` (ConfigMap + Secrets + limb + SA). This repo ships NO
-  chart at all — `helm/` is gone with the mock service it held.
+  it): redbull-platform's `gitops/charts/workflows-orchestrator/` (ConfigMap + brain + SA),
+  `gitops/charts/segment-lifecycle-worker/` and `gitops/charts/server-lifecycle-worker/`
+  (each: ConfigMap + Secrets + limb + SA). This repo ships NO chart at all — `helm/` is gone with
+  the mock service it held. The server-lifecycle limb is the first to need real RBAC: it creates
+  secrets, metal3.io/baremetalhosts and agent-install.openshift.io/nmstateconfigs in the target
+  namespace, where segment-lifecycle only makes HTTP and git calls.
 - Assumed already running: a Temporal server and the Segments Manager (via OpenShift routes or
   localhost — no port assumptions in code).
 - Trigger via the unified API: `uvicorn workflow_domains.api:app --port 8080`, Swagger at `/docs`.
+  `POST /workflows/server-lifecycle/install-server` is ASYNC (202 + workflow id) and takes the
+  InfraEnv to fill plus its MCE cluster; the InfraEnv's name states which hardware it is for
+  (`cisco-m6-bat-yam-64c-512gb`) and server names carry the same tokens behind an `ocp-` prefix,
+  so the InfraEnv IS the server query. Its id keys on the CANDIDATE POOL — the InfraEnv alone, with
+  no MCE in it — which makes installs drawing from one pool serial: server-scan hands out
+  candidates without reserving them, so two concurrent runs could otherwise draw the same machine,
+  and two MCEs filling an InfraEnv of the same name draw from the same pool.
   `POST /workflows/segment-lifecycle/initialize-segment` is ASYNC (202 + workflow id) and takes
   the full segment definition; poll `GET /workflows/runs/{workflow_id}` for progress/result. The
   `/bulk` variant takes a list and starts ONE WORKFLOW PER SEGMENT (never one batch workflow — each

@@ -247,3 +247,201 @@ async def read_custom_object(
             raise _classify(exc, "read", kind, name) from exc
 
     return await asyncio.to_thread(_read)
+
+
+async def list_custom_objects(
+    *,
+    group: str,
+    version: str,
+    plural: str,
+    kind: str,
+    namespace: str,
+) -> list[dict[str, Any]]:
+    """Every namespaced custom resource of one kind, or [] when there are none.
+
+    A 404 is an EMPTY LIST, not an error, for one specific reason: the Agent CRD
+    is installed by the Assisted Installer, and a namespace that has never had
+    an Agent in it answers the same way as one whose CRD is missing. Treating
+    that as a failure would turn "no host has booted yet" — the normal answer
+    for most of an hour-long wait — into a retrying activity.
+    """
+
+    def _list() -> list[dict[str, Any]]:
+        _load_kube()
+        try:
+            response = k8s_client.CustomObjectsApi().list_namespaced_custom_object(
+                group=group, version=version, namespace=namespace, plural=plural
+            )
+        except k8s_client.ApiException as exc:
+            if exc.status == _NOT_FOUND:
+                return []
+            raise _classify(exc, "list", kind, namespace) from exc
+        items = response.get("items") if isinstance(response, dict) else None
+        return list(items or [])
+
+    return await asyncio.to_thread(_list)
+
+
+async def annotate_custom_object(
+    *,
+    group: str,
+    version: str,
+    plural: str,
+    kind: str,
+    namespace: str,
+    name: str,
+    annotations: dict[str, str],
+) -> bool:
+    """Merge-patch annotations onto one custom resource; False when it is gone.
+
+    A 404 is success-shaped: the caller is annotating a host it is about to
+    delete, so one that has already gone needs nothing done to it.
+    """
+
+    def _patch() -> bool:
+        _load_kube()
+        try:
+            k8s_client.CustomObjectsApi().patch_namespaced_custom_object(
+                group=group,
+                version=version,
+                namespace=namespace,
+                plural=plural,
+                name=name,
+                body={"metadata": {"annotations": annotations}},
+            )
+        except k8s_client.ApiException as exc:
+            if exc.status == _NOT_FOUND:
+                return False
+            raise _classify(exc, "annotate", kind, name) from exc
+        return True
+
+    return await asyncio.to_thread(_patch)
+
+
+async def delete_custom_object(
+    *,
+    group: str,
+    version: str,
+    plural: str,
+    kind: str,
+    namespace: str,
+    name: str,
+) -> bool:
+    """Delete one custom resource. False when it was already absent.
+
+    Returning rather than raising on 404 is the delete half of this module's
+    idempotency rule: "already gone" is the outcome the caller wanted. Note what
+    a successful return does NOT mean — the object may still exist with a
+    `deletionTimestamp` and a finalizer held by a controller. Confirming it is
+    really gone is the caller's job.
+    """
+
+    def _delete() -> bool:
+        _load_kube()
+        try:
+            k8s_client.CustomObjectsApi().delete_namespaced_custom_object(
+                group=group, version=version, namespace=namespace, plural=plural, name=name
+            )
+        except k8s_client.ApiException as exc:
+            if exc.status == _NOT_FOUND:
+                return False
+            raise _classify(exc, "delete", kind, name) from exc
+        return True
+
+    return await asyncio.to_thread(_delete)
+
+
+async def clear_custom_object_finalizers(
+    *,
+    group: str,
+    version: str,
+    plural: str,
+    kind: str,
+    namespace: str,
+    name: str,
+    finalizers: frozenset[str],
+) -> bool:
+    """Drop only the NAMED finalizers from one resource. False when it is gone.
+
+    The LAST RESORT of a teardown, and narrow on purpose: it removes the
+    finalizers it was given and leaves every other one in place, so a controller
+    that still has legitimate cleanup to do is not robbed of it. Clearing the
+    whole list — the obvious shortcut — would orphan whatever those other
+    controllers own.
+
+    Read-modify-write rather than a blind patch, because the set on the object
+    is what decides whether anything needs doing at all: a host whose finalizer
+    has just cleared on its own must not be patched back into existence.
+    """
+
+    def _clear() -> bool:
+        _load_kube()
+        api = k8s_client.CustomObjectsApi()
+        try:
+            existing = api.get_namespaced_custom_object(
+                group=group, version=version, namespace=namespace, plural=plural, name=name
+            )
+        except k8s_client.ApiException as exc:
+            if exc.status == _NOT_FOUND:
+                return False
+            raise _classify(exc, "read finalizers of", kind, name) from exc
+
+        current = list((existing.get("metadata") or {}).get("finalizers") or [])
+        remaining = [f for f in current if f not in finalizers]
+        if remaining == current:
+            return False
+
+        try:
+            api.patch_namespaced_custom_object(
+                group=group,
+                version=version,
+                namespace=namespace,
+                plural=plural,
+                name=name,
+                body={"metadata": {"finalizers": remaining}},
+            )
+        except k8s_client.ApiException as exc:
+            if exc.status == _NOT_FOUND:
+                return False
+            raise _classify(exc, "clear finalizers of", kind, name) from exc
+        return True
+
+    return await asyncio.to_thread(_clear)
+
+
+async def secret_exists(namespace: str, name: str) -> bool:
+    """Whether one Secret is still on the cluster."""
+
+    def _read() -> bool:
+        _load_kube()
+        try:
+            k8s_client.CoreV1Api().read_namespaced_secret(name=name, namespace=namespace)
+        except k8s_client.ApiException as exc:
+            if exc.status == _NOT_FOUND:
+                return False
+            raise _classify(exc, "read", "Secret", name) from exc
+        return True
+
+    return await asyncio.to_thread(_read)
+
+
+async def delete_secret_if_present(namespace: str, name: str) -> bool:
+    """Delete one Secret. False when it was already absent.
+
+    Normally a no-op on teardown: the Secret has an ownerReference to the
+    BareMetalHost, so the garbage collector removes it once the host is really
+    gone. Kept anyway, because the alternative when that does not happen is a
+    BMC credential left on the cluster after every rollback.
+    """
+
+    def _delete() -> bool:
+        _load_kube()
+        try:
+            k8s_client.CoreV1Api().delete_namespaced_secret(name=name, namespace=namespace)
+        except k8s_client.ApiException as exc:
+            if exc.status == _NOT_FOUND:
+                return False
+            raise _classify(exc, "delete", "Secret", name) from exc
+        return True
+
+    return await asyncio.to_thread(_delete)

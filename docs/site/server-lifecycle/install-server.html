@@ -218,23 +218,26 @@
         <div class="marker">4</div>
         <div class="card">
           <div class="card-title">
-            <h3>get_baremetal_host, on a bounded timer</h3>
-            <span class="phase">phase <b>verifying-registration</b></span>
+            <h3>find_agent_for_host, on a bounded timer</h3>
+            <span class="phase">phase <b>awaiting-agent</b></span>
           </div>
-          <p>A stored object is <b>not</b> a registered host. The API server accepting the BareMetalHost
-          only means it was written down; Ironic still has to reach the BMC and authenticate, and a wrong
-          address or credential surfaces nowhere else. So the run does not claim success until it has:
-          a 15-second durable timer, a <b>10-minute deadline</b>, then
-          <code>BmhNotRegisteredError</code>.</p>
-          <p><code>registering</code> does <b>not</b> count as registered. It is the state Metal3 assigns
-          the moment it picks a host up &mdash; before contacting the BMC at all &mdash; and a host whose
-          address or credential is wrong <em>stays</em> there. Accepting it would make this poll return on
-          its first iteration for exactly the failure the poll exists to catch.</p>
-          <p class="note">An <code>errorType</code> containing <code>registration error</code> is given a
-          2-minute grace (Metal3 retries registration itself, so one observation can be a briefly busy BMC)
-          and then fails immediately, rather than spending the rest of the deadline re-reading it. The
-          three resources are left standing either way &mdash; they are what an operator needs to diagnose
-          it.</p>
+          <p>An <b>Agent</b> is the only observation that proves the install worked. It exists because the
+          machine POSTed, booted the discovery ISO and reached assisted-service &mdash; so in one reading it
+          proves the BMC accepted virtual media, the bond formed, the VLAN was the right one and DHCP
+          answered. A 30-second durable timer, a <b>1-hour deadline</b>: bare metal POSTs for longer than a
+          VM takes to boot.</p>
+          <p>The Agent is matched by <b>bond MAC</b>, never by name. BMAC names an Agent after the host's own
+          inventory UUID, and the live CRD's <code>agent.spec</code> carries <code>approved</code>,
+          <code>clusterDeploymentName</code>, role and installation disk &mdash; no reference back to the
+          BareMetalHost at all. Both bond members are searched, since the host registers with whichever NIC
+          brought the ISO up.</p>
+          <p class="note">This <b>replaced a 10-minute Ironic-registration deadline</b>, which was the wrong
+          signal in both directions. It <em>passed</em> hosts that would never boot &mdash; one whose bond or
+          VLAN is wrong registers perfectly and is then never heard from again &mdash; and it could not
+          recognise a dead one: on an unreachable BMC Metal3 reports provisioning state
+          <code>registering</code> with <code>operationalStatus: OK</code> and no <code>errorType</code>,
+          observed unchanged for <b>14 hours</b> on a live cluster. Nothing but the deadline itself ever
+          distinguished a slow host from a dead one; an Agent distinguishes them by existing.</p>
         </div>
       </div>
 
@@ -490,7 +493,7 @@
 {
   "status":   "RUNNING",
   "progress": {
-    "phase":          "verifying-registration",
+    "phase":          "awaiting-agent",
     "server_name":    "ocp-cisco-m6-bat-yam-64c-512gb-WZP12345",
     "activity_queue": "server-lifecycle-activity-ocp4-mce-bat-yam-01"
   }
@@ -545,7 +548,8 @@
           <tr><td class="k">creating-secret</td><td class="muted">The BMC credentials Secret</td><td class="muted">instant</td></tr>
           <tr><td class="k">creating-baremetalhost</td><td class="muted">The BareMetalHost</td><td class="muted">instant</td></tr>
           <tr><td class="k">creating-nmstateconfig</td><td class="muted">The bond + tagged VLAN</td><td class="muted">instant</td></tr>
-          <tr><td class="k">verifying-registration</td><td class="muted">Polling until Ironic has reached the BMC &mdash; <b>bounded, &le; 10 min</b></td><td class="muted">30 s&ndash;2 min</td></tr>
+          <tr><td class="k">awaiting-agent</td><td class="muted">Waiting for an Agent to register &mdash; <b>bounded, &le; 1 h</b></td><td class="muted">5&ndash;30 min</td></tr>
+          <tr><td class="k">rolling-back</td><td class="muted">Removing a candidate that produced no Agent, then trying the next</td><td class="muted">5&ndash;60 s</td></tr>
           <tr><td class="k">completed</td><td class="muted">The server is installable in the InfraEnv</td><td class="muted">&mdash;</td></tr>
         </tbody>
       </table>

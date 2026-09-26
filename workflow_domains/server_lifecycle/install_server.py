@@ -11,27 +11,35 @@ vendor-strategy layer is gone: one HTTP call replaces four vendor SDKs.
 
 Shape of the run:
 
-  1. resolving-vlan      — the VLAN belongs to the target MCE, not to the
-                           server or the caller: each MCE owns one inventory
-                           segment, looked up in the Segments Manager. Runs on
-                           the SEGMENT-LIFECYCLE queue, where that credential
-                           already lives.
-  2. acquiring-server    — GET /servers/available. The InfraEnv name states
+  1. acquiring-server    — GET /servers/available. The InfraEnv name states
                            which hardware it is for
                            (cisco-m6-bat-yam-64c-512gb), and server names carry
                            the same tokens behind an `ocp-` prefix, so the
                            InfraEnv IS the query. Several candidates are drawn
                            so one unusable server is a retry, not a failure.
-  3. selecting-bond      — the pure rule in bond_selection.py, plus one read per
-                           surviving candidate to skip machines already
-                           installed.
-  4. creating-secret
+  2. selecting-server    — the first candidate that can actually be installed,
+                           and the inventory VLAN it needs. EVERY reason a
+                           candidate is unusable is a skip here, so the draw
+                           keeps its promise; the reasons are reported together
+                           if none survives.
+  3. creating-secret
      creating-baremetalhost
      creating-nmstateconfig  — all idempotent; an existing resource is success.
-  5. verifying-registration — a BOUNDED poll. Storing the BareMetalHost only
+  4. verifying-registration — a BOUNDED poll. Storing the BareMetalHost only
                            means the API server accepted it; Ironic still has
                            to reach the BMC, and a wrong address or credential
                            surfaces nowhere else.
+
+THE VLAN IS RESOLVED INSIDE SELECTION, not before it. An MCE's inventory
+network is really up to TWO networks, split by how a server's BMC is driven:
+Ironic reaches a Redfish BMC (HP via OneView, Dell via iDRAC, Cisco via
+Intersight) on one and a UCS-managed blade over IPMI on another, allocated as
+INVENTORY_REDFISH and INVENTORY_IPMI. So which segment applies is not known
+until a machine is chosen — and an MCE holds only the classes it serves, which
+is why a UCS blade drawn against a Redfish-only MCE is passed over rather than
+failing a run that could still install the Dell behind it. The lookup runs on
+the SEGMENT-LIFECYCLE queue, where that credential already lives, once per
+class rather than once per candidate.
 
 This module is the SHAPE of the run only. The rule deciding which two NICs carry
 the bond is policy with no I/O in it, so it lives in bond_selection.py and is
@@ -69,7 +77,13 @@ from temporalio.common import RetryPolicy
 from temporalio.exceptions import ApplicationError
 
 with workflow.unsafe.imports_passed_through():
-    from shared.bmc_address import BMC_VENDORS, build_bmc_address, is_k8s_resource_name
+    from shared.bmc_address import (
+        BMC_VENDORS,
+        BmcDriverClass,
+        bmc_driver_class,
+        build_bmc_address,
+        is_k8s_resource_name,
+    )
     from shared.consts import (
         SEGMENT_LIFECYCLE_ACTIVITY_QUEUE,
         server_lifecycle_activity_queue,
@@ -94,6 +108,12 @@ with workflow.unsafe.imports_passed_through():
         UnknownBmcVendorError,
     )
     from shared.interfaces.segment_lifecycle import get_inventory_segment
+    from shared.models.segment_lifecycle import (
+        InventorySegmentLookup,
+        InventorySegmentRequest,
+        SegmentEntry,
+        SegmentType,
+    )
     from shared.interfaces.server_lifecycle import (
         acquire_servers,
         create_baremetal_host,
@@ -146,7 +166,6 @@ _PERMANENT_ACTIVITY_ERRORS: tuple[type[Exception], ...] = (
     BmhRequestInvalidError,
     InvalidMacError,
     InvalidServerNameError,
-    InventorySegmentNotFoundError,
     AmbiguousInventorySegmentError,
     SegmentsManagerAuthError,
 )
@@ -234,101 +253,100 @@ def _acquire_request(
     )
 
 
-def _require_bmc_vendor(server: AcquiredServer) -> str:
-    """The server's BMC vendor, or fail rather than guess a driver.
+# Why one candidate could not be installed, and the failure a run gets when
+# EVERY candidate was rejected for that ONE reason. A mixed pool falls back to
+# the general "nothing installable", because no single type is then true.
+#
+# Every one of these is a SKIP, not a failure: the draw exists so that one
+# unusable server is a retry rather than a failed run, and a reason that failed
+# the run outright would quietly break that promise for part of the fleet.
+# Which of an MCE's inventory networks a server's BMC is reachable on. One
+# entry per driver class, so a class added in shared/bmc_address.py fails here
+# loudly rather than defaulting a host onto the wrong network.
+_INVENTORY_TYPE_BY_DRIVER_CLASS = {
+    BmcDriverClass.REDFISH: SegmentType.INVENTORY_REDFISH,
+    BmcDriverClass.IPMI: SegmentType.INVENTORY_IPMI,
+}
 
-    The vocabulary comes from shared/bmc_address.py — the module that owns
-    the driver mapping — so a vendor added there is drivable here without a
-    second edit.
-    """
-    vendor = server.bmc_vendor
-    if vendor is None or vendor.upper() not in BMC_VENDORS:
-        raise ApplicationError(
-            f"server-scan reports no usable BMC driver vocabulary for "
-            f"{server.name} (bmc_vendor={vendor!r}, vendor={server.vendor}, "
-            f"provider={server.source_provider}). A STANDALONE machine's "
-            "driver is the caller's decision, and guessing IPMI would be "
-            "silently wrong for a Redfish-only BMC",
-            type=UnknownBmcVendorError.__name__,
-        )
-    return vendor
+_REJECTION_TYPE = {
+    "unnameable": InvalidServerNameError,
+    "no-bond": NoBondableInterfacesError,
+    "already-installed": NoBondableInterfacesError,
+    "unknown-bmc-vendor": UnknownBmcVendorError,
+    "no-bmc-host": BmcEndpointMissingError,
+    "bad-mac": InvalidMacError,
+    "no-inventory-segment": InventorySegmentNotFoundError,
+}
 
-
-def _require_bmc_endpoint(server: AcquiredServer) -> None:
-    """Reject a server whose BMC address server-scan never collected.
-
-    An empty host is not caught anywhere downstream: build_bmc_address still
-    produces a syntactically valid `redfish-virtualmedia:///redfish/v1/Systems/1`,
-    the API server stores the BareMetalHost without complaint, and the run then
-    spends the full registration deadline before failing with a message about
-    BMC credentials. Ten minutes and three resources to learn that the inventory
-    has no address for this machine.
-    """
-    if not server.bmc.host.strip("[] "):
-        raise ApplicationError(
-            f"server-scan reports no BMC host for {server.name} "
-            f"(vendor={server.vendor}, provider={server.source_provider}). "
-            "Ironic has nothing to connect to, so the BareMetalHost would be "
-            "stored and never register. A collector run fills this in",
-            type=BmcEndpointMissingError.__name__,
-        )
-
-
-def _require_valid_macs(server_name: str, bond_members: list[BondMember]) -> None:
-    """Reject a malformed MAC BEFORE the first resource is written.
-
-    The same check runs again in the resource builders, as a guard on their
-    own inputs. It matters here because a MAC discovered to be bad inside
-    create_baremetal_host would already have left a Secret behind, and the
-    builders' InvalidMacError arrives on the SECOND of three creates.
-    """
-    bad = [member.mac for member in bond_members if not mac_is_valid(member.mac)]
-    if bad:
-        raise ApplicationError(
-            f"server-scan reported malformed MAC(s) {bad} for {server_name}; "
-            "MACs are normalized on ingest, so this is a bad payload rather "
-            "than a condition to wait out",
-            type=InvalidMacError.__name__,
-        )
+_REJECTION_SUMMARY = {
+    "unnameable": (
+        "cannot be a Kubernetes resource name even lowercased — rename these "
+        "in server-scan"
+    ),
+    "no-bond": (
+        "offer fewer than two link-up NICs on two distinct physical ports. "
+        "HPE OneView reports no link state at all and Intersight vNICs usually "
+        "report none, so servers from those collectors cannot satisfy a strict "
+        "link-up requirement"
+    ),
+    "already-installed": "already hold a BareMetalHost in this namespace",
+    "unknown-bmc-vendor": (
+        "have no BMC driver vocabulary server-scan can name. A STANDALONE "
+        "machine's driver is the caller's decision, and guessing IPMI would be "
+        "silently wrong for a Redfish-only BMC"
+    ),
+    "no-bmc-host": (
+        "have no BMC host in the inventory, so Ironic would have nothing to "
+        "connect to. A collector run fills this in"
+    ),
+    "bad-mac": (
+        "carry a malformed MAC. server-scan normalizes MACs on ingest, so this "
+        "is a bad payload rather than a condition to wait out"
+    ),
+    "no-inventory-segment": (
+        "need an inventory network this MCE does not have allocated. An MCE "
+        "holds one segment per BMC protocol class, and only the classes it "
+        "serves — allocate the missing one in the Segments Manager"
+    ),
+}
 
 
 def _no_installable_candidate(
     infra_env: str,
     namespace: str,
     candidates: list[AcquiredServer],
-    already_installed: list[str],
-    unnameable: list[str],
+    rejections: list[tuple[str, str]],
 ) -> ApplicationError:
     """The failure for a draw in which no candidate could be installed.
 
-    Each reason a candidate was passed over is reported separately, because they
-    are three different people's problem: an already-installed machine means the
-    pool is in use, an unnameable one means the inventory needs renaming, and
-    anything left means the collector cannot report link state.
+    Every reason is reported as its own group, because they are different
+    people's problem: a pool in use, an inventory that needs renaming, a
+    collector that cannot report link state, an MCE missing a segment. Merging
+    them into one sentence sends whoever reads it to the wrong place.
+
+    The failure TYPE is the specific one when every candidate was rejected for
+    the same reason — which is the common case, and the whole case when a
+    server was named explicitly — and the general one otherwise.
     """
-    parts = [
-        f"checked {len(candidates)} candidate(s): "
-        + "; ".join(describe_candidate(c) for c in candidates)
+    by_reason: dict[str, list[str]] = {}
+    for reason, description in rejections:
+        by_reason.setdefault(reason, []).append(description)
+
+    groups = [
+        f"{_REJECTION_SUMMARY[reason]}: " + "; ".join(described)
+        for reason, described in by_reason.items()
     ]
-    if already_installed:
-        parts.append(
-            f"skipped as already holding a BareMetalHost in {namespace}: "
-            + ", ".join(already_installed)
-        )
-    if unnameable:
-        parts.append(
-            "skipped as unusable Kubernetes resource names even lowercased "
-            "(rename these in server-scan): " + ", ".join(unnameable)
-        )
-    parts.append(
-        "anything left offers fewer than two link-up NICs on two distinct "
-        "physical ports. Note that HPE OneView reports no link state at all "
-        "and Intersight vNICs usually report none, so servers from those "
-        "collectors cannot satisfy a strict link-up requirement"
+    reasons = set(by_reason)
+    error = (
+        _REJECTION_TYPE[reasons.pop()]
+        if len(reasons) == 1
+        else NoBondableInterfacesError
     )
     return ApplicationError(
-        f"No candidate for InfraEnv {infra_env} is installable. " + ". ".join(parts),
-        type=NoBondableInterfacesError.__name__,
+        f"No candidate for InfraEnv {infra_env} could be installed into "
+        f"{namespace}. Checked {len(candidates)} candidate(s) — "
+        + ". ".join(groups),
+        type=error.__name__,
     )
 
 
@@ -380,31 +398,7 @@ class InstallServerWorkflow:
             install_input.mce_cluster,
         )
 
-        # Step 1 — the VLAN is the MCE's, so it is read from the Segments
-        # Manager rather than taken from the caller: a supplied VLAN could
-        # contradict the segment the cluster actually owns. Runs on the
-        # segment-lifecycle queue, which already holds that credential.
-        self._phase = "resolving-vlan"
-        segment = await workflow.execute_activity(
-            get_inventory_segment,
-            install_input.mce_cluster,
-            task_queue=SEGMENT_LIFECYCLE_ACTIVITY_QUEUE,
-            start_to_close_timeout=_ACTIVITY_TIMEOUT,
-            retry_policy=_RETRY_POLICY,
-        )
-        # Re-checked here even though the activity already matched the cluster:
-        # that match is client-side (the list endpoint has no cluster filter),
-        # and this is the one value that decides which VLAN a host is tagged
-        # onto.
-        if segment.cluster_name != install_input.mce_cluster:
-            raise ApplicationError(
-                f"Segments Manager returned segment {segment.segment} allocated "
-                f"to {segment.cluster_name!r}, not to the requested MCE "
-                f"{install_input.mce_cluster!r}",
-                type=InventorySegmentMismatchError.__name__,
-            )
-
-        # Step 2 — the InfraEnv name IS the hardware query. It encodes vendor,
+        # Step 1 — the InfraEnv name IS the hardware query. It encodes vendor,
         # model, site and spec, and server names carry the same tokens behind
         # an `ocp-` prefix, so no part of either is parsed apart.
         self._phase = "acquiring-server"
@@ -419,35 +413,36 @@ class InstallServerWorkflow:
             retry_policy=_RETRY_POLICY,
         )
 
-        # Step 3 — the first candidate that can actually be installed.
-        self._phase = "selecting-bond"
-        server, bond_members = await self._select_candidate(
+        # Step 2 — the first candidate that can actually be installed, and the
+        # inventory VLAN it needs. The VLAN is resolved HERE, not up front,
+        # because it depends on the chosen server: an MCE's inventory network
+        # is split by BMC protocol class, so which segment applies is not known
+        # until a machine is picked.
+        self._phase = "selecting-server"
+        server, bond_members, segment = await self._select_candidate(
             install_input.server_name,
             infra_env,
             install_input.namespace,
+            install_input.mce_cluster,
             candidates,
             activity_queue,
         )
         self._server_name = server.name
 
-        # All three before the first write: a Secret left behind by a failure
-        # the payload guaranteed is worse than no resources at all.
-        bmc_vendor = _require_bmc_vendor(server)
-        _require_bmc_endpoint(server)
-        _require_valid_macs(server.name, bond_members)
-
         resource_request = BmhResourceRequest(
             server_name=server.name,
             namespace=install_input.namespace,
             infra_env=infra_env,
-            bmc_vendor=bmc_vendor,
+            # Narrowed by the selection: an unusable vendor is a rejection
+            # reason, so a chosen candidate always has one.
+            bmc_vendor=str(server.bmc_vendor),
             bmc=server.bmc,
             bond_members=bond_members,
             vlan_id=segment.vlan_id,
             labels=install_input.labels,
         )
 
-        # Step 4 — the three resources, in dependency order: the BareMetalHost
+        # Step 3 — the three resources, in dependency order: the BareMetalHost
         # references the Secret by name, so the Secret goes first. Each create
         # treats "already exists" as success, which is what makes the whole run
         # re-runnable.
@@ -462,7 +457,7 @@ class InstallServerWorkflow:
             create_nmstate_config, resource_request, activity_queue
         )
 
-        # Step 5 — a stored object is not a registered host. Ironic still has
+        # Step 4 — a stored object is not a registered host. Ironic still has
         # to reach the BMC, and a wrong address or credential shows up only
         # here, so the run does not claim success until it has.
         self._phase = "verifying-registration"
@@ -486,8 +481,8 @@ class InstallServerWorkflow:
             namespace=resource_request.namespace,
             mce_cluster=install_input.mce_cluster,
             vlan_id=segment.vlan_id,
-            bmc_vendor=bmc_vendor,
-            bmc_address=build_bmc_address(bmc_vendor, server.bmc),
+            bmc_vendor=resource_request.bmc_vendor,
+            bmc_address=build_bmc_address(resource_request.bmc_vendor, server.bmc),
             bond_macs=[member.mac for member in bond_members],
             boot_mac=bond_members[0].mac,
             resources_changed=any(
@@ -501,35 +496,77 @@ class InstallServerWorkflow:
         requested_name: str | None,
         infra_env: str,
         namespace: str,
+        mce_cluster: str,
         candidates: list[AcquiredServer],
         task_queue: str,
-    ) -> tuple[AcquiredServer, list[BondMember]]:
-        """The first candidate that can carry a bond and is not already installed.
+    ) -> tuple[AcquiredServer, list[BondMember], SegmentEntry]:
+        """The first candidate that can be installed, with its inventory VLAN.
 
-        The bond rule is pure logic, so it costs no round trip; the installed
-        check is one read per surviving candidate.
+        EVERY reason a candidate cannot be installed is a skip here, not a
+        failure. The draw exists so one unusable server is a retry rather than a
+        failed run, and a reason handled outside this loop would silently break
+        that promise: a pool of three would die on a STANDALONE machine at the
+        front while two installable servers sat behind it. When nothing
+        survives, the reasons are reported together and the failure takes the
+        specific type if they all agree — which they do whenever a server was
+        named explicitly, since that pool holds one.
 
-        Why the installed check is needed at all: server-scan reports a machine
-        as unclaimed until a CLUSTER reports the node, minutes after this
-        workflow finishes. A second run started in that window draws the same
-        machine, every create answers "already exists", and the run reports
-        success having added nothing. Skipping candidates that already have a
-        BareMetalHost is what makes a second run either take a DIFFERENT machine
-        or fail honestly.
+        Why an already-installed candidate has to be skipped at all: server-scan
+        reports a machine as unclaimed until a CLUSTER reports the node, minutes
+        after this workflow finishes. A second run started in that window draws
+        the same machine, every create answers "already exists", and the run
+        reports success having added nothing.
         """
-        already_installed: list[str] = []
-        unnameable: list[str] = []
+        rejections: list[tuple[str, str]] = []
+        # One lookup per BMC protocol class, at most two per run, and none at
+        # all for a draw whose candidates are all rejected before this point.
+        segments: dict[SegmentType, InventorySegmentLookup] = {}
+
         for candidate in candidates:
-            # Checked before the name is used anywhere: the read below and every
-            # create derive a Kubernetes object name from it, and the raising
-            # form of that conversion in an activity would fail the whole run
-            # over one badly-named machine in the pool.
+            described = describe_candidate(candidate)
+
+            # Checked before the name is used anywhere: every read and every
+            # create derives a Kubernetes object name from it.
             if not is_k8s_resource_name(candidate.name):
-                unnameable.append(candidate.name)
+                rejections.append(("unnameable", candidate.name))
                 continue
+
+            vendor = candidate.bmc_vendor
+            if vendor is None or vendor.upper() not in BMC_VENDORS:
+                rejections.append(
+                    ("unknown-bmc-vendor", f"{candidate.name} (bmc_vendor={vendor!r})")
+                )
+                continue
+
+            if not candidate.bmc.host.strip("[] "):
+                rejections.append(("no-bmc-host", candidate.name))
+                continue
+
             members = select_bond_members(candidate)
             if members is None:
+                rejections.append(("no-bond", described))
                 continue
+
+            bad = [m.mac for m in members if not mac_is_valid(m.mac)]
+            if bad:
+                rejections.append(("bad-mac", f"{candidate.name} {bad}"))
+                continue
+
+            # The inventory network this machine's BMC is reachable on. An MCE
+            # holds one segment per protocol class and only the classes it
+            # serves, so a UCS blade on a Redfish-only MCE is passed over here.
+            segment_type = _INVENTORY_TYPE_BY_DRIVER_CLASS[bmc_driver_class(vendor)]
+            if segment_type not in segments:
+                segments[segment_type] = await self._inventory_segment(
+                    mce_cluster, segment_type
+                )
+            lookup = segments[segment_type]
+            if not lookup.found or lookup.entry is None:
+                rejections.append(
+                    ("no-inventory-segment", f"{candidate.name} needs {segment_type.value}")
+                )
+                continue
+
             # An explicitly named server is a request to converge THAT machine,
             # so it is never skipped — only an unnamed draw from a pool is.
             if requested_name is None:
@@ -538,12 +575,45 @@ class InstallServerWorkflow:
                     task_queue,
                 )
                 if existing.found:
-                    already_installed.append(candidate.name)
+                    rejections.append(("already-installed", candidate.name))
                     continue
-            return candidate, members
-        raise _no_installable_candidate(
-            infra_env, namespace, candidates, already_installed, unnameable
+
+            return candidate, members, lookup.entry
+
+        raise _no_installable_candidate(infra_env, namespace, candidates, rejections)
+
+    async def _inventory_segment(
+        self, mce_cluster: str, segment_type: SegmentType
+    ) -> InventorySegmentLookup:
+        """One MCE's inventory segment of one BMC protocol class.
+
+        Runs on the SEGMENT-LIFECYCLE queue: it reads the Segments Manager,
+        whose credential already lives on that limb, so routing one activity
+        there beats a second copy of the token on this domain's worker.
+        """
+        lookup = await workflow.execute_activity(
+            get_inventory_segment,
+            InventorySegmentRequest(
+                mce_cluster=mce_cluster, segment_type=segment_type
+            ),
+            task_queue=SEGMENT_LIFECYCLE_ACTIVITY_QUEUE,
+            start_to_close_timeout=_ACTIVITY_TIMEOUT,
+            retry_policy=_RETRY_POLICY,
         )
+        # Re-checked even though the activity already matched the cluster: that
+        # match is client-side, because the list endpoint has no cluster filter,
+        # and this is the one value that decides which VLAN a host is tagged
+        # onto. A host on another cluster's inventory network comes up
+        # somewhere this MCE cannot reach.
+        entry = lookup.entry
+        if entry is not None and entry.cluster_name != mce_cluster:
+            raise ApplicationError(
+                f"Segments Manager returned segment {entry.segment} allocated "
+                f"to {entry.cluster_name!r}, not to the requested MCE "
+                f"{mce_cluster!r}",
+                type=InventorySegmentMismatchError.__name__,
+            )
+        return lookup
 
     async def _create(
         self,

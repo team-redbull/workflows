@@ -144,11 +144,35 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   `NoBondableInterfacesError` naming the provider and the states observed —
   deliberately loud, so the gap is visible rather than looking like an empty
   inventory. Decided with the operator, 2026-09-25.
-- **The inventory VLAN belongs to the MCE, and is read from the Segments
-  Manager** — `get_inventory_segment` on the SEGMENT-LIFECYCLE queue, not a
+- **The inventory VLAN belongs to the MCE AND to the chosen server's BMC
+  protocol** — `get_inventory_segment` on the SEGMENT-LIFECYCLE queue, not a
   second copy of that token on the server-lifecycle limb. There is deliberately
   no `vlan_id` input: a caller-supplied VLAN could contradict the segment the
   cluster owns.
+- **An MCE has up to TWO inventory networks, split by how a BMC is DRIVEN.**
+  Ironic reaches a Redfish BMC on one and a UCS-managed blade over IPMI on
+  another, allocated as `INVENTORY_REDFISH` (HP via OneView, Dell via
+  OpenManage's iDRAC — Redfish underneath, so not a class of its own — and
+  Cisco via Intersight) and `INVENTORY_IPMI` (Cisco via UCS Central). So which
+  segment applies is not known until a SERVER is chosen, which is why the
+  lookup sits INSIDE candidate selection rather than being step one, and is
+  memoized per class rather than repeated per candidate. An MCE holds only the
+  classes it serves; a candidate needing a class it has not allocated is passed
+  over like any other unusable one. There is deliberately no plain `INVENTORY`
+  type — an allocation naming no class serves neither kind of BMC. The class is
+  derived in `shared/bmc_address.py` from the driver map, keyed by DRIVER, so
+  the vendor list stays the one place a vendor is named.
+- **In install-server, EVERY reason a candidate is unusable is a SKIP.** The
+  multi-candidate draw exists so one unusable server is a retry rather than a
+  failed run, and a reason handled outside the selection loop silently breaks
+  that promise for part of the fleet — a pool of three dying on a STANDALONE
+  machine at the front while two installable servers sit behind it. The reasons
+  are two tables in `install_server.py` (`_REJECTION_TYPE`, `_REJECTION_SUMMARY`)
+  keyed by the same strings the loop records; when nothing survives they are
+  reported as separate groups and the failure takes the specific type only if
+  they all agree. A reason missing from either table is a KeyError raised in
+  WORKFLOW code, which hangs the run rather than failing it — so a test keeps
+  the loop and both tables in step.
 
 - **The workflow is the ENTRY POINT; the Segments Manager is a dependency, never a trigger.** A
   caller POSTs the full segment DEFINITION to `POST /workflows/segment-lifecycle/initialize-segment`

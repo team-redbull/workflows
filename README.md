@@ -19,7 +19,8 @@ direction is reversed: callers POST the definition to
 Segments Manager itself. The Segments Manager is a dependency, never a trigger.
 
 **A segment has no type until it is allocated.** The type (`HC`, `MCE`,
-`INVENTORY`, `PXE`) is allocation state, like the cluster: initialize-segment
+`INVENTORY_REDFISH`, `INVENTORY_IPMI`, `PXE`) is allocation state, like the
+cluster: initialize-segment
 creates a typeless segment into one shared Available pool per site, allocate-segment
 passes the type as a parameter and the Segments Manager stamps it onto whichever
 segment it reserves, and a release clears it again. So there is no per-type
@@ -106,22 +107,26 @@ per-segment status — which is what lets the bulk route start N of them.
 `POST /workflows/server-lifecycle/install-server` with the **InfraEnv** to fill
 and its **MCE cluster**. The run:
 
-1. **resolving-vlan** — reads the MCE's `INVENTORY` segment from the Segments
-   Manager (`get_inventory_segment`, on the *segment-lifecycle* queue, where
-   that token already lives). There is no `vlan_id` input: a caller-supplied
-   VLAN could contradict the segment the cluster owns.
-2. **acquiring-server** — `GET /servers/available` against server-scan. The
+1. **acquiring-server** — `GET /servers/available` against server-scan. The
    InfraEnv's name states which hardware it is for
    (`cisco-m6-bat-yam-64c-512gb`) and server names carry the same tokens behind
    an `ocp-` prefix, so the pattern is `^ocp-<infraEnv>`. `HEALTHY` only.
-3. **selecting-bond** — two link-up NICs on two **distinct physical ports**,
-   on a candidate that does not already have a BareMetalHost. Members come from
-   `interfaces[]`, never `nic_macs`: server-scan reduces NPAR partitions to one
-   entry per port in the former and leaves the latter whole, so indexing MACs
-   can bond two partitions of one wire. `UP` is required strictly, which no HPE
-   server can satisfy — OneView reports no link state at all — so those fail
-   loudly rather than being silently skipped.
-4. **creating-secret / -baremetalhost / -nmstateconfig** — all idempotent; an
+2. **selecting-server** — the first candidate that can actually be installed,
+   and the inventory VLAN it needs. Bond members are two link-up NICs on two
+   **distinct physical ports**, taken from `interfaces[]` and never
+   `nic_macs`: server-scan reduces NPAR partitions to one entry per port in the
+   former and leaves the latter whole, so indexing MACs can bond two partitions
+   of one wire. `UP` is required strictly, which no HPE server can satisfy —
+   OneView reports no link state at all.
+
+   **Every** reason a candidate is unusable is a *skip*, never a failed run —
+   an unusable name, no bond, an unknown `bmc_vendor`, no BMC host, a malformed
+   MAC, an inventory segment this MCE does not hold, or a BareMetalHost it
+   already has. That is what the multi-candidate draw is for. If none survives,
+   the reasons are reported as separate groups and the failure takes the
+   specific error type when they all agree — which they always do for an
+   explicitly named server, whose pool holds one.
+3. **creating-secret / -baremetalhost / -nmstateconfig** — all idempotent; an
    existing resource is success **once its BMC address, boot MAC, InfraEnv and
    VLAN match**, and never an overwrite. A resource that differs is a
    `BmhConflictError` for a human, because reporting success would describe an
@@ -140,6 +145,28 @@ reserving them, and two concurrent runs could otherwise draw the same machine.
 The sequential case an id cannot cover — a second run minutes later, before any
 cluster has reported the node — is covered by step 3 skipping candidates that
 already have a BareMetalHost.
+
+**The inventory VLAN is split by BMC protocol.** An MCE's inventory network is
+really up to two networks: Ironic reaches a Redfish BMC on one and a
+UCS-managed blade over IPMI on another, allocated in the Segments Manager as
+`INVENTORY_REDFISH` and `INVENTORY_IPMI`.
+
+| server-scan `bmc_vendor` | managed by | Ironic driver | inventory segment |
+| --- | --- | --- | --- |
+| `HP` | OneView | `redfish-virtualmedia` | `INVENTORY_REDFISH` |
+| `DELL` | OpenManage | `idrac-virtualmedia` | `INVENTORY_REDFISH` |
+| `INTERSIGHT` | Intersight | `redfish-virtualmedia` | `INVENTORY_REDFISH` |
+| `CISCO` | UCS Central | `ipmi` | `INVENTORY_IPMI` |
+| `null` | standalone | *refused* | — |
+
+iDRAC is Redfish underneath, so a Dell is not a class of its own. That is why
+the VLAN is resolved **inside** candidate selection rather than as a first
+step: which segment applies is not known until a server is chosen. An MCE holds
+only the classes it serves, so a UCS blade drawn against a Redfish-only MCE is
+passed over — the Dell behind it still installs. There is deliberately no
+`vlan_id` input, and no plain `INVENTORY` type: an allocation naming no class
+serves neither kind of BMC. The lookup runs on the *segment-lifecycle* queue
+where that token already lives, once per class rather than once per candidate.
 
 **One worker per MCE, routed by queue.** The brain runs on the hub; the
 resources belong on the MCE that owns the InfraEnv, which is a different API
@@ -185,7 +212,7 @@ resource name — three different people's problem, so they are never merged.
 | field | type | rules | what it is for |
 | --- | --- | --- | --- |
 | `infra_env` | str | non-empty | The InfraEnv to fill. Labels both resources, **and** is the server query (`^ocp-<infra_env>`). Must already exist, in `namespace`. |
-| `mce_cluster` | str | non-empty | Which MCE. Selects the `INVENTORY` segment the VLAN comes from **and** the activity queue the cluster writes go to. |
+| `mce_cluster` | str | non-empty | Which MCE. Selects the inventory segment the VLAN comes from — `INVENTORY_REDFISH` or `INVENTORY_IPMI`, whichever the chosen server's BMC needs — **and** the activity queue the cluster writes go to. |
 | `namespace` | str | non-empty | Where the three resources go. **Must be the InfraEnv's own namespace** — BMAC looks for the InfraEnv beside the BareMetalHost. |
 | `server_name` | str \| null | default `null` | Install one specific machine instead of drawing from the pool (see above). |
 | `candidate_count` | int | 1–20, default 3 | How many candidates to draw. Ignored when `server_name` is given. |

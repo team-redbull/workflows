@@ -128,30 +128,6 @@
         <div class="marker">1</div>
         <div class="card">
           <div class="card-title">
-            <h3>get_inventory_segment</h3>
-            <span class="phase">phase <b>resolving-vlan</b></span>
-          </div>
-          <p>The VLAN belongs to the <b>MCE</b>, not to the server and not to the caller: each MCE owns one
-          <code>INVENTORY</code> segment, so the workflow reads it from the Segments Manager. There is
-          deliberately <b>no <code>vlan_id</code> input</b> &mdash; a supplied VLAN could contradict the
-          segment the cluster actually owns.</p>
-          <div class="calls">
-            <div class="call sm"><span class="verb">GET</span><span class="path">/api/segments?type=INVENTORY <em>· on the SEGMENT-LIFECYCLE queue</em></span></div>
-          </div>
-          <p class="note">Runs on the other domain&rsquo;s queue on purpose: the Segments Manager token
-          already lives on <code>segment-lifecycle-worker</code>, and routing one activity there beats
-          putting a second copy of that credential on this limb. No <code>INVENTORY</code> segment for the
-          MCE &rarr; <code>InventorySegmentNotFoundError</code>; two &rarr;
-          <code>AmbiguousInventorySegmentError</code>; one belonging to another cluster &rarr;
-          <code>InventorySegmentMismatchError</code>. All three are non-retryable.</p>
-        </div>
-      </div>
-
-      <!-- 2 -->
-      <div class="step">
-        <div class="marker">2</div>
-        <div class="card">
-          <div class="card-title">
             <h3>acquire_servers</h3>
             <span class="phase">phase <b>acquiring-server</b></span>
           </div>
@@ -171,43 +147,51 @@
         </div>
       </div>
 
-      <!-- 3 -->
+      <!-- 2 -->
       <div class="step">
-        <div class="marker">3</div>
+        <div class="marker">2</div>
         <div class="card">
           <div class="card-title">
-            <h3>Bond selection + the already-installed probe</h3>
-            <span class="phase">phase <b>selecting-bond</b></span>
+            <h3>Candidate selection + the inventory VLAN</h3>
+            <span class="phase">phase <b>selecting-server</b></span>
           </div>
-          <p>The bond rule is <b>pure workflow logic</b> &mdash; no activity, no round trip, and it replays
-          identically. The first candidate that survives all three of these is the one installed:</p>
+          <p>The first candidate that survives <em>every</em> one of these is the one installed. Most of it
+          is pure workflow logic &mdash; no activity, no round trip, and it replays identically:</p>
           <ol>
             <li>its server-scan name can be a Kubernetes resource name once lowercased;</li>
+            <li>its <code>bmc_vendor</code> is one this orchestrator has an Ironic driver for &mdash; a
+              STANDALONE machine reports <code>null</code>, and guessing IPMI would be silently wrong for
+              a Redfish-only BMC;</li>
+            <li>server-scan actually collected a BMC host for it;</li>
             <li>it offers two link-up NICs on two distinct physical ports (below);</li>
+            <li>those MACs are well-formed;</li>
+            <li>this MCE holds the inventory segment its BMC class needs (below);</li>
             <li>it does not already have a <code>BareMetalHost</code> &mdash; one read per surviving
               candidate, skipped when a <code>server_name</code> was given.</li>
           </ol>
           <div class="calls">
-            <div class="call sm"><span class="verb">GET</span><span class="path">baremetalhosts/&lt;server&gt; <em>· per candidate, on the MCE&rsquo;s queue</em></span></div>
+            <div class="call sm"><span class="verb">GET</span><span class="path">/api/segments?type=INVENTORY_REDFISH <em>· once per BMC class, on the SEGMENT-LIFECYCLE queue</em></span></div>
+            <div class="call nxt"><span class="verb">GET</span><span class="path">baremetalhosts/&lt;server&gt; <em>· per surviving candidate, on the MCE&rsquo;s queue</em></span></div>
           </div>
-          <p class="note">When nothing survives, the failure names <em>every</em> candidate with its
-          provider and each interface&rsquo;s link state, and lists separately those skipped as already
-          installed and those whose name needs fixing in server-scan. Three different people&rsquo;s
-          problem, so they are never merged into one sentence.</p>
-          <p class="note"><b>Three more checks run on the chosen server before anything is written:</b> a
-          <code>bmc_vendor</code> this orchestrator has an Ironic driver for
-          (<code>UnknownBmcVendorError</code>), a BMC host server-scan actually collected
-          (<code>BmcEndpointMissingError</code>), and well-formed MACs (<code>InvalidMacError</code>).
-          They are here rather than later because each would otherwise cost more than it should: an empty
-          BMC host still builds a <em>syntactically valid</em> address that the API server stores happily,
-          so the run would create all three resources and spend the whole 10-minute registration deadline
-          before blaming the credentials for an address the inventory never had.</p>
+          <p class="note"><b>Every one of those is a SKIP, not a failed run.</b> The multi-candidate draw
+          exists so that one unusable server is a retry, and a reason handled outside this loop would
+          quietly break that promise for part of the fleet &mdash; a pool of three would die on a
+          STANDALONE machine at the front while two installable servers sat behind it.</p>
+          <p class="note">When nothing survives, each reason is reported as its own group &mdash; they are
+          different people&rsquo;s problem, and merging them sends whoever reads it to the wrong place. The
+          failure takes the <em>specific</em> error type when every candidate was rejected for the same
+          reason, which is always the case for an explicitly named server, whose pool holds one.</p>
+          <p class="note">The segment lookup runs on the other domain&rsquo;s queue on purpose: the
+          Segments Manager token already lives on <code>segment-lifecycle-worker</code>, and routing one
+          activity there beats a second copy of that credential on this limb. Two segments of one class for
+          an MCE &rarr; <code>AmbiguousInventorySegmentError</code>; one belonging to another cluster &rarr;
+          <code>InventorySegmentMismatchError</code>. Both non-retryable.</p>
         </div>
       </div>
 
-      <!-- 4 -->
+      <!-- 3 -->
       <div class="step">
-        <div class="marker">4</div>
+        <div class="marker">3</div>
         <div class="card">
           <div class="card-title">
             <h3>create_bmc_secret &rarr; create_baremetal_host &rarr; create_nmstate_config</h3>
@@ -229,9 +213,9 @@
         </div>
       </div>
 
-      <!-- 5 -->
+      <!-- 4 -->
       <div class="step">
-        <div class="marker">5</div>
+        <div class="marker">4</div>
         <div class="card">
           <div class="card-title">
             <h3>get_baremetal_host, on a bounded timer</h3>
@@ -316,6 +300,54 @@
       <code>HEALTHY</code> overall. Hence <code>min_nic_macs=2</code> on the query <em>and</em> the
       structural rule above: the health tier says nothing bad was observed, and these say the machine is
       actually installable.</p>
+    </div>
+  </section>
+
+  <!-- =========================================================== VLANS -->
+  <section id="inventory-networks">
+    <div class="sec-head">
+      <div class="eyebrow">Why the VLAN is resolved inside selection</div>
+      <h2>An MCE has up to <em>two</em> inventory networks, split by BMC protocol</h2>
+      <p class="lede">Ironic reaches a Redfish BMC on one network and a UCS-managed blade over IPMI on
+      another. So which inventory segment applies is not a property of the MCE alone &mdash; it depends on
+      the server that was chosen, which is why the lookup cannot be step one.</p>
+    </div>
+
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>server-scan <code>bmc_vendor</code></th><th>managed by</th><th>Ironic driver</th><th>inventory segment</th></tr></thead>
+        <tbody>
+          <tr><td class="k">HP</td><td class="muted">OneView</td><td class="muted"><code>redfish-virtualmedia</code></td><td class="muted"><code>INVENTORY_REDFISH</code></td></tr>
+          <tr><td class="k">DELL</td><td class="muted">OpenManage</td><td class="muted"><code>idrac-virtualmedia</code></td><td class="muted"><code>INVENTORY_REDFISH</code></td></tr>
+          <tr><td class="k">INTERSIGHT</td><td class="muted">Intersight</td><td class="muted"><code>redfish-virtualmedia</code></td><td class="muted"><code>INVENTORY_REDFISH</code></td></tr>
+          <tr><td class="k">CISCO</td><td class="muted">UCS Central</td><td class="muted"><code>ipmi</code></td><td class="muted"><code>INVENTORY_IPMI</code></td></tr>
+          <tr><td class="k">null</td><td class="muted">standalone</td><td class="muted"><em>refused</em></td><td class="muted">&mdash;</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="grid-2" style="margin-top:24px">
+      <div class="panel">
+        <h3>Why Dell is not a class of its own</h3>
+        <p><code>idrac-virtualmedia</code> is Dell&rsquo;s Redfish implementation, so it sits with HP and
+        Intersight. Only UCS Central&rsquo;s blades are genuinely a different protocol, which is why the
+        split is by <b>protocol</b> rather than by vendor: the network is reachable over one or the other,
+        and a vendor list would have to be kept in step with the driver table to say the same thing.</p>
+        <p class="note">The class is derived from the driver map in <code>shared/bmc_address.py</code>,
+        keyed by DRIVER, so the vendor list stays the one place a vendor is named. A driver nobody has
+        classified raises rather than defaulting into a class &mdash; being wrong here puts a host on a
+        network its BMC cannot be reached on, which looks exactly like a dead BMC.</p>
+      </div>
+      <div class="panel">
+        <h3>An MCE holds only the classes it serves</h3>
+        <p>Some MCEs have both segments; some have only one. A UCS blade drawn against a Redfish-only MCE
+        is <b>passed over</b> like any other unusable candidate, so the Dell behind it still installs. Only
+        when that was the sole problem with every candidate does the run fail, as
+        <code>InventorySegmentNotFoundError</code> naming the class that is missing.</p>
+        <p class="note">There is deliberately <b>no plain <code>INVENTORY</code></b> type. An allocation
+        naming no class serves neither kind of BMC while reading as &ldquo;inventory, sorted out&rdquo; on
+        a site card, so the ambiguity would sit in the data instead of being caught.</p>
+      </div>
     </div>
   </section>
 
@@ -507,9 +539,9 @@
         <thead><tr><th>phase</th><th>Meaning</th><th>Normal duration</th></tr></thead>
         <tbody>
           <tr><td class="k">pending</td><td class="muted">Run accepted, nothing read yet</td><td class="muted">instant</td></tr>
-          <tr><td class="k">resolving-vlan</td><td class="muted">Reading the MCE&rsquo;s <code>INVENTORY</code> segment</td><td class="muted">seconds</td></tr>
+
           <tr><td class="k">acquiring-server</td><td class="muted">Asking server-scan for candidates &mdash; it live-rechecks each one</td><td class="muted">seconds to ~1 min (it reaches a vendor manager)</td></tr>
-          <tr><td class="k">selecting-bond</td><td class="muted">Pure bond rule + one BareMetalHost read per candidate</td><td class="muted">seconds</td></tr>
+          <tr><td class="k">selecting-server</td><td class="muted">Bond rule + one BareMetalHost read per candidate + the inventory VLAN (one lookup per BMC class)</td><td class="muted">seconds</td></tr>
           <tr><td class="k">creating-secret</td><td class="muted">The BMC credentials Secret</td><td class="muted">instant</td></tr>
           <tr><td class="k">creating-baremetalhost</td><td class="muted">The BareMetalHost</td><td class="muted">instant</td></tr>
           <tr><td class="k">creating-nmstateconfig</td><td class="muted">The bond + tagged VLAN</td><td class="muted">instant</td></tr>

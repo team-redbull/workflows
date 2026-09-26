@@ -28,8 +28,13 @@ from shared.consts import (
     SEGMENT_LIFECYCLE_ACTIVITY_QUEUE,
     server_lifecycle_activity_queue,
 )
-from shared.exceptions import InventorySegmentNotFoundError, ServerNotAvailableError
-from shared.models.segment_lifecycle import SegmentEntry
+from shared.exceptions import ServerNotAvailableError
+from shared.models.segment_lifecycle import (
+    InventorySegmentLookup,
+    InventorySegmentRequest,
+    SegmentEntry,
+    SegmentType,
+)
 from shared.models.server_lifecycle import (
     AcquiredServer,
     AcquireServerRequest,
@@ -59,12 +64,14 @@ INPUT = InstallServerInput(
     infra_env=INFRA_ENV, mce_cluster=MCE_CLUSTER, namespace=NAMESPACE
 )
 
+# An MCE's inventory network is split by BMC protocol class, so the fixture is
+# the REDFISH one — the class a Dell (iDRAC is Redfish underneath) needs.
 INVENTORY_SEGMENT = SegmentEntry(
     segment="10.20.90.0/24",
     site="bat-yam",
     vlan_id=VLAN_ID,
     status="Allocated",
-    type="INVENTORY",
+    type=SegmentType.INVENTORY_REDFISH.value,
     cluster_name=MCE_CLUSTER,
 )
 
@@ -131,6 +138,7 @@ def make_mock_activities(
     acquire_error: Exception | None = None,
     segment: SegmentEntry | None = None,
     segment_error: Exception | None = None,
+    segments_by_type: dict[SegmentType, SegmentEntry | None] | None = None,
     resources_exist: bool = False,
     bmh_script: list[BmhState] | None = None,
     bmh_never_registers: bool = False,
@@ -167,11 +175,18 @@ def make_mock_activities(
     )
 
     @activity.defn
-    async def get_inventory_segment(mce_cluster: str) -> SegmentEntry:
-        calls["get_inventory_segment"].append(mce_cluster)
+    async def get_inventory_segment(
+        request: InventorySegmentRequest,
+    ) -> InventorySegmentLookup:
+        calls["get_inventory_segment"].append(request)
         if segment_error is not None:
             raise segment_error
-        return segment or INVENTORY_SEGMENT
+        if segments_by_type is not None:
+            # An MCE holds only the classes it serves, so a class it has none
+            # of reports absent rather than raising.
+            entry = segments_by_type.get(request.segment_type)
+            return InventorySegmentLookup(found=entry is not None, entry=entry)
+        return InventorySegmentLookup(found=True, entry=segment or INVENTORY_SEGMENT)
 
     @activity.defn
     async def acquire_servers(request: AcquireServerRequest) -> list[AcquiredServer]:
@@ -305,7 +320,8 @@ async def test_happy_path_resolves_vlan_acquires_creates_and_verifies():
     assert result.bmc_address == (
         "idrac-virtualmedia://10.11.1.229/redfish/v1/Systems/System.Embedded.1"
     )
-    assert calls["get_inventory_segment"] == [MCE_CLUSTER]
+    (segment_request,) = calls["get_inventory_segment"]
+    assert segment_request.mce_cluster == MCE_CLUSTER
     # probe (is this candidate already installed?), then not-found, then registered
     assert len(calls["get_baremetal_host"]) == 3
 
@@ -361,14 +377,96 @@ async def test_a_segment_allocated_to_another_cluster_is_refused():
     assert _application_error(excinfo.value).type == "InventorySegmentMismatchError"
 
 
-async def test_a_missing_inventory_segment_fails_fast():
-    _, segment_acts, server_acts = make_mock_activities(
-        segment_error=InventorySegmentNotFoundError("no INVENTORY segment for that MCE")
-    )
-    async with _Harness(segment_acts, server_acts) as client:
-        with pytest.raises(WorkflowFailureError) as excinfo:
+class TestTheInventoryNetworkIsSplitByBmcProtocol:
+    """An MCE's inventory network is really up to two networks.
+
+    Ironic reaches a Redfish BMC (HP via OneView, Dell via iDRAC, Cisco via
+    Intersight) on one and a UCS-managed blade over IPMI on another, so which
+    segment applies is not known until a SERVER is chosen — which is why the
+    VLAN is resolved inside candidate selection rather than as step one.
+    """
+
+    async def test_a_redfish_server_asks_for_the_redfish_segment(self) -> None:
+        calls, segment_acts, server_acts = make_mock_activities()
+        async with _Harness(segment_acts, server_acts) as client:
             await _execute(client, InstallServerRunArgs(input=INPUT))
-    assert _application_error(excinfo.value).type == "InventorySegmentNotFoundError"
+
+        (request,) = calls["get_inventory_segment"]
+        # Dell: iDRAC is Redfish underneath, so it is not a class of its own.
+        assert request.segment_type is SegmentType.INVENTORY_REDFISH
+        assert request.mce_cluster == MCE_CLUSTER
+
+    async def test_a_ucs_server_asks_for_the_ipmi_segment(self) -> None:
+        ucs = bondable_server().model_copy(update={"bmc_vendor": "CISCO"})
+        ipmi_segment = INVENTORY_SEGMENT.model_copy(
+            update={"type": SegmentType.INVENTORY_IPMI.value, "vlan_id": 1444}
+        )
+        calls, segment_acts, server_acts = make_mock_activities(
+            candidates=[ucs],
+            segments_by_type={SegmentType.INVENTORY_IPMI: ipmi_segment},
+        )
+        async with _Harness(segment_acts, server_acts) as client:
+            result = await _execute(client, InstallServerRunArgs(input=INPUT))
+
+        (request,) = calls["get_inventory_segment"]
+        assert request.segment_type is SegmentType.INVENTORY_IPMI
+        assert result.vlan_id == 1444
+
+    async def test_a_ucs_server_is_passed_over_on_a_redfish_only_mce(self) -> None:
+        """The reason this is a SKIP and not a failure.
+
+        An MCE holds only the classes it serves. A pool draw that happens to
+        put a UCS blade first must still install the Dell behind it.
+        """
+        ucs = bondable_server("srv_ucs", name="ocp-ucs-blade").model_copy(
+            update={"bmc_vendor": "CISCO"}
+        )
+        dell = bondable_server("srv_dell")
+        calls, segment_acts, server_acts = make_mock_activities(
+            candidates=[ucs, dell],
+            segments_by_type={SegmentType.INVENTORY_REDFISH: INVENTORY_SEGMENT},
+        )
+        async with _Harness(segment_acts, server_acts) as client:
+            result = await _execute(client, InstallServerRunArgs(input=INPUT))
+
+        assert result.server_name == SERVER_NAME
+        assert [c.server_name for c in calls["create_baremetal_host"]] == [SERVER_NAME]
+        # One lookup per class, not one per candidate.
+        assert len(calls["get_inventory_segment"]) == 2
+
+    async def test_an_mce_with_no_segment_of_that_class_says_so(self) -> None:
+        ucs = bondable_server().model_copy(update={"bmc_vendor": "CISCO"})
+        calls, segment_acts, server_acts = make_mock_activities(
+            candidates=[ucs],
+            segments_by_type={SegmentType.INVENTORY_REDFISH: INVENTORY_SEGMENT},
+        )
+        async with _Harness(segment_acts, server_acts) as client:
+            with pytest.raises(WorkflowFailureError) as excinfo:
+                await _execute(client, InstallServerRunArgs(input=INPUT))
+
+        error = _application_error(excinfo.value)
+        assert error.type == "InventorySegmentNotFoundError"
+        assert "INVENTORY_IPMI" in str(error)
+        assert calls["create_bmc_secret"] == []
+
+    async def test_a_class_is_looked_up_once_however_many_candidates_need_it(
+        self,
+    ) -> None:
+        # Two lookups per candidate would be two round trips to the Segments
+        # Manager for every server in the draw.
+        pool = [
+            bondable_server("srv_a", name="ocp-a"),
+            bondable_server("srv_b", name="ocp-b"),
+            bondable_server("srv_c", name="ocp-c"),
+        ]
+        calls, segment_acts, server_acts = make_mock_activities(
+            candidates=pool, already_installed={"ocp-a", "ocp-b"}
+        )
+        async with _Harness(segment_acts, server_acts) as client:
+            result = await _execute(client, InstallServerRunArgs(input=INPUT))
+
+        assert result.server_name == "ocp-c"
+        assert len(calls["get_inventory_segment"]) == 1
 
 
 async def test_no_assignable_server_fails_fast():
@@ -592,7 +690,9 @@ async def test_a_pool_of_unnameable_candidates_says_to_rename_them():
             await _execute(client, InstallServerRunArgs(input=INPUT))
 
     error = _application_error(excinfo.value)
-    assert error.type == "NoBondableInterfacesError"
+    # Every candidate was rejected for the SAME reason, so the failure names it
+    # rather than falling back to the general "nothing installable".
+    assert error.type == "InvalidServerNameError"
     assert "rename these in server-scan" in str(error)
     assert "ocp_dell_underscores_are_illegal" in str(error)
     assert calls["create_baremetal_host"] == []
@@ -609,7 +709,7 @@ async def test_every_candidate_already_installed_fails_rather_than_reporting_suc
 
     error = _application_error(excinfo.value)
     assert error.type == "NoBondableInterfacesError"
-    assert "already holding a BareMetalHost" in str(error)
+    assert "already hold a BareMetalHost" in str(error)
     assert calls["create_baremetal_host"] == []
 
 

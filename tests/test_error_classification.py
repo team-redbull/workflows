@@ -32,7 +32,11 @@ from shared.bmc_address import (
 )
 from shared.exceptions import InvalidServerNameError, OrchestratorError
 from shared.models.server_lifecycle import BmcEndpoint
-from workflow_domains.server_lifecycle.install_server import _RETRY_POLICY
+from workflow_domains.server_lifecycle.install_server import (
+    _REJECTION_SUMMARY,
+    _REJECTION_TYPE,
+    _RETRY_POLICY,
+)
 
 _INSTALL_SERVER = (
     pathlib.Path(__file__).resolve().parent.parent
@@ -100,6 +104,11 @@ class TestWorkflowRaisedTypes:
         ]
         assert literals == []
 
+    # One `type=` is resolved through _REJECTION_TYPE rather than naming a
+    # class directly — the failure for a draw where nothing was installable
+    # takes the reason's own type. TestRejectionReasons covers that table.
+    _RESOLVED_VIA_TABLE = {"error"}
+
     def test_each_type_used_resolves_to_a_class_in_shared_exceptions(self):
         tree = ast.parse(_INSTALL_SERVER.read_text())
         used = {
@@ -114,8 +123,60 @@ class TestWorkflowRaisedTypes:
             and isinstance(keyword.value.value, ast.Name)
         }
         assert used, "install_server raises no classified ApplicationError"
-        for name in used:
+        for name in used - self._RESOLVED_VIA_TABLE:
             assert isinstance(getattr(exceptions, name, None), type), name
+
+
+class TestRejectionReasons:
+    """The two tables a rejected candidate is reported through.
+
+    A reason is a bare string in the selection loop, and it is looked up in
+    BOTH tables when a draw yields nothing. A reason missing from either is a
+    KeyError raised in WORKFLOW code — which does not fail the run, it fails
+    the workflow task and retries forever, so the run hangs at exactly the
+    moment it was trying to explain itself.
+    """
+
+    def test_the_two_tables_describe_the_same_reasons(self):
+        assert set(_REJECTION_TYPE) == set(_REJECTION_SUMMARY)
+
+    def test_every_reason_the_loop_records_is_in_both_tables(self):
+        tree = ast.parse(_INSTALL_SERVER.read_text())
+        recorded = {
+            node.args[0].elts[0].value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and getattr(node.func, "attr", None) == "append"
+            and node.args
+            and isinstance(node.args[0], ast.Tuple)
+            and node.args[0].elts
+            and isinstance(node.args[0].elts[0], ast.Constant)
+            and isinstance(node.args[0].elts[0].value, str)
+        }
+        assert recorded, "the selection loop records no rejection reasons"
+        assert recorded <= set(_REJECTION_TYPE), sorted(recorded - set(_REJECTION_TYPE))
+
+    def test_no_reason_is_left_described_but_unreachable(self):
+        # The other direction: a reason nothing records any more is dead
+        # weight that reads as a case the loop still handles.
+        tree = ast.parse(_INSTALL_SERVER.read_text())
+        recorded = {
+            node.args[0].elts[0].value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and getattr(node.func, "attr", None) == "append"
+            and node.args
+            and isinstance(node.args[0], ast.Tuple)
+            and node.args[0].elts
+            and isinstance(node.args[0].elts[0], ast.Constant)
+            and isinstance(node.args[0].elts[0].value, str)
+        }
+        assert set(_REJECTION_TYPE) == recorded
+
+    def test_every_reason_maps_to_a_real_error_class(self):
+        for reason, error in _REJECTION_TYPE.items():
+            assert issubclass(error, OrchestratorError), reason
+            assert getattr(exceptions, error.__name__, None) is error, reason
 
 
 class TestTheBmcVendorGate:

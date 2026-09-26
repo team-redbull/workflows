@@ -14,6 +14,8 @@ from shared.models.segment_lifecycle import (
     ClusterFileLookupRequest,
     ClusterValuesAppendRequest,
     InitializeSegmentInput,
+    InventorySegmentLookup,
+    InventorySegmentRequest,
     SegmentAllocation,
     SegmentAllocationRequest,
     SegmentEntry,
@@ -130,8 +132,10 @@ async def append_allocation_to_cluster_values(
 
 
 @activity.defn
-async def get_inventory_segment(mce_cluster: str) -> SegmentEntry:
-    """Find the INVENTORY segment allocated to one MCE cluster (GET /api/segments).
+async def get_inventory_segment(
+    request: InventorySegmentRequest,
+) -> InventorySegmentLookup:
+    """Find one MCE cluster's inventory segment of a given class (GET /api/segments).
 
     Lives in THIS domain, not server-lifecycle, because it reads the Segments
     Manager — whose base URL and token already sit on the segment-lifecycle
@@ -139,17 +143,25 @@ async def get_inventory_segment(mce_cluster: str) -> SegmentEntry:
     task_queue=SEGMENT_LIFECYCLE_ACTIVITY_QUEUE rather than a second
     deployment holding a copy of that credential.
 
-    Each MCE owns one inventory network, so its VLAN is a property of the
-    cluster, not of the server being installed or of the caller's request.
+    An MCE's inventory network is really up to TWO networks, split by how a
+    server's BMC is driven: Ironic reaches a Redfish BMC (HP, Dell's iDRAC,
+    Intersight) on one and a UCS-managed blade over IPMI on another. So the
+    VLAN is a property of the cluster AND of the chosen server's BMC class,
+    which is why the class is an input here — `INVENTORY_REDFISH` or
+    `INVENTORY_IPMI`.
 
-The Segments Manager's list endpoint filters by `type` but has no
+    The Segments Manager's list endpoint filters by `type` but has no
     `cluster_name` parameter (verified against its OpenAPI: site, status, type,
     fresh), so the cluster match is made client-side over the returned list.
     The type is re-checked there too — a filter the server ignores must not
-    silently yield some other cluster's segment. Exactly one match is required.
+    silently yield some other cluster's segment, or a segment of the other
+    class, which would boot the host on a network its BMC cannot be reached on.
 
-    Raises InventorySegmentNotFoundError when the MCE has no INVENTORY segment
-    and AmbiguousInventorySegmentError when several do; both deterministic and
-    non-retryable.
+    NO match reports found=False: an MCE holding only one class of inventory
+    network is a normal, supported deployment, and the workflow turns that into
+    "this MCE takes no servers of that class" rather than an outage. SEVERAL
+    raise AmbiguousInventorySegmentError — one cluster with two segments of one
+    class is broken data a human resolves, and picking one would tag hosts onto
+    a VLAN chosen by document order.
     """
     ...

@@ -287,16 +287,21 @@ class BmhNotRegisteredError(OrchestratorError):
 
 
 class InventorySegmentNotFoundError(OrchestratorError):
-    """The MCE cluster has no INVENTORY segment allocated in the Segments Manager.
+    """WORKFLOW-RAISED. No candidate's BMC class has a segment on this MCE.
 
-    The VLAN a server's inventory network uses belongs to the MCE, so without
-    that allocation there is no VLAN to tag and the run cannot proceed.
-    Deterministic — an operator allocates the segment, retrying does not.
+    An MCE holds one inventory segment per BMC protocol class
+    (INVENTORY_REDFISH, INVENTORY_IPMI) and only the classes it serves, so a
+    missing one is NOT an error the lookup raises — get_inventory_segment
+    reports it absent and the workflow passes that candidate over, exactly as
+    it passes over one that cannot carry a bond. This is what a run gets when
+    that was the only thing wrong with every candidate it drew: the MCE takes
+    no servers driven that way. Deterministic — an operator allocates the
+    segment, retrying does not.
     """
 
 
 class AmbiguousInventorySegmentError(OrchestratorError):
-    """More than one INVENTORY segment is allocated to the same MCE cluster.
+    """More than one inventory segment of ONE class is allocated to an MCE.
 
     Distinct from InventorySegmentNotFoundError: the data is wrong rather than
     missing, and picking one of the two would tag hosts onto a VLAN chosen by

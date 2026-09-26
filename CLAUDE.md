@@ -14,14 +14,24 @@ shared/                      Contract layer — the API between brain and limbs
   logging_config.py          Shared worker logging setup
 workflow_domains/            The orchestration "brain" (one lightweight deployment)
   <domain>/                  One folder per domain — mirrors activities/<domain>/
-    <workflow>.py            Workflow logic (one file per workflow)
+    <workflow>.py            Workflow logic (one file per workflow) — the SHAPE of
+                               the run: phases, dispatches, timeouts, failures
+    <policy>.py              Pure sandbox-safe rules that workflow needs and no
+                               limb does (server_lifecycle/bond_selection.py)
     router.py                That domain's APIRouter (prefix /workflows/<domain>)
   routers/                   API pieces owned by NO domain: deps, shared models,
                                runs.py (domain-agnostic run status)
   main_worker_init.py        Registers every workflow, one Worker per workflow queue
   api.py                     Unified FastAPI/Swagger entrypoint (2nd entry, same image)
 activities/<domain>/         The execution "limbs" (one deployment per domain)
-  activities.py / worker_init.py   Concrete impls / registers activities, polls that queue
+  activities.py              The @activity.defn surface ONLY — thin: settings,
+                               activity.logger, and a call into a module below
+  <technology>.py            One module per dependency, taking PLAIN PARAMETERS and
+                               holding no settings and no Temporal, so it is testable
+                               with no worker: values_repo.py (git), server_scan.py
+                               (the inventory API), cluster_api.py (the Kubernetes
+                               API, its idempotency rule and its error classification)
+  worker_init.py             Registers activities, polls that queue
 docs/                             The static documentation site (its own image, no code)
 ```
 
@@ -214,6 +224,16 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   error must be in `non_retryable_error_types` (e.g. `SegmentNotFoundError`, `SegmentsManagerAuthError`)
   or raised by the activity as `ApplicationError(..., non_retryable=True)`. Unclassified permanent errors
   retry every minute forever — run sits RUNNING (not FAILED) with the failure on the activity in the UI.
+- **Name an error type ONCE — build the non-retryable list from the CLASSES.** Temporal matches
+  `non_retryable_error_types` against the error's type NAME, so a string literal with a typo in it
+  reads as "retryable" and there is nothing to notice. install-server keeps a
+  `_PERMANENT_ACTIVITY_ERRORS` tuple of the exception classes and passes
+  `[e.__name__ for e in ...]`; a wrong name is then an ImportError at worker startup. The same
+  applies to the types raised FROM workflow code: `ApplicationError(..., type=ThatError.__name__)`
+  with the class in `shared/exceptions.py` (marked WORKFLOW-RAISED there), never a literal — a
+  literal keeps failing under the old name after the class is renamed, and the status endpoint and
+  any alerting key on that name. Workflow-raised types must NOT appear in
+  `non_retryable_error_types`: it is inert there, and an inert entry reads as a protection.
 - **One Worker PER WORKFLOW, all in the one brain process:** a Temporal `Worker` polls exactly one
   task queue, and each workflow has its own queue — so `main_worker_init.py` holds a `_WORKER_SPECS`
   list of `(queue, [WorkflowClass])` and enters every `Worker` into a single `contextlib.AsyncExitStack`,
@@ -406,9 +426,10 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   `POST /workflows/server-lifecycle/install-server` is ASYNC (202 + workflow id) and takes the
   InfraEnv to fill plus its MCE cluster; the InfraEnv's name states which hardware it is for
   (`cisco-m6-bat-yam-64c-512gb`) and server names carry the same tokens behind an `ocp-` prefix,
-  so the InfraEnv IS the server query. Its id keys on (InfraEnv, MCE), which makes installs into
-  one target serial — server-scan hands out candidates without reserving them, so two concurrent
-  runs could otherwise draw the same machine.
+  so the InfraEnv IS the server query. Its id keys on the CANDIDATE POOL — the InfraEnv alone, with
+  no MCE in it — which makes installs drawing from one pool serial: server-scan hands out
+  candidates without reserving them, so two concurrent runs could otherwise draw the same machine,
+  and two MCEs filling an InfraEnv of the same name draw from the same pool.
   `POST /workflows/segment-lifecycle/initialize-segment` is ASYNC (202 + workflow id) and takes
   the full segment definition; poll `GET /workflows/runs/{workflow_id}` for progress/result. The
   `/bulk` variant takes a list and starts ONE WORKFLOW PER SEGMENT (never one batch workflow — each

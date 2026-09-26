@@ -30,16 +30,6 @@ from shared.bmc_address import (
 from shared.exceptions import InvalidMacError
 from shared.models.server_lifecycle import BmhResourceRequest, mac_is_valid
 
-# Re-exported: the builders are where callers meet this error.
-__all__ = [
-    "InvalidMacError",
-    "build_baremetal_host",
-    "build_bmc_secret",
-    "build_nmstate_config",
-    "baremetal_host_differences",
-    "nmstate_config_differences",
-]
-
 BMH_GROUP = "metal3.io"
 BMH_VERSION = "v1alpha1"
 BMH_PLURAL = "baremetalhosts"
@@ -49,6 +39,7 @@ NMSTATE_VERSION = "v1beta1"
 NMSTATE_PLURAL = "nmstateconfigs"
 
 _INFRAENV_LABEL = "infraenvs.agent-install.openshift.io"
+
 
 def _validate_macs(request: BmhResourceRequest) -> None:
     """Reject a malformed MAC before anything is written to the cluster.

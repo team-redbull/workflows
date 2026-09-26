@@ -358,7 +358,7 @@ async def test_a_segment_allocated_to_another_cluster_is_refused():
     async with _Harness(segment_acts, server_acts) as client:
         with pytest.raises(WorkflowFailureError) as excinfo:
             await _execute(client, InstallServerRunArgs(input=INPUT))
-    assert _application_error(excinfo.value).type == "InventorySegmentMismatch"
+    assert _application_error(excinfo.value).type == "InventorySegmentMismatchError"
 
 
 async def test_a_missing_inventory_segment_fails_fast():
@@ -562,6 +562,42 @@ async def test_a_candidate_that_already_has_a_baremetalhost_is_skipped():
     assert [c.server_name for c in calls["create_baremetal_host"]] == [SERVER_NAME]
 
 
+async def test_a_candidate_kubernetes_cannot_name_is_skipped_not_fatal():
+    """One badly-named machine in the pool must not kill every install from it.
+
+    Every read and every create derives a Kubernetes object name from the
+    server's name, and the conversion raises for a name no amount of lowercasing
+    can save. Raised from an ACTIVITY that is a non-retryable failure of the
+    whole run — so the name is checked in the workflow, where it is just another
+    reason to try the next candidate.
+    """
+    bad = bondable_server("srv_bad", name="ocp_dell_underscores_are_illegal")
+    good = bondable_server("srv_good")
+    calls, segment_acts, server_acts = make_mock_activities(candidates=[bad, good])
+    async with _Harness(segment_acts, server_acts) as client:
+        result = await _execute(client, InstallServerRunArgs(input=INPUT))
+
+    assert result.server_name == SERVER_NAME
+    # Never even probed: the probe itself would have raised on the name.
+    assert [r.server_name for r in calls["get_baremetal_host"]] == [SERVER_NAME] * len(
+        calls["get_baremetal_host"]
+    )
+
+
+async def test_a_pool_of_unnameable_candidates_says_to_rename_them():
+    bad = bondable_server("srv_bad", name="ocp_dell_underscores_are_illegal")
+    calls, segment_acts, server_acts = make_mock_activities(candidates=[bad])
+    async with _Harness(segment_acts, server_acts) as client:
+        with pytest.raises(WorkflowFailureError) as excinfo:
+            await _execute(client, InstallServerRunArgs(input=INPUT))
+
+    error = _application_error(excinfo.value)
+    assert error.type == "NoBondableInterfacesError"
+    assert "rename these in server-scan" in str(error)
+    assert "ocp_dell_underscores_are_illegal" in str(error)
+    assert calls["create_baremetal_host"] == []
+
+
 async def test_every_candidate_already_installed_fails_rather_than_reporting_success():
     """The bug this guards: every create answers 409 and the run 'succeeds' having added nothing."""
     calls, segment_acts, server_acts = make_mock_activities(
@@ -573,7 +609,7 @@ async def test_every_candidate_already_installed_fails_rather_than_reporting_suc
 
     error = _application_error(excinfo.value)
     assert error.type == "NoBondableInterfacesError"
-    assert "already having a BareMetalHost" in str(error)
+    assert "already holding a BareMetalHost" in str(error)
     assert calls["create_baremetal_host"] == []
 
 

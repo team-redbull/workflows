@@ -38,13 +38,26 @@ spare segments between pools has been removed.
 
 ```
 shared/                           Contract layer (temporalio + pydantic only)
-  models/segment_lifecycle.py     Typed state across the workflow/activity boundary
-  interfaces/segment_lifecycle.py Activity signatures (no bodies)
+  models/<domain>.py              Typed state across the workflow/activity boundary
+  interfaces/<domain>.py          Activity signatures (no bodies)
+  bmc_address.py                  Pure naming/address logic BOTH sides need
   settings.py / exceptions.py / consts.py / workflow_ids.py / logging_config.py
 workflow_domains/                 The brain — one folder per domain, plus main_worker_init.py + api.py
-  segment_lifecycle/              The two workflows + that domain's router.py
+  segment_lifecycle/              initialize_segment.py, allocate_segment.py, router.py
+  server_lifecycle/               install_server.py (the SHAPE of the run),
+                                    bond_selection.py (the pure rule it applies),
+                                    router.py
   routers/                        What no domain owns: deps, shared models, runs.py (status)
-activities/segment_lifecycle/     The limb (activity impls + worker_init.py)
+activities/<domain>/              The limbs
+  activities.py                   The @activity.defn surface ONLY — thin
+  <technology>.py                 One module per dependency, plain parameters, no
+                                    settings and no Temporal, so each is testable
+                                    with no worker: values_repo.py (git),
+                                    server_scan.py (the inventory API),
+                                    cluster_api.py (the Kubernetes API, its
+                                    idempotency rule and error classification),
+                                    bmh_resources.py (the resource bodies)
+  worker_init.py                  Registers this domain's activities, polls its queue
 docs/                             The static documentation site (its own image)
 ```
 

@@ -46,6 +46,15 @@ _DEFAULT_PATH_BY_VENDOR = {
 
 _DEFAULT_IPMI_PORT = 623
 
+# The vendor vocabulary this module can drive, as ONE definition. install-server
+# gates on it before writing anything, because server-scan reports
+# `bmc_vendor: null` for a STANDALONE machine and guessing IPMI would be
+# silently wrong for a Redfish-only BMC. Exported so that adding a vendor to the
+# driver map above does not also require adding it to a second list in the
+# workflow, where forgetting it would reject a vendor this module can drive and
+# the disagreement would be invisible until a run failed.
+BMC_VENDORS = frozenset(_DRIVER_BY_VENDOR)
+
 
 def build_bmc_address(bmc_vendor: str, bmc: BmcEndpoint) -> str:
     """The Ironic BMC address for a BareMetalHost's `spec.bmc.address`.
@@ -77,6 +86,22 @@ def build_bmc_address(bmc_vendor: str, bmc: BmcEndpoint) -> str:
 
 
 _RFC1123_NAME = re.compile(r"[a-z0-9]([-a-z0-9.]*[a-z0-9])?")
+_MAX_NAME_LENGTH = 253
+
+
+def is_k8s_resource_name(server_name: str) -> bool:
+    """Whether k8s_resource_name can turn this name into a Kubernetes name.
+
+    The same rule as below, as a PREDICATE, because the two callers need
+    different things from it. An activity wants the converted name and an
+    exception when there is none. The WORKFLOW wants to skip an unusable
+    candidate and try the next one, and cannot use the raising form to decide:
+    a bare InvalidServerNameError raised in workflow code fails the workflow
+    TASK, which retries forever and leaves the run hanging RUNNING instead of
+    failing.
+    """
+    lowered = server_name.lower()
+    return bool(_RFC1123_NAME.fullmatch(lowered)) and len(lowered) <= _MAX_NAME_LENGTH
 
 
 def k8s_resource_name(server_name: str) -> str:
@@ -98,14 +123,13 @@ def k8s_resource_name(server_name: str) -> str:
     not something to paper over by rewriting characters and installing the
     server under a name nobody can correlate back to the inventory.
     """
-    lowered = server_name.lower()
-    if not _RFC1123_NAME.fullmatch(lowered) or len(lowered) > 253:
+    if not is_k8s_resource_name(server_name):
         raise InvalidServerNameError(
             f"server-scan name {server_name!r} cannot be a Kubernetes resource "
             "name even lowercased: it must be alphanumerics, '-' or '.', start "
-            "and end alphanumeric, and be at most 253 characters"
+            f"and end alphanumeric, and be at most {_MAX_NAME_LENGTH} characters"
         )
-    return lowered
+    return server_name.lower()
 
 
 def bmc_secret_name(bmc_vendor: str, server_name: str) -> str:

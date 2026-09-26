@@ -1,41 +1,30 @@
 """Server-lifecycle activity implementations — the execution limbs.
 
-These run in the `server-lifecycle-worker` deployment. They talk to:
-  - server-scan (SERVER_SCAN_URL) — the inventory platform. One read:
-    GET /servers/available, which returns servers that are unclaimed, healthy,
-    reachable and not in maintenance, live-rechecking each one it hands back.
-    A VIEWER token is enough; only server-scan's four mutation endpoints need
-    admin.
-  - the target cluster's Kubernetes API — creates the BMC Secret,
-    BareMetalHost and NMStateConfig, and reads the BareMetalHost back.
+These run in the `server-lifecycle-worker` deployment, ONE PER MCE CLUSTER. This
+module is deliberately thin: it is the @activity.defn surface and nothing else,
+so what each activity does is readable in one screen. The work itself lives in
+the three modules beside it, each owning one technology and taking plain
+parameters, which is what makes them testable without a Temporal environment:
 
-Conventions enforced here:
-  * activity.logger only (not the root logger).
-  * Idempotency: every create treats ALREADY EXISTS (409) as success with
-    changed=False, so a re-run converges instead of failing — and never
-    overwrites, so an operator's hand-correction survives.
-  * The httpx client is created INSIDE each activity via `async with`, with an
-    explicit timeout below the 90s start_to_close_timeout, so a network hang
-    frees the worker before Temporal reaps the activity and the token never
-    leaks across concurrent runs.
-  * Blocking kubernetes-client calls run in asyncio.to_thread — that SDK is
-    synchronous, and calling it directly would block the worker's event loop
-    and stall every other activity on this queue.
-  * TLS verification is disabled (_TLS_VERIFY), as in the segment-lifecycle
-    limb: the airgapped environment's internal CA cannot be injected into this
-    image, and with unbounded retries a handshake failure would retry forever.
+  * server_scan.py    — the inventory read (httpx against SERVER_SCAN_URL).
+  * cluster_api.py    — every call to the target cluster's Kubernetes API,
+                        including the idempotency rule and error classification.
+  * bmh_resources.py  — the three resource BODIES, as pure functions.
+
+This module owns what only an activity can: the settings instance (read once at
+import, so a missing key crash-loops the worker instead of failing a run) and
+`activity.logger`.
+
+BMC credentials are the one thing server-scan never returns — it holds inventory
+data only — so they come from this deployment's own Secret, per vendor, exactly
+as the operator's did.
 """
 
 from __future__ import annotations
 
-import asyncio
-from typing import Any
-
-import httpx
-from kubernetes import client as k8s_client
-from kubernetes import config as k8s_config
 from temporalio import activity
 
+from activities.server_lifecycle import cluster_api
 from activities.server_lifecycle.bmh_resources import (
     BMH_GROUP,
     BMH_PLURAL,
@@ -49,179 +38,27 @@ from activities.server_lifecycle.bmh_resources import (
     build_nmstate_config,
     nmstate_config_differences,
 )
+from activities.server_lifecycle.server_scan import fetch_available_servers
 from shared.bmc_address import k8s_resource_name
-from shared.exceptions import (
-    AmbiguousServerNameError,
-    BmcCredentialsMissingError,
-    BmhConflictError,
-    BmhPrerequisiteMissingError,
-    BmhRequestInvalidError,
-    BmhResourceError,
-    ServerNotAvailableError,
-    ServerScanAuthError,
-    ServerScanError,
-)
+from shared.exceptions import BmcCredentialsMissingError
 from shared.models.server_lifecycle import (
     AcquiredServer,
     AcquireServerRequest,
-    BmcEndpoint,
     BmhRef,
     BmhResourceRequest,
     BmhState,
     CreatedResource,
-    ServerInterface,
 )
 from shared.settings import ServerLifecycleActivitySettings
 
 _settings = ServerLifecycleActivitySettings()
 
-# Must stay strictly below the activity start_to_close_timeout (90s). A live
-# recheck inside server-scan reaches a vendor manager, so this is not a fast
-# endpoint — 60s is the same budget the segment-lifecycle limb uses.
-_HTTP_TIMEOUT = httpx.Timeout(60.0)
-
-# See the segment-lifecycle limb's _TLS_VERIFY for the full reasoning: the
-# airgapped internal CA is not in this image's trust store. Flip to True (and
-# mount a CA bundle via SSL_CERT_FILE) once the certificates can be trusted.
-_TLS_VERIFY = False
-
-
-def _server_scan_client() -> httpx.AsyncClient:
-    """A fresh, per-invocation client for server-scan."""
-    return httpx.AsyncClient(
-        base_url=_settings.server_scan_url, timeout=_HTTP_TIMEOUT, verify=_TLS_VERIFY
-    )
-
-
-def _server_scan_auth() -> dict[str, str]:
-    """Bearer header. Empty when server-scan runs with auth disabled."""
-    if not _settings.server_scan_api_token:
-        return {}
-    return {"Authorization": f"Bearer {_settings.server_scan_api_token}"}
-
-
-def _server_scan_detail(resp: httpx.Response) -> str:
-    """server-scan's own RFC 9457 `detail`, which is what an operator acts on.
-
-    It distinguishes "nothing matched the pattern" from "everything matching is
-    CRITICAL, claimed, unreachable or in maintenance" — a difference the caller
-    cannot otherwise see.
-    """
-    try:
-        body = resp.json()
-    except ValueError:
-        return resp.text
-    if isinstance(body, dict):
-        return str(body.get("detail") or body)
-    return str(body)
-
-
-def _to_acquired_server(item: dict[str, Any]) -> AcquiredServer:
-    """Project one `AvailableServerItem` onto this domain's model.
-
-    `nic_macs` is deliberately dropped rather than carried: for a Dell server
-    it holds every NPAR partition MAC while `interfaces` is reduced to one
-    entry per physical port, so keeping both would invite selecting from the
-    wrong one.
-    """
-    bmc = item.get("bmc") or {}
-    return AcquiredServer(
-        id=item["id"],
-        name=item["name"],
-        vendor=item.get("vendor", ""),
-        source_provider=item.get("source_provider"),
-        bmc_vendor=item.get("bmc_vendor"),
-        bmc=BmcEndpoint(
-            scheme=bmc.get("scheme"),
-            host=bmc.get("host") or "",
-            host_is_ip=bool(bmc.get("host_is_ip", False)),
-            port=bmc.get("port"),
-            path=bmc.get("path"),
-        ),
-        interfaces=[
-            ServerInterface(
-                name=interface.get("name", ""),
-                mac=interface.get("mac"),
-                location=interface.get("location"),
-                link_state=interface.get("link_state") or "UNKNOWN",
-            )
-            for interface in item.get("interfaces") or []
-        ],
-        site_id=item.get("site_id"),
-        health_overall=item.get("health_overall", "UNKNOWN"),
-        live_recheck_performed=bool(item.get("live_recheck_performed", False)),
-    )
-
-
-@activity.defn
-async def acquire_servers(request: AcquireServerRequest) -> list[AcquiredServer]:
-    """Ask server-scan for assignable candidates (GET /servers/available)."""
-    params: dict[str, Any] = {
-        "health": request.health,
-        "min_nic_macs": request.min_nic_macs,
-    }
-    if request.name is not None:
-        params["name"] = request.name
-    else:
-        params["pattern"] = request.pattern
-        params["count"] = request.count
-
-    async with _server_scan_client() as client:
-        resp = await client.get(
-            "/servers/available", params=params, headers=_server_scan_auth()
-        )
-
-    if resp.status_code in (401, 403):
-        raise ServerScanAuthError(
-            f"server-scan rejected our credentials ({resp.status_code}): check "
-            "SERVER_SCAN_API_TOKEN (a viewer token is sufficient)"
-        )
-    if resp.status_code == 404:
-        raise ServerNotAvailableError(
-            f"server-scan has no assignable server for this request: "
-            f"{_server_scan_detail(resp)}"
-        )
-    if resp.status_code == 409:
-        raise AmbiguousServerNameError(
-            f"server name {request.name!r} matches more than one server-scan "
-            f"document: {_server_scan_detail(resp)}"
-        )
-    if resp.status_code != 200:
-        raise ServerScanError(
-            f"server-scan lookup failed: {resp.status_code} {resp.text}"
-        )
-
-    payload = resp.json()
-    items = payload.get("items", [])
-    activity.logger.info(
-        "server-scan returned %d candidate(s) of %s requested",
-        len(items),
-        payload.get("requested", request.count),
-    )
-    if not items:
-        # A 200 with nothing in it is the honest partial-fulfilment answer, but
-        # for one install it means the same as a 404 and is classified as such.
-        raise ServerNotAvailableError(
-            "server-scan returned no candidates for this request "
-            f"(mode={payload.get('mode')}, requested={payload.get('requested')})"
-        )
-    return [_to_acquired_server(item) for item in items]
-
-
-def _load_kube() -> None:
-    """Load in-cluster config, falling back to a kubeconfig for local runs."""
-    try:
-        k8s_config.load_incluster_config()
-    except Exception:  # noqa: BLE001 — any failure here means "not in a pod"
-        k8s_config.load_kube_config()
+_BMH_KIND = "BareMetalHost"
+_NMSTATE_KIND = "NMStateConfig"
 
 
 def _bmc_credentials(bmc_vendor: str) -> tuple[str, str]:
-    """This worker's configured BMC credentials for one vendor.
-
-    server-scan never holds these — it returns inventory data only — so they
-    come from this deployment's own Secret, exactly as the operator's did.
-    """
+    """This worker's configured BMC credentials for one vendor."""
     credentials = {
         "HP": (_settings.hp_bmc_username, _settings.hp_bmc_password),
         "DELL": (_settings.dell_bmc_username, _settings.dell_bmc_password),
@@ -240,183 +77,107 @@ def _bmc_credentials(bmc_vendor: str) -> tuple[str, str]:
     return username, password
 
 
-def _classify_api_error(exc: k8s_client.ApiException, kind: str, name: str) -> Exception:
-    """Turn a Kubernetes ApiException into a classified domain error.
-
-    Anything left as BmhResourceError retries every minute forever, so each
-    status that a retry cannot fix has to be named here rather than defaulted.
-    """
-    if exc.status == 404:
-        # Either the resource TYPE or the NAMESPACE is absent — a create
-        # cannot tell them apart, and both are deployment gaps.
-        return BmhPrerequisiteMissingError(
-            f"Cannot create {kind} {name}: the target cluster has no such "
-            f"resource type, or no namespace for it (Metal3 / Assisted "
-            f"Installer not installed, or the InfraEnv namespace is missing)"
+def _log_outcome(resource: CreatedResource) -> CreatedResource:
+    """Say whether this run wrote the resource or converged on an existing one."""
+    if resource.changed:
+        activity.logger.info("Created %s %s", resource.kind, resource.name)
+    else:
+        activity.logger.info(
+            "%s %s already exists and matches — nothing to do",
+            resource.kind,
+            resource.name,
         )
-    if exc.status == 403:
-        return BmhPrerequisiteMissingError(
-            f"Cannot create {kind} {name}: this worker's ServiceAccount is not "
-            f"authorized for it ({exc.reason}). RBAC is a deployment gap, not "
-            "a transient failure"
-        )
-    if exc.status == 422:
-        return BmhRequestInvalidError(
-            f"The API server rejected {kind} {name} as invalid: {exc.reason}. "
-            "The body is identical on every attempt, so this cannot clear"
-        )
-    return BmhResourceError(f"Failed to create {kind} {name}: {exc.status} {exc.reason}")
+    return resource
 
 
-def _create_namespaced(
-    create_fn, kind: str, name: str, on_exists=None
-) -> CreatedResource:
-    """Run one create, treating ALREADY EXISTS as success once it MATCHES.
-
-    Not an upsert: an existing resource is left exactly as it is, so a re-run
-    converges without overwriting a BMC credential or a bond an operator has
-    corrected by hand.
-
-    `on_exists` is what keeps that from becoming a lie. Reporting success for a
-    resource that names a different BMC, boot MAC, InfraEnv or VLAN would
-    return a result describing an installation that is not the one on the
-    cluster. It reads the existing object back and returns the fields that
-    disagree; any difference is a BmhConflictError for a human to settle —
-    the same rule create_segment applies in the segment-lifecycle domain.
-    """
-    try:
-        create_fn()
-    except k8s_client.ApiException as exc:
-        if exc.status != 409:
-            raise _classify_api_error(exc, kind, name) from exc
-        differences = on_exists() if on_exists is not None else []
-        if differences:
-            raise BmhConflictError(
-                f"{kind} {name} already exists and does not match this request: "
-                + "; ".join(differences)
-                + ". Nothing was overwritten — reconcile the existing resource "
-                "or install a different server"
-            ) from exc
-        activity.logger.info("%s %s already exists and matches — nothing to do", kind, name)
-        return CreatedResource(kind=kind, name=name, changed=False)
-    activity.logger.info("Created %s %s", kind, name)
-    return CreatedResource(kind=kind, name=name, changed=True)
+@activity.defn
+async def acquire_servers(request: AcquireServerRequest) -> list[AcquiredServer]:
+    """Ask server-scan for assignable candidates (GET /servers/available)."""
+    servers = await fetch_available_servers(
+        _settings.server_scan_url, _settings.server_scan_api_token, request
+    )
+    activity.logger.info(
+        "server-scan returned %d candidate(s) of %d requested",
+        len(servers),
+        request.count,
+    )
+    return servers
 
 
 @activity.defn
 async def create_bmc_secret(request: BmhResourceRequest) -> CreatedResource:
     """Create the BMC credentials Secret (`{vendor}-cred-{server}`)."""
     username, password = _bmc_credentials(request.bmc_vendor)
-    secret = build_bmc_secret(request, username, password)
-    name = secret["metadata"]["name"]
-
-    def _create() -> None:
-        _load_kube()
-        k8s_client.CoreV1Api().create_namespaced_secret(
-            namespace=request.namespace, body=secret
+    return _log_outcome(
+        await cluster_api.create_secret_if_absent(
+            request.namespace, build_bmc_secret(request, username, password)
         )
-
-    return await asyncio.to_thread(_create_namespaced, _create, "Secret", name)
+    )
 
 
 @activity.defn
 async def create_baremetal_host(request: BmhResourceRequest) -> CreatedResource:
     """Create the BareMetalHost (metal3.io/v1alpha1)."""
     bmh = build_baremetal_host(request)
-    name = bmh["metadata"]["name"]
     activity.logger.info(
         "BareMetalHost %s: bmc=%s boot_mac=%s",
-        name,
+        bmh["metadata"]["name"],
         bmh["spec"]["bmc"]["address"],
         bmh["spec"]["bootMACAddress"],
     )
-
-    def _create() -> None:
-        _load_kube()
-        k8s_client.CustomObjectsApi().create_namespaced_custom_object(
+    return _log_outcome(
+        await cluster_api.create_custom_object_if_absent(
             group=BMH_GROUP,
             version=BMH_VERSION,
-            namespace=request.namespace,
             plural=BMH_PLURAL,
+            kind=_BMH_KIND,
+            namespace=request.namespace,
             body=bmh,
+            differences=baremetal_host_differences,
         )
-
-    def _on_exists() -> list[str]:
-        existing = k8s_client.CustomObjectsApi().get_namespaced_custom_object(
-            group=BMH_GROUP,
-            version=BMH_VERSION,
-            namespace=request.namespace,
-            plural=BMH_PLURAL,
-            name=name,
-        )
-        return baremetal_host_differences(bmh, existing)
-
-    return await asyncio.to_thread(
-        _create_namespaced, _create, "BareMetalHost", name, _on_exists
     )
 
 
 @activity.defn
 async def create_nmstate_config(request: BmhResourceRequest) -> CreatedResource:
     """Create the NMStateConfig (`nmstate-config-{server}`)."""
-    nmstate = build_nmstate_config(request)
-    name = nmstate["metadata"]["name"]
-
-    def _create() -> None:
-        _load_kube()
-        k8s_client.CustomObjectsApi().create_namespaced_custom_object(
+    return _log_outcome(
+        await cluster_api.create_custom_object_if_absent(
             group=NMSTATE_GROUP,
             version=NMSTATE_VERSION,
-            namespace=request.namespace,
             plural=NMSTATE_PLURAL,
-            body=nmstate,
-        )
-
-    def _on_exists() -> list[str]:
-        existing = k8s_client.CustomObjectsApi().get_namespaced_custom_object(
-            group=NMSTATE_GROUP,
-            version=NMSTATE_VERSION,
+            kind=_NMSTATE_KIND,
             namespace=request.namespace,
-            plural=NMSTATE_PLURAL,
-            name=name,
+            body=build_nmstate_config(request),
+            differences=nmstate_config_differences,
         )
-        return nmstate_config_differences(nmstate, existing)
-
-    return await asyncio.to_thread(
-        _create_namespaced, _create, "NMStateConfig", name, _on_exists
     )
 
 
 @activity.defn
 async def get_baremetal_host(ref: BmhRef) -> BmhState:
-    """Read one BareMetalHost's status back, by name and namespace."""
+    """Read one BareMetalHost's status back, by name and namespace.
 
-    def _get() -> BmhState:
-        _load_kube()
-        try:
-            bmh = k8s_client.CustomObjectsApi().get_namespaced_custom_object(
-                group=BMH_GROUP,
-                version=BMH_VERSION,
-                namespace=ref.namespace,
-                plural=BMH_PLURAL,
-                name=k8s_resource_name(ref.server_name),
-            )
-        except k8s_client.ApiException as exc:
-            if exc.status == 404:
-                # Not an error: the normal answer while Ironic has not picked
-                # the host up yet. The workflow's bounded loop owns the waiting.
-                return BmhState(found=False)
-            raise BmhResourceError(
-                f"Failed to read BareMetalHost {ref.server_name}: "
-                f"{exc.status} {exc.reason}"
-            ) from exc
-        status = bmh.get("status") or {}
-        return BmhState(
-            found=True,
-            provisioning_state=(status.get("provisioning") or {}).get("state"),
-            operational_status=status.get("operationalStatus"),
-            error_type=status.get("errorType") or None,
-            error_message=status.get("errorMessage") or None,
-        )
-
-    return await asyncio.to_thread(_get)
+    An absent host is NOT an error — it reports found=False, which is the normal
+    answer both while Ironic has not picked the host up and when probing whether
+    a candidate is already installed. The workflow's bounded loop owns the
+    waiting.
+    """
+    bmh = await cluster_api.read_custom_object(
+        group=BMH_GROUP,
+        version=BMH_VERSION,
+        plural=BMH_PLURAL,
+        kind=_BMH_KIND,
+        namespace=ref.namespace,
+        name=k8s_resource_name(ref.server_name),
+    )
+    if bmh is None:
+        return BmhState(found=False)
+    status = bmh.get("status") or {}
+    return BmhState(
+        found=True,
+        provisioning_state=(status.get("provisioning") or {}).get("state"),
+        operational_status=status.get("operationalStatus"),
+        error_type=status.get("errorType") or None,
+        error_message=status.get("errorMessage") or None,
+    )

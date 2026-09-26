@@ -4,6 +4,26 @@ These live in the contract layer so both workflows and activities can reference
 them by type (e.g. to mark certain failures non-retryable in a RetryPolicy —
 the Temporal SDK converts activity-raised exceptions to ApplicationError with
 `type` set to the class name).
+
+TWO KINDS live here, and the difference is which side may RAISE them:
+
+  * ACTIVITY-raised — raised as ordinary exceptions from activities/<domain>/.
+    The SDK converts them, and the permanent ones are listed in a workflow's
+    `non_retryable_error_types` BY `__name__` rather than as a string literal:
+    that list is matched against the type name, so a typo in it means "retry
+    forever" with nothing to notice, while a wrong attribute is an ImportError
+    at worker startup.
+  * WORKFLOW-raised — NEVER raised as an exception. A non-FailureError raised
+    in workflow code fails the workflow TASK, which retries forever and leaves
+    the run hanging RUNNING, so workflow code raises
+    `ApplicationError(..., type=ThatError.__name__)`. The class exists to own
+    the type name and to document the failure in one place; listing it in
+    `non_retryable_error_types` would be inert, because workflow failures are
+    never retried. Each is marked WORKFLOW-RAISED below.
+
+The segment-lifecycle workflows still spell their own workflow-raised types as
+literals (`UnsupportedSegmentType`, `DhcpScopeNotConverged`, ...). Those have no
+class yet; the rule above is what a new one follows.
 """
 
 
@@ -161,7 +181,7 @@ class AmbiguousServerNameError(OrchestratorError):
 
 
 class NoBondableInterfacesError(OrchestratorError):
-    """No candidate offered two link-up NICs on two distinct physical ports.
+    """WORKFLOW-RAISED. No candidate offered two usable NICs on distinct ports.
 
     Deterministic for the candidates drawn: the interfaces a server reports do
     not change between retries of the same run. The message names each
@@ -173,7 +193,7 @@ class NoBondableInterfacesError(OrchestratorError):
 
 
 class UnknownBmcVendorError(OrchestratorError):
-    """server-scan reported no BMC driver vocabulary for this server.
+    """WORKFLOW-RAISED. server-scan reported no BMC driver vocabulary for this server.
 
     `bmc_vendor` is null for a STANDALONE machine — server-scan leaves the
     driver choice to the caller by design — and install-server declines to
@@ -244,7 +264,7 @@ class InvalidMacError(OrchestratorError):
 
 
 class BmhNotRegisteredError(OrchestratorError):
-    """The BareMetalHost did not reach a registered state before the deadline.
+    """WORKFLOW-RAISED. The BareMetalHost never reached a registered state.
 
     Machine convergence with a real deadline: storing the object only means the
     API server accepted it, while Ironic still has to reach the BMC. A wrong
@@ -268,6 +288,18 @@ class AmbiguousInventorySegmentError(OrchestratorError):
     Distinct from InventorySegmentNotFoundError: the data is wrong rather than
     missing, and picking one of the two would tag hosts onto a VLAN chosen by
     document order. A human resolves the duplicate allocation — non-retryable.
+    """
+
+
+class InventorySegmentMismatchError(OrchestratorError):
+    """WORKFLOW-RAISED. The segment read back is allocated to another cluster.
+
+    get_inventory_segment matches the cluster client-side, because the Segments
+    Manager's list endpoint has no `cluster_name` filter. The workflow re-checks
+    it anyway: this is the one value that decides which VLAN a host is tagged
+    onto, and accepting another cluster's segment would bring the host up on a
+    network the target MCE cannot reach. Deterministic — the answer is the same
+    on every attempt.
     """
 
 

@@ -18,7 +18,7 @@ from shared.models.server_lifecycle import (
     LinkState,
     ServerInterface,
 )
-from workflow_domains.server_lifecycle.install_server import select_bond_members
+from workflow_domains.server_lifecycle.bond_selection import select_bond_members
 
 IP_BMC = BmcEndpoint(host="10.11.1.229", host_is_ip=True, scheme="redfish")
 

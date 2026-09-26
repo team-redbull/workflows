@@ -4,6 +4,13 @@ name: Build and Push
 # the segment-lifecycle activity worker "limb" (activities/segment_lifecycle/Dockerfile),
 # and the documentation site (docs/Dockerfile), which carries no code at all.
 
+# A commit message containing "[skip ci]" (or "[ci skip]", "[no ci]", "[skip actions]")
+# makes GitHub skip this WHOLE workflow, the `changes` job included, and the next push
+# builds only what ITS OWN range touched. So a skipped push leaves its images unbuilt
+# until a later push touches their paths, which can ship a new brain against an old
+# limb. Never quote the marker in a commit message; if it happens anyway, re-trigger by
+# pushing a change to this file, which rebuilds all three images.
+
 on:
   push:
     branches: [ '**' ]

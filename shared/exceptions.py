@@ -202,6 +202,19 @@ class UnknownBmcVendorError(OrchestratorError):
     """
 
 
+class BmcEndpointMissingError(OrchestratorError):
+    """WORKFLOW-RAISED. server-scan reported no BMC host for this server.
+
+    Distinct from UnknownBmcVendorError: the driver is known, the ADDRESS is
+    not. Checked before anything is written, because an empty host still builds
+    a syntactically valid address (`redfish-virtualmedia:///redfish/v1/Systems/1`)
+    that the API server happily stores — so without this the run creates all
+    three resources, spends the whole 10-minute registration deadline, and then
+    blames the BMC credentials for a BMC address that was never collected.
+    Deterministic: a collector run fills this in, not a retry.
+    """
+
+
 class BmcCredentialsMissingError(OrchestratorError):
     """No BMC username/password is configured for this server's vendor.
 

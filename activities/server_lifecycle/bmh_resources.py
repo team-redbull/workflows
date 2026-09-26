@@ -202,9 +202,33 @@ def build_nmstate_config(request: BmhResourceRequest) -> dict[str, Any]:
     }
 
 
-def _diff(field: str, desired: Any, existing: Any) -> str | None:
-    """One human-readable difference, or None when the two agree."""
-    if desired == existing:
+def _mac(value: Any) -> Any:
+    """One MAC for COMPARISON: case-folded, because a MAC has no case.
+
+    This is what lets a resource bmhgen created be converged rather than
+    reported as a conflict. bmhgen wrote MACs exactly as the vendor manager
+    handed them over — HP OneView and Dell OME return them upper case, and
+    nothing in that operator normalised them — while server-scan lower-cases
+    every MAC on ingest. Comparing the two literally makes every host the
+    operator ever created a non-retryable BmhConflictError on the SAME machine,
+    which an operator could only clear by hand-editing each one.
+    """
+    return value.lower() if isinstance(value, str) else value
+
+
+def _diff(
+    field: str, desired: Any, existing: Any, *, normalize: Any = None
+) -> str | None:
+    """One human-readable difference, or None when the two agree.
+
+    `normalize` applies only to the COMPARISON. The reported values stay raw,
+    so a real disagreement shows what is actually on the cluster rather than a
+    tidied version of it.
+    """
+    if normalize is not None:
+        if normalize(desired) == normalize(existing):
+            return None
+    elif desired == existing:
         return None
     return f"{field}: want {desired!r}, found {existing!r}"
 
@@ -236,6 +260,7 @@ def baremetal_host_differences(
             "spec.bootMACAddress",
             d_spec.get("bootMACAddress"),
             e_spec.get("bootMACAddress"),
+            normalize=_mac,
         ),
         _diff(
             f"metadata.labels[{_INFRAENV_LABEL}]",
@@ -266,7 +291,12 @@ def nmstate_config_differences(
     d_vlans = sorted(str((i.get("vlan") or {}).get("id")) for i in _vlan_interfaces(desired))
     e_vlans = sorted(str((i.get("vlan") or {}).get("id")) for i in _vlan_interfaces(existing))
     checks = [
-        _diff("spec.interfaces MAC set", sorted(filter(None, d_macs)), sorted(filter(None, e_macs))),
+        _diff(
+            "spec.interfaces MAC set",
+            sorted(filter(None, d_macs)),
+            sorted(filter(None, e_macs)),
+            normalize=lambda macs: sorted(_mac(m) for m in macs),
+        ),
         _diff("VLAN id", d_vlans, e_vlans),
         _diff(
             f"metadata.labels[{_INFRAENV_LABEL}]",

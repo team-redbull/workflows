@@ -78,6 +78,7 @@ with workflow.unsafe.imports_passed_through():
         AmbiguousInventorySegmentError,
         AmbiguousServerNameError,
         BmcCredentialsMissingError,
+        BmcEndpointMissingError,
         BmhConflictError,
         BmhNotRegisteredError,
         BmhPrerequisiteMissingError,
@@ -253,6 +254,26 @@ def _require_bmc_vendor(server: AcquiredServer) -> str:
     return vendor
 
 
+def _require_bmc_endpoint(server: AcquiredServer) -> None:
+    """Reject a server whose BMC address server-scan never collected.
+
+    An empty host is not caught anywhere downstream: build_bmc_address still
+    produces a syntactically valid `redfish-virtualmedia:///redfish/v1/Systems/1`,
+    the API server stores the BareMetalHost without complaint, and the run then
+    spends the full registration deadline before failing with a message about
+    BMC credentials. Ten minutes and three resources to learn that the inventory
+    has no address for this machine.
+    """
+    if not server.bmc.host.strip("[] "):
+        raise ApplicationError(
+            f"server-scan reports no BMC host for {server.name} "
+            f"(vendor={server.vendor}, provider={server.source_provider}). "
+            "Ironic has nothing to connect to, so the BareMetalHost would be "
+            "stored and never register. A collector run fills this in",
+            type=BmcEndpointMissingError.__name__,
+        )
+
+
 def _require_valid_macs(server_name: str, bond_members: list[BondMember]) -> None:
     """Reject a malformed MAC BEFORE the first resource is written.
 
@@ -409,7 +430,10 @@ class InstallServerWorkflow:
         )
         self._server_name = server.name
 
+        # All three before the first write: a Secret left behind by a failure
+        # the payload guaranteed is worse than no resources at all.
         bmc_vendor = _require_bmc_vendor(server)
+        _require_bmc_endpoint(server)
         _require_valid_macs(server.name, bond_members)
 
         resource_request = BmhResourceRequest(

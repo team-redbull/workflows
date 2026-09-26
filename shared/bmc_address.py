@@ -73,7 +73,11 @@ def build_bmc_address(bmc_vendor: str, bmc: BmcEndpoint) -> str:
             UnknownBmcVendorError rather than guessing a driver.
     """
     driver = _DRIVER_BY_VENDOR[bmc_vendor.upper()]
-    host = f"[{bmc.host}]" if ":" in bmc.host else bmc.host
+    # Stripped first: an IPv6 literal must be bracketed in a URL authority, but
+    # server-scan may already have bracketed it, and `[[fd00::5]]` is not an
+    # address Ironic can parse.
+    bare_host = bmc.host.strip("[]")
+    host = f"[{bare_host}]" if ":" in bare_host else bare_host
 
     if driver == "ipmi":
         # IPMI carries no path, and the port is part of the address that

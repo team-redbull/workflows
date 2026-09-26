@@ -183,6 +183,33 @@ class TestExistingResourceComparison:
         desired = build_baremetal_host(_request())
         assert baremetal_host_differences(desired, desired) == []
 
+    def test_a_resource_the_operator_created_converges_despite_mac_case(self) -> None:
+        """The compatibility guarantee this whole migration rests on.
+
+        bmhgen wrote MACs exactly as the vendor manager handed them over, and
+        HP OneView and Dell OME return them UPPER case — nothing in that
+        operator normalised them. server-scan lower-cases every MAC on ingest.
+        Comparing the two literally turns every host bmhgen ever created into a
+        non-retryable BmhConflictError on the SAME machine, clearable only by
+        hand-editing each one.
+        """
+        desired = build_baremetal_host(_request())
+        as_bmhgen_wrote_it = build_baremetal_host(_request())
+        as_bmhgen_wrote_it["spec"]["bootMACAddress"] = (
+            as_bmhgen_wrote_it["spec"]["bootMACAddress"].upper()
+        )
+        assert baremetal_host_differences(desired, as_bmhgen_wrote_it) == []
+
+    def test_a_genuinely_different_mac_is_still_a_difference(self) -> None:
+        # Case-folding must not blunt the check it is folding for.
+        desired = build_baremetal_host(_request())
+        existing = build_baremetal_host(_request())
+        existing["spec"]["bootMACAddress"] = "AA:BB:CC:DD:EE:FF"
+        (difference,) = baremetal_host_differences(desired, existing)
+        assert "spec.bootMACAddress" in difference
+        # Reported RAW, so an operator sees what is actually on the cluster.
+        assert "AA:BB:CC:DD:EE:FF" in difference
+
     def test_a_different_bmc_address_is_a_difference(self) -> None:
         desired = build_baremetal_host(_request())
         existing = build_baremetal_host(
@@ -218,6 +245,20 @@ class TestExistingResourceComparison:
     def test_an_identical_nmstateconfig_has_no_differences(self) -> None:
         desired = build_nmstate_config(_request())
         assert nmstate_config_differences(desired, desired) == []
+
+    def test_an_nmstateconfig_from_the_operator_converges_despite_mac_case(self) -> None:
+        desired = build_nmstate_config(_request())
+        as_bmhgen_wrote_it = build_nmstate_config(_request())
+        for interface in as_bmhgen_wrote_it["spec"]["interfaces"]:
+            interface["macAddress"] = interface["macAddress"].upper()
+        assert nmstate_config_differences(desired, as_bmhgen_wrote_it) == []
+
+    def test_a_genuinely_different_mac_set_is_still_a_difference(self) -> None:
+        desired = build_nmstate_config(_request())
+        existing = build_nmstate_config(_request())
+        existing["spec"]["interfaces"][0]["macAddress"] = "AA:BB:CC:DD:EE:FF"
+        (difference,) = nmstate_config_differences(desired, existing)
+        assert "MAC set" in difference
 
     def test_a_different_vlan_is_a_difference(self) -> None:
         desired = build_nmstate_config(_request())

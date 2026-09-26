@@ -649,6 +649,30 @@ async def test_a_malformed_mac_fails_before_any_resource_is_written():
     assert calls["create_bmc_secret"] == []
 
 
+async def test_a_server_with_no_bmc_host_fails_in_seconds_not_in_ten_minutes():
+    """Nothing downstream catches an empty BMC host, which is why this exists.
+
+    `build_bmc_address` still produces a syntactically valid
+    `redfish-virtualmedia:///redfish/v1/Systems/1`, and the API server stores
+    the BareMetalHost without complaint — so the run would create all three
+    resources, spend the whole registration deadline, and then blame the BMC
+    credentials for an address the inventory never had.
+    """
+    hostless = bondable_server().model_copy(
+        update={"bmc": BmcEndpoint(host="", host_is_ip=False, scheme=None)}
+    )
+    calls, segment_acts, server_acts = make_mock_activities(candidates=[hostless])
+    async with _Harness(segment_acts, server_acts) as client:
+        with pytest.raises(WorkflowFailureError) as excinfo:
+            await _execute(client, InstallServerRunArgs(input=INPUT))
+
+    error = _application_error(excinfo.value)
+    assert error.type == "BmcEndpointMissingError"
+    assert "no BMC host" in str(error)
+    assert calls["create_bmc_secret"] == []
+    assert calls["create_baremetal_host"] == []
+
+
 class TestPerMceRouting:
     """The queue IS the target cluster.
 

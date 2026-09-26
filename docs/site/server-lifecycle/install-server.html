@@ -194,6 +194,14 @@
           provider and each interface&rsquo;s link state, and lists separately those skipped as already
           installed and those whose name needs fixing in server-scan. Three different people&rsquo;s
           problem, so they are never merged into one sentence.</p>
+          <p class="note"><b>Three more checks run on the chosen server before anything is written:</b> a
+          <code>bmc_vendor</code> this orchestrator has an Ironic driver for
+          (<code>UnknownBmcVendorError</code>), a BMC host server-scan actually collected
+          (<code>BmcEndpointMissingError</code>), and well-formed MACs (<code>InvalidMacError</code>).
+          They are here rather than later because each would otherwise cost more than it should: an empty
+          BMC host still builds a <em>syntactically valid</em> address that the API server stores happily,
+          so the run would create all three resources and spend the whole 10-minute registration deadline
+          before blaming the credentials for an address the inventory never had.</p>
         </div>
       </div>
 

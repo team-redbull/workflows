@@ -238,6 +238,15 @@ class TestBmcAddress:
         # converged by this workflow, not duplicated by it.
         assert bmc_secret_name("HP", "server01") == "hp-cred-server01"
 
+    def test_an_ipv6_host_is_bracketed_exactly_once(self) -> None:
+        # A URL authority needs an IPv6 literal bracketed, but server-scan may
+        # already have done it — and `[[fd00::5]]` is not an address Ironic can
+        # parse.
+        bare = build_bmc_address("HP", BmcEndpoint(host="fd00::5", host_is_ip=True))
+        pre_bracketed = build_bmc_address("HP", BmcEndpoint(host="[fd00::5]", host_is_ip=True))
+        assert bare == pre_bracketed
+        assert "[fd00::5]" in bare and "[[" not in bare
+
 
 class TestWorkflowIdKeysOnTheCandidatePool:
     """The id must serialize whatever decides which servers a run can draw.
@@ -264,3 +273,22 @@ class TestWorkflowIdKeysOnTheCandidatePool:
         by_name = install_server_workflow_id("dell-r650-tlv-64c-1024gb", "ocp-dell-x")
         assert by_name == "install-server-name-ocp-dell-x"
         assert by_name != install_server_workflow_id("dell-r650-tlv-64c-1024gb")
+
+    def test_one_machine_gets_one_id_however_the_caller_cased_its_name(self) -> None:
+        """server-scan names carry an uppercase vendor serial.
+
+        The run lowercases that to build the resource names, so an id that kept
+        the original case would hand ONE machine TWO ids — both runs accepted,
+        both racing onto the same BareMetalHost, which is the collision the id
+        exists to prevent.
+        """
+        upper = install_server_workflow_id("ie", "ocp-hp-gen11-nyc-64c-128gb-HP0001592")
+        lower = install_server_workflow_id("ie", "ocp-hp-gen11-nyc-64c-128gb-hp0001592")
+        assert upper == lower
+
+    def test_two_different_servers_still_get_different_ids(self) -> None:
+        # Lowercasing cannot merge two machines: server-scan names differ by
+        # more than case.
+        assert install_server_workflow_id("ie", "ocp-a-HP0001592") != (
+            install_server_workflow_id("ie", "ocp-a-HP0001593")
+        )

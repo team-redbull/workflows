@@ -79,7 +79,15 @@ def install_server_workflow_id(infra_env: str, server_name: str | None = None) -
 
     An explicitly named server draws from a pool of one, so it gets its own id
     and does not serialize against pattern draws for the same InfraEnv.
+
+    That name is LOWERCASED, which is not cosmetic: server-scan names carry an
+    uppercase vendor serial, the run lowercases it to build the resource names,
+    and an id that kept the original case would give ONE machine TWO ids
+    depending on how a caller typed it. Both runs would then be accepted and
+    both would race onto the same BareMetalHost — the exact collision this id
+    exists to prevent. Two different servers cannot collide by lowercasing:
+    server-scan names differ by more than case.
     """
     if server_name:
-        return f"install-server-name-{server_name}"
+        return f"install-server-name-{server_name.lower()}"
     return f"install-server-{infra_env}"

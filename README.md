@@ -157,6 +157,44 @@ A run whose MCE has no worker waits instead of acting; `GET
 /workflows/runs/{workflow_id}` reports `activity_queue`, which says which MCE
 to go and look at.
 
+**Two ways to trigger it.** `server_name` is optional, and leaving it out is the
+normal mode:
+
+| | `server_name` omitted — *"fill this InfraEnv"* | `server_name` given — *"install this machine"* |
+| --- | --- | --- |
+| server-scan query | `?pattern=^ocp-<infraEnv>&count=<candidate_count>` | `?name=<server_name>&count=1` |
+| candidates drawn | `candidate_count` (default 3, 1–20) | one |
+| already has a BareMetalHost | **skipped**, next candidate tried | **converged** — that is the point |
+| workflow id | `install-server-<infraEnv>` | `install-server-name-<server_name>` |
+| use it for | routine capacity: take whatever is free and healthy | re-running a specific host, or repairing one |
+
+Both modes apply every other rule identically: `HEALTHY` only, at least two NIC
+MACs, two link-up NICs on two distinct physical ports, a `bmc_vendor` this
+orchestrator has a driver for, and well-formed MACs. So naming a server does not
+force an unusable one through — it only narrows the pool to one and turns the
+already-installed check off.
+
+Drawing several candidates is what makes one unusable server a retry rather than
+a failed run. When no candidate survives, the failure names every candidate with
+its provider and each interface's link state, and lists separately those skipped
+as already installed and those whose server-scan name cannot be a Kubernetes
+resource name — three different people's problem, so they are never merged.
+
+### Request body — `InstallServerInput`
+
+| field | type | rules | what it is for |
+| --- | --- | --- | --- |
+| `infra_env` | str | non-empty | The InfraEnv to fill. Labels both resources, **and** is the server query (`^ocp-<infra_env>`). Must already exist, in `namespace`. |
+| `mce_cluster` | str | non-empty | Which MCE. Selects the `INVENTORY` segment the VLAN comes from **and** the activity queue the cluster writes go to. |
+| `namespace` | str | non-empty | Where the three resources go. **Must be the InfraEnv's own namespace** — BMAC looks for the InfraEnv beside the BareMetalHost. |
+| `server_name` | str \| null | default `null` | Install one specific machine instead of drawing from the pool (see above). |
+| `candidate_count` | int | 1–20, default 3 | How many candidates to draw. Ignored when `server_name` is given. |
+| `labels` | map | default `{}` | Extra labels for the BareMetalHost. Cannot override the InfraEnv label — that would split the host from its NMStateConfig. |
+
+There is deliberately **no `vlan_id`**: it belongs to the MCE's segment, and a
+supplied one could contradict it. The request body forbids unknown fields, so
+sending `vlan_id` is a 422 rather than a silently ignored value.
+
 ### `allocate-segment` — give a cluster a segment
 
 Takes the cluster, the **values-repo branch** to record on, and the **type** to
@@ -219,8 +257,9 @@ would hide which segments actually got a workflow.
 - **ConfigMap split by scope:** `workflows-orchestrator-config` (owned by the
   always-present brain release) holds what every domain shares — `TEMPORAL_*` and
   `SEGMENTS_MANAGER_URL`. Each domain adds its own `<domain>-config` (here
-  `segment-lifecycle-config`: `DAY1_REPO_URL` and the DHCP policy). A domain's activity
-  worker mounts both, so the brain must install before any limb.
+  `segment-lifecycle-config`: `DAY1_REPO_URL` and the DHCP policy;
+  `server-lifecycle-config`: `MCE_CLUSTER` and `SERVER_SCAN_URL`). A domain's
+  activity worker mounts both, so the brain must install before any limb.
 - **ConfigMaps hold operator-editable data**, expanded and validated in code at
   worker startup rather than baked into an image. `DHCP_EXCLUSION_OCTET_RANGES` is
   the one structured knob left: a type → last-octet-ranges map, so changing the
@@ -233,12 +272,18 @@ would hide which segments actually got a workflow.
 - **Retries are unbounded** so transient outages are out-waited; only CLASSIFIED
   deterministic errors fail a run. An unclassified permanent error retries every
   minute forever, leaving the run RUNNING rather than FAILED — which is why every
-  known-permanent error is named in a `non_retryable_error_types` list.
+  known-permanent error is named in a `non_retryable_error_types` list. That list
+  is built from the exception CLASSES, not written out as strings: Temporal
+  matches it by type name, so a literal with a typo in it reads as "retryable"
+  with nothing to notice, while a wrong class name fails at worker startup.
 - **Idempotency:** `create_segment` accepts a matching existing segment;
   `allocate_segment` is idempotent server-side per (cluster, site, type); the
   values-repo append is a no-op for a file already recording this allocation.
+  install-server's three creates each treat an existing resource as success once
+  it matches, and a run skips candidates that already have a BareMetalHost.
   Workflow ids are deterministic (`initialize-segment-<network>`,
-  `allocate-segment-<TYPE>-<cluster>`), so a duplicate trigger while running gets
+  `allocate-segment-<TYPE>-<cluster>`, `install-server-<infraEnv>` or
+  `install-server-name-<server>`), so a duplicate trigger while running gets
   HTTP 409.
 
 ## Configuration

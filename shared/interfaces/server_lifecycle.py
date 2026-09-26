@@ -56,7 +56,10 @@ async def create_bmc_secret(request: BmhResourceRequest) -> CreatedResource:
     The credentials come from this worker's own configuration, per vendor —
     server-scan never holds them. Idempotent: an existing Secret is success
     (changed=False), NOT an overwrite, so a re-run never rotates a credential
-    an operator has since corrected by hand.
+    an operator has since corrected by hand. It is the one resource whose
+    contents are NOT compared, deliberately: the only way to compare a Secret is
+    to read a credential back out of the cluster, and since nothing here would
+    rewrite it there is nothing a comparison could act on.
 
     Raises BmcCredentialsMissingError when no username/password is configured
     for the server's vendor — deterministic, non-retryable.
@@ -73,9 +76,20 @@ async def create_baremetal_host(request: BmhResourceRequest) -> CreatedResource:
     matching Ironic driver — never from a fixed per-vendor template, so a BMC
     behind a Route with a DNS host and its own path works unchanged.
 
-    Idempotent: an existing BareMetalHost of the same name is success
-    (changed=False). Raises BmhConflictError when the CRD itself is absent from
-    the cluster (non-retryable); BmhResourceError otherwise (transient).
+    Idempotent, but not blindly: an existing BareMetalHost of the same name is
+    success (changed=False) only once its BMC address, credentials Secret, boot
+    MAC and InfraEnv label MATCH what this request would have created. A
+    disagreement is BmhConflictError — reporting success would describe an
+    installation that is not the one on the cluster — and nothing is overwritten
+    either way, so an operator's hand-correction survives.
+
+    Permanent (all non-retryable): BmhPrerequisiteMissingError when the cluster
+    has no such resource type, no such namespace, or this worker's
+    ServiceAccount lacks RBAC (404/403); BmhRequestInvalidError when the API
+    server rejects the body (400/422); InvalidServerNameError when the
+    server-scan name cannot be a Kubernetes resource name even lowercased.
+    Anything else is transient BmhResourceError — including 401, since a
+    projected ServiceAccount token is rotated under the pod.
     """
     ...
 
@@ -90,7 +104,10 @@ async def create_nmstate_config(request: BmhResourceRequest) -> CreatedResource:
     match before applying `spec.config`, so no per-server-type NIC-name profile
     is needed.
 
-    Idempotent and error-classified exactly as create_baremetal_host.
+    Idempotent and error-classified exactly as create_baremetal_host; the
+    identity compared on an existing resource is its MAC set (unordered — the
+    bond is the same wiring whichever member became nic1), its VLAN id and its
+    InfraEnv label.
     """
     ...
 

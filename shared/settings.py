@@ -194,7 +194,7 @@ class ServerLifecycleActivitySettings(BaseSettings):
     # Required, with no default, because a wrong value here is undetectable at
     # runtime: the worker would serve installs meant for a different MCE and
     # create their BareMetalHosts on this cluster, with both halves succeeding.
-    # ONE WORKER SERVES ONE MCE HUB; this is the field that says which.
+    # ONE WORKER SERVES ONE MCE; this is the field that says which.
     mce_cluster: str
 
     # --- server-scan: the inventory platform --------------------------------

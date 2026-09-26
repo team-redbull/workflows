@@ -1,0 +1,548 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>install-server — Redbull Workflows</title>
+<meta name="description" content="The install-server workflow: take a healthy, unclaimed server from the server-scan inventory and make it installable in an MCE InfraEnv — BareMetalHost, BMC Secret and NMStateConfig, on the MCE that owns the InfraEnv.">
+<link rel="icon" href="/assets/favicon.svg?v=__DOC_VERSION__" type="image/svg+xml">
+<link rel="stylesheet" href="/assets/site.css?v=__DOC_VERSION__">
+</head>
+<body data-page="/server-lifecycle/install-server.html">
+
+<a class="skip-link" href="#main">Skip to content</a>
+
+<!-- Topbar: identical on every page. Brand + deployed version upper-left; the
+     "Workflows" menu is built from the catalogue in assets/nav.js. -->
+<header class="topbar">
+  <a class="brand" href="/">
+    <img class="brand-mark" src="/assets/redbull-logo.png?v=__DOC_VERSION__" alt="" aria-hidden="true"
+         width="480" height="179">
+    <span class="brand-name">Redbull Workflows</span>
+    <span class="brand-ver" title="deployed image tag of this documentation site">__DOC_VERSION__</span>
+  </a>
+  <nav class="topnav" aria-label="Site">
+    <a class="topnav-link" href="/">Orchestrator guide</a>
+    <div class="wfmenu">
+      <button class="wfmenu-btn" id="wfmenu-btn" type="button"
+              aria-expanded="false" aria-haspopup="true" aria-controls="wfmenu-panel">
+        Workflows <span class="caret" aria-hidden="true">&#9662;</span>
+      </button>
+      <div class="wfmenu-panel" id="wfmenu-panel" role="menu" aria-label="Workflows by domain" hidden></div>
+    </div>
+    <noscript>
+      <a class="topnav-link" href="/server-lifecycle/install-server.html">install-server</a>
+    </noscript>
+  </nav>
+</header>
+
+<main id="main">
+<header class="masthead">
+  <div class="masthead-inner">
+    <div class="eyebrow">Temporal workflow &middot; domain: server-lifecycle</div>
+    <h1>install-server<span class="dim"> &mdash; what actually happens</span></h1>
+    <p class="lede">
+      One request makes a physical server installable in an MCE <b>InfraEnv</b>: the workflow asks
+      <b>server-scan</b> for a healthy, unclaimed machine matching that InfraEnv, picks two NICs for a
+      bond, and creates the three Kubernetes resources the Assisted Installer needs &mdash; a
+      <code>BareMetalHost</code>, its BMC <code>Secret</code> and an <code>NMStateConfig</code>.
+    </p>
+    <p class="lede">It replaces <b>bmh-generator-operator</b> (BareMetalHostUCS), a Kopf operator that
+    queried HP OneView, UCS Central, Dell OME and Intersight live on every reconcile. server-scan
+    already collects all of that on a 6-hour cron, so one HTTP call replaced four vendor SDKs.</p>
+    <div class="facts">
+      <div class="fact"><span class="k">Trigger</span><span class="v">POST /workflows/server-lifecycle/install-server</span></div>
+      <div class="fact"><span class="k">Workflow id</span><span class="v">install-server-&lt;infraEnv&gt;</span></div>
+      <div class="fact"><span class="k">Workflow queue</span><span class="v">install-server-workflow</span></div>
+      <div class="fact"><span class="k">Activity queue</span><span class="v">server-lifecycle-activity-&lt;mce_cluster&gt;</span></div>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <!-- ============================================================= MODES -->
+  <section id="modes">
+    <div class="sec-head">
+      <div class="eyebrow">The first thing to know</div>
+      <h2>Two ways to trigger it: name a server, or don&rsquo;t</h2>
+      <p class="lede"><code>server_name</code> is optional, and <b>leaving it out is the normal mode</b>.
+      The InfraEnv&rsquo;s own name is then the hardware query, so you ask for &ldquo;a server for this
+      InfraEnv&rdquo; and the workflow decides which one.</p>
+    </div>
+
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th></th><th><code>server_name</code> omitted</th><th><code>server_name</code> given</th></tr></thead>
+        <tbody>
+          <tr><td class="k">reads as</td><td class="muted"><em>&ldquo;fill this InfraEnv&rdquo;</em></td><td class="muted"><em>&ldquo;install this machine&rdquo;</em></td></tr>
+          <tr><td class="k">server-scan query</td><td class="muted"><code>?pattern=^ocp-&lt;infraEnv&gt;&amp;count=&lt;candidate_count&gt;</code></td><td class="muted"><code>?name=&lt;server_name&gt;&amp;count=1</code></td></tr>
+          <tr><td class="k">candidates drawn</td><td class="muted"><code>candidate_count</code> &mdash; default 3, range 1&ndash;20</td><td class="muted">one</td></tr>
+          <tr><td class="k">already has a BareMetalHost</td><td class="muted"><b>skipped</b>, next candidate tried</td><td class="muted"><b>converged</b> &mdash; that is the point</td></tr>
+          <tr><td class="k">workflow id</td><td class="muted"><code>install-server-&lt;infraEnv&gt;</code></td><td class="muted"><code>install-server-name-&lt;server_name&gt;</code></td></tr>
+          <tr><td class="k">use it for</td><td class="muted">routine capacity: take whatever is free and healthy</td><td class="muted">re-running or repairing one known host</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="grid-2" style="margin-top:24px">
+      <div class="panel">
+        <h3>Naming a server narrows the pool — it does not lower the bar</h3>
+        <p>Every other rule applies identically in both modes: <code>HEALTHY</code> only, at least two
+        NIC MACs, two <b>link-up</b> NICs on two <b>distinct physical ports</b>, a <code>bmc_vendor</code>
+        this orchestrator has an Ironic driver for, and well-formed MACs. So a named server that cannot
+        carry a bond fails exactly as it would have inside a pool draw.</p>
+        <p class="note">The only behaviour a name changes is the already-installed skip. Naming a machine
+        is a request to converge <em>that</em> machine, so an existing BareMetalHost is the expected
+        state rather than a reason to move on.</p>
+      </div>
+      <div class="panel">
+        <h3>Why the pattern is just a prefix</h3>
+        <p>An InfraEnv&rsquo;s name states which hardware it is for &mdash;
+        <code>cisco-m6-bat-yam-64c-512gb</code> is vendor, model, site, cores, memory &mdash; and
+        server-scan names carry the same tokens behind an <code>ocp-</code> prefix. So the query is
+        <code>^ocp-&lt;infraEnv&gt;</code>: neither name is parsed apart, and there is no mapping table
+        to keep in step with either.</p>
+        <p class="note">The InfraEnv name is caller data going into a regex, so it is escaped. Today&rsquo;s
+        names are <code>[a-z0-9-]</code> and it changes nothing &mdash; a <code>.</code> would silently
+        widen the pool without it.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================== FLOW -->
+  <section id="flow">
+    <div class="sec-head">
+      <div class="eyebrow">Five phases, in order</div>
+      <h2>What the run does</h2>
+      <p class="lede" style="margin-bottom:24px">Each card carries a <code>phase</code> &mdash; read live off a
+      running workflow through a Temporal <b>query</b>, which is how
+      <code>GET /workflows/runs/{workflow_id}</code> can tell you <em>where inside the run</em> an install
+      currently is.</p>
+    </div>
+
+    <div class="flow">
+
+      <!-- 1 -->
+      <div class="step">
+        <div class="marker">1</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>get_inventory_segment</h3>
+            <span class="phase">phase <b>resolving-vlan</b></span>
+          </div>
+          <p>The VLAN belongs to the <b>MCE</b>, not to the server and not to the caller: each MCE owns one
+          <code>INVENTORY</code> segment, so the workflow reads it from the Segments Manager. There is
+          deliberately <b>no <code>vlan_id</code> input</b> &mdash; a supplied VLAN could contradict the
+          segment the cluster actually owns.</p>
+          <div class="calls">
+            <div class="call sm"><span class="verb">GET</span><span class="path">/api/segments?type=INVENTORY <em>· on the SEGMENT-LIFECYCLE queue</em></span></div>
+          </div>
+          <p class="note">Runs on the other domain&rsquo;s queue on purpose: the Segments Manager token
+          already lives on <code>segment-lifecycle-worker</code>, and routing one activity there beats
+          putting a second copy of that credential on this limb. No <code>INVENTORY</code> segment for the
+          MCE &rarr; <code>InventorySegmentNotFoundError</code>; two &rarr;
+          <code>AmbiguousInventorySegmentError</code>; one belonging to another cluster &rarr;
+          <code>InventorySegmentMismatchError</code>. All three are non-retryable.</p>
+        </div>
+      </div>
+
+      <!-- 2 -->
+      <div class="step">
+        <div class="marker">2</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>acquire_servers</h3>
+            <span class="phase">phase <b>acquiring-server</b></span>
+          </div>
+          <p>One read against server-scan, which returns machines that are unclaimed, reachable, not in
+          maintenance and at the requested health &mdash; live-rechecking each one it hands back, so
+          freshness is its problem rather than ours. Several candidates are drawn
+          (<code>candidate_count</code>) so that <em>one</em> unusable server is a retry rather than a
+          failed run.</p>
+          <div class="calls">
+            <div class="call sm"><span class="verb">GET</span><span class="path">/servers/available?pattern=…&amp;health=HEALTHY&amp;min_nic_macs=2&amp;count=N</span></div>
+          </div>
+          <p class="note"><code>HEALTHY</code> is asked for server-side: without it the endpoint fills
+          HEALTHY, then WARNING, then MAJOR, and a WARNING server would be returned &mdash; and
+          live-rechecked at a vendor manager&rsquo;s expense &mdash; only to be discarded here. Nothing
+          assignable &rarr; <code>ServerNotAvailableError</code>; a name spanning several documents &rarr;
+          <code>AmbiguousServerNameError</code>.</p>
+        </div>
+      </div>
+
+      <!-- 3 -->
+      <div class="step">
+        <div class="marker">3</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>Bond selection + the already-installed probe</h3>
+            <span class="phase">phase <b>selecting-bond</b></span>
+          </div>
+          <p>The bond rule is <b>pure workflow logic</b> &mdash; no activity, no round trip, and it replays
+          identically. The first candidate that survives all three of these is the one installed:</p>
+          <ol>
+            <li>its server-scan name can be a Kubernetes resource name once lowercased;</li>
+            <li>it offers two link-up NICs on two distinct physical ports (below);</li>
+            <li>it does not already have a <code>BareMetalHost</code> &mdash; one read per surviving
+              candidate, skipped when a <code>server_name</code> was given.</li>
+          </ol>
+          <div class="calls">
+            <div class="call sm"><span class="verb">GET</span><span class="path">baremetalhosts/&lt;server&gt; <em>· per candidate, on the MCE&rsquo;s queue</em></span></div>
+          </div>
+          <p class="note">When nothing survives, the failure names <em>every</em> candidate with its
+          provider and each interface&rsquo;s link state, and lists separately those skipped as already
+          installed and those whose name needs fixing in server-scan. Three different people&rsquo;s
+          problem, so they are never merged into one sentence.</p>
+        </div>
+      </div>
+
+      <!-- 4 -->
+      <div class="step">
+        <div class="marker">4</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>create_bmc_secret &rarr; create_baremetal_host &rarr; create_nmstate_config</h3>
+            <span class="phase">phases <b>creating-secret</b> / <b>-baremetalhost</b> / <b>-nmstateconfig</b></span>
+          </div>
+          <p>In dependency order: the BareMetalHost references the Secret by name, so the Secret goes
+          first. All three are idempotent &mdash; an existing resource is success, never an overwrite, so a
+          BMC credential or a bond an operator corrected by hand survives a re-run.</p>
+          <div class="calls">
+            <div class="call sm"><span class="verb">POST</span><span class="path">secrets/&lt;vendor&gt;-cred-&lt;server&gt; <em>· credentials from THIS worker&rsquo;s Secret</em></span></div>
+            <div class="call nxt"><span class="verb">POST</span><span class="path">baremetalhosts/&lt;server&gt; <em>· customDeploy: start_assisted_install</em></span></div>
+            <div class="call nxt"><span class="verb">POST</span><span class="path">nmstateconfigs/nmstate-config-&lt;server&gt; <em>· 802.3ad bond + tagged VLAN</em></span></div>
+          </div>
+          <p class="note">Resource names are byte-identical to the operator&rsquo;s, so a cluster already
+          holding resources bmhgen created is <em>converged</em> rather than duplicated. The one
+          difference: names are lowercased, because server-scan names carry an uppercase vendor serial
+          (<code>…-HP0001592</code>) and Kubernetes rejects any uppercase letter in a resource name
+          outright. bmhgen never met this &mdash; its names came from a CR a human had written.</p>
+        </div>
+      </div>
+
+      <!-- 5 -->
+      <div class="step">
+        <div class="marker">5</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>get_baremetal_host, on a bounded timer</h3>
+            <span class="phase">phase <b>verifying-registration</b></span>
+          </div>
+          <p>A stored object is <b>not</b> a registered host. The API server accepting the BareMetalHost
+          only means it was written down; Ironic still has to reach the BMC and authenticate, and a wrong
+          address or credential surfaces nowhere else. So the run does not claim success until it has:
+          a 15-second durable timer, a <b>10-minute deadline</b>, then
+          <code>BmhNotRegisteredError</code>.</p>
+          <p><code>registering</code> does <b>not</b> count as registered. It is the state Metal3 assigns
+          the moment it picks a host up &mdash; before contacting the BMC at all &mdash; and a host whose
+          address or credential is wrong <em>stays</em> there. Accepting it would make this poll return on
+          its first iteration for exactly the failure the poll exists to catch.</p>
+          <p class="note">An <code>errorType</code> containing <code>registration error</code> is given a
+          2-minute grace (Metal3 retries registration itself, so one observation can be a briefly busy BMC)
+          and then fails immediately, rather than spending the rest of the deadline re-reading it. The
+          three resources are left standing either way &mdash; they are what an operator needs to diagnose
+          it.</p>
+        </div>
+      </div>
+
+      <!-- done -->
+      <div class="step done">
+        <div class="marker">&#10003;</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>Result</h3>
+            <span class="phase">phase <b>completed</b></span>
+          </div>
+          <p>The server that is now installable, its VLAN, the BMC address that was written, the bond MACs
+          and the boot MAC. <code>resources_changed</code> is <code>false</code> for a re-run that found all
+          three resources already present &mdash; the run still succeeds, and the flag says nothing was
+          written this time.</p>
+          <p class="note">What happens next is BMAC&rsquo;s, not this workflow&rsquo;s: it sees the
+          <code>infraenvs.agent-install.openshift.io</code> label, finds the InfraEnv <b>in the same
+          namespace</b>, attaches its discovery ISO over virtual media, and the host registers as an
+          <code>Agent</code>.</p>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ============================================================== BOND -->
+  <section id="bond">
+    <div class="sec-head">
+      <div class="eyebrow">The subtle part</div>
+      <h2>Two link-up NICs on two <em>distinct physical ports</em></h2>
+      <p class="lede">Both halves of that sentence exist because of a specific way of getting it wrong.</p>
+    </div>
+
+    <div class="grid-2">
+      <div class="panel">
+        <h3>Members come from <code>interfaces[]</code>, never <code>nic_macs</code></h3>
+        <p>server-scan reduces Dell NPAR partitions to one entry per physical port in
+        <code>network.interfaces</code>, but leaves <code>identity.nic_macs</code> whole on purpose. A
+        4-port partitioned card therefore reports <b>4 interfaces and 16 MACs</b>.</p>
+        <p>bmhgen indexed that MAC list positionally, which can bond <em>two partitions of one physical
+        port</em>: one wire, no redundancy &mdash; and it looks correct right up until that wire fails.
+        Distinctness here is by port, not by interface, so a Dell
+        <code>controller/port/partition</code> location collapses to <code>controller/port</code> and two
+        partitions of one port share a key.</p>
+      </div>
+      <div class="panel warn">
+        <h3><code>UP</code> is required strictly, and that excludes whole vendors</h3>
+        <p>Not &ldquo;not DOWN&rdquo; &mdash; <code>UNKNOWN</code> does not qualify. HPE OneView&rsquo;s
+        <code>portMap</code> carries no link state at all, so server-scan stores <code>UNKNOWN</code>
+        unconditionally, and Intersight vNICs mostly report none either. Servers from those collectors
+        therefore <b>fail bond selection</b> rather than being quietly passed over.</p>
+        <p>That is a decided, accepted trade. The failure names the provider and every observed link
+        state, because the usual cause is that the collector cannot report link state rather than that the
+        hardware is down &mdash; and from the workflow&rsquo;s side those two look identical.</p>
+      </div>
+    </div>
+
+    <div class="panel" style="margin-top:20px">
+      <h3>Why a health filter is not enough on its own</h3>
+      <p>server-scan&rsquo;s rollup is <code>max(category severities)</code>, and <code>UNKNOWN</code>
+      ranks <em>below</em> <code>HEALTHY</code> &mdash; so a category that was never read cannot lower it.
+      A server whose NIC read failed has no network facts to fail a policy on, and comes out
+      <code>HEALTHY</code> overall. Hence <code>min_nic_macs=2</code> on the query <em>and</em> the
+      structural rule above: the health tier says nothing bad was observed, and these say the machine is
+      actually installable.</p>
+    </div>
+  </section>
+
+  <!-- ========================================================== CROSSING -->
+  <section id="crossing">
+    <div class="sec-head">
+      <div class="eyebrow">How a hub workflow writes to a dozen clusters</div>
+      <h2>One worker per MCE, routed by task queue &mdash; not by credentials</h2>
+      <p class="lede">The brain runs on the hub. The resources belong on the MCE that owns the InfraEnv,
+      which is a different API server at its own <code>api.&lt;mce&gt;.&lt;domain&gt;</code>.</p>
+    </div>
+
+    <div class="grid-2">
+      <div class="panel">
+        <h3><code>mce_cluster</code> is the whole mechanism</h3>
+        <p>It names two things at once: the <code>INVENTORY</code> segment the VLAN is read from, and the
+        activity queue every cluster write is dispatched to
+        (<code>server-lifecycle-activity-&lt;mce_cluster&gt;</code>). A
+        <code>server-lifecycle-worker</code> runs <em>inside</em> each MCE, polls only its own queue, and
+        talks to its own API server as its own ServiceAccount.</p>
+        <p class="note">So the VLAN&rsquo;s cluster and the cluster written to are the same string and
+        cannot disagree. The worker&rsquo;s <code>MCE_CLUSTER</code> setting builds the same queue name,
+        which is why it must match what callers send.</p>
+      </div>
+      <div class="panel">
+        <h3>Routing beats holding kubeconfigs</h3>
+        <p>No cross-cluster kubeconfig exists anywhere, and because workers dial <b>out</b> to Temporal to
+        long-poll, the hub never needs inbound access to an MCE&rsquo;s API server. The alternative &mdash;
+        one hub worker holding a kubeconfig per MCE &mdash; concentrates admin-equivalent credentials for
+        the whole fleet onto one pod.</p>
+        <p class="note">A run whose MCE has <em>no</em> worker waits rather than acting. The cluster writes
+        carry a 5-minute schedule-to-start timeout, so history shows repeated timeouts instead of a task
+        sitting invisibly in a queue, and the status endpoint reports <code>activity_queue</code> &mdash;
+        which says which MCE to go and look at.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================================================= IDEMPOTENCY -->
+  <section id="idempotency">
+    <div class="sec-head">
+      <div class="eyebrow">Running it twice</div>
+      <h2>A re-run converges &mdash; or refuses, but never lies</h2>
+      <p class="lede">Temporal retries activities and operators re-POST things, so both have to be safe.
+      &ldquo;Safe&rdquo; here means more than &ldquo;does not crash&rdquo;.</p>
+    </div>
+
+    <div class="grid-2">
+      <div class="panel">
+        <h3>An existing resource is success once it MATCHES</h3>
+        <p>An <code>ALREADY EXISTS</code> is not an error, and not an upsert either: the object is left
+        exactly as it is. But reporting success for one that names a <em>different</em> BMC address,
+        credential Secret, boot MAC, InfraEnv or VLAN would describe an installation that is not the one on
+        the cluster &mdash; so those fields are read back and compared, and any disagreement is a
+        non-retryable <code>BmhConflictError</code> naming the field. A human decides which is right.</p>
+        <p class="note">Only identity fields are compared. Status, an operator&rsquo;s added annotation, a
+        hardware profile corrected by hand: all left alone deliberately. The MAC set is compared unordered
+        &mdash; the bond is the same wiring whichever member became <code>nic1</code>.</p>
+      </div>
+      <div class="panel">
+        <h3>The id serializes per POOL, and the probe covers the rest</h3>
+        <p><code>install-server-&lt;infraEnv&gt;</code> keys on the candidate <b>pool</b>
+        (<code>^ocp-&lt;infraEnv&gt;</code>), not on the machine &mdash; which is not known when the run
+        starts &mdash; and not on the target. Two MCEs filling an InfraEnv of the same name draw from the
+        same pool, so a second trigger while one is in flight gets <b>409</b> even when it names a
+        different MCE.</p>
+        <p class="note">That covers concurrent runs. The <em>sequential</em> case an id cannot cover
+        &mdash; a second run minutes later, before any cluster has reported the node, so server-scan still
+        calls the machine unclaimed &mdash; is what step 3&rsquo;s already-installed probe is for. Without
+        it, every create would answer &ldquo;already exists&rdquo; and the run would report success having
+        added nothing.</p>
+      </div>
+    </div>
+
+    <div class="panel warn" style="margin-top:20px">
+      <h3>Installing several servers from one pool concurrently is not just a looser id</h3>
+      <p>server-scan hands out candidates <em>without reserving them</em>: two concurrent callers can be
+      drawn the same machine, and nothing changes its lifecycle state until a cluster reports the node
+      minutes later. Parallel installs from one InfraEnv need a real reservation in server-scan first.</p>
+    </div>
+  </section>
+
+  <!-- =============================================================== API -->
+  <section id="api">
+    <div class="sec-head">
+      <div class="eyebrow">HTTP surface</div>
+      <h2>How you start it and how you watch it</h2>
+      <p class="lede">Served by <code>workflows-orchestrator-api</code> (Swagger at <code>/docs</code>).
+      Async throughout: the POST hands back the workflow id at once and you poll it.</p>
+    </div>
+
+    <div class="api">
+
+      <div class="endpoint">
+        <div class="endpoint-head">
+          <span class="method">POST</span>
+          <span class="path">/workflows/server-lifecycle/install-server</span>
+          <span class="ret">202 &middot; 409 if already running</span>
+        </div>
+        <div class="endpoint-body">
+          <p>The minimum body is three fields &mdash; the InfraEnv to fill, its MCE, and the namespace the
+          InfraEnv lives in.</p>
+          <pre><span class="c">// request — fill the InfraEnv from the pool</span>
+{
+  "infra_env":   "cisco-m6-bat-yam-64c-512gb",
+  "mce_cluster": "ocp4-mce-bat-yam-01",
+  "namespace":   "multicluster-engine"
+}
+
+<span class="c">// request — install one specific machine instead</span>
+{
+  "infra_env":   "cisco-m6-bat-yam-64c-512gb",
+  "mce_cluster": "ocp4-mce-bat-yam-01",
+  "namespace":   "multicluster-engine",
+  "server_name": "ocp-cisco-m6-bat-yam-64c-512gb-WZP12345"
+}
+
+<span class="c">// 202 response</span>
+{ "workflow_id": "install-server-cisco-m6-bat-yam-64c-512gb", "run_id": "…" }</pre>
+          <p class="note">The body <b>forbids unknown fields</b>. Chiefly that means a <code>vlan_id</code>
+          is a 422 rather than a silently ignored value: the VLAN comes from the MCE&rsquo;s segment, and a
+          caller who sends one expects it to be used.</p>
+          <p class="note"><code>namespace</code> must be the <b>InfraEnv&rsquo;s own namespace</b>. BMAC
+          looks for the InfraEnv beside the BareMetalHost, so a host created elsewhere is never given a
+          discovery ISO.</p>
+        </div>
+      </div>
+
+      <div class="endpoint">
+        <div class="endpoint-head">
+          <span class="method">GET</span>
+          <span class="path">/workflows/runs/{workflow_id}</span>
+          <span class="ret">200</span>
+        </div>
+        <div class="endpoint-body">
+          <p>Domain-agnostic: workflow ids are globally unique, so one route serves every domain. It
+          addresses the <code>progress</code> query by name, so the response carries the live phase, the
+          server chosen once there is one, and the activity queue this run dispatches to.</p>
+          <pre><span class="c">// 200 while running</span>
+{
+  "status":   "RUNNING",
+  "progress": {
+    "phase":          "verifying-registration",
+    "server_name":    "ocp-cisco-m6-bat-yam-64c-512gb-WZP12345",
+    "activity_queue": "server-lifecycle-activity-ocp4-mce-bat-yam-01"
+  }
+}</pre>
+          <p class="note">A phase that does not advance is diagnosable from this alone: it means nothing is
+          polling <code>activity_queue</code>, so that MCE has no <code>server-lifecycle-worker</code>
+          deployed or it cannot reach Temporal.</p>
+        </div>
+      </div>
+
+    </div>
+
+    <p class="note" style="margin-top:18px">No healthy server matching the InfraEnv, no candidate with two
+    link-up NICs on distinct ports, and a BareMetalHost that never registers are all <b>FAILED runs</b> on
+    the status endpoint &mdash; not 4xx on the trigger. Everything the outcome depends on happens inside
+    the run, as a retried activity.</p>
+  </section>
+
+  <!-- ========================================================= REFERENCE -->
+  <section id="reference">
+    <div class="sec-head">
+      <div class="eyebrow">Reference</div>
+      <h2>Inputs, phases, and what the limb needs configured</h2>
+    </div>
+
+    <h3 style="margin-bottom:10px">Request body &mdash; <code>InstallServerInput</code></h3>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>Field</th><th>Type</th><th>Rules</th><th>What it&rsquo;s for</th></tr></thead>
+        <tbody>
+          <tr><td class="k">infra_env</td><td class="k">str</td><td class="muted">required, non-empty</td><td class="muted">The InfraEnv to fill. Labels both resources <b>and</b> is the server query (<code>^ocp-&lt;infra_env&gt;</code>). Must already exist, in <code>namespace</code>.</td></tr>
+          <tr><td class="k">mce_cluster</td><td class="k">str</td><td class="muted">required, non-empty</td><td class="muted">Which MCE. Selects the <code>INVENTORY</code> segment the VLAN comes from <b>and</b> the activity queue the cluster writes go to.</td></tr>
+          <tr><td class="k">namespace</td><td class="k">str</td><td class="muted">required, non-empty</td><td class="muted">Where the three resources go. Must be the InfraEnv&rsquo;s own namespace.</td></tr>
+          <tr><td class="k">server_name</td><td class="k">str | null</td><td class="muted">default <code>null</code></td><td class="muted">Install one specific machine instead of drawing from the pool. Turns the already-installed skip off; changes the workflow id.</td></tr>
+          <tr><td class="k">candidate_count</td><td class="k">int</td><td class="muted">1&ndash;20, default 3</td><td class="muted">How many candidates to draw. Ignored when <code>server_name</code> is given.</td></tr>
+          <tr><td class="k">labels</td><td class="k">map</td><td class="muted">default <code>{}</code></td><td class="muted">Extra labels for the BareMetalHost. Cannot override the InfraEnv label &mdash; that would split the host from its NMStateConfig.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note" style="margin-top:10px">No <code>vlan_id</code>, on purpose: it belongs to the MCE&rsquo;s
+    inventory segment, and a supplied one could contradict it.</p>
+
+    <h3 style="margin:28px 0 10px">Phases you&rsquo;ll see on the status endpoint</h3>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>phase</th><th>Meaning</th><th>Normal duration</th></tr></thead>
+        <tbody>
+          <tr><td class="k">pending</td><td class="muted">Run accepted, nothing read yet</td><td class="muted">instant</td></tr>
+          <tr><td class="k">resolving-vlan</td><td class="muted">Reading the MCE&rsquo;s <code>INVENTORY</code> segment</td><td class="muted">seconds</td></tr>
+          <tr><td class="k">acquiring-server</td><td class="muted">Asking server-scan for candidates &mdash; it live-rechecks each one</td><td class="muted">seconds to ~1 min (it reaches a vendor manager)</td></tr>
+          <tr><td class="k">selecting-bond</td><td class="muted">Pure bond rule + one BareMetalHost read per candidate</td><td class="muted">seconds</td></tr>
+          <tr><td class="k">creating-secret</td><td class="muted">The BMC credentials Secret</td><td class="muted">instant</td></tr>
+          <tr><td class="k">creating-baremetalhost</td><td class="muted">The BareMetalHost</td><td class="muted">instant</td></tr>
+          <tr><td class="k">creating-nmstateconfig</td><td class="muted">The bond + tagged VLAN</td><td class="muted">instant</td></tr>
+          <tr><td class="k">verifying-registration</td><td class="muted">Polling until Ironic has reached the BMC &mdash; <b>bounded, &le; 10 min</b></td><td class="muted">30 s&ndash;2 min</td></tr>
+          <tr><td class="k">completed</td><td class="muted">The server is installable in the InfraEnv</td><td class="muted">&mdash;</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 style="margin:28px 0 10px">What <code>server-lifecycle-worker</code> needs &mdash; one deployment per MCE</h3>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>key</th><th>where</th><th>notes</th></tr></thead>
+        <tbody>
+          <tr><td class="k">MCE_CLUSTER</td><td class="muted"><code>server-lifecycle-config</code></td><td class="muted"><b>Required, no default.</b> Names the queue this worker polls, so it must equal callers&rsquo; <code>mce_cluster</code>.</td></tr>
+          <tr><td class="k">SERVER_SCAN_URL</td><td class="muted"><code>server-lifecycle-config</code></td><td class="muted">Inventory API base, <b>including</b> <code>/api/v1</code>.</td></tr>
+          <tr><td class="k">SERVER_SCAN_API_TOKEN</td><td class="muted"><code>server-lifecycle-credentials</code></td><td class="muted">A <b>viewer</b> token is enough &mdash; the endpoint is a GET. May be empty where server-scan runs with auth disabled.</td></tr>
+          <tr><td class="k">{HP,DELL,CISCO,INTERSIGHT}_BMC_USERNAME / _PASSWORD</td><td class="muted"><code>server-lifecycle-credentials</code></td><td class="muted">What Ironic uses to drive the BMC. server-scan never holds these. A vendor with no pair fails its run with <code>BmcCredentialsMissingError</code>.</td></tr>
+          <tr><td class="k">RBAC</td><td class="muted">the chart&rsquo;s Role</td><td class="muted"><code>get</code> + <code>create</code> on <code>secrets</code>, <code>metal3.io/baremetalhosts</code> and <code>agent-install.openshift.io/nmstateconfigs</code>, namespace-scoped. A missing verb is a non-retryable <code>BmhPrerequisiteMissingError</code>, not a silent retry loop.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note" style="margin-top:10px">It also mounts the global
+    <code>workflows-orchestrator-config</code> for <code>TEMPORAL_*</code>, so the brain release must be
+    installed before any limb.</p>
+  </section>
+
+  <footer>
+    <span>workflow_domains/server_lifecycle/install_server.py</span>
+    <span>workflow_domains/server_lifecycle/bond_selection.py</span>
+    <span>activities/server_lifecycle/activities.py</span>
+    <span>activities/server_lifecycle/server_scan.py</span>
+    <span>activities/server_lifecycle/cluster_api.py</span>
+    <span>activities/server_lifecycle/bmh_resources.py</span>
+    <span>shared/models/server_lifecycle.py</span>
+    <span>shared/bmc_address.py</span>
+  </footer>
+
+</div>
+</main>
+
+<script src="/assets/nav.js?v=__DOC_VERSION__" defer></script>
+</body>
+</html>

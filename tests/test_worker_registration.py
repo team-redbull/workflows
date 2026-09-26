@@ -20,10 +20,14 @@ import pytest
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 
-# queue const -> the worker module that must poll it
+# What names a queue in workflow code -> the worker module that must poll it.
+# Either a module-level const, or the helper that builds a per-MCE queue name
+# (server-lifecycle activities are routed to the MCE they write to, so their
+# queue is computed rather than constant).
 _WORKERS = {
     "SEGMENT_LIFECYCLE_ACTIVITY_QUEUE": "activities/segment_lifecycle/worker_init.py",
     "SERVER_LIFECYCLE_ACTIVITY_QUEUE": "activities/server_lifecycle/worker_init.py",
+    "server_lifecycle_activity_queue": "activities/server_lifecycle/worker_init.py",
 }
 
 # the workflow modules that dispatch activities, and the interface module each
@@ -80,6 +84,73 @@ def _helper_arguments(tree: ast.Module, helper: str, activities: set[str]) -> se
     return passed
 
 
+def _enclosing_function(tree: ast.Module, param: str):
+    """The function declaring `param`, if any."""
+    return next(
+        (
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef)
+            and any(a.arg == param for a in n.args.args)
+        ),
+        None,
+    )
+
+
+def _argument_passed_for(tree: ast.Module, function: ast.AST, param: str):
+    """What callers of `function` pass for `param`, as an AST node."""
+    index = [a.arg for a in function.args.args].index(param)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if getattr(node.func, "attr", None) != function.name:
+            continue
+        # `self`/`cls` is not in the call's positional args.
+        offset = 1 if function.args.args and function.args.args[0].arg in {"self", "cls"} else 0
+        position = index - offset
+        if 0 <= position < len(node.args):
+            return node.args[position]
+    return None
+
+
+def _resolve_queue(tree: ast.Module, name: str) -> str:
+    """A task_queue name reduced to something _WORKERS can be keyed on.
+
+    Three shapes reach this, and only the first is literal:
+
+      * a module-level const — resolves to itself;
+      * a local holding a computed queue
+        (`activity_queue = server_lifecycle_activity_queue(mce)`) — resolves to
+        the helper that built it, since that helper is what pairs with the
+        worker polling the same name;
+      * a PARAMETER of a helper method (`_create(..., task_queue)`) — resolved
+        by following what callers pass, the same hop activity names take.
+    """
+    seen: set[str] = set()
+    while name not in _WORKERS and name not in seen:
+        seen.add(name)
+        assigned = next(
+            (
+                node.value
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Assign)
+                and any(t.id == name for t in node.targets if isinstance(t, ast.Name))
+            ),
+            None,
+        )
+        if isinstance(assigned, ast.Call) and getattr(assigned.func, "id", None):
+            name = assigned.func.id
+            continue
+        function = _enclosing_function(tree, name)
+        if function is None:
+            break
+        passed = _argument_passed_for(tree, function, name)
+        if not isinstance(passed, ast.Name):
+            break
+        name = passed.id
+    return name
+
+
 def _dispatched(workflow_module: str) -> list[tuple[str, str]]:
     """(activity name, queue const) for each activity a workflow dispatches."""
     tree = _tree(workflow_module)
@@ -94,7 +165,7 @@ def _dispatched(workflow_module: str) -> list[tuple[str, str]]:
             continue
         queue = next(
             (
-                k.value.id
+                _resolve_queue(tree, k.value.id)
                 for k in node.keywords
                 if k.arg == "task_queue" and isinstance(k.value, ast.Name)
             ),
@@ -142,6 +213,10 @@ def test_the_install_server_workflow_reaches_both_queues():
     """Guards the premise of the test above: install-server really does span two limbs."""
     queues = {queue for _, queue in _dispatched(_WORKFLOW_MODULES[0])}
     assert queues == {
+        # The Segments Manager credential lives on the segment-lifecycle limb,
+        # on the hub...
         "SEGMENT_LIFECYCLE_ACTIVITY_QUEUE",
-        "SERVER_LIFECYCLE_ACTIVITY_QUEUE",
+        # ...while everything that writes to a cluster is routed to the worker
+        # inside the target MCE, by a queue name computed from the request.
+        "server_lifecycle_activity_queue",
     }

@@ -128,10 +128,21 @@ The sequential case an id cannot cover — a second run minutes later, before an
 cluster has reported the node — is covered by step 3 skipping candidates that
 already have a BareMetalHost.
 
-**One worker serves one MCE hub.** `mce_cluster` picks the VLAN; the resources
-go to whichever cluster the worker's own credentials point at. Deploy a
-`server-lifecycle-worker` per MCE hub — nothing in a request can correct a
-worker pointed at the wrong cluster.
+**One worker per MCE, routed by queue.** The brain runs on the hub; the
+resources belong on the MCE that owns the InfraEnv, which is a different API
+server. `mce_cluster` names both the inventory segment AND the activity queue
+(`server-lifecycle-activity-<mce_cluster>`), and a `server-lifecycle-worker`
+inside each MCE polls only its own queue, authenticating to its own API server
+as its own ServiceAccount.
+
+That is deliberately routing rather than credentials: no cross-cluster
+kubeconfig exists anywhere, and because workers dial OUT to Temporal, the hub
+never needs inbound access to an MCE's API server. It also makes the VLAN's
+cluster and the cluster written to the same string, so they cannot disagree.
+
+A run whose MCE has no worker waits instead of acting; `GET
+/workflows/runs/{workflow_id}` reports `activity_queue`, which says which MCE
+to go and look at.
 
 ### `allocate-segment` — give a cluster a segment
 
@@ -227,6 +238,7 @@ would hide which segments actually got a workflow.
 | `DHCP_EXCLUSION_OCTET_RANGES` | `segment-lifecycle-config` | DHCP policy |
 | `SEGMENTS_MANAGER_API_TOKEN` | Secret | mutating calls only; GETs are public |
 | `DAY1_GIT_TOKEN` | Secret `day1-git-token` | push rights; scrubbed from every error |
+| `MCE_CLUSTER` | `server-lifecycle-config` | which MCE this worker serves — names its queue, so it must match callers' `mce_cluster` |
 | `SERVER_SCAN_URL` | `server-lifecycle-config` | inventory API base, INCLUDING `/api/v1` |
 | `SERVER_SCAN_API_TOKEN` | Secret | a **viewer** token — the lookup is a GET |
 | `{HP,DELL,CISCO,INTERSIGHT}_BMC_USERNAME`/`_PASSWORD` | Secret | what Ironic drives the BMC with |

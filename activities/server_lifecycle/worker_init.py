@@ -1,11 +1,19 @@
 """Server-lifecycle activity worker — the `server-lifecycle-worker` deployment.
 
-Registers the server-lifecycle activities and polls the server-lifecycle
-activity queue. A separate deployment from the segment-lifecycle limb because
-the driver for one is the dependency + credential set, and this one's is
-entirely different: a Kubernetes client with RBAC to create BareMetalHosts,
-Secrets and NMStateConfigs in the target namespace, plus per-vendor BMC
-credentials and a server-scan token.
+ONE DEPLOYMENT PER MCE CLUSTER, running INSIDE that MCE. Its queue is scoped to
+the MCE it serves (`server-lifecycle-activity-<MCE_CLUSTER>`), so the brain on
+the hub picks the target cluster purely by which queue it dispatches to.
+
+That is what lets a hub-side workflow create resources on a dozen other API
+servers without holding a single cross-cluster credential: this worker talks to
+its OWN API server as its own ServiceAccount, and reaches Temporal by dialling
+OUT. The hub never needs inbound access to an MCE.
+
+A separate deployment from the segment-lifecycle limb because the driver for
+one is the dependency + credential set, and this one's is entirely different: a
+Kubernetes client with RBAC to create BareMetalHosts, Secrets and
+NMStateConfigs in the target namespace, plus per-vendor BMC credentials and a
+server-scan token.
 
 install-server's VLAN lookup is deliberately NOT registered here: it reads the
 Segments Manager, whose credential lives on the segment-lifecycle limb, so the
@@ -33,12 +41,14 @@ from activities.server_lifecycle.activities import (
     create_nmstate_config,
     get_baremetal_host,
 )
-from shared.consts import SERVER_LIFECYCLE_ACTIVITY_QUEUE
+from shared.consts import server_lifecycle_activity_queue
 from shared.logging_config import configure_logging
-from shared.settings import TemporalSettings
+from shared.settings import ServerLifecycleActivitySettings, TemporalSettings
 from shared.shutdown import install_shutdown_handler
 
 _settings = TemporalSettings()
+_activity_settings = ServerLifecycleActivitySettings()
+_TASK_QUEUE = server_lifecycle_activity_queue(_activity_settings.mce_cluster)
 
 
 async def main() -> None:
@@ -51,7 +61,7 @@ async def main() -> None:
     )
     worker = Worker(
         client,
-        task_queue=SERVER_LIFECYCLE_ACTIVITY_QUEUE,
+        task_queue=_TASK_QUEUE,
         activities=[
             # install-server
             acquire_servers,
@@ -72,7 +82,7 @@ async def main() -> None:
 
     logger.info(
         "Activity worker polling queue=%s on %s",
-        SERVER_LIFECYCLE_ACTIVITY_QUEUE,
+        _TASK_QUEUE,
         _settings.temporal_host,
     )
     async with worker:

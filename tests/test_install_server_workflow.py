@@ -26,7 +26,7 @@ from temporalio.worker import Worker
 from shared.consts import (
     INSTALL_SERVER_WORKFLOW_QUEUE,
     SEGMENT_LIFECYCLE_ACTIVITY_QUEUE,
-    SERVER_LIFECYCLE_ACTIVITY_QUEUE,
+    server_lifecycle_activity_queue,
 )
 from shared.exceptions import InventorySegmentNotFoundError, ServerNotAvailableError
 from shared.models.segment_lifecycle import SegmentEntry
@@ -47,6 +47,10 @@ from workflow_domains.server_lifecycle.install_server import InstallServerWorkfl
 
 INFRA_ENV = "cisco-m6-bat-yam-64c-512gb"
 MCE_CLUSTER = "ocp4-mce-bat-yam-01"
+# The queue the worker INSIDE that MCE polls. The brain picks the target
+# cluster purely by dispatching here, so the harness has to register the mock
+# activities on the same MCE-scoped name the workflow computes.
+MCE_ACTIVITY_QUEUE = server_lifecycle_activity_queue(MCE_CLUSTER)
 NAMESPACE = "multicluster-engine"
 VLAN_ID = 24
 SERVER_NAME = "ocp-dell-r650-tlv-64c-1024gb-DEL0000485"
@@ -224,9 +228,10 @@ def make_mock_activities(
 class _Harness:
     """Brain + BOTH limbs, mirroring the real three-queue split."""
 
-    def __init__(self, segment_activities, server_activities) -> None:
+    def __init__(self, segment_activities, server_activities, server_queue=None) -> None:
         self._segment_activities = segment_activities
         self._server_activities = server_activities
+        self._server_queue = server_queue or MCE_ACTIVITY_QUEUE
 
     async def __aenter__(self) -> Client:
         self._env = await WorkflowEnvironment.start_time_skipping()
@@ -241,7 +246,7 @@ class _Harness:
             ),
             Worker(
                 client,
-                task_queue=SERVER_LIFECYCLE_ACTIVITY_QUEUE,
+                task_queue=self._server_queue,
                 activities=self._server_activities,
             ),
             Worker(
@@ -606,3 +611,76 @@ async def test_a_malformed_mac_fails_before_any_resource_is_written():
     error = _application_error(excinfo.value)
     assert error.type == "InvalidMacError"
     assert calls["create_bmc_secret"] == []
+
+
+class TestPerMceRouting:
+    """The queue IS the target cluster.
+
+    The brain runs on the hub; the BareMetalHost has to be created on the MCE
+    that owns the InfraEnv, which is a different API server. Routing by queue
+    is what crosses that boundary, so that no cross-cluster credential has to
+    exist anywhere — each MCE's worker uses its own ServiceAccount and dials
+    out to Temporal.
+    """
+
+    def test_the_queue_name_carries_the_mce(self) -> None:
+        assert server_lifecycle_activity_queue("ocp4-prep-mce-batyam") == (
+            "server-lifecycle-activity-ocp4-prep-mce-batyam"
+        )
+
+    def test_two_mces_get_two_queues(self) -> None:
+        assert server_lifecycle_activity_queue("mce-a") != (
+            server_lifecycle_activity_queue("mce-b")
+        )
+
+    async def test_cluster_writes_go_to_the_requested_mces_queue(self) -> None:
+        # Registered ONLY on this MCE's queue: if the workflow dispatched
+        # anywhere else the run could not finish.
+        calls, segment_acts, server_acts = make_mock_activities()
+        async with _Harness(segment_acts, server_acts, MCE_ACTIVITY_QUEUE) as client:
+            result = await _execute(client, InstallServerRunArgs(input=INPUT))
+
+        assert result.server_name == SERVER_NAME
+        assert len(calls["create_baremetal_host"]) == 1
+
+    async def test_a_run_for_another_mce_is_not_served_by_this_worker(self) -> None:
+        """The isolation that makes the routing real, not decorative.
+
+        This worker is registered on ONE MCE's queue. A run aimed at a
+        different MCE gets its VLAN (that activity runs on the hub's
+        segment-lifecycle queue) and then waits, because nothing polls the
+        other MCE's queue — it cannot be served here by accident.
+        """
+        other_mce = "ocp4-mce-somewhere-else"
+        # The segment has to match the MCE asked for, or the workflow's own
+        # mismatch guard fires first and we never reach the routing.
+        matching = INVENTORY_SEGMENT.model_copy(update={"cluster_name": other_mce})
+        other = InstallServerInput(
+            infra_env=INFRA_ENV, mce_cluster=other_mce, namespace=NAMESPACE
+        )
+        calls, segment_acts, server_acts = make_mock_activities(segment=matching)
+        async with _Harness(segment_acts, server_acts, MCE_ACTIVITY_QUEUE) as client:
+            handle = await client.start_workflow(
+                InstallServerWorkflow.run,
+                InstallServerRunArgs(input=other),
+                id=f"test-{uuid.uuid4()}",
+                task_queue=INSTALL_SERVER_WORKFLOW_QUEUE,
+            )
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(handle.result(), timeout=5)
+            progress = await handle.query(InstallServerWorkflow.progress)
+
+        # Nothing reached this MCE's worker...
+        assert calls["acquire_servers"] == []
+        assert calls["create_baremetal_host"] == []
+        # ...and the stall says which queue is unserved, so "the run is stuck"
+        # reads as "that MCE has no server-lifecycle-worker".
+        assert progress.activity_queue == f"server-lifecycle-activity-{other_mce}"
+        assert progress.phase == "acquiring-server"
+
+    async def test_the_result_still_reports_which_mce_was_targeted(self) -> None:
+        calls, segment_acts, server_acts = make_mock_activities()
+        async with _Harness(segment_acts, server_acts) as client:
+            result = await _execute(client, InstallServerRunArgs(input=INPUT))
+        assert result.mce_cluster == MCE_CLUSTER
+        assert len(calls["create_baremetal_host"]) == 1

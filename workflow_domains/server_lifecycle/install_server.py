@@ -40,13 +40,19 @@ indexed that MAC list positionally, which can bond two partitions of ONE
 physical port — a bond with no redundancy over a single wire, which looks
 correct until that wire fails.
 
-ONE WORKER SERVES ONE MCE HUB. `mce_cluster` selects the VLAN, but the three
-resources are written to whichever cluster the worker's in-cluster credentials
-point at — nothing in the request chooses that. Deploying a
-server-lifecycle-worker into a cluster that is not the MCE hub named in the
-request would tag the host with MCE X's inventory VLAN and create it on cluster
-Y, which no error surfaces because both halves individually succeed. The
-deployment, not this workflow, is what binds the two together.
+CROSSING CLUSTERS. This workflow runs on the hub, but the resources belong on
+the MCE that owns the InfraEnv — a different API server at its own
+`api.<mce>.<domain>`. `mce_cluster` is what bridges that: it names both the
+inventory segment to read the VLAN from AND the activity queue the cluster
+writes are dispatched to (`server-lifecycle-activity-<mce_cluster>`).
+
+One server-lifecycle-worker runs INSIDE each MCE, polls only its own queue,
+and talks to its own API server as its own ServiceAccount. So no cross-cluster
+kubeconfig exists anywhere, the hub never needs inbound access to an MCE, and
+the VLAN's cluster cannot disagree with the cluster written to — they are the
+same string. If no worker polls that queue the run waits rather than acting,
+and the `progress` query names the queue so it reads as "that MCE has no
+worker" instead of "the run is stuck".
 
 On cancellation there is deliberately no compensating cleanup: the three
 resources are idempotent, so a re-run converges on them, and a half-created set
@@ -66,7 +72,7 @@ from temporalio.exceptions import ApplicationError
 with workflow.unsafe.imports_passed_through():
     from shared.consts import (
         SEGMENT_LIFECYCLE_ACTIVITY_QUEUE,
-        SERVER_LIFECYCLE_ACTIVITY_QUEUE,
+        server_lifecycle_activity_queue,
     )
     from shared.bmc_address import build_bmc_address
     from shared.interfaces.segment_lifecycle import get_inventory_segment
@@ -123,6 +129,15 @@ _RETRY_POLICY = RetryPolicy(
 # scope poll does. A host that has not registered in 10 minutes has a bad BMC
 # address or credential, not a slow one. Changing either constant is a
 # non-deterministic change for in-flight runs.
+# How long a create may sit in an MCE's queue before Temporal reports that
+# nobody picked it up. Temporal advises against schedule-to-start timeouts in
+# general; the exception it names is exactly this case — a queue served by
+# specific hosts, where the timeout is what distinguishes "no worker is running
+# there" from "the work is slow". Retryable, because a worker rolling out is a
+# normal few-second gap, so the signal is repeated timeouts in history rather
+# than a failed run.
+_SCHEDULE_TO_START_TIMEOUT = timedelta(minutes=5)
+
 _BMH_POLL_INTERVAL = timedelta(seconds=15)
 _BMH_REGISTRATION_DEADLINE = timedelta(minutes=10)
 
@@ -219,16 +234,31 @@ class InstallServerWorkflow:
     def __init__(self) -> None:
         self._phase = "pending"
         self._server_name: str | None = None
+        self._activity_queue: str | None = None
 
     @workflow.query
     def progress(self) -> InstallServerProgress:
-        """Cheap progress surface for the async caller (GET status endpoint)."""
-        return InstallServerProgress(phase=self._phase, server_name=self._server_name)
+        """Cheap progress surface for the async caller (GET status endpoint).
+
+        `activity_queue` is what makes a stalled run diagnosable: a phase that
+        does not advance means no `server-lifecycle-worker` is polling that
+        MCE's queue, and the queue name says which MCE to go and look at.
+        """
+        return InstallServerProgress(
+            phase=self._phase,
+            server_name=self._server_name,
+            activity_queue=self._activity_queue,
+        )
 
     @workflow.run
     async def run(self, run_args: InstallServerRunArgs) -> InstallServerResult:
         install_input = run_args.input
         infra_env = install_input.infra_env
+        # The MCE this run writes to. Everything that touches the target
+        # cluster goes to this queue, and only the worker inside that MCE
+        # polls it.
+        activity_queue = server_lifecycle_activity_queue(install_input.mce_cluster)
+        self._activity_queue = activity_queue
         workflow.logger.info(
             "Installing a server into InfraEnv=%s for MCE=%s",
             infra_env,
@@ -280,8 +310,9 @@ class InstallServerWorkflow:
         candidates = await workflow.execute_activity(
             acquire_servers,
             request,
-            task_queue=SERVER_LIFECYCLE_ACTIVITY_QUEUE,
+            task_queue=activity_queue,
             start_to_close_timeout=_ACTIVITY_TIMEOUT,
+            schedule_to_start_timeout=_SCHEDULE_TO_START_TIMEOUT,
             retry_policy=_RETRY_POLICY,
         )
 
@@ -312,8 +343,9 @@ class InstallServerWorkflow:
                     BmhRef(
                         server_name=candidate.name, namespace=install_input.namespace
                     ),
-                    task_queue=SERVER_LIFECYCLE_ACTIVITY_QUEUE,
+                    task_queue=activity_queue,
                     start_to_close_timeout=_ACTIVITY_TIMEOUT,
+                    schedule_to_start_timeout=_SCHEDULE_TO_START_TIMEOUT,
                     retry_policy=_RETRY_POLICY,
                 )
                 if existing.found:
@@ -378,20 +410,21 @@ class InstallServerWorkflow:
         # treats "already exists" as success, which is what makes the whole run
         # re-runnable.
         self._phase = "creating-secret"
-        secret = await self._create(create_bmc_secret, resource_request)
+        secret = await self._create(create_bmc_secret, resource_request, activity_queue)
 
         self._phase = "creating-baremetalhost"
-        bmh = await self._create(create_baremetal_host, resource_request)
+        bmh = await self._create(create_baremetal_host, resource_request, activity_queue)
 
         self._phase = "creating-nmstateconfig"
-        nmstate = await self._create(create_nmstate_config, resource_request)
+        nmstate = await self._create(create_nmstate_config, resource_request, activity_queue)
 
         # Step 5 — a stored object is not a registered host. Ironic still has
         # to reach the BMC, and a wrong address or credential shows up only
         # here, so the run does not claim success until it has.
         self._phase = "verifying-registration"
         await self._await_registration(
-            BmhRef(server_name=server.name, namespace=install_input.namespace)
+            BmhRef(server_name=server.name, namespace=install_input.namespace),
+            activity_queue,
         )
 
         self._phase = "completed"
@@ -421,17 +454,18 @@ class InstallServerWorkflow:
             bmh_registered=True,
         )
 
-    async def _create(self, activity_fn, request: BmhResourceRequest):
-        """Run one idempotent resource create on the server-lifecycle queue."""
+    async def _create(self, activity_fn, request: BmhResourceRequest, task_queue: str):
+        """Run one idempotent resource create on the target MCE's queue."""
         return await workflow.execute_activity(
             activity_fn,
             request,
-            task_queue=SERVER_LIFECYCLE_ACTIVITY_QUEUE,
+            task_queue=task_queue,
             start_to_close_timeout=_ACTIVITY_TIMEOUT,
+            schedule_to_start_timeout=_SCHEDULE_TO_START_TIMEOUT,
             retry_policy=_RETRY_POLICY,
         )
 
-    async def _await_registration(self, ref: BmhRef) -> None:
+    async def _await_registration(self, ref: BmhRef, task_queue: str) -> None:
         """Poll until Ironic has registered the host, or fail at the deadline."""
         started_at = workflow.now()
         errored_since = None
@@ -439,8 +473,9 @@ class InstallServerWorkflow:
             state = await workflow.execute_activity(
                 get_baremetal_host,
                 ref,
-                task_queue=SERVER_LIFECYCLE_ACTIVITY_QUEUE,
+                task_queue=task_queue,
                 start_to_close_timeout=_ACTIVITY_TIMEOUT,
+                schedule_to_start_timeout=_SCHEDULE_TO_START_TIMEOUT,
                 retry_policy=_RETRY_POLICY,
             )
             # An errored host is never registered, whatever state it sits in:

@@ -271,10 +271,17 @@ class InstallServerRunArgs(BaseModel):
 
 
 class InstallServerProgress(BaseModel):
-    """Returned by the workflow's `progress` query (surfaced by the status API)."""
+    """Returned by the workflow's `progress` query (surfaced by the status API).
+
+    `activity_queue` names the MCE-scoped queue this run's cluster writes go
+    to. It is what turns "the run is stuck" into "no server-lifecycle-worker is
+    polling this queue, so that MCE has none deployed or it cannot reach
+    Temporal".
+    """
 
     phase: str
     server_name: str | None = None
+    activity_queue: str | None = None
 
 
 class InstallServerResult(BaseModel):

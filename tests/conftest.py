@@ -39,6 +39,8 @@ os.environ.update(
         "DAY1_GIT_TOKEN": "test-git-token",
         "DHCP_EXCLUSION_OCTET_RANGES": '{"HC": [[1, 10], [241, 254]]}',
         # --- install-server: server-scan + BMC credentials ---
+        # Names this worker's queue; one deployment serves one MCE.
+        "MCE_CLUSTER": "ocp4-mce-test",
         "SERVER_SCAN_URL": "http://server-scan.test/api/v1",
         "SERVER_SCAN_API_TOKEN": "test-viewer-token",
         "DELL_BMC_USERNAME": "test-dell-user",

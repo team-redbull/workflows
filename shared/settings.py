@@ -185,6 +185,18 @@ class ServerLifecycleActivitySettings(BaseSettings):
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
+    # --- which MCE cluster this worker serves --------------------------------
+    # Names the activity queue this worker polls
+    # (`server-lifecycle-activity-<mce_cluster>`), so it must match the
+    # `mce_cluster` callers put in an install-server request — the same string
+    # the Segments Manager holds as that segment's `cluster_name`.
+    #
+    # Required, with no default, because a wrong value here is undetectable at
+    # runtime: the worker would serve installs meant for a different MCE and
+    # create their BareMetalHosts on this cluster, with both halves succeeding.
+    # ONE WORKER SERVES ONE MCE HUB; this is the field that says which.
+    mce_cluster: str
+
     # --- server-scan: the inventory platform --------------------------------
     # Base URL INCLUDING the /api/v1 prefix. The token needs server-scan's
     # VIEWER role only: /servers/available is a GET, and just its four mutation

@@ -39,7 +39,6 @@ vlanId: 23
 
 dhcp_values:
   network: "10.20.90.0"
-
   exclusions:
     - startAddress: "10.20.90.1"
       endAddress: "10.20.90.10"

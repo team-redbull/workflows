@@ -320,8 +320,7 @@
 vlanId: 23                        <span class="c">// audit only — no chart reads it</span>
 
 dhcp_values:
-  network: "10.20.90.0"           <span class="c">// mask stripped — the scope's identity</span>
-                                  <span class="c">// no startRange/endRange: the DHCP API derives .1-.253</span>
+  network: "10.20.90.0"           <span class="c">// mask stripped; no startRange/endRange — the DHCP API derives .1-.253</span>
   exclusions:                     <span class="c">// ascending — required by the DHCP API</span>
     - startAddress: "10.20.90.1"
       endAddress: "10.20.90.10"

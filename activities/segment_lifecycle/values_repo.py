@@ -89,9 +89,9 @@ dhcp_values:
 # Appended only when the type's policy defines exclusions. A type with none
 # leaves the key out entirely rather than writing an empty list: the block then
 # reads exactly like a hand-written minimal cluster file, and any exclusions a
-# site layer defines keep applying.
+# site layer defines keep applying. No blank line before "exclusions:" — it
+# stays a sibling of "network:" under dhcp_values, not a new section.
 _EXCLUSIONS_SECTION_TEMPLATE = """
-
   exclusions:
 {exclusions}"""
 

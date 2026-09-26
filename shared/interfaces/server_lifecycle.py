@@ -18,10 +18,13 @@ from temporalio import activity
 from shared.models.server_lifecycle import (
     AcquireServerRequest,
     AcquiredServer,
+    AgentRef,
+    AgentState,
     BmhRef,
     BmhResourceRequest,
     BmhState,
     CreatedResource,
+    TeardownResult,
 )
 
 
@@ -123,5 +126,67 @@ async def get_baremetal_host(ref: BmhRef) -> BmhState:
     loop owns the waiting. Candidate selection uses the same read to skip a
     server that is ALREADY installed — server-scan cannot report that, because
     nothing changes its lifecycle state until a cluster reports the node.
+    """
+    ...
+
+
+@activity.defn
+async def find_agent_for_host(ref: AgentRef) -> AgentState:
+    """Whether an Agent has registered for this host yet, matched by MAC.
+
+    THE SUCCESS SIGNAL of an install. An Agent exists because the host booted
+    the discovery ISO and reached assisted-service, which proves in one
+    observation what nothing earlier can: that the BMC accepted virtual media,
+    that the bond formed, that the VLAN was the right one and that DHCP
+    answered. A BareMetalHost Ironic has registered proves only that the BMC
+    answered — a host whose bond or VLAN is wrong registers perfectly well and
+    is then never heard from again.
+
+    Lists Agents in the namespace and matches
+    `status.inventory.interfaces[].macAddress` against the bond MACs, because
+    BMAC names an Agent after the host's inventory UUID and `agent.spec` holds
+    no back-reference to the BareMetalHost. Name-based matching would break.
+
+    Absent is NOT an error: found=False is the normal answer for most of the
+    wait, and the workflow's bounded timer owns the deadline. Errors are
+    classified as for every other cluster read — notably 403, so a missing
+    `list` verb on agents fails the run instead of looking like a host that
+    never booted.
+    """
+    ...
+
+
+@activity.defn
+async def teardown_bmh_resources(ref: BmhRef) -> TeardownResult:
+    """Remove one candidate's resources so the machine returns to the inventory.
+
+    Called when a host never produced an Agent, to roll that candidate back
+    before the next one is tried. Ordering is NOT arbitrary and was established
+    against a live cluster:
+
+      1. Annotate the BareMetalHost `baremetalhost.metal3.io/detached`. This has
+         to happen BEFORE the delete — metal3 honours the annotation during
+         normal reconcile, but once `deletionTimestamp` is set the host is on
+         the delete path and applying it then changes nothing (measured: no
+         effect after four minutes).
+      2. Delete the NMStateConfig. It has no finalizer and no ownerReference, so
+         nothing removes it implicitly and it goes immediately.
+      3. Delete the BareMetalHost, then wait, bounded.
+      4. If it still stands, drop the `baremetalhost.metal3.io` finalizer. Metal3
+         holds it while trying to deprovision through the BMC — and a rollback
+         happens exactly when that BMC never answered, so this is the expected
+         path here rather than an exceptional one. BMAC's own
+         `bmac.agent-install.openshift.io/deprovision` finalizer releases on its
+         own within a second and is left alone.
+      5. Confirm the Secret is gone. It carries an ownerReference to the
+         BareMetalHost, so the garbage collector takes it once the host really
+         goes — which is only after the finalizer clears. It is deleted
+         explicitly if it somehow outlives the host, because the alternative is
+         a credential left behind on every rollback.
+
+    Idempotent throughout: a resource already absent is success, which is what
+    lets Temporal retry this. Raises BmhTeardownError (retryable) only when
+    something is STILL there afterwards — the server must not be reported back
+    to the inventory while a BareMetalHost still points at it.
     """
     ...

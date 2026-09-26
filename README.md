@@ -133,10 +133,32 @@ and its **MCE cluster**. The run:
    installation that is not the one on the cluster. NIC names in the
    NMStateConfig are logical placeholders (`nic1`, `nic2`) bonded 802.3ad with
    the VLAN riding the bond.
-5. **verifying-registration** — a bounded poll. A stored BareMetalHost only
-   means the API server accepted it; a wrong BMC address or credential surfaces
-   nowhere but here. `registering` does NOT count: it is the state Metal3
-   assigns before contacting the BMC, and a host it cannot reach stays there.
+4. **awaiting-agent** — a bounded wait, **one hour**, for an **Agent** to
+   register for the host. This is the only observation that proves the install
+   worked: an Agent exists because the machine booted the discovery ISO and
+   reached assisted-service, so the BMC accepted virtual media, the bond formed,
+   the VLAN was right and DHCP answered. An hour because bare metal POSTs for
+   longer than a VM takes to boot. The Agent is matched by **bond MAC** — BMAC
+   names an Agent after the host's inventory UUID and its spec holds no
+   reference back to the BareMetalHost.
+5. **rolling-back** — no Agent by the deadline is that **candidate's** failure,
+   not the run's. The NMStateConfig and BareMetalHost are removed (the Secret
+   cascades off the host's ownerReference), which returns the machine to the
+   inventory, and the next candidate is tried from step 2. Only an exhausted
+   pool fails the run, as `AgentNeverAppearedError`.
+
+   Steps 2–5 are a **loop**, not a pipeline: a server cannot be shown to be
+   installable without creating its resources and watching what happens, so the
+   draw is a list of things to *try*. Teardown order is load-bearing — metal3
+   must be told to detach the host *before* the delete, or its finalizer blocks
+   forever trying to deprovision through the BMC that just failed to answer.
+
+   This replaced a 10-minute Ironic-registration deadline, which was the wrong
+   signal both ways: it passed hosts whose bond or VLAN was wrong (they register
+   fine, then never boot), and on an unreachable BMC metal3 reports
+   `registering` with operationalStatus OK and no errorType for as long as you
+   watch — 14 hours, measured — so only the deadline itself distinguished a dead
+   host from a slow one.
 
 Its id is `install-server-<infraEnv>` — the **candidate pool**, not the target
 pair, because the pool is `^ocp-<infraEnv>` with no MCE in it. Installs drawing

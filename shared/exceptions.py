@@ -276,13 +276,43 @@ class InvalidMacError(OrchestratorError):
     """
 
 
-class BmhNotRegisteredError(OrchestratorError):
-    """WORKFLOW-RAISED. The BareMetalHost never reached a registered state.
+class AgentNeverAppearedError(OrchestratorError):
+    """WORKFLOW-RAISED. No candidate the run drew ever registered an Agent.
 
-    Machine convergence with a real deadline: storing the object only means the
-    API server accepted it, while Ironic still has to reach the BMC. A wrong
-    BMC address or credential surfaces only here. The three resources are left
-    in place — they are what an operator needs to diagnose it.
+    The Agent CR is the success signal install-server waits on, and it is the
+    only one that proves the whole chain at once: an Agent exists because the
+    host booted the discovery ISO and reached assisted-service, which means the
+    BMC accepted virtual media, the bond came up, the VLAN was right and DHCP
+    answered. Nothing earlier proves any of that — a BareMetalHost Ironic has
+    "registered" only means the BMC answered, and a host whose bond or VLAN is
+    wrong registers perfectly and is never heard from again.
+
+    This replaced BmhNotRegisteredError, which deadlined on Ironic registration
+    instead. That signal was too weak in both directions: it passed hosts that
+    would never boot, and on an unreachable BMC Metal3 sits in `registering`
+    with operationalStatus OK and no errorType at all — observed for 14 hours
+    straight on a mock BMC — so there was nothing to distinguish a slow host
+    from a dead one except the deadline itself.
+
+    ONE candidate timing out is a skip, not this: its resources are torn down
+    and the next candidate is tried. This is what a run gets when EVERY
+    candidate was torn down again for want of an Agent.
+    """
+
+
+class BmhTeardownError(OrchestratorError):
+    """A rolled-back candidate's resources are still on the cluster.
+
+    RETRYABLE, and deliberately not classified permanent. The usual cause is
+    Metal3 still holding `baremetalhost.metal3.io` while it tries to deprovision
+    through a BMC that never answered, which is exactly the state a rollback
+    happens in — measured stuck past four minutes on a live cluster, with
+    BMAC's own finalizer released inside one second.
+
+    Raised only when the resources remain AFTER the teardown activity has done
+    everything it can, finalizer removal included. That distinction matters: the
+    server must not be reported back to the inventory while a BareMetalHost
+    still points at it, or another MCE will draw the same machine.
     """
 
 

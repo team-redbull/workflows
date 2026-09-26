@@ -39,7 +39,9 @@ from activities.server_lifecycle.activities import (
     create_baremetal_host,
     create_bmc_secret,
     create_nmstate_config,
+    find_agent_for_host,
     get_baremetal_host,
+    teardown_bmh_resources,
 )
 from shared.consts import server_lifecycle_activity_queue
 from shared.logging_config import configure_logging
@@ -68,7 +70,9 @@ async def main() -> None:
             create_bmc_secret,
             create_baremetal_host,
             create_nmstate_config,
+            find_agent_for_host,
             get_baremetal_host,
+            teardown_bmh_resources,
         ],
         # In-flight activities get this long to finish after shutdown starts
         # before being cancelled — keep it below the pod's

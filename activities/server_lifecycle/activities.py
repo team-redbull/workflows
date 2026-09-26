@@ -22,16 +22,24 @@ as the operator's did.
 
 from __future__ import annotations
 
+import asyncio
+
 from temporalio import activity
 
 from activities.server_lifecycle import cluster_api
 from activities.server_lifecycle.bmh_resources import (
+    AGENT_GROUP,
+    AGENT_PLURAL,
+    AGENT_VERSION,
+    BMH_DEPROVISION_FINALIZERS,
     BMH_GROUP,
     BMH_PLURAL,
     BMH_VERSION,
+    DETACHED_ANNOTATION,
     NMSTATE_GROUP,
     NMSTATE_PLURAL,
     NMSTATE_VERSION,
+    agent_matches_macs,
     baremetal_host_differences,
     build_baremetal_host,
     build_bmc_secret,
@@ -39,15 +47,18 @@ from activities.server_lifecycle.bmh_resources import (
     nmstate_config_differences,
 )
 from activities.server_lifecycle.server_scan import fetch_available_servers
-from shared.bmc_address import k8s_resource_name
-from shared.exceptions import BmcCredentialsMissingError
+from shared.bmc_address import k8s_resource_name, nmstate_config_name
+from shared.exceptions import BmcCredentialsMissingError, BmhTeardownError
 from shared.models.server_lifecycle import (
     AcquiredServer,
     AcquireServerRequest,
+    AgentRef,
+    AgentState,
     BmhRef,
     BmhResourceRequest,
     BmhState,
     CreatedResource,
+    TeardownResult,
 )
 from shared.settings import ServerLifecycleActivitySettings
 
@@ -55,6 +66,15 @@ _settings = ServerLifecycleActivitySettings()
 
 _BMH_KIND = "BareMetalHost"
 _NMSTATE_KIND = "NMStateConfig"
+_AGENT_KIND = "Agent"
+
+# How long teardown waits for the BareMetalHost to actually disappear after the
+# delete, before dropping the finalizer itself. Short on purpose: the object is
+# detached first, so a host metal3 can clean up goes almost at once, and one it
+# cannot is not going to become cleanable by waiting — measured stuck past four
+# minutes on an unreachable BMC.
+_TEARDOWN_GONE_TIMEOUT = 30.0
+_TEARDOWN_POLL_SECONDS = 3.0
 
 
 def _bmc_credentials(bmc_vendor: str) -> tuple[str, str]:
@@ -181,3 +201,170 @@ async def get_baremetal_host(ref: BmhRef) -> BmhState:
         error_type=status.get("errorType") or None,
         error_message=status.get("errorMessage") or None,
     )
+
+
+@activity.defn
+async def find_agent_for_host(ref: AgentRef) -> AgentState:
+    """Whether an Agent has registered for this host yet, matched by MAC."""
+    agents = await cluster_api.list_custom_objects(
+        group=AGENT_GROUP,
+        version=AGENT_VERSION,
+        plural=AGENT_PLURAL,
+        kind=_AGENT_KIND,
+        namespace=ref.namespace,
+    )
+    for agent in agents:
+        if not agent_matches_macs(agent, ref.macs):
+            continue
+        name = (agent.get("metadata") or {}).get("name")
+        activity.logger.info(
+            "Agent %s registered for MACs %s in %s", name, ref.macs, ref.namespace
+        )
+        return AgentState(
+            found=True,
+            name=name,
+            approved=(agent.get("spec") or {}).get("approved"),
+        )
+    activity.logger.info(
+        "No Agent yet for MACs %s in %s (%d agent(s) in the namespace)",
+        ref.macs,
+        ref.namespace,
+        len(agents),
+    )
+    return AgentState(found=False)
+
+
+async def _bmh_is_gone(namespace: str, name: str) -> bool:
+    """Whether the BareMetalHost object has actually left the API server.
+
+    Not the same question as "was the delete accepted": a deleted host sits
+    there with a `deletionTimestamp` for as long as any controller holds a
+    finalizer on it.
+    """
+    return (
+        await cluster_api.read_custom_object(
+            group=BMH_GROUP,
+            version=BMH_VERSION,
+            plural=BMH_PLURAL,
+            kind=_BMH_KIND,
+            namespace=namespace,
+            name=name,
+        )
+        is None
+    )
+
+
+@activity.defn
+async def teardown_bmh_resources(ref: BmhRef) -> TeardownResult:
+    """Remove one candidate's resources so the machine returns to the inventory.
+
+    The ordering here was established against a live cluster and is load-bearing
+    at every step — see the contract in shared/interfaces/server_lifecycle.py.
+    """
+    namespace = ref.namespace
+    bmh_name = k8s_resource_name(ref.server_name)
+    removed: list[str] = []
+
+    # 0. Which Secret this host references, read from the host itself while it
+    #    still exists. Not rebuilt from the vendor: a BmhRef carries no vendor,
+    #    and the host's own `credentialsName` is authoritative anyway — it
+    #    stays correct for a Secret an operator renamed by hand.
+    existing = await cluster_api.read_custom_object(
+        group=BMH_GROUP,
+        version=BMH_VERSION,
+        plural=BMH_PLURAL,
+        kind=_BMH_KIND,
+        namespace=namespace,
+        name=bmh_name,
+    )
+    secret_name = (
+        ((existing or {}).get("spec") or {}).get("bmc") or {}
+    ).get("credentialsName")
+
+    # 1. Detach FIRST. After `deletionTimestamp` is set this annotation does
+    #    nothing, so ordering is the whole point of doing it here.
+    if await cluster_api.annotate_custom_object(
+        group=BMH_GROUP,
+        version=BMH_VERSION,
+        plural=BMH_PLURAL,
+        kind=_BMH_KIND,
+        namespace=namespace,
+        name=bmh_name,
+        annotations={DETACHED_ANNOTATION: ""},
+    ):
+        activity.logger.info("Detached BareMetalHost %s before deleting it", bmh_name)
+
+    # 2. The NMStateConfig: no finalizer, no ownerReference, so nothing else
+    #    removes it and it goes immediately.
+    nmstate_name = nmstate_config_name(ref.server_name)
+    if await cluster_api.delete_custom_object(
+        group=NMSTATE_GROUP,
+        version=NMSTATE_VERSION,
+        plural=NMSTATE_PLURAL,
+        kind=_NMSTATE_KIND,
+        namespace=namespace,
+        name=nmstate_name,
+    ):
+        removed.append(f"{_NMSTATE_KIND}/{nmstate_name}")
+
+    # 3. The host itself, then wait for it to really go.
+    if await cluster_api.delete_custom_object(
+        group=BMH_GROUP,
+        version=BMH_VERSION,
+        plural=BMH_PLURAL,
+        kind=_BMH_KIND,
+        namespace=namespace,
+        name=bmh_name,
+    ):
+        removed.append(f"{_BMH_KIND}/{bmh_name}")
+
+    waited = 0.0
+    while waited < _TEARDOWN_GONE_TIMEOUT:
+        if await _bmh_is_gone(namespace, bmh_name):
+            break
+        await asyncio.sleep(_TEARDOWN_POLL_SECONDS)
+        waited += _TEARDOWN_POLL_SECONDS
+
+    # 4. Still there means a finalizer is held. Expected here rather than
+    #    exceptional: metal3 is trying to deprovision through a BMC that never
+    #    answered, which is why this candidate is being rolled back at all.
+    finalizers_cleared = False
+    if not await _bmh_is_gone(namespace, bmh_name):
+        activity.logger.warning(
+            "BareMetalHost %s still present %.0fs after delete — dropping %s",
+            bmh_name,
+            waited,
+            sorted(BMH_DEPROVISION_FINALIZERS),
+        )
+        finalizers_cleared = await cluster_api.clear_custom_object_finalizers(
+            group=BMH_GROUP,
+            version=BMH_VERSION,
+            plural=BMH_PLURAL,
+            kind=_BMH_KIND,
+            namespace=namespace,
+            name=bmh_name,
+            finalizers=BMH_DEPROVISION_FINALIZERS,
+        )
+
+    # 5. The Secret normally cascades off the host's ownerReference, but only
+    #    once the host is really gone. Deleted explicitly when it outlives it,
+    #    because the alternative is a BMC credential left behind per rollback.
+    if secret_name and await cluster_api.secret_exists(namespace, secret_name):
+        if await cluster_api.delete_secret_if_present(namespace, secret_name):
+            removed.append(f"Secret/{secret_name}")
+
+    if not await _bmh_is_gone(namespace, bmh_name):
+        raise BmhTeardownError(
+            f"BareMetalHost {bmh_name} is still on the cluster in {namespace} "
+            f"after detach, delete and finalizer removal. The server is NOT "
+            f"being returned to the inventory while a BareMetalHost still points "
+            f"at it"
+        )
+
+    activity.logger.info(
+        "Rolled back %s: removed %s%s",
+        ref.server_name,
+        removed or ["nothing (already absent)"],
+        " (finalizer dropped)" if finalizers_cleared else "",
+    )
+    return TeardownResult(removed=removed, finalizers_cleared=finalizers_cleared)

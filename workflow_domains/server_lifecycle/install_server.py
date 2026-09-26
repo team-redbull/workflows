@@ -25,10 +25,24 @@ Shape of the run:
   3. creating-secret
      creating-baremetalhost
      creating-nmstateconfig  — all idempotent; an existing resource is success.
-  4. verifying-registration — a BOUNDED poll. Storing the BareMetalHost only
-                           means the API server accepted it; Ironic still has
-                           to reach the BMC, and a wrong address or credential
-                           surfaces nowhere else.
+  4. awaiting-agent      — a BOUNDED wait for an AGENT to register for the
+                           host, which is the only observation that proves the
+                           install worked: an Agent exists because the machine
+                           booted the discovery ISO and reached
+                           assisted-service, so the BMC accepted virtual media,
+                           the bond formed, the VLAN was right and DHCP
+                           answered. An hour, because bare metal POSTs for
+                           longer than a VM takes to boot.
+  5. rolling-back        — no Agent by the deadline is that CANDIDATE's
+                           failure, not the run's: the NMStateConfig and
+                           BareMetalHost are removed, which returns the machine
+                           to the inventory, and the next candidate is tried
+                           from step 2.
+
+Steps 2-5 are therefore a LOOP, not a pipeline. A candidate cannot be shown to
+be installable without creating its resources and watching what happens, so the
+draw is a list of things to TRY rather than to validate, and an hour-deep
+failure is a skip like any other. The run fails only when nothing is left.
 
 THE VLAN IS RESOLVED INSIDE SELECTION, not before it. An MCE's inventory
 network is really up to TWO networks, split by how a server's BMC is driven:
@@ -60,17 +74,27 @@ same string. If no worker polls that queue the run waits rather than acting,
 and the `progress` query names the queue so it reads as "that MCE has no
 worker" instead of "the run is stuck".
 
-On cancellation there is deliberately no compensating cleanup: the three
-resources are idempotent, so a re-run converges on them, and a half-created set
-is what an operator needs in order to see how far the run got. Removing a
-server is a separate uninstall-server workflow, not a rollback of this one.
+TEARDOWN IS PART OF THE LOOP, NOT A CANCELLATION HANDLER. A candidate that
+never produced an Agent is rolled back because the run intends to try another
+machine, and leaving a BareMetalHost behind would make that machine undrawable
+here and invisible to every other MCE — server-scan reports it unclaimed until
+a cluster reports the node, so nothing else would notice. On CANCELLATION there
+is still deliberately no compensating cleanup: the three resources are
+idempotent, so a re-run converges on them, and a half-created set is what an
+operator needs in order to see how far the run got. Removing a SUCCESSFULLY
+installed server remains a separate uninstall-server workflow.
+
+The teardown order is load-bearing and was established against a live cluster:
+metal3 must be told to detach the host BEFORE the delete, or its
+`baremetalhost.metal3.io` finalizer blocks forever trying to deprovision
+through the BMC that just failed to answer. See teardown_bmh_resources.
 """
 
 from __future__ import annotations
 
 import re
 from collections.abc import Awaitable, Callable
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
@@ -94,7 +118,7 @@ with workflow.unsafe.imports_passed_through():
         BmcCredentialsMissingError,
         BmcEndpointMissingError,
         BmhConflictError,
-        BmhNotRegisteredError,
+        AgentNeverAppearedError,
         BmhPrerequisiteMissingError,
         BmhRequestInvalidError,
         InvalidMacError,
@@ -119,11 +143,15 @@ with workflow.unsafe.imports_passed_through():
         create_baremetal_host,
         create_bmc_secret,
         create_nmstate_config,
+        find_agent_for_host,
         get_baremetal_host,
+        teardown_bmh_resources,
     )
     from shared.models.server_lifecycle import (
         AcquiredServer,
         AcquireServerRequest,
+        AgentRef,
+        AgentState,
         BmhRef,
         BmhResourceRequest,
         BmhState,
@@ -132,6 +160,7 @@ with workflow.unsafe.imports_passed_through():
         InstallServerProgress,
         InstallServerResult,
         InstallServerRunArgs,
+        TeardownResult,
         mac_is_valid,
     )
     from workflow_domains.server_lifecycle.bond_selection import (
@@ -185,41 +214,27 @@ _RETRY_POLICY = RetryPolicy(
 # than a failed run.
 _SCHEDULE_TO_START_TIMEOUT = timedelta(minutes=5)
 
-# Registration is MACHINE convergence — Ironic reaching the BMC — so the wait
-# gets a real deadline and fails loudly, exactly as allocate-segment's DHCP
-# scope poll does. A host that has not registered in 10 minutes has a bad BMC
-# address or credential, not a slow one. Changing either constant is a
-# non-deterministic change for in-flight runs.
-_BMH_POLL_INTERVAL = timedelta(seconds=15)
-_BMH_REGISTRATION_DEADLINE = timedelta(minutes=10)
-
-# How long a registration error is tolerated before the run gives up on it.
-# Metal3 retries registration itself, so a single observation can be a BMC
-# that was briefly busy; an error still standing after this has a cause no
-# amount of further waiting fixes.
-_BMH_REGISTRATION_ERROR_GRACE = timedelta(minutes=2)
-
-# States that mean Ironic has FINISHED registering the host — it reached the
-# BMC, authenticated, and moved on.
+# THE SUCCESS SIGNAL, on a bare-metal-shaped deadline. An Agent appears only
+# once the host has POSTed, booted the discovery ISO and reached
+# assisted-service; on real hardware POST alone outlasts a VM's entire boot, so
+# the wait is an hour. Decided with the operator, 2026-09-27.
 #
-# `registering` is deliberately NOT here. It is the state Metal3 assigns the
-# moment it picks the host up, before contacting the BMC at all, and a host
-# whose BMC address or credential is wrong STAYS in it — so accepting it would
-# make this poll return on its first iteration for exactly the failure the
-# poll exists to catch. `inspecting` is included because inspection is
-# disabled on these hosts, so it is passed through rather than settled in, and
-# reaching it already proves the BMC was contacted.
-_REGISTERED_STATES = frozenset(
-    {
-        "inspecting",
-        "preparing",
-        "available",
-        "ready",
-        "provisioning",
-        "provisioned",
-        "externally provisioned",
-    }
-)
+# This replaced a 10-minute Ironic-registration deadline, which was the wrong
+# signal in both directions. It PASSED hosts that would never boot — a host
+# whose bond or VLAN is wrong registers perfectly and is then never heard from
+# again — and it could not recognise a dead one: on an unreachable BMC metal3
+# reports provisioning state `registering` with operationalStatus OK and no
+# errorType at all, observed unchanged for 14 hours on a live cluster. So
+# nothing but the deadline itself ever distinguished a slow host from a dead
+# one, while the Agent distinguishes them by existing.
+#
+# MACHINE convergence still, so still a real deadline — but reaching it is a
+# CANDIDATE's failure, not the run's: the resources are torn down, the machine
+# goes back to the inventory and the next candidate is tried.
+#
+# Changing either constant is a non-deterministic change for in-flight runs.
+_AGENT_DEADLINE = timedelta(hours=1)
+_AGENT_POLL_INTERVAL = timedelta(seconds=30)
 
 # The server-scan health verdict this workflow accepts. Deliberately only the
 # top tier: the endpoint would otherwise fill HEALTHY, then WARNING, then MAJOR.
@@ -276,6 +291,7 @@ _REJECTION_TYPE = {
     "no-bmc-host": BmcEndpointMissingError,
     "bad-mac": InvalidMacError,
     "no-inventory-segment": InventorySegmentNotFoundError,
+    "no-agent": AgentNeverAppearedError,
 }
 
 _REJECTION_SUMMARY = {
@@ -307,6 +323,14 @@ _REJECTION_SUMMARY = {
         "need an inventory network this MCE does not have allocated. An MCE "
         "holds one segment per BMC protocol class, and only the classes it "
         "serves — allocate the missing one in the Segments Manager"
+    ),
+    "no-agent": (
+        "were installed and never registered an Agent before the deadline, so "
+        "each was rolled back and its machine returned to the inventory. An "
+        "Agent appears once the host boots the discovery ISO and reaches "
+        "assisted-service, so what failed is DOWNSTREAM of the BareMetalHost — "
+        "the BMC, the bond, the VLAN, or DHCP on that inventory segment. Each "
+        "entry below says which of those the host's own state points at"
     ),
 }
 
@@ -362,6 +386,34 @@ def _describe_bmh_state(state: BmhState) -> str:
     )
 
 
+def _describe_no_agent(server_name: str, state: BmhState | None) -> str:
+    """Why one candidate is believed to have failed, for the rejection group.
+
+    The BareMetalHost's own state cannot say an install SUCCEEDED — that is the
+    whole reason this workflow waits on an Agent instead — but it is decisive
+    about where a failure lies. Ironic reporting a registration error means the
+    BMC was never reached, which is an address or a credential. Ironic content
+    with the host while no Agent ever appeared means the opposite: the BMC
+    worked and the host was told to boot, so the fault is on the wire — the
+    bond, the VLAN, or DHCP on that inventory segment.
+    """
+    minutes = int(_AGENT_DEADLINE.total_seconds() // 60)
+    if state is not None and state.is_registration_error():
+        return (
+            f"{server_name} (no Agent in {minutes} min, and Ironic never "
+            f"registered the host: errorType {state.error_type!r}"
+            f"{f' — {state.error_message}' if state.error_message else ''}. "
+            f"The BMC address or credential is the place to look)"
+        )
+    observed = _describe_bmh_state(state) if state is not None else "not observed"
+    return (
+        f"{server_name} (no Agent in {minutes} min; {observed}. Ironic raised no "
+        f"registration error, so the BMC answered and the host was driven to "
+        f"boot — look at the bond, the VLAN and DHCP on this segment, not at "
+        f"the BMC)"
+    )
+
+
 @workflow.defn
 class InstallServerWorkflow:
     def __init__(self) -> None:
@@ -387,6 +439,7 @@ class InstallServerWorkflow:
     async def run(self, run_args: InstallServerRunArgs) -> InstallServerResult:
         install_input = run_args.input
         infra_env = install_input.infra_env
+        namespace = install_input.namespace
         # The MCE this run writes to. Everything that touches the target
         # cluster goes to this queue, and only the worker inside that MCE
         # polls it.
@@ -413,174 +466,214 @@ class InstallServerWorkflow:
             retry_policy=_RETRY_POLICY,
         )
 
-        # Step 2 — the first candidate that can actually be installed, and the
-        # inventory VLAN it needs. The VLAN is resolved HERE, not up front,
-        # because it depends on the chosen server: an MCE's inventory network
-        # is split by BMC protocol class, so which segment applies is not known
-        # until a machine is picked.
-        self._phase = "selecting-server"
-        server, bond_members, segment = await self._select_candidate(
-            install_input.server_name,
-            infra_env,
-            install_input.namespace,
-            install_input.mce_cluster,
-            candidates,
-            activity_queue,
-        )
-        self._server_name = server.name
+        # Step 2 — INSTALL ONE CANDIDATE AT A TIME, all the way to an Agent,
+        # and roll it back if it never produces one.
+        #
+        # The draw is not a list of things to validate, it is a list of things
+        # to TRY: the only proof a server is installable is a host that booted
+        # and reached assisted-service, and that cannot be established without
+        # creating its resources first. So each candidate gets the full
+        # sequence, and a candidate that fails at the end is torn down — which
+        # returns the machine to the inventory — before the next is tried.
+        #
+        # That is why every rejection below, including one an hour deep, is a
+        # SKIP: the run fails only once nothing is left to try.
+        rejections: list[tuple[str, str]] = []
+        # One lookup per BMC protocol class, at most two per run, shared across
+        # candidates rather than repeated per candidate.
+        segments: dict[SegmentType, InventorySegmentLookup] = {}
+        attempts = 0
 
-        resource_request = BmhResourceRequest(
-            server_name=server.name,
-            namespace=install_input.namespace,
-            infra_env=infra_env,
-            # Narrowed by the selection: an unusable vendor is a rejection
-            # reason, so a chosen candidate always has one.
-            bmc_vendor=str(server.bmc_vendor),
-            bmc=server.bmc,
-            bond_members=bond_members,
-            vlan_id=segment.vlan_id,
-            labels=install_input.labels,
-        )
+        for candidate in candidates:
+            self._phase = "selecting-server"
+            evaluated = await self._evaluate_candidate(
+                candidate,
+                install_input.server_name,
+                namespace,
+                install_input.mce_cluster,
+                activity_queue,
+                segments,
+                rejections,
+            )
+            if evaluated is None:
+                continue
+            bond_members, segment = evaluated
 
-        # Step 3 — the three resources, in dependency order: the BareMetalHost
-        # references the Secret by name, so the Secret goes first. Each create
-        # treats "already exists" as success, which is what makes the whole run
-        # re-runnable.
-        self._phase = "creating-secret"
-        secret = await self._create(create_bmc_secret, resource_request, activity_queue)
+            attempts += 1
+            self._server_name = candidate.name
+            resource_request = BmhResourceRequest(
+                server_name=candidate.name,
+                namespace=namespace,
+                infra_env=infra_env,
+                # Narrowed by the evaluation: an unusable vendor is a rejection
+                # reason, so a candidate that gets here always has one.
+                bmc_vendor=str(candidate.bmc_vendor),
+                bmc=candidate.bmc,
+                bond_members=bond_members,
+                vlan_id=segment.vlan_id,
+                labels=install_input.labels,
+            )
 
-        self._phase = "creating-baremetalhost"
-        bmh = await self._create(create_baremetal_host, resource_request, activity_queue)
+            # Step 3 — the three resources, in dependency order: the
+            # BareMetalHost references the Secret by name, so the Secret goes
+            # first. Each create treats "already exists" as success, which is
+            # what makes the whole run re-runnable.
+            self._phase = "creating-secret"
+            secret = await self._create(
+                create_bmc_secret, resource_request, activity_queue
+            )
 
-        self._phase = "creating-nmstateconfig"
-        nmstate = await self._create(
-            create_nmstate_config, resource_request, activity_queue
-        )
+            self._phase = "creating-baremetalhost"
+            bmh = await self._create(
+                create_baremetal_host, resource_request, activity_queue
+            )
 
-        # Step 4 — a stored object is not a registered host. Ironic still has
-        # to reach the BMC, and a wrong address or credential shows up only
-        # here, so the run does not claim success until it has.
-        self._phase = "verifying-registration"
-        await self._await_registration(
-            BmhRef(server_name=server.name, namespace=install_input.namespace),
-            activity_queue,
-        )
+            self._phase = "creating-nmstateconfig"
+            nmstate = await self._create(
+                create_nmstate_config, resource_request, activity_queue
+            )
 
-        self._phase = "completed"
-        workflow.logger.info(
-            "Server %s installed into InfraEnv %s (vlan=%d, bond=%s)",
-            server.name,
-            infra_env,
-            segment.vlan_id,
-            [member.mac for member in bond_members],
-        )
-        return InstallServerResult(
-            server_id=server.id,
-            server_name=server.name,
-            infra_env=infra_env,
-            namespace=resource_request.namespace,
-            mce_cluster=install_input.mce_cluster,
-            vlan_id=segment.vlan_id,
-            bmc_vendor=resource_request.bmc_vendor,
-            bmc_address=build_bmc_address(resource_request.bmc_vendor, server.bmc),
-            bond_macs=[member.mac for member in bond_members],
-            boot_mac=bond_members[0].mac,
-            resources_changed=any(
-                resource.changed for resource in (secret, bmh, nmstate)
-            ),
-            bmh_registered=True,
-        )
+            # Step 4 — wait for the host to actually come up. An Agent existing
+            # is the only observation that proves the BMC accepted virtual
+            # media, the bond formed, the VLAN was right and DHCP answered.
+            self._phase = "awaiting-agent"
+            bmh_ref = BmhRef(server_name=candidate.name, namespace=namespace)
+            agent, last_state = await self._await_agent(
+                bmh_ref, [member.mac for member in bond_members], activity_queue
+            )
 
-    async def _select_candidate(
+            if agent.found:
+                self._phase = "completed"
+                workflow.logger.info(
+                    "Server %s installed into InfraEnv %s as Agent %s "
+                    "(vlan=%d, bond=%s, attempt %d)",
+                    candidate.name,
+                    infra_env,
+                    agent.name,
+                    segment.vlan_id,
+                    [member.mac for member in bond_members],
+                    attempts,
+                )
+                return InstallServerResult(
+                    server_id=candidate.id,
+                    server_name=candidate.name,
+                    infra_env=infra_env,
+                    namespace=namespace,
+                    mce_cluster=install_input.mce_cluster,
+                    vlan_id=segment.vlan_id,
+                    bmc_vendor=resource_request.bmc_vendor,
+                    bmc_address=build_bmc_address(
+                        resource_request.bmc_vendor, candidate.bmc
+                    ),
+                    bond_macs=[member.mac for member in bond_members],
+                    boot_mac=bond_members[0].mac,
+                    resources_changed=any(
+                        resource.changed for resource in (secret, bmh, nmstate)
+                    ),
+                    # An Agent cannot exist unless Ironic registered the host
+                    # and drove it through a boot, so this is implied rather
+                    # than separately observed.
+                    bmh_registered=True,
+                    agent_name=agent.name,
+                    attempts=attempts,
+                )
+
+            # No Agent. Take the machine back out of this MCE before trying
+            # another — a BareMetalHost left pointing at it would make the same
+            # server undrawable, and on another MCE, invisible.
+            self._phase = "rolling-back"
+            teardown = await self._teardown(bmh_ref, activity_queue)
+            workflow.logger.warning(
+                "Rolled back %s after no Agent in %s: removed %s",
+                candidate.name,
+                _AGENT_DEADLINE,
+                teardown.removed or "nothing (already absent)",
+            )
+            rejections.append(
+                ("no-agent", _describe_no_agent(candidate.name, last_state))
+            )
+
+        raise _no_installable_candidate(infra_env, namespace, candidates, rejections)
+
+    async def _evaluate_candidate(
         self,
+        candidate: AcquiredServer,
         requested_name: str | None,
-        infra_env: str,
         namespace: str,
         mce_cluster: str,
-        candidates: list[AcquiredServer],
         task_queue: str,
-    ) -> tuple[AcquiredServer, list[BondMember], SegmentEntry]:
-        """The first candidate that can be installed, with its inventory VLAN.
+        segments: dict[SegmentType, InventorySegmentLookup],
+        rejections: list[tuple[str, str]],
+    ) -> tuple[list[BondMember], SegmentEntry] | None:
+        """One candidate's bond and VLAN, or None with a reason recorded.
 
-        EVERY reason a candidate cannot be installed is a skip here, not a
-        failure. The draw exists so one unusable server is a retry rather than a
-        failed run, and a reason handled outside this loop would silently break
+        EVERY reason a candidate cannot be installed is a skip, not a failure.
+        The draw exists so one unusable server is a retry rather than a failed
+        run, and a reason handled outside this function would silently break
         that promise: a pool of three would die on a STANDALONE machine at the
-        front while two installable servers sat behind it. When nothing
-        survives, the reasons are reported together and the failure takes the
-        specific type if they all agree — which they do whenever a server was
-        named explicitly, since that pool holds one.
+        front while two installable servers sat behind it.
 
         Why an already-installed candidate has to be skipped at all: server-scan
         reports a machine as unclaimed until a CLUSTER reports the node, minutes
         after this workflow finishes. A second run started in that window draws
         the same machine, every create answers "already exists", and the run
-        reports success having added nothing.
+        would report success having added nothing.
         """
-        rejections: list[tuple[str, str]] = []
-        # One lookup per BMC protocol class, at most two per run, and none at
-        # all for a draw whose candidates are all rejected before this point.
-        segments: dict[SegmentType, InventorySegmentLookup] = {}
+        described = describe_candidate(candidate)
 
-        for candidate in candidates:
-            described = describe_candidate(candidate)
+        # Checked before the name is used anywhere: every read and every
+        # create derives a Kubernetes object name from it.
+        if not is_k8s_resource_name(candidate.name):
+            rejections.append(("unnameable", candidate.name))
+            return None
 
-            # Checked before the name is used anywhere: every read and every
-            # create derives a Kubernetes object name from it.
-            if not is_k8s_resource_name(candidate.name):
-                rejections.append(("unnameable", candidate.name))
-                continue
+        vendor = candidate.bmc_vendor
+        if vendor is None or vendor.upper() not in BMC_VENDORS:
+            rejections.append(
+                ("unknown-bmc-vendor", f"{candidate.name} (bmc_vendor={vendor!r})")
+            )
+            return None
 
-            vendor = candidate.bmc_vendor
-            if vendor is None or vendor.upper() not in BMC_VENDORS:
-                rejections.append(
-                    ("unknown-bmc-vendor", f"{candidate.name} (bmc_vendor={vendor!r})")
-                )
-                continue
+        if not candidate.bmc.host.strip("[] "):
+            rejections.append(("no-bmc-host", candidate.name))
+            return None
 
-            if not candidate.bmc.host.strip("[] "):
-                rejections.append(("no-bmc-host", candidate.name))
-                continue
+        members = select_bond_members(candidate)
+        if members is None:
+            rejections.append(("no-bond", described))
+            return None
 
-            members = select_bond_members(candidate)
-            if members is None:
-                rejections.append(("no-bond", described))
-                continue
+        bad = [m.mac for m in members if not mac_is_valid(m.mac)]
+        if bad:
+            rejections.append(("bad-mac", f"{candidate.name} {bad}"))
+            return None
 
-            bad = [m.mac for m in members if not mac_is_valid(m.mac)]
-            if bad:
-                rejections.append(("bad-mac", f"{candidate.name} {bad}"))
-                continue
+        # The inventory network this machine's BMC is reachable on. An MCE
+        # holds one segment per protocol class and only the classes it serves,
+        # so a UCS blade on a Redfish-only MCE is passed over here.
+        segment_type = _INVENTORY_TYPE_BY_DRIVER_CLASS[bmc_driver_class(vendor)]
+        if segment_type not in segments:
+            segments[segment_type] = await self._inventory_segment(
+                mce_cluster, segment_type
+            )
+        lookup = segments[segment_type]
+        if not lookup.found or lookup.entry is None:
+            rejections.append(
+                ("no-inventory-segment", f"{candidate.name} needs {segment_type.value}")
+            )
+            return None
 
-            # The inventory network this machine's BMC is reachable on. An MCE
-            # holds one segment per protocol class and only the classes it
-            # serves, so a UCS blade on a Redfish-only MCE is passed over here.
-            segment_type = _INVENTORY_TYPE_BY_DRIVER_CLASS[bmc_driver_class(vendor)]
-            if segment_type not in segments:
-                segments[segment_type] = await self._inventory_segment(
-                    mce_cluster, segment_type
-                )
-            lookup = segments[segment_type]
-            if not lookup.found or lookup.entry is None:
-                rejections.append(
-                    ("no-inventory-segment", f"{candidate.name} needs {segment_type.value}")
-                )
-                continue
+        # An explicitly named server is a request to converge THAT machine, so
+        # it is never skipped — only an unnamed draw from a pool is.
+        if requested_name is None:
+            existing = await self._read_bmh(
+                BmhRef(server_name=candidate.name, namespace=namespace), task_queue
+            )
+            if existing.found:
+                rejections.append(("already-installed", candidate.name))
+                return None
 
-            # An explicitly named server is a request to converge THAT machine,
-            # so it is never skipped — only an unnamed draw from a pool is.
-            if requested_name is None:
-                existing = await self._read_bmh(
-                    BmhRef(server_name=candidate.name, namespace=namespace),
-                    task_queue,
-                )
-                if existing.found:
-                    rejections.append(("already-installed", candidate.name))
-                    continue
-
-            return candidate, members, lookup.entry
-
-        raise _no_installable_candidate(infra_env, namespace, candidates, rejections)
+        return members, lookup.entry
 
     async def _inventory_segment(
         self, mce_cluster: str, segment_type: SegmentType
@@ -646,49 +739,48 @@ class InstallServerWorkflow:
             retry_policy=_RETRY_POLICY,
         )
 
-    async def _await_registration(self, ref: BmhRef, task_queue: str) -> None:
-        """Poll until Ironic has registered the host, or fail at the deadline."""
+    async def _await_agent(
+        self, ref: BmhRef, macs: list[str], task_queue: str
+    ) -> tuple[AgentState, BmhState | None]:
+        """Wait for an Agent to register for this host, bounded by the deadline.
+
+        Returns the Agent as soon as one appears. On the deadline it returns the
+        empty result plus ONE read of the BareMetalHost — the host's own view of
+        itself is worthless as a success signal but is exactly what separates a
+        BMC that was never reached from a bond, VLAN or DHCP scope that did not
+        work, which is the difference between two very different investigations.
+        """
         started_at = workflow.now()
-        errored_since: datetime | None = None
+        agent_ref = AgentRef(namespace=ref.namespace, macs=macs)
         while True:
-            state = await self._read_bmh(ref, task_queue)
-            # An errored host is never registered, whatever state it sits in:
-            # Metal3 reports a failed registration as `registering` plus
-            # operationalStatus=error, so the state alone cannot tell the two
-            # apart.
-            if (
-                state.found
-                and not state.is_errored()
-                and (state.provisioning_state or "").lower() in _REGISTERED_STATES
-            ):
-                return
+            agent = await workflow.execute_activity(
+                find_agent_for_host,
+                agent_ref,
+                task_queue=task_queue,
+                start_to_close_timeout=_ACTIVITY_TIMEOUT,
+                schedule_to_start_timeout=_SCHEDULE_TO_START_TIMEOUT,
+                retry_policy=_RETRY_POLICY,
+            )
+            if agent.found:
+                return agent, None
+            if workflow.now() - started_at >= _AGENT_DEADLINE:
+                return agent, await self._read_bmh(ref, task_queue)
+            await workflow.sleep(_AGENT_POLL_INTERVAL)  # durable, replay-safe
 
-            # Fail on a registration error that has stopped being transient,
-            # rather than spending the rest of the deadline re-reading it.
-            if state.is_registration_error():
-                errored_since = errored_since or workflow.now()
-                if workflow.now() - errored_since >= _BMH_REGISTRATION_ERROR_GRACE:
-                    raise ApplicationError(
-                        f"Ironic cannot register BareMetalHost "
-                        f"{ref.server_name}: errorType {state.error_type!r}"
-                        f"{f' — {state.error_message}' if state.error_message else ''}. "
-                        "That is a wrong BMC address, a wrong credential, or a "
-                        "BMC this cluster cannot reach — none of which clear on "
-                        "their own. The Secret, BareMetalHost and NMStateConfig "
-                        "stand for inspection",
-                        type=BmhNotRegisteredError.__name__,
-                    )
-            else:
-                errored_since = None
+    async def _teardown(self, ref: BmhRef, task_queue: str) -> TeardownResult:
+        """Roll one candidate back so its machine returns to the inventory.
 
-            if workflow.now() - started_at >= _BMH_REGISTRATION_DEADLINE:
-                raise ApplicationError(
-                    f"BareMetalHost {ref.server_name} did not register within "
-                    f"{int(_BMH_REGISTRATION_DEADLINE.total_seconds() // 60)} "
-                    f"minutes: {_describe_bmh_state(state)}. The Secret, "
-                    "BareMetalHost and NMStateConfig stand — check the BMC "
-                    "address and credentials, and Ironic's reachability of that "
-                    "BMC",
-                    type=BmhNotRegisteredError.__name__,
-                )
-            await workflow.sleep(_BMH_POLL_INTERVAL)  # durable, replay-safe timer
+        Retried like any other activity, and that matters more here than
+        elsewhere: the usual reason teardown does not finish is metal3 holding
+        its finalizer while it tries to deprovision through the BMC that just
+        failed to answer, which is a state the activity is built to break out of
+        but should still be allowed to retry into.
+        """
+        return await workflow.execute_activity(
+            teardown_bmh_resources,
+            ref,
+            task_queue=task_queue,
+            start_to_close_timeout=_ACTIVITY_TIMEOUT,
+            schedule_to_start_timeout=_SCHEDULE_TO_START_TIMEOUT,
+            retry_policy=_RETRY_POLICY,
+        )

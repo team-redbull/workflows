@@ -19,6 +19,7 @@ duplicated by it.
 from __future__ import annotations
 
 import base64
+from collections.abc import Iterable
 from typing import Any
 
 from shared.bmc_address import (
@@ -37,6 +38,28 @@ BMH_PLURAL = "baremetalhosts"
 NMSTATE_GROUP = "agent-install.openshift.io"
 NMSTATE_VERSION = "v1beta1"
 NMSTATE_PLURAL = "nmstateconfigs"
+
+AGENT_GROUP = "agent-install.openshift.io"
+AGENT_VERSION = "v1beta1"
+AGENT_PLURAL = "agents"
+
+# Tells metal3 to stop managing a host WITHOUT deprovisioning it. A teardown
+# sets this before deleting, because deprovisioning talks to the BMC and a
+# rollback happens precisely when that BMC never answered.
+#
+# IT MUST BE SET BEFORE THE DELETE. Measured on a live cluster: applied after
+# `deletionTimestamp` was already set, it changed nothing for four minutes —
+# metal3 honours it while reconciling a live host, not while draining a dying
+# one.
+DETACHED_ANNOTATION = "baremetalhost.metal3.io/detached"
+
+# The finalizer a teardown may have to drop itself, and ONLY this one.
+# baremetal-operator holds it while trying to deprovision through the BMC, which
+# never completes when the BMC is unreachable — stuck past four minutes when
+# measured. BMAC's `bmac.agent-install.openshift.io/deprovision` is deliberately
+# NOT here: it released on its own inside one second, so taking it would be
+# robbing a controller that was already doing its job.
+BMH_DEPROVISION_FINALIZERS = frozenset({"baremetalhost.metal3.io"})
 
 _INFRAENV_LABEL = "infraenvs.agent-install.openshift.io"
 
@@ -305,3 +328,26 @@ def nmstate_config_differences(
         ),
     ]
     return [c for c in checks if c is not None]
+
+
+def agent_matches_macs(agent: dict[str, Any], macs: Iterable[str]) -> bool:
+    """Whether one Agent reports any of these MACs among its interfaces.
+
+    MAC is the only usable link between an Agent and the BareMetalHost it came
+    from. BMAC names an Agent after the host's own inventory UUID, and the live
+    CRD's `agent.spec` carries `approved`, `clusterDeploymentName`, role and
+    installation disk — no reference back to the host at all. So matching on
+    name or on a spec field would work only by accident, and would break
+    silently when BMAC changed either.
+
+    Compared through `_mac` for the same reason every other MAC comparison in
+    this module is: assisted-service reports what the NIC announced over the
+    wire, server-scan lower-cases on ingest, and a MAC has no case. Comparing
+    them literally would make a matching Agent invisible and time the install
+    out at its deadline — with the host sitting there, correctly installed.
+    """
+    wanted = {_mac(mac) for mac in macs}
+    interfaces = (
+        ((agent.get("status") or {}).get("inventory") or {}).get("interfaces") or []
+    )
+    return any(_mac(iface.get("macAddress")) in wanted for iface in interfaces)

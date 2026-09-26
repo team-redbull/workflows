@@ -233,6 +233,59 @@ class BmhState(BaseModel):
         return self.is_errored() and "registration error" in (self.error_type or "").lower()
 
 
+class AgentRef(BaseModel):
+    """Which host to look for an Agent for: a namespace and the host's bond MACs.
+
+    MATCHED ON MAC, never on name. BMAC names an Agent after the host's own
+    inventory UUID, and `agent.spec` carries no reference back to the
+    BareMetalHost at all — verified against the live CRD, whose spec holds
+    `approved`, `clusterDeploymentName`, role and installation disk and nothing
+    else. `status.inventory.interfaces[].macAddress` is the only link between
+    the two that holds across BMAC versions, so it is the one used.
+
+    The MACs are the bond members, both of them: the host registers with
+    whichever NIC brought the discovery ISO up, and which of the two that was
+    is not knowable in advance.
+    """
+
+    namespace: str = Field(min_length=1)
+    macs: list[str] = Field(min_length=1)
+
+
+class AgentState(BaseModel):
+    """Whether an Agent has registered for one host, and which one it is.
+
+    `found=False` is the normal answer for most of the wait — bare metal takes
+    far longer to POST, boot the ISO and phone home than a VM does — so it is
+    an observation, not an error, and the workflow's bounded timer owns the
+    waiting.
+    """
+
+    found: bool = False
+    name: str | None = None
+    approved: bool | None = None
+
+
+class TeardownResult(BaseModel):
+    """What rolling one candidate back actually removed.
+
+    `finalizers_cleared` records the blunt path being taken: Metal3 holds
+    `baremetalhost.metal3.io` while it tries to deprovision through the BMC,
+    and a rollback happens precisely when that BMC never answered — so the
+    teardown detaches the host first and, if the object still stands at the
+    deadline, drops the finalizer itself. True here means that happened, which
+    is worth seeing in the history of a run rather than inferring.
+
+    The Secret is absent from `removed` when it cascaded: it carries an
+    ownerReference to the BareMetalHost, so the API server's garbage collector
+    takes it once the host is really gone — which is only after the finalizer
+    clears, never at the moment delete is called.
+    """
+
+    removed: list[str] = Field(default_factory=list)
+    finalizers_cleared: bool = False
+
+
 class InstallServerInput(BaseModel):
     """Input to InstallServerWorkflow: which InfraEnv to fill, and from where.
 
@@ -304,3 +357,12 @@ class InstallServerResult(BaseModel):
     boot_mac: str
     resources_changed: bool
     bmh_registered: bool
+    # The Agent that proved the host actually booted and reached
+    # assisted-service. Defaulted because a run COMPLETED before this field
+    # existed has a result payload in history without it, and the status
+    # endpoint decodes those.
+    agent_name: str | None = None
+    # How many candidates were installed and watched before one produced an
+    # Agent. 1 is the happy path; more means earlier candidates were created,
+    # waited on for the full deadline, and rolled back.
+    attempts: int = 1

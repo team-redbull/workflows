@@ -21,7 +21,18 @@ from temporalio import workflow
 with workflow.unsafe.imports_passed_through():
     from shared.models.server_lifecycle import AcquiredServer, BondMember, LinkState
 
-# A bond needs two members, so a candidate with fewer usable ports is no use.
+# Two link-up NICs on two DISTINCT physical ports, and nothing less. The
+# provisioning network is delivered over an 802.3ad bond0 and the switch ports
+# are configured for it, so a machine that cannot form that bond must not enter
+# the inventory at all: half a bond is not a degraded install, it is a host the
+# fabric is not set up to carry.
+#
+# This is DELIBERATELY stricter than the operator being replaced. bmhgen fell
+# back to a non-bonded layout, VLAN straight on the NIC, when it found exactly
+# one interface (yaml_generators.py, "Single interface — preserve the original
+# non-bonded layout"). That path is NOT ported, and its absence is a decision,
+# not an oversight — do not restore it without the fabric changing first.
+#
 # Also the `min_nic_macs` floor asked of server-scan, so the structural gate the
 # endpoint applies and the rule applied here cannot drift apart.
 BOND_MEMBER_COUNT = 2

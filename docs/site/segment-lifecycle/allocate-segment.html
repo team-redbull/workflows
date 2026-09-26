@@ -47,8 +47,6 @@
       cluster's values file in the day1 repo, and waits until Argo&nbsp;CD + Crossplane have turned that commit
       into a live DHCP scope. The cluster gets its network <em>and</em> its DHCP scope from one durable run.
     </p>
-    <p class="lede">It replaces the GitLab CI bash pipeline outright — the one with no durable retry, no
-    verification, and a failure mode of “cluster created without a VLAN”.</p>
     <div class="facts">
       <div class="fact"><span class="k">Trigger</span><span class="v">POST /workflows/segment-lifecycle/allocate-segment</span></div>
       <div class="fact"><span class="k">Workflow id</span><span class="v">allocate-segment-&lt;TYPE&gt;-&lt;cluster&gt;</span></div>

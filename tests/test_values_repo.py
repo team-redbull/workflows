@@ -311,6 +311,41 @@ async def test_an_unreachable_repo_stays_retryable(tmp_path):
         )
 
 
+async def test_a_push_rejected_as_non_fast_forward_retries_and_converges(
+    origin, tmp_path, monkeypatch
+):
+    """Someone pushes to the pipeline branch between our clone and our push.
+    The push is rejected (non-fast-forward): that must be the RETRYABLE
+    ValuesRepoGitError, and the retry — a fresh clone — must converge on top
+    of the other commit without losing it."""
+    real_run_git = values_repo._run_git
+    raced = []
+
+    async def racing_run_git(args, **kwargs):
+        if args[0] == "push" and not raced:
+            raced.append(True)
+            other = tmp_path / "other-writer"
+            _git("clone", "--branch", BRANCH, str(origin), str(other), cwd=tmp_path)
+            (other / "README.md").write_text("changed by someone else\n")
+            _git("add", ".", cwd=other)
+            _git("-c", "user.name=o", "-c", "user.email=o@t", "commit", "-m", "concurrent", cwd=other)
+            _git("push", "origin", BRANCH, cwd=other)
+        return await real_run_git(args, **kwargs)
+
+    monkeypatch.setattr(values_repo, "_run_git", racing_run_git)
+
+    with pytest.raises(ValuesRepoGitError, match="push"):
+        await _append(origin)
+
+    # The retry: a fresh clone that already contains the other writer's commit.
+    commit_sha, changed = await _append(origin)
+    assert changed
+    assert commit_sha == _git("rev-parse", BRANCH, cwd=origin).strip()
+    log = _git("log", "--format=%s", "-3", BRANCH, cwd=origin).splitlines()
+    assert log[1] == "concurrent"  # the other writer's commit survived, ours sits on top
+    assert values_repo.MARKER in _origin_file(origin, tmp_path, "verify-raced")
+
+
 def test_token_is_injected_only_into_https_urls():
     assert values_repo.authenticated_url(
         "https://github.com/org/repo.git", "s3cret"

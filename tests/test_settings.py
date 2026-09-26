@@ -1,4 +1,5 @@
-"""DHCP_EXCLUSION_OCTET_RANGES parsing in SegmentLifecycleActivitySettings.
+"""Fail-fast parsing in SegmentLifecycleActivitySettings: DHCP_EXCLUSION_OCTET_RANGES
+and the DAY1_REPO_URL scheme.
 
 The activity worker's config is fail-fast by design: it is instantiated at
 module import, so a bad value crash-loops the pod at startup rather than
@@ -16,6 +17,29 @@ from pydantic import ValidationError
 
 from shared.models.segment_lifecycle import SegmentType
 from shared.settings import SegmentLifecycleActivitySettings
+
+
+class TestDay1RepoUrl:
+    """The push token is injected into https URLs only. Any other scheme would
+    drop it silently and every run would retry an auth failure forever, so the
+    worker refuses to start instead."""
+
+    def test_https_is_accepted(self, monkeypatch):
+        monkeypatch.setenv("DAY1_REPO_URL", "https://gitlab.internal/redbull/day1.git")
+        assert SegmentLifecycleActivitySettings().day1_repo_url.startswith("https://")
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://gitlab.internal/redbull/day1.git",
+            "git@gitlab.internal:redbull/day1.git",
+            "ssh://git@gitlab.internal/redbull/day1.git",
+        ],
+    )
+    def test_any_other_scheme_is_rejected_at_startup(self, monkeypatch, url):
+        monkeypatch.setenv("DAY1_REPO_URL", url)
+        with pytest.raises(ValidationError, match="must be an https:// URL"):
+            SegmentLifecycleActivitySettings()
 
 
 class TestDhcpExclusionOctetRanges:

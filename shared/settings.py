@@ -76,6 +76,21 @@ class SegmentLifecycleActivitySettings(BaseSettings):
     day1_repo_url: str
     day1_git_token: str
 
+    @field_validator("day1_repo_url")
+    @classmethod
+    def _require_https_day1_repo_url(cls, url: str) -> str:
+        """The push token is injected into https:// URLs ONLY
+        (values_repo.authenticated_url). Any other scheme would silently drop
+        it: every ls-remote would then fail authentication, which is the
+        retryable ValuesRepoGitError, so each run would retry forever. Fail at
+        worker startup instead, where the fix is one config edit."""
+        if not url.startswith("https://"):
+            raise ValueError(
+                "day1_repo_url must be an https:// URL — the push token is only "
+                f"injected into https clone URLs (got {url.split('@')[-1]!r})"
+            )
+        return url
+
     # --- allocate-segment: DHCP scope policy --------------------------------
     # The ONE DHCP policy knob, PER SEGMENT TYPE: last-octet ranges excluded
     # from distribution, e.g. {"HC": [[1, 10], [241, 254]]}. Together with the

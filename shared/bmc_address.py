@@ -20,7 +20,6 @@ for the same reason.
 from __future__ import annotations
 
 import re
-from enum import Enum
 
 from shared.exceptions import InvalidServerNameError
 from shared.models.server_lifecycle import BmcEndpoint
@@ -47,43 +46,6 @@ _DEFAULT_PATH_BY_VENDOR = {
 
 _DEFAULT_IPMI_PORT = 623
 
-
-class BmcDriverClass(str, Enum):
-    """How Ironic talks to a BMC — the coarse split, not the driver itself.
-
-    Two drivers are Redfish underneath: `idrac-virtualmedia` is Dell's Redfish
-    implementation, so a Dell sits with HP and Intersight rather than on its
-    own. Only UCS Central's blades are genuinely a different protocol.
-
-    This is what decides which of an MCE's inventory networks a host boots on,
-    which is why the split is by PROTOCOL rather than by vendor: the network is
-    reachable by one or the other, and a vendor list would have to be kept in
-    step with the driver table below to say the same thing.
-    """
-
-    REDFISH = "REDFISH"
-    IPMI = "IPMI"
-
-
-# Keyed by DRIVER, not by vendor, so the vendor list above stays the one place
-# a vendor is named. A new driver that nobody has classified here raises rather
-# than defaulting into a class — being wrong about this puts a host on a network
-# its BMC cannot be reached on, which looks exactly like a dead BMC.
-_CLASS_BY_DRIVER = {
-    "redfish-virtualmedia": BmcDriverClass.REDFISH,
-    "idrac-virtualmedia": BmcDriverClass.REDFISH,
-    "ipmi": BmcDriverClass.IPMI,
-}
-
-
-def bmc_driver_class(bmc_vendor: str) -> BmcDriverClass:
-    """Which protocol class this vendor's BMC is driven over.
-
-    Raises:
-        KeyError: the vendor has no driver mapping, exactly as
-            build_bmc_address does. Callers gate on BMC_VENDORS first.
-    """
-    return _CLASS_BY_DRIVER[_DRIVER_BY_VENDOR[bmc_vendor.upper()]]
 
 # The vendor vocabulary this module can drive, as ONE definition. install-server
 # gates on it before writing anything, because server-scan reports

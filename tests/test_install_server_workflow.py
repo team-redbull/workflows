@@ -28,13 +28,8 @@ from shared.consts import (
     SEGMENT_LIFECYCLE_ACTIVITY_QUEUE,
     server_lifecycle_activity_queue,
 )
-from shared.exceptions import ServerNotAvailableError
-from shared.models.segment_lifecycle import (
-    InventorySegmentLookup,
-    InventorySegmentRequest,
-    SegmentEntry,
-    SegmentType,
-)
+from shared.exceptions import InventorySegmentNotFoundError, ServerNotAvailableError
+from shared.models.segment_lifecycle import SegmentEntry, SegmentType
 from shared.models.server_lifecycle import (
     AcquiredServer,
     AcquireServerRequest,
@@ -67,14 +62,13 @@ INPUT = InstallServerInput(
     infra_env=INFRA_ENV, mce_cluster=MCE_CLUSTER, namespace=NAMESPACE
 )
 
-# An MCE's inventory network is split by BMC protocol class, so the fixture is
-# the REDFISH one — the class a Dell (iDRAC is Redfish underneath) needs.
+# One inventory segment per MCE, found by cluster name — no BMC-protocol class.
 INVENTORY_SEGMENT = SegmentEntry(
     segment="10.20.90.0/24",
     site="bat-yam",
     vlan_id=VLAN_ID,
     status="Allocated",
-    type=SegmentType.INVENTORY_REDFISH.value,
+    type=SegmentType.INVENTORY.value,
     cluster_name=MCE_CLUSTER,
 )
 
@@ -151,7 +145,6 @@ def make_mock_activities(
     acquire_error: Exception | None = None,
     segment: SegmentEntry | None = None,
     segment_error: Exception | None = None,
-    segments_by_type: dict[SegmentType, SegmentEntry | None] | None = None,
     resources_exist: bool = False,
     bmh_script: list[BmhState] | None = None,
     bmh_never_registers: bool = False,
@@ -200,18 +193,11 @@ def make_mock_activities(
     )
 
     @activity.defn
-    async def get_inventory_segment(
-        request: InventorySegmentRequest,
-    ) -> InventorySegmentLookup:
-        calls["get_inventory_segment"].append(request)
+    async def get_inventory_segment(mce_cluster: str) -> SegmentEntry:
+        calls["get_inventory_segment"].append(mce_cluster)
         if segment_error is not None:
             raise segment_error
-        if segments_by_type is not None:
-            # An MCE holds only the classes it serves, so a class it has none
-            # of reports absent rather than raising.
-            entry = segments_by_type.get(request.segment_type)
-            return InventorySegmentLookup(found=entry is not None, entry=entry)
-        return InventorySegmentLookup(found=True, entry=segment or INVENTORY_SEGMENT)
+        return segment or INVENTORY_SEGMENT
 
     @activity.defn
     async def acquire_servers(request: AcquireServerRequest) -> list[AcquiredServer]:
@@ -391,8 +377,7 @@ async def test_happy_path_resolves_vlan_acquires_creates_and_awaits_the_agent():
     assert result.bmc_address == (
         "idrac-virtualmedia://10.11.1.229/redfish/v1/Systems/System.Embedded.1"
     )
-    (segment_request,) = calls["get_inventory_segment"]
-    assert segment_request.mce_cluster == MCE_CLUSTER
+    assert calls["get_inventory_segment"] == [MCE_CLUSTER]
     # ONLY the candidate probe. The host is never polled for success — an Agent
     # is the proof — and the one diagnostic read happens only on a failure.
     assert len(calls["get_baremetal_host"]) == 1
@@ -450,83 +435,43 @@ async def test_a_segment_allocated_to_another_cluster_is_refused():
     assert _application_error(excinfo.value).type == "InventorySegmentMismatchError"
 
 
-class TestTheInventoryNetworkIsSplitByBmcProtocol:
-    """An MCE's inventory network is really up to two networks.
+class TestTheInventoryNetworkIsOneScopePerCluster:
+    """An MCE owns ONE inventory network, found by its cluster name.
 
-    Ironic reaches a Redfish BMC (HP via OneView, Dell via iDRAC, Cisco via
-    Intersight) on one and a UCS-managed blade over IPMI on another, so which
-    segment applies is not known until a SERVER is chosen — which is why the
-    VLAN is resolved inside candidate selection rather than as step one.
+    It was briefly split by how a server's BMC is driven — INVENTORY_REDFISH
+    for HP/Dell/Intersight, INVENTORY_IPMI for a UCS blade — which made the
+    segment a property of the chosen machine and moved the lookup inside
+    candidate selection. Reverted on both sides, so these tests pin the
+    opposite: the cluster name is the whole lookup, and it happens once, before
+    a candidate exists.
     """
 
-    async def test_a_redfish_server_asks_for_the_redfish_segment(self) -> None:
+    async def test_the_lookup_is_the_cluster_name_and_nothing_else(self) -> None:
         calls, segment_acts, server_acts = make_mock_activities()
         async with _Harness(segment_acts, server_acts) as client:
             await _execute(client, InstallServerRunArgs(input=INPUT))
 
-        (request,) = calls["get_inventory_segment"]
-        # Dell: iDRAC is Redfish underneath, so it is not a class of its own.
-        assert request.segment_type is SegmentType.INVENTORY_REDFISH
-        assert request.mce_cluster == MCE_CLUSTER
+        assert calls["get_inventory_segment"] == [MCE_CLUSTER]
 
-    async def test_a_ucs_server_asks_for_the_ipmi_segment(self) -> None:
-        ucs = bondable_server().model_copy(update={"bmc_vendor": "CISCO"})
-        ipmi_segment = INVENTORY_SEGMENT.model_copy(
-            update={"type": SegmentType.INVENTORY_IPMI.value, "vlan_id": 1444}
-        )
-        calls, segment_acts, server_acts = make_mock_activities(
-            candidates=[ucs],
-            segments_by_type={SegmentType.INVENTORY_IPMI: ipmi_segment},
-        )
-        async with _Harness(segment_acts, server_acts) as client:
-            result = await _execute(client, InstallServerRunArgs(input=INPUT))
+    async def test_a_ucs_blade_uses_the_same_segment_as_a_dell(self) -> None:
+        """What the revert removed: the BMC protocol no longer picks a network.
 
-        (request,) = calls["get_inventory_segment"]
-        assert request.segment_type is SegmentType.INVENTORY_IPMI
-        assert result.vlan_id == 1444
-
-    async def test_a_ucs_server_is_passed_over_on_a_redfish_only_mce(self) -> None:
-        """The reason this is a SKIP and not a failure.
-
-        An MCE holds only the classes it serves. A pool draw that happens to
-        put a UCS blade first must still install the Dell behind it.
+        A UCS blade is driven over IPMI and a Dell over Redfish, and both now
+        boot on the one inventory VLAN the MCE owns.
         """
-        ucs = bondable_server("srv_ucs", name="ocp-ucs-blade").model_copy(
-            update={"bmc_vendor": "CISCO"}
-        )
-        dell = bondable_server("srv_dell")
-        calls, segment_acts, server_acts = make_mock_activities(
-            candidates=[ucs, dell],
-            segments_by_type={SegmentType.INVENTORY_REDFISH: INVENTORY_SEGMENT},
-        )
+        ucs = bondable_server().model_copy(update={"bmc_vendor": "CISCO"})
+        calls, segment_acts, server_acts = make_mock_activities(candidates=[ucs])
         async with _Harness(segment_acts, server_acts) as client:
             result = await _execute(client, InstallServerRunArgs(input=INPUT))
 
-        assert result.server_name == SERVER_NAME
-        assert [c.server_name for c in calls["create_baremetal_host"]] == [SERVER_NAME]
-        # One lookup per class, not one per candidate.
-        assert len(calls["get_inventory_segment"]) == 2
+        assert result.vlan_id == VLAN_ID
+        assert calls["get_inventory_segment"] == [MCE_CLUSTER]
 
-    async def test_an_mce_with_no_segment_of_that_class_says_so(self) -> None:
-        ucs = bondable_server().model_copy(update={"bmc_vendor": "CISCO"})
-        calls, segment_acts, server_acts = make_mock_activities(
-            candidates=[ucs],
-            segments_by_type={SegmentType.INVENTORY_REDFISH: INVENTORY_SEGMENT},
-        )
-        async with _Harness(segment_acts, server_acts) as client:
-            with pytest.raises(WorkflowFailureError) as excinfo:
-                await _execute(client, InstallServerRunArgs(input=INPUT))
-
-        error = _application_error(excinfo.value)
-        assert error.type == "InventorySegmentNotFoundError"
-        assert "INVENTORY_IPMI" in str(error)
-        assert calls["create_bmc_secret"] == []
-
-    async def test_a_class_is_looked_up_once_however_many_candidates_need_it(
+    async def test_the_segment_is_resolved_once_per_run_not_per_candidate(
         self,
     ) -> None:
-        # Two lookups per candidate would be two round trips to the Segments
-        # Manager for every server in the draw.
+        # A lookup per candidate would be a round trip to the Segments Manager
+        # for every server in the draw, for an answer that cannot differ.
         pool = [
             bondable_server("srv_a", name="ocp-a"),
             bondable_server("srv_b", name="ocp-b"),
@@ -539,7 +484,33 @@ class TestTheInventoryNetworkIsSplitByBmcProtocol:
             result = await _execute(client, InstallServerRunArgs(input=INPUT))
 
         assert result.server_name == "ocp-c"
-        assert len(calls["get_inventory_segment"]) == 1
+        assert calls["get_inventory_segment"] == [MCE_CLUSTER]
+
+    async def test_an_mce_with_no_inventory_segment_fails_before_the_draw(
+        self,
+    ) -> None:
+        """No candidate can make a missing allocation usable.
+
+        With one scope per cluster this is the run's failure, not a candidate's,
+        so it is raised by the LOOKUP and nothing is drawn or created. (While
+        the type was split it had to be a per-candidate skip instead: an MCE
+        missing one class still served the other.)
+        """
+        calls, segment_acts, server_acts = make_mock_activities(
+            segment_error=InventorySegmentNotFoundError(
+                f"MCE cluster {MCE_CLUSTER!r} has no INVENTORY segment"
+            )
+        )
+        async with _Harness(segment_acts, server_acts) as client:
+            with pytest.raises(WorkflowFailureError) as excinfo:
+                await _execute(client, InstallServerRunArgs(input=INPUT))
+
+        assert (
+            _application_error(excinfo.value).type
+            == "InventorySegmentNotFoundError"
+        )
+        assert calls["acquire_servers"] == []
+        assert calls["create_bmc_secret"] == []
 
 
 async def test_no_assignable_server_fails_fast():

@@ -11,21 +11,25 @@ vendor-strategy layer is gone: one HTTP call replaces four vendor SDKs.
 
 Shape of the run:
 
-  1. acquiring-server    — GET /servers/available. The InfraEnv name states
+  1. resolving-vlan      — the VLAN belongs to the target MCE, not to the
+                           server or the caller: each MCE owns one inventory
+                           segment, looked up in the Segments Manager by
+                           cluster name. Runs on the SEGMENT-LIFECYCLE queue,
+                           where that credential already lives.
+  2. acquiring-server    — GET /servers/available. The InfraEnv name states
                            which hardware it is for
                            (cisco-m6-bat-yam-64c-512gb), and server names carry
                            the same tokens behind an `ocp-` prefix, so the
                            InfraEnv IS the query. Several candidates are drawn
                            so one unusable server is a retry, not a failure.
-  2. selecting-server    — the first candidate that can actually be installed,
-                           and the inventory VLAN it needs. EVERY reason a
-                           candidate is unusable is a skip here, so the draw
-                           keeps its promise; the reasons are reported together
-                           if none survives.
-  3. creating-secret
+  3. selecting-server    — the first candidate that can actually be installed.
+                           EVERY reason a candidate is unusable is a skip here,
+                           so the draw keeps its promise; the reasons are
+                           reported together if none survives.
+  4. creating-secret
      creating-baremetalhost
      creating-nmstateconfig  — all idempotent; an existing resource is success.
-  4. awaiting-agent      — a BOUNDED wait for an AGENT to register for the
+  5. awaiting-agent      — a BOUNDED wait for an AGENT to register for the
                            host, which is the only observation that proves the
                            install worked: an Agent exists because the machine
                            booted the discovery ISO and reached
@@ -33,27 +37,31 @@ Shape of the run:
                            the bond formed, the VLAN was right and DHCP
                            answered. An hour, because bare metal POSTs for
                            longer than a VM takes to boot.
-  5. rolling-back        — no Agent by the deadline is that CANDIDATE's
+  6. rolling-back        — no Agent by the deadline is that CANDIDATE's
                            failure, not the run's: the NMStateConfig and
                            BareMetalHost are removed, which returns the machine
                            to the inventory, and the next candidate is tried
-                           from step 2.
+                           from step 3.
 
-Steps 2-5 are therefore a LOOP, not a pipeline. A candidate cannot be shown to
+Steps 3-6 are therefore a LOOP, not a pipeline. A candidate cannot be shown to
 be installable without creating its resources and watching what happens, so the
 draw is a list of things to TRY rather than to validate, and an hour-deep
 failure is a skip like any other. The run fails only when nothing is left.
 
-THE VLAN IS RESOLVED INSIDE SELECTION, not before it. An MCE's inventory
-network is really up to TWO networks, split by how a server's BMC is driven:
-Ironic reaches a Redfish BMC (HP via OneView, Dell via iDRAC, Cisco via
-Intersight) on one and a UCS-managed blade over IPMI on another, allocated as
-INVENTORY_REDFISH and INVENTORY_IPMI. So which segment applies is not known
-until a machine is chosen — and an MCE holds only the classes it serves, which
-is why a UCS blade drawn against a Redfish-only MCE is passed over rather than
-failing a run that could still install the Dell behind it. The lookup runs on
-the SEGMENT-LIFECYCLE queue, where that credential already lives, once per
-class rather than once per candidate.
+THE VLAN IS THE MCE'S, AND IS RESOLVED ONCE. An MCE owns one inventory network,
+so its VLAN is a property of the cluster this run targets and nothing else — not
+of the machine chosen, and not of the caller, who could otherwise supply a VLAN
+contradicting the segment the cluster actually owns. It is read before any
+candidate is drawn, because no candidate could make a missing allocation usable.
+The lookup runs on the SEGMENT-LIFECYCLE queue, where that credential already
+lives, rather than putting a second copy of the Segments Manager token on this
+domain's worker.
+
+(It was briefly resolved per candidate instead, while INVENTORY was split into
+INVENTORY_REDFISH and INVENTORY_IPMI by how a server's BMC is driven — an MCE
+then held up to two inventory segments and which applied was not known until a
+machine was chosen. Reverted on both sides: one inventory scope per cluster,
+found by cluster name.)
 
 This module is the SHAPE of the run only. The rule deciding which two NICs carry
 the bond is policy with no I/O in it, so it lives in bond_selection.py and is
@@ -103,8 +111,6 @@ from temporalio.exceptions import ApplicationError
 with workflow.unsafe.imports_passed_through():
     from shared.bmc_address import (
         BMC_VENDORS,
-        BmcDriverClass,
-        bmc_driver_class,
         build_bmc_address,
         is_k8s_resource_name,
     )
@@ -132,12 +138,7 @@ with workflow.unsafe.imports_passed_through():
         UnknownBmcVendorError,
     )
     from shared.interfaces.segment_lifecycle import get_inventory_segment
-    from shared.models.segment_lifecycle import (
-        InventorySegmentLookup,
-        InventorySegmentRequest,
-        SegmentEntry,
-        SegmentType,
-    )
+    from shared.models.segment_lifecycle import SegmentEntry
     from shared.interfaces.server_lifecycle import (
         acquire_servers,
         create_baremetal_host,
@@ -196,6 +197,7 @@ _PERMANENT_ACTIVITY_ERRORS: tuple[type[Exception], ...] = (
     InvalidMacError,
     InvalidServerNameError,
     AmbiguousInventorySegmentError,
+    InventorySegmentNotFoundError,
     SegmentsManagerAuthError,
 )
 _RETRY_POLICY = RetryPolicy(
@@ -275,14 +277,6 @@ def _acquire_request(
 # Every one of these is a SKIP, not a failure: the draw exists so that one
 # unusable server is a retry rather than a failed run, and a reason that failed
 # the run outright would quietly break that promise for part of the fleet.
-# Which of an MCE's inventory networks a server's BMC is reachable on. One
-# entry per driver class, so a class added in shared/bmc_address.py fails here
-# loudly rather than defaulting a host onto the wrong network.
-_INVENTORY_TYPE_BY_DRIVER_CLASS = {
-    BmcDriverClass.REDFISH: SegmentType.INVENTORY_REDFISH,
-    BmcDriverClass.IPMI: SegmentType.INVENTORY_IPMI,
-}
-
 _REJECTION_TYPE = {
     "unnameable": InvalidServerNameError,
     "no-bond": NoBondableInterfacesError,
@@ -290,7 +284,6 @@ _REJECTION_TYPE = {
     "unknown-bmc-vendor": UnknownBmcVendorError,
     "no-bmc-host": BmcEndpointMissingError,
     "bad-mac": InvalidMacError,
-    "no-inventory-segment": InventorySegmentNotFoundError,
     "no-agent": AgentNeverAppearedError,
 }
 
@@ -318,11 +311,6 @@ _REJECTION_SUMMARY = {
     "bad-mac": (
         "carry a malformed MAC. server-scan normalizes MACs on ingest, so this "
         "is a bad payload rather than a condition to wait out"
-    ),
-    "no-inventory-segment": (
-        "need an inventory network this MCE does not have allocated. An MCE "
-        "holds one segment per BMC protocol class, and only the classes it "
-        "serves — allocate the missing one in the Segments Manager"
     ),
     "no-agent": (
         "were installed and never registered an Agent before the deadline, so "
@@ -451,7 +439,15 @@ class InstallServerWorkflow:
             install_input.mce_cluster,
         )
 
-        # Step 1 — the InfraEnv name IS the hardware query. It encodes vendor,
+        # Step 1 — the VLAN is the MCE's, so it is read from the Segments
+        # Manager rather than taken from the caller: a supplied VLAN could
+        # contradict the segment the cluster actually owns. Before the draw,
+        # because no candidate could make a missing allocation usable. Runs on
+        # the segment-lifecycle queue, which already holds that credential.
+        self._phase = "resolving-vlan"
+        segment = await self._inventory_segment(install_input.mce_cluster)
+
+        # Step 2 — the InfraEnv name IS the hardware query. It encodes vendor,
         # model, site and spec, and server names carry the same tokens behind
         # an `ocp-` prefix, so no part of either is parsed apart.
         self._phase = "acquiring-server"
@@ -466,7 +462,7 @@ class InstallServerWorkflow:
             retry_policy=_RETRY_POLICY,
         )
 
-        # Step 2 — INSTALL ONE CANDIDATE AT A TIME, all the way to an Agent,
+        # Step 3 — INSTALL ONE CANDIDATE AT A TIME, all the way to an Agent,
         # and roll it back if it never produces one.
         #
         # The draw is not a list of things to validate, it is a list of things
@@ -479,25 +475,19 @@ class InstallServerWorkflow:
         # That is why every rejection below, including one an hour deep, is a
         # SKIP: the run fails only once nothing is left to try.
         rejections: list[tuple[str, str]] = []
-        # One lookup per BMC protocol class, at most two per run, shared across
-        # candidates rather than repeated per candidate.
-        segments: dict[SegmentType, InventorySegmentLookup] = {}
         attempts = 0
 
         for candidate in candidates:
             self._phase = "selecting-server"
-            evaluated = await self._evaluate_candidate(
+            bond_members = await self._evaluate_candidate(
                 candidate,
                 install_input.server_name,
                 namespace,
-                install_input.mce_cluster,
                 activity_queue,
-                segments,
                 rejections,
             )
-            if evaluated is None:
+            if bond_members is None:
                 continue
-            bond_members, segment = evaluated
 
             attempts += 1
             self._server_name = candidate.name
@@ -514,7 +504,7 @@ class InstallServerWorkflow:
                 labels=install_input.labels,
             )
 
-            # Step 3 — the three resources, in dependency order: the
+            # Step 4 — the three resources, in dependency order: the
             # BareMetalHost references the Secret by name, so the Secret goes
             # first. Each create treats "already exists" as success, which is
             # what makes the whole run re-runnable.
@@ -533,7 +523,7 @@ class InstallServerWorkflow:
                 create_nmstate_config, resource_request, activity_queue
             )
 
-            # Step 4 — wait for the host to actually come up. An Agent existing
+            # Step 5 — wait for the host to actually come up. An Agent existing
             # is the only observation that proves the BMC accepted virtual
             # media, the bond formed, the VLAN was right and DHCP answered.
             self._phase = "awaiting-agent"
@@ -600,12 +590,10 @@ class InstallServerWorkflow:
         candidate: AcquiredServer,
         requested_name: str | None,
         namespace: str,
-        mce_cluster: str,
         task_queue: str,
-        segments: dict[SegmentType, InventorySegmentLookup],
         rejections: list[tuple[str, str]],
-    ) -> tuple[list[BondMember], SegmentEntry] | None:
-        """One candidate's bond and VLAN, or None with a reason recorded.
+    ) -> list[BondMember] | None:
+        """One candidate's bond members, or None with a reason recorded.
 
         EVERY reason a candidate cannot be installed is a skip, not a failure.
         The draw exists so one unusable server is a retry rather than a failed
@@ -648,21 +636,6 @@ class InstallServerWorkflow:
             rejections.append(("bad-mac", f"{candidate.name} {bad}"))
             return None
 
-        # The inventory network this machine's BMC is reachable on. An MCE
-        # holds one segment per protocol class and only the classes it serves,
-        # so a UCS blade on a Redfish-only MCE is passed over here.
-        segment_type = _INVENTORY_TYPE_BY_DRIVER_CLASS[bmc_driver_class(vendor)]
-        if segment_type not in segments:
-            segments[segment_type] = await self._inventory_segment(
-                mce_cluster, segment_type
-            )
-        lookup = segments[segment_type]
-        if not lookup.found or lookup.entry is None:
-            rejections.append(
-                ("no-inventory-segment", f"{candidate.name} needs {segment_type.value}")
-            )
-            return None
-
         # An explicitly named server is a request to converge THAT machine, so
         # it is never skipped — only an unnamed draw from a pool is.
         if requested_name is None:
@@ -673,22 +646,22 @@ class InstallServerWorkflow:
                 rejections.append(("already-installed", candidate.name))
                 return None
 
-        return members, lookup.entry
+        return members
 
-    async def _inventory_segment(
-        self, mce_cluster: str, segment_type: SegmentType
-    ) -> InventorySegmentLookup:
-        """One MCE's inventory segment of one BMC protocol class.
+    async def _inventory_segment(self, mce_cluster: str) -> SegmentEntry:
+        """The MCE's inventory segment, the one thing the VLAN comes from.
 
         Runs on the SEGMENT-LIFECYCLE queue: it reads the Segments Manager,
         whose credential already lives on that limb, so routing one activity
         there beats a second copy of the token on this domain's worker.
+
+        The activity raises when the MCE has no INVENTORY allocation, and that
+        is right — there is one inventory scope per cluster, so no candidate the
+        run might draw could make a missing one usable.
         """
-        lookup = await workflow.execute_activity(
+        segment = await workflow.execute_activity(
             get_inventory_segment,
-            InventorySegmentRequest(
-                mce_cluster=mce_cluster, segment_type=segment_type
-            ),
+            mce_cluster,
             task_queue=SEGMENT_LIFECYCLE_ACTIVITY_QUEUE,
             start_to_close_timeout=_ACTIVITY_TIMEOUT,
             retry_policy=_RETRY_POLICY,
@@ -698,15 +671,14 @@ class InstallServerWorkflow:
         # and this is the one value that decides which VLAN a host is tagged
         # onto. A host on another cluster's inventory network comes up
         # somewhere this MCE cannot reach.
-        entry = lookup.entry
-        if entry is not None and entry.cluster_name != mce_cluster:
+        if segment.cluster_name != mce_cluster:
             raise ApplicationError(
-                f"Segments Manager returned segment {entry.segment} allocated "
-                f"to {entry.cluster_name!r}, not to the requested MCE "
+                f"Segments Manager returned segment {segment.segment} allocated "
+                f"to {segment.cluster_name!r}, not to the requested MCE "
                 f"{mce_cluster!r}",
                 type=InventorySegmentMismatchError.__name__,
             )
-        return lookup
+        return segment
 
     async def _create(
         self,

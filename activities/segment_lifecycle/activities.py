@@ -33,6 +33,7 @@ from activities.segment_lifecycle import values_repo
 from activities.segment_lifecycle.dhcp_values import build_dhcp_values
 from shared.exceptions import (
     AmbiguousInventorySegmentError,
+    InventorySegmentNotFoundError,
     SegmentConflictError,
     SegmentPoolExhaustedError,
     SegmentsManagerAuthError,
@@ -45,8 +46,6 @@ from shared.models.segment_lifecycle import (
     ClusterFileLookupRequest,
     ClusterValuesAppendRequest,
     InitializeSegmentInput,
-    InventorySegmentLookup,
-    InventorySegmentRequest,
     SegmentAllocation,
     SegmentAllocationRequest,
     SegmentEntry,
@@ -385,19 +384,23 @@ async def append_allocation_to_cluster_values(
 # --- shared with the server-lifecycle domain --------------------------------
 
 # The Segments Manager's own name for an MCE's inventory network. install-server
-# tags every NMStateConfig with the VLAN of the segment carrying this type.
+# tags every NMStateConfig with the VLAN of the segment carrying this type. One
+# type, because there is one inventory scope per cluster: the class-per-BMC-
+# protocol split (INVENTORY_REDFISH / INVENTORY_IPMI) is reverted on both sides.
+_INVENTORY_SEGMENT_TYPE = "INVENTORY"
+
+
 @activity.defn
-async def get_inventory_segment(
-    request: InventorySegmentRequest,
-) -> InventorySegmentLookup:
-    """Find one MCE cluster's inventory segment of a given class."""
-    segment_type = request.segment_type.value
+async def get_inventory_segment(mce_cluster: str) -> SegmentEntry:
+    """Find the INVENTORY segment allocated to one MCE cluster."""
     async with _segments_manager_client() as client:
         # `type` is the only filter of the two this endpoint accepts —
         # verified against its OpenAPI, which declares site/status/type/fresh
         # and no cluster_name. The cluster match is therefore made below,
         # client-side, and is not optional.
-        resp = await client.get("/api/segments", params={"type": segment_type})
+        resp = await client.get(
+            "/api/segments", params={"type": _INVENTORY_SEGMENT_TYPE}
+        )
         if resp.status_code == 404:
             # A list endpoint answers an empty result with 200 and [], so 404
             # here means the ROUTE is absent, not that there is no segment.
@@ -414,34 +417,24 @@ async def get_inventory_segment(
 
         # The cluster match, made here because the endpoint cannot make it.
         # The type is re-checked as well: an ignored or renamed filter would
-        # otherwise hand back another cluster's VLAN — or this cluster's OTHER
-        # inventory network, which would boot the host on a segment its BMC
-        # cannot be reached on.
+        # otherwise hand back another cluster's VLAN, which the caller has no
+        # way to detect.
         matches = [
             entry
             for entry in entries
-            if entry.get("cluster_name") == request.mce_cluster
-            and entry.get("type") == segment_type
+            if entry.get("cluster_name") == mce_cluster
+            and entry.get("type") == _INVENTORY_SEGMENT_TYPE
         ]
         if not matches:
-            # NOT an error. An MCE holds only the classes of inventory network
-            # it serves, so "none of this class" is a supported deployment and
-            # the workflow turns it into "this MCE takes no servers driven that
-            # way" — with the candidate passed over rather than the run failed.
-            activity.logger.info(
-                "MCE %s has no %s segment (searched %d)",
-                request.mce_cluster,
-                segment_type,
-                len(entries),
+            raise InventorySegmentNotFoundError(
+                f"MCE cluster {mce_cluster!r} has no {_INVENTORY_SEGMENT_TYPE} "
+                f"segment in the Segments Manager (searched {len(entries)} segment(s))"
             )
-            return InventorySegmentLookup(found=False)
         if len(matches) > 1:
             raise AmbiguousInventorySegmentError(
-                f"MCE cluster {request.mce_cluster!r} has {len(matches)} "
-                f"{segment_type} segments "
+                f"MCE cluster {mce_cluster!r} has {len(matches)} "
+                f"{_INVENTORY_SEGMENT_TYPE} segments "
                 f"({', '.join(str(m.get('segment')) for m in matches)}); "
                 "exactly one is required — resolve the duplicate allocation"
             )
-        return InventorySegmentLookup(
-            found=True, entry=SegmentEntry.model_validate(matches[0])
-        )
+        return SegmentEntry.model_validate(matches[0])

@@ -15,14 +15,17 @@ import pytest
 
 import activities.segment_lifecycle.activities as segment_impl
 import activities.server_lifecycle.activities as server_impl
+import activities.server_provisioning.activities as provisioning_impl
 import shared.interfaces.segment_lifecycle as segment_interface
 import shared.interfaces.server_lifecycle as server_interface
+import shared.interfaces.server_provisioning as provisioning_interface
 
 # Every domain, not just the first one written: an activity whose stub and
 # implementation disagree converts payloads silently rather than raising.
 _DOMAINS = [
     pytest.param(segment_interface, segment_impl, id="segment_lifecycle"),
     pytest.param(server_interface, server_impl, id="server_lifecycle"),
+    pytest.param(provisioning_interface, provisioning_impl, id="server_provisioning"),
 ]
 
 

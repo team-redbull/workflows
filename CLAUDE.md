@@ -37,7 +37,8 @@ docs/                             The static documentation site (its own image, 
 
 Prod charts are VENDORED into the Argo CD repo, at
 `redbull-platform/gitops/charts/<service>/`: `workflows-orchestrator` (brain: ONE release for
-all domains), `segment-lifecycle-worker` and `server-lifecycle-worker` (limbs: one per domain). One generic ApplicationSet
+all domains), `segment-lifecycle-worker`, `server-lifecycle-worker` and `server-provisioning-worker`
+(limbs: one per domain — the last NOT YET CREATED there, so CI's bump of it fails until it is). One generic ApplicationSet
 sweeps `gitops/services/<service>/app.yaml`, so the service FOLDER NAME is the Argo app name,
 the chart path and the release name at once. There is no per-environment values layer — a
 chart's own `values.yaml` is exactly what the cluster runs — and pushing redbull-platform's
@@ -120,6 +121,39 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   they go.
 
 ## 4. External dependencies are black boxes
+
+- **provision-dell-server (domain `server-provisioning`) takes a Dell from "iDRAC has an IP" to
+  "server-scan lists it"**, so install-server can draw it. Designed with the operator 2026-09-30.
+  The pieces that are decisions, not incidental:
+  - **Credentials by POSITION, never by value in history.** Root only (iDRAC user 2); the OME
+    account on the iDRAC is NEVER touched (OME would lose the machine). Candidates are
+    `IDRAC_ROOT_PASSWORD` (the one the template enforces) then `IDRAC_FACTORY_PASSWORDS` (≤2), one
+    request each — iDRAC9 blocks an address after 3 failures, so only an all-wrong round trips it,
+    and the next round waits `_LOCKOUT_WAIT` out. A machine that came in on a factory password is
+    re-discovered in OME with the target one after the template, or OME loses it.
+  - **The TEMPLATE is per (Redfish model, iDRAC firmware)** — `DELL_TEMPLATES`, no fallback.
+    It sets root's password; the run verifies that by logging in.
+  - **Storage: RAID 1 on the BOSS pair, every PERC drive Non-RAID, NEVER a delete.** Policy in
+    `storage_plan.py`; staged `OnReset` so ONE reboot applies all; after the template, so the
+    layout checked is final. An existing volume or in-use drive fails the run.
+  - **The naming service is the author of the name** (it reads OME and rounds its own way);
+    `server_namer.py` is the opening for its real contract. The run checks the name read back
+    from the OME PROFILE (what server-scan reads) against the convention, the run's region and
+    the iDRAC's service tag — never re-deriving cores/memory/disk.
+  - **Region comes from the iDRAC prefix at the API EDGE** (`regions.py`, a const), carried as
+    input — never looked up on replay.
+  - **A server server-scan lists as claimed by a cluster is refused** before anything reboots it.
+  - **Dell's own client code is the reference for every OME/iDRAC shape** — the
+    `dellemc.openmanage` collection (`docs/design/dell-ome-idrac-api.md` lists each
+    fact with its source file). Change a request only against that code, and keep
+    `tests/dell_simulator.py` in step: the e2e test runs the real limb against it.
+    Traps it found: NVMe RaidStatus lives under `DellPCIeSSD`; a PERC runs Non-RAID
+    at once (RealTimeNoRebootConfiguration) so NO reset while a job runs; a
+    templated device is `ProfileState > 0` + same `TemplateId`, and its
+    `DeploymentTaskId` is the job to wait on.
+  - **Done = server-scan lists it under that name.** server-scan discovers by itself (its OME
+    collector, every 6 h); the run polls a Mongo-backed read for up to 8 h and NEVER asks
+    server-scan to refresh or calls `/servers/available` (live vendor recheck).
 
 - **server-scan is the inventory source of record for install-server**
   (`SERVER_SCAN_URL`). The workflow makes ONE read — `GET /servers/available`
@@ -392,8 +426,8 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   global ConfigMap) — and the chart must ship the new keys BEFORE (or with) an image that requires
   them, or the worker crash-loops on its fail-fast settings.
 - **`shared/settings.py`** groups: `TemporalSettings` (workers + api.py),
-  `SegmentLifecycleActivitySettings` and `ServerLifecycleActivitySettings`
-  (each that domain's activity worker only). Field names = Helm ConfigMap/Secret keys
+  `SegmentLifecycleActivitySettings`, `ServerLifecycleActivitySettings` and
+  `ServerProvisioningActivitySettings` (each that domain's activity worker only). Field names = Helm ConfigMap/Secret keys
   lowercased — keep aligned with redbull-platform's `gitops/charts/workflows-orchestrator/templates/config.yaml`
   (global) and `gitops/charts/segment-lifecycle-worker/templates/config.yaml` (day1 URL + DHCP
   policy + the credential Secret). Which ConfigMap
@@ -433,11 +467,13 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
 
 ## 9. Deploy & run (local)
 
-- Three charts, NONE creates a Namespace (each deploys into whichever namespace the release targets —
+- Four charts, NONE creates a Namespace (each deploys into whichever namespace the release targets —
   `helm install -n <ns> [--create-namespace]`, or redbull-platform's `namespaces` release pre-creates
   it): redbull-platform's `gitops/charts/workflows-orchestrator/` (ConfigMap + brain + SA),
-  `gitops/charts/segment-lifecycle-worker/` and `gitops/charts/server-lifecycle-worker/`
-  (each: ConfigMap + Secrets + limb + SA). This repo ships NO chart at all — `helm/` is gone with
+  `gitops/charts/segment-lifecycle-worker/`, `gitops/charts/server-lifecycle-worker/` and the
+  still-to-be-written `gitops/charts/server-provisioning-worker/` (each: ConfigMap + Secrets + limb +
+  SA; the provisioning one needs no RBAC, only egress to the iDRACs, OME, the naming service and
+  server-scan). This repo ships NO chart at all — `helm/` is gone with
   the mock service it held. The server-lifecycle limb is the first to need real RBAC: it creates
   secrets, metal3.io/baremetalhosts and agent-install.openshift.io/nmstateconfigs in the target
   namespace, where segment-lifecycle only makes HTTP and git calls.

@@ -362,3 +362,159 @@ class InvalidServerNameError(OrchestratorError):
     remains is a name carrying characters Kubernetes forbids. Deterministic —
     the name is renamed in the inventory, not waited out.
     """
+
+
+# -- Server-provisioning domain (provision-dell-server) -----------------------
+
+
+class IdracError(OrchestratorError):
+    """An iDRAC answered unexpectedly or could not be reached mid-call.
+
+    Transient by classification — an iDRAC restarting to apply a job answers
+    nothing for minutes — so it is retried.
+    """
+
+
+class IdracAuthError(OrchestratorError):
+    """An iDRAC rejected a credential the run had already established works.
+
+    Deterministic: after the probe (or after the template enforced the target
+    password) a 401 means someone changed the password underneath the run.
+    Retrying would only feed the iDRAC's failed-login counter until it blocks
+    this worker's address.
+    """
+
+
+class IdracRequestRejectedError(OrchestratorError):
+    """An iDRAC refused a configuration request (400/405/409/422).
+
+    Deterministic — the same body is refused on every attempt. The iDRAC's own
+    message is in the error: a controller that does not support the requested
+    RAID level, a drive in the wrong state, a pending job on the controller.
+    """
+
+
+class IdracCredentialsMissingError(OrchestratorError):
+    """The limb has no root password configured at the position the run named.
+
+    Only possible when IDRAC_FACTORY_PASSWORDS shrinks while a run is in
+    flight. Deterministic — the run is restarted against the new config.
+    """
+
+
+class OmeError(OrchestratorError):
+    """OpenManage Enterprise answered unexpectedly or was unreachable. Retried."""
+
+
+class OmeAuthError(OrchestratorError):
+    """OME rejected OME_USERNAME/OME_PASSWORD (401/403). Deterministic."""
+
+
+class OmeRequestRejectedError(OrchestratorError):
+    """OME refused a request body (400/404/409/422). Deterministic."""
+
+
+class TemplateNotConfiguredError(OrchestratorError):
+    """DELL_TEMPLATES has no template for this (model, iDRAC firmware).
+
+    Deterministic, and deliberately not defaulted: the template sets the root
+    password and the BIOS, and one captured on other firmware can carry
+    attributes this iDRAC does not have. An operator adds the entry.
+    """
+
+
+class TemplateNotFoundError(OrchestratorError):
+    """DELL_TEMPLATES names a template OME does not hold. Deterministic."""
+
+
+class ProfileConflictError(OrchestratorError):
+    """The device already carries a profile from a DIFFERENT template.
+
+    Deterministic, and never overwritten: a machine someone templated by hand is
+    an operator's call to redo, not the workflow's.
+    """
+
+
+class ServerNamerError(OrchestratorError):
+    """The naming service answered unexpectedly or was unreachable. Retried."""
+
+
+class ServerNamerRejectedError(OrchestratorError):
+    """The naming service refused the request (4xx). Deterministic."""
+
+
+class RegionMissingError(OrchestratorError):
+    """WORKFLOW-RAISED. A run carries no region.
+
+    The router resolves one from the iDRAC prefix on every run it starts, so
+    only a run started around it gets here. The region is part of the name
+    server-scan reads the site from, so it is never guessed.
+    """
+
+
+class IdracUnreachableError(OrchestratorError):
+    """WORKFLOW-RAISED. The iDRAC never answered within the reachability deadline.
+
+    The usual cause is a mistyped IP or an iDRAC not yet cabled — the run
+    waits a while for the second, and then says so rather than run forever.
+    """
+
+
+class IdracCredentialsRejectedError(OrchestratorError):
+    """WORKFLOW-RAISED. Every configured root password was rejected, round after round.
+
+    Each round waits out the iDRAC's IP-blocking penalty first, so this is not
+    a lockout — the machine has a root password nobody configured.
+    """
+
+
+class NotADellServerError(OrchestratorError):
+    """WORKFLOW-RAISED. The address answers Redfish but is not a Dell PowerEdge."""
+
+
+class ServerAlreadyInstalledError(OrchestratorError):
+    """WORKFLOW-RAISED. server-scan says this service tag is in use by a cluster.
+
+    Checked before anything touches the machine: provisioning reboots it and
+    re-templates its BIOS, so an iDRAC IP typed one digit wrong must not take
+    down a production node.
+    """
+
+
+class OmeDiscoveryFailedError(OrchestratorError):
+    """WORKFLOW-RAISED. OME's discovery job failed, or finished without the device."""
+
+
+class TemplateDeployFailedError(OrchestratorError):
+    """WORKFLOW-RAISED. The template deployment job failed or did not finish in time."""
+
+
+class TemplatePasswordNotAppliedError(OrchestratorError):
+    """WORKFLOW-RAISED. After the template deployed, root still does not accept
+    the target password — the template does not carry it, or did not apply it."""
+
+
+class StorageLayoutUnsupportedError(OrchestratorError):
+    """WORKFLOW-RAISED. The machine's storage cannot be taken to the required
+    layout WITHOUT DESTROYING SOMETHING: no BOSS controller, a BOSS without
+    exactly two drives, a BOSS volume that is not the RAID 1, or a PERC drive
+    already in a volume. The workflow never deletes a volume."""
+
+
+class StorageJobFailedError(OrchestratorError):
+    """WORKFLOW-RAISED. A staged RAID / non-RAID job failed or did not finish in time."""
+
+
+class StorageNotConvergedError(OrchestratorError):
+    """WORKFLOW-RAISED. Every storage job completed, yet reading the storage back
+    does not show the RAID 1 on the BOSS and every PERC drive Non-RAID."""
+
+
+class ServerNameNotAppliedError(OrchestratorError):
+    """WORKFLOW-RAISED. The OME profile never carried a name matching the
+    convention for this machine (region and service tag included) in time."""
+
+
+class ServerScanNeverSawServerError(OrchestratorError):
+    """WORKFLOW-RAISED. server-scan did not collect the server under its new name
+    before the deadline, which spans more than one full collector cycle."""

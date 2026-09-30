@@ -19,12 +19,14 @@ import os
 from shared.settings import (
     SegmentLifecycleActivitySettings,
     ServerLifecycleActivitySettings,
+    ServerProvisioningActivitySettings,
     TemporalSettings,
 )
 
 for _settings_class in (
     SegmentLifecycleActivitySettings,
     ServerLifecycleActivitySettings,
+    ServerProvisioningActivitySettings,
     TemporalSettings,
 ):
     _settings_class.model_config["env_file"] = None
@@ -47,5 +49,13 @@ os.environ.update(
         "DELL_BMC_PASSWORD": "test-dell-pass",
         "HP_BMC_USERNAME": "test-hp-user",
         "HP_BMC_PASSWORD": "test-hp-pass",
+        # --- provision-dell-server: OME, iDRAC root, templates, naming service ---
+        "OME_URL": "https://ome.test",
+        "OME_USERNAME": "test-ome-user",
+        "OME_PASSWORD": "test-ome-pass",
+        "IDRAC_ROOT_PASSWORD": "target-pass",
+        "IDRAC_FACTORY_PASSWORDS": '["factory-a", "factory-b"]',
+        "DELL_TEMPLATES": '{"PowerEdge R660": {"7.10.70.00": "ocp-r660-7.10.70.00"}}',
+        "SERVER_NAMER_URL": "https://namer.test/rename",
     }
 )

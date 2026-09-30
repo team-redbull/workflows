@@ -111,20 +111,33 @@ pytest -q tests/test_provision_dell_server_e2e.py       # REAL workflow + REAL a
 - The e2e test needs `openssl` and permission to bind `127.0.0.2:443`; it
   **skips** otherwise. On a host with `HTTPS_PROXY` set it adds the simulator to
   `NO_PROXY` itself, because httpx ignores CIDR entries there.
+- **On macOS that skip is unavoidable, so run the e2e module in a Linux
+  container.** A Mac gives neither half: 443 is privileged, and `127.0.0.2` is
+  not on `lo0` unless someone aliases it. Linux needs neither — the whole of
+  127/8 is local and a container's root may bind 443:
+
+  ```bash
+  podman run --rm -v "$PWD":/app:z -w /app python:3.12-slim bash -lc '
+    apt-get update -qq && apt-get install -y -qq openssl
+    pip install -q -r requirements-dev.txt && python -m pytest -q'
+  ```
+
 - The Temporal-based tests download Temporal's test server from
-  `temporal.download` on first use. The first session could not reach it, so
-  those tests have **never run under real Temporal**. They were run through an
-  in-process stand-in instead (same test cases, real code, faked
-  execute_activity/sleep/now): 16/16 workflow cases and 5/5 e2e scenarios pass.
-  The workflow also passes Temporal's sandbox validation. **Run them for real
-  first** and fix anything that differs.
-- To prove the simulator can catch a real bug, put a known bug back (e.g. read
-  RaidStatus only from `DellPhysicalDisk`) and check that the e2e test fails.
+  `temporal.download` on first use. **They now run against it** (temporalio
+  1.33.0): the whole suite is **367 passed, 0 skipped**, the 16 workflow cases
+  and all 5 e2e scenarios included. Time skipping is what makes that take 20 s
+  rather than hours: the workflow's own waits are minutes apart, up to
+  `_SERVER_SCAN_POLL`'s 10 min inside an 8 h deadline. A wall-clock Temporal
+  would run the same scenarios in real time, so it is not a faster substitute.
+- The e2e test is not vacuous: reading RaidStatus only from `DellPhysicalDisk`
+  (the real bug the API review found) fails 3 of its 5 scenarios with exactly
+  the `StorageLayoutUnsupportedError` that `dell-ome-idrac-api.md` predicts.
+  Re-do that check after changing the simulator.
 
 ### Open work, in order
 
-1. Run the full suite under real Temporal. Open a PR from
-   `claude/ome-api-verification` (it contains the first commit) once green.
+1. ~~Run the full suite under real Temporal~~ — done, green, nothing differed.
+   Open a PR from `claude/ome-api-verification` (it contains the first commit).
 2. Put the naming service's real contract into `server_namer.py`.
 3. Replace the placeholder prefixes in `regions.py` with the real iDRAC networks
    and server-scan site codes.

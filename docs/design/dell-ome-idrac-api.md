@@ -85,12 +85,17 @@ only managing a machine whose root password it holds.
 
 ## Still unverified: check these on the first real server
 
-- **The template must not carry RAID/storage components.** Dell's own SCP sample
-  in `ome_template.py` includes `RAIDresetConfig=True` and
-  `RAIDforeignConfig=Clear`. A template captured from a reference server can
-  therefore **wipe the controller** when deployed. Strip storage components
-  from the templates in `DELL_TEMPLATES`.
-- The template must set the iDRAC root (user 2) password, and only that user.
+- ~~**The template must not carry RAID/storage components.**~~ **Settled
+  2026-09-30** — this suspicion was right, for two independent reasons, and the
+  run now refuses such a template outright rather than trusting an operator to
+  strip it. See [`dell-scp-template-r660.md`](dell-scp-template-r660.md), which
+  also covers what else a template must not carry (iDRAC network settings, user
+  accounts) and why a template is NOT tied to the firmware it was captured on.
+- ~~The template must set the iDRAC root (user 2) password, and only that user.~~
+  **Superseded 2026-09-30:** the template no longer sets it at all. Root's
+  password is applied over Redfish (`Accounts/2`) before OME discovers the
+  machine, which removed the `rediscovering-in-ome` phase and the firmware
+  fragility of KB 000326070.
 - Which `ProfileState` a deployed profile really reaches in this OME version,
   and whether the naming service renames with the same `PUT` as above.
 - Whether this OME version answers the `$filter=TargetId eq <n>` on

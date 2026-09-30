@@ -145,8 +145,9 @@ class World:
 
 
 @pytest.fixture
-def world(certificate, monkeypatch) -> Iterator[World]:
-    idrac = sim.IdracSim(root_password="calvin")
+def world(request, certificate, monkeypatch) -> Iterator[World]:
+    generation = getattr(request, "param", 9)
+    idrac = sim.IdracSim.for_generation(generation, root_password="calvin")
     ome = sim.OmeSim(idrac=idrac, idrac_ip=IDRAC_IP, template_root_password=TARGET)
     scan = sim.ScanSim(ome=ome)
     port = _free_port()
@@ -226,7 +227,8 @@ async def test_a_factory_fresh_server_is_provisioned_end_to_end(world: World):
     # The factory OS hostname is gone, so OME shows the machine's address next
     # to its profile. Cleared before OME ever discovered it.
     assert world.idrac.os_hostname == "" and result.os_hostname_cleared
-    assert result.profile_name == f"ocp-dell-r660-{REGION}-128c-1024gb-10tb-{world.idrac.service_tag}"
+    token = world.idrac.model.split()[-1].lower()
+    assert result.profile_name == f"ocp-dell-{token}-{REGION}-128c-1024gb-10tb-{world.idrac.service_tag}"
     # The run finished on its own configuration work. server-scan has not
     # collected the machine yet (its simulator needs 3 reads), and that is
     # deliberately not something the run waits for.
@@ -250,13 +252,12 @@ async def test_a_factory_fresh_server_is_provisioned_end_to_end(world: World):
     assert [d.status for d in perc] == ["NonRAID"] * 4
     assert result.boss_raid1_created and result.non_raid_drives_converted == 4
 
-    # The template said System Profile should be PerfOptimized; the machine
-    # came with PerfPerWattOptimizedOs and the deployment did not change it.
-    # The run found that, staged it over Redfish, and the SAME reboot applied
-    # it alongside the RAID — the profile was deployed exactly once.
+    # The template deployment really did apply its BIOS attributes, so the
+    # verification finds nothing to fix and nothing is staged over Redfish.
     assert world.idrac.bios["SysProfile"] == "PerfOptimized"
-    assert world.idrac.bios_pending == {}
-    assert result.bios_attributes_remediated == 1
+    assert "System Profile" in world.ome.template_applied
+    assert result.bios_attributes_checked == 2
+    assert result.bios_attributes_remediated == 0
     assert result.bios_attributes_unverified == 0
     assert world.ome.deploy_calls == 1
 
@@ -335,3 +336,124 @@ async def test_a_template_carrying_the_idracs_own_address_is_refused(world: Worl
     assert world.idrac.password_writes == []
     assert world.idrac.os_hostname == "Miniwinpc"
     assert world.ome.discovery_posts == [] and world.ome.deploy_calls == 0
+
+
+@pytest.mark.parametrize("world", [9, 10], indirect=True)
+async def test_both_supported_idrac_generations_are_provisioned(world: World):
+    """iDRAC9 and iDRAC10 put the root account in different places — 9 under the
+    Manager, 10 under AccountService — and the limb has to find it without being
+    told which machine it is talking to."""
+    result = await _run()
+
+    assert result.model == world.idrac.model
+    assert world.idrac.root_password == TARGET
+    assert world.idrac.password_writes == [TARGET]
+    # Whichever collection this generation serves, exactly one was written.
+    assert len(world.ome.discovery_posts) == 1
+    token = world.idrac.model.split()[-1].lower()
+    assert result.profile_name.startswith(f"ocp-dell-{token}-")
+
+
+async def test_a_setting_the_deployment_silently_skipped_is_fixed(world: World):
+    """The case the whole verification exists for.
+
+    SCP import is a "continue on error" operation: the job reports Completed
+    while one attribute never applied. Nothing in OME says so — only reading the
+    value back does.
+    """
+    world.ome.template_apply_failures = {"System Profile"}
+    result = await _run()
+
+    # The deployment claimed success and did apply the rest.
+    assert world.ome.deploy_calls == 1
+    assert world.ome.template_applied == ["Boot Mode"]
+    # The run caught it, staged it over Redfish, and the storage reboot applied it.
+    assert result.bios_attributes_remediated == 1
+    assert world.idrac.bios["SysProfile"] == "PerfOptimized"
+    assert world.idrac.bios_pending == {}
+    # Fixed by modifying the setting, NOT by redeploying the profile.
+    assert world.ome.deploy_calls == 1
+
+
+async def test_an_attribute_this_firmware_lacks_is_reported_not_failed(world: World):
+    """A template built for another firmware level names attributes the target
+    does not have. Dell's documented consequence, and a coverage gap to report
+    rather than a machine to fail."""
+    world.ome.template_attribute_groups.append(
+        {
+            "DisplayName": "BIOS",
+            "SubAttributeGroups": [
+                {
+                    "DisplayName": "Newer Firmware Only",
+                    "SubAttributeGroups": [],
+                    "Attributes": [
+                        {"AttributeId": 99, "DisplayName": "Some New Knob",
+                         "Value": "Enabled", "IsIgnored": False},
+                    ],
+                }
+            ],
+        }
+    )
+    result = await _run()
+
+    assert result.bios_attributes_unverified == 1
+    assert result.bios_attributes_remediated == 0
+    assert "Some New Knob" not in world.ome.template_applied
+
+
+@pytest.mark.parametrize("world", [8], indirect=True)
+async def test_an_idrac8_machine_fails_loudly_rather_than_misconfiguring(world: World):
+    """The honest boundary of this workflow.
+
+    iDRAC8 takes `VolumeType: Mirrored` where iDRAC9 takes `RAIDType: RAID1`
+    (Dell's redfish_storage_volume switches on firmware > 3.0), and the limb only
+    speaks the modern form. That is fine — the fleet is R660s — but it has to
+    fail by NAME rather than leave a half-configured machine, and it must fail
+    before the reboot rather than after it.
+
+    Everything up to storage works on an iDRAC8, which is what makes this worth
+    pinning: the root account, the hostname and the template all behave.
+    """
+    error = await _failure()
+
+    assert error.type == "IdracRequestRejectedError"
+    assert "RAIDType" in error.message
+    # It got far enough to prove the rest of the generation handling works...
+    assert world.idrac.password_writes == [TARGET]
+    assert world.idrac.os_hostname == ""
+    assert world.ome.deploy_calls == 1
+    # ...and stopped before touching the machine's storage or rebooting it.
+    assert world.idrac.volumes[sim.BOSS] == [] and world.idrac.resets == []
+
+
+async def test_an_idrac_that_restarts_after_the_template_is_waited_out(world: World):
+    """Applying a template rewrites the iDRAC's own settings, and it restarts.
+    Every call in that window fails; the run has to wait rather than give up,
+    which is what verifying-root-password's 20-minute poll is for."""
+    world.idrac.restart_after_template = 4
+    result = await _run()
+
+    assert result.service_tag == world.idrac.service_tag
+    assert world.idrac.unavailable_for == 0
+    assert world.ome.deploy_calls == 1
+
+
+async def test_a_drive_with_a_foreign_config_is_never_wiped(world: World):
+    """The domain's hardest rule: the run never destroys data.
+
+    A drive carrying a foreign RAID configuration is a machine that was in use
+    somewhere else. Clearing it is a person's decision, so the run stops before
+    staging anything and says what it found.
+    """
+    perc = next(d for d in world.idrac.drives if d.controller == sim.PERC)
+    perc.status = "Foreign"
+
+    error = await _failure()
+
+    assert error.type == "StorageLayoutUnsupportedError"
+    assert "Foreign" in error.message
+    # Nothing staged, nothing rebooted, no volume created.
+    assert world.idrac.jobs == {} and world.idrac.resets == []
+    assert world.idrac.volumes[sim.BOSS] == []
+    # The drive is exactly as it was found.
+    assert perc.status == "Foreign"

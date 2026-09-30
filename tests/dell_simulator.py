@@ -28,6 +28,26 @@ reset running the staged jobs, OME only managing a machine whose root password
 it knows, the template enforcing root's password, and server-scan listing the
 server only after its next collection.
 
+FOUR BEHAVIOURS THAT ONLY REAL HARDWARE USUALLY SHOWS, modelled because the
+workflow exists to survive them:
+
+  * GENERATIONS. `IdracSim.for_generation(8|9|10)` picks the model, firmware and
+    Redfish surfaces of that vintage. iDRAC8/9 keep the root account under the
+    MANAGER and iDRAC10 under `AccountService`; both collections are routed and
+    the wrong one 404s, which is what the limb's fallback has to cope with.
+    iDRAC8 also rejects `RAIDType` on a volume (it wants `VolumeType`), which is
+    the honest boundary of what this workflow can provision.
+  * CONTINUE ON ERROR. A template deployment applies the BIOS attributes the
+    machine's registry knows and SKIPS the rest, then reports Completed anyway
+    — Dell's documented behaviour, and the entire reason `verifying-config`
+    exists. `template_apply_failures` makes a named attribute fail while the
+    job still succeeds.
+  * A RESTARTING iDRAC. `restart_after_template` makes it answer 503 for a few
+    requests once the template has rewritten its own settings, which is why
+    verifying-root-password polls instead of asking once.
+  * FOREIGN CONFIGURATION. A drive can carry one, and the run must refuse the
+    machine rather than clear it.
+
 Time is counted in REQUESTS, never seconds: the workflow runs on durable
 timers that the test environment skips, so a wall-clock rule here would never
 advance.
@@ -48,8 +68,12 @@ from fastapi.responses import JSONResponse, Response
 SYSTEM = "/redfish/v1/Systems/System.Embedded.1"
 MANAGER = "/redfish/v1/Managers/iDRAC.Embedded.1"
 JOBS = f"{MANAGER}/Jobs"
-# iDRAC9 keeps its accounts under the MANAGER, not AccountService (iDRAC10 does).
+# iDRAC8 and iDRAC9 keep their accounts under the MANAGER; iDRAC10 moved them to
+# the standard AccountService collection. The simulator serves BOTH and 404s the
+# one this generation does not have, which is what the real appliances do and
+# what the limb's fallback has to cope with.
 ROOT_ACCOUNT = f"{MANAGER}/Accounts/2"
+ROOT_ACCOUNT_IDRAC10 = "/redfish/v1/AccountService/Accounts/2"
 SYSTEM_ATTRIBUTES = f"{MANAGER}/Oem/Dell/DellAttributes/System.Embedded.1"
 BOSS = "BOSS.SL.14-1"
 PERC = "RAID.SL.3-1"
@@ -97,12 +121,29 @@ class Job:
         }
 
 
+# (model, iDRAC firmware) per generation, so a test can ask for a machine of a
+# given vintage instead of hand-picking strings. The model is what Dell's own
+# client parses to decide which Redfish surfaces exist: 12G/13G -> iDRAC8,
+# 14G/15G/16G -> iDRAC9, 17G and later -> iDRAC10.
+GENERATIONS = {
+    8: ("PowerEdge R630", "2.83.83.83"),
+    9: ("PowerEdge R660", "7.10.70.00"),
+    10: ("PowerEdge R770", "1.10.00.00"),
+}
+
+
 @dataclass
 class IdracSim:
-    """One PowerEdge R660: a BOSS-N1 pair, a PERC with three SAS drives and one
-    NVMe drive, and a CPU-attached NVMe controller that has no RAID at all."""
+    """One PowerEdge: a BOSS-N1 pair, a PERC with three SAS drives and one NVMe
+    drive, and a CPU-attached NVMe controller that has no RAID at all.
+
+    `generation` decides which Redfish surfaces the machine serves — see
+    GENERATIONS and `for_generation`. The default is an iDRAC9 R660, which is
+    the fleet this workflow provisions.
+    """
 
     service_tag: str = "7XK2QF3"
+    generation: int = 9
     model: str = "PowerEdge R660"
     firmware: str = "7.10.70.00"
     root_password: str = "calvin"
@@ -115,6 +156,12 @@ class IdracSim:
     boss_raid_types: list[str] = field(default_factory=lambda: ["RAID1"])
     failures: int = 0
     blocked_for: int = 0
+    # The iDRAC restarting after the template rewrote its own settings: it
+    # answers 503 for this many requests, then comes back. Real, and the reason
+    # verifying-root-password polls for 20 minutes instead of asking once.
+    unavailable_for: int = 0
+    # How many requests the iDRAC is unavailable for once the template applies.
+    restart_after_template: int = 0
     resets: list[str] = field(default_factory=list)
     login_attempts: list[str] = field(default_factory=list)
     # Every password this machine's root account was set to, in order.
@@ -149,6 +196,16 @@ class IdracSim:
     volumes: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     jobs: dict[str, Job] = field(default_factory=dict)
 
+    @classmethod
+    def for_generation(cls, generation: int, **kwargs: Any) -> IdracSim:
+        """A machine of that vintage, with the model and firmware to match."""
+        model, firmware = GENERATIONS[generation]
+        return cls(generation=generation, model=model, firmware=firmware, **kwargs)
+
+    @property
+    def root_account_path(self) -> str:
+        return ROOT_ACCOUNT_IDRAC10 if self.generation >= 10 else ROOT_ACCOUNT
+
     def __post_init__(self) -> None:
         if not self.drives:
             self.drives = [
@@ -164,6 +221,9 @@ class IdracSim:
     # --- auth: HTTP Basic, with iDRAC9's IP block ----------------------------
 
     def authenticate(self, request: Request) -> Response | None:
+        if self.unavailable_for > 0:
+            self.unavailable_for -= 1
+            return _error(503, "The iDRAC is restarting and cannot serve requests.", "RAC0503")
         header = request.headers.get("authorization", "")
         password = ""
         if header.startswith("Basic "):
@@ -220,6 +280,14 @@ class OmeSim:
     template_id: int = 25
     # The root password the template's iDRAC user-2 attribute carries.
     template_root_password: str = "Target-Pw1"
+    # Display names the SCP import will silently fail to apply even though the
+    # machine HAS the attribute. This is the "continue on error" behaviour Dell
+    # documents: the job still reports Completed, and only reading the values
+    # back reveals it (SCP-RG §2.5).
+    template_apply_failures: set[str] = field(default_factory=set)
+    # Every display name a deployment actually wrote, in order — so a test can
+    # assert what the template did rather than infer it.
+    template_applied: list[str] = field(default_factory=list)
     device_id: int | None = None
     device_credential: str | None = None
     groups: list[dict[str, Any]] = field(default_factory=list)
@@ -250,6 +318,44 @@ class OmeSim:
             }
         ]
     )
+
+    def apply_template_bios(self, idrac: IdracSim) -> None:
+        """Push the template's BIOS attributes, exactly as an SCP import does.
+
+        An attribute the machine's BIOS registry does not carry is SKIPPED —
+        that is what a template built for another firmware level looks like,
+        and Dell's own guidance says the import "could complete with errors and
+        be unable to apply attribute changes because the older iDRAC version may
+        not support all attributes". Nothing about the job status shows it.
+        """
+        by_display = {e["DisplayName"]: e for e in idrac.bios_registry}
+        for display, value in self.template_bios_intent().items():
+            entry = by_display.get(display)
+            if entry is None or entry.get("ReadOnly") or display in self.template_apply_failures:
+                continue
+            resolved = next(
+                (v["ValueName"] for v in entry.get("Value") or [] if v["ValueDisplayName"] == value),
+                value,
+            )
+            idrac.bios[entry["AttributeName"]] = resolved
+            self.template_applied.append(display)
+
+    def template_bios_intent(self) -> dict[str, str]:
+        """The BIOS attributes this template would deploy, by display name."""
+        intent: dict[str, str] = {}
+
+        def walk(groups: list[dict[str, Any]], path: str) -> None:
+            for group in groups:
+                here = f"{path},{group['DisplayName']}" if path else group["DisplayName"]
+                if group.get("SubAttributeGroups"):
+                    walk(group["SubAttributeGroups"], here)
+                    continue
+                for attribute in group.get("Attributes") or []:
+                    if "bios" in here.lower() and not attribute.get("IsIgnored"):
+                        intent[attribute["DisplayName"]] = attribute.get("Value")
+
+        walk(self.template_attribute_groups, "")
+        return intent
 
     def new_job(self, reads: int, on_done: Any) -> int:
         job_id = next(_ids)
@@ -337,17 +443,36 @@ def idrac_app(sim: IdracSim) -> FastAPI:
             sim.os_hostname = str(attributes["ServerOS.1.HostName"])
         return {"Attributes": attributes}
 
-    @app.get(ROOT_ACCOUNT)
-    async def root_account():
+    def _account(path: str) -> Response | dict[str, Any]:
+        if path != sim.root_account_path:
+            return _error(404, f"Resource {path} not found on this iDRAC generation")
         return {"Id": "2", "UserName": "root", "RoleId": "Administrator"}
 
-    @app.patch(ROOT_ACCOUNT)
-    async def patch_root_account(request: Request):
+    async def _set_password(path: str, request: Request) -> Response | dict[str, Any]:
+        if path != sim.root_account_path:
+            return _error(404, f"Resource {path} not found on this iDRAC generation")
         body = await request.json()
         if "Password" in body:
             sim.root_password = str(body["Password"])
             sim.password_writes.append(sim.root_password)
         return {"Id": "2", "UserName": "root"}
+
+    # BOTH collections are routed; only the one this generation has answers.
+    @app.get(ROOT_ACCOUNT)
+    async def manager_account():
+        return _account(ROOT_ACCOUNT)
+
+    @app.patch(ROOT_ACCOUNT)
+    async def patch_manager_account(request: Request):
+        return await _set_password(ROOT_ACCOUNT, request)
+
+    @app.get(ROOT_ACCOUNT_IDRAC10)
+    async def service_account():
+        return _account(ROOT_ACCOUNT_IDRAC10)
+
+    @app.patch(ROOT_ACCOUNT_IDRAC10)
+    async def patch_service_account(request: Request):
+        return await _set_password(ROOT_ACCOUNT_IDRAC10, request)
 
     @app.get(f"{SYSTEM}/Bios")
     async def bios():
@@ -416,6 +541,22 @@ def idrac_app(sim: IdracSim) -> FastAPI:
         body = await request.json()
         if sim.pending_on(controller):
             return _error(400, f"A configuration job already exists for {controller}.", "STOR023")
+        # Dell's redfish_storage_volume uses RAIDType only on iDRAC firmware
+        # LATER THAN 3.0; before that the property is VolumeType ("Mirrored"
+        # rather than "RAID1"). An iDRAC8 therefore rejects the modern payload,
+        # which is the real boundary of what this workflow can provision.
+        #
+        # Keyed on the GENERATION, not on the firmware string, and that is not
+        # pedantry: iDRAC10 restarted its version numbering at 1.x, so
+        # "firmware > 3.0" read literally would class the NEWEST machines as the
+        # oldest. Anything comparing Dell firmware numbers across generations
+        # has the same trap waiting in it.
+        if sim.generation <= 8 and "RAIDType" in body:
+            return _error(
+                400,
+                "The property RAIDType is not supported by this iDRAC firmware; use VolumeType.",
+                "STOR016",
+            )
         if body.get("RAIDType") not in (sim.boss_raid_types if controller == BOSS else ["RAID1"]):
             return _error(400, f"RAIDType {body.get('RAIDType')} is not supported.", "STOR016")
         if controller == BOSS and body.get("@Redfish.OperationApplyTime") != "OnReset":
@@ -606,7 +747,12 @@ def services_app(ome: OmeSim, scan: ScanSim, region_names: dict[str, str] | None
             if ome.device_credential != idrac.root_password:
                 return (2070, "Failed")
             idrac.root_password = ome.template_root_password
+            ome.apply_template_bios(idrac)
+            idrac.unavailable_for = idrac.restart_after_template
             profile["ProfileState"] = 4
+            # Completed EVEN IF attributes failed: SCP import is a "continue on
+            # error" operation, which is the whole reason the run reads the
+            # values back instead of trusting this status.
             return (2060, "Completed")
 
         job_id = ome.new_job(3, done)
@@ -623,7 +769,12 @@ def services_app(ome: OmeSim, scan: ScanSim, region_names: dict[str, str] | None
         body = await request.json()
         profile = next(p for p in ome.profiles if p["TargetId"] == body["ome_device_id"] and p["ProfileState"] > 0)
         # The service reads cores/memory/disks from OME and rounds them itself.
-        profile["ProfileName"] = f"ocp-dell-r660-{body['region']}-128c-1024gb-10tb-{idrac.service_tag}"
+        # The model token comes from the machine, so this follows whichever
+        # generation the test asked for.
+        token = idrac.model.split()[-1].lower()
+        profile["ProfileName"] = (
+            f"ocp-dell-{token}-{body['region']}-128c-1024gb-10tb-{idrac.service_tag}"
+        )
         return {"renamed": profile["ProfileName"]}
 
     @app.get("/scan/api/v1/servers")

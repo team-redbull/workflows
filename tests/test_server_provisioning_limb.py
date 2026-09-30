@@ -477,6 +477,59 @@ def _server(server_id: str, name: str, serial: str, state: str = "AVAILABLE", cl
     }
 
 
+class TestTemplateAttributes:
+    """OME reports nested AttributeGroups; the walker flattens them the way
+    Dell's own ome_template.py recurse_subattr_list does."""
+
+    @respx.mock
+    async def test_nested_groups_are_flattened_with_their_display_path(self):
+        _login()
+        respx.get(f"{API}/TemplateService/Templates(25)/AttributeDetails").mock(
+            return_value=httpx.Response(200, json={"AttributeGroups": [
+                {"DisplayName": "iDRAC", "SubAttributeGroups": [
+                    {"DisplayName": "IPv4 Information", "SubAttributeGroups": [], "Attributes": [
+                        {"AttributeId": 7, "DisplayName": "Address", "Value": "10.0.0.5", "IsIgnored": False},
+                    ]},
+                ]},
+                {"DisplayName": "BIOS", "SubAttributeGroups": [
+                    {"DisplayName": "Boot Settings", "SubAttributeGroups": [], "Attributes": [
+                        {"AttributeId": 8, "DisplayName": "Boot Mode", "Value": "Uefi", "IsIgnored": True},
+                    ]},
+                ]},
+            ]})
+        )
+        async with ome.session(OME, "u", "p") as client:
+            attributes = await ome.template_attributes(client, 25)
+        assert [(a.group, a.name, a.is_ignored) for a in attributes] == [
+            ("iDRAC,IPv4 Information", "Address", False),
+            ("BIOS,Boot Settings", "Boot Mode", True),
+        ]
+        assert attributes[0].describe() == "iDRAC,IPv4 Information,Address"
+
+    @respx.mock
+    async def test_a_group_with_no_subgroups_carries_its_attributes_directly(self):
+        _login()
+        respx.get(f"{API}/TemplateService/Templates(25)/AttributeDetails").mock(
+            return_value=httpx.Response(200, json={"AttributeGroups": [
+                {"DisplayName": "System", "SubAttributeGroups": [], "Attributes": [
+                    {"AttributeId": 1, "DisplayName": "Asset Tag", "Value": None, "IsIgnored": False},
+                ]},
+            ]})
+        )
+        async with ome.session(OME, "u", "p") as client:
+            attributes = await ome.template_attributes(client, 25)
+        assert [(a.group, a.name, a.value) for a in attributes] == [("System", "Asset Tag", None)]
+
+    @respx.mock
+    async def test_a_template_with_no_attributes_reads_as_empty(self):
+        _login()
+        respx.get(f"{API}/TemplateService/Templates(25)/AttributeDetails").mock(
+            return_value=httpx.Response(200, json={})
+        )
+        async with ome.session(OME, "u", "p") as client:
+            assert await ome.template_attributes(client, 25) == []
+
+
 class TestServerScan:
     NAME = "ocp-dell-r660-israel-128c-1024gb-10tb-ABC1234"
 

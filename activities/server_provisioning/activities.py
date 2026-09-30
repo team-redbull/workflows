@@ -36,12 +36,14 @@ from shared.models.server_provisioning import (
     OmeJobState,
     OmeProfile,
     OmeProfileRef,
+    OmeTemplateRef,
     RebootResult,
     ServerNameRequest,
     ServerScanLookup,
     ServerScanState,
     StorageConfigRequest,
     StorageLayout,
+    TemplateContents,
     TemplateDeployRequest,
     TemplateDeployResult,
 )
@@ -63,6 +65,18 @@ def _password(ref: IdracRef) -> str:
 
 def _ome_session():
     return ome.session(_settings.ome_url, _settings.ome_username, _settings.ome_password)
+
+
+def _template_name(model: str, idrac_firmware: str) -> str:
+    """The template DELL_TEMPLATES configures for this machine. No fallback."""
+    by_firmware = _settings.dell_templates.get(model) or {}
+    template_name = by_firmware.get(idrac_firmware)
+    if not template_name:
+        raise TemplateNotConfiguredError(
+            f"DELL_TEMPLATES has no template for {model!r} on iDRAC firmware "
+            f"{idrac_firmware!r} (configured for this model: {sorted(by_firmware) or 'none'})"
+        )
+    return template_name
 
 
 # --- iDRAC -------------------------------------------------------------------
@@ -213,14 +227,7 @@ async def get_ome_job(ref: OmeJobRef) -> OmeJobState:
 @activity.defn
 async def deploy_ome_template(request: TemplateDeployRequest) -> TemplateDeployResult:
     """Deploy the configured template for (model, iDRAC firmware) to the device."""
-    by_firmware = _settings.dell_templates.get(request.model) or {}
-    template_name = by_firmware.get(request.idrac_firmware)
-    if not template_name:
-        raise TemplateNotConfiguredError(
-            f"DELL_TEMPLATES has no template for {request.model!r} on iDRAC firmware "
-            f"{request.idrac_firmware!r} (configured for this model: "
-            f"{sorted(by_firmware) or 'none'})"
-        )
+    template_name = _template_name(request.model, request.idrac_firmware)
     async with _ome_session() as client:
         template_id = await ome.find_template_id(client, template_name)
         job_id = await ome.deploy_template(client, template_id, template_name, request.device_id)
@@ -232,6 +239,26 @@ async def deploy_ome_template(request: TemplateDeployRequest) -> TemplateDeployR
         f"job {job_id}" if job_id is not None else "already deployed",
     )
     return TemplateDeployResult(template_name=template_name, template_id=template_id, job_id=job_id)
+
+
+@activity.defn
+async def read_ome_template(ref: OmeTemplateRef) -> TemplateContents:
+    """Every attribute the configured template would deploy, for the audit."""
+    template_name = _template_name(ref.model, ref.idrac_firmware)
+    async with _ome_session() as client:
+        template_id = await ome.find_template_id(client, template_name)
+        attributes = await ome.template_attributes(client, template_id)
+    deployable = sum(1 for attribute in attributes if not attribute.is_ignored)
+    activity.logger.info(
+        "Template %s (id %d): %d attribute(s), %d deployed",
+        template_name,
+        template_id,
+        len(attributes),
+        deployable,
+    )
+    return TemplateContents(
+        template_id=template_id, template_name=template_name, attributes=attributes
+    )
 
 
 @activity.defn

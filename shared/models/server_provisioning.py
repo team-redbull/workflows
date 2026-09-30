@@ -183,6 +183,43 @@ class RebootResult(BaseModel):
     reset_type: str | None = None
 
 
+class TemplateAttribute(BaseModel):
+    """One attribute an OME template would deploy.
+
+    As `TemplateService/Templates({id})/AttributeDetails` reports it: OME gives
+    the GUI's display names rather than the SCP attribute names, so `group` is
+    the joined path of the nested AttributeGroups ("iDRAC,IPv4 Information")
+    and `name` the leaf DisplayName ("Address"). `template_policy.py` matches
+    on both — there is no stable id to key on.
+    """
+
+    attribute_id: int | None = None
+    name: str
+    group: str = ""
+    value: str | None = None
+    # OME's own "capture it but do not deploy it" flag. An ignored attribute is
+    # not applied, so it is never a hazard.
+    is_ignored: bool = False
+
+    def describe(self) -> str:
+        return f"{self.group},{self.name}" if self.group else self.name
+
+
+class TemplateContents(BaseModel):
+    """What a template would deploy, for the audit that runs before it does."""
+
+    template_id: int
+    template_name: str
+    attributes: list[TemplateAttribute] = Field(default_factory=list)
+
+
+class OmeTemplateRef(BaseModel):
+    """Which template to read, named the way DELL_TEMPLATES names it."""
+
+    model: str
+    idrac_firmware: str
+
+
 class OmeDeviceRef(BaseModel):
     service_tag: str
 

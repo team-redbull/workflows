@@ -17,6 +17,9 @@ Shape of the run:
                             Dell PowerEdge.
      checking-server-scan — and must not be a server a cluster is using:
                             everything after this reboots it.
+     auditing-template    — the template must carry no iDRAC network settings,
+                            no storage and no user accounts. Checked before the
+                            run writes ANYTHING (template_policy.py).
      clearing-os-hostname — blank the factory OS hostname (`Miniwinpc`), or
                             OME shows it instead of the machine's address.
      enforcing-root-password — root goes onto the target password HERE, over
@@ -114,6 +117,7 @@ with workflow.unsafe.imports_passed_through():
         TemplateNotConfiguredError,
         TemplateNotFoundError,
         TemplatePasswordNotAppliedError,
+        TemplateUnsafeError,
     )
     from shared.interfaces.server_provisioning import (
         apply_staged_idrac_jobs,
@@ -127,6 +131,7 @@ with workflow.unsafe.imports_passed_through():
         get_ome_profile,
         probe_idrac_credentials,
         read_idrac_identity,
+        read_ome_template,
         read_storage_layout,
         request_server_name,
         set_idrac_root_password,
@@ -148,6 +153,7 @@ with workflow.unsafe.imports_passed_through():
         OmeDiscoveryRequest,
         OmeJobRef,
         OmeProfileRef,
+        OmeTemplateRef,
         ProvisionDellServerProgress,
         ProvisionDellServerResult,
         ProvisionDellServerRunArgs,
@@ -156,6 +162,10 @@ with workflow.unsafe.imports_passed_through():
         StorageConfigRequest,
         StorageLayout,
         TemplateDeployRequest,
+    )
+    from workflow_domains.server_provisioning.template_policy import (
+        audit_template,
+        describe_hazards,
     )
     from workflow_domains.server_provisioning.server_name import (
         model_token,
@@ -291,6 +301,26 @@ class ProvisionDellServerWorkflow:
                 f"{identity.service_tag} at {idrac_ip} is {known.claimed_by} according to "
                 f"server-scan (as {known.name!r}) — refusing to reprovision a server in use",
                 ServerAlreadyInstalledError,
+            )
+
+        # Step 2b2 — the template must be safe to deploy, checked BEFORE the run
+        # writes anything at all. The worst thing a template can carry is the
+        # reference server's iDRAC network configuration: deploying it moves
+        # this machine's address, or resets it to DHCP, and nothing remote can
+        # get it back. Failing here costs nothing — not a password change, not a
+        # hostname, not an OME device.
+        self._phase("auditing-template")
+        template = await self._run(
+            read_ome_template,
+            OmeTemplateRef(model=identity.model, idrac_firmware=identity.idrac_firmware),
+        )
+        self._progress.template_name = template.template_name
+        hazards = audit_template(template.attributes)
+        if hazards:
+            raise _fail(
+                f"Template {template.template_name!r} carries {len(hazards)} attribute(s) this "
+                f"workflow refuses to deploy — {describe_hazards(hazards)}",
+                TemplateUnsafeError,
             )
 
         # Step 2c — blank the factory OS hostname. AFTER the in-use guard above,

@@ -150,6 +150,20 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
     `Set On Import: False` — so a golden template per model is technically sound; the key stays
     exact until `verifying-config` has measured what real batches differ by. See
     `docs/design/dell-scp-template-r660.md`.
+  - **A template must carry NO iDRAC network settings, NO storage and NO `Users.*`**, and the run
+    AUDITS it before deploying rather than trusting an operator to have stripped them
+    (`template_policy.py`, phase `auditing-template`, `TemplateUnsafeError`). The audit runs
+    BEFORE the run writes anything at all — no password change, no hostname, no OME device —
+    because the worst hazard is unrecoverable remotely: a template carrying the reference
+    server's iDRAC address moves or DHCPs every target's iDRAC, and the machine is then reachable
+    only at the rack. Storage either wipes the controller (Clone/Replace exports set
+    `RAIDresetConfig=True`) or fails outright on OME 4.5.x (KB 000384312 drops every
+    `IncludedPhysicalDiskID` after the first, and our BOSS mirror spans two) — which is why RAID
+    is built over Redfish. Matching is on OME's DISPLAY names, not SCP attribute names, because
+    `AttributeDetails` reports what the GUI shows and there is no stable id to key on; the rules
+    are deliberately generous, since a false positive fails a run with the offending attributes
+    named while a false negative strands a machine. An attribute marked `IsIgnored` is not
+    deployed, so it is not a hazard.
   - **The factory OS hostname is blanked** (`Miniwinpc`), unconditionally, after the in-use guard
     and before OME discovery: while one is set OME shows it instead of the machine's address next
     to the profile. A machine being provisioned has no OS, so anything there is stale.

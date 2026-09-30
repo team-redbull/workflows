@@ -70,6 +70,7 @@ LIMB_ACTIVITIES = [
     limb.start_ome_discovery,
     limb.get_ome_job,
     limb.deploy_ome_template,
+    limb.read_ome_template,
     limb.get_ome_profile,
     limb.request_server_name,
     limb.find_in_server_scan,
@@ -289,3 +290,36 @@ async def test_a_boss_without_raid1_fails_before_anything_is_staged(world: World
     error = await _failure()
     assert error.type == "IdracRequestRejectedError"
     assert world.idrac.jobs == {} and world.idrac.resets == []
+
+
+async def test_a_template_carrying_the_idracs_own_address_is_refused(world: World):
+    """The audit against a real OME AttributeDetails payload.
+
+    A template captured from a reference server carries THAT server's iDRAC
+    address. Deploying it would move this machine's address or reset it to
+    DHCP, and no remote call could bring it back — so the run refuses before it
+    writes anything at all.
+    """
+    world.ome.template_attribute_groups.append(
+        {
+            "DisplayName": "iDRAC",
+            "SubAttributeGroups": [
+                {
+                    "DisplayName": "IPv4 Information",
+                    "SubAttributeGroups": [],
+                    "Attributes": [
+                        {"AttributeId": 70, "DisplayName": "Address",
+                         "Value": "10.9.9.9", "IsIgnored": False},
+                    ],
+                }
+            ],
+        }
+    )
+    error = await _failure()
+    assert error.type == "TemplateUnsafeError"
+    # Nothing was written: the machine is still on its factory password, still
+    # carries its factory hostname, and OME never saw it.
+    assert world.idrac.root_password == "calvin"
+    assert world.idrac.password_writes == []
+    assert world.idrac.os_hostname == "Miniwinpc"
+    assert world.ome.discovery_posts == [] and world.ome.deploy_calls == 0

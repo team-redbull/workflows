@@ -40,6 +40,7 @@ from shared.exceptions import (
     StorageJobFailedError,
     StorageLayoutUnsupportedError,
     TemplatePasswordNotAppliedError,
+    TemplateUnsafeError,
 )
 from shared.models.server_provisioning import (
     IdracController,
@@ -58,6 +59,7 @@ from shared.models.server_provisioning import (
     OmeJobState,
     OmeProfile,
     OmeProfileRef,
+    OmeTemplateRef,
     ProvisionDellServerInput,
     ProvisionDellServerRunArgs,
     RebootResult,
@@ -66,6 +68,8 @@ from shared.models.server_provisioning import (
     ServerScanState,
     StorageConfigRequest,
     StorageLayout,
+    TemplateAttribute,
+    TemplateContents,
     TemplateDeployRequest,
     TemplateDeployResult,
 )
@@ -119,6 +123,8 @@ class Fake:
     )
     claimed_by: str | None = None
     os_hostname_was_set: bool = True
+    # A safe template by default: BIOS settings only.
+    template_attributes: list[TemplateAttribute] = field(default_factory=list)
     in_ome: bool = False
     template_job: int | None = 900
     template_error: Exception | None = None
@@ -150,6 +156,13 @@ class Fake:
         async def identity(ref: IdracRef) -> IdracIdentity:
             fake.calls.append("identity")
             return fake.identity
+
+        @activity.defn(name="read_ome_template")
+        async def read_template(ref: OmeTemplateRef) -> TemplateContents:
+            fake.calls.append("audit")
+            return TemplateContents(
+                template_id=25, template_name="ocp-r660", attributes=fake.template_attributes
+            )
 
         @activity.defn(name="set_idrac_root_password")
         async def set_password(ref: IdracRef) -> bool:
@@ -242,7 +255,8 @@ class Fake:
             return ServerScanState(claimed_by=fake.claimed_by, name="old-name")
 
         return [probe, check_login, identity, set_password, clear_hostname, layout, stage,
-                apply, jobs, find_device, discover, ome_job, deploy, profile, rename, scan]
+                apply, jobs, find_device, discover, ome_job, deploy, read_template, profile,
+                rename, scan]
 
 
 class _Harness:
@@ -452,3 +466,39 @@ async def test_a_name_that_never_matches_fails_the_run():
     error = await _failure(fake)
     assert error.type == ServerNameNotAppliedError.__name__
 
+
+
+async def test_an_unsafe_template_stops_the_run_before_anything_is_written():
+    """The audit's whole value is WHERE it runs.
+
+    A template carrying the reference server's iDRAC address would strand this
+    machine at the rack, so the run must refuse it before it has changed a
+    password, blanked a hostname, or put the device into OME.
+    """
+    fake = Fake(
+        template_attributes=[
+            TemplateAttribute(attribute_id=1, name="Address", group="iDRAC,IPv4 Information"),
+        ]
+    )
+    error = await _failure(fake)
+    assert error.type == TemplateUnsafeError.__name__
+    assert "reachable only at the rack" in error.message
+    # Nothing was written: no password change, no hostname, no OME device.
+    for untouched in ("set-password:from-1", "clear-hostname", "discover:0", "deploy"):
+        assert untouched not in fake.calls
+    # ...and the guard still ran first, so an in-use server is refused even
+    # when the template is also bad.
+    assert fake.calls.index("guard") < fake.calls.index("audit")
+
+
+async def test_a_template_carrying_storage_is_refused():
+    """KB 000384312 and RAIDresetConfig=True both make template-driven RAID
+    unsafe; storage is built over Redfish instead."""
+    fake = Fake(
+        template_attributes=[
+            TemplateAttribute(attribute_id=9, name="Virtual Disk 0", group="Storage,RAID.Integrated.1-1"),
+        ]
+    )
+    error = await _failure(fake)
+    assert error.type == TemplateUnsafeError.__name__
+    assert "stage" not in fake.calls

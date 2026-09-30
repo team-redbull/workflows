@@ -485,6 +485,18 @@ class OmeDiscoveryFailedError(OrchestratorError):
     """WORKFLOW-RAISED. OME's discovery job failed, or finished without the device."""
 
 
+class TemplateUnsafeError(OrchestratorError):
+    """WORKFLOW-RAISED. The configured template carries attributes this workflow
+    refuses to deploy — iDRAC network settings, storage, or user accounts.
+
+    Checked BEFORE anything touches the machine, because the worst of the three
+    is unrecoverable remotely: a template carrying the reference server's iDRAC
+    address moves every target onto it, or resets it to DHCP, and the machine is
+    then reachable only at the rack. See template_policy.py for all three groups
+    and docs/design/dell-scp-template-r660.md for why each is fatal.
+    """
+
+
 class TemplateDeployFailedError(OrchestratorError):
     """WORKFLOW-RAISED. The template deployment job failed or did not finish in time."""
 

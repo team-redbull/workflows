@@ -28,12 +28,14 @@ from shared.models.server_provisioning import (
     OmeJobState,
     OmeProfile,
     OmeProfileRef,
+    OmeTemplateRef,
     RebootResult,
     ServerNameRequest,
     ServerScanLookup,
     ServerScanState,
     StorageConfigRequest,
     StorageLayout,
+    TemplateContents,
     TemplateDeployRequest,
     TemplateDeployResult,
 )
@@ -167,6 +169,17 @@ async def deploy_ome_template(request: TemplateDeployRequest) -> TemplateDeployR
     that template gets no second deployment — the profile's own
     DeploymentTaskId is returned to wait on. Raises TemplateNotConfiguredError,
     TemplateNotFoundError or ProfileConflictError — all deterministic.
+    """
+    ...
+
+
+@activity.defn
+async def read_ome_template(ref: OmeTemplateRef) -> TemplateContents:
+    """Every attribute the configured template would deploy, flattened.
+
+    Read BEFORE anything touches the machine, so a template carrying iDRAC
+    network settings, storage or user accounts stops the run without a single
+    write. `template_policy.py` decides what is unsafe; this only reports.
     """
     ...
 

@@ -200,6 +200,28 @@ class OmeSim:
     deploy_calls: int = 0
     discovery_posts: list[dict[str, Any]] = field(default_factory=list)
     open_sessions: set[str] = field(default_factory=set)
+    # What the template would deploy, as OME's AttributeDetails reports it:
+    # nested AttributeGroups, leaf groups carrying Attributes. The default is a
+    # SAFE template — BIOS settings only. A test adds a hazard to it.
+    template_attribute_groups: list[dict[str, Any]] = field(
+        default_factory=lambda: [
+            {
+                "DisplayName": "BIOS",
+                "SubAttributeGroups": [
+                    {
+                        "DisplayName": "System Profile Settings",
+                        "SubAttributeGroups": [],
+                        "Attributes": [
+                            {"AttributeId": 1, "DisplayName": "System Profile",
+                             "Value": "PerfOptimized", "IsIgnored": False},
+                            {"AttributeId": 2, "DisplayName": "Boot Mode",
+                             "Value": "Uefi", "IsIgnored": False},
+                        ],
+                    }
+                ],
+            }
+        ]
+    )
 
     def new_job(self, reads: int, on_done: Any) -> int:
         job_id = next(_ids)
@@ -497,6 +519,12 @@ def services_app(ome: OmeSim, scan: ScanSim, region_names: dict[str, str] | None
         name = _filter_value(request, "Name")
         items = [{"Id": ome.template_id, "Name": ome.template_name, "ViewTypeId": 2}]
         return {"value": [t for t in items if name is None or t["Name"] == name]}
+
+    @app.get("/api/TemplateService/Templates({template_id})/AttributeDetails")
+    async def template_attribute_details(template_id: int):
+        if template_id != ome.template_id:
+            return _error(404, f"No template with id {template_id}")
+        return {"AttributeGroups": ome.template_attribute_groups}
 
     @app.post("/api/TemplateService/Actions/TemplateService.Deploy")
     async def deploy(request: Request):

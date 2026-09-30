@@ -60,6 +60,7 @@ LIMB_ACTIVITIES = [
     limb.probe_idrac_credentials,
     limb.check_idrac_login,
     limb.read_idrac_identity,
+    limb.clear_idrac_os_hostname,
     limb.read_storage_layout,
     limb.stage_storage_config,
     limb.apply_staged_idrac_jobs,
@@ -218,6 +219,9 @@ async def test_a_factory_fresh_server_is_provisioned_end_to_end(world: World):
 
     assert result.service_tag == world.idrac.service_tag
     assert result.initial_credential == "factory-1"  # arrived on calvin
+    # The factory OS hostname is gone, so OME shows the machine's address next
+    # to its profile. Cleared before OME ever discovered it.
+    assert world.idrac.os_hostname == "" and result.os_hostname_cleared
     assert result.profile_name == f"ocp-dell-r660-{REGION}-128c-1024gb-10tb-{world.idrac.service_tag}"
     # The run finished on its own configuration work. server-scan has not
     # collected the machine yet (its simulator needs 3 reads), and that is

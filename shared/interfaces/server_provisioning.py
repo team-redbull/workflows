@@ -71,6 +71,18 @@ async def read_idrac_identity(ref: IdracRef) -> IdracIdentity:
 
 
 @activity.defn
+async def clear_idrac_os_hostname(ref: IdracRef) -> bool:
+    """Blank the machine's OS hostname; True when it had one. Idempotent.
+
+    Servers arrive carrying a factory OS hostname (`Miniwinpc`), and while one
+    is set OME displays it instead of the machine's address next to the
+    profile. Cleared unconditionally — a machine being provisioned has no OS,
+    so whatever is there is stale.
+    """
+    ...
+
+
+@activity.defn
 async def read_storage_layout(ref: IdracRef) -> StorageLayout:
     """Every storage controller with its drives (and their RAID status) and volumes."""
     ...

@@ -91,6 +91,12 @@ class IdracIdentity(BaseModel):
     idrac_firmware: str
     bios_version: str | None = None
     power_state: str | None = None
+    # The OS hostname the iDRAC reports (Redfish `HostName`, racadm
+    # `System.ServerOS.HostName`). Servers arrive carrying a factory value —
+    # `Miniwinpc` is the one the DC team keeps seeing — and while it is set, OME
+    # shows it instead of the machine's address next to the profile. A server
+    # being provisioned has no OS, so any value here is stale by definition.
+    os_hostname: str | None = None
 
 
 class IdracDrive(BaseModel):
@@ -301,6 +307,7 @@ class ProvisionDellServerProgress(BaseModel):
     ome_device_id: int | None = None
     template_name: str | None = None
     profile_name: str | None = None
+    os_hostname_cleared: bool | None = None
     waiting_on: str | None = None
 
 
@@ -318,3 +325,6 @@ class ProvisionDellServerResult(BaseModel):
     profile_name: str
     boss_raid1_created: bool
     non_raid_drives_converted: int
+    # True when the machine arrived with a factory OS hostname (`Miniwinpc`)
+    # that this run blanked, so OME shows its address beside the profile.
+    os_hostname_cleared: bool = False

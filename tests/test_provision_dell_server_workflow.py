@@ -117,6 +117,7 @@ class Fake:
         )
     )
     claimed_by: str | None = None
+    os_hostname_was_set: bool = True
     in_ome: bool = False
     template_job: int | None = 900
     template_error: Exception | None = None
@@ -148,6 +149,11 @@ class Fake:
         async def identity(ref: IdracRef) -> IdracIdentity:
             fake.calls.append("identity")
             return fake.identity
+
+        @activity.defn(name="clear_idrac_os_hostname")
+        async def clear_hostname(ref: IdracRef) -> bool:
+            fake.calls.append("clear-hostname")
+            return fake.os_hostname_was_set
 
         @activity.defn(name="read_storage_layout")
         async def layout(ref: IdracRef) -> StorageLayout:
@@ -229,8 +235,8 @@ class Fake:
             fake.calls.append("guard")
             return ServerScanState(claimed_by=fake.claimed_by, name="old-name")
 
-        return [probe, check_login, identity, layout, stage, apply, jobs, find_device, discover,
-                ome_job, deploy, profile, rename, scan]
+        return [probe, check_login, identity, clear_hostname, layout, stage, apply, jobs,
+                find_device, discover, ome_job, deploy, profile, rename, scan]
 
 
 class _Harness:

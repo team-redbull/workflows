@@ -186,7 +186,33 @@ async def read_identity(idrac_ip: str, username: str, password: str) -> IdracIde
         idrac_firmware=firmware,
         bios_version=system.get("BiosVersion"),
         power_state=system.get("PowerState"),
+        os_hostname=system.get("HostName"),
     )
+
+
+async def clear_os_hostname(idrac_ip: str, username: str, password: str) -> bool:
+    """Blank the OS hostname the iDRAC reports; True when it changed.
+
+    The Redfish equivalent of `racadm set System.ServerOS.HostName ""`: the
+    standard ComputerSystem `HostName` property, on the same resource
+    `read_identity` already reads.
+
+    Servers arrive with a factory OS hostname (`Miniwinpc`), and while one is
+    set OME shows it in place of the machine's address beside the profile. A
+    machine being provisioned has no OS, so this is cleared unconditionally
+    rather than matched against a list of known-bad names — a list would need
+    extending every time a factory image changes, and there is nothing here
+    worth keeping in the first place.
+
+    Reads before writing, so a machine that is already blank is untouched and a
+    retry is a no-op.
+    """
+    async with _client(idrac_ip, username, password) as client:
+        system = await _get(client, SYSTEM)
+        if not str(system.get("HostName") or "").strip():
+            return False
+        await _request(client, "PATCH", SYSTEM, json={"HostName": ""})
+    return True
 
 
 def _raid_status(drive: dict[str, Any]) -> str | None:

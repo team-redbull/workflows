@@ -105,6 +105,15 @@ async def read_idrac_identity(ref: IdracRef) -> IdracIdentity:
 
 
 @activity.defn
+async def clear_idrac_os_hostname(ref: IdracRef) -> bool:
+    """Blank the machine's OS hostname so OME shows its address, not `Miniwinpc`."""
+    cleared = await idrac.clear_os_hostname(ref.idrac_ip, _settings.idrac_username, _password(ref))
+    if cleared:
+        activity.logger.info("iDRAC %s: OS hostname cleared", ref.idrac_ip)
+    return cleared
+
+
+@activity.defn
 async def read_storage_layout(ref: IdracRef) -> StorageLayout:
     """Every storage controller with its drives and volumes."""
     return await idrac.read_storage(ref.idrac_ip, _settings.idrac_username, _password(ref))

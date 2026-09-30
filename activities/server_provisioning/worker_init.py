@@ -26,6 +26,7 @@ from temporalio.worker import Worker
 from activities.server_provisioning.activities import (
     apply_staged_idrac_jobs,
     check_idrac_login,
+    clear_idrac_os_hostname,
     deploy_ome_template,
     find_in_server_scan,
     find_ome_device,
@@ -63,6 +64,7 @@ async def main() -> None:
             probe_idrac_credentials,
             check_idrac_login,
             read_idrac_identity,
+            clear_idrac_os_hostname,
             read_storage_layout,
             stage_storage_config,
             apply_staged_idrac_jobs,

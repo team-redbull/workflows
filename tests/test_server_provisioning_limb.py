@@ -101,6 +101,32 @@ class TestIdentity:
             await idrac.read_identity(IP, "root", "pw")
 
 
+class TestOsHostname:
+    """The factory hostname (`Miniwinpc`) that hides a machine's address in OME."""
+
+    @respx.mock
+    async def test_a_factory_hostname_is_blanked(self):
+        respx.get(SYSTEM).mock(return_value=httpx.Response(200, json={"HostName": "Miniwinpc"}))
+        patched = respx.patch(SYSTEM).mock(return_value=httpx.Response(200))
+        assert await idrac.clear_os_hostname(IP, "root", "pw") is True
+        assert json.loads(patched.calls.last.request.content) == {"HostName": ""}
+
+    @respx.mock
+    async def test_an_already_blank_machine_is_never_written_to(self):
+        """Idempotence: a re-run must not PATCH a machine that is already right."""
+        respx.get(SYSTEM).mock(return_value=httpx.Response(200, json={"HostName": ""}))
+        patched = respx.patch(SYSTEM).mock(return_value=httpx.Response(200))
+        assert await idrac.clear_os_hostname(IP, "root", "pw") is False
+        assert not patched.called
+
+    @respx.mock
+    async def test_whitespace_counts_as_blank(self):
+        respx.get(SYSTEM).mock(return_value=httpx.Response(200, json={"HostName": "   "}))
+        patched = respx.patch(SYSTEM).mock(return_value=httpx.Response(200))
+        assert await idrac.clear_os_hostname(IP, "root", "pw") is False
+        assert not patched.called
+
+
 BOSS = "AHCI.SL.6-1"
 PERC = "RAID.SL.3-1"
 BOSS_DRIVES = [f"{idrac.SYSTEM}/Storage/{BOSS}/Drives/Disk.Direct.{n}:{BOSS}" for n in (0, 1)]

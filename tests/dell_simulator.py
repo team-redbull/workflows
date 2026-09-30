@@ -104,6 +104,9 @@ class IdracSim:
     firmware: str = "7.10.70.00"
     root_password: str = "calvin"
     power: str = "On"
+    # What a server carries off the pallet: the factory OS hostname that stops
+    # OME showing the machine's address beside its profile.
+    os_hostname: str = "Miniwinpc"
     lockout_after: int = 3
     lockout_requests: int = 5
     boss_raid_types: list[str] = field(default_factory=lambda: ["RAID1"])
@@ -267,7 +270,15 @@ def idrac_app(sim: IdracSim) -> FastAPI:
             "Manufacturer": "Dell Inc.",
             "BiosVersion": "1.6.6",
             "PowerState": sim.power,
+            "HostName": sim.os_hostname,
         }
+
+    @app.patch(SYSTEM)
+    async def patch_system(request: Request):
+        body = await request.json()
+        if "HostName" in body:
+            sim.os_hostname = str(body["HostName"])
+        return {"Id": "System.Embedded.1", "HostName": sim.os_hostname}
 
     @app.get(MANAGER)
     async def manager():

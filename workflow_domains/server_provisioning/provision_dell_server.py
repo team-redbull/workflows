@@ -98,6 +98,7 @@ with workflow.unsafe.imports_passed_through():
     from shared.interfaces.server_provisioning import (
         apply_staged_idrac_jobs,
         check_idrac_login,
+        clear_idrac_os_hostname,
         deploy_ome_template,
         find_in_server_scan,
         find_ome_device,
@@ -271,6 +272,14 @@ class ProvisionDellServerWorkflow:
                 ServerAlreadyInstalledError,
             )
 
+        # Step 2c — blank the factory OS hostname. AFTER the in-use guard above,
+        # because this writes to the machine: `Miniwinpc` is stale factory data
+        # on a server being provisioned, but on a server a cluster is running it
+        # would be the node's real name. Before OME sees it, because while a
+        # hostname is set OME shows it beside the profile instead of the address.
+        self._phase("clearing-os-hostname")
+        self._progress.os_hostname_cleared = await self._run(clear_idrac_os_hostname, initial)
+
         # Step 3 — into OME, unless it is already there.
         self._phase("discovering-in-ome")
         device = await self._discover(initial, identity.service_tag, purpose="discover")
@@ -384,6 +393,7 @@ class ProvisionDellServerWorkflow:
             profile_name=profile_name,
             boss_raid1_created=boss_created,
             non_raid_drives_converted=converted,
+            os_hostname_cleared=bool(self._progress.os_hostname_cleared),
         )
 
     async def _probe(self, idrac_ip: str) -> int:

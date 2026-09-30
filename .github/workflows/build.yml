@@ -1,8 +1,8 @@
 name: Build and Push
 
-# Four images from this one repo: the workflow "brain" (workflow_domains/Dockerfile),
-# two activity worker "limbs" — segment-lifecycle and server-lifecycle, one per
-# domain (activities/<domain>/Dockerfile) — and the documentation site
+# Five images from this one repo: the workflow "brain" (workflow_domains/Dockerfile),
+# three activity worker "limbs" — segment-lifecycle, server-lifecycle and
+# server-provisioning, one per domain (activities/<domain>/Dockerfile) — and the documentation site
 # (docs/Dockerfile), which carries no code at all.
 
 # A commit message containing "[skip ci]" (or "[ci skip]", "[no ci]", "[skip actions]")
@@ -185,6 +185,23 @@ jobs:
       helm-image-path: image
     secrets: inherit
 
+  build-server-provisioning-worker:
+    # The provision-dell-server limb. LAST in the chain on purpose: its chart
+    # (gitops/charts/server-provisioning-worker/ in redbull-platform) does not
+    # exist yet, so the image-tag bump fails until it is added — and a failure
+    # here must not stop the docs, which it would if it sat ahead of them.
+    # Move it back beside the other limbs once the chart lands.
+    needs: [changes, build-workflows-docs]
+    if: ${{ !cancelled() && !failure() && needs.changes.outputs.limb == 'true' }}
+    uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
+    with:
+      image-name: server-provisioning-worker
+      dockerfile: activities/server_provisioning/Dockerfile
+      chart-repo: team-redbull/redbull-platform
+      helm-values-path: gitops/charts/server-provisioning-worker/values.yaml
+      helm-image-path: activityWorker.image
+    secrets: inherit
+
   cleanup-workflow-brain-on-delete:
     if: github.event_name == 'delete'
     uses: team-redbull/.github/.github/workflows/ghcr-cleanup-on-delete.yml@main
@@ -204,6 +221,13 @@ jobs:
     uses: team-redbull/.github/.github/workflows/ghcr-cleanup-on-delete.yml@main
     with:
       image-name: server-lifecycle-worker
+    secrets: inherit
+
+  cleanup-server-provisioning-worker-on-delete:
+    if: github.event_name == 'delete'
+    uses: team-redbull/.github/.github/workflows/ghcr-cleanup-on-delete.yml@main
+    with:
+      image-name: server-provisioning-worker
     secrets: inherit
 
   cleanup-workflows-docs-on-delete:

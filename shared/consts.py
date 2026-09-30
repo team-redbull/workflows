@@ -48,3 +48,13 @@ def server_lifecycle_activity_queue(mce_cluster: str) -> str:
     workflow's `progress` query reports the queue it is waiting on.
     """
     return f"{SERVER_LIFECYCLE_ACTIVITY_QUEUE}-{mce_cluster}"
+
+# -- Server-provisioning domain --
+# Back to the plain segment-lifecycle shape: ONE activity queue for the domain,
+# because this limb writes to no cluster. Its dependencies are the iDRACs, the
+# OpenManage Enterprise appliance, the naming service and server-scan — all
+# reached from one hub-side deployment holding the OME and iDRAC credentials.
+# Each vendor gets its own WORKFLOW (and queue): provisioning a Dell through
+# OME has nothing in common with an Intersight claim beyond its end state.
+PROVISION_DELL_SERVER_WORKFLOW_QUEUE = "provision-dell-server-workflow"
+SERVER_PROVISIONING_ACTIVITY_QUEUE = "server-provisioning-activity"

@@ -4,6 +4,7 @@
 # Both limbs, so the contract test can import BOTH implementation modules —
 # the kubernetes client is only ever imported by the server-lifecycle one.
 -r activities/server_lifecycle/requirements.txt
+-r activities/server_provisioning/requirements.txt
 pytest>=8,<10
 pytest-asyncio>=1,<2
 respx>=0.22,<1

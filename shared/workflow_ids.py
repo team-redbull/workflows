@@ -91,3 +91,14 @@ def install_server_workflow_id(infra_env: str, server_name: str | None = None) -
     if server_name:
         return f"install-server-name-{server_name.lower()}"
     return f"install-server-{infra_env}"
+
+
+def provision_dell_server_workflow_id(idrac_ip: str) -> str:
+    """`provision-dell-server-<idrac ip>`: natural dedup per machine at the rack.
+
+    The iDRAC address is the only identity the run has when it starts — the
+    service tag is read FROM that iDRAC — and a technician double-submitting a
+    row of a bulk list must land on the running run, not start a second one
+    that races it through the same reboots.
+    """
+    return f"provision-dell-server-{idrac_ip}"

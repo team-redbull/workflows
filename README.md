@@ -1,6 +1,6 @@
 # Cluster Orchestrator
 
-An OpenShift cluster lifecycle orchestrator built on Temporal. Two domains today:
+An OpenShift cluster lifecycle orchestrator built on Temporal. Three domains today:
 
 - **segment-lifecycle** owns the segments a hosted cluster runs on: **creating**
   them in the team's **Segments Manager**, and **allocating** one to a cluster
@@ -10,6 +10,13 @@ An OpenShift cluster lifecycle orchestrator built on Temporal. Two domains today
   inventory platform and creates the `BareMetalHost` + BMC `Secret` +
   `NMStateConfig` an InfraEnv needs. It replaces `bmh-generator-operator`, a
   Kopf operator that queried four vendor managers itself.
+- **server-provisioning** owns getting a racked server INTO that inventory:
+  **provision-dell-server** takes a Dell whose iDRAC has an IP and nothing else,
+  and discovers it in OpenManage Enterprise, deploys its template (which sets
+  root's password), builds the RAID 1 on the BOSS, sets the PERC drives
+  Non-RAID, has the naming service rename it, and completes when server-scan
+  lists it — ready for install-server. It replaces the DC team's manual OME and
+  BIOS work; Cisco, HPE and Intersight get their own workflows later.
 
 **One entry point, one Temporal run.** The Segments Manager used to own creation and
 then fire a best-effort HTTP trigger at this service — which put creation outside
@@ -47,6 +54,9 @@ workflow_domains/                 The brain — one folder per domain, plus main
   server_lifecycle/               install_server.py (the SHAPE of the run),
                                     bond_selection.py (the pure rule it applies),
                                     router.py
+  server_provisioning/            provision_dell_server.py, storage_plan.py and
+                                    server_name.py (its pure rules), regions.py
+                                    (iDRAC prefix -> region), router.py
   routers/                        What no domain owns: deps, shared models, runs.py (status)
 activities/<domain>/              The limbs
   activities.py                   The @activity.defn surface ONLY — thin
@@ -56,7 +66,9 @@ activities/<domain>/              The limbs
                                     server_scan.py (the inventory API),
                                     cluster_api.py (the Kubernetes API, its
                                     idempotency rule and error classification),
-                                    bmh_resources.py (the resource bodies)
+                                    bmh_resources.py (the resource bodies),
+                                    idrac.py (Redfish), ome.py (OpenManage),
+                                    server_namer.py (the naming service)
   worker_init.py                  Registers this domain's activities, polls its queue
 docs/                             The static documentation site (its own image)
 ```
@@ -68,6 +80,7 @@ The prod charts are vendored into the Argo CD repo, not this one:
 | `redbull-platform/gitops/charts/workflows-orchestrator/` | the brain — ONE release, shared by every domain |
 | `redbull-platform/gitops/charts/segment-lifecycle-worker/` | the `segment-lifecycle-worker` limb |
 | `redbull-platform/gitops/charts/server-lifecycle-worker/` | the `server-lifecycle-worker` limb |
+| `redbull-platform/gitops/charts/server-provisioning-worker/` | the `server-provisioning-worker` limb — **not created yet**; CI's image bump fails until it exists |
 
 Worker-file naming convention: the workflow (brain) worker is
 `workflow_domains/main_worker_init.py`; each activity domain's worker is
@@ -250,6 +263,47 @@ There is deliberately **no `vlan_id`**: it belongs to the MCE's segment, and a
 supplied one could contradict it. The request body forbids unknown fields, so
 sending `vlan_id` is a 422 rather than a silently ignored value.
 
+### `provision-dell-server` — from an iDRAC IP to a server install-server can use
+
+`POST /workflows/server-provisioning/provision-dell-server` with `{"idrac_ip": "134.1.2.1"}`
+(or `/bulk` with `{"servers": [{"idrac_ip": ...}, ...]}` — one run per machine).
+The **region** is resolved from the IP's prefix (`workflow_domains/server_provisioning/regions.py`)
+before the run starts; an address under no prefix is a 422 (a `rejected` item in
+bulk). An explicit `region` wins. The only manual step left is the iDRAC IP.
+
+1. **probing-idrac** — which root password does the iDRAC accept: the target
+   (`IDRAC_ROOT_PASSWORD`) first, then each of `IDRAC_FACTORY_PASSWORDS`. One
+   request each, so a round can trip iDRAC9's 3-failure IP block only when every
+   candidate is wrong — and the next round then waits 11 min for the block to
+   lift. Three rounds, then `IdracCredentialsRejectedError`. An iDRAC that
+   answers nothing gets 30 min (`IdracUnreachableError`).
+2. **reading-identity**, **checking-server-scan** — service tag, model, iDRAC
+   firmware; must be a Dell PowerEdge; and server-scan must not list that service
+   tag as claimed by a cluster (`ServerAlreadyInstalledError`) — everything after
+   this reboots the machine, and a mistyped IP must not take a node down.
+3. **discovering-in-ome** — skipped when OME already has the service tag.
+4. **deploying-template** — `DELL_TEMPLATES[model][iDRAC firmware]`. The template
+   creates the profile and **enforces root's password**; it must touch root
+   (user 2) only, never the OME account on the iDRAC. A device already carrying a
+   profile from another template is `ProfileConflictError`, never overwritten.
+5. **verifying-root-password** — root must accept the target password now; if the
+   machine came in on a factory one, OME is re-discovered with the new one.
+6. **configuring-storage / applying-storage / verifying-storage** — RAID 1 over
+   the BOSS's two drives, every PERC drive Non-RAID, staged together and applied
+   by ONE reboot, then read back. It **never deletes**: an existing volume or a
+   drive in use is `StorageLayoutUnsupportedError`.
+7. **naming-server / verifying-name** — the naming service renames the OME
+   profile; the name is read back and must be
+   `ocp-dell-<model>-<region>-<N>c-<N>gb-<N>tb-<service tag>` with THIS region
+   and service tag. `server_namer.py` is where the service's real request
+   contract goes — today it POSTs the request model to `SERVER_NAMER_URL`.
+8. **awaiting-server-scan** — server-scan's own Dell collector (every 6 h) lists
+   the server under that name. Up to 8 h, then `ServerScanNeverSawServerError`.
+
+Workflow id `provision-dell-server-<idrac ip>`. Every wait is the workflow's, on
+durable timers with a deadline; no password is ever in Temporal history (a run
+names a credential by its position in the limb's list).
+
 ### `allocate-segment` — give a cluster a segment
 
 Takes the cluster, the **values-repo branch** to record on, and the **type** to
@@ -286,6 +340,8 @@ result.
 | `POST /workflows/segment-lifecycle/initialize-segment/bulk` | one workflow PER segment |
 | `POST /workflows/segment-lifecycle/allocate-segment` | one allocation |
 | `POST /workflows/server-lifecycle/install-server` | one server into an InfraEnv |
+| `POST /workflows/server-provisioning/provision-dell-server` | one Dell server, by iDRAC IP |
+| `POST /workflows/server-provisioning/provision-dell-server/bulk` | one workflow PER iDRAC IP |
 | `GET  /workflows/runs/{workflow_id}` | (status, every domain) |
 
 ### Paths: `/workflows/<domain>/<workflow>`, status on `/workflows/runs`
@@ -355,6 +411,15 @@ would hide which segments actually got a workflow.
 | `SERVER_SCAN_URL` | `server-lifecycle-config` | inventory API base, INCLUDING `/api/v1` |
 | `SERVER_SCAN_API_TOKEN` | Secret | a **viewer** token — the lookup is a GET |
 | `{HP,DELL,CISCO,INTERSIGHT}_BMC_USERNAME`/`_PASSWORD` | Secret | what Ironic drives the BMC with |
+| `OME_URL` | `server-provisioning-config` | the OpenManage Enterprise appliance, `https://` |
+| `OME_USERNAME`/`OME_PASSWORD` | Secret | discovers devices and deploys templates |
+| `IDRAC_USERNAME` | `server-provisioning-config` | default `root` — the only iDRAC account touched |
+| `IDRAC_ROOT_PASSWORD` | Secret | the password the template enforces; tried first |
+| `IDRAC_FACTORY_PASSWORDS` | Secret | JSON list, at most 2 — what servers may arrive with |
+| `DELL_TEMPLATES` | `server-provisioning-config` | `{"<Redfish model>": {"<iDRAC firmware>": "<OME template>"}}` |
+| `SERVER_NAMER_URL` | `server-provisioning-config` | the naming service |
+| `SERVER_NAMER_API_TOKEN` | Secret | optional bearer token |
+| `SERVER_SCAN_URL`/`_API_TOKEN` | as above | the provisioning worker reads it too (a viewer token) |
 
 server-scan holds no BMC credentials by design, so those live here; a vendor
 with none configured fails that server's install rather than writing a Secret

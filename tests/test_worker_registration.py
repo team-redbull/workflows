@@ -28,6 +28,7 @@ _WORKERS = {
     "SEGMENT_LIFECYCLE_ACTIVITY_QUEUE": "activities/segment_lifecycle/worker_init.py",
     "SERVER_LIFECYCLE_ACTIVITY_QUEUE": "activities/server_lifecycle/worker_init.py",
     "server_lifecycle_activity_queue": "activities/server_lifecycle/worker_init.py",
+    "SERVER_PROVISIONING_ACTIVITY_QUEUE": "activities/server_provisioning/worker_init.py",
 }
 
 # the workflow modules that dispatch activities, and the interface module each
@@ -36,6 +37,7 @@ _WORKFLOW_MODULES = [
     "workflow_domains/server_lifecycle/install_server.py",
     "workflow_domains/segment_lifecycle/allocate_segment.py",
     "workflow_domains/segment_lifecycle/initialize_segment.py",
+    "workflow_domains/server_provisioning/provision_dell_server.py",
 ]
 
 

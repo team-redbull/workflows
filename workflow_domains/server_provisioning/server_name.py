@@ -22,7 +22,8 @@ import re
 
 def model_token(model: str) -> str:
     """`PowerEdge R660` -> `r660`: the last word of the Redfish model, lowercased."""
-    return model.split()[-1].lower() if model.split() else ""
+    words = model.split()
+    return words[-1].lower() if words else ""
 
 
 def name_matches_convention(name: str, model: str, region: str, service_tag: str) -> bool:

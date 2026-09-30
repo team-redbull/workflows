@@ -22,18 +22,16 @@ from __future__ import annotations
 
 import httpx
 
+from activities.server_provisioning.http_client import TIMEOUT, VERIFY_TLS
 from shared.exceptions import ServerNamerError, ServerNamerRejectedError
 from shared.models.server_provisioning import ServerNameRequest
-
-_HTTP_TIMEOUT = httpx.Timeout(60.0)
-_TLS_VERIFY = False
 
 
 async def request_name(base_url: str, token: str, request: ServerNameRequest) -> None:
     """Ask the naming service to rename this device's OME profile."""
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     try:
-        async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT, verify=_TLS_VERIFY) as client:
+        async with httpx.AsyncClient(timeout=TIMEOUT, verify=VERIFY_TLS) as client:
             # TODO(naming service): the real method, path and body go here.
             resp = await client.post(base_url, json=request.model_dump(), headers=headers)
     except httpx.HTTPError as exc:

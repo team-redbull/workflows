@@ -71,7 +71,8 @@ def is_perc(controller: IdracController) -> bool:
     )
 
 
-def _drive_name(odata_id: str) -> str:
+def _short_id(odata_id: str) -> str:
+    """The last segment of any Redfish id — a drive's or a volume's."""
     return odata_id.rstrip("/").rsplit("/", 1)[-1]
 
 
@@ -105,7 +106,7 @@ def plan_storage(layout: StorageLayout) -> StoragePlan:
         if others:
             problems.append(
                 f"BOSS {boss.id} already holds volume(s) that are not the RAID 1 over both "
-                f"drives: {', '.join(_drive_name(v.odata_id) for v in others)} — delete by hand "
+                f"drives: {', '.join(_short_id(v.odata_id) for v in others)} — delete by hand "
                 "if it is really unused"
             )
         create_boss_raid1 = not mirrors and not others
@@ -115,7 +116,7 @@ def plan_storage(layout: StorageLayout) -> StoragePlan:
         if controller.volumes:
             problems.append(
                 f"PERC {controller.id} already holds volume(s) "
-                f"{', '.join(_drive_name(v.odata_id) for v in controller.volumes)} — its "
+                f"{', '.join(_short_id(v.odata_id) for v in controller.volumes)} — its "
                 "drives must all be Non-RAID; delete by hand if really unused"
             )
         for drive in controller.drives:
@@ -125,7 +126,7 @@ def plan_storage(layout: StorageLayout) -> StoragePlan:
                 non_raid_drives.append(drive.odata_id)
             elif not controller.volumes:
                 problems.append(
-                    f"PERC drive {_drive_name(drive.odata_id)} is {drive.raid_status or 'of unknown state'}, "
+                    f"PERC drive {_short_id(drive.odata_id)} is {drive.raid_status or 'of unknown state'}, "
                     "not Ready or Non-RAID"
                 )
 

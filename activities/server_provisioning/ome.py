@@ -45,6 +45,7 @@ from typing import Any
 
 import httpx
 
+from activities.server_provisioning.http_client import TIMEOUT, VERIFY_TLS, extended_info
 from shared.exceptions import (
     OmeAuthError,
     OmeError,
@@ -53,10 +54,6 @@ from shared.exceptions import (
     TemplateNotFoundError,
 )
 from shared.models.server_provisioning import OmeDevice, OmeJobState, OmeProfile
-
-_HTTP_TIMEOUT = httpx.Timeout(60.0)
-# The appliance ships a self-signed certificate (as server-scan's OME client notes).
-_TLS_VERIFY = False
 
 # OME job LastRunStatus ids (RestOME.get_job_info's job_status_map).
 _JOB_COMPLETED = 2060
@@ -78,31 +75,20 @@ def _odata_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
-def _message(resp: httpx.Response) -> str:
-    try:
-        body = resp.json()
-    except ValueError:
-        return resp.text[:500]
-    error = body.get("error", {}) if isinstance(body, dict) else {}
-    infos = error.get("@Message.ExtendedInfo") or []
-    messages = [str(i.get("Message")) for i in infos if isinstance(i, dict) and i.get("Message")]
-    return "; ".join(messages) or str(error.get("message") or body)[:500]
-
-
 def _classify(resp: httpx.Response, what: str) -> None:
     if resp.is_success:
         return
     if resp.status_code in _REJECTED_STATUSES:
-        raise OmeRequestRejectedError(f"OME refused {what} ({resp.status_code}): {_message(resp)}")
+        raise OmeRequestRejectedError(f"OME refused {what} ({resp.status_code}): {extended_info(resp)}")
     # A 401 after a successful login is an expired session, not a bad account.
-    raise OmeError(f"OME answered {resp.status_code} to {what}: {_message(resp)}")
+    raise OmeError(f"OME answered {resp.status_code} to {what}: {extended_info(resp)}")
 
 
 @asynccontextmanager
 async def session(base_url: str, username: str, password: str) -> AsyncIterator[httpx.AsyncClient]:
     """An authenticated OME client for one activity invocation."""
     async with httpx.AsyncClient(
-        base_url=f"{base_url}/api", timeout=_HTTP_TIMEOUT, verify=_TLS_VERIFY
+        base_url=f"{base_url}/api", timeout=TIMEOUT, verify=VERIFY_TLS
     ) as client:
         try:
             resp = await client.post(
@@ -212,11 +198,9 @@ async def start_discovery(
     A group of this name that already exists is the one an earlier attempt of
     this same activity created — its job is returned instead of a second group.
     """
-    groups = (
-        await _request(client, "GET", "/DiscoveryConfigService/DiscoveryConfigGroups?$top=9999")
-    ).json().get("value", [])
+    groups = await _get_all(client, "/DiscoveryConfigService/DiscoveryConfigGroups?$top=9999")
     for group in groups:
-        if isinstance(group, dict) and group.get("DiscoveryConfigGroupName") == group_name:
+        if group.get("DiscoveryConfigGroupName") == group_name:
             task_id = _task_id(group)
             if task_id is not None:
                 return task_id

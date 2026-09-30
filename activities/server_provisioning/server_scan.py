@@ -17,11 +17,10 @@ from typing import Any
 
 import httpx
 
+from activities.server_provisioning.http_client import TIMEOUT, VERIFY_TLS
 from shared.exceptions import ServerScanAuthError, ServerScanError
 from shared.models.server_provisioning import ServerScanLookup, ServerScanState
 
-_HTTP_TIMEOUT = httpx.Timeout(60.0)
-_TLS_VERIFY = False
 _PAGE_SIZE = 50
 
 
@@ -49,7 +48,7 @@ async def lookup(base_url: str, token: str, request: ServerScanLookup) -> Server
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     tag = request.service_tag.upper()
     async with httpx.AsyncClient(
-        base_url=base_url, timeout=_HTTP_TIMEOUT, verify=_TLS_VERIFY, headers=headers
+        base_url=base_url, timeout=TIMEOUT, verify=VERIFY_TLS, headers=headers
     ) as client:
         page = await _get(client, "/servers", search=request.service_tag, page_size=_PAGE_SIZE)
         details = [await _get(client, f"/servers/{item['id']}") for item in page.get("items", [])]

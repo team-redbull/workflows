@@ -34,6 +34,7 @@ from typing import Any
 
 import httpx
 
+from activities.server_provisioning.http_client import TIMEOUT, VERIFY_TLS, extended_info
 from shared.exceptions import IdracAuthError, IdracError, IdracRequestRejectedError
 from shared.models.server_provisioning import (
     IdracController,
@@ -45,12 +46,6 @@ from shared.models.server_provisioning import (
     RebootResult,
     StorageLayout,
 )
-
-# Below the activity's start_to_close_timeout (5 min), per request.
-_HTTP_TIMEOUT = httpx.Timeout(60.0)
-# iDRACs ship a factory self-signed certificate and this estate has no CA
-# issuing them one — the same trade the other limbs make (see server_scan.py).
-_TLS_VERIFY = False
 
 SYSTEM = "/redfish/v1/Systems/System.Embedded.1"
 MANAGER = "/redfish/v1/Managers/iDRAC.Embedded.1"
@@ -79,23 +74,11 @@ async def _client(idrac_ip: str, username: str, password: str) -> AsyncIterator[
     async with httpx.AsyncClient(
         base_url=_base_url(idrac_ip),
         auth=(username, password),
-        timeout=_HTTP_TIMEOUT,
-        verify=_TLS_VERIFY,
+        timeout=TIMEOUT,
+        verify=VERIFY_TLS,
         headers={"Accept": "application/json"},
     ) as client:
         yield client
-
-
-def _message(resp: httpx.Response) -> str:
-    """The iDRAC's own explanation — Redfish `error.@Message.ExtendedInfo`."""
-    try:
-        body = resp.json()
-    except ValueError:
-        return resp.text[:500]
-    error = body.get("error", {}) if isinstance(body, dict) else {}
-    infos = error.get("@Message.ExtendedInfo") or []
-    messages = [str(i.get("Message")) for i in infos if isinstance(i, dict) and i.get("Message")]
-    return "; ".join(messages) or str(error.get("message") or body)[:500]
 
 
 def _classify(resp: httpx.Response, what: str) -> None:
@@ -105,15 +88,25 @@ def _classify(resp: httpx.Response, what: str) -> None:
     if resp.status_code in (401, 403):
         raise IdracAuthError(f"iDRAC rejected root's credential on {what} ({resp.status_code})")
     if resp.status_code in _REJECTED_STATUSES:
-        raise IdracRequestRejectedError(f"iDRAC refused {what} ({resp.status_code}): {_message(resp)}")
-    raise IdracError(f"iDRAC answered {resp.status_code} to {what}: {_message(resp)}")
+        raise IdracRequestRejectedError(f"iDRAC refused {what} ({resp.status_code}): {extended_info(resp)}")
+    raise IdracError(f"iDRAC answered {resp.status_code} to {what}: {extended_info(resp)}")
+
+
+async def _send(client: httpx.AsyncClient, method: str, path: str, **kwargs: Any) -> httpx.Response:
+    """The iDRAC's answer whatever its status — transport failures named, nothing classified.
+
+    Separate from `_request` for the one caller that must see a 404 itself: a
+    controller with no RAID capability serves no Volumes collection, and that
+    is a fact about the machine rather than a failure.
+    """
+    try:
+        return await client.request(method, path, **kwargs)
+    except httpx.HTTPError as exc:
+        raise IdracError(f"iDRAC unreachable on {method} {path}: {type(exc).__name__}: {exc}") from exc
 
 
 async def _request(client: httpx.AsyncClient, method: str, path: str, **kwargs: Any) -> httpx.Response:
-    try:
-        resp = await client.request(method, path, **kwargs)
-    except httpx.HTTPError as exc:
-        raise IdracError(f"iDRAC unreachable on {method} {path}: {type(exc).__name__}: {exc}") from exc
+    resp = await _send(client, method, path, **kwargs)
     _classify(resp, f"{method} {path}")
     return resp
 
@@ -161,7 +154,7 @@ async def probe_credentials(idrac_ip: str, username: str, passwords: list[str]) 
             rejected += 1
             continue
         return IdracProbeResult(
-            reachable=False, rejected=rejected, detail=f"HTTP {resp.status_code}: {_message(resp)}"
+            reachable=False, rejected=rejected, detail=f"HTTP {resp.status_code}: {extended_info(resp)}"
         )
     return IdracProbeResult(reachable=True, credential=None, rejected=rejected)
 
@@ -229,7 +222,7 @@ async def _read_controller(client: httpx.AsyncClient, path: str) -> IdracControl
     volumes: list[IdracVolume] = []
     volumes_link = (storage.get("Volumes") or {}).get("@odata.id")
     if volumes_link:
-        resp = await client.get(volumes_link)
+        resp = await _send(client, "GET", volumes_link)
         # A controller with no RAID capability (CPU-attached NVMe) may not
         # serve a Volumes collection at all.
         if resp.status_code != 404:

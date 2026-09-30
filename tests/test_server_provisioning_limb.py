@@ -130,10 +130,14 @@ class TestStorageLayout:
             })
         )
         respx.get(f"{BASE}{storage}/{PERC}/Volumes").mock(return_value=httpx.Response(404))
-        for drive in BOSS_DRIVES + PERC_DRIVES:
+        for drive in BOSS_DRIVES + PERC_DRIVES[:1]:
             respx.get(f"{BASE}{drive}").mock(
                 return_value=httpx.Response(200, json={"Oem": {"Dell": {"DellPhysicalDisk": {"RaidStatus": "Ready"}}}})
             )
+        # An NVMe drive reports its RaidStatus under DellPCIeSSD instead.
+        respx.get(f"{BASE}{PERC_DRIVES[1]}").mock(
+            return_value=httpx.Response(200, json={"Oem": {"Dell": {"DellPCIeSSD": {"RaidStatus": "Ready"}}}})
+        )
         layout = await idrac.read_storage(IP, "root", "pw")
         assert [c.id for c in layout.controllers] == [BOSS, PERC]
         assert layout.controllers[0].name == "BOSS-N1 Monolithic"
@@ -145,10 +149,17 @@ def _jobs(*members: dict) -> httpx.Response:
     return httpx.Response(200, json={"Members": list(members)})
 
 
+def _boss_supports(*raid_types: str) -> None:
+    respx.get(f"{BASE}{idrac.SYSTEM}/Storage/{BOSS}").mock(
+        return_value=httpx.Response(200, json={"Id": BOSS, "StorageControllers": [{"SupportedRAIDTypes": list(raid_types)}]})
+    )
+
+
 class TestStageStorage:
     @respx.mock
     async def test_stages_the_mirror_and_the_conversion_as_two_jobs(self):
         respx.get(url__startswith=JOBS).mock(return_value=_jobs())
+        _boss_supports("RAID0", "RAID1")
         volume = respx.post(f"{BASE}{idrac.SYSTEM}/Storage/{BOSS}/Volumes").mock(
             return_value=httpx.Response(202, headers={"Location": f"{idrac.JOBS}/JID_1"})
         )
@@ -163,6 +174,26 @@ class TestStageStorage:
         assert json.loads(convert.calls.last.request.content) == {
             "PDArray": [d.rsplit("/", 1)[-1] for d in PERC_DRIVES]
         }
+
+    @respx.mock
+    async def test_a_controller_without_raid1_is_refused_before_posting(self):
+        respx.get(url__startswith=JOBS).mock(return_value=_jobs())
+        _boss_supports("RAID0")
+        post = respx.post(url__startswith=BASE).mock(return_value=httpx.Response(202))
+        with pytest.raises(IdracRequestRejectedError, match="does not support RAID1"):
+            await idrac.stage_storage(IP, "root", "pw", BOSS, BOSS_DRIVES, [])
+        assert post.call_count == 0
+
+    @respx.mock
+    async def test_a_job_named_for_another_controller_is_not_reused(self):
+        respx.get(url__startswith=JOBS).mock(
+            return_value=_jobs({"Id": "JID_9", "Name": f"Configure: {BOSS}-2", "JobState": "Scheduled"})
+        )
+        _boss_supports("RAID1")
+        respx.post(f"{BASE}{idrac.SYSTEM}/Storage/{BOSS}/Volumes").mock(
+            return_value=httpx.Response(202, headers={"Location": f"{idrac.JOBS}/JID_1"})
+        )
+        assert await idrac.stage_storage(IP, "root", "pw", BOSS, BOSS_DRIVES, []) == ["JID_1"]
 
     @respx.mock
     async def test_a_retry_reuses_the_pending_jobs_instead_of_staging_twice(self):
@@ -181,6 +212,7 @@ class TestStageStorage:
     @respx.mock
     async def test_a_refused_request_is_permanent_and_carries_the_idrac_message(self):
         respx.get(url__startswith=JOBS).mock(return_value=_jobs())
+        _boss_supports("RAID1")
         respx.post(f"{BASE}{idrac.SYSTEM}/Storage/{BOSS}/Volumes").mock(
             return_value=httpx.Response(
                 400, json={"error": {"@Message.ExtendedInfo": [{"Message": "RAID level not supported"}]}}
@@ -192,6 +224,7 @@ class TestStageStorage:
     @respx.mock
     async def test_an_accepted_request_without_a_job_is_refused(self):
         respx.get(url__startswith=JOBS).mock(return_value=_jobs())
+        _boss_supports("RAID1")
         respx.post(f"{BASE}{idrac.SYSTEM}/Storage/{BOSS}/Volumes").mock(return_value=httpx.Response(202))
         with pytest.raises(IdracRequestRejectedError, match="no job"):
             await idrac.stage_storage(IP, "root", "pw", BOSS, BOSS_DRIVES, [])
@@ -217,11 +250,22 @@ class TestApplyStaged:
         assert (await idrac.apply_staged(IP, "root", "pw", ["JID_1"])).reset_type == "On"
 
     @respx.mock
-    async def test_never_resets_once_the_jobs_are_running(self):
-        respx.get(f"{JOBS}/JID_1").mock(return_value=httpx.Response(200, json={"JobState": "Running"}))
+    async def test_never_resets_once_every_job_has_run(self):
+        respx.get(f"{JOBS}/JID_1").mock(return_value=httpx.Response(200, json={"JobState": "Completed"}))
         reset = respx.post(url__startswith=BASE).mock(return_value=httpx.Response(204))
         result = await idrac.apply_staged(IP, "root", "pw", ["JID_1"])
         assert not result.rebooted
+        assert reset.call_count == 0
+
+    @respx.mock
+    async def test_never_resets_under_a_running_realtime_job(self):
+        respx.get(f"{JOBS}/JID_1").mock(return_value=httpx.Response(200, json={"JobState": "Scheduled"}))
+        respx.get(f"{JOBS}/JID_2").mock(
+            return_value=httpx.Response(200, json={"JobState": "Running", "JobType": "RealTimeNoRebootConfiguration"})
+        )
+        reset = respx.post(url__startswith=BASE).mock(return_value=httpx.Response(204))
+        with pytest.raises(IdracError, match="JID_2 Running"):
+            await idrac.apply_staged(IP, "root", "pw", ["JID_1", "JID_2"])
         assert reset.call_count == 0
 
 
@@ -279,6 +323,12 @@ class TestOme:
         respx.get(f"{API}/DiscoveryConfigService/DiscoveryConfigGroups").mock(
             return_value=httpx.Response(200, json={"value": []})
         )
+        respx.get(f"{API}/DiscoveryConfigService/ProtocolToDeviceType").mock(
+            return_value=httpx.Response(200, json={"value": [
+                {"DeviceTypeId": 1000, "DeviceTypeName": "SERVER", "ProtocolName": "WSMAN"},
+                {"DeviceTypeId": 2000, "DeviceTypeName": "CHASSIS", "ProtocolName": "WSMAN"},
+            ]})
+        )
         create = respx.post(f"{API}/DiscoveryConfigService/DiscoveryConfigGroups").mock(
             return_value=httpx.Response(201, json={"DiscoveryConfigTaskParam": [{"TaskId": 78}]})
         )
@@ -287,12 +337,16 @@ class TestOme:
         body = json.loads(create.calls.last.request.content)
         model = body["DiscoveryConfigModels"][0]
         assert model["DiscoveryConfigTargets"] == [{"NetworkAddressDetail": IP}]
-        credentials = json.loads(model["ConnectionProfile"])["credentials"][0]["credentials"]
+        assert model["DeviceType"] == [1000]
+        profile = json.loads(model["ConnectionProfile"])
+        # Dell's get_connection_profile: WS-Man, duplicated as REDFISH "as in GUI".
+        assert [c["type"] for c in profile["credentials"]] == ["WSMAN", "REDFISH"]
+        credentials = profile["credentials"][0]["credentials"]
         assert (credentials["username"], credentials["password"]) == ("root", "pw")
 
     @pytest.mark.parametrize(
         ("status_id", "finished", "succeeded"),
-        [(2050, False, False), (2060, True, True), (2070, True, False), (2090, True, False)],
+        [(2050, False, False), (2060, True, True), (2070, True, False), (2090, True, False), (2101, True, False)],
     )
     @respx.mock
     async def test_job_status_is_interpreted_on_the_limb(self, status_id, finished, succeeded):
@@ -315,24 +369,40 @@ class TestOme:
                 await ome.find_template_id(client, "ocp-r660")
 
     @respx.mock
-    async def test_deploy_is_skipped_when_the_template_is_already_on_the_device(self):
+    async def test_a_deployed_template_returns_its_own_deployment_job(self):
         _login()
         respx.get(url__startswith=f"{API}/ProfileService/Profiles").mock(
             return_value=httpx.Response(200, json={"value": [
-                {"Id": 9, "TargetId": 2, "ProfileName": "p", "TemplateName": "ocp-r660"}
+                {"Id": 9, "TargetId": 2, "ProfileName": "p", "TemplateId": 3, "TemplateName": "ocp-r660",
+                 "ProfileState": 4, "DeploymentTaskId": 555}
             ]})
         )
         deploy = respx.post(url__startswith=f"{API}/TemplateService/Actions").mock(return_value=httpx.Response(500))
         async with ome.session(OME, "u", "p") as client:
-            assert await ome.deploy_template(client, 3, "ocp-r660", 2) is None
+            assert await ome.deploy_template(client, 3, "ocp-r660", 2) == 555
         assert deploy.call_count == 0
+
+    @respx.mock
+    async def test_an_unassigned_profile_does_not_count(self):
+        _login()
+        respx.get(url__startswith=f"{API}/ProfileService/Profiles").mock(
+            return_value=httpx.Response(200, json={"value": [
+                {"Id": 9, "TargetId": 2, "TemplateId": 99, "ProfileState": 0}
+            ]})
+        )
+        respx.post(f"{API}/TemplateService/Actions/TemplateService.Deploy").mock(
+            return_value=httpx.Response(200, json=4243)
+        )
+        async with ome.session(OME, "u", "p") as client:
+            assert await ome.deploy_template(client, 3, "ocp-r660", 2) == 4243
 
     @respx.mock
     async def test_a_profile_from_another_template_is_never_overwritten(self):
         _login()
         respx.get(url__startswith=f"{API}/ProfileService/Profiles").mock(
             return_value=httpx.Response(200, json={"value": [
-                {"Id": 9, "TargetId": 2, "ProfileName": "p", "TemplateName": "hand-made"}
+                {"Id": 9, "TargetId": 2, "ProfileName": "p", "TemplateId": 99, "TemplateName": "hand-made",
+                 "ProfileState": 4}
             ]})
         )
         async with ome.session(OME, "u", "p") as client:

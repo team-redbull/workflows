@@ -59,9 +59,12 @@ _CONVERT_TO_NON_RAID = f"{SYSTEM}/Oem/Dell/DellRaidService/Actions/DellRaidServi
 _RESET = f"{SYSTEM}/Actions/ComputerSystem.Reset"
 
 # Lifecycle Controller job states after which a job will not change again.
-_TERMINAL_JOB_STATES = {"Completed", "Failed", "CompletedWithErrors", "RebootFailed"}
-# A staged job waiting for the reset that runs it.
-_AWAITING_RESET_STATES = {"Scheduled", "New"}
+TERMINAL_JOB_STATES = {"Completed", "Failed", "CompletedWithErrors", "RebootFailed"}
+# A staged (OnReset) job waiting for the reset that runs it. Anything neither
+# this nor terminal is ACTIVE — e.g. a PERC's Non-RAID conversion, which Dell
+# runs at once as a RealTimeNoRebootConfiguration job — and no reset may
+# happen until it is done.
+AWAITING_RESET_STATE = "Scheduled"
 _REJECTED_STATUSES = {400, 405, 409, 422}
 
 
@@ -198,6 +201,17 @@ async def read_identity(idrac_ip: str, username: str, password: str) -> IdracIde
     )
 
 
+def _raid_status(drive: dict[str, Any]) -> str | None:
+    """Dell's RaidStatus: SAS/SATA drives report it under `DellPhysicalDisk`,
+    NVMe drives under `DellPCIeSSD` (as Dell's own storage module reads it)."""
+    dell = (drive.get("Oem") or {}).get("Dell") or {}
+    for key in ("DellPhysicalDisk", "DellPCIeSSD"):
+        status = (dell.get(key) or {}).get("RaidStatus")
+        if status:
+            return str(status)
+    return None
+
+
 async def _read_controller(client: httpx.AsyncClient, path: str) -> IdracController:
     storage = await _get(client, path)
     controllers = storage.get("StorageControllers") or []
@@ -210,8 +224,7 @@ async def _read_controller(client: httpx.AsyncClient, path: str) -> IdracControl
         if not drive_path:
             continue
         drive = await _get(client, drive_path)
-        dell = ((drive.get("Oem") or {}).get("Dell") or {}).get("DellPhysicalDisk") or {}
-        drives.append(IdracDrive(odata_id=drive_path, raid_status=dell.get("RaidStatus")))
+        drives.append(IdracDrive(odata_id=drive_path, raid_status=_raid_status(drive)))
 
     volumes: list[IdracVolume] = []
     volumes_link = (storage.get("Volumes") or {}).get("@odata.id")
@@ -255,16 +268,37 @@ async def _pending_jobs(client: httpx.AsyncClient) -> list[dict[str, Any]]:
     return [
         job
         for job in body.get("Members", [])
-        if isinstance(job, dict) and job.get("JobState") not in _TERMINAL_JOB_STATES
+        if isinstance(job, dict) and job.get("JobState") not in TERMINAL_JOB_STATES
     ]
 
 
 def _pending_for(jobs: list[dict[str, Any]], controller: str) -> str | None:
-    """A pending configuration job on this controller (named `Configure: <ctrl>`)."""
+    """A pending configuration job on this controller.
+
+    Dell names every storage configuration job `Configure: <controller FQDD>`
+    (dellemc.openmanage's idrac_redfish_storage_controller sample:
+    `"Name": "Configure: RAID.Integrated.1-1"`), whatever its JobType.
+    """
     for job in jobs:
-        if controller in str(job.get("Name", "")) and str(job.get("Id", "")).startswith("JID_"):
+        if str(job.get("Name", "")) == f"Configure: {controller}" and str(job.get("Id", "")).startswith("JID_"):
             return str(job["Id"])
     return None
+
+
+async def _require_raid1(client: httpx.AsyncClient, controller: str) -> None:
+    """Refuse up front when the controller does not offer RAID 1 at all.
+
+    Dell's redfish_storage_volume checks `StorageControllers[0].SupportedRAIDTypes`
+    the same way; without it the refusal would come back as the iDRAC's own
+    message from the POST, which says less.
+    """
+    storage = await _get(client, f"{SYSTEM}/Storage/{controller}")
+    controllers = storage.get("StorageControllers") or [{}]
+    supported = controllers[0].get("SupportedRAIDTypes") if isinstance(controllers[0], dict) else None
+    if supported is not None and "RAID1" not in supported:
+        raise IdracRequestRejectedError(
+            f"{controller} does not support RAID1 (SupportedRAIDTypes: {supported})"
+        )
 
 
 def _controller_of(drive_path: str) -> str:
@@ -296,7 +330,10 @@ async def stage_storage(
             if existing:
                 job_ids.append(existing)
             else:
+                await _require_raid1(client, boss_controller)
                 what = f"a RAID 1 on {boss_controller}"
+                # BOSS controllers apply volume changes OnReset only (Dell's
+                # redfish_storage_volume: "BOSS-S1 and BOSS-N1 ... OnReset").
                 resp = await _request(
                     client,
                     "POST",
@@ -339,6 +376,7 @@ async def get_jobs(idrac_ip: str, username: str, password: str, job_ids: list[st
                 IdracJobState(
                     job_id=job_id,
                     state=str(job.get("JobState") or "Unknown"),
+                    job_type=job.get("JobType"),
                     message=job.get("Message"),
                     percent_complete=job.get("PercentComplete"),
                 )
@@ -347,9 +385,21 @@ async def get_jobs(idrac_ip: str, username: str, password: str, job_ids: list[st
 
 
 async def apply_staged(idrac_ip: str, username: str, password: str, job_ids: list[str]) -> RebootResult:
-    """Reset the machine if (and only if) a job is still waiting for a reset."""
+    """Reset the machine if (and only if) a job is waiting for a reset — and none is running.
+
+    A PERC applies its Non-RAID conversion at once as a real-time job, so it
+    can still be RUNNING when the BOSS's volume is waiting for the reset.
+    Resetting then would cut the conversion off mid-apply; that is a
+    retryable IdracError here, and the workflow waits for it before calling.
+    """
     states = await get_jobs(idrac_ip, username, password, job_ids)
-    if not any(state.state in _AWAITING_RESET_STATES for state in states):
+    active = [s for s in states if s.state not in TERMINAL_JOB_STATES and s.state != AWAITING_RESET_STATE]
+    if active:
+        raise IdracError(
+            "not resetting while job(s) still run: "
+            + ", ".join(f"{s.job_id} {s.state}" for s in active)
+        )
+    if not any(state.state == AWAITING_RESET_STATE for state in states):
         return RebootResult(rebooted=False)
     async with _client(idrac_ip, username, password) as client:
         system = await _get(client, SYSTEM)

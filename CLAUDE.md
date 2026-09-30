@@ -143,6 +143,14 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   - **Region comes from the iDRAC prefix at the API EDGE** (`regions.py`, a const), carried as
     input — never looked up on replay.
   - **A server server-scan lists as claimed by a cluster is refused** before anything reboots it.
+  - **Dell's own client code is the reference for every OME/iDRAC shape** — the
+    `dellemc.openmanage` collection (`docs/design/dell-ome-idrac-api.md` lists each
+    fact with its source file). Change a request only against that code, and keep
+    `tests/dell_simulator.py` in step: the e2e test runs the real limb against it.
+    Traps it found: NVMe RaidStatus lives under `DellPCIeSSD`; a PERC runs Non-RAID
+    at once (RealTimeNoRebootConfiguration) so NO reset while a job runs; a
+    templated device is `ProfileState > 0` + same `TemplateId`, and its
+    `DeploymentTaskId` is the job to wait on.
   - **Done = server-scan lists it under that name.** server-scan discovers by itself (its OME
     collector, every 6 h); the run polls a Mongo-backed read for up to 8 h and NEVER asks
     server-scan to refresh or calls `/servers/available` (live vendor recheck).

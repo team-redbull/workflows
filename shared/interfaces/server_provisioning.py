@@ -94,7 +94,9 @@ async def apply_staged_idrac_jobs(ref: IdracJobsRef) -> RebootResult:
 
     Only resets while at least one job is still `Scheduled`: once the
     Lifecycle Controller has picked them up, a second reset would interrupt
-    the apply. A powered-off machine is powered on instead.
+    the apply. Refuses (retryable IdracError) while any job is still RUNNING —
+    a PERC's real-time Non-RAID conversion must finish first. A powered-off
+    machine is powered on instead.
     """
     ...
 
@@ -135,8 +137,9 @@ async def deploy_ome_template(request: TemplateDeployRequest) -> TemplateDeployR
     """Deploy the configured template for (model, iDRAC firmware) to the device.
 
     The template is chosen from DELL_TEMPLATES and resolved by name in OME.
-    Idempotent: a device already carrying a profile from that template gets no
-    second deployment (job_id=None). Raises TemplateNotConfiguredError,
+    Idempotent: a device already carrying a profile (ProfileState > 0) from
+    that template gets no second deployment — the profile's own
+    DeploymentTaskId is returned to wait on. Raises TemplateNotConfiguredError,
     TemplateNotFoundError or ProfileConflictError — all deterministic.
     """
     ...

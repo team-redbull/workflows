@@ -186,6 +186,7 @@ _STORAGE_DEADLINE = timedelta(minutes=90)
 _STORAGE_POLL = timedelta(minutes=1)
 _IDRAC_JOB_SUCCESS = "Completed"
 _IDRAC_JOB_TERMINAL = {"Completed", "Failed", "CompletedWithErrors", "RebootFailed"}
+_IDRAC_JOB_AWAITING_RESET = "Scheduled"
 
 # --- Naming ------------------------------------------------------------------
 _NAME_DEADLINE = timedelta(minutes=30)
@@ -515,8 +516,18 @@ class ProvisionDellServerWorkflow:
             ),
         )
         jobs_ref = IdracJobsRef(idrac=target, job_ids=job_ids)
-        self._phase("applying-storage", waiting_on=f"iDRAC jobs {', '.join(job_ids)} (reboot)")
-        await self._run(apply_staged_idrac_jobs, jobs_ref)
+        # A PERC runs its Non-RAID conversion at once (a real-time job); the
+        # reset that applies the BOSS volume must not cut it off mid-apply.
+        self._phase("applying-storage", waiting_on=f"real-time iDRAC jobs among {', '.join(job_ids)}")
+        _, settled = await self._poll(
+            lambda: self._run(get_idrac_jobs, jobs_ref),
+            lambda s: all(job.state in _IDRAC_JOB_TERMINAL or job.state == _IDRAC_JOB_AWAITING_RESET for job in s.jobs),
+            _STORAGE_DEADLINE,
+            _STORAGE_POLL,
+        )
+        if settled:
+            self._phase("applying-storage", waiting_on=f"iDRAC jobs {', '.join(job_ids)} (reboot)")
+            await self._run(apply_staged_idrac_jobs, jobs_ref)
         state, finished = await self._poll(
             lambda: self._run(get_idrac_jobs, jobs_ref),
             lambda s: all(job.state in _IDRAC_JOB_TERMINAL for job in s.jobs),

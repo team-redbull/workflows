@@ -140,6 +140,9 @@ class IdracJobState(BaseModel):
 
     job_id: str
     state: str
+    # e.g. RAIDConfiguration (staged, runs on reset) or
+    # RealTimeNoRebootConfiguration (a PERC applying at once).
+    job_type: str | None = None
     message: str | None = None
     percent_complete: int | None = None
 
@@ -209,7 +212,12 @@ class TemplateDeployRequest(BaseModel):
 
 
 class TemplateDeployResult(BaseModel):
-    """`job_id` is None when the device already carries a profile from this template."""
+    """The job that deploys (or already deployed) the template.
+
+    When the device already carries a profile from this template, `job_id` is
+    that profile's own `DeploymentTaskId`, so a retry or re-run waits on the
+    real deployment; None only when OME recorded no task for it.
+    """
 
     template_name: str
     template_id: int
@@ -227,6 +235,10 @@ class OmeProfile(BaseModel):
     profile_id: int | None = None
     profile_name: str | None = None
     template_name: str | None = None
+    template_id: int | None = None
+    # 0 unassigned, 1 assigned for auto-deploy, 4 deployed.
+    profile_state: int | None = None
+    deployment_task_id: int | None = None
 
 
 class ServerNameRequest(BaseModel):

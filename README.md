@@ -304,6 +304,17 @@ Workflow id `provision-dell-server-<idrac ip>`. Every wait is the workflow's, on
 durable timers with a deadline; no password is ever in Temporal history (a run
 names a credential by its position in the limb's list).
 
+Every OME and iDRAC request was checked against Dell's own client code (the
+`dellemc.openmanage` collection); the facts, their sources and what is still
+unverified on real hardware are in `docs/design/dell-ome-idrac-api.md`.
+`tests/test_provision_dell_server_e2e.py` runs the real workflow and activities
+against a Dell simulator built from them (`tests/dell_simulator.py`).
+
+> **The templates in `DELL_TEMPLATES` must not carry storage components.** A
+> template captured from a reference server can include `RAIDresetConfig=True`
+> (Dell's own sample does), which wipes the controller when it is deployed —
+> and the storage layout is this workflow's job, done after the template.
+
 ### `allocate-segment` — give a cluster a segment
 
 Takes the cluster, the **values-repo branch** to record on, and the **type** to

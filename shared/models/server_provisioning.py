@@ -183,6 +183,49 @@ class RebootResult(BaseModel):
     reset_type: str | None = None
 
 
+class BiosComparison(BaseModel):
+    """One BIOS attribute the template meant to set, against what the machine has.
+
+    `attribute_name` is None when the machine's BIOS attribute registry has no
+    entry with that display name — reported rather than dropped, because
+    silence would read as "verified" when it means "not checked". That happens
+    when a template built for one firmware names an attribute another firmware
+    does not have, which is the exact case Dell warns about.
+    """
+
+    display_name: str
+    attribute_name: str | None = None
+    intended: str | None = None
+    actual: str | None = None
+    read_only: bool = False
+
+    @property
+    def verifiable(self) -> bool:
+        return bool(self.attribute_name) and not self.read_only and self.intended is not None
+
+    @property
+    def drifted(self) -> bool:
+        return self.verifiable and self.actual != self.intended
+
+
+class BiosVerifyRequest(BaseModel):
+    """The BIOS attributes to check, keyed by the DISPLAY name OME reports."""
+
+    idrac: IdracRef
+    intended: dict[str, str | None] = Field(default_factory=dict)
+
+
+class BiosVerification(BaseModel):
+    compared: list[BiosComparison] = Field(default_factory=list)
+
+
+class BiosStageRequest(BaseModel):
+    """Attribute NAME -> value, as Redfish accepts them in a PATCH."""
+
+    idrac: IdracRef
+    attributes: dict[str, str] = Field(default_factory=dict)
+
+
 class TemplateAttribute(BaseModel):
     """One attribute an OME template would deploy.
 
@@ -345,6 +388,8 @@ class ProvisionDellServerProgress(BaseModel):
     template_name: str | None = None
     profile_name: str | None = None
     os_hostname_cleared: bool | None = None
+    bios_attributes_checked: int | None = None
+    bios_attributes_drifted: int | None = None
     waiting_on: str | None = None
 
 
@@ -365,3 +410,10 @@ class ProvisionDellServerResult(BaseModel):
     # True when the machine arrived with a factory OS hostname (`Miniwinpc`)
     # that this run blanked, so OME shows its address beside the profile.
     os_hostname_cleared: bool = False
+    # How much of the template this run could actually verify, and how much of
+    # it the deployment silently failed to apply. `bios_attributes_unverified`
+    # is the honest coverage gap: attributes the machine's BIOS registry does
+    # not know, which is what a template/firmware mismatch looks like.
+    bios_attributes_checked: int = 0
+    bios_attributes_remediated: int = 0
+    bios_attributes_unverified: int = 0

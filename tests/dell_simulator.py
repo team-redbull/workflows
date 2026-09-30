@@ -117,6 +117,32 @@ class IdracSim:
     login_attempts: list[str] = field(default_factory=list)
     # Every password this machine's root account was set to, in order.
     password_writes: list[str] = field(default_factory=list)
+    # The BIOS as the machine actually has it, and what a PATCH has staged but
+    # not yet applied. The default is a machine whose System Profile is still
+    # at its factory value — the template wants PerfOptimized, so a run has one
+    # attribute of drift to find and fix.
+    bios: dict[str, str] = field(
+        default_factory=lambda: {"SysProfile": "PerfPerWattOptimizedOs", "BootMode": "Uefi"}
+    )
+    bios_pending: dict[str, str] = field(default_factory=dict)
+    bios_registry: list[dict[str, Any]] = field(
+        default_factory=lambda: [
+            {
+                "AttributeName": "SysProfile",
+                "DisplayName": "System Profile",
+                "ReadOnly": False,
+                "Type": "Enumeration",
+                "Value": [
+                    {"ValueName": "PerfOptimized", "ValueDisplayName": "Performance Optimized"},
+                    {"ValueName": "PerfPerWattOptimizedOs", "ValueDisplayName": "Performance per Watt (OS)"},
+                ],
+            },
+            {"AttributeName": "BootMode", "DisplayName": "Boot Mode", "ReadOnly": False,
+             "Type": "Enumeration", "Value": [{"ValueName": "Uefi", "ValueDisplayName": "UEFI"}]},
+            {"AttributeName": "SysMemSize", "DisplayName": "System Memory Size", "ReadOnly": True,
+             "Type": "String", "Value": []},
+        ]
+    )
     drives: list[Drive] = field(default_factory=list)
     volumes: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     jobs: dict[str, Job] = field(default_factory=dict)
@@ -317,9 +343,37 @@ def idrac_app(sim: IdracSim) -> FastAPI:
             sim.password_writes.append(sim.root_password)
         return {"Id": "2", "UserName": "root"}
 
+    @app.get(f"{SYSTEM}/Bios")
+    async def bios():
+        return {"Id": "BIOS.Setup.1-1", "Attributes": dict(sim.bios)}
+
+    @app.get(f"{SYSTEM}/Bios/BiosRegistry")
+    async def bios_registry():
+        return {"RegistryEntries": {"Attributes": sim.bios_registry}}
+
+    @app.patch(f"{SYSTEM}/Bios/Settings")
+    async def patch_bios_settings(request: Request):
+        # Pending, exactly like the real thing: nothing changes until a reset
+        # runs the configuration job queued against this resource.
+        sim.bios_pending.update((await request.json()).get("Attributes") or {})
+        return {"Id": "Settings"}
+
     @app.get(MANAGER)
     async def manager():
         return {"Id": "iDRAC.Embedded.1", "FirmwareVersion": sim.firmware}
+
+    @app.post(JOBS)
+    async def create_job(request: Request):
+        body = await request.json()
+        if body.get("TargetSettingsURI") != f"{SYSTEM}/Bios/Settings":
+            return _error(400, f"Unsupported TargetSettingsURI {body.get('TargetSettingsURI')!r}")
+
+        def apply_pending() -> None:
+            sim.bios.update(sim.bios_pending)
+            sim.bios_pending.clear()
+
+        job = sim.new_job("BIOS.Setup.1-1", "BIOSConfiguration", "Scheduled", apply_pending)
+        return JSONResponse({}, status_code=202, headers={"Location": f"{JOBS}/{job.id}"})
 
     @app.get(f"{SYSTEM}/Storage")
     async def storage():

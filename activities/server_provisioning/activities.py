@@ -24,6 +24,9 @@ from activities.server_provisioning import idrac, ome, server_namer, server_scan
 from shared.exceptions import IdracCredentialsMissingError, TemplateNotConfiguredError
 from shared.models.server_provisioning import (
     TARGET_CREDENTIAL,
+    BiosStageRequest,
+    BiosVerification,
+    BiosVerifyRequest,
     IdracIdentity,
     IdracJobsRef,
     IdracJobsState,
@@ -143,6 +146,40 @@ async def clear_idrac_os_hostname(ref: IdracRef) -> bool:
     if cleared:
         activity.logger.info("iDRAC %s: OS hostname cleared", ref.idrac_ip)
     return cleared
+
+
+@activity.defn
+async def verify_bios_configuration(request: BiosVerifyRequest) -> BiosVerification:
+    """What the template meant each BIOS attribute to be, against what it is."""
+    ref = request.idrac
+    compared = await idrac.compare_bios(
+        ref.idrac_ip, _settings.idrac_username, _password(ref), request.intended
+    )
+    drifted = [c.display_name for c in compared if c.drifted]
+    activity.logger.info(
+        "iDRAC %s BIOS: %d checked, %d drifted%s",
+        ref.idrac_ip,
+        len(compared),
+        len(drifted),
+        f" ({', '.join(drifted)})" if drifted else "",
+    )
+    return BiosVerification(compared=compared)
+
+
+@activity.defn
+async def stage_bios_attributes(request: BiosStageRequest) -> str:
+    """Stage BIOS values and queue the job that applies them on the next reset."""
+    ref = request.idrac
+    job_id = await idrac.stage_bios_attributes(
+        ref.idrac_ip, _settings.idrac_username, _password(ref), request.attributes
+    )
+    activity.logger.info(
+        "iDRAC %s: %d BIOS attribute(s) staged as %s",
+        ref.idrac_ip,
+        len(request.attributes),
+        job_id,
+    )
+    return job_id
 
 
 @activity.defn

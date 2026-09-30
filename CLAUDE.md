@@ -164,6 +164,20 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
     are deliberately generous, since a false positive fails a run with the offending attributes
     named while a false negative strands a machine. An attribute marked `IsIgnored` is not
     deployed, so it is not a hazard.
+  - **A DEPLOYED TEMPLATE IS NOT A VERIFIED ONE.** SCP import is a "continue on error"
+    operation, so an attribute the target's firmware does not know fails while everything else
+    applies and the job still reports success — Dell's own reference client does not trust the
+    job state either, it string-searches the message for failure words. So `verifying-config`
+    reads the template's BIOS attributes back and REMEDIATES drift over Redfish, never by
+    redeploying the profile (which would re-run everything that already worked). The fix is
+    staged as a BIOS job and applied by the SAME reboot the storage jobs need — but storage is
+    STAGED FIRST, because a controller that cannot take the layout fails at staging and a run
+    dying there must not leave a pending BIOS job for an unrelated reset to apply later. Only
+    BIOS is verified: its attribute registry maps OME's display names to the names Redfish
+    accepts, which is what makes an attribute both checkable and fixable, and the iDRAC's own
+    attributes have no such published bridge. An attribute the registry does not know is
+    REPORTED (`bios_attributes_unverified`), never silently passed — that count is the evidence
+    for whether one template can serve several firmware levels.
   - **The factory OS hostname is blanked** (`Miniwinpc`), unconditionally, after the in-use guard
     and before OME discovery: while one is set OME shows it instead of the machine's address next
     to the profile. A machine being provisioned has no OS, so anything there is stale.

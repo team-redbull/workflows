@@ -127,6 +127,90 @@ class TestOsHostname:
         assert not patched.called
 
 
+REGISTRY = f"{BASE}{idrac.BIOS_REGISTRY}"
+BIOS = f"{BASE}{idrac.BIOS}"
+BIOS_SETTINGS = f"{BASE}{idrac.BIOS_SETTINGS}"
+
+_REGISTRY_BODY = {"RegistryEntries": {"Attributes": [
+    {"AttributeName": "SysProfile", "DisplayName": "System Profile", "ReadOnly": False,
+     "Value": [{"ValueName": "PerfOptimized", "ValueDisplayName": "Performance Optimized"}]},
+    {"AttributeName": "SysMemSize", "DisplayName": "System Memory Size", "ReadOnly": True, "Value": []},
+]}}
+
+
+class TestBiosComparison:
+    """The BIOS attribute registry is the only bridge between OME's display
+    names and the names Redfish accepts, so getting it wrong means either
+    silently skipping a setting or PATCHing one that does not exist."""
+
+    def _registry(self) -> None:
+        respx.get(REGISTRY).mock(return_value=httpx.Response(200, json=_REGISTRY_BODY))
+
+    @respx.mock
+    async def test_a_display_name_resolves_to_its_redfish_attribute(self):
+        self._registry()
+        respx.get(BIOS).mock(return_value=httpx.Response(200, json={"Attributes": {"SysProfile": "Custom"}}))
+        [compared] = await idrac.compare_bios(IP, "root", "pw", {"System Profile": "PerfOptimized"})
+        assert (compared.attribute_name, compared.actual, compared.intended) == (
+            "SysProfile", "Custom", "PerfOptimized"
+        )
+        assert compared.drifted
+
+    @respx.mock
+    async def test_a_value_given_by_its_display_name_is_translated(self):
+        """OME may report either the value name or its display name; only the
+        value NAME is what Redfish stores, so comparing the raw strings would
+        report drift on a machine that is already correct."""
+        self._registry()
+        respx.get(BIOS).mock(
+            return_value=httpx.Response(200, json={"Attributes": {"SysProfile": "PerfOptimized"}})
+        )
+        [compared] = await idrac.compare_bios(
+            IP, "root", "pw", {"System Profile": "Performance Optimized"}
+        )
+        assert compared.intended == "PerfOptimized" and not compared.drifted
+
+    @respx.mock
+    async def test_an_attribute_the_registry_does_not_know_is_reported_not_dropped(self):
+        """A template built for another firmware names attributes this machine
+        does not have. Dropping them silently would read as 'verified'."""
+        self._registry()
+        respx.get(BIOS).mock(return_value=httpx.Response(200, json={"Attributes": {}}))
+        [compared] = await idrac.compare_bios(IP, "root", "pw", {"Some New Knob": "On"})
+        assert compared.attribute_name is None and not compared.drifted and not compared.verifiable
+
+    @respx.mock
+    async def test_a_read_only_attribute_is_never_drift(self):
+        self._registry()
+        respx.get(BIOS).mock(return_value=httpx.Response(200, json={"Attributes": {"SysMemSize": "1024 GB"}}))
+        [compared] = await idrac.compare_bios(IP, "root", "pw", {"System Memory Size": "512 GB"})
+        assert compared.read_only and not compared.drifted
+
+
+class TestStageBios:
+    @respx.mock
+    async def test_patches_pending_values_then_queues_the_job(self):
+        respx.get(JOBS).mock(return_value=httpx.Response(200, json={"Members": []}))
+        patched = respx.patch(BIOS_SETTINGS).mock(return_value=httpx.Response(200))
+        respx.post(JOBS).mock(
+            return_value=httpx.Response(202, headers={"Location": f"{idrac.JOBS}/JID_555"})
+        )
+        assert await idrac.stage_bios_attributes(IP, "root", "pw", {"SysProfile": "PerfOptimized"}) == "JID_555"
+        assert json.loads(patched.calls.last.request.content) == {"Attributes": {"SysProfile": "PerfOptimized"}}
+
+    @respx.mock
+    async def test_a_retry_reuses_the_pending_job_instead_of_queueing_a_second(self):
+        """An iDRAC holds one pending configuration job per controller, so a
+        second would be refused — the same rule stage_storage follows."""
+        respx.get(JOBS).mock(return_value=httpx.Response(200, json={"Members": [
+            {"Id": "JID_111", "Name": "Configure: BIOS.Setup.1-1", "JobState": "Scheduled"},
+        ]}))
+        patched = respx.patch(BIOS_SETTINGS).mock(return_value=httpx.Response(200))
+        posted = respx.post(JOBS).mock(return_value=httpx.Response(202))
+        assert await idrac.stage_bios_attributes(IP, "root", "pw", {"SysProfile": "X"}) == "JID_111"
+        assert not patched.called and not posted.called
+
+
 BOSS = "AHCI.SL.6-1"
 PERC = "RAID.SL.3-1"
 BOSS_DRIVES = [f"{idrac.SYSTEM}/Storage/{BOSS}/Drives/Disk.Direct.{n}:{BOSS}" for n in (0, 1)]

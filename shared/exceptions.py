@@ -485,6 +485,18 @@ class OmeDiscoveryFailedError(OrchestratorError):
     """WORKFLOW-RAISED. OME's discovery job failed, or finished without the device."""
 
 
+class ConfigurationDriftError(OrchestratorError):
+    """WORKFLOW-RAISED. The template deployed, the reboot ran, and BIOS
+    attributes it set still do not match it.
+
+    The deployment reporting success is not evidence: SCP Import is a "continue
+    on error" operation, so an attribute the target's firmware does not know
+    fails while everything else applies. The run stages the drift over Redfish
+    and lets the storage reboot apply it; this is what remains after that, which
+    means the machine will not take the setting at all.
+    """
+
+
 class TemplateUnsafeError(OrchestratorError):
     """WORKFLOW-RAISED. The configured template carries attributes this workflow
     refuses to deploy — iDRAC network settings, storage, or user accounts.

@@ -30,11 +30,15 @@ Shape of the run:
                             DELL_TEMPLATES. It creates the server profile.
   5. verifying-root-password — nothing in the deployment may have moved root's
                             password; a guard, not the mechanism.
-  6. configuring-storage  — RAID 1 on the BOSS, every PERC drive Non-RAID,
-     applying-storage       staged together and applied by ONE reboot, then
-     verifying-storage      read back. Nothing is ever deleted
-                            (storage_plan.py).
-  7. naming-server        — the naming service renames the OME profile, and
+  6. verifying-config     — did the template's BIOS attributes ACTUALLY apply?
+                            An SCP import is "continue on error", so a finished
+                            deployment proves nothing. Drift is staged over
+                            Redfish, never by redeploying the profile.
+  7. configuring-storage  — RAID 1 on the BOSS, every PERC drive Non-RAID,
+     applying-storage       staged together and applied by ONE reboot — the
+     verifying-storage      same reboot that applies any BIOS drift — then read
+                            back. Nothing is ever deleted (storage_plan.py).
+  8. naming-server        — the naming service renames the OME profile, and
      verifying-name         the name is read back from OME and checked against
                             the convention, region and service tag included.
 
@@ -103,6 +107,7 @@ with workflow.unsafe.imports_passed_through():
         OmeAuthError,
         OmeDiscoveryFailedError,
         OmeRequestRejectedError,
+        ConfigurationDriftError,
         ProfileConflictError,
         RegionMissingError,
         RootPasswordNotSetError,
@@ -133,6 +138,8 @@ with workflow.unsafe.imports_passed_through():
         read_idrac_identity,
         read_ome_template,
         read_storage_layout,
+        stage_bios_attributes,
+        verify_bios_configuration,
         request_server_name,
         set_idrac_root_password,
         stage_storage_config,
@@ -143,6 +150,8 @@ with workflow.unsafe.imports_passed_through():
         IDRAC_JOB_SUCCESS,
         IDRAC_TERMINAL_JOB_STATES,
         TARGET_CREDENTIAL,
+        BiosStageRequest,
+        BiosVerifyRequest,
         IdracIdentity,
         IdracJobsRef,
         IdracJobsState,
@@ -161,11 +170,16 @@ with workflow.unsafe.imports_passed_through():
         ServerScanLookup,
         StorageConfigRequest,
         StorageLayout,
+        TemplateAttribute,
         TemplateDeployRequest,
     )
     from workflow_domains.server_provisioning.template_policy import (
         audit_template,
+        bios_drift,
+        bios_intent,
+        describe_drift,
         describe_hazards,
+        unverifiable,
     )
     from workflow_domains.server_provisioning.server_name import (
         model_token,
@@ -250,6 +264,13 @@ def _describe_jobs(state: IdracJobsState) -> str:
 class ProvisionDellServerWorkflow:
     def __init__(self) -> None:
         self._progress = ProvisionDellServerProgress(phase="pending")
+        # How much of the template this run could check, and how much of it the
+        # deployment silently failed to apply. Reported in the result because
+        # it is the evidence for whether one template can serve many firmware
+        # levels (docs/design/dell-scp-template-r660.md).
+        self._bios_checked = 0
+        self._bios_remediated = 0
+        self._bios_unverified = 0
 
     @workflow.query
     def progress(self) -> ProvisionDellServerProgress:
@@ -410,8 +431,29 @@ class ProvisionDellServerWorkflow:
                 TemplatePasswordNotAppliedError,
             )
 
-        # Step 6 — storage: RAID 1 on the BOSS, PERC drives Non-RAID.
-        boss_created, converted = await self._configure_storage(target)
+        # Steps 6 and 7 — storage and configuration drift, applied by ONE reboot.
+        #
+        # Storage is STAGED FIRST, deliberately. A controller that cannot take
+        # the layout fails at staging, and a run that dies there must not leave
+        # a pending BIOS job behind for some unrelated reset to apply weeks
+        # later. So nothing else is staged until the storage jobs exist.
+        plan, storage_jobs = await self._stage_storage(target)
+
+        # Then: did the template's BIOS attributes ACTUALLY apply? A finished
+        # deployment proves nothing — SCP import is "continue on error", so an
+        # attribute this firmware does not know fails while the rest succeed.
+        # Drift is staged as its own job, never by redeploying the profile,
+        # which would re-run everything that already worked.
+        bios_job = await self._verify_configuration(target, template.attributes)
+
+        boss_created, converted = await self._apply_storage(
+            target, plan, storage_jobs + ([bios_job] if bios_job else [])
+        )
+
+        # The reboot has run, so the drift must be gone. Anything left is a
+        # machine that will not take the setting at all.
+        if bios_job:
+            await self._verify_configuration(target, template.attributes, remediating=False)
 
         # Step 7 — the name. The naming service computes it; OME is where it is read back.
         self._phase("naming-server")
@@ -464,6 +506,9 @@ class ProvisionDellServerWorkflow:
             boss_raid1_created=boss_created,
             non_raid_drives_converted=converted,
             os_hostname_cleared=bool(self._progress.os_hostname_cleared),
+            bios_attributes_checked=self._bios_checked,
+            bios_attributes_remediated=self._bios_remediated,
+            bios_attributes_unverified=self._bios_unverified,
         )
 
     async def _probe(self, idrac_ip: str) -> int:
@@ -552,11 +597,76 @@ class ProvisionDellServerWorkflow:
             )
         return device
 
-    async def _configure_storage(self, target: IdracRef) -> tuple[bool, int]:
-        """Take the machine to the required storage layout; (RAID 1 created, drives converted).
+    async def _verify_configuration(
+        self, target: IdracRef, attributes: list[TemplateAttribute], remediating: bool = True
+    ) -> str | None:
+        """Check the template's BIOS attributes really applied; stage the fixes.
 
-        Plan, stage everything, ONE reboot, wait for the jobs, then read the
-        storage back and plan again: a converged plan is the only success.
+        Returns the id of the staged BIOS job when there was drift to fix, so
+        the caller can have one reboot apply it alongside the storage jobs.
+
+        On the second pass (`remediating=False`) there is nothing left to try:
+        the reboot has run, so remaining drift is a machine that will not take
+        the setting, and the run fails by name rather than looping.
+        """
+        self._phase("verifying-config")
+        intended = bios_intent(attributes)
+        if not intended:
+            return None
+        verification = await self._run(
+            verify_bios_configuration, BiosVerifyRequest(idrac=target, intended=intended)
+        )
+        drifted = bios_drift(verification.compared)
+        unchecked = unverifiable(verification.compared)
+        self._progress.bios_attributes_checked = len(verification.compared)
+        self._progress.bios_attributes_drifted = len(drifted)
+        self._bios_checked = len(verification.compared)
+        self._bios_unverified = len(unchecked)
+        if remediating:
+            self._bios_remediated = len(drifted)
+
+        if unchecked:
+            # Not a failure: this is a template naming an attribute the target's
+            # firmware does not have, which is Dell's documented consequence of
+            # a version difference. Loud in the log, and counted in the result,
+            # because it is the evidence for whether a golden template is safe.
+            workflow.logger.warning(
+                "%d template BIOS attribute(s) are not in %s's registry and were not verified: %s",
+                len(unchecked),
+                target.idrac_ip,
+                ", ".join(a.display_name for a in unchecked),
+            )
+        if not drifted:
+            return None
+        if not remediating:
+            raise _fail(
+                f"The template deployed and the reboot ran, but {len(drifted)} BIOS attribute(s) "
+                f"still do not match it: {describe_drift(drifted)}",
+                ConfigurationDriftError,
+            )
+        workflow.logger.info(
+            "Template %s reported success but %d BIOS attribute(s) did not apply; staging them "
+            "over Redfish: %s",
+            self._progress.template_name,
+            len(drifted),
+            describe_drift(drifted),
+        )
+        return await self._run(
+            stage_bios_attributes,
+            BiosStageRequest(
+                idrac=target,
+                attributes={str(a.attribute_name): str(a.intended) for a in drifted},
+            ),
+        )
+
+    async def _stage_storage(self, target: IdracRef) -> tuple[StoragePlan, list[str]]:
+        """Plan the storage and stage it; the jobs waiting for the reset.
+
+        Staging happens BEFORE anything else is staged, and that ordering is
+        load-bearing: a controller that cannot take the layout fails HERE
+        (`stage_storage` checks SupportedRAIDTypes before it posts), and a run
+        that dies then must not leave some other pending job behind to be
+        applied by an unrelated reset weeks later.
         """
         self._phase("configuring-storage")
         layout: StorageLayout = await self._run(read_storage_layout, target)
@@ -567,9 +677,8 @@ class ProvisionDellServerWorkflow:
                 StorageLayoutUnsupportedError,
             )
         if plan.converged:
-            return False, 0
-
-        job_ids: list[str] = await self._run(
+            return plan, []
+        return plan, await self._run(
             stage_storage_config,
             StorageConfigRequest(
                 idrac=target,
@@ -578,6 +687,21 @@ class ProvisionDellServerWorkflow:
                 non_raid_drives=plan.non_raid_drives,
             ),
         )
+
+    async def _apply_storage(
+        self, target: IdracRef, plan: StoragePlan, job_ids: list[str]
+    ) -> tuple[bool, int]:
+        """ONE reboot for every staged job, then read the storage back.
+
+        `job_ids` is the storage jobs plus anything else staged for the same
+        reset — today the BIOS drift job. They are carried through the whole
+        wait together, so one reboot applies everything and one poll watches it.
+        A machine whose storage was already right still reboots when something
+        else is staged: the job is on the iDRAC either way, and leaving it
+        pending would apply it at some unrelated later reset.
+        """
+        if not job_ids:
+            return False, 0
         jobs_ref = IdracJobsRef(idrac=target, job_ids=job_ids)
         # A PERC runs its Non-RAID conversion at once (a real-time job); the
         # reset that applies the BOSS volume must not cut it off mid-apply.

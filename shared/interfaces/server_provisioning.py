@@ -16,6 +16,9 @@ from __future__ import annotations
 from temporalio import activity
 
 from shared.models.server_provisioning import (
+    BiosStageRequest,
+    BiosVerification,
+    BiosVerifyRequest,
     IdracIdentity,
     IdracJobsRef,
     IdracJobsState,
@@ -94,6 +97,30 @@ async def clear_idrac_os_hostname(ref: IdracRef) -> bool:
     is set OME displays it instead of the machine's address next to the
     profile. Cleared unconditionally — a machine being provisioned has no OS,
     so whatever is there is stale.
+    """
+    ...
+
+
+@activity.defn
+async def verify_bios_configuration(request: BiosVerifyRequest) -> BiosVerification:
+    """What the template meant each BIOS attribute to be, against what it is.
+
+    Keyed by OME's DISPLAY name, which is all OME reports about a template. The
+    limb resolves those through the machine's BIOS attribute registry — the only
+    bridge to the names Redfish accepts — and reports an attribute the registry
+    does not know rather than dropping it, because a silent drop reads as
+    "verified" when it means "not checked".
+    """
+    ...
+
+
+@activity.defn
+async def stage_bios_attributes(request: BiosStageRequest) -> str:
+    """Stage BIOS values and queue the job that applies them on the next reset.
+
+    Returns the job id, which joins the storage job ids so ONE reboot applies
+    configuration drift and RAID together. Idempotent: an existing pending
+    `Configure: BIOS.Setup.1-1` job is returned rather than a second queued.
     """
     ...
 

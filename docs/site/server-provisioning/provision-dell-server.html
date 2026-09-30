@@ -101,7 +101,7 @@
   <section id="flow">
     <div class="sec-head">
       <div class="eyebrow">The run, step by step</div>
-      <h2>Seven steps, and what each one is waiting for</h2>
+      <h2>Eight steps, and what each one is waiting for</h2>
       <p class="lede">Every phase below is a value you will see on
       <code>GET /workflows/runs/{workflow_id}</code>, alongside a <code>waiting_on</code> naming the job
       or the machine the run is blocked on.</p>
@@ -202,17 +202,20 @@
         <div class="marker">5</div>
         <div class="card">
           <div class="card-title">
-            <h3>check_idrac_login &middot; re-discovery</h3>
-            <span class="phase">phase <b>verifying-root-password</b> &rarr; <b>rediscovering-in-ome</b></span>
+            <h3>check_idrac_login</h3>
+            <span class="phase">phase <b>verifying-root-password</b></span>
           </div>
-          <p>The template is what <b>enforces</b> root&rsquo;s password, so the run proves it by logging
-          in. Polled every minute for 20 min, because the iDRAC may restart after the template changes its
-          own settings. Still refusing the target password &rarr;
-          <code>TemplatePasswordNotAppliedError</code>, which almost always means the template is missing
-          the iDRAC user-2 password attribute.</p>
-          <p>If the machine <em>arrived</em> on a factory password, OME discovered it with that one. The
-          run re-runs discovery with the target password, or <b>OME loses the machine</b> the moment the
-          old one stops working.</p>
+          <p>Root&rsquo;s password was set over Redfish back in step 2, <em>before</em> OME ever saw the
+          machine, so this is a <b>guard rather than the mechanism</b>: nothing in the deployment may have
+          moved it. Polled every minute for 20 min, because the iDRAC may restart after the template
+          changes its own settings. Still refusing the target password &rarr;
+          <code>TemplatePasswordNotAppliedError</code>, which means the template carries a
+          <code>Users.*</code> component that changed it &mdash; something the step-2 audit should already
+          have refused.</p>
+          <p><b>There is no re-discovery.</b> There used to be: OME was discovered on whatever password the
+          server arrived with, the template then enforced the target one, and OME had to be re-pointed at
+          it or it would lose the machine. Setting the password first makes a stale credential impossible,
+          so OME is discovered exactly once.</p>
         </div>
       </div>
 
@@ -459,8 +462,13 @@
 { …, "status": "COMPLETED",
   "result": { "service_tag": "7XK2QF3", "initial_credential": "factory-1",
               "profile_name": "ocp-dell-r660-israel-128c-1024gb-10tb-7XK2QF3",
-              "boss_raid1_created": true, "non_raid_drives_converted": 4 } }</pre>
-          <p class="note"><code>initial_credential</code> names the credential by <em>position</em>
+              "boss_raid1_created": true, "non_raid_drives_converted": 4,
+              "os_hostname_cleared": true, "bios_attributes_checked": 37,
+              "bios_attributes_remediated": 1, "bios_attributes_unverified": 0 } }</pre>
+          <p class="note"><code>bios_attributes_unverified</code> counts attributes the template names
+          that this machine&rsquo;s BIOS registry does not have &mdash; the honest coverage gap, and what
+          says whether one template can serve several firmware levels.
+          <code>initial_credential</code> names the credential by <em>position</em>
           (<code>target</code>, <code>factory-1</code>), never by value &mdash; it tells you whether the
           machine arrived factory-fresh without telling you the password.</p>
         </div>
@@ -505,9 +513,11 @@
         stops the run immediately: <code>RegionMissingError</code>, <code>NotADellServerError</code>,
         <code>ServerAlreadyInstalledError</code>, <code>IdracUnreachableError</code>,
         <code>IdracCredentialsRejectedError</code>, <code>OmeDiscoveryFailedError</code>,
+        <code>TemplateUnsafeError</code>, <code>RootPasswordNotSetError</code>,
         <code>TemplateDeployFailedError</code>, <code>TemplatePasswordNotAppliedError</code>,
-        <code>StorageLayoutUnsupportedError</code>, <code>StorageJobFailedError</code>,
-        <code>StorageNotConvergedError</code>, <code>ServerNameNotAppliedError</code>.</p>
+        <code>ConfigurationDriftError</code>, <code>StorageLayoutUnsupportedError</code>,
+        <code>StorageJobFailedError</code>, <code>StorageNotConvergedError</code>,
+        <code>ServerNameNotAppliedError</code>.</p>
         <h3 style="margin-top:6px">The failure mode to watch for</h3>
         <p style="font-size:var(--fs-14);color:var(--ink-2)">An <em>unclassified</em> permanent error
         retries every minute <b>forever</b>: the run sits <b>RUNNING</b> in the Temporal UI, not FAILED,
@@ -548,10 +558,13 @@
           <tr><td class="k">probing-idrac</td><td class="muted">Finding which root password the iDRAC accepts</td><td class="muted">3 rounds &middot; 30 min if unreachable</td></tr>
           <tr><td class="k">reading-identity</td><td class="muted">Service tag, model, iDRAC firmware</td><td class="muted">seconds</td></tr>
           <tr><td class="k">checking-server-scan</td><td class="muted">Refusing a machine a cluster already uses</td><td class="muted">seconds</td></tr>
+          <tr><td class="k">auditing-template</td><td class="muted">Refusing a template that carries iDRAC network settings, storage or user accounts</td><td class="muted">seconds</td></tr>
+          <tr><td class="k">clearing-os-hostname</td><td class="muted">Blanking the factory OS hostname so OME shows the address</td><td class="muted">seconds</td></tr>
+          <tr><td class="k">enforcing-root-password</td><td class="muted">Setting root's password over Redfish, before OME sees the machine</td><td class="muted">20 min</td></tr>
           <tr><td class="k">discovering-in-ome</td><td class="muted">OME discovery job (skipped if already known)</td><td class="muted">30 min</td></tr>
           <tr><td class="k">deploying-template</td><td class="muted">Template deployment; can reboot the machine</td><td class="muted">2 h</td></tr>
-          <tr><td class="k">verifying-root-password</td><td class="muted">Proving the template set root's password</td><td class="muted">20 min</td></tr>
-          <tr><td class="k">rediscovering-in-ome</td><td class="muted">Re-pointing OME at the new password</td><td class="muted">30 min</td></tr>
+          <tr><td class="k">verifying-root-password</td><td class="muted">Proving nothing moved root's password</td><td class="muted">20 min</td></tr>
+          <tr><td class="k">verifying-config</td><td class="muted">Checking the template's BIOS attributes really applied; staging the fixes</td><td class="muted">seconds</td></tr>
           <tr><td class="k">configuring-storage</td><td class="muted">Reading the layout and planning the change</td><td class="muted">seconds</td></tr>
           <tr><td class="k">applying-storage</td><td class="muted">Staged jobs, then the one reboot</td><td class="muted">90 min</td></tr>
           <tr><td class="k">verifying-storage</td><td class="muted">Reading the layout back; convergence is the only success</td><td class="muted">seconds</td></tr>

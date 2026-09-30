@@ -113,6 +113,50 @@ single incompatible attribute does not fail the deployment — it fails that one
 attribute and the rest still apply. That is precisely why a deployment reporting
 success proves nothing, and why this workflow verifies attributes individually.
 
+### Dell's answer to mixed firmware: normalise it first
+
+The DC team found this in Dell's iDRAC9 documentation (exact page not located
+from here; the same guidance appears in *SCP-RG* §2.4.1, quoted below):
+
+> "…different iDRAC versions, updating the iDRAC firmware version first before
+> importing the SCP file is recommended. If this step is not performed, the SCP
+> import job could complete with errors and be unable to apply attribute
+> changes because the older iDRAC version may not support all attributes in the
+> SCP file."
+
+Note the DIRECTION. The hazard is a target **older** than the template: it does
+not know attributes the template carries, so those fail while the rest apply.
+A target *newer* than the template usually still works — except where the newer
+firmware made an attribute REQUIRED, which is exactly KB 000326070.
+
+*SCP-RG* §2.4.1 says the same thing as a recommendation list item:
+
+> "If not using RepositoryUpdate, confirm that the target servers have similar
+> iDRAC and device firmware levels."
+
+**RepositoryUpdate is the mechanism Dell means, and it is not available to us.**
+`SCP.1#RepositoryUpdate` (*SCP-RG* §13) points at a `Catalog.xml` on the same
+network share as the SCP, and the import then generates firmware-update jobs for
+every device behind the catalog before applying configuration. It requires the
+SCP to be imported FROM A NETWORK SHARE — OME template deployment pushes its own
+stored template instead, so the attribute has nothing to resolve against.
+
+So the "if not using RepositoryUpdate" branch is the one we are on, and its
+instruction is to confirm the firmware level. Today that is exactly what
+`DELL_TEMPLATES`' `(model, iDRAC firmware)` key does: a machine whose firmware
+has no template fails with `TemplateNotConfiguredError` rather than getting a
+near-miss template. Crude, but it is Dell's stated requirement met literally.
+
+**The open option, not built:** a firmware-normalisation step before the
+template — bring every machine to a known iDRAC version, then one golden
+template per model covers every purchasing batch. That is the design Dell's
+guidance points at, and it is what would let `DELL_TEMPLATES` collapse to one
+entry per model. It is deliberately not in this workflow yet: a firmware update
+reboots the machine and can brick an iDRAC, so whether provisioning is allowed
+to flash firmware is an operator's decision, not a default. Until then,
+`verifying-config` reports which attributes a given firmware failed to apply,
+which is the evidence that decision needs.
+
 ## Export type changes the file, silently
 
 `Basic`, `Clone` and `Replace` do not merely select components — Clone and

@@ -39,6 +39,7 @@ from shared.exceptions import IdracAuthError, IdracError, IdracRequestRejectedEr
 from shared.models.server_provisioning import (
     IDRAC_AWAITING_RESET_STATE,
     IDRAC_TERMINAL_JOB_STATES,
+    BiosComparison,
     IdracController,
     IdracDrive,
     IdracIdentity,
@@ -55,6 +56,16 @@ JOBS = f"{MANAGER}/Jobs"
 # Slot 2 is root on every iDRAC9. The OME account lives in another slot and is
 # NEVER touched — changing it would cut OME off from the machine (CLAUDE.md §4).
 ROOT_ACCOUNT = "/redfish/v1/AccountService/Accounts/2"
+BIOS = f"{SYSTEM}/Bios"
+# AttributeName <-> DisplayName, plus ReadOnly and the value-name mapping. This
+# is the ONLY bridge between what OME reports about a template (the GUI's
+# display names) and what Redfish accepts in a PATCH (attribute names).
+BIOS_REGISTRY = f"{BIOS}/BiosRegistry"
+# Staged BIOS changes: written here, applied by the next reset — which is the
+# same reset the storage jobs already need, so one reboot does both.
+BIOS_SETTINGS = f"{BIOS}/Settings"
+# The FQDD a BIOS configuration job is named for: `Configure: BIOS.Setup.1-1`.
+_BIOS_FQDD = "BIOS.Setup.1-1"
 _CONVERT_TO_NON_RAID = f"{SYSTEM}/Oem/Dell/DellRaidService/Actions/DellRaidService.ConvertToNonRAID"
 _RESET = f"{SYSTEM}/Actions/ComputerSystem.Reset"
 
@@ -191,6 +202,97 @@ async def read_identity(idrac_ip: str, username: str, password: str) -> IdracIde
         power_state=system.get("PowerState"),
         os_hostname=system.get("HostName"),
     )
+
+
+def _registry_by_display(registry: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """DisplayName -> registry entry, for the attributes a template can name."""
+    entries = (registry.get("RegistryEntries") or {}).get("Attributes") or []
+    by_display: dict[str, dict[str, Any]] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        display = str(entry.get("DisplayName") or "").strip()
+        if display and display not in by_display:
+            by_display[display] = entry
+    return by_display
+
+
+def _value_name(entry: dict[str, Any], intended: str | None) -> str | None:
+    """The value as Redfish names it.
+
+    A BIOS attribute's values have both a name and a display name
+    (`PerfOptimized` / "Performance Optimized"), and OME may report either. The
+    registry carries the mapping, so an intended value that matches a display
+    name is translated; anything else is passed through unchanged.
+    """
+    if intended is None:
+        return None
+    for value in entry.get("Value") or []:
+        if isinstance(value, dict) and str(value.get("ValueDisplayName") or "") == intended:
+            return str(value.get("ValueName"))
+    return intended
+
+
+async def compare_bios(
+    idrac_ip: str, username: str, password: str, intended: dict[str, str | None]
+) -> list[BiosComparison]:
+    """What the template meant each BIOS attribute to be, against what it is.
+
+    `intended` is keyed by OME's DISPLAY name, which is all OME reports. The
+    BIOS attribute registry is the only bridge to the name Redfish accepts, so
+    it is read here rather than shipped to the workflow: an R660's registry runs
+    to hundreds of entries and would sit in Temporal history on every poll.
+
+    An attribute the registry does not know is reported with
+    `attribute_name=None` rather than dropped — silence would read as "verified"
+    when it means "not checked".
+    """
+    async with _client(idrac_ip, username, password) as client:
+        registry = await _get(client, BIOS_REGISTRY)
+        current = (await _get(client, BIOS)).get("Attributes") or {}
+    by_display = _registry_by_display(registry)
+
+    compared: list[BiosComparison] = []
+    for display, value in intended.items():
+        entry = by_display.get(display)
+        if entry is None:
+            compared.append(BiosComparison(display_name=display, intended=value))
+            continue
+        name = str(entry.get("AttributeName") or "")
+        actual = current.get(name)
+        compared.append(
+            BiosComparison(
+                display_name=display,
+                attribute_name=name or None,
+                intended=_value_name(entry, value),
+                actual=None if actual is None else str(actual),
+                read_only=bool(entry.get("ReadOnly")),
+            )
+        )
+    return compared
+
+
+async def stage_bios_attributes(
+    idrac_ip: str, username: str, password: str, attributes: dict[str, str]
+) -> str:
+    """Stage BIOS values and queue the job that applies them on the next reset.
+
+    Two calls, as Dell's own CreateBiosConfigJob scripts do: PATCH the pending
+    values onto `Bios/Settings`, then POST a job whose `TargetSettingsURI` is
+    that resource. The job sits `Scheduled` until a reset — the SAME reset the
+    storage jobs need, so one reboot applies BIOS drift and RAID together.
+
+    Idempotent the same way `stage_storage` is: a controller may hold only one
+    pending configuration job, so an existing `Configure: BIOS.Setup.1-1` is
+    returned rather than a second one queued.
+    """
+    async with _client(idrac_ip, username, password) as client:
+        pending = _pending_for(await _pending_jobs(client), _BIOS_FQDD)
+        if pending:
+            return pending
+        await _request(client, "PATCH", BIOS_SETTINGS, json={"Attributes": attributes})
+        resp = await _request(client, "POST", JOBS, json={"TargetSettingsURI": BIOS_SETTINGS})
+    return _job_id(resp, f"staging {len(attributes)} BIOS attribute(s)")
 
 
 async def set_root_password(

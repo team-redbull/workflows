@@ -39,10 +39,15 @@ from shared.exceptions import (
     ServerNameNotAppliedError,
     StorageJobFailedError,
     StorageLayoutUnsupportedError,
+    ConfigurationDriftError,
     TemplatePasswordNotAppliedError,
     TemplateUnsafeError,
 )
 from shared.models.server_provisioning import (
+    BiosComparison,
+    BiosStageRequest,
+    BiosVerification,
+    BiosVerifyRequest,
     IdracController,
     IdracDrive,
     IdracIdentity,
@@ -125,6 +130,11 @@ class Fake:
     os_hostname_was_set: bool = True
     # A safe template by default: BIOS settings only.
     template_attributes: list[TemplateAttribute] = field(default_factory=list)
+    # One list per verify_bios_configuration call, consumed in order.
+    bios_comparisons: list[list[BiosComparison]] = field(default_factory=list)
+    staged_bios: list[dict[str, str]] = field(default_factory=list)
+    # Every job id the one reboot was asked to apply.
+    staged_reboot_jobs: list[str] = field(default_factory=list)
     in_ome: bool = False
     template_job: int | None = 900
     template_error: Exception | None = None
@@ -174,6 +184,19 @@ class Fake:
             fake.calls.append("clear-hostname")
             return fake.os_hostname_was_set
 
+        @activity.defn(name="verify_bios_configuration")
+        async def verify_bios(request: BiosVerifyRequest) -> BiosVerification:
+            fake.calls.append("verify-bios")
+            return BiosVerification(compared=fake.bios_comparisons.pop(0)
+                                    if len(fake.bios_comparisons) > 1
+                                    else (fake.bios_comparisons[0] if fake.bios_comparisons else []))
+
+        @activity.defn(name="stage_bios_attributes")
+        async def stage_bios(request: BiosStageRequest) -> str:
+            fake.calls.append("stage-bios")
+            fake.staged_bios.append(request.attributes)
+            return "JID_BIOS"
+
         @activity.defn(name="read_storage_layout")
         async def layout(ref: IdracRef) -> StorageLayout:
             fake.calls.append(f"layout:{ref.credential}")
@@ -188,6 +211,7 @@ class Fake:
         @activity.defn(name="apply_staged_idrac_jobs")
         async def apply(ref: IdracJobsRef) -> RebootResult:
             fake.calls.append("reboot")
+            fake.staged_reboot_jobs.extend(ref.job_ids)
             return RebootResult(rebooted=True, reset_type="ForceRestart")
 
         jobs_polls = {"n": 0}
@@ -256,7 +280,7 @@ class Fake:
 
         return [probe, check_login, identity, set_password, clear_hostname, layout, stage,
                 apply, jobs, find_device, discover, ome_job, deploy, read_template, profile,
-                rename, scan]
+                rename, scan, verify_bios, stage_bios]
 
 
 class _Harness:
@@ -502,3 +526,63 @@ async def test_a_template_carrying_storage_is_refused():
     error = await _failure(fake)
     assert error.type == TemplateUnsafeError.__name__
     assert "stage" not in fake.calls
+
+
+def _bios(display: str, name: str, intended: str, actual: str) -> BiosComparison:
+    return BiosComparison(display_name=display, attribute_name=name, intended=intended, actual=actual)
+
+
+async def test_a_setting_the_template_did_not_apply_is_fixed_over_redfish():
+    """The coworker's requirement: a profile that reports Completed while a
+    setting never landed must be fixed by MODIFYING the setting, not by
+    redeploying the profile."""
+    fake = Fake(
+        template_attributes=[
+            TemplateAttribute(attribute_id=1, name="System Profile", group="BIOS,System Profile Settings",
+                              value="PerfOptimized"),
+        ],
+        bios_comparisons=[
+            [_bios("System Profile", "SysProfile", "PerfOptimized", "PerfPerWattOptimizedOs")],
+            [_bios("System Profile", "SysProfile", "PerfOptimized", "PerfOptimized")],
+        ],
+    )
+    result = await _run(fake)
+
+    assert fake.staged_bios == [{"SysProfile": "PerfOptimized"}]
+    assert result.bios_attributes_remediated == 1
+    # The profile was deployed ONCE — the fix never re-ran it.
+    assert fake.calls.count("deploy") == 1
+    # ONE reboot applied the BIOS job and the storage jobs together.
+    assert fake.calls.count("reboot") == 1
+    assert "JID_BIOS" in fake.staged_reboot_jobs
+
+
+async def test_drift_that_survives_the_reboot_fails_the_run():
+    """Remediation is not assumed to work: the second read is what decides."""
+    drifted = [_bios("System Profile", "SysProfile", "PerfOptimized", "PerfPerWattOptimizedOs")]
+    fake = Fake(
+        template_attributes=[
+            TemplateAttribute(attribute_id=1, name="System Profile", group="BIOS,System Profile Settings",
+                              value="PerfOptimized"),
+        ],
+        bios_comparisons=[drifted, drifted],
+    )
+    error = await _failure(fake)
+    assert error.type == ConfigurationDriftError.__name__
+    assert "SysProfile" in error.message
+
+
+async def test_an_attribute_this_firmware_does_not_have_is_reported_not_failed():
+    """Dell's documented consequence of a template/firmware mismatch: the
+    attribute simply is not there. That is a coverage gap to report, not a
+    machine to fail."""
+    fake = Fake(
+        template_attributes=[
+            TemplateAttribute(attribute_id=1, name="Some New Knob", group="BIOS,Misc", value="On"),
+        ],
+        bios_comparisons=[[BiosComparison(display_name="Some New Knob", intended="On")]],
+    )
+    result = await _run(fake)
+    assert result.bios_attributes_unverified == 1
+    assert result.bios_attributes_remediated == 0
+    assert "stage-bios" not in fake.calls

@@ -39,7 +39,7 @@ from dataclasses import dataclass
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
-    from shared.models.server_provisioning import TemplateAttribute
+    from shared.models.server_provisioning import BiosComparison, TemplateAttribute
 
 # --- the three groups --------------------------------------------------------
 NETWORK = "idrac-network"
@@ -138,6 +138,59 @@ def audit_template(attributes: list[TemplateAttribute]) -> list[Hazard]:
                 )
                 break
     return hazards
+
+
+# --- what the template MEANT to set, and whether it took ---------------------
+# A deployment reporting Completed proves nothing: SCP Import is a "continue on
+# error" operation, so one attribute the firmware does not know fails while the
+# rest apply (SCP-RG §2.5). Dell's own reference client does not trust the job
+# state either — it string-searches the message for failure words.
+#
+# Only BIOS attributes are verified. That is a deliberate limit, not an
+# oversight: the BIOS attribute registry maps OME's display names to the names
+# Redfish accepts, which is what makes a BIOS attribute both checkable and
+# fixable. The iDRAC's own attributes have no such published bridge, so they are
+# reported as unverified rather than guessed at.
+_BIOS_GROUP = "bios"
+
+
+def bios_intent(attributes: list[TemplateAttribute]) -> dict[str, str | None]:
+    """The BIOS attributes a template would deploy, keyed by display name.
+
+    Ignored attributes are skipped — OME does not deploy them, so the machine
+    is under no obligation to match them.
+    """
+    return {
+        attribute.name: attribute.value
+        for attribute in attributes
+        if not attribute.is_ignored and _BIOS_GROUP in attribute.group.lower()
+    }
+
+
+def bios_drift(compared: list[BiosComparison]) -> list[BiosComparison]:
+    """Every attribute the template set that the machine does not actually have."""
+    return [attribute for attribute in compared if attribute.drifted]
+
+
+def unverifiable(compared: list[BiosComparison]) -> list[BiosComparison]:
+    """Attributes that could not be checked at all — the honest coverage gap.
+
+    Almost always a template naming something this firmware does not have, which
+    is exactly what Dell warns of when a template and a target differ in
+    version. Reported, never silently passed.
+    """
+    return [
+        attribute
+        for attribute in compared
+        if not attribute.read_only and attribute.intended is not None and not attribute.attribute_name
+    ]
+
+
+def describe_drift(drifted: list[BiosComparison]) -> str:
+    return "; ".join(
+        f"{a.display_name} ({a.attribute_name}) is {a.actual!r}, template says {a.intended!r}"
+        for a in drifted
+    )
 
 
 def describe_hazards(hazards: list[Hazard]) -> str:

@@ -62,6 +62,8 @@ LIMB_ACTIVITIES = [
     limb.read_idrac_identity,
     limb.clear_idrac_os_hostname,
     limb.set_idrac_root_password,
+    limb.verify_bios_configuration,
+    limb.stage_bios_attributes,
     limb.read_storage_layout,
     limb.stage_storage_config,
     limb.apply_staged_idrac_jobs,
@@ -247,6 +249,16 @@ async def test_a_factory_fresh_server_is_provisioned_end_to_end(world: World):
     perc = [d for d in world.idrac.drives if d.controller == sim.PERC]
     assert [d.status for d in perc] == ["NonRAID"] * 4
     assert result.boss_raid1_created and result.non_raid_drives_converted == 4
+
+    # The template said System Profile should be PerfOptimized; the machine
+    # came with PerfPerWattOptimizedOs and the deployment did not change it.
+    # The run found that, staged it over Redfish, and the SAME reboot applied
+    # it alongside the RAID — the profile was deployed exactly once.
+    assert world.idrac.bios["SysProfile"] == "PerfOptimized"
+    assert world.idrac.bios_pending == {}
+    assert result.bios_attributes_remediated == 1
+    assert result.bios_attributes_unverified == 0
+    assert world.ome.deploy_calls == 1
 
     # No OME session left open behind the run.
     assert world.ome.open_sessions == set()

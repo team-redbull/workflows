@@ -60,8 +60,9 @@ later.
    tests included.
 8. **No BIOS/firmware settings** beyond the template for now.
 9. **server-scan discovers the server by itself** (its OME collector, every 6 h).
-   Never add a refresh call; the workflow polls a read-only lookup until the
-   server appears.
+   Never add a refresh call. **Superseded 2026-09-30:** the run no longer waits
+   for it either — done means configured, and the server-scan read that remains
+   is the in-use guard before the first reboot.
 10. **Technicians use Swagger**, usually for **bulk** batches, hence
     `POST .../provision-dell-server/bulk` (one run per IP).
 

@@ -170,10 +170,10 @@ async def request_server_name(request: ServerNameRequest) -> None:
 
 @activity.defn
 async def find_in_server_scan(lookup: ServerScanLookup) -> ServerScanState:
-    """Whether server-scan holds this service tag under the expected name yet.
+    """Whether a cluster is already using the machine with this service tag.
 
     A plain Mongo-backed read (GET /servers?search=), never
-    /servers/available: that endpoint live-rechecks against the vendor
-    manager, which is not something to do every few minutes for hours.
+    /servers/available: that endpoint live-rechecks against the vendor manager,
+    which is far more than a yes/no guard needs.
     """
     ...

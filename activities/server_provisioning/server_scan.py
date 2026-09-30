@@ -1,8 +1,10 @@
 """server-scan lookups for provisioning — by service tag, Mongo-backed reads only.
 
-Two questions, one function: is a document with this serial in use by a
-cluster (the guard before anything reboots the machine), and does one carry the
-name the run gave it yet (the end of the run).
+ONE question: is a document with this serial in use by a cluster? That is the
+guard the run makes before anything reboots the machine. It used to answer a
+second one — whether the machine had been listed under its new name — but being
+listed is no longer the run's definition of done (see provision_dell_server.py),
+so the lookup at the end of the run went with it.
 
 `GET /servers?search=<tag>` narrows by token prefix — the serial is one of
 server-scan's search tokens — and `GET /servers/{id}` then confirms each hit's
@@ -66,17 +68,7 @@ async def lookup(base_url: str, token: str, request: ServerScanLookup) -> Server
             claimed_by = f"{state} {openshift.get('cluster_name') or openshift.get('mce_name') or ''}".strip()
             break
 
-    named = [
-        d
-        for d in matches
-        if request.expected_name and str(d.get("name", "")).lower() == request.expected_name.lower()
-    ]
-    chosen = named[0] if named else (matches[0] if matches else None)
     return ServerScanState(
-        found=bool(named),
-        server_id=chosen.get("id") if chosen else None,
-        name=chosen.get("name") if chosen else None,
-        health=((chosen.get("health") or {}).get("overall")) if chosen else None,
-        reachable=chosen.get("reachable") if chosen else None,
+        name=matches[0].get("name") if matches else None,
         claimed_by=claimed_by,
     )

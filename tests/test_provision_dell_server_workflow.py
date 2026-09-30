@@ -36,7 +36,6 @@ from shared.exceptions import (
     RegionMissingError,
     ServerAlreadyInstalledError,
     ServerNameNotAppliedError,
-    ServerScanNeverSawServerError,
     StorageJobFailedError,
     StorageLayoutUnsupportedError,
     TemplatePasswordNotAppliedError,
@@ -128,11 +127,9 @@ class Fake:
     # can never be issued, so the staged one can never apply.
     storage_never_settles: bool = False
     profile_names: list[str] = field(default_factory=lambda: ["Profile from template 00001", NAME])
-    server_scan_after: int = 2  # found on the Nth completion lookup
     calls: list[str] = field(default_factory=list)
     discoveries: list[OmeDiscoveryRequest] = field(default_factory=list)
     staged: list[StorageConfigRequest] = field(default_factory=list)
-    _scan_lookups: int = 0
 
     def activities(self) -> list:
         fake = self
@@ -229,13 +226,8 @@ class Fake:
 
         @activity.defn(name="find_in_server_scan")
         async def scan(lookup: ServerScanLookup) -> ServerScanState:
-            if lookup.expected_name is None:
-                fake.calls.append("guard")
-                return ServerScanState(found=False, claimed_by=fake.claimed_by, name="old-name")
-            fake._scan_lookups += 1
-            if fake._scan_lookups >= fake.server_scan_after:
-                return ServerScanState(found=True, server_id="srv_1", name=lookup.expected_name, health="HEALTHY")
-            return ServerScanState(found=False)
+            fake.calls.append("guard")
+            return ServerScanState(claimed_by=fake.claimed_by, name="old-name")
 
         return [probe, check_login, identity, layout, stage, apply, jobs, find_device, discover,
                 ome_job, deploy, profile, rename, scan]
@@ -287,7 +279,7 @@ async def _failure(fake: Fake, region: str | None = REGION) -> ApplicationError:
     return cause
 
 
-async def test_happy_path_from_factory_password_to_server_scan():
+async def test_happy_path_from_factory_password_to_a_configured_machine():
     fake = Fake()
     result = await _run(fake)
 
@@ -295,7 +287,9 @@ async def test_happy_path_from_factory_password_to_server_scan():
     assert result.profile_name == NAME
     assert result.initial_credential == "factory-1"
     assert result.boss_raid1_created and result.non_raid_drives_converted == 3
-    assert result.server_scan_id == "srv_1"
+    # server-scan is read ONCE, as the in-use guard — never again to decide the
+    # run is done.
+    assert fake.calls.count("guard") == 1
     # Discovered with the factory password it came in on, then re-pointed at
     # the target one once the template enforced it.
     assert [d.idrac.credential for d in fake.discoveries] == [1, 0]
@@ -420,8 +414,3 @@ async def test_a_name_that_never_matches_fails_the_run():
     error = await _failure(fake)
     assert error.type == ServerNameNotAppliedError.__name__
 
-
-async def test_server_scan_never_seeing_it_fails_on_the_deadline():
-    fake = Fake(server_scan_after=10_000)
-    error = await _failure(fake)
-    assert error.type == ServerScanNeverSawServerError.__name__

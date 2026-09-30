@@ -56,6 +56,20 @@
           blurb: "take a server back out of the InfraEnv"
         }
       ]
+    },
+    {
+      domain: "server-provisioning",
+      // Not per MCE: this limb writes to no cluster at all, only outward to the
+      // iDRACs, OME, the naming service and server-scan. One deployment serves
+      // the whole estate.
+      queue: "server-provisioning-activity",
+      workflows: [
+        {
+          name: "provision-dell-server",
+          href: "/server-provisioning/provision-dell-server.html",
+          blurb: "rack-ready Dell → listed in server-scan"
+        }
+      ]
     }
   ];
 

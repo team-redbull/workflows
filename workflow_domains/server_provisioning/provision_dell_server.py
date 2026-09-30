@@ -17,13 +17,16 @@ Shape of the run:
                             Dell PowerEdge.
      checking-server-scan — and must not be a server a cluster is using:
                             everything after this reboots it.
+     clearing-os-hostname — blank the factory OS hostname (`Miniwinpc`), or
+                            OME shows it instead of the machine's address.
+     enforcing-root-password — root goes onto the target password HERE, over
+                            Redfish, while OME has never heard of the machine.
   3. discovering-in-ome   — skipped when OME already has the service tag.
+                            Always with the target credential.
   4. deploying-template   — the template for (model, iDRAC firmware) from
-                            DELL_TEMPLATES. It creates the server profile and
-                            ENFORCES the root password.
-  5. verifying-root-password — root must now accept the target password; if
-                            the machine came in on a factory password, OME is
-                            re-pointed at the new one (rediscovering-in-ome).
+                            DELL_TEMPLATES. It creates the server profile.
+  5. verifying-root-password — nothing in the deployment may have moved root's
+                            password; a guard, not the mechanism.
   6. configuring-storage  — RAID 1 on the BOSS, every PERC drive Non-RAID,
      applying-storage       staged together and applied by ONE reboot, then
      verifying-storage      read back. Nothing is ever deleted
@@ -40,6 +43,22 @@ add hours to every run to learn something the run cannot influence, and would
 turn a slow or paused collector into a fleet of failed provisions. The early
 server-scan read stays: that one is a SAFETY check (step 2), not a completion
 one.
+
+THE PASSWORD IS SET BEFORE OME EVER SEES THE MACHINE, AND THAT IS WHY THERE IS
+NO REDISCOVERY. OME was once discovered with whatever password the server
+arrived on, the template then enforced the target one, and OME had to be
+re-pointed at it (`rediscovering-in-ome`) or it would lose the machine. That
+repair was wrong in three ways: re-running a discovery over a device that
+already carries a profile is not what OME's own documentation asks for (an
+onboarding operation is, and OME exposes none over REST); it needed a second
+discovery group per run; and the template component that carried the password,
+`Users.*`, is the single most firmware-fragile thing a template can hold — Dell
+KB 000326070, where iDRAC 7.20.30.00 added required SNMPv3 key attributes and
+every older template began failing SYS055. Setting the password over Redfish
+first removes all three at once: OME is discovered ONCE, with the password root
+keeps, so a stale credential cannot exist, and the template needs no `Users.*`
+at all. Reversed 2026-09-30, on the DC team's review. Do not re-add a
+rediscovery — narrow the inputs instead (CLAUDE.md §5).
 
 WHY STORAGE COMES AFTER THE TEMPLATE. The template deployment can reboot the
 machine and apply BIOS attributes; configuring storage afterwards means the
@@ -83,6 +102,7 @@ with workflow.unsafe.imports_passed_through():
         OmeRequestRejectedError,
         ProfileConflictError,
         RegionMissingError,
+        RootPasswordNotSetError,
         ServerNameNotAppliedError,
         ServerNamerRejectedError,
         ServerAlreadyInstalledError,
@@ -109,6 +129,7 @@ with workflow.unsafe.imports_passed_through():
         read_idrac_identity,
         read_storage_layout,
         request_server_name,
+        set_idrac_root_password,
         stage_storage_config,
         start_ome_discovery,
     )
@@ -280,9 +301,31 @@ class ProvisionDellServerWorkflow:
         self._phase("clearing-os-hostname")
         self._progress.os_hostname_cleared = await self._run(clear_idrac_os_hostname, initial)
 
-        # Step 3 — into OME, unless it is already there.
+        # Step 2d — root goes onto the target password BEFORE OME sees the
+        # machine, so OME is only ever handed the password root keeps. See the
+        # module docstring: this is what makes rediscovery unnecessary.
+        target = IdracRef(idrac_ip=idrac_ip, credential=TARGET_CREDENTIAL)
+        if initial_credential != TARGET_CREDENTIAL:
+            self._phase("enforcing-root-password")
+            await self._run(set_idrac_root_password, initial)
+            _, on_target = await self._poll(
+                lambda: self._run(check_idrac_login, target),
+                lambda ok: ok,
+                _PASSWORD_DEADLINE,
+                _PASSWORD_POLL,
+            )
+            if not on_target:
+                raise _fail(
+                    f"The iDRAC at {idrac_ip} accepted the change of root's password but root "
+                    f"still does not accept the target one {_PASSWORD_DEADLINE} later — refusing "
+                    "to discover it in OME with a credential that will not keep working",
+                    RootPasswordNotSetError,
+                )
+
+        # Step 3 — into OME, unless it is already there. Always with the TARGET
+        # credential: root is on it by now, whatever the machine arrived with.
         self._phase("discovering-in-ome")
-        device = await self._discover(initial, identity.service_tag, purpose="discover")
+        device = await self._discover(target, identity.service_tag, purpose="discover")
         device_id = int(device.device_id or 0)
         self._progress.ome_device_id = device_id
 
@@ -318,8 +361,10 @@ class ProvisionDellServerWorkflow:
                     TemplateDeployFailedError,
                 )
 
-        # Step 5 — the template must have left root on the target password.
-        target = IdracRef(idrac_ip=idrac_ip, credential=TARGET_CREDENTIAL)
+        # Step 5 — the deployment must not have moved root's password. The
+        # template is audited to carry no Users.* component, so this should
+        # never fire; it stays because it costs one login and the state it
+        # catches — a machine OME can no longer reach — is expensive to undo.
         self._phase("verifying-root-password")
         _, accepted = await self._poll(
             lambda: self._run(check_idrac_login, target),
@@ -329,16 +374,11 @@ class ProvisionDellServerWorkflow:
         )
         if not accepted:
             raise _fail(
-                f"After template {deploy.template_name!r} deployed, root on {idrac_ip} still does "
-                "not accept the target password — check that the template carries the root "
-                "(user 2) password attribute",
+                f"After template {deploy.template_name!r} deployed, root on {idrac_ip} no longer "
+                "accepts the target password — the template carries a Users.* component that "
+                "changed it, which OME's own credential for this machine will not survive",
                 TemplatePasswordNotAppliedError,
             )
-        if initial_credential != TARGET_CREDENTIAL:
-            # OME discovered the machine with the factory password it came in
-            # on; point it at the one root has now, or OME loses the machine.
-            self._phase("rediscovering-in-ome")
-            await self._discover(target, identity.service_tag, purpose="rediscover", force=True)
 
         # Step 6 — storage: RAID 1 on the BOSS, PERC drives Non-RAID.
         boss_created, converted = await self._configure_storage(target)
@@ -438,16 +478,15 @@ class ProvisionDellServerWorkflow:
             IdracCredentialsRejectedError,
         )
 
-    async def _discover(
-        self, idrac: IdracRef, service_tag: str, purpose: str, force: bool = False
-    ) -> OmeDevice:
+    async def _discover(self, idrac: IdracRef, service_tag: str, purpose: str) -> OmeDevice:
         """The OME device for this service tag, discovering it first if needed.
 
-        `force` runs the discovery even when OME already has the device — that
-        is how OME learns root's new password.
+        There is deliberately no way to force a re-discovery. Root is already on
+        the target password when this runs, so the credential OME is given never
+        goes stale — see the module docstring.
         """
         device: OmeDevice = await self._run(find_ome_device, OmeDeviceRef(service_tag=service_tag))
-        if device.found and not force:
+        if device.found:
             return device
         info = workflow.info()
         job_ref: OmeJobRef = await self._run(

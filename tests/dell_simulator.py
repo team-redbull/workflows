@@ -48,6 +48,7 @@ from fastapi.responses import JSONResponse, Response
 SYSTEM = "/redfish/v1/Systems/System.Embedded.1"
 MANAGER = "/redfish/v1/Managers/iDRAC.Embedded.1"
 JOBS = f"{MANAGER}/Jobs"
+ROOT_ACCOUNT = "/redfish/v1/AccountService/Accounts/2"
 BOSS = "BOSS.SL.14-1"
 PERC = "RAID.SL.3-1"
 NVME = "CPU.1"
@@ -114,6 +115,8 @@ class IdracSim:
     blocked_for: int = 0
     resets: list[str] = field(default_factory=list)
     login_attempts: list[str] = field(default_factory=list)
+    # Every password this machine's root account was set to, in order.
+    password_writes: list[str] = field(default_factory=list)
     drives: list[Drive] = field(default_factory=list)
     volumes: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     jobs: dict[str, Job] = field(default_factory=dict)
@@ -279,6 +282,18 @@ def idrac_app(sim: IdracSim) -> FastAPI:
         if "HostName" in body:
             sim.os_hostname = str(body["HostName"])
         return {"Id": "System.Embedded.1", "HostName": sim.os_hostname}
+
+    @app.get(ROOT_ACCOUNT)
+    async def root_account():
+        return {"Id": "2", "UserName": "root", "RoleId": "Administrator"}
+
+    @app.patch(ROOT_ACCOUNT)
+    async def patch_root_account(request: Request):
+        body = await request.json()
+        if "Password" in body:
+            sim.root_password = str(body["Password"])
+            sim.password_writes.append(sim.root_password)
+        return {"Id": "2", "UserName": "root"}
 
     @app.get(MANAGER)
     async def manager():

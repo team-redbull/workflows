@@ -71,6 +71,20 @@ async def read_idrac_identity(ref: IdracRef) -> IdracIdentity:
 
 
 @activity.defn
+async def set_idrac_root_password(ref: IdracRef) -> bool:
+    """Set root's password to the TARGET one, using the credential `ref` names.
+
+    True when this call changed it, False when root already had it. Both
+    passwords are resolved on the limb — neither crosses this boundary.
+
+    Runs BEFORE OME discovers the machine, so OME is only ever handed the
+    password root keeps. Touches iDRAC user 2 and refuses if slot 2 turns out
+    not to be root.
+    """
+    ...
+
+
+@activity.defn
 async def clear_idrac_os_hostname(ref: IdracRef) -> bool:
     """Blank the machine's OS hostname; True when it had one. Idempotent.
 

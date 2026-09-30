@@ -128,12 +128,31 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   The pieces that are decisions, not incidental:
   - **Credentials by POSITION, never by value in history.** Root only (iDRAC user 2); the OME
     account on the iDRAC is NEVER touched (OME would lose the machine). Candidates are
-    `IDRAC_ROOT_PASSWORD` (the one the template enforces) then `IDRAC_FACTORY_PASSWORDS` (≤2), one
+    `IDRAC_ROOT_PASSWORD` (the one the run enforces) then `IDRAC_FACTORY_PASSWORDS` (≤2), one
     request each — iDRAC9 blocks an address after 3 failures, so only an all-wrong round trips it,
-    and the next round waits `_LOCKOUT_WAIT` out. A machine that came in on a factory password is
-    re-discovered in OME with the target one after the template, or OME loses it.
+    and the next round waits `_LOCKOUT_WAIT` out.
+  - **ROOT'S PASSWORD IS SET OVER REDFISH BEFORE OME DISCOVERS THE MACHINE. Do not re-add a
+    rediscovery.** `set_root_password` PATCHes `AccountService/Accounts/2` (refusing if slot 2
+    is not root), then OME is discovered ONCE with the password root keeps. It used to run the
+    other way: OME was discovered on whatever password the server arrived with, the TEMPLATE
+    enforced the target one, and `rediscovering-in-ome` re-ran discovery so OME would not lose
+    the machine. Reversed 2026-09-30 on the DC team's review, for three reasons. OME's documented
+    repair for a changed credential is an ONBOARDING operation, which OME exposes nowhere over
+    REST (it is a GUI wizard), so re-running discovery over a device that already carries a
+    profile was never the right call. Without an OME Advanced licence there is no
+    `OME_<application-GUID>` service account, so OME really does depend on that credential — the
+    hazard was real, only the fix was wrong. And `Users.*` is the most firmware-fragile component
+    a template can carry (KB 000326070: iDRAC 7.20.30.00 added required SNMPv3 key attributes and
+    every older template began failing SYS055), so taking the password out of the template removed
+    a whole class of breakage. Narrow the inputs, never detect the interaction (§5).
   - **The TEMPLATE is per (Redfish model, iDRAC firmware)** — `DELL_TEMPLATES`, no fallback.
-    It sets root's password; the run verifies that by logging in.
+    A template is NOT locked to the firmware it was captured on — the versions in it are ReadOnly,
+    `Set On Import: False` — so a golden template per model is technically sound; the key stays
+    exact until `verifying-config` has measured what real batches differ by. See
+    `docs/design/dell-scp-template-r660.md`.
+  - **The factory OS hostname is blanked** (`Miniwinpc`), unconditionally, after the in-use guard
+    and before OME discovery: while one is set OME shows it instead of the machine's address next
+    to the profile. A machine being provisioned has no OS, so anything there is stale.
   - **Storage: RAID 1 on the BOSS pair, every PERC drive Non-RAID, NEVER a delete.** Policy in
     `storage_plan.py`; staged `OnReset` so ONE reboot applies all; after the template, so the
     layout checked is final. An existing volume or in-use drive fails the run.

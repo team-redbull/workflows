@@ -61,6 +61,7 @@ LIMB_ACTIVITIES = [
     limb.check_idrac_login,
     limb.read_idrac_identity,
     limb.clear_idrac_os_hostname,
+    limb.set_idrac_root_password,
     limb.read_storage_layout,
     limb.stage_storage_config,
     limb.apply_staged_idrac_jobs,
@@ -228,10 +229,13 @@ async def test_a_factory_fresh_server_is_provisioned_end_to_end(world: World):
     # deliberately not something the run waits for.
     assert world.scan.current() is None
 
-    # The template enforced the target password, and OME was re-pointed at it.
+    # Root was moved onto the target password over Redfish, BEFORE OME saw the
+    # machine — so OME was discovered ONCE, with the password root keeps, and
+    # its credential can never go stale. This is what replaced the rediscovery.
     assert world.idrac.root_password == TARGET
+    assert world.idrac.password_writes == [TARGET]
     assert world.ome.device_credential == TARGET
-    assert len(world.ome.discovery_posts) == 2
+    assert len(world.ome.discovery_posts) == 1
     assert world.ome.deploy_calls == 1
 
     # Storage: one reboot; RAID 1 over the BOSS pair; every PERC drive Non-RAID,

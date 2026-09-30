@@ -489,9 +489,27 @@ class TemplateDeployFailedError(OrchestratorError):
     """WORKFLOW-RAISED. The template deployment job failed or did not finish in time."""
 
 
+class RootPasswordNotSetError(OrchestratorError):
+    """WORKFLOW-RAISED. The iDRAC accepted the password change but root still
+    does not accept the target password.
+
+    Raised BEFORE OME discovers the machine, which is the point: OME must only
+    ever be handed the password root will keep, so a change that did not take
+    has to stop the run rather than strand OME on a stale credential later.
+    """
+
+
 class TemplatePasswordNotAppliedError(OrchestratorError):
-    """WORKFLOW-RAISED. After the template deployed, root still does not accept
-    the target password — the template does not carry it, or did not apply it."""
+    """WORKFLOW-RAISED. After the template deployed, root no longer accepts the
+    target password.
+
+    This used to mean the template failed to SET the password. Since 2026-09-30
+    the run sets it over Redfish before OME discovery and the template is
+    audited to carry no `Users.*` component at all, so it now means the
+    opposite: something in the deployment MOVED root's password away from the
+    target. Kept as a guard because the cost is one login and the failure mode
+    it catches — a machine OME can no longer reach — is expensive.
+    """
 
 
 class StorageLayoutUnsupportedError(OrchestratorError):

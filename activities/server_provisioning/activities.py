@@ -23,6 +23,7 @@ from temporalio import activity
 from activities.server_provisioning import idrac, ome, server_namer, server_scan
 from shared.exceptions import IdracCredentialsMissingError, TemplateNotConfiguredError
 from shared.models.server_provisioning import (
+    TARGET_CREDENTIAL,
     IdracIdentity,
     IdracJobsRef,
     IdracJobsState,
@@ -102,6 +103,23 @@ async def read_idrac_identity(ref: IdracRef) -> IdracIdentity:
         identity.idrac_firmware,
     )
     return identity
+
+
+@activity.defn
+async def set_idrac_root_password(ref: IdracRef) -> bool:
+    """Set root's password to the target one, from whichever it has now."""
+    changed = await idrac.set_root_password(
+        ref.idrac_ip,
+        _settings.idrac_username,
+        _password(ref),
+        _password(IdracRef(idrac_ip=ref.idrac_ip, credential=TARGET_CREDENTIAL)),
+    )
+    activity.logger.info(
+        "iDRAC %s: root %s",
+        ref.idrac_ip,
+        "moved to the target password" if changed else "already on the target password",
+    )
+    return changed
 
 
 @activity.defn

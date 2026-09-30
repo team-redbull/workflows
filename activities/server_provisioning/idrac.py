@@ -52,6 +52,9 @@ from shared.models.server_provisioning import (
 SYSTEM = "/redfish/v1/Systems/System.Embedded.1"
 MANAGER = "/redfish/v1/Managers/iDRAC.Embedded.1"
 JOBS = f"{MANAGER}/Jobs"
+# Slot 2 is root on every iDRAC9. The OME account lives in another slot and is
+# NEVER touched — changing it would cut OME off from the machine (CLAUDE.md §4).
+ROOT_ACCOUNT = "/redfish/v1/AccountService/Accounts/2"
 _CONVERT_TO_NON_RAID = f"{SYSTEM}/Oem/Dell/DellRaidService/Actions/DellRaidService.ConvertToNonRAID"
 _RESET = f"{SYSTEM}/Actions/ComputerSystem.Reset"
 
@@ -187,6 +190,51 @@ async def read_identity(idrac_ip: str, username: str, password: str) -> IdracIde
         bios_version=system.get("BiosVersion"),
         power_state=system.get("PowerState"),
         os_hostname=system.get("HostName"),
+    )
+
+
+async def set_root_password(
+    idrac_ip: str, username: str, current_password: str, new_password: str
+) -> bool:
+    """Set root's password, authenticating with the one it has now.
+
+    True when this call changed it, False when root already had the new one.
+
+    Applied BEFORE OME discovers the machine, so OME is only ever given the
+    password root will keep. The alternative — letting the template set it and
+    re-pointing OME afterwards — cannot work here: without an OME Advanced
+    licence there is no `OME_<guid>` service account, so OME talks to the iDRAC
+    with the discovery credential and a later change strands it.
+
+    RETRY SAFETY. A retry after a successful PATCH would authenticate with a
+    password the machine no longer has. Rather than probing the new password
+    first — which would spend a failed login on every run, and iDRAC9 blocks an
+    address after three — this lets the 401 happen and only then asks whether
+    the new password works. The happy path costs no failed login at all; only a
+    retry-after-success costs one.
+    """
+    async with _client(idrac_ip, username, current_password) as client:
+        account = await _send(client, "GET", ROOT_ACCOUNT)
+        if account.status_code not in (401, 403):
+            _classify(account, f"GET {ROOT_ACCOUNT}")
+            body = account.json()
+            owner = str((body or {}).get("UserName") or "") if isinstance(body, dict) else ""
+            # Slot 2 is root by Dell convention, but a machine configured by
+            # hand could have it renamed, and changing the WRONG account is how
+            # OME loses a server for good.
+            if owner and owner != username:
+                raise IdracRequestRejectedError(
+                    f"iDRAC {idrac_ip} account slot 2 belongs to {owner!r}, not {username!r} — "
+                    "refusing to change it; this workflow only ever touches root"
+                )
+            await _request(client, "PATCH", ROOT_ACCOUNT, json={"Password": new_password})
+            return True
+
+    if await check_login(idrac_ip, username, new_password):
+        return False
+    raise IdracAuthError(
+        f"iDRAC {idrac_ip} refused root's current credential, and does not accept the target "
+        "password either — root's password changed under this run"
     )
 
 

@@ -33,6 +33,7 @@ from shared.exceptions import (
     IdracUnreachableError,
     NotADellServerError,
     ProfileConflictError,
+    RootPasswordNotSetError,
     RegionMissingError,
     ServerAlreadyInstalledError,
     ServerNameNotAppliedError,
@@ -150,6 +151,11 @@ class Fake:
             fake.calls.append("identity")
             return fake.identity
 
+        @activity.defn(name="set_idrac_root_password")
+        async def set_password(ref: IdracRef) -> bool:
+            fake.calls.append(f"set-password:from-{ref.credential}")
+            return True
+
         @activity.defn(name="clear_idrac_os_hostname")
         async def clear_hostname(ref: IdracRef) -> bool:
             fake.calls.append("clear-hostname")
@@ -235,8 +241,8 @@ class Fake:
             fake.calls.append("guard")
             return ServerScanState(claimed_by=fake.claimed_by, name="old-name")
 
-        return [probe, check_login, identity, clear_hostname, layout, stage, apply, jobs,
-                find_device, discover, ome_job, deploy, profile, rename, scan]
+        return [probe, check_login, identity, set_password, clear_hostname, layout, stage,
+                apply, jobs, find_device, discover, ome_job, deploy, profile, rename, scan]
 
 
 class _Harness:
@@ -296,11 +302,15 @@ async def test_happy_path_from_factory_password_to_a_configured_machine():
     # server-scan is read ONCE, as the in-use guard — never again to decide the
     # run is done.
     assert fake.calls.count("guard") == 1
-    # Discovered with the factory password it came in on, then re-pointed at
-    # the target one once the template enforced it.
-    assert [d.idrac.credential for d in fake.discoveries] == [1, 0]
-    # The guard ran before anything touched the machine.
-    assert fake.calls.index("guard") < fake.calls.index("discover:1")
+    # Root was moved onto the target password BEFORE OME was told anything, so
+    # OME is discovered exactly ONCE and with the credential it keeps. The
+    # rediscovery this replaced would have shown up here as a second entry.
+    assert fake.calls.index("set-password:from-1") < fake.calls.index("discover:0")
+    assert [d.idrac.credential for d in fake.discoveries] == [0]
+    # The guard ran before anything touched the machine — including the
+    # password change and the hostname blanking, which both write to it.
+    assert fake.calls.index("guard") < fake.calls.index("set-password:from-1")
+    assert fake.calls.index("guard") < fake.calls.index("clear-hostname")
     # Storage ran as root on the TARGET password, after the template.
     assert fake.calls.index("deploy") < fake.calls.index("layout:0")
     assert fake.calls.count("reboot") == 1
@@ -381,10 +391,32 @@ async def test_a_profile_conflict_fails_the_run_without_retrying():
     assert fake.calls.count("deploy") == 1
 
 
-async def test_a_template_that_leaves_the_old_password_fails():
+async def test_a_password_change_that_does_not_take_stops_before_ome_is_told():
+    """The safety property of setting the password first.
+
+    OME must only ever be handed a credential that will keep working, so a
+    change that did not take has to stop the run BEFORE discovery — otherwise
+    OME is onboarded against a password the machine does not have, which is
+    exactly the stranding the rediscovery used to paper over.
+    """
     fake = Fake(target_login=False)
     error = await _failure(fake)
+    assert error.type == RootPasswordNotSetError.__name__
+    assert fake.discoveries == [] and "deploy" not in fake.calls
+
+
+async def test_a_template_that_moves_the_password_is_still_caught():
+    """A machine already on the target password skips the change, so the only
+    login check left is the one after the template — which is there to catch a
+    template that carries a Users.* component and moves the password itself."""
+    fake = Fake(
+        probes=[IdracProbeResult(reachable=True, credential=0, rejected=0)],
+        target_login=False,
+    )
+    error = await _failure(fake)
     assert error.type == TemplatePasswordNotAppliedError.__name__
+    assert "set-password:from-0" not in fake.calls
+    assert fake.calls.count("deploy") == 1
 
 
 async def test_storage_that_would_destroy_data_is_refused_before_staging():

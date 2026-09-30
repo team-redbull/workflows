@@ -37,6 +37,7 @@ from activities.server_provisioning.activities import (
     read_idrac_identity,
     read_storage_layout,
     request_server_name,
+    set_idrac_root_password,
     stage_storage_config,
     start_ome_discovery,
 )
@@ -64,6 +65,7 @@ async def main() -> None:
             probe_idrac_credentials,
             check_idrac_login,
             read_idrac_identity,
+            set_idrac_root_password,
             clear_idrac_os_hostname,
             read_storage_layout,
             stage_storage_config,

@@ -38,6 +38,9 @@ BASE = f"https://{IP}"
 SYSTEM = f"{BASE}{idrac.SYSTEM}"
 MANAGER = f"{BASE}{idrac.MANAGER}"
 JOBS = f"{BASE}{idrac.JOBS}"
+SYSTEM_ATTRS = f"{BASE}{idrac.SYSTEM_ATTRIBUTES}"
+ACCOUNT = f"{BASE}{idrac.ROOT_ACCOUNT}"
+ACCOUNT_10 = f"{BASE}{idrac.ROOT_ACCOUNT_IDRAC10}"
 
 
 class TestProbe:
@@ -101,28 +104,80 @@ class TestIdentity:
             await idrac.read_identity(IP, "root", "pw")
 
 
+class TestRootPassword:
+    """Set over Redfish before OME ever sees the machine, so OME is only handed
+    the password root keeps."""
+
+    @respx.mock
+    async def test_the_idrac9_account_collection_is_used(self):
+        """iDRAC9 keeps accounts under the MANAGER; AccountService is iDRAC10.
+        An R660 is 16G, so the whole current fleet is on the first."""
+        respx.get(ACCOUNT).mock(return_value=httpx.Response(200, json={"UserName": "root"}))
+        patched = respx.patch(ACCOUNT).mock(return_value=httpx.Response(200))
+        assert await idrac.set_root_password(IP, "root", "old", "new") is True
+        assert json.loads(patched.calls.last.request.content) == {"Password": "new"}
+
+    @respx.mock
+    async def test_an_idrac10_machine_falls_back_to_accountservice(self):
+        respx.get(ACCOUNT).mock(return_value=httpx.Response(404))
+        respx.get(ACCOUNT_10).mock(return_value=httpx.Response(200, json={"UserName": "root"}))
+        patched = respx.patch(ACCOUNT_10).mock(return_value=httpx.Response(200))
+        assert await idrac.set_root_password(IP, "root", "old", "new") is True
+        assert patched.called
+
+    @respx.mock
+    async def test_a_retry_after_success_is_not_a_failure(self):
+        """The retry authenticates with a password the machine no longer has.
+        Rather than spending a rejected login on EVERY run to find out — iDRAC9
+        blocks an address after three — the 401 is allowed to happen and only
+        then is the target password tried."""
+        respx.get(ACCOUNT).mock(return_value=httpx.Response(401))
+        respx.get(SYSTEM).mock(return_value=httpx.Response(200, json={}))
+        assert await idrac.set_root_password(IP, "root", "old", "new") is False
+
+    @respx.mock
+    async def test_a_credential_that_is_simply_wrong_still_fails(self):
+        respx.get(ACCOUNT).mock(return_value=httpx.Response(401))
+        respx.get(SYSTEM).mock(return_value=httpx.Response(401))
+        with pytest.raises(IdracAuthError):
+            await idrac.set_root_password(IP, "root", "old", "new")
+
+    @respx.mock
+    async def test_a_slot_2_that_is_not_root_is_refused(self):
+        """Changing the wrong account is how OME loses a server for good."""
+        respx.get(ACCOUNT).mock(return_value=httpx.Response(200, json={"UserName": "ome-svc"}))
+        patched = respx.patch(ACCOUNT).mock(return_value=httpx.Response(200))
+        with pytest.raises(IdracRequestRejectedError):
+            await idrac.set_root_password(IP, "root", "old", "new")
+        assert not patched.called
+
+
 class TestOsHostname:
     """The factory hostname (`Miniwinpc`) that hides a machine's address in OME."""
 
     @respx.mock
     async def test_a_factory_hostname_is_blanked(self):
+        """Written as the SYSTEM ATTRIBUTE racadm sets, not the standard
+        ComputerSystem property — Dell fills that one from the OS via iSM."""
         respx.get(SYSTEM).mock(return_value=httpx.Response(200, json={"HostName": "Miniwinpc"}))
-        patched = respx.patch(SYSTEM).mock(return_value=httpx.Response(200))
+        patched = respx.patch(SYSTEM_ATTRS).mock(return_value=httpx.Response(200))
         assert await idrac.clear_os_hostname(IP, "root", "pw") is True
-        assert json.loads(patched.calls.last.request.content) == {"HostName": ""}
+        assert json.loads(patched.calls.last.request.content) == {
+            "Attributes": {"ServerOS.1.HostName": ""}
+        }
 
     @respx.mock
     async def test_an_already_blank_machine_is_never_written_to(self):
         """Idempotence: a re-run must not PATCH a machine that is already right."""
         respx.get(SYSTEM).mock(return_value=httpx.Response(200, json={"HostName": ""}))
-        patched = respx.patch(SYSTEM).mock(return_value=httpx.Response(200))
+        patched = respx.patch(SYSTEM_ATTRS).mock(return_value=httpx.Response(200))
         assert await idrac.clear_os_hostname(IP, "root", "pw") is False
         assert not patched.called
 
     @respx.mock
     async def test_whitespace_counts_as_blank(self):
         respx.get(SYSTEM).mock(return_value=httpx.Response(200, json={"HostName": "   "}))
-        patched = respx.patch(SYSTEM).mock(return_value=httpx.Response(200))
+        patched = respx.patch(SYSTEM_ATTRS).mock(return_value=httpx.Response(200))
         assert await idrac.clear_os_hostname(IP, "root", "pw") is False
         assert not patched.called
 
@@ -189,14 +244,19 @@ class TestBiosComparison:
 
 class TestStageBios:
     @respx.mock
-    async def test_patches_pending_values_then_queues_the_job(self):
+    async def test_one_patch_stages_the_values_and_creates_the_job(self):
+        """Dell's shape: the SettingsApplyTime is what makes the iDRAC create
+        the config job, and the job comes back in the Location header. Patching
+        attributes alone leaves pending values with nothing to apply them."""
         respx.get(JOBS).mock(return_value=httpx.Response(200, json={"Members": []}))
-        patched = respx.patch(BIOS_SETTINGS).mock(return_value=httpx.Response(200))
-        respx.post(JOBS).mock(
+        patched = respx.patch(BIOS_SETTINGS).mock(
             return_value=httpx.Response(202, headers={"Location": f"{idrac.JOBS}/JID_555"})
         )
         assert await idrac.stage_bios_attributes(IP, "root", "pw", {"SysProfile": "PerfOptimized"}) == "JID_555"
-        assert json.loads(patched.calls.last.request.content) == {"Attributes": {"SysProfile": "PerfOptimized"}}
+        assert json.loads(patched.calls.last.request.content) == {
+            "@Redfish.SettingsApplyTime": {"ApplyTime": "OnReset"},
+            "Attributes": {"SysProfile": "PerfOptimized"},
+        }
 
     @respx.mock
     async def test_a_retry_reuses_the_pending_job_instead_of_queueing_a_second(self):
@@ -205,10 +265,9 @@ class TestStageBios:
         respx.get(JOBS).mock(return_value=httpx.Response(200, json={"Members": [
             {"Id": "JID_111", "Name": "Configure: BIOS.Setup.1-1", "JobState": "Scheduled"},
         ]}))
-        patched = respx.patch(BIOS_SETTINGS).mock(return_value=httpx.Response(200))
-        posted = respx.post(JOBS).mock(return_value=httpx.Response(202))
+        patched = respx.patch(BIOS_SETTINGS).mock(return_value=httpx.Response(202))
         assert await idrac.stage_bios_attributes(IP, "root", "pw", {"SysProfile": "X"}) == "JID_111"
-        assert not patched.called and not posted.called
+        assert not patched.called
 
 
 BOSS = "AHCI.SL.6-1"

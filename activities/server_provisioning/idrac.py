@@ -13,12 +13,19 @@ Dell's Redfish layout, as used here (iDRAC9, firmware 5.x-7.x):
   .../Storage/<ctrl>/Volumes                      POST RAIDType RAID1 creates a volume
   .../Oem/Dell/DellRaidService/Actions/
         DellRaidService.ConvertToNonRAID          {"PDArray": [<drive ids>]}
+  .../Systems/System.Embedded.1/Bios              current BIOS attribute values
+  .../Bios/BiosRegistry                           AttributeName <-> DisplayName
+  .../Bios/Settings                               PATCH stages values + the job
   /redfish/v1/Managers/iDRAC.Embedded.1/Jobs      Lifecycle Controller jobs (JID_...)
+  .../Managers/iDRAC.Embedded.1/Accounts/2        root (iDRAC9; see ROOT_ACCOUNT)
+  .../Oem/Dell/DellAttributes/System.Embedded.1   racadm's System.* attributes
 
-Configuration is STAGED (`@Redfish.OperationApplyTime: OnReset`), so the
-iDRAC answers 202 with the job in its `Location` header and the change applies
-on the next reset — which is how one reboot applies the RAID 1 and every
-Non-RAID conversion together.
+TWO DIFFERENT APPLY-TIME KEYS, and they are not interchangeable. A volume POST
+carries `@Redfish.OperationApplyTime: OnReset`; a BIOS settings PATCH carries
+`@Redfish.SettingsApplyTime: {ApplyTime: OnReset}`. Either way the iDRAC answers
+202 with the job in its `Location` header and the change applies on the next
+reset — which is how ONE reboot applies the RAID 1, every Non-RAID conversion
+and any BIOS drift together.
 
 AUTHENTICATION IS HTTP BASIC, one request per credential. Every rejected
 request counts toward iDRAC9's IP block (3 failures in its fail window), so the
@@ -55,7 +62,21 @@ MANAGER = "/redfish/v1/Managers/iDRAC.Embedded.1"
 JOBS = f"{MANAGER}/Jobs"
 # Slot 2 is root on every iDRAC9. The OME account lives in another slot and is
 # NEVER touched — changing it would cut OME off from the machine (CLAUDE.md §4).
-ROOT_ACCOUNT = "/redfish/v1/AccountService/Accounts/2"
+#
+# TWO paths, because Dell moved the accounts collection between generations.
+# `ChangeIdracUserPasswordREDFISH.py` branches on the system model: 12G/13G ->
+# iDRAC8 and 14G/15G/16G -> iDRAC9 both use the MANAGER collection, and only
+# iDRAC10 (17G and later) uses the standard `AccountService` one. An R660 is
+# 16G, so the whole current fleet is on the first — but the second is tried when
+# the first is absent rather than pinning this code to one generation.
+ROOT_ACCOUNT = f"{MANAGER}/Accounts/2"
+ROOT_ACCOUNT_IDRAC10 = "/redfish/v1/AccountService/Accounts/2"
+# racadm `System.ServerOS.HostName` — the command the DC team runs by hand —
+# is a SYSTEM attribute, not the standard ComputerSystem `HostName` property
+# (which Dell populates from the OS through iSM). Dell's own
+# SetIdracLcSystemAttributesREDFISH.py writes System attributes here.
+SYSTEM_ATTRIBUTES = f"{MANAGER}/Oem/Dell/DellAttributes/System.Embedded.1"
+OS_HOSTNAME_ATTRIBUTE = "ServerOS.1.HostName"
 BIOS = f"{SYSTEM}/Bios"
 # AttributeName <-> DisplayName, plus ReadOnly and the value-name mapping. This
 # is the ONLY bridge between what OME reports about a template (the GUI's
@@ -246,6 +267,14 @@ async def compare_bios(
     An attribute the registry does not know is reported with
     `attribute_name=None` rather than dropped — silence would read as "verified"
     when it means "not checked".
+
+    A LIMIT worth knowing: the registry is flat, so two attributes sharing a
+    display name cannot be told apart and the first wins. Dell's own client
+    disambiguates by the GROUP PATH when it reads a template
+    (`recurse_subattr_list` joins the group DisplayNames), but the BIOS registry
+    carries no such path, so there is nothing here to join on. Dell's BIOS
+    display names are unique in practice; if that ever stops being true, the
+    symptom is one attribute verified in place of another.
     """
     async with _client(idrac_ip, username, password) as client:
         registry = await _get(client, BIOS_REGISTRY)
@@ -290,8 +319,16 @@ async def stage_bios_attributes(
         pending = _pending_for(await _pending_jobs(client), _BIOS_FQDD)
         if pending:
             return pending
-        await _request(client, "PATCH", BIOS_SETTINGS, json={"Attributes": attributes})
-        resp = await _request(client, "POST", JOBS, json={"TargetSettingsURI": BIOS_SETTINGS})
+        # ONE call, as Dell's GetSetBiosAttributesREDFISH.py does it: the
+        # ApplyTime is what makes the iDRAC create the config job, and it comes
+        # back in the Location header. Patching the attributes alone leaves
+        # pending values with nothing scheduled to apply them.
+        resp = await _request(
+            client,
+            "PATCH",
+            BIOS_SETTINGS,
+            json={"@Redfish.SettingsApplyTime": {"ApplyTime": "OnReset"}, "Attributes": attributes},
+        )
     return _job_id(resp, f"staging {len(attributes)} BIOS attribute(s)")
 
 
@@ -317,8 +354,13 @@ async def set_root_password(
     """
     async with _client(idrac_ip, username, current_password) as client:
         account = await _send(client, "GET", ROOT_ACCOUNT)
+        path = ROOT_ACCOUNT
+        if account.status_code == 404:
+            # An iDRAC10 machine: the accounts moved to the standard collection.
+            path = ROOT_ACCOUNT_IDRAC10
+            account = await _send(client, "GET", path)
         if account.status_code not in (401, 403):
-            _classify(account, f"GET {ROOT_ACCOUNT}")
+            _classify(account, f"GET {path}")
             body = account.json()
             owner = str((body or {}).get("UserName") or "") if isinstance(body, dict) else ""
             # Slot 2 is root by Dell convention, but a machine configured by
@@ -329,7 +371,7 @@ async def set_root_password(
                     f"iDRAC {idrac_ip} account slot 2 belongs to {owner!r}, not {username!r} — "
                     "refusing to change it; this workflow only ever touches root"
                 )
-            await _request(client, "PATCH", ROOT_ACCOUNT, json={"Password": new_password})
+            await _request(client, "PATCH", path, json={"Password": new_password})
             return True
 
     if await check_login(idrac_ip, username, new_password):
@@ -343,9 +385,15 @@ async def set_root_password(
 async def clear_os_hostname(idrac_ip: str, username: str, password: str) -> bool:
     """Blank the OS hostname the iDRAC reports; True when it changed.
 
-    The Redfish equivalent of `racadm set System.ServerOS.HostName ""`: the
-    standard ComputerSystem `HostName` property, on the same resource
-    `read_identity` already reads.
+    The Redfish equivalent of `racadm set System.ServerOS.HostName ""`, which is
+    the command the DC team runs by hand. That is a SYSTEM ATTRIBUTE
+    (`ServerOS.1.HostName`), not the standard ComputerSystem `HostName`
+    property — Dell populates that one from the OS through iSM. Dell's own
+    SetIdracLcSystemAttributesREDFISH.py writes System attributes to the
+    DellAttributes resource used here.
+
+    The current value is still READ from the ComputerSystem resource, because
+    `read_identity` fetches it anyway and the two report the same thing.
 
     Servers arrive with a factory OS hostname (`Miniwinpc`), and while one is
     set OME shows it in place of the machine's address beside the profile. A
@@ -361,7 +409,9 @@ async def clear_os_hostname(idrac_ip: str, username: str, password: str) -> bool
         system = await _get(client, SYSTEM)
         if not str(system.get("HostName") or "").strip():
             return False
-        await _request(client, "PATCH", SYSTEM, json={"HostName": ""})
+        await _request(
+            client, "PATCH", SYSTEM_ATTRIBUTES, json={"Attributes": {OS_HOSTNAME_ATTRIBUTE: ""}}
+        )
     return True
 
 

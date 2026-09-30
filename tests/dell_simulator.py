@@ -48,7 +48,9 @@ from fastapi.responses import JSONResponse, Response
 SYSTEM = "/redfish/v1/Systems/System.Embedded.1"
 MANAGER = "/redfish/v1/Managers/iDRAC.Embedded.1"
 JOBS = f"{MANAGER}/Jobs"
-ROOT_ACCOUNT = "/redfish/v1/AccountService/Accounts/2"
+# iDRAC9 keeps its accounts under the MANAGER, not AccountService (iDRAC10 does).
+ROOT_ACCOUNT = f"{MANAGER}/Accounts/2"
+SYSTEM_ATTRIBUTES = f"{MANAGER}/Oem/Dell/DellAttributes/System.Embedded.1"
 BOSS = "BOSS.SL.14-1"
 PERC = "RAID.SL.3-1"
 NVME = "CPU.1"
@@ -324,12 +326,16 @@ def idrac_app(sim: IdracSim) -> FastAPI:
             "HostName": sim.os_hostname,
         }
 
-    @app.patch(SYSTEM)
-    async def patch_system(request: Request):
-        body = await request.json()
-        if "HostName" in body:
-            sim.os_hostname = str(body["HostName"])
-        return {"Id": "System.Embedded.1", "HostName": sim.os_hostname}
+    @app.get(SYSTEM_ATTRIBUTES)
+    async def system_attributes():
+        return {"Attributes": {"ServerOS.1.HostName": sim.os_hostname}}
+
+    @app.patch(SYSTEM_ATTRIBUTES)
+    async def patch_system_attributes(request: Request):
+        attributes = (await request.json()).get("Attributes") or {}
+        if "ServerOS.1.HostName" in attributes:
+            sim.os_hostname = str(attributes["ServerOS.1.HostName"])
+        return {"Attributes": attributes}
 
     @app.get(ROOT_ACCOUNT)
     async def root_account():
@@ -353,20 +359,13 @@ def idrac_app(sim: IdracSim) -> FastAPI:
 
     @app.patch(f"{SYSTEM}/Bios/Settings")
     async def patch_bios_settings(request: Request):
-        # Pending, exactly like the real thing: nothing changes until a reset
-        # runs the configuration job queued against this resource.
-        sim.bios_pending.update((await request.json()).get("Attributes") or {})
-        return {"Id": "Settings"}
-
-    @app.get(MANAGER)
-    async def manager():
-        return {"Id": "iDRAC.Embedded.1", "FirmwareVersion": sim.firmware}
-
-    @app.post(JOBS)
-    async def create_job(request: Request):
+        # Dell's shape: the ApplyTime is what creates the config job, and the
+        # job comes back in the Location header. Pending values change nothing
+        # until a reset runs that job.
         body = await request.json()
-        if body.get("TargetSettingsURI") != f"{SYSTEM}/Bios/Settings":
-            return _error(400, f"Unsupported TargetSettingsURI {body.get('TargetSettingsURI')!r}")
+        if (body.get("@Redfish.SettingsApplyTime") or {}).get("ApplyTime") != "OnReset":
+            return _error(400, "SettingsApplyTime OnReset is required to create a config job")
+        sim.bios_pending.update(body.get("Attributes") or {})
 
         def apply_pending() -> None:
             sim.bios.update(sim.bios_pending)
@@ -374,6 +373,11 @@ def idrac_app(sim: IdracSim) -> FastAPI:
 
         job = sim.new_job("BIOS.Setup.1-1", "BIOSConfiguration", "Scheduled", apply_pending)
         return JSONResponse({}, status_code=202, headers={"Location": f"{JOBS}/{job.id}"})
+
+    @app.get(MANAGER)
+    async def manager():
+        return {"Id": "iDRAC.Embedded.1", "FirmwareVersion": sim.firmware}
+
 
     @app.get(f"{SYSTEM}/Storage")
     async def storage():

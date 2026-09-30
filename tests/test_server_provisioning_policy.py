@@ -13,6 +13,7 @@ from shared.models.server_provisioning import (
     IdracController,
     IdracDrive,
     IdracVolume,
+    BiosComparison,
     StorageLayout,
     TemplateAttribute,
 )
@@ -22,6 +23,7 @@ from workflow_domains.server_provisioning.template_policy import (
     STORAGE,
     USERS,
     audit_template,
+    describe_drift,
     describe_hazards,
 )
 from workflow_domains.server_provisioning.server_name import (
@@ -220,6 +222,20 @@ class TestTemplateAudit:
         hazards = audit_template([self._attr("iDRAC,Users,User 2", "Password")])
         assert [h.group for h in hazards] == [USERS]
 
+    def test_ordinary_bios_settings_that_merely_sound_dangerous_are_allowed(self):
+        """The audit FAILS a run, so a false positive stops provisioning. The
+        BIOS is full of words that look like hazards out of context, and every
+        one of these is a normal thing for a template to carry."""
+        innocent = [
+            self._attr("BIOS,System Security", "System Password"),
+            self._attr("BIOS,System Security", "Setup Password"),
+            self._attr("BIOS,Boot Settings", "Hard-Disk Drive Sequence"),
+            self._attr("BIOS,SATA Settings", "Embedded SATA"),
+            self._attr("BIOS,Integrated Devices", "Embedded NIC1"),
+            self._attr("BIOS,Network Settings", "IPv4 Support"),
+        ]
+        assert audit_template(innocent) == []
+
     def test_an_ignored_attribute_is_not_a_hazard(self):
         """IsIgnored is how an operator keeps a captured attribute without
         deploying it — refusing it would make the audit unsatisfiable from the
@@ -242,3 +258,17 @@ class TestTemplateAudit:
         assert "idrac-network (2)" in described and "storage (1)" in described
         assert "iDRAC,IPv4 Information,Address" in described
         assert "reachable only at the rack" in described
+
+
+class TestDriftReporting:
+    def test_a_long_drift_list_is_capped_so_the_failure_stays_readable(self):
+        """A template on the wrong firmware can fail dozens of attributes, and
+        the message goes verbatim into Temporal history."""
+        many = [
+            BiosComparison(display_name=f"Attr {n}", attribute_name=f"A{n}",
+                           intended="on", actual="off")
+            for n in range(25)
+        ]
+        described = describe_drift(many)
+        assert "and 15 more" in described
+        assert described.count("template says") == 10

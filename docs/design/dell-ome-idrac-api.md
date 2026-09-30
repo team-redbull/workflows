@@ -42,6 +42,10 @@ against real hardware is their test.
 | A storage job is named **`Configure: <controller FQDD>`**. A PERC applying at once shows `JobType: RealTimeNoRebootConfiguration`; staged storage jobs are `RAIDConfiguration`. Pending jobs are found in the Jobs collection by `JobState` (Scheduled/New/Running) and `JobType`. | `idrac_redfish_storage_controller.py` RETURN sample; `module_utils/utils.py`, `get_scheduled_job_resp` |
 | Controller and drive FQDDs: `BOSS.SL.14-1` (BOSS-N1), `AHCI.Slot.6-1` (BOSS-S1), `RAID.SL.3-1` / `RAID.Integrated.1-1` / `RAID.Slot.1-1` (PERC). Drives: `Disk.Direct.0-0:<BOSS>`, `Disk.Bay.<n>:Enclosure.Internal.0-1:<PERC>`. | examples throughout the collection; `ome_template.py` SCP sample |
 | Reset is `POST Systems/System.Embedded.1/Actions/ComputerSystem.Reset {"ResetType": ...}`. Dell's own helpers use `GracefulRestart`, fall back to `ForceRestart`/`ForceOff`, and send `On` to a machine that is off. | `module_utils/utils.py`, `trigger_restart_operation`, `reset_host` |
+| **Root's password is PATCHed on the MANAGER's account collection for iDRAC8/9** — `Managers/iDRAC.Embedded.1/Accounts/<id>` with `{"Password": ...}`. Only **iDRAC10** (17G and later) uses the standard `AccountService/Accounts/<id>`. Dell branches on the system Model: 12G/13G → iDRAC8, 14G/15G/16G → iDRAC9, else iDRAC10. An R660 is 16G, so the current fleet is on the manager collection. | `iDRAC-Redfish-Scripting`, `ChangeIdracUserPasswordREDFISH.py` |
+| **BIOS attributes are staged and the job created in ONE PATCH** to `Systems/System.Embedded.1/Bios/Settings`, carrying `{"@Redfish.SettingsApplyTime": {"ApplyTime": "OnReset"}, "Attributes": {...}}`. The job id comes back in the `Location` header. Note this is `SettingsApplyTime`, NOT the `OperationApplyTime` a volume POST uses. | `iDRAC-Redfish-Scripting`, `GetSetBiosAttributesREDFISH.py`, `create_next_boot_config_job` |
+| The **BIOS attribute registry** at `Systems/System.Embedded.1/Bios/BiosRegistry` maps `AttributeName` ↔ `DisplayName`, and carries `ReadOnly` plus a `Value[]` list of `ValueName`/`ValueDisplayName`. It is the only bridge between what OME reports about a template (display names) and what a Redfish PATCH accepts. | iDRAC9 Redfish API guide, *BIOS and boot settings* |
+| **racadm's `System.*` objects are Dell ATTRIBUTES, not ComputerSystem properties.** `racadm set System.ServerOS.HostName` writes `ServerOS.1.HostName` via `PATCH Managers/iDRAC.Embedded.1/Oem/Dell/DellAttributes/System.Embedded.1 {"Attributes": {...}}`. The standard `ComputerSystem.HostName` is what Dell POPULATES from the OS through iSM. | `iDRAC-Redfish-Scripting`, `SetIdracLcSystemAttributesREDFISH.py` |
 
 ## What this changed in the code
 
@@ -83,6 +87,23 @@ activities against it:
 The simulator also models iDRAC9's IP block, a PERC's real-time job, and OME
 only managing a machine whose root password it holds.
 
+## What the second research pass changed
+
+The calls added for the DC team's review were written partly from search results
+rather than from Dell's client code, and three of them were wrong. Found by
+re-reading `dell/iDRAC-Redfish-Scripting` afterwards, which is why CLAUDE.md §4
+says to change a request only against that code:
+
+1. **Root's password went to `AccountService/Accounts/2`** — the iDRAC10 path.
+   Every R660 is iDRAC9 and keeps its accounts under the Manager, so the call
+   would have 404'd on the entire fleet.
+2. **BIOS staging did a PATCH and then a separate job POST.** Dell does it in
+   one PATCH; without `@Redfish.SettingsApplyTime` the pending values may have
+   nothing scheduled to apply them at all.
+3. **The OS hostname was written as `ComputerSystem.HostName`.** That property
+   is what Dell FILLS IN from the OS via iSM; the DC team's
+   `racadm set System.ServerOS.HostName` writes a Dell system attribute.
+
 ## Still unverified: check these on the first real server
 
 - ~~**The template must not carry RAID/storage components.**~~ **Settled
@@ -106,6 +127,14 @@ only managing a machine whose root password it holds.
   R660s have.
 - `ForceRestart` on a machine with no OS. Dell's helpers prefer `GracefulRestart`
   first; a new server has nothing to honour it.
+- **`ServerOS.1.HostName` is the right attribute name.** It follows Dell's
+  `<Group>.<Index>.<Name>` convention (as `Users.2.Password` and `IPv4.1.Address`
+  do) and matches racadm's `System.ServerOS.HostName`, but no Dell sample writes
+  this specific one. If the PATCH is refused, the fallback is the standard
+  `PATCH Systems/System.Embedded.1 {"HostName": ""}`.
+- **Which BIOS display names an R660's registry actually carries**, and whether
+  any two share one — the registry is flat, so a duplicate display name cannot
+  be disambiguated and the first wins (`compare_bios`).
 - **Proxy:** httpx ignores CIDR entries in `NO_PROXY`. If the worker pod ever gets
   an `HTTPS_PROXY`, iDRAC traffic would go through the proxy unless the iDRAC
   addresses are listed in a form httpx matches.

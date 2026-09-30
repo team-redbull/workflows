@@ -23,9 +23,11 @@ MATCHING IS ON DISPLAY NAMES, AND THAT IS A COMPROMISE. OME's AttributeDetails
 reports what the GUI shows — group "iDRAC,IPv4 Information", attribute "Address"
 — not the SCP attribute names (`IPv4Static.1#Address`). There is no stable id to
 key on, so the rules below are token matches over the group path and the display
-name. They are deliberately generous: a false positive fails a run with a
-message naming exactly what matched, which an operator fixes in one read, while
-a false negative can strand a machine at the rack.
+name, ANCHORED ON THE GROUP. Both kinds of mistake are expensive and they pull
+in opposite directions: a false negative strands a machine at the rack, while a
+false positive fails every run until someone edits the template. The group
+anchor is what keeps the second from happening on ordinary BIOS settings — see
+the comment above the token lists for the ones that would otherwise trip it.
 
 Kept out of the workflow file so it is testable with no Temporal environment,
 and out of the limb because it is policy: the limb reports what the template
@@ -63,20 +65,32 @@ _WHY = {
     ),
 }
 
-# Tokens matched case-insensitively against the group path and the display name.
-# `scope` narrows a rule to attributes whose GROUP mentions it, which is what
-# separates the iDRAC's own NIC from the host NICs a template legitimately sets.
+# EVERY RULE IS ANCHORED ON THE GROUP, and that is what keeps the audit usable.
+# Matching a bare word anywhere would refuse templates that are perfectly safe,
+# and since an unsafe template FAILS the run, a false positive stops
+# provisioning entirely. The BIOS in particular is full of words that look like
+# hazards out of context:
+#
+#   "BIOS,System Security"      -> "System Password", "Setup Password"
+#   "BIOS,Boot Settings"        -> "Hard-Disk Drive Sequence"
+#   "BIOS,SATA Settings"        -> "Embedded SATA" (whose value can be RAID Mode)
+#   "NIC,Integrated 1 Port 1"   -> "MAC Address"
+#
+# None of those is what this audit is for: the hazards are the iDRAC's OWN
+# network, the storage components a Clone/Replace export injects, and iDRAC
+# LOCAL USER accounts. So each rule first establishes the group, then looks.
 _NETWORK_TOKENS = (
     "ipv4", "ipv6", "dns", "vlan", "netmask", "gateway", "dhcp",
     "static ip", "ip address", "mac address",
 )
-_STORAGE_TOKENS = (
-    "virtual disk", "raidreset", "raidaction", "raidforeign", "raidinit",
-    "disk.virtual", "physical disk", "raid level", "raid type", "controller",
-)
-_STORAGE_GROUPS = ("storage", "raid", "disk")
-_USER_TOKENS = ("password", "username", "user name", "snmpv3", "sha1v3", "md5v3")
+# Unambiguous even on their own: no BIOS attribute is called any of these.
+_STORAGE_TOKENS = ("virtual disk", "raidreset", "raidaction", "raidforeign", "raidinit", "disk.virtual")
+_STORAGE_GROUPS = ("storage", "raid")
 _USER_GROUPS = ("user",)
+# The one group name shared by both halves of this module: the audit must NOT
+# treat BIOS boot/SATA settings as storage, and the verification checks only
+# BIOS attributes.
+_BIOS_GROUP = "bios"
 
 
 @dataclass(frozen=True)
@@ -104,16 +118,21 @@ def _is_idrac_network(attribute: TemplateAttribute) -> bool:
 
 def _is_storage(attribute: TemplateAttribute) -> bool:
     group, name = _haystacks(attribute)
+    # The BIOS names disks all over its boot and SATA settings, and none of that
+    # configures a controller — "Hard-Disk Drive Sequence" is a boot order.
+    if _BIOS_GROUP in group:
+        return False
     if any(token in group for token in _STORAGE_GROUPS):
         return True
     return any(token in name for token in _STORAGE_TOKENS)
 
 
 def _is_user_account(attribute: TemplateAttribute) -> bool:
-    group, name = _haystacks(attribute)
-    if any(token in group for token in _USER_GROUPS):
-        return True
-    return any(token in name for token in _USER_TOKENS)
+    group, _ = _haystacks(attribute)
+    # Group only. "Password" alone would refuse the BIOS System and Setup
+    # passwords, which are a legitimate thing for a template to carry — the
+    # hazard is an iDRAC LOCAL USER, and those live in a Users group.
+    return any(token in group for token in _USER_GROUPS)
 
 
 _RULES = ((NETWORK, _is_idrac_network), (STORAGE, _is_storage), (USERS, _is_user_account))
@@ -151,7 +170,6 @@ def audit_template(attributes: list[TemplateAttribute]) -> list[Hazard]:
 # Redfish accepts, which is what makes a BIOS attribute both checkable and
 # fixable. The iDRAC's own attributes have no such published bridge, so they are
 # reported as unverified rather than guessed at.
-_BIOS_GROUP = "bios"
 
 
 def bios_intent(attributes: list[TemplateAttribute]) -> dict[str, str | None]:
@@ -186,10 +204,24 @@ def unverifiable(compared: list[BiosComparison]) -> list[BiosComparison]:
     ]
 
 
+# A template deployed onto a firmware that does not match it can fail dozens of
+# attributes at once, and the whole list would go into a workflow failure
+# message — recorded verbatim in Temporal history and shown in the UI. Enough
+# to diagnose, not the entire registry.
+_MAX_LISTED = 10
+
+
+def _listed(items: list[str]) -> str:
+    shown = "; ".join(items[:_MAX_LISTED])
+    return shown if len(items) <= _MAX_LISTED else f"{shown}; and {len(items) - _MAX_LISTED} more"
+
+
 def describe_drift(drifted: list[BiosComparison]) -> str:
-    return "; ".join(
-        f"{a.display_name} ({a.attribute_name}) is {a.actual!r}, template says {a.intended!r}"
-        for a in drifted
+    return _listed(
+        [
+            f"{a.display_name} ({a.attribute_name}) is {a.actual!r}, template says {a.intended!r}"
+            for a in drifted
+        ]
     )
 
 
@@ -207,6 +239,6 @@ def describe_hazards(hazards: list[Hazard]) -> str:
         by_group.setdefault(hazard.group, []).append(hazard.attribute)
         reasons[hazard.group] = hazard.reason
     return ". ".join(
-        f"{group} ({len(found)}): {reasons[group]} — {', '.join(sorted(found))}"
+        f"{group} ({len(found)}): {reasons[group]} — {_listed(sorted(found))}"
         for group, found in by_group.items()
     )

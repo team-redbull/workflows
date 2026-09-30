@@ -124,6 +124,9 @@ class Fake:
     target_login: bool = True
     layouts: list[StorageLayout] = field(default_factory=lambda: [_controllers(False), _controllers(True)])
     storage_job_final: str = "Completed"
+    # One job staged for the reset, another that never stops running: the reset
+    # can never be issued, so the staged one can never apply.
+    storage_never_settles: bool = False
     profile_names: list[str] = field(default_factory=lambda: ["Profile from template 00001", NAME])
     server_scan_after: int = 2  # found on the Nth completion lookup
     calls: list[str] = field(default_factory=list)
@@ -170,6 +173,13 @@ class Fake:
         @activity.defn(name="get_idrac_jobs")
         async def jobs(ref: IdracJobsRef) -> IdracJobsState:
             jobs_polls["n"] += 1
+            if fake.storage_never_settles:
+                return IdracJobsState(
+                    jobs=[
+                        IdracJobState(job_id=j, state="Scheduled" if i == 0 else "Running")
+                        for i, j in enumerate(ref.job_ids)
+                    ]
+                )
             state = "Running" if jobs_polls["n"] < 3 else fake.storage_job_final
             return IdracJobsState(jobs=[IdracJobState(job_id=j, state=state) for j in ref.job_ids])
 
@@ -389,6 +399,20 @@ async def test_a_failed_storage_job_fails_the_run():
     fake = Fake(storage_job_final="Failed")
     error = await _failure(fake)
     assert error.type == StorageJobFailedError.__name__
+
+
+async def test_a_staged_job_the_reset_can_never_reach_fails_at_the_first_deadline():
+    """A job stuck running blocks the reset the staged one is waiting for.
+
+    Both waits are _STORAGE_DEADLINE long, so falling through to the second
+    would spend it over again to reach the same answer — and the staged job
+    could not have moved, because nothing would have rebooted the machine.
+    """
+    fake = Fake(storage_never_settles=True)
+    error = await _failure(fake)
+    assert error.type == StorageJobFailedError.__name__
+    assert "cannot be issued while the others run" in error.message
+    assert "reboot" not in fake.calls
 
 
 async def test_a_name_that_never_matches_fails_the_run():

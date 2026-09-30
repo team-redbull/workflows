@@ -37,6 +37,8 @@ import httpx
 from activities.server_provisioning.http_client import TIMEOUT, VERIFY_TLS, extended_info
 from shared.exceptions import IdracAuthError, IdracError, IdracRequestRejectedError
 from shared.models.server_provisioning import (
+    IDRAC_AWAITING_RESET_STATE,
+    IDRAC_TERMINAL_JOB_STATES,
     IdracController,
     IdracDrive,
     IdracIdentity,
@@ -53,13 +55,6 @@ JOBS = f"{MANAGER}/Jobs"
 _CONVERT_TO_NON_RAID = f"{SYSTEM}/Oem/Dell/DellRaidService/Actions/DellRaidService.ConvertToNonRAID"
 _RESET = f"{SYSTEM}/Actions/ComputerSystem.Reset"
 
-# Lifecycle Controller job states after which a job will not change again.
-TERMINAL_JOB_STATES = {"Completed", "Failed", "CompletedWithErrors", "RebootFailed"}
-# A staged (OnReset) job waiting for the reset that runs it. Anything neither
-# this nor terminal is ACTIVE — e.g. a PERC's Non-RAID conversion, which Dell
-# runs at once as a RealTimeNoRebootConfiguration job — and no reset may
-# happen until it is done.
-AWAITING_RESET_STATE = "Scheduled"
 _REJECTED_STATUSES = {400, 405, 409, 422}
 
 
@@ -261,7 +256,7 @@ async def _pending_jobs(client: httpx.AsyncClient) -> list[dict[str, Any]]:
     return [
         job
         for job in body.get("Members", [])
-        if isinstance(job, dict) and job.get("JobState") not in TERMINAL_JOB_STATES
+        if isinstance(job, dict) and job.get("JobState") not in IDRAC_TERMINAL_JOB_STATES
     ]
 
 
@@ -386,13 +381,17 @@ async def apply_staged(idrac_ip: str, username: str, password: str, job_ids: lis
     retryable IdracError here, and the workflow waits for it before calling.
     """
     states = await get_jobs(idrac_ip, username, password, job_ids)
-    active = [s for s in states if s.state not in TERMINAL_JOB_STATES and s.state != AWAITING_RESET_STATE]
+    active = [
+        s
+        for s in states
+        if s.state not in IDRAC_TERMINAL_JOB_STATES and s.state != IDRAC_AWAITING_RESET_STATE
+    ]
     if active:
         raise IdracError(
             "not resetting while job(s) still run: "
             + ", ".join(f"{s.job_id} {s.state}" for s in active)
         )
-    if not any(state.state == AWAITING_RESET_STATE for state in states):
+    if not any(state.state == IDRAC_AWAITING_RESET_STATE for state in states):
         return RebootResult(rebooted=False)
     async with _client(idrac_ip, username, password) as client:
         system = await _get(client, SYSTEM)

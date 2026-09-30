@@ -107,6 +107,9 @@ with workflow.unsafe.imports_passed_through():
         start_ome_discovery,
     )
     from shared.models.server_provisioning import (
+        IDRAC_AWAITING_RESET_STATE,
+        IDRAC_JOB_SUCCESS,
+        IDRAC_TERMINAL_JOB_STATES,
         TARGET_CREDENTIAL,
         IdracIdentity,
         IdracJobsRef,
@@ -184,9 +187,6 @@ _PASSWORD_POLL = timedelta(minutes=1)
 # --- Storage: a reboot through POST plus the Lifecycle Controller's apply ------
 _STORAGE_DEADLINE = timedelta(minutes=90)
 _STORAGE_POLL = timedelta(minutes=1)
-_IDRAC_JOB_SUCCESS = "Completed"
-_IDRAC_JOB_TERMINAL = {"Completed", "Failed", "CompletedWithErrors", "RebootFailed"}
-_IDRAC_JOB_AWAITING_RESET = "Scheduled"
 
 # --- Naming ------------------------------------------------------------------
 _NAME_DEADLINE = timedelta(minutes=30)
@@ -519,22 +519,37 @@ class ProvisionDellServerWorkflow:
         # A PERC runs its Non-RAID conversion at once (a real-time job); the
         # reset that applies the BOSS volume must not cut it off mid-apply.
         self._phase("applying-storage", waiting_on=f"real-time iDRAC jobs among {', '.join(job_ids)}")
-        _, settled = await self._poll(
+        running, settled = await self._poll(
             lambda: self._run(get_idrac_jobs, jobs_ref),
-            lambda s: all(job.state in _IDRAC_JOB_TERMINAL or job.state == _IDRAC_JOB_AWAITING_RESET for job in s.jobs),
+            lambda s: all(
+                job.state in IDRAC_TERMINAL_JOB_STATES or job.state == IDRAC_AWAITING_RESET_STATE
+                for job in s.jobs
+            ),
             _STORAGE_DEADLINE,
             _STORAGE_POLL,
         )
         if settled:
             self._phase("applying-storage", waiting_on=f"iDRAC jobs {', '.join(job_ids)} (reboot)")
             await self._run(apply_staged_idrac_jobs, jobs_ref)
+        elif any(job.state == IDRAC_AWAITING_RESET_STATE for job in running.jobs):
+            # Nothing below can change: the staged job needs the reset, and the
+            # reset cannot be issued while another job runs (the limb refuses,
+            # or it would cut a real-time conversion off mid-apply). Waiting the
+            # second deadline out would only double the time to the same answer.
+            raise _fail(
+                f"Storage jobs did not settle within {_STORAGE_DEADLINE}, and the reset that would "
+                f"apply the staged one cannot be issued while the others run: {_describe_jobs(running)}",
+                StorageJobFailedError,
+            )
+        # Every job is real-time and some are still going: no reset was ever
+        # owed, so waiting for them to finish is the right thing to do.
         state, finished = await self._poll(
             lambda: self._run(get_idrac_jobs, jobs_ref),
-            lambda s: all(job.state in _IDRAC_JOB_TERMINAL for job in s.jobs),
+            lambda s: all(job.state in IDRAC_TERMINAL_JOB_STATES for job in s.jobs),
             _STORAGE_DEADLINE,
             _STORAGE_POLL,
         )
-        if not finished or any(job.state != _IDRAC_JOB_SUCCESS for job in state.jobs):
+        if not finished or any(job.state != IDRAC_JOB_SUCCESS for job in state.jobs):
             raise _fail(
                 "Storage jobs "
                 + ("did not all succeed" if finished else f"did not finish within {_STORAGE_DEADLINE}")

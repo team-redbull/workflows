@@ -22,6 +22,20 @@ from pydantic import BaseModel, Field
 # position is one of the factory passwords a server may arrive with.
 TARGET_CREDENTIAL = 0
 
+# Lifecycle Controller job states, HERE because both sides read them and must
+# read them the same way: the limb decides from these whether it may reset the
+# machine, and the workflow decides from them whether storage has converged. Two
+# copies could drift apart on a firmware change and the run would then reset a
+# machine mid-apply, or wait forever for a state the limb no longer reports.
+IDRAC_JOB_SUCCESS = "Completed"
+# After any of these a job never changes again.
+IDRAC_TERMINAL_JOB_STATES = frozenset({IDRAC_JOB_SUCCESS, "Failed", "CompletedWithErrors", "RebootFailed"})
+# A staged (OnReset) job waiting for the reset that runs it. Anything neither
+# this nor terminal is ACTIVE — e.g. a PERC's Non-RAID conversion, which Dell
+# runs at once as a RealTimeNoRebootConfiguration job — and no reset may happen
+# until it is done.
+IDRAC_AWAITING_RESET_STATE = "Scheduled"
+
 
 class ProvisionDellServerInput(BaseModel):
     """One machine to provision, as the technician names it: its iDRAC address.

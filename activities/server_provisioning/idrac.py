@@ -41,7 +41,12 @@ from typing import Any
 
 import httpx
 
-from activities.server_provisioning.http_client import TIMEOUT, VERIFY_TLS, extended_info
+from activities.server_provisioning.http_client import (
+    TIMEOUT,
+    VERIFY_TLS,
+    extended_info,
+    password_change_required,
+)
 from shared.exceptions import IdracAuthError, IdracError, IdracRequestRejectedError
 from shared.models.server_provisioning import (
     IDRAC_AWAITING_RESET_STATE,
@@ -168,6 +173,12 @@ async def probe_credentials(idrac_ip: str, username: str, passwords: list[str]) 
     answered" and "an answer that was neither success nor 401/403" (a 5xx
     from an iDRAC still booting): either way this round proved nothing about
     the credentials, and continuing would only add failed logins.
+
+    A refusal carrying `PasswordChangeRequired` is NOT a rejection: Force
+    Change of Password means this password is right and the account is locked
+    to changing it. Counting it as wrong would spend the remaining candidates
+    on a machine already answering, trip the iDRAC's own block with the last
+    of them, and report "no credential worked" about the one that did.
     """
     rejected = 0
     for index, password in enumerate(passwords):
@@ -180,6 +191,14 @@ async def probe_credentials(idrac_ip: str, username: str, passwords: list[str]) 
             )
         if resp.is_success:
             return IdracProbeResult(reachable=True, credential=index, rejected=rejected)
+        if password_change_required(resp):
+            return IdracProbeResult(
+                reachable=True,
+                credential=index,
+                rejected=rejected,
+                password_change_required=True,
+                detail=extended_info(resp),
+            )
         if resp.status_code in (401, 403):
             rejected += 1
             continue
@@ -359,6 +378,17 @@ async def set_root_password(
             # An iDRAC10 machine: the accounts moved to the standard collection.
             path = ROOT_ACCOUNT_IDRAC10
             account = await _send(client, "GET", path)
+        if password_change_required(account):
+            # The password is right; Force Change of Password is what refused.
+            # Falling through would ask whether the TARGET password works,
+            # get another 401, and report "root's password changed under this
+            # run" — which is both wrong and unactionable.
+            raise IdracRequestRejectedError(
+                f"iDRAC {idrac_ip} has Force Change of Password pending for {username!r}: the "
+                "current password is correct but the account may do nothing until it is changed. "
+                "Clear it at the iDRAC (racadm set iDRAC.Users.2.ForceChangePassword 0, or change "
+                f"the password by hand) and re-run. Detail: {extended_info(account)}"
+            )
         if account.status_code not in (401, 403):
             _classify(account, f"GET {path}")
             body = account.json()

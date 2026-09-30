@@ -129,6 +129,12 @@
           it. Three rounds, then <code>IdracCredentialsRejectedError</code>.</p>
           <p class="note">An iDRAC that answers nothing is a different wait: still being cabled, or a
           mistyped IP. Retried every 2 min for up to 30 min, then <code>IdracUnreachableError</code>.</p>
+          <p class="note"><b>Not every 401 is a wrong password.</b> A server ordered with Dell's
+          <em>Force Change of Password</em> refuses the <em>correct</em> one identically, and differs only
+          by a Redfish <code>MessageId</code> ending <code>PasswordChangeRequired</code>. Counted as a
+          rejection it would spend the other candidates, trip the block with the last of them, and blame
+          the password that worked. It is recognised instead: the run stops here, having written nothing,
+          with <code>IdracForcePasswordChangeError</code>.</p>
         </div>
       </div>
 

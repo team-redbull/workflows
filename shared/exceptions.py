@@ -523,6 +523,25 @@ class RootPasswordNotSetError(OrchestratorError):
     """
 
 
+class IdracForcePasswordChangeError(OrchestratorError):
+    """WORKFLOW-RAISED. The iDRAC has Force Change of Password pending, so root's
+    password is correct but the account may do nothing until it is changed.
+
+    A refusal, not a retry: the condition is cleared by a human at the iDRAC (or
+    by the factory order that set it), and no amount of waiting moves it.
+
+    Deliberately NOT worked around, though Dell's own reference client can —
+    `ChangeIdracUserPasswordREDFISH.py --force-change-enabled` writes
+    `Users.2.Password` to the DellAttributes resource, which FCP does not block.
+    That route cannot first READ the account, and this workflow's one hard rule
+    about accounts is that it touches root and never the slot OME uses
+    (CLAUDE.md §4). Writing a password into slot 2 unread, on the assumption
+    that the convention holds, is the single change that loses a server for
+    good. So the run stops and names the fix instead. If these turn out to be
+    common in a real batch, the trade is worth revisiting WITH that evidence.
+    """
+
+
 class TemplatePasswordNotAppliedError(OrchestratorError):
     """WORKFLOW-RAISED. After the template deployed, root no longer accepts the
     target password.

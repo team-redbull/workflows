@@ -130,10 +130,20 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
     account on the iDRAC is NEVER touched (OME would lose the machine). Candidates are
     `IDRAC_ROOT_PASSWORD` (the one the run enforces) then `IDRAC_FACTORY_PASSWORDS` (≤2), one
     request each — iDRAC9 blocks an address after 3 failures, so only an all-wrong round trips it,
-    and the next round waits `_LOCKOUT_WAIT` out.
+    and the next round waits `_LOCKOUT_WAIT` out. **A 401 is not automatically a wrong password.**
+    Dell's Force Change of Password (a factory order option) refuses the CORRECT one the same way,
+    differing only by a Redfish `MessageId` ending `PasswordChangeRequired`; read as a rejection it
+    spends the remaining candidates, trips the block with the last of them, and reports that no
+    password worked about the one that did. `password_change_required()` classifies it, the probe
+    returns the credential with the flag set, and the workflow stops at `probing-idrac` with
+    `IdracForcePasswordChangeError` before writing anything. Dell's own workaround — writing
+    `Users.2.Password` to the iDRAC DellAttributes resource, which FCP does not block — is
+    deliberately NOT used: it cannot first read the account, and writing a password into slot 2
+    unread is exactly how the OME account gets clobbered.
   - **ROOT'S PASSWORD IS SET OVER REDFISH BEFORE OME DISCOVERS THE MACHINE. Do not re-add a
-    rediscovery.** `set_root_password` PATCHes `AccountService/Accounts/2` (refusing if slot 2
-    is not root), then OME is discovered ONCE with the password root keeps. It used to run the
+    rediscovery.** `set_root_password` PATCHes `Managers/iDRAC.Embedded.1/Accounts/2` — the
+    iDRAC8/9 collection, falling back to `AccountService/Accounts/2` on a 404 for iDRAC10, and
+    refusing if slot 2 is not root — then OME is discovered ONCE with the password root keeps. It used to run the
     other way: OME was discovered on whatever password the server arrived with, the TEMPLATE
     enforced the target one, and `rediscovering-in-ome` re-ran discovery so OME would not lose
     the machine. Reversed 2026-09-30 on the DC team's review, for three reasons. OME's documented

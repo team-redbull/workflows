@@ -153,6 +153,11 @@ class IdracSim:
     os_hostname: str = "Miniwinpc"
     lockout_after: int = 3
     lockout_requests: int = 5
+    # Dell's Force Change of Password, orderable from the factory: the right
+    # password authenticates and then the iDRAC refuses every interface but
+    # IPMI until it is changed. The refusal is a 401 like any other, and the
+    # ONLY thing separating it from a wrong password is the MessageId.
+    force_password_change: bool = False
     boss_raid_types: list[str] = field(default_factory=lambda: ["RAID1"])
     failures: int = 0
     blocked_for: int = 0
@@ -239,6 +244,16 @@ class IdracSim:
                 self.blocked_for = self.lockout_requests
             return Response(status_code=401)
         self.failures = 0
+        if self.force_password_change:
+            # Authenticated — note the reset failure count above, because the
+            # iDRAC does NOT hold this against the account — and refused
+            # anyway. The registry is versioned into the id, so anything
+            # matching on the whole string breaks on the next minor.
+            return _error(
+                401,
+                "The password provided for this account must be changed before access is granted.",
+                "Base.1.18.PasswordChangeRequired",
+            )
         return None
 
     # --- jobs ------------------------------------------------------------------

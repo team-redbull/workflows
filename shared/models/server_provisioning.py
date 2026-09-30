@@ -80,6 +80,12 @@ class IdracProbeResult(BaseModel):
     credential: int | None = None
     rejected: int = 0
     detail: str | None = None
+    # Force Change of Password is pending: `credential` is the password root
+    # HAS, and the iDRAC will refuse everything else until it is changed.
+    # Defaults False, which is exactly how this read before the field existed —
+    # so a run replaying a payload an older limb wrote takes the path it
+    # originally took, rather than a new one (CLAUDE.md §5).
+    password_change_required: bool = False
 
 
 class IdracIdentity(BaseModel):

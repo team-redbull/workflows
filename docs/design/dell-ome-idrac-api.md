@@ -45,6 +45,9 @@ against real hardware is their test.
 | **Root's password is PATCHed on the MANAGER's account collection for iDRAC8/9** — `Managers/iDRAC.Embedded.1/Accounts/<id>` with `{"Password": ...}`. Only **iDRAC10** (17G and later) uses the standard `AccountService/Accounts/<id>`. Dell branches on the system Model: 12G/13G → iDRAC8, 14G/15G/16G → iDRAC9, else iDRAC10. An R660 is 16G, so the current fleet is on the manager collection. | `iDRAC-Redfish-Scripting`, `ChangeIdracUserPasswordREDFISH.py` |
 | **BIOS attributes are staged and the job created in ONE PATCH** to `Systems/System.Embedded.1/Bios/Settings`, carrying `{"@Redfish.SettingsApplyTime": {"ApplyTime": "OnReset"}, "Attributes": {...}}`. The job id comes back in the `Location` header. Note this is `SettingsApplyTime`, NOT the `OperationApplyTime` a volume POST uses. | `iDRAC-Redfish-Scripting`, `GetSetBiosAttributesREDFISH.py`, `create_next_boot_config_job` |
 | The **BIOS attribute registry** at `Systems/System.Embedded.1/Bios/BiosRegistry` maps `AttributeName` ↔ `DisplayName`, and carries `ReadOnly` plus a `Value[]` list of `ValueName`/`ValueDisplayName`. It is the only bridge between what OME reports about a template (display names) and what a Redfish PATCH accepts. | iDRAC9 Redfish API guide, *BIOS and boot settings* |
+| **Force Change of Password (FCP) refuses a CORRECT password with a 401.** It is a factory order option; while pending, the iDRAC blocks "login through any UI except IPMI over-LAN", Redfish included. The only thing distinguishing it from a wrong password is the Redfish `MessageId` ending `PasswordChangeRequired` in `error.@Message.ExtendedInfo[]`. Dell's own client cannot detect it either — it makes the operator pass `--force-change-enabled`, and that code path skips even the Manager GET, which is itself evidence that a plain GET is refused. | iDRAC9 Security Configuration Guide, *Force change of password (FCP)*; `ChangeIdracUserPasswordREDFISH.py`, `force_change_enabled()`; Redfish DSP2065 base registry |
+| Under FCP, Dell's workaround writes `Users.2.Password` to `Managers/iDRAC.Embedded.1/Oem/Dell/DellAttributes/iDRAC.Embedded.1`, which FCP does not block. **Deliberately not used here** — that route cannot first read the account to confirm slot 2 is root. | `ChangeIdracUserPasswordREDFISH.py`, `force_change_enabled()` |
+| **HTTP Basic auth is `Unadvertised` by default from iDRAC9 7.30.10.50 / iDRAC10 1.30.10.50** (7.00.00.184 on 14G): the iDRAC stops sending `WWW-Authenticate: basic` on a 401, so clients that wait to be challenged break. Clients sending the header on the first request are unaffected — which httpx's `auth=(user, pass)` does, verified. `Disabled` would break us; it is not the default. | KB 000437501, *iDRAC HTTP basic authentication changes* |
 | **racadm's `System.*` objects are Dell ATTRIBUTES, not ComputerSystem properties.** `racadm set System.ServerOS.HostName` writes `ServerOS.1.HostName` via `PATCH Managers/iDRAC.Embedded.1/Oem/Dell/DellAttributes/System.Embedded.1 {"Attributes": {...}}`. The standard `ComputerSystem.HostName` is what Dell POPULATES from the OS through iSM. | `iDRAC-Redfish-Scripting`, `SetIdracLcSystemAttributesREDFISH.py` |
 
 ## What this changed in the code
@@ -103,6 +106,24 @@ says to change a request only against that code:
 3. **The OS hostname was written as `ComputerSystem.HostName`.** That property
    is what Dell FILLS IN from the OS via iSM; the DC team's
    `racadm set System.ServerOS.HostName` writes a Dell system attribute.
+
+## What the third research pass changed
+
+Aimed at the credential path, which had never been read against Dell's *security*
+documentation — only its API documentation.
+
+1. **A machine ordered with Force Change of Password was unprovisionable, and
+   lied about why.** Its 401 is byte-identical to a wrong password apart from
+   the `MessageId`, so `probe_credentials` counted the CORRECT password as
+   rejected, tried the remaining candidates, tripped the iDRAC's own
+   three-strike block with the last of them, and failed the run saying no
+   configured password worked. The run now recognises it, stops at the probe
+   without writing anything, and names the fix
+   (`IdracForcePasswordChangeError`).
+2. **Basic auth was checked, and is fine.** Recent firmware stopped advertising
+   it, which breaks challenge-response clients; ours sends the header
+   preemptively. Recorded because the symptom — a fleet-wide wave of 401s after
+   a firmware update — invites exactly the wrong fix.
 
 ## Still unverified: check these on the first real server
 

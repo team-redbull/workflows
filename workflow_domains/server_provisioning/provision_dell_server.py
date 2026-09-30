@@ -101,6 +101,7 @@ with workflow.unsafe.imports_passed_through():
         IdracAuthError,
         IdracCredentialsMissingError,
         IdracCredentialsRejectedError,
+        IdracForcePasswordChangeError,
         IdracRequestRejectedError,
         IdracUnreachableError,
         NotADellServerError,
@@ -526,6 +527,18 @@ class ProvisionDellServerWorkflow:
         while True:
             probe: IdracProbeResult = await self._run(probe_idrac_credentials, idrac_ip)
             last = probe
+            if probe.password_change_required:
+                # Answered, authenticated, and refusing everything anyway. Stop
+                # here rather than at the first write: the run cannot do a
+                # single useful thing on this machine, and the next round would
+                # only re-prove it.
+                raise _fail(
+                    f"iDRAC {idrac_ip} has Force Change of Password pending: root's password is "
+                    "correct, but the iDRAC refuses every interface except IPMI until it is "
+                    "changed. Clear it at the iDRAC and re-run"
+                    f"{f'. Detail: {probe.detail}' if probe.detail else ''}",
+                    IdracForcePasswordChangeError,
+                )
             if probe.credential is not None:
                 return probe.credential
             if not probe.reachable:

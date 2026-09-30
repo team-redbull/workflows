@@ -68,6 +68,53 @@ class TestProbe:
         assert not result.reachable and result.credential is None
         assert route.call_count == 1
 
+    @staticmethod
+    def _force_change(message_id: str = "Base.1.18.PasswordChangeRequired") -> httpx.Response:
+        return httpx.Response(
+            401,
+            json={
+                "error": {
+                    "@Message.ExtendedInfo": [
+                        {
+                            "MessageId": message_id,
+                            "Message": "The password provided for this account must be "
+                            "changed before access is granted.",
+                        }
+                    ]
+                }
+            },
+        )
+
+    @respx.mock
+    async def test_force_change_of_password_is_the_right_password_not_a_rejection(self):
+        """Dell's FCP refuses a CORRECT password with the same 401 a wrong one
+        gets. Counting it as wrong spends the other candidates and trips the
+        iDRAC's own block — on a machine that just told us the password."""
+        route = respx.get(SYSTEM).mock(side_effect=[httpx.Response(401), self._force_change()])
+        result = await idrac.probe_credentials(IP, "root", ["target", "calvin", "other"])
+
+        assert result.reachable and result.credential == 1
+        assert result.password_change_required
+        assert result.rejected == 1  # the genuine one before it, and no more
+        assert route.call_count == 2
+
+    @respx.mock
+    async def test_the_registry_version_in_the_message_id_is_not_matched_on(self):
+        """`Base.1.18.PasswordChangeRequired` today; a later firmware ships a
+        later registry. Matching the whole string would silently stop working."""
+        respx.get(SYSTEM).mock(return_value=self._force_change("Base.1.21.PasswordChangeRequired"))
+        result = await idrac.probe_credentials(IP, "root", ["calvin"])
+        assert result.password_change_required and result.credential == 0
+
+    @respx.mock
+    async def test_an_ordinary_401_is_still_a_rejection(self):
+        """The detection must not swallow the case it sits next to: a 401
+        carrying some other Dell message is a wrong password, as before."""
+        respx.get(SYSTEM).mock(return_value=self._force_change("Base.1.18.InsufficientPrivilege"))
+        result = await idrac.probe_credentials(IP, "root", ["a", "b"])
+        assert result.credential is None and result.rejected == 2
+        assert not result.password_change_required
+
     @respx.mock
     async def test_a_5xx_ends_the_round_without_counting_as_a_rejection(self):
         respx.get(SYSTEM).mock(side_effect=[httpx.Response(401), httpx.Response(503)])
@@ -134,6 +181,21 @@ class TestRootPassword:
         respx.get(ACCOUNT).mock(return_value=httpx.Response(401))
         respx.get(SYSTEM).mock(return_value=httpx.Response(200, json={}))
         assert await idrac.set_root_password(IP, "root", "old", "new") is False
+
+    @respx.mock
+    async def test_force_change_of_password_is_named_not_mistaken_for_a_lost_password(self):
+        """Reaching here under FCP means the probe let it through. The 401 on
+        the account read must not fall into the retry-after-success path: that
+        asks whether the TARGET password works, gets another 401, and reports
+        "root's password changed under this run" — wrong, and unactionable."""
+        respx.get(ACCOUNT).mock(return_value=TestProbe._force_change())
+
+        with pytest.raises(IdracRequestRejectedError) as info:
+            await idrac.set_root_password(IP, "root", "old", "new")
+
+        assert "Force Change of Password" in str(info.value)
+        # It names the fix, and it never tried the target password.
+        assert "ForceChangePassword" in str(info.value)
 
     @respx.mock
     async def test_a_credential_that_is_simply_wrong_still_fails(self):

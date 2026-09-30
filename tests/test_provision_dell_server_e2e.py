@@ -426,6 +426,39 @@ async def test_an_idrac8_machine_fails_loudly_rather_than_misconfiguring(world: 
     assert world.idrac.volumes[sim.BOSS] == [] and world.idrac.resets == []
 
 
+async def test_a_server_ordered_with_force_change_of_password_stops_at_the_probe(world: World):
+    """The refusal that looks exactly like a wrong password, and is not.
+
+    Force Change of Password is a factory order option: the right password
+    authenticates, and then the iDRAC refuses every interface but IPMI until it
+    is changed. Its 401 is distinguishable from a wrong password ONLY by the
+    Redfish MessageId.
+
+    Read as a rejection it costs more than a failed run. The probe would spend
+    the remaining candidates on a machine that is already answering, trip the
+    iDRAC's own three-strike block with the last of them, and then report that
+    no configured password worked — about the one that did. So the test pins
+    the credential arithmetic, not just the error: ONE login attempt, and no
+    block.
+    """
+    world.idrac.force_password_change = True
+
+    error = await _failure()
+
+    assert error.type == "IdracForcePasswordChangeError"
+    assert "Force Change of Password" in error.message
+    # Candidates are the enforced password first, then the factory ones. The
+    # probe stops at the one the machine answers to: the third is never tried,
+    # which is the whole point — three wrong logins is what trips the block.
+    assert world.idrac.login_attempts == [TARGET, "calvin"]
+    assert "Factory-Pw2" not in world.idrac.login_attempts
+    assert world.idrac.blocked_for == 0
+    # Nothing was written, anywhere: this fails before the first mutation.
+    assert world.idrac.password_writes == []
+    assert world.idrac.os_hostname == "Miniwinpc"
+    assert world.ome.discovery_posts == []
+
+
 async def test_an_idrac_that_restarts_after_the_template_is_waited_out(world: World):
     """Applying a template rewrites the iDRAC's own settings, and it restarts.
     Every call in that window fails; the run has to wait rather than give up,

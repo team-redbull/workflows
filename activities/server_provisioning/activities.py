@@ -231,7 +231,7 @@ async def request_server_name(request: ServerNameRequest) -> None:
 
 @activity.defn
 async def find_in_server_scan(lookup: ServerScanLookup) -> ServerScanState:
-    """Whether server-scan holds this service tag, claimed or under the expected name."""
+    """Whether a cluster is already using the machine with this service tag."""
     return await server_scan.lookup(
         _settings.server_scan_url, _settings.server_scan_api_token, lookup
     )

@@ -1,9 +1,9 @@
 """Server-provisioning HTTP surface — what a DC technician calls from Swagger.
 
 ASYNC trigger, like every domain: POST returns 202 with the workflow id at once
-and the caller polls GET /workflows/runs/{workflow_id}. A provisioning run takes
-hours (reboots, then server-scan's next collection), so holding a connection
-open was never an option.
+and the caller polls GET /workflows/runs/{workflow_id}. A provisioning run can
+take hours — a template deployment and a RAID reboot are both real waits — so
+holding a connection open was never an option.
 
 Technicians rack servers in batches, so the `/bulk` variant takes a list of
 iDRAC IPs and starts ONE WORKFLOW PER MACHINE — each with its own dedup id, its
@@ -112,8 +112,11 @@ async def start_provision_dell_server(
     The run discovers the server in OpenManage, deploys the template for its
     model and iDRAC firmware (which sets root's password), builds the RAID 1 on
     the BOSS and sets every PERC drive Non-RAID, has the naming service rename
-    its profile, and completes when server-scan lists it under that name —
-    typically within one server-scan collection cycle (6 h).
+    its profile, and completes once the machine is configured: root on the
+    enforced password, the template applied, the storage layout verified and
+    the OME profile carrying the right name. It does NOT wait for server-scan
+    to list the machine — server-scan's own collector finds it on its next
+    pass (every 6 h), which is well after this run has finished.
 
     Poll GET /workflows/runs/{workflow_id}; its `progress.phase` and
     `progress.waiting_on` say where the run is. A second POST for the same IP

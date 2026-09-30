@@ -270,27 +270,24 @@ class ServerNameRequest(BaseModel):
 
 
 class ServerScanLookup(BaseModel):
-    """Look a service tag up in server-scan; `expected_name` None asks only
-    whether some document with that serial is claimed by a cluster."""
+    """Ask server-scan what it holds for one service tag."""
 
     service_tag: str
-    expected_name: str | None = None
 
 
 class ServerScanState(BaseModel):
     """What server-scan holds for one service tag.
 
-    `found` — a document with this serial carries `expected_name`.
-    `claimed_by` — set when ANY document with this serial is in use by a
-    cluster (`INSTALLED ocp4-x`, `INSTALLED_TO_INVENTORY mce-y`): the one
-    thing that makes rebooting and re-templating the machine unsafe.
+    Read for ONE reason: `claimed_by` is set when any document with this serial
+    is in use by a cluster (`INSTALLED ocp4-x`, `INSTALLED_TO_INVENTORY mce-y`),
+    which is the one thing that makes rebooting and re-templating the machine
+    unsafe. `name` only names the machine in that refusal.
+
+    The run does not read this again at the end: being LISTED by server-scan is
+    not this workflow's definition of done (see provision_dell_server.py).
     """
 
-    found: bool
-    server_id: str | None = None
     name: str | None = None
-    health: str | None = None
-    reachable: bool | None = None
     claimed_by: str | None = None
 
 
@@ -321,5 +318,3 @@ class ProvisionDellServerResult(BaseModel):
     profile_name: str
     boss_raid1_created: bool
     non_raid_drives_converted: int
-    server_scan_id: str
-    server_scan_health: str | None = None

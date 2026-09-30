@@ -297,8 +297,11 @@ bulk). An explicit `region` wins. The only manual step left is the iDRAC IP.
    `ocp-dell-<model>-<region>-<N>c-<N>gb-<N>tb-<service tag>` with THIS region
    and service tag. `server_namer.py` is where the service's real request
    contract goes — today it POSTs the request model to `SERVER_NAMER_URL`.
-8. **awaiting-server-scan** — server-scan's own Dell collector (every 6 h) lists
-   the server under that name. Up to 8 h, then `ServerScanNeverSawServerError`.
+
+The run ends there: the machine is configured. It does **not** wait for
+server-scan to list it — server-scan's own Dell collector (every 6 h) picks the
+server up afterwards, and waiting would add hours to every run to watch
+something the run cannot influence.
 
 Workflow id `provision-dell-server-<idrac ip>`. Every wait is the workflow's, on
 durable timers with a deadline; no password is ever in Temporal history (a run

@@ -514,7 +514,3 @@ class ServerNameNotAppliedError(OrchestratorError):
     """WORKFLOW-RAISED. The OME profile never carried a name matching the
     convention for this machine (region and service tag included) in time."""
 
-
-class ServerScanNeverSawServerError(OrchestratorError):
-    """WORKFLOW-RAISED. server-scan did not collect the server under its new name
-    before the deadline, which spans more than one full collector cycle."""

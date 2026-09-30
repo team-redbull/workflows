@@ -1,4 +1,4 @@
-"""provision-dell-server — from "the iDRAC has an IP" to "server-scan lists it, ready to install".
+"""provision-dell-server — from "the iDRAC has an IP" to "this machine is configured".
 
 The FIRST workflow of the `server-provisioning` domain. It replaces what the DC
 team did by hand for every Dell server: discover it in OpenManage Enterprise,
@@ -31,9 +31,15 @@ Shape of the run:
   7. naming-server        — the naming service renames the OME profile, and
      verifying-name         the name is read back from OME and checked against
                             the convention, region and service tag included.
-  8. awaiting-server-scan — server-scan's own collector finds the server under
-                            that name. The run COMPLETES only then, because that
-                            is the moment install-server can use the machine.
+
+DONE MEANS CONFIGURED, NOT YET INVENTORIED. The run ends when the machine is
+right: root on the enforced password, the template applied, the storage layout
+verified and the OME profile named. It does NOT wait for server-scan to list
+it — server-scan discovers by itself on a 6-hourly collection, so waiting would
+add hours to every run to learn something the run cannot influence, and would
+turn a slow or paused collector into a fleet of failed provisions. The early
+server-scan read stays: that one is a SAFETY check (step 2), not a completion
+one.
 
 WHY STORAGE COMES AFTER THE TEMPLATE. The template deployment can reboot the
 machine and apply BIOS attributes; configuring storage afterwards means the
@@ -41,9 +47,9 @@ layout checked in step 6 is the one the server ends up with. It also means
 every storage call runs as root on the TARGET password, never a factory one.
 
 EVERY WAIT IS THE WORKFLOW'S, bounded, on durable timers — a discovery job, a
-template deployment, a reboot applying RAID, the next server-scan collection.
-They are all MACHINE convergence (CLAUDE.md §5): each gets a deadline and
-fails the run loudly by name when it passes. No activity sleeps.
+template deployment, a reboot applying RAID. They are all MACHINE convergence
+(CLAUDE.md §5): each gets a deadline and fails the run loudly by name when it
+passes. No activity sleeps.
 
 NO PASSWORD IS EVER IN HISTORY. The run refers to a root credential by its
 position in the limb's configured list (IdracRef.credential); the limb resolves
@@ -81,7 +87,6 @@ with workflow.unsafe.imports_passed_through():
         ServerNamerRejectedError,
         ServerAlreadyInstalledError,
         ServerScanAuthError,
-        ServerScanNeverSawServerError,
         StorageJobFailedError,
         StorageLayoutUnsupportedError,
         StorageNotConvergedError,
@@ -191,11 +196,6 @@ _STORAGE_POLL = timedelta(minutes=1)
 # --- Naming ------------------------------------------------------------------
 _NAME_DEADLINE = timedelta(minutes=30)
 _NAME_POLL = timedelta(seconds=30)
-
-# --- server-scan: its Dell collector runs every 6 h and may take 90 min, so the
-# deadline outlasts one full cycle. The read is Mongo-only and cheap.
-_SERVER_SCAN_DEADLINE = timedelta(hours=8)
-_SERVER_SCAN_POLL = timedelta(minutes=10)
 
 
 def _fail(message: str, error: type[Exception]) -> ApplicationError:
@@ -367,24 +367,10 @@ class ProvisionDellServerWorkflow:
         profile_name = str(profile.profile_name)
         self._progress.profile_name = profile_name
 
-        # Step 8 — done means install-server can see it.
-        self._phase("awaiting-server-scan", waiting_on="server-scan's next Dell (OME) collection")
-        seen, found = await self._poll(
-            lambda: self._run(
-                find_in_server_scan,
-                ServerScanLookup(service_tag=identity.service_tag, expected_name=profile_name),
-            ),
-            lambda state: state.found,
-            _SERVER_SCAN_DEADLINE,
-            _SERVER_SCAN_POLL,
-        )
-        if not found:
-            raise _fail(
-                f"server-scan did not list {profile_name} within {_SERVER_SCAN_DEADLINE}. Check the "
-                "OPENMANAGE collector's last run and its INVENTORY_OME_NAME_PATTERN",
-                ServerScanNeverSawServerError,
-            )
-
+        # DONE. The machine is configured: root on the enforced password, the
+        # template applied, the storage layout verified, the profile named.
+        # server-scan's own collector picks it up on its next pass, and the run
+        # deliberately does NOT wait for that — see the module docstring.
         self._phase("completed")
         return ProvisionDellServerResult(
             idrac_ip=idrac_ip,
@@ -398,8 +384,6 @@ class ProvisionDellServerWorkflow:
             profile_name=profile_name,
             boss_raid1_created=boss_created,
             non_raid_drives_converted=converted,
-            server_scan_id=str(seen.server_id),
-            server_scan_health=seen.health,
         )
 
     async def _probe(self, idrac_ip: str) -> int:

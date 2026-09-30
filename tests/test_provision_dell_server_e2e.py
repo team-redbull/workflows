@@ -219,7 +219,10 @@ async def test_a_factory_fresh_server_is_provisioned_end_to_end(world: World):
     assert result.service_tag == world.idrac.service_tag
     assert result.initial_credential == "factory-1"  # arrived on calvin
     assert result.profile_name == f"ocp-dell-r660-{REGION}-128c-1024gb-10tb-{world.idrac.service_tag}"
-    assert result.server_scan_id == "srv_sim_1"
+    # The run finished on its own configuration work. server-scan has not
+    # collected the machine yet (its simulator needs 3 reads), and that is
+    # deliberately not something the run waits for.
+    assert world.scan.current() is None
 
     # The template enforced the target password, and OME was re-pointed at it.
     assert world.idrac.root_password == TARGET

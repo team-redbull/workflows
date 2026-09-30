@@ -123,7 +123,8 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
 ## 4. External dependencies are black boxes
 
 - **provision-dell-server (domain `server-provisioning`) takes a Dell from "iDRAC has an IP" to
-  "server-scan lists it"**, so install-server can draw it. Designed with the operator 2026-09-30.
+  "this machine is configured"**, after which install-server can draw it. Designed with the
+  operator 2026-09-30.
   The pieces that are decisions, not incidental:
   - **Credentials by POSITION, never by value in history.** Root only (iDRAC user 2); the OME
     account on the iDRAC is NEVER touched (OME would lose the machine). Candidates are
@@ -151,9 +152,17 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
     at once (RealTimeNoRebootConfiguration) so NO reset while a job runs; a
     templated device is `ProfileState > 0` + same `TemplateId`, and its
     `DeploymentTaskId` is the job to wait on.
-  - **Done = server-scan lists it under that name.** server-scan discovers by itself (its OME
-    collector, every 6 h); the run polls a Mongo-backed read for up to 8 h and NEVER asks
-    server-scan to refresh or calls `/servers/available` (live vendor recheck).
+  - **DONE = CONFIGURED, NOT INVENTORIED. Do not re-add the server-scan wait.** The run ends
+    once root is on the enforced password, the template is applied, the storage layout verifies
+    and the OME profile carries the right name. It used to end instead at "server-scan lists it",
+    polling a Mongo-backed read every 10 min for up to 8 h (`awaiting-server-scan`,
+    `_SERVER_SCAN_DEADLINE`, `ServerScanNeverSawServerError`). Reversed by the operator on
+    2026-09-30: server-scan discovers by itself on a 6-hourly collection, so the wait added hours
+    to every run to observe something the run cannot influence, and made a slow or paused
+    collector fail a fleet of correctly provisioned machines. The EARLY server-scan read stays —
+    that one refuses a machine a cluster is using, which is a safety check, not a completion one.
+    Either way, never ask server-scan to refresh and never call `/servers/available` (live vendor
+    recheck).
 
 - **server-scan is the inventory source of record for install-server**
   (`SERVER_SCAN_URL`). The workflow makes ONE read — `GET /servers/available`

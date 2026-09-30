@@ -1,0 +1,604 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>provision-dell-server — Redbull Workflows</title>
+<meta name="description" content="The provision-dell-server workflow: take a freshly racked Dell from &quot;the iDRAC has an IP&quot; to a fully configured machine — OME discovery, the server profile template, the boot RAID and the name.">
+<link rel="icon" href="/assets/favicon.svg?v=__DOC_VERSION__" type="image/svg+xml">
+<link rel="stylesheet" href="/assets/site.css?v=__DOC_VERSION__">
+</head>
+<body data-page="/server-provisioning/provision-dell-server.html">
+
+<a class="skip-link" href="#main">Skip to content</a>
+
+<!-- Topbar: identical on every page. Brand + deployed version upper-left; the
+     "Workflows" menu is built from the catalogue in assets/nav.js. -->
+<header class="topbar">
+  <a class="brand" href="/">
+    <img class="brand-mark" src="/assets/redbull-logo.png?v=__DOC_VERSION__" alt="" aria-hidden="true"
+         width="480" height="179">
+    <span class="brand-name">Redbull Workflows</span>
+    <span class="brand-ver" title="deployed image tag of this documentation site">__DOC_VERSION__</span>
+  </a>
+  <nav class="topnav" aria-label="Site">
+    <a class="topnav-link" href="/">Orchestrator guide</a>
+    <div class="wfmenu">
+      <button class="wfmenu-btn" id="wfmenu-btn" type="button"
+              aria-expanded="false" aria-haspopup="true" aria-controls="wfmenu-panel">
+        Workflows <span class="caret" aria-hidden="true">&#9662;</span>
+      </button>
+      <div class="wfmenu-panel" id="wfmenu-panel" role="menu" aria-label="Workflows by domain" hidden></div>
+    </div>
+    <noscript>
+      <a class="topnav-link" href="/server-provisioning/provision-dell-server.html">provision-dell-server</a>
+    </noscript>
+  </nav>
+</header>
+
+<main id="main">
+<header class="masthead">
+  <div class="masthead-inner">
+    <div class="eyebrow">Temporal workflow &middot; domain: server-provisioning</div>
+    <h1>provision-dell-server<span class="dim"> &mdash; what actually happens</span></h1>
+    <p class="lede">
+      A technician racks a Dell and gives its iDRAC an IP. That is the last manual step. This workflow
+      takes it from there to <b>a fully configured machine</b> &mdash; root on the enforced password, the
+      template applied, the boot RAID built and the profile named &mdash; after which
+      <a href="/server-lifecycle/install-server.html">install-server</a> can draw it.
+    </p>
+    <p class="lede">It replaces what the DC team used to do by hand in OpenManage Enterprise: discover the
+    machine, build a server profile, attach a template, rename the profile &mdash; plus the RAID 1 someone
+    built in the BIOS. Dell only, for now.</p>
+    <div class="facts">
+      <div class="fact"><span class="k">Trigger</span><span class="v">POST /workflows/server-provisioning/provision-dell-server</span></div>
+      <div class="fact"><span class="k">Workflow id</span><span class="v">provision-dell-server-&lt;idrac ip&gt;</span></div>
+      <div class="fact"><span class="k">Workflow queue</span><span class="v">provision-dell-server-workflow</span></div>
+      <div class="fact"><span class="k">Activity queue</span><span class="v">server-provisioning-activity</span></div>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <!-- ======================= WHY ======================= -->
+  <section id="why">
+    <div class="sec-head">
+      <div class="eyebrow">Why this is a workflow and not a script</div>
+      <h2>Because it reboots someone else&rsquo;s hardware</h2>
+      <p class="lede">A script that does this has to survive a template deployment that reboots the
+      machine and a Lifecycle Controller applying RAID on the way up &mdash; neither of which fits in a
+      request, and both of which leave a machine half-configured if the script dies.</p>
+    </div>
+
+    <div class="grid-2">
+      <div class="panel">
+        <h3>Every wait is durable and bounded</h3>
+        <p>Discovery, template deployment, the reboot that applies storage, the rename &mdash; each is a
+        <code>workflow.sleep</code> on the Temporal server, not a process holding a socket. Each is
+        <em>machine</em> convergence, so each gets a real deadline and fails loudly by name when it
+        passes.</p>
+        <h3 style="margin-top:6px">The id is the machine</h3>
+        <p>Built from the iDRAC address alone &mdash; the only identity the run has before it has read
+        anything. A technician double-submitting a row of a bulk list lands on the running run rather than
+        starting a second one that races it through the same reboots.</p>
+      </div>
+      <div class="panel">
+        <h3>Nothing half-applies</h3>
+        <p>Storage is <b>staged</b> and applied by <b>one</b> reboot, so the machine is never left between
+        two layouts by a crash in the middle. Every activity is idempotent: a re-run of a finished server
+        finds the profile already deployed and the RAID already built, and changes nothing.</p>
+        <h3 style="margin-top:6px">Done means configured</h3>
+        <p>The run ends on its own work, not on another system noticing it. server-scan picks the machine
+        up on its next six-hourly collection; waiting for that would add hours to every run to observe
+        something the run cannot influence &mdash; and would turn a paused collector into a fleet of
+        failed provisions.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================= FLOW ======================= -->
+  <section id="flow">
+    <div class="sec-head">
+      <div class="eyebrow">The run, step by step</div>
+      <h2>Seven steps, and what each one is waiting for</h2>
+      <p class="lede">Every phase below is a value you will see on
+      <code>GET /workflows/runs/{workflow_id}</code>, alongside a <code>waiting_on</code> naming the job
+      or the machine the run is blocked on.</p>
+    </div>
+
+    <div class="flow">
+
+      <!-- 1 -->
+      <div class="step">
+        <div class="marker">1</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>probe_idrac_credentials</h3>
+            <span class="phase">phase <b>probing-idrac</b></span>
+          </div>
+          <p>Which root password does this iDRAC accept? The <b>target</b> one first &mdash; a re-run, or a
+          machine that shipped with it &mdash; then each configured factory password, one request each, in
+          order.</p>
+          <div class="calls">
+            <div class="call sm"><span class="verb">GET</span><span class="path">/redfish/v1/Systems/System.Embedded.1 <em>&middot; once per candidate, HTTP Basic</em></span></div>
+          </div>
+          <p class="note">iDRAC9 blocks a source address after <b>3</b> failed logins in its fail window.
+          One round is at most three candidates, so a round can only trip the block when <em>all</em> of
+          them are wrong &mdash; and the next round then waits the penalty out (11 min) instead of feeding
+          it. Three rounds, then <code>IdracCredentialsRejectedError</code>.</p>
+          <p class="note">An iDRAC that answers nothing is a different wait: still being cabled, or a
+          mistyped IP. Retried every 2 min for up to 30 min, then <code>IdracUnreachableError</code>.</p>
+        </div>
+      </div>
+
+      <!-- 2 -->
+      <div class="step">
+        <div class="marker">2</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>read_idrac_identity &middot; find_in_server_scan</h3>
+            <span class="phase">phase <b>reading-identity</b> &rarr; <b>checking-server-scan</b></span>
+          </div>
+          <p>Service tag, model and iDRAC firmware, off the machine itself. A non-Dell or non-PowerEdge
+          answer stops here (<code>NotADellServerError</code>).</p>
+          <p>Then the guard that matters: <b>is a cluster already using this machine?</b> Everything after
+          this point reboots it or rewrites its BIOS, and an IP typed one digit wrong must not take a
+          production node down. A server-scan document whose lifecycle state is anything but
+          <code>AVAILABLE</code> fails the run with <code>ServerAlreadyInstalledError</code>.</p>
+          <div class="calls">
+            <div class="call sm"><span class="verb">GET</span><span class="path">/servers?search=&lt;service tag&gt; <em>&middot; then /servers/{id} to confirm the serial exactly</em></span></div>
+          </div>
+          <p class="note">Never <code>/servers/available</code> &mdash; that endpoint live-rechecks against
+          the vendor manager on every call, which is far more than a yes/no guard needs. These are
+          Mongo-backed reads, and this is the <b>only</b> time the run reads server-scan.</p>
+        </div>
+      </div>
+
+      <!-- 3 -->
+      <div class="step">
+        <div class="marker">3</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>find_ome_device &middot; start_ome_discovery</h3>
+            <span class="phase">phase <b>discovering-in-ome</b></span>
+          </div>
+          <p>Skipped entirely when OME already holds the service tag. Otherwise the run creates a discovery
+          for this one address and waits for its job &mdash; polled every 30 s, deadline 30 min.</p>
+          <div class="calls">
+            <div class="call sm"><span class="verb">POST</span><span class="path">/api/DiscoveryConfigService/DiscoveryConfigGroups <em>&middot; RunNow, one target</em></span></div>
+            <div class="call sm"><span class="verb">GET</span><span class="path">/api/JobService/Jobs(&lt;id&gt;) <em>&middot; until LastRunStatus is terminal</em></span></div>
+          </div>
+          <p class="note">The discovery group is named deterministically from the service tag, the purpose
+          and the run id, so a retried activity finds the discovery it already created instead of making a
+          second one.</p>
+        </div>
+      </div>
+
+      <!-- 4 -->
+      <div class="step">
+        <div class="marker">4</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>deploy_ome_template</h3>
+            <span class="phase">phase <b>deploying-template</b></span>
+          </div>
+          <p>The template for this machine&rsquo;s <b>(Redfish model, iDRAC firmware)</b> pair, from
+          <code>DELL_TEMPLATES</code>. There is no fallback: an unlisted pair fails with
+          <code>TemplateNotConfiguredError</code> rather than getting a near-miss template.</p>
+          <div class="calls">
+            <div class="call nxt"><span class="verb">POST</span><span class="path">/api/TemplateService/Actions/TemplateService.Deploy <em>&middot; may reboot the machine</em></span></div>
+          </div>
+          <p class="note">A device already carrying a profile from <em>this</em> template returns that
+          profile&rsquo;s own <code>DeploymentTaskId</code>, so a retry waits on the job that really
+          deployed it. A profile from any <em>other</em> template is
+          <code>ProfileConflictError</code> &mdash; never redeployed over. Deadline 2 h, polled every
+          minute.</p>
+        </div>
+      </div>
+
+      <!-- 5 -->
+      <div class="step">
+        <div class="marker">5</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>check_idrac_login &middot; re-discovery</h3>
+            <span class="phase">phase <b>verifying-root-password</b> &rarr; <b>rediscovering-in-ome</b></span>
+          </div>
+          <p>The template is what <b>enforces</b> root&rsquo;s password, so the run proves it by logging
+          in. Polled every minute for 20 min, because the iDRAC may restart after the template changes its
+          own settings. Still refusing the target password &rarr;
+          <code>TemplatePasswordNotAppliedError</code>, which almost always means the template is missing
+          the iDRAC user-2 password attribute.</p>
+          <p>If the machine <em>arrived</em> on a factory password, OME discovered it with that one. The
+          run re-runs discovery with the target password, or <b>OME loses the machine</b> the moment the
+          old one stops working.</p>
+        </div>
+      </div>
+
+      <!-- 6 -->
+      <div class="step">
+        <div class="marker">6</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>read_storage_layout &rarr; stage &rarr; apply &rarr; verify</h3>
+            <span class="phase">phase <b>configuring-storage</b> &rarr; <b>applying-storage</b> &rarr; <b>verifying-storage</b></span>
+          </div>
+          <p>RAID 1 across the <b>BOSS</b> pair, every <b>PERC</b> drive <b>Non-RAID</b>. Both are staged
+          <code>OnReset</code> and applied by <b>one</b> reboot, then the layout is read back and re-planned
+          &mdash; a converged plan is the only success.</p>
+          <div class="calls">
+            <div class="call sm"><span class="verb">POST</span><span class="path">.../Storage/&lt;boss&gt;/Volumes <em>&middot; RAIDType RAID1, @Redfish.OperationApplyTime OnReset</em></span></div>
+            <div class="call sm"><span class="verb">POST</span><span class="path">.../DellRaidService.ConvertToNonRAID <em>&middot; PDArray</em></span></div>
+            <div class="call nxt"><span class="verb">POST</span><span class="path">.../ComputerSystem.Reset <em>&middot; ForceRestart — the one reboot</em></span></div>
+          </div>
+          <p class="note">A PERC runs its Non-RAID conversion <em>immediately</em> (a real-time job), so the
+          reset that applies the BOSS volume must not cut it off mid-apply. The run waits for the real-time
+          jobs to settle before resetting, and the limb refuses the reset while any job is still active.</p>
+          <p class="note">Storage comes <em>after</em> the template on purpose: the template can reboot the
+          machine and apply BIOS attributes, so doing storage afterwards means the layout verified here is
+          the one the server ends up with &mdash; and every storage call runs on the target password, never
+          a factory one.</p>
+        </div>
+      </div>
+
+      <!-- 7 -->
+      <div class="step done">
+        <div class="marker">7</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>request_server_name &middot; get_ome_profile</h3>
+            <span class="phase">phase <b>naming-server</b> &rarr; <b>verifying-name</b></span>
+          </div>
+          <p>The naming service is the <b>author</b> of the name: it reads the device&rsquo;s cores, memory
+          and disks from OME, rounds them its own way and renames the server profile. This workflow asks,
+          then verifies &mdash; it never re-derives the numbers, because two roundings eventually
+          disagree.</p>
+          <pre>ocp-dell-r660-&lt;region&gt;-128c-1024gb-10tb-&lt;service tag&gt;</pre>
+          <p class="note">Checked against the convention, the run&rsquo;s <b>region</b> and the iDRAC&rsquo;s
+          own <b>service tag</b> &mdash; getting either wrong would file the machine under the wrong
+          server-scan site, or name it after a different server. Read back from the <b>OME profile</b>,
+          because that is the name server-scan reads. Polled every 30 s for 30 min, then
+          <code>ServerNameNotAppliedError</code>.</p>
+          <p class="note"><b>And that is the run.</b> The machine is configured, and server-scan&rsquo;s
+          own OME collector lists it on its next pass &mdash; which the run deliberately does not wait
+          for. Until then the machine simply is not in the inventory yet, which is a fact about
+          server-scan&rsquo;s schedule rather than anything wrong with the server.</p>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ======================= CREDENTIALS ======================= -->
+  <section id="credentials">
+    <div class="sec-head">
+      <div class="eyebrow">The part that would be easy to get dangerously wrong</div>
+      <h2>No password is ever in Temporal history</h2>
+      <p class="lede">Activity inputs, results and error messages are all recorded verbatim in history and
+      readable by anyone with Temporal UI access. So a run never carries a password &mdash; it carries a
+      <em>position</em>.</p>
+    </div>
+
+    <div class="grid-2">
+      <div class="panel">
+        <h3>Credentials by index</h3>
+        <p>A run refers to a root credential as <code>IdracRef.credential</code>, an integer: <code>0</code>
+        is the target password, <code>1</code> and up are the factory ones in configured order. The limb
+        resolves the index against its own Secret at the moment of the call. History records
+        <code>credential=1</code>; the logs say <code>credential=1</code>; the result says
+        <code>factory-1</code>.</p>
+        <p class="note">The list changing under a running run is caught rather than guessed at: an index
+        with no password behind it is <code>IdracCredentialsMissingError</code>.</p>
+      </div>
+      <div class="panel warn">
+        <h3>Only root. Never the OME account.</h3>
+        <p>This workflow touches <b>iDRAC user 2 (root)</b> and nothing else. The OME service account on
+        the iDRAC is never read and never changed &mdash; changing it would cut OME off from the machine,
+        and OME is how the rest of this run (and server-scan after it) sees the server at all.</p>
+        <p>The real passwords live only in the worker&rsquo;s Secret. They are not in this repo, not in the
+        chart&rsquo;s <code>values.yaml</code>, and not in the tests.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================= STORAGE ======================= -->
+  <section id="storage">
+    <div class="sec-head">
+      <div class="eyebrow">Storage policy</div>
+      <h2>Nothing is ever deleted to make room</h2>
+      <p class="lede">A new server arrives with an empty controller. One that does not is either not new,
+      or was configured by hand &mdash; and either way that is a person&rsquo;s call, not this
+      workflow&rsquo;s.</p>
+    </div>
+
+    <div class="grid-2">
+      <div class="panel">
+        <h3>What gets built</h3>
+        <ul>
+          <li>The <b>BOSS</b> card (the M.2 boot pair) carries <b>one RAID 1</b> over both drives &mdash;
+          the OS disk.</li>
+          <li>Every drive behind a <b>PERC</b> becomes <b>Non-RAID</b>, so the OS sees each one directly
+          (ODF and local storage want whole disks).</li>
+          <li>Anything else &mdash; CPU-attached NVMe, an embedded SATA controller &mdash; has no RAID
+          state to set and is left alone.</li>
+        </ul>
+        <p class="note">Bond members and drive states are read from the machine, never assumed. NVMe drives
+        report their RAID status under <code>DellPCIeSSD</code> rather than
+        <code>DellPhysicalDisk</code>, which is the kind of detail that silently drops a drive if you read
+        only one of them.</p>
+      </div>
+      <div class="panel alarm">
+        <h3>What fails the run instead</h3>
+        <ul>
+          <li>A drive that is already a volume member</li>
+          <li>A BOSS volume that is not exactly that RAID 1</li>
+          <li>A PERC that already holds volumes</li>
+          <li>A drive in a state that is neither <code>Ready</code> nor <code>NonRAID</code></li>
+        </ul>
+        <p style="font-size:var(--fs-14);color:var(--ink-2)">Each is a <code>StorageLayoutUnsupportedError</code>
+        naming what it found, raised <em>before</em> anything is staged. Delete it by hand if it really is
+        unused.</p>
+      </div>
+    </div>
+
+    <div class="panel warn" style="margin-top:14px">
+      <h3>The template must not carry storage components</h3>
+      <p>A Dell server profile template that includes storage deploys with
+      <code>RAIDresetConfig=True</code>, which <b>wipes the controller</b> &mdash; every volume on the
+      machine, at step 4, before this workflow has read the layout it promised never to destroy. Capture
+      templates from BIOS and iDRAC components only; the RAID is this workflow&rsquo;s job, at step 6.</p>
+    </div>
+  </section>
+
+  <!-- ======================= REGION ======================= -->
+  <section id="region">
+    <div class="sec-head">
+      <div class="eyebrow">Where the machine is</div>
+      <h2>Region is resolved at the edge, once</h2>
+    </div>
+
+    <div class="grid-2">
+      <div class="panel">
+        <h3>From the iDRAC&rsquo;s address prefix</h3>
+        <p>Technicians submit IPs, not regions, and the address plan already says where a machine is: each
+        region&rsquo;s iDRACs live under their own prefix. The <em>router</em> resolves it and the run
+        carries it as input.</p>
+        <p>So editing the prefix table never changes what an in-flight run does &mdash; a lookup inside the
+        workflow would be a non-deterministic change on replay &mdash; and an address matching no prefix is
+        a <b>422</b> to the technician now, not a failed run an hour later.</p>
+      </div>
+      <div class="panel">
+        <h3>It has to be a server-scan site code</h3>
+        <p>The region is the <code>&lt;region&gt;</code> token of the server name, and server-scan parses a
+        server&rsquo;s <b>site</b> out of that name. A region that is not a site code server-scan knows
+        produces a machine filed in the wrong place &mdash; which is why the name is verified against the
+        run&rsquo;s region at step 7.</p>
+        <p class="note">An explicit <code>region</code> in the request body overrides the lookup, for a
+        machine on a network the table does not cover yet.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================= API ======================= -->
+  <section id="api">
+    <div class="sec-head">
+      <div class="eyebrow">HTTP surface</div>
+      <h2>How you start it and how you watch it</h2>
+      <p class="lede">Served by <code>workflows-orchestrator-api</code> (Swagger at <code>/docs</code>).
+      Technicians rack servers in batches, so <code>/bulk</code> is the route that gets used most.</p>
+    </div>
+
+    <div class="api">
+
+      <div class="endpoint">
+        <div class="endpoint-head">
+          <span class="method">POST</span>
+          <span class="path">/workflows/server-provisioning/provision-dell-server</span>
+          <span class="ret">202 &middot; 409 if already running &middot; 422 if no region</span>
+        </div>
+        <div class="endpoint-body">
+          <p>One machine, identified only by its iDRAC address.</p>
+          <pre><span class="c">// request</span>
+{
+  "idrac_ip": "134.1.20.31",
+  "region":   "israel"          <span class="c">// optional — resolved from the prefix when omitted</span>
+}
+
+<span class="c">// 202 response</span>
+{ "workflow_id": "provision-dell-server-134.1.20.31", "run_id": "…" }</pre>
+          <p class="note">The address is <b>normalised</b> before it becomes the id, and a non-address is
+          refused rather than reinterpreted (<code>010.001.002.003</code> is an error, not
+          <code>10.1.2.3</code>), so the dedup key is the same however it was typed. Unknown fields are
+          refused too.</p>
+        </div>
+      </div>
+
+      <div class="endpoint">
+        <div class="endpoint-head">
+          <span class="method">POST</span>
+          <span class="path">/workflows/server-provisioning/provision-dell-server/bulk</span>
+          <span class="ret">202 &middot; always, with a per-item report</span>
+        </div>
+        <div class="endpoint-body">
+          <p>Takes <code>{"servers": [ … ]}</code> and starts <b>one workflow per iDRAC</b>. Each machine
+          gets its own dedup id, its own status and its own failure, so one bad row can neither delay nor
+          fail the rest of the rack.</p>
+          <pre><span class="c">// 202 response</span>
+{ "started": 2, "already_running": 1, "rejected": 1, "failed": 0,
+  "results": [
+    { "idrac_ip": "134.1.20.31", "workflow_id": "provision-dell-server-134.1.20.31", "status": "started",         "region": "israel", "run_id": "…" },
+    { "idrac_ip": "134.1.20.32", "workflow_id": "provision-dell-server-134.1.20.32", "status": "already_running", "region": "israel" },
+    { "idrac_ip": "9.9.9.9",     "workflow_id": "provision-dell-server-9.9.9.9",     "status": "rejected",
+      "error": "No region for iDRAC 9.9.9.9: its address matches no prefix …" }
+  ] }</pre>
+          <p class="note"><code>rejected</code> is this route&rsquo;s own status, and it is the common one:
+          a machine on a network nobody has added to the region table yet. It is refused before a workflow
+          is started at all.</p>
+        </div>
+      </div>
+
+      <div class="endpoint">
+        <div class="endpoint-head">
+          <span class="method">GET</span>
+          <span class="path">/workflows/runs/{workflow_id}</span>
+          <span class="ret">200 &middot; 404 if unknown id</span>
+        </div>
+        <div class="endpoint-body">
+          <p>The same domain-agnostic status endpoint every workflow uses. A provisioning run is long, so
+          <code>phase</code> and <code>waiting_on</code> are the fields to watch.</p>
+          <pre><span class="c">// RUNNING</span>
+{ "workflow_id": "provision-dell-server-134.1.20.31",
+  "workflow_type": "ProvisionDellServerWorkflow", "status": "RUNNING",
+  "progress": { "phase": "applying-storage",
+                "waiting_on": "iDRAC jobs JID_00123, JID_00124 (reboot)",
+                "idrac_ip": "134.1.20.31", "service_tag": "7XK2QF3",
+                "model": "PowerEdge R660", "ome_device_id": 10074 } }
+
+<span class="c">// COMPLETED</span>
+{ …, "status": "COMPLETED",
+  "result": { "service_tag": "7XK2QF3", "initial_credential": "factory-1",
+              "profile_name": "ocp-dell-r660-israel-128c-1024gb-10tb-7XK2QF3",
+              "boss_raid1_created": true, "non_raid_drives_converted": 4 } }</pre>
+          <p class="note"><code>initial_credential</code> names the credential by <em>position</em>
+          (<code>target</code>, <code>factory-1</code>), never by value &mdash; it tells you whether the
+          machine arrived factory-fresh without telling you the password.</p>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ======================= FAILURE ======================= -->
+  <section id="failure">
+    <div class="sec-head">
+      <div class="eyebrow">When things go wrong</div>
+      <h2>Outages are out-waited. Real errors stop the run.</h2>
+      <p class="lede">Same rule as every workflow here: <b>retries are unbounded</b> (1 s &rarr; doubling
+      &rarr; capped at 1 min), so an OME restart or a flapping iDRAC never fails a run. Retrying stops
+      <em>only</em> for errors explicitly classified as permanent. Each activity gets 5 min per attempt.</p>
+    </div>
+
+    <div class="grid-2">
+      <div class="panel alarm">
+        <h3>Activity errors classified as permanent</h3>
+        <ul>
+          <li><code>IdracAuthError</code> &mdash; the iDRAC rejected the credential mid-run</li>
+          <li><code>IdracCredentialsMissingError</code> &mdash; the configured list changed under the run</li>
+          <li><code>IdracRequestRejectedError</code> &mdash; the iDRAC refused the request itself</li>
+          <li><code>OmeAuthError</code> &mdash; bad <code>OME_USERNAME</code>/<code>OME_PASSWORD</code></li>
+          <li><code>OmeRequestRejectedError</code> &mdash; OME refused the request itself</li>
+          <li><code>TemplateNotConfiguredError</code> &mdash; no <code>DELL_TEMPLATES</code> entry for this (model, firmware)</li>
+          <li><code>TemplateNotFoundError</code> &mdash; OME holds no template by that name, or several</li>
+          <li><code>ProfileConflictError</code> &mdash; the device carries a profile from another template</li>
+          <li><code>ServerNamerRejectedError</code> &mdash; the naming service refused this request</li>
+          <li><code>ServerScanAuthError</code> &mdash; bad <code>SERVER_SCAN_API_TOKEN</code></li>
+        </ul>
+        <p style="font-size:var(--fs-14);color:var(--ink-2)">The list is built from the exception
+        <b>classes</b>, not from strings &mdash; Temporal matches on the type <em>name</em>, so a typo in a
+        literal would silently read as &ldquo;retryable&rdquo; with nothing to notice. A wrong name here is
+        an ImportError at worker startup instead.</p>
+      </div>
+      <div class="panel">
+        <h3>Failures the workflow itself raises</h3>
+        <p style="font-size:var(--fs-14);color:var(--ink-2)">Decisions, not call failures &mdash; each one
+        stops the run immediately: <code>RegionMissingError</code>, <code>NotADellServerError</code>,
+        <code>ServerAlreadyInstalledError</code>, <code>IdracUnreachableError</code>,
+        <code>IdracCredentialsRejectedError</code>, <code>OmeDiscoveryFailedError</code>,
+        <code>TemplateDeployFailedError</code>, <code>TemplatePasswordNotAppliedError</code>,
+        <code>StorageLayoutUnsupportedError</code>, <code>StorageJobFailedError</code>,
+        <code>StorageNotConvergedError</code>, <code>ServerNameNotAppliedError</code>.</p>
+        <h3 style="margin-top:6px">The failure mode to watch for</h3>
+        <p style="font-size:var(--fs-14);color:var(--ink-2)">An <em>unclassified</em> permanent error
+        retries every minute <b>forever</b>: the run sits <b>RUNNING</b> in the Temporal UI, not FAILED,
+        with the real error on the activity. The fix is to classify it, never to add a deadline.</p>
+        <h3 style="margin-top:6px">What a failed run leaves behind</h3>
+        <p style="font-size:var(--fs-14);color:var(--ink-2)">Whatever it had already done &mdash; there is
+        no compensating rollback, on purpose. Nothing it does is destructive, so a half-provisioned machine
+        is safe to leave and safe to re-run: the next run finds the profile deployed, the RAID built, and
+        carries on from the first thing that is missing.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================= REFERENCE ======================= -->
+  <section id="reference">
+    <div class="sec-head">
+      <div class="eyebrow">Reference</div>
+      <h2>Inputs, phases, and the knobs an operator can turn</h2>
+    </div>
+
+    <h3 style="margin-bottom:10px">Request body &mdash; <code>ProvisionDellServerInput</code></h3>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>Field</th><th>Type</th><th>Rules</th><th>What it's for</th></tr></thead>
+        <tbody>
+          <tr><td class="k">idrac_ip</td><td class="k">str</td><td class="muted">a real IP address</td><td class="muted">The machine. Normalised before it becomes the workflow id, so the dedup key does not depend on how it was typed.</td></tr>
+          <tr><td class="k">region</td><td class="k">str</td><td class="muted">optional</td><td class="muted">Overrides the prefix lookup. Must be a site code server-scan knows, because it becomes a token of the server's name.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 style="margin:28px 0 10px">Phases you'll see on the status endpoint</h3>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>phase</th><th>Meaning</th><th>Deadline</th></tr></thead>
+        <tbody>
+          <tr><td class="k">pending</td><td class="muted">Run accepted, nothing attempted yet</td><td class="muted">&mdash;</td></tr>
+          <tr><td class="k">probing-idrac</td><td class="muted">Finding which root password the iDRAC accepts</td><td class="muted">3 rounds &middot; 30 min if unreachable</td></tr>
+          <tr><td class="k">reading-identity</td><td class="muted">Service tag, model, iDRAC firmware</td><td class="muted">seconds</td></tr>
+          <tr><td class="k">checking-server-scan</td><td class="muted">Refusing a machine a cluster already uses</td><td class="muted">seconds</td></tr>
+          <tr><td class="k">discovering-in-ome</td><td class="muted">OME discovery job (skipped if already known)</td><td class="muted">30 min</td></tr>
+          <tr><td class="k">deploying-template</td><td class="muted">Template deployment; can reboot the machine</td><td class="muted">2 h</td></tr>
+          <tr><td class="k">verifying-root-password</td><td class="muted">Proving the template set root's password</td><td class="muted">20 min</td></tr>
+          <tr><td class="k">rediscovering-in-ome</td><td class="muted">Re-pointing OME at the new password</td><td class="muted">30 min</td></tr>
+          <tr><td class="k">configuring-storage</td><td class="muted">Reading the layout and planning the change</td><td class="muted">seconds</td></tr>
+          <tr><td class="k">applying-storage</td><td class="muted">Staged jobs, then the one reboot</td><td class="muted">90 min</td></tr>
+          <tr><td class="k">verifying-storage</td><td class="muted">Reading the layout back; convergence is the only success</td><td class="muted">seconds</td></tr>
+          <tr><td class="k">naming-server</td><td class="muted">Asking the naming service to rename the profile</td><td class="muted">seconds</td></tr>
+          <tr><td class="k">verifying-name</td><td class="muted">Reading the name back off the OME profile</td><td class="muted">30 min</td></tr>
+          <tr><td class="k">completed</td><td class="muted">The machine is configured; install-server can draw it once server-scan has collected it</td><td class="muted">&mdash;</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note" style="margin-top:10px">A healthy run is minutes, and its length is set almost
+    entirely by how long the template deployment takes to reboot the machine and how long the Lifecycle
+    Controller takes to apply the RAID.</p>
+
+    <h3 style="margin:28px 0 10px">Operator knobs</h3>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>Key</th><th>Lives in</th><th>Effect</th></tr></thead>
+        <tbody>
+          <tr><td class="k">OME_URL</td><td class="muted">server-provisioning-config</td><td class="muted">The OpenManage Enterprise appliance. <code>https://</code> only; the worker refuses to start otherwise. No default &mdash; a wrong one is another site's fleet being rebooted.</td></tr>
+          <tr><td class="k">DELL_TEMPLATES</td><td class="muted">server-provisioning-config</td><td class="muted">Redfish model &rarr; iDRAC firmware &rarr; template name. Per firmware because a template only fits the firmware it was captured from. <b>The templates must carry no storage components.</b></td></tr>
+          <tr><td class="k">SERVER_NAMER_URL</td><td class="muted">server-provisioning-config</td><td class="muted">The naming service's rename endpoint.</td></tr>
+          <tr><td class="k">SERVER_SCAN_URL</td><td class="muted">server-provisioning-config</td><td class="muted">server-scan's API including <code>/api/v1</code>. Read-only here.</td></tr>
+          <tr><td class="k">OME_USERNAME / OME_PASSWORD</td><td class="muted">Secret</td><td class="muted">Needs OME device-manager rights over the Dell estate.</td></tr>
+          <tr><td class="k">IDRAC_ROOT_PASSWORD</td><td class="muted">Secret</td><td class="muted">The password the template enforces, and the first one tried.</td></tr>
+          <tr><td class="k">IDRAC_FACTORY_PASSWORDS</td><td class="muted">Secret</td><td class="muted">What a server may arrive with, in order. <b>At most two</b> — with the target tried first, a third would be a third failed login, which iDRAC9 answers by blocking the worker's address.</td></tr>
+          <tr><td class="k">SERVER_NAMER_API_TOKEN<br>SERVER_SCAN_API_TOKEN</td><td class="muted">Secret</td><td class="muted">Optional. A viewer token is enough for server-scan.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note" style="margin-top:10px">All of it is mounted by <code>server-provisioning-worker</code>,
+    which also mounts the global <code>workflows-orchestrator-config</code> for Temporal. It is the only
+    limb with <b>no RBAC at all</b> &mdash; it writes to no Kubernetes API, only outward to the iDRACs,
+    OME, the naming service and server-scan.</p>
+  </section>
+
+  <footer>
+    <span>workflow_domains/server_provisioning/provision_dell_server.py</span>
+    <span>workflow_domains/server_provisioning/router.py</span>
+    <span>workflow_domains/server_provisioning/storage_plan.py</span>
+    <span>activities/server_provisioning/activities.py</span>
+    <span>shared/models/server_provisioning.py</span>
+    <span>docs/design/dell-ome-idrac-api.md</span>
+  </footer>
+
+</div>
+</main>
+
+<script src="/assets/nav.js?v=__DOC_VERSION__" defer></script>
+</body>
+</html>

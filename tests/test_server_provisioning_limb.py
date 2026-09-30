@@ -462,22 +462,22 @@ class TestServerScan:
             respx.get(f"{SS}/servers/{s['id']}").mock(return_value=httpx.Response(200, json=s))
 
     @respx.mock
-    async def test_found_under_the_expected_name(self):
+    async def test_an_available_machine_is_not_claimed(self):
         self._mock(_server("s1", self.NAME, "ABC1234"))
-        state = await server_scan.lookup(SS, "", ServerScanLookup(service_tag="ABC1234", expected_name=self.NAME))
-        assert state.found and state.server_id == "s1" and state.health == "HEALTHY"
+        state = await server_scan.lookup(SS, "", ServerScanLookup(service_tag="ABC1234"))
+        assert state.claimed_by is None and state.name == self.NAME
 
     @respx.mock
-    async def test_a_prefix_hit_with_another_serial_is_not_this_machine(self):
-        self._mock(_server("s1", self.NAME, "ABC12345"))
-        state = await server_scan.lookup(SS, "", ServerScanLookup(service_tag="ABC1234", expected_name=self.NAME))
-        assert not state.found and state.server_id is None
+    async def test_a_prefix_hit_with_another_serial_cannot_claim_this_machine(self):
+        """`?search=` matches by token PREFIX, so ABC1234 also returns ABC12345.
 
-    @respx.mock
-    async def test_the_old_name_is_not_found_yet(self):
-        self._mock(_server("s1", "Profile from template 00001", "ABC1234"))
-        state = await server_scan.lookup(SS, "", ServerScanLookup(service_tag="ABC1234", expected_name=self.NAME))
-        assert not state.found and state.name == "Profile from template 00001"
+        The serial is re-checked exactly against the detail document; without
+        that, a neighbouring machine being installed would refuse a run for a
+        server that is perfectly free.
+        """
+        self._mock(_server("s1", self.NAME, "ABC12345", "INSTALLED", "ocp4-prod"))
+        state = await server_scan.lookup(SS, "", ServerScanLookup(service_tag="ABC1234"))
+        assert state.claimed_by is None and state.name is None
 
     @respx.mock
     async def test_a_server_in_use_is_reported_as_claimed(self):

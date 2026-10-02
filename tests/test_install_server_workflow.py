@@ -454,7 +454,6 @@ async def test_the_infraenv_becomes_the_server_query():
     assert request.pattern == f"^ocp-{re.escape(INFRA_ENV)}"
     assert request.name is None
     assert request.health == "HEALTHY"
-    assert request.min_nic_macs == 2
 
 
 async def test_an_explicit_server_name_bypasses_the_pattern():

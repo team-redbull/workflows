@@ -33,8 +33,8 @@ with workflow.unsafe.imports_passed_through():
 # non-bonded layout"). That path is NOT ported, and its absence is a decision,
 # not an oversight — do not restore it without the fabric changing first.
 #
-# Also the `min_nic_macs` floor asked of server-scan, so the structural gate the
-# endpoint applies and the rule applied here cannot drift apart.
+# No NIC count is asked of server-scan: /servers/available already requires the
+# network health category HEALTHY, i.e. at least two links observed up.
 BOND_MEMBER_COUNT = 2
 
 

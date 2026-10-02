@@ -266,7 +266,7 @@
           (<code>candidate_count</code>) so that <em>one</em> unusable server is a retry rather than a
           failed run.</p>
           <div class="calls">
-            <div class="call sm"><span class="verb">GET</span><span class="path">/servers/available?pattern=…&amp;health=HEALTHY&amp;min_nic_macs=2&amp;count=N</span></div>
+            <div class="call sm"><span class="verb">GET</span><span class="path">/servers/available?pattern=…&amp;health=HEALTHY&amp;count=N</span></div>
           </div>
           <p class="note"><code>HEALTHY</code> is asked for server-side: without it the endpoint fills
           HEALTHY, then WARNING, then MAJOR, and a WARNING server would be returned &mdash; and
@@ -488,9 +488,8 @@
       <code>HEALTHY</code> overall.</p>
       <p>server-scan closes that itself since 2026-09-26: <code>/servers/available</code> also requires
       the <b>network</b> category to be <code>HEALTHY</code>, which it is only when at least two links
-      were observed UP. <code>min_nic_macs=2</code> on the query predates that gate and now adds little
-      beyond &ldquo;the MACs were read this run&rdquo;. The rule above is still applied here, because it
-      is what picks the two bond members.</p>
+      were observed UP &mdash; so the run sends no NIC count of its own (<code>min_nic_macs</code> was
+      dropped). The rule above is still applied here, because it is what picks the two bond members.</p>
     </div>
   </section>
 

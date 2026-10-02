@@ -50,13 +50,12 @@ SS = "http://server-scan.test/api/v1"
 AVAILABLE = f"{SS}/servers/available"
 
 PATTERN_REQUEST = AcquireServerRequest(
-    pattern="^ocp-dell-r650-tlv", count=3, health="HEALTHY", min_nic_macs=2
+    pattern="^ocp-dell-r650-tlv", count=3, health="HEALTHY"
 )
 NAME_REQUEST = AcquireServerRequest(
     name="ocp-dell-r650-tlv-64c-1024gb-DEL0000485",
     count=1,
     health="HEALTHY",
-    min_nic_macs=2,
 )
 
 _ITEM = {
@@ -228,7 +227,8 @@ class TestTheInventoryQuery:
         assert params["pattern"] == "^ocp-dell-r650-tlv"
         assert params["count"] == "3"
         assert params["health"] == "HEALTHY"
-        assert params["min_nic_macs"] == "2"
+        # server-scan's own network gate already requires two links up.
+        assert "min_nic_macs" not in params
         assert route.calls[0].request.headers["Authorization"] == "Bearer tok"
 
     @respx.mock

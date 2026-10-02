@@ -59,10 +59,7 @@ def _query(request: AcquireServerRequest) -> dict[str, Any]:
     and `count` only means anything for a pattern draw — a named lookup is a
     pool of one.
     """
-    params: dict[str, Any] = {
-        "health": request.health,
-        "min_nic_macs": request.min_nic_macs,
-    }
+    params: dict[str, Any] = {"health": request.health}
     if request.name is not None:
         params["name"] = request.name
     else:

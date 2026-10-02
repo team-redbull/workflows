@@ -157,8 +157,8 @@ physical port), and not locked. The workflow: *which* two NICs form the bond,
 the name, BMC driver and address, MAC syntax, and no BareMetalHost in this MCE.
 The bond rule overlaps server-scan's network gate on purpose — server-scan says
 the machine *can* be bonded; the workflow picks the two NICs and is the last
-check before a cluster write. (`min_nic_macs=2` predates that gate and now adds
-little beyond "the MACs were read this run".)
+check before a cluster write. No NIC count is sent to server-scan
+(`min_nic_macs` was dropped once that gate existed).
 
 | What happens when… | The run | The lock |
 | --- | --- | --- |

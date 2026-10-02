@@ -202,10 +202,13 @@
     </div>
 
     <div class="panel warn" style="margin-top:20px">
-      <h3>Two known gaps</h3>
-      <p><b>The 24 h hold can run out.</b> If the MCE runs no membership job, or the cluster is not built
-      within a day, server-scan reads the machine as <code>AVAILABLE</code> again and another MCE could
-      draw a machine that is already installed. 24 h is the longest lock server-scan accepts.</p>
+      <h3>One precondition, and one known gap</h3>
+      <p><b>The 24 h hold relies on server-scan&rsquo;s agents job.</b> Every MCE install-server targets
+      runs the Agent stack (an InfraEnv and an <code>AgentServiceConfig</code>), and server-scan&rsquo;s
+      <code>nodes-status</code> <code>agents</code> job runs there every 15 minutes: it marks a server
+      with an unbound Agent <code>INSTALLED_TO_INVENTORY</code>, after which it is never drawn again. So
+      the hold only has to last ~15 minutes. An MCE without that job would read the machine as
+      <code>AVAILABLE</code> again once the 24 h &mdash; server-scan&rsquo;s ceiling &mdash; ran out.</p>
       <p><b>A crash mid-create strands resources.</b> The BareMetalHost stays on the MCE while the lock
       expires after 2 h, so after that the machine is drawable while still pointing at one cluster.
       Clean these up by hand, or re-run with <code>server_name</code> set to that machine to converge on them.</p>

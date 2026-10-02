@@ -173,9 +173,13 @@ check before a cluster write. No NIC count is sent to server-scan
 | no worker in that MCE | waits; `progress` names the queue | — |
 | server-scan token not admin | fails at the first lock (`ServerScanAuthError`) | never taken |
 
-**Known gaps.** (1) The 24 h hold can run out: with no membership job on that
-MCE, or a cluster not built within a day, the machine reads `AVAILABLE` again
-and another MCE could draw it — 24 h is server-scan's ceiling. (2) A crash
+**Precondition.** The 24 h hold relies on server-scan's `nodes-status` `agents`
+job, which runs on every MCE install-server targets (each has an InfraEnv and an
+`AgentServiceConfig`): every 15 min it marks a server with an unbound Agent
+`INSTALLED_TO_INVENTORY`, so it is never drawn again. An MCE without that job
+would read the machine `AVAILABLE` again after the 24 h (server-scan's ceiling).
+
+**Known gap.** A crash
 mid-create leaves the BareMetalHost on the MCE while the lock expires after
 2 h; clean up by hand, or re-run with `server_name` set to that machine.
 

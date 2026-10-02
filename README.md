@@ -137,11 +137,16 @@ and its **MCE cluster**. The run:
 
    **Every** reason a candidate is unusable is a *skip*, never a failed run —
    an unusable name, no bond, an unknown `bmc_vendor`, no BMC host, a malformed
-   MAC, or a BareMetalHost it already has. That is what the multi-candidate draw
-   is for. If none survives,
+   MAC, a BareMetalHost it already has, or an install lock another run holds
+   (below). That is what the multi-candidate draw is for. If none survives,
    the reasons are reported as separate groups and the failure takes the
    specific error type when they all agree — which they always do for an
    explicitly named server, whose pool holds one.
+
+   **reserving-server** — the chosen machine is locked in server-scan
+   (`POST /servers/{id}/reservation`, server-scan's ADR-0035) before anything is
+   written. A lock another run holds is a skip (`ServerReservedError` if the
+   whole pool is held), as is a server that has left the inventory.
 4. **creating-secret / -baremetalhost / -nmstateconfig** — all idempotent; an
    existing resource is success **once its BMC address, boot MAC, InfraEnv and
    VLAN match**, and never an overwrite. A resource that differs is a
@@ -156,11 +161,17 @@ and its **MCE cluster**. The run:
    the VLAN was right and DHCP answered. An hour because bare metal POSTs for
    longer than a VM takes to boot. The Agent is matched by **bond MAC** — BMAC
    names an Agent after the host's inventory UUID and its spec holds no
-   reference back to the BareMetalHost.
+   reference back to the BareMetalHost. The lock is renewed as the wait begins,
+   so it covers the whole hour however long the creates took; if it had lapsed
+   and another run took the machine, this candidate is torn down instead.
+   On success (**holding-server**) the lock is extended to a day — the machine
+   is taken, and server-scan keeps listing it `AVAILABLE` until a membership
+   job sees it in a cluster.
 6. **rolling-back** — no Agent by the deadline is that **candidate's** failure,
    not the run's. The NMStateConfig and BareMetalHost are removed (the Secret
-   cascades off the host's ownerReference), which returns the machine to the
-   inventory, and the next candidate is tried from step 3. Only an exhausted
+   cascades off the host's ownerReference) and then the lock is released
+   (**releasing-server**), which returns the machine to the inventory, and the
+   next candidate is tried from step 3. Only an exhausted
    pool fails the run, as `AgentNeverAppearedError`.
 
    Steps 3–6 are a **loop**, not a pipeline: a server cannot be shown to be
@@ -178,11 +189,20 @@ and its **MCE cluster**. The run:
 
 Its id is `install-server-<infraEnv>` — the **candidate pool**, not the target
 pair, because the pool is `^ocp-<infraEnv>` with no MCE in it. Installs drawing
-from one pool are therefore serial: server-scan hands out candidates without
-reserving them, and two concurrent runs could otherwise draw the same machine.
-The sequential case an id cannot cover — a second run minutes later, before any
-cluster has reported the node — is covered by step 3 skipping candidates that
-already have a BareMetalHost.
+from one pool are therefore serial.
+
+**The install lock is the guard across MCEs.** server-scan lists a machine
+`AVAILABLE` until a cluster reports it, and the BareMetalHost probe in step 3
+only sees the run's *own* MCE — so without a lock, a server installed into
+MCE-A is drawn again by a run for MCE-B and both clusters drive one BMC. The lock
+is keyed on the run's workflow id (a retry or renewal extends it, never loses a
+race to itself), expires on its own (a dead run costs one TTL, not the
+machine), and is released only after a teardown proved nothing on the cluster
+still points at the machine; a failure anywhere else leaves it to expire,
+because half-created resources may still name it. It needs server-scan's
+**admin** role. Runs started before it existed replay without it
+(`workflow.patched`). With the lock in place the per-pool id could become
+per-(pool, MCE); that is a separate decision and not made here.
 
 **The inventory VLAN is the MCE's, and is read before anything is drawn.** An
 MCE owns one inventory network, allocated in the Segments Manager as
@@ -423,7 +443,7 @@ would hide which segments actually got a workflow.
 | `DAY1_GIT_TOKEN` | Secret `day1-git-token` | push rights; scrubbed from every error |
 | `MCE_CLUSTER` | `server-lifecycle-config` | which MCE this worker serves — names its queue, so it must match callers' `mce_cluster` |
 | `SERVER_SCAN_URL` | `server-lifecycle-config` | inventory API base, INCLUDING `/api/v1` |
-| `SERVER_SCAN_API_TOKEN` | Secret | a **viewer** token — the lookup is a GET |
+| `SERVER_SCAN_API_TOKEN` | Secret | an **admin** token — install-server takes and releases the install lock |
 | `{HP,DELL,CISCO,INTERSIGHT}_BMC_USERNAME`/`_PASSWORD` | Secret | what Ironic drives the BMC with |
 | `OME_URL` | `server-provisioning-config` | the OpenManage Enterprise appliance, `https://` |
 | `OME_USERNAME`/`OME_PASSWORD` | Secret | discovers devices and deploys templates |

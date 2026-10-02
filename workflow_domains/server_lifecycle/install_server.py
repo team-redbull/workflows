@@ -26,6 +26,9 @@ Shape of the run:
                            EVERY reason a candidate is unusable is a skip here,
                            so the draw keeps its promise; the reasons are
                            reported together if none survives.
+     reserving-server    — server-scan's install lock on the chosen machine
+                           (ADR-0035). A lock another run holds is one more
+                           skip reason.
   4. creating-secret
      creating-baremetalhost
      creating-nmstateconfig  — all idempotent; an existing resource is success.
@@ -36,12 +39,16 @@ Shape of the run:
                            assisted-service, so the BMC accepted virtual media,
                            the bond formed, the VLAN was right and DHCP
                            answered. An hour, because bare metal POSTs for
-                           longer than a VM takes to boot.
+                           longer than a VM takes to boot. The lock is renewed
+                           on entry so it covers the whole wait.
+     holding-server      — on success the lock is extended to a day, so the
+                           machine stays out of every other MCE's draw until
+                           server-scan's membership jobs see it in a cluster.
   6. rolling-back        — no Agent by the deadline is that CANDIDATE's
-                           failure, not the run's: the NMStateConfig and
-                           BareMetalHost are removed, which returns the machine
-                           to the inventory, and the next candidate is tried
-                           from step 3.
+     releasing-server      failure, not the run's: the NMStateConfig and
+                           BareMetalHost are removed and the lock released,
+                           which returns the machine to the inventory, and the
+                           next candidate is tried from step 3.
 
 Steps 3-6 are therefore a LOOP, not a pipeline. A candidate cannot be shown to
 be installable without creating its resources and watching what happens, so the
@@ -92,6 +99,19 @@ idempotent, so a re-run converges on them, and a half-created set is what an
 operator needs in order to see how far the run got. Removing a SUCCESSFULLY
 installed server remains a separate uninstall-server workflow.
 
+THE INSTALL LOCK IS WHAT MAKES "UNCLAIMED" TRUE ACROSS MCEs. server-scan
+reports a machine AVAILABLE until a cluster reports it, and this run's
+BareMetalHost probe only sees its OWN MCE — so without the lock a server
+installed into MCE-A is drawn again by a run for MCE-B, and both clusters drive
+one BMC. The lock is taken only once a candidate is chosen (server-scan's draw
+cannot know which one will be), keyed on this run's workflow id so a retry or a
+renewal is an extension rather than a lost race, and it expires on its own, so
+a run that dies costs one TTL rather than the machine. It is released only
+after a teardown has proved nothing on the cluster still points at the machine
+— a failure anywhere else leaves it held until it expires, deliberately, since
+half-created resources may still name it. Runs started before the lock existed
+replay without it (`workflow.patched`).
+
 The teardown order is load-bearing and was established against a live cluster:
 metal3 must be told to detach the host BEFORE the delete, or its
 `baremetalhost.metal3.io` finalizer blocks forever trying to deprovision
@@ -106,7 +126,7 @@ from datetime import timedelta
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
-from temporalio.exceptions import ApplicationError
+from temporalio.exceptions import ActivityError, ApplicationError
 
 with workflow.unsafe.imports_passed_through():
     from shared.bmc_address import (
@@ -134,7 +154,9 @@ with workflow.unsafe.imports_passed_through():
         NoBondableInterfacesError,
         SegmentsManagerAuthError,
         ServerNotAvailableError,
+        ServerReservedError,
         ServerScanAuthError,
+        ServerScanRequestInvalidError,
         UnknownBmcVendorError,
     )
     from shared.interfaces.segment_lifecycle import get_inventory_segment
@@ -146,6 +168,8 @@ with workflow.unsafe.imports_passed_through():
         create_nmstate_config,
         find_agent_for_host,
         get_baremetal_host,
+        release_server,
+        reserve_server,
         teardown_bmh_resources,
     )
     from shared.models.server_lifecycle import (
@@ -159,8 +183,12 @@ with workflow.unsafe.imports_passed_through():
         BondMember,
         CreatedResource,
         InstallServerProgress,
+        InstallServerInput,
         InstallServerResult,
         InstallServerRunArgs,
+        ReleaseServerRequest,
+        ReserveServerRequest,
+        ServerReservation,
         TeardownResult,
         mac_is_valid,
     )
@@ -189,6 +217,8 @@ _ACTIVITY_TIMEOUT = timedelta(seconds=90)
 _PERMANENT_ACTIVITY_ERRORS: tuple[type[Exception], ...] = (
     ServerScanAuthError,
     ServerNotAvailableError,
+    ServerReservedError,
+    ServerScanRequestInvalidError,
     AmbiguousServerNameError,
     BmcCredentialsMissingError,
     BmhConflictError,
@@ -238,6 +268,18 @@ _SCHEDULE_TO_START_TIMEOUT = timedelta(minutes=5)
 _AGENT_DEADLINE = timedelta(hours=1)
 _AGENT_POLL_INTERVAL = timedelta(seconds=30)
 
+# server-scan's install lock (ADR-0035). The TTL while installing covers the
+# Agent wait plus an hour, and is renewed as the wait begins, so creates that
+# stalled on a missing MCE worker cannot let it lapse mid-install. Once an Agent
+# exists the machine IS taken, so holding it longer costs nothing: a day — the
+# ceiling server-scan accepts — outlasts any membership job that will then
+# report it in a cluster.
+_RESERVATION_HOLDER = "install-server"
+_RESERVATION_TTL = _AGENT_DEADLINE + timedelta(hours=1)
+_INSTALLED_HOLD = timedelta(hours=24)
+# Gates every lock call, so a run started before the lock replays unchanged.
+_RESERVATION_PATCH = "server-scan-install-lock"
+
 # The server-scan health verdict this workflow accepts. Deliberately only the
 # top tier: the endpoint would otherwise fill HEALTHY, then WARNING, then MAJOR.
 _REQUIRED_HEALTH = "HEALTHY"
@@ -285,6 +327,8 @@ _REJECTION_TYPE = {
     "no-bmc-host": BmcEndpointMissingError,
     "bad-mac": InvalidMacError,
     "no-agent": AgentNeverAppearedError,
+    "reserved": ServerReservedError,
+    "gone": ServerNotAvailableError,
 }
 
 _REJECTION_SUMMARY = {
@@ -319,6 +363,15 @@ _REJECTION_SUMMARY = {
         "assisted-service, so what failed is DOWNSTREAM of the BareMetalHost — "
         "the BMC, the bond, the VLAN, or DHCP on that inventory segment. Each "
         "entry below says which of those the host's own state points at"
+    ),
+    "reserved": (
+        "are held by another install's lock in server-scan — most likely being "
+        "installed into another MCE right now. Each entry names the holder and "
+        "when its lock expires"
+    ),
+    "gone": (
+        "left server-scan's inventory between the draw and the reservation, so "
+        "there was nothing to lock"
     ),
 }
 
@@ -408,6 +461,7 @@ class InstallServerWorkflow:
         self._phase = "pending"
         self._server_name: str | None = None
         self._activity_queue: str | None = None
+        self._reserving = False
 
     @workflow.query
     def progress(self) -> InstallServerProgress:
@@ -433,6 +487,7 @@ class InstallServerWorkflow:
         # polls it.
         activity_queue = server_lifecycle_activity_queue(install_input.mce_cluster)
         self._activity_queue = activity_queue
+        self._reserving = workflow.patched(_RESERVATION_PATCH)
         workflow.logger.info(
             "Installing a server into InfraEnv=%s for MCE=%s",
             infra_env,
@@ -489,6 +544,16 @@ class InstallServerWorkflow:
             if bond_members is None:
                 continue
 
+            # Locked only now, once THIS machine is the one being installed:
+            # server-scan's draw cannot know which candidate a run will choose.
+            if self._reserving:
+                self._phase = "reserving-server"
+                lock = await self._reserve(
+                    candidate, install_input, _RESERVATION_TTL, activity_queue, rejections
+                )
+                if lock is None:
+                    continue
+
             attempts += 1
             self._server_name = candidate.name
             resource_request = BmhResourceRequest(
@@ -528,11 +593,30 @@ class InstallServerWorkflow:
             # media, the bond formed, the VLAN was right and DHCP answered.
             self._phase = "awaiting-agent"
             bmh_ref = BmhRef(server_name=candidate.name, namespace=namespace)
+            # Renewed so the lock covers the whole wait however long the creates
+            # took. Refused means it lapsed and another run took the machine:
+            # undo ours, and leave theirs alone.
+            if self._reserving and (
+                await self._reserve(
+                    candidate, install_input, _RESERVATION_TTL, activity_queue, rejections
+                )
+                is None
+            ):
+                self._phase = "rolling-back"
+                await self._teardown(bmh_ref, activity_queue)
+                continue
             agent, last_state = await self._await_agent(
                 bmh_ref, [member.mac for member in bond_members], activity_queue
             )
 
             if agent.found:
+                reservation_expires_at = None
+                if self._reserving:
+                    self._phase = "holding-server"
+                    held = await self._reserve(
+                        candidate, install_input, _INSTALLED_HOLD, activity_queue, None
+                    )
+                    reservation_expires_at = held.expires_at if held else None
                 self._phase = "completed"
                 workflow.logger.info(
                     "Server %s installed into InfraEnv %s as Agent %s "
@@ -566,6 +650,7 @@ class InstallServerWorkflow:
                     bmh_registered=True,
                     agent_name=agent.name,
                     attempts=attempts,
+                    reservation_expires_at=reservation_expires_at,
                 )
 
             # No Agent. Take the machine back out of this MCE before trying
@@ -579,6 +664,9 @@ class InstallServerWorkflow:
                 _AGENT_DEADLINE,
                 teardown.removed or "nothing (already absent)",
             )
+            if self._reserving:
+                self._phase = "releasing-server"
+                await self._release(candidate, activity_queue)
             rejections.append(
                 ("no-agent", _describe_no_agent(candidate.name, last_state))
             )
@@ -647,6 +735,83 @@ class InstallServerWorkflow:
                 return None
 
         return members
+
+    async def _reserve(
+        self,
+        candidate: AcquiredServer,
+        install_input: InstallServerInput,
+        ttl: timedelta,
+        task_queue: str,
+        rejections: list[tuple[str, str]] | None,
+    ) -> ServerReservation | None:
+        """Take or extend server-scan's install lock, or None with a reason recorded.
+
+        Two refusals are a candidate's, not the run's: a live lock held by
+        another run, and a server that left the inventory. Both are recorded as
+        skips in `rejections`; with None (the hold after a success, where the
+        machine is installed whatever the answer) they are only logged.
+        Everything else — a token without the ADMIN role above all — fails the
+        run, because no other candidate would fare differently.
+        """
+        try:
+            return await workflow.execute_activity(
+                reserve_server,
+                ReserveServerRequest(
+                    server_id=candidate.id,
+                    server_name=candidate.name,
+                    holder=_RESERVATION_HOLDER,
+                    workflow_id=workflow.info().workflow_id,
+                    mce_cluster=install_input.mce_cluster,
+                    infra_env=install_input.infra_env,
+                    namespace=install_input.namespace,
+                    ttl_seconds=int(ttl.total_seconds()),
+                ),
+                task_queue=task_queue,
+                start_to_close_timeout=_ACTIVITY_TIMEOUT,
+                schedule_to_start_timeout=_SCHEDULE_TO_START_TIMEOUT,
+                retry_policy=_RETRY_POLICY,
+            )
+        except ActivityError as err:
+            cause = err.cause
+            if not isinstance(cause, ApplicationError):
+                raise
+            if cause.type not in (
+                ServerReservedError.__name__,
+                ServerNotAvailableError.__name__,
+            ):
+                raise
+            workflow.logger.warning(
+                "server-scan refused the install lock on %s: %s",
+                candidate.name,
+                cause.message,
+            )
+            if rejections is None:
+                return None
+            if cause.type == ServerReservedError.__name__:
+                rejections.append(("reserved", f"{candidate.name} ({cause.message})"))
+            else:
+                rejections.append(("gone", candidate.name))
+            return None
+
+    async def _release(self, candidate: AcquiredServer, task_queue: str) -> None:
+        """Give the lock back once a teardown proved nothing still points at the machine."""
+        released = await workflow.execute_activity(
+            release_server,
+            ReleaseServerRequest(
+                server_id=candidate.id,
+                server_name=candidate.name,
+                holder=_RESERVATION_HOLDER,
+                workflow_id=workflow.info().workflow_id,
+            ),
+            task_queue=task_queue,
+            start_to_close_timeout=_ACTIVITY_TIMEOUT,
+            schedule_to_start_timeout=_SCHEDULE_TO_START_TIMEOUT,
+            retry_policy=_RETRY_POLICY,
+        )
+        if released.detail:
+            workflow.logger.info(
+                "Released %s in server-scan: %s", candidate.name, released.detail
+            )
 
     async def _inventory_segment(self, mce_cluster: str) -> SegmentEntry:
         """The MCE's inventory segment, the one thing the VLAN comes from.

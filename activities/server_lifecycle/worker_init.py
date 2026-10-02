@@ -41,6 +41,8 @@ from activities.server_lifecycle.activities import (
     create_nmstate_config,
     find_agent_for_host,
     get_baremetal_host,
+    release_server,
+    reserve_server,
     teardown_bmh_resources,
 )
 from shared.consts import server_lifecycle_activity_queue
@@ -72,6 +74,8 @@ async def main() -> None:
             create_nmstate_config,
             find_agent_for_host,
             get_baremetal_host,
+            reserve_server,
+            release_server,
             teardown_bmh_resources,
         ],
         # In-flight activities get this long to finish after shutdown starts

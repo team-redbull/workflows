@@ -6,29 +6,35 @@ token as PARAMETERS rather than reading settings, so the offline tests drive it
 with respx against any base URL and no environment at all. The @activity.defn
 wrapper in activities.py owns the settings and the logging.
 
-One read is the whole surface: GET /servers/available, which returns servers
-that are unclaimed, healthy, reachable and not in maintenance, live-rechecking
-each one it hands back. A VIEWER token is enough — only server-scan's four
-mutation endpoints need admin.
+Three calls are the whole surface. GET /servers/available returns servers that
+are unclaimed, healthy, reachable, unreserved and not in maintenance,
+live-rechecking each one it hands back. POST and DELETE
+/servers/{id}/reservation take and release the install lock on the one a run
+chose (ADR-0035) — mutations, so the token needs server-scan's ADMIN role.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, NoReturn
 
 import httpx
 
 from shared.exceptions import (
     AmbiguousServerNameError,
     ServerNotAvailableError,
+    ServerReservedError,
     ServerScanAuthError,
     ServerScanError,
+    ServerScanRequestInvalidError,
 )
 from shared.models.server_lifecycle import (
     AcquiredServer,
     AcquireServerRequest,
     BmcEndpoint,
+    ReleaseServerRequest,
+    ReserveServerRequest,
     ServerInterface,
+    ServerReservation,
 )
 
 # Must stay strictly below the activity start_to_close_timeout (90s). A live
@@ -43,6 +49,7 @@ _HTTP_TIMEOUT = httpx.Timeout(60.0)
 _TLS_VERIFY = False
 
 _AVAILABLE_PATH = "/servers/available"
+_RESERVATION_PATH = "/servers/{server_id}/reservation"
 
 
 def _query(request: AcquireServerRequest) -> dict[str, Any]:
@@ -80,6 +87,16 @@ def _detail(resp: httpx.Response) -> str:
     return str(body)
 
 
+def _details(resp: httpx.Response) -> dict[str, Any]:
+    """server-scan's RFC 9457 `details` extension, or an empty dict."""
+    try:
+        body = resp.json()
+    except ValueError:
+        return {}
+    details = body.get("details") if isinstance(body, dict) else None
+    return details if isinstance(details, dict) else {}
+
+
 def _raise_for_status(resp: httpx.Response, request: AcquireServerRequest) -> None:
     """Classify a non-200 answer. Everything permanent is named, not defaulted.
 
@@ -92,7 +109,7 @@ def _raise_for_status(resp: httpx.Response, request: AcquireServerRequest) -> No
     if resp.status_code in (401, 403):
         raise ServerScanAuthError(
             f"server-scan rejected our credentials ({resp.status_code}): check "
-            "SERVER_SCAN_API_TOKEN (a viewer token is sufficient)"
+            "SERVER_SCAN_API_TOKEN (install-server needs the ADMIN role, for its install lock)"
         )
     if resp.status_code == 404:
         raise ServerNotAvailableError(
@@ -154,12 +171,11 @@ async def fetch_available_servers(
     below the activity's, so a network hang frees the worker before Temporal
     reaps the activity and the token never outlives one invocation.
     """
-    headers = {"Authorization": f"Bearer {token}"} if token else {}
     async with httpx.AsyncClient(
         base_url=base_url, timeout=_HTTP_TIMEOUT, verify=_TLS_VERIFY
     ) as client:
         resp = await client.get(
-            _AVAILABLE_PATH, params=_query(request), headers=headers
+            _AVAILABLE_PATH, params=_query(request), headers=_headers(token)
         )
 
     _raise_for_status(resp, request)
@@ -173,3 +189,117 @@ async def fetch_available_servers(
             f"requested={request.count})"
         )
     return [_to_acquired_server(item) for item in items]
+
+
+def _headers(token: str) -> dict[str, str]:
+    """The bearer header, or none where server-scan runs with auth disabled."""
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
+def _raise_for_lock_status(resp: httpx.Response, action: str) -> NoReturn:
+    """Classify the answers both lock calls share; 200, 404 and 409 are the caller's."""
+    if resp.status_code in (401, 403):
+        raise ServerScanAuthError(
+            f"server-scan refused to {action} the install lock ({resp.status_code}): "
+            "SERVER_SCAN_API_TOKEN needs the ADMIN role — the reservation "
+            "endpoints are mutations"
+        )
+    if resp.status_code in (400, 422):
+        raise ServerScanRequestInvalidError(
+            f"server-scan rejected the {action} request ({resp.status_code}): "
+            f"{_detail(resp)}"
+        )
+    raise ServerScanError(
+        f"server-scan {action} failed: {resp.status_code} {_detail(resp)}"
+    )
+
+
+def _expires_at(resp: httpx.Response) -> str | None:
+    """The lock's expiry from the returned ServerDetail, when it carries one."""
+    try:
+        reservation = resp.json().get("reservation") or {}
+    except (ValueError, AttributeError):
+        return None
+    return reservation.get("expires_at") if isinstance(reservation, dict) else None
+
+
+async def reserve_server(
+    base_url: str, token: str, request: ReserveServerRequest
+) -> ServerReservation:
+    """Take, or extend, the install lock on one server.
+
+    A 409 is TWO different answers and only one of them is final. With
+    `held_by` in its details, a live lock belongs to another run: permanent for
+    this candidate. Without it, this caller lost a revision race to some other
+    write on the document — often a collector run, not a claim — and a retry
+    either wins or turns into the first kind.
+    """
+    body = request.model_dump(
+        include={
+            "holder",
+            "mce_cluster",
+            "infra_env",
+            "namespace",
+            "workflow_id",
+            "ttl_seconds",
+        }
+    )
+    async with httpx.AsyncClient(
+        base_url=base_url, timeout=_HTTP_TIMEOUT, verify=_TLS_VERIFY
+    ) as client:
+        resp = await client.post(
+            _RESERVATION_PATH.format(server_id=request.server_id),
+            json=body,
+            headers=_headers(token),
+        )
+
+    if resp.status_code == 200:
+        return ServerReservation(
+            server_id=request.server_id, held=True, expires_at=_expires_at(resp)
+        )
+    if resp.status_code == 404:
+        raise ServerNotAvailableError(
+            f"{request.server_name} ({request.server_id}) is no longer in "
+            f"server-scan's inventory: {_detail(resp)}"
+        )
+    if resp.status_code == 409 and _details(resp).get("held_by"):
+        held = _details(resp)
+        raise ServerReservedError(
+            f"{request.server_name} is reserved by {held.get('held_by')!r} for "
+            f"MCE {held.get('held_for_mce')!r} (run {held.get('workflow_id')!r}) "
+            f"until {held.get('expires_at')}"
+        )
+    _raise_for_lock_status(resp, "reserve")
+
+
+async def release_server(
+    base_url: str, token: str, request: ReleaseServerRequest
+) -> ServerReservation:
+    """Release this run's install lock; nothing of ours to release is success."""
+    async with httpx.AsyncClient(
+        base_url=base_url, timeout=_HTTP_TIMEOUT, verify=_TLS_VERIFY
+    ) as client:
+        resp = await client.request(
+            "DELETE",
+            _RESERVATION_PATH.format(server_id=request.server_id),
+            json={"holder": request.holder, "workflow_id": request.workflow_id},
+            headers=_headers(token),
+        )
+
+    if resp.status_code == 200:
+        return ServerReservation(server_id=request.server_id, held=False)
+    if resp.status_code == 404:
+        return ServerReservation(
+            server_id=request.server_id,
+            held=False,
+            detail="the server is no longer in server-scan's inventory",
+        )
+    if resp.status_code == 409:
+        # Our lock lapsed and another run has since taken the machine. Clearing
+        # it would hand that run's server back to the pool mid-install.
+        return ServerReservation(
+            server_id=request.server_id,
+            held=False,
+            detail=f"left alone, it is not ours: {_detail(resp)}",
+        )
+    _raise_for_lock_status(resp, "release")

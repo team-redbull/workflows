@@ -156,8 +156,30 @@ class ServerScanAuthError(OrchestratorError):
     """server-scan rejected our credentials (401/403).
 
     Deterministic — a bad SERVER_SCAN_API_TOKEN never fixes itself, so the
-    workflow lists this in non_retryable_error_types. Note the token only needs
-    server-scan's VIEWER role: /servers/available is a GET.
+    workflow lists this in non_retryable_error_types. install-server's token
+    needs server-scan's ADMIN role: the install lock is taken and released
+    through two of its mutation endpoints. provision-dell-server only reads, so
+    a viewer token is enough there.
+    """
+
+
+class ServerReservedError(OrchestratorError):
+    """server-scan refused the install lock: another run holds it (409).
+
+    Deterministic for this candidate and non-retryable — the holder's lock lasts
+    until it is released or expires, and waiting it out would stall the run on a
+    machine some other MCE is installing. install-server treats it as a SKIP:
+    the next candidate is tried. The message names the holder, its MCE and the
+    expiry, because that is the run an operator goes and looks at.
+    """
+
+
+class ServerScanRequestInvalidError(OrchestratorError):
+    """server-scan rejected a request body as invalid (400/422).
+
+    Built from validated models, so this is a contract drift between the two
+    repos — a field renamed or a bound tightened on server-scan's side. No retry
+    can fix it.
     """
 
 

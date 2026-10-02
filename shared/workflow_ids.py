@@ -67,15 +67,14 @@ def install_server_workflow_id(infra_env: str, server_name: str | None = None) -
     ids while drawing from the SAME pool — the one case the serialization
     exists to prevent. The pool is the InfraEnv, so the id is too.
 
-    Serializing per pool is what stops two runs racing onto one machine, since
-    server-scan hands out candidates with no reservation (ADR-0032 accepts this
-    explicitly — `$sample` can draw the same server for two concurrent callers,
-    and nothing changes its state until a cluster reports the node minutes
-    later). It is not the whole defence: a run also skips candidates that
-    already have a BareMetalHost, which covers the SEQUENTIAL case that an id
-    cannot. Installing several servers from one pool concurrently needs a real
-    reservation in server-scan first; it is not just a matter of loosening this
-    id.
+    Serializing per pool was the first defence against two runs racing onto
+    one machine, since server-scan's draw hands candidates out unlocked. The
+    run now also takes server-scan's install lock on the machine it chooses
+    (ADR-0035 there), which covers what this id never could: a run for ANOTHER
+    MCE drawing a server already installed elsewhere, invisible to its own
+    BareMetalHost probe. With the lock, keying on (pool, MCE) would let two MCEs
+    fill one InfraEnv concurrently — a deliberate change still to be made, not
+    a consequence of adding the lock.
 
     An explicitly named server draws from a pool of one, so it gets its own id
     and does not serialize against pattern draws for the same InfraEnv.

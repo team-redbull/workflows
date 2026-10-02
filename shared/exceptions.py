@@ -507,13 +507,74 @@ class OmeDiscoveryFailedError(OrchestratorError):
     """WORKFLOW-RAISED. OME's discovery job failed, or finished without the device."""
 
 
+class ConfigurationDriftError(OrchestratorError):
+    """WORKFLOW-RAISED. The template deployed, the reboot ran, and BIOS
+    attributes it set still do not match it.
+
+    The deployment reporting success is not evidence: SCP Import is a "continue
+    on error" operation, so an attribute the target's firmware does not know
+    fails while everything else applies. The run stages the drift over Redfish
+    and lets the storage reboot apply it; this is what remains after that, which
+    means the machine will not take the setting at all.
+    """
+
+
+class TemplateUnsafeError(OrchestratorError):
+    """WORKFLOW-RAISED. The configured template carries attributes this workflow
+    refuses to deploy — iDRAC network settings, storage, or user accounts.
+
+    Checked BEFORE anything touches the machine, because the worst of the three
+    is unrecoverable remotely: a template carrying the reference server's iDRAC
+    address moves every target onto it, or resets it to DHCP, and the machine is
+    then reachable only at the rack. See template_policy.py for all three groups
+    and docs/design/dell-scp-template-r660.md for why each is fatal.
+    """
+
+
 class TemplateDeployFailedError(OrchestratorError):
     """WORKFLOW-RAISED. The template deployment job failed or did not finish in time."""
 
 
+class RootPasswordNotSetError(OrchestratorError):
+    """WORKFLOW-RAISED. The iDRAC accepted the password change but root still
+    does not accept the target password.
+
+    Raised BEFORE OME discovers the machine, which is the point: OME must only
+    ever be handed the password root will keep, so a change that did not take
+    has to stop the run rather than strand OME on a stale credential later.
+    """
+
+
+class IdracForcePasswordChangeError(OrchestratorError):
+    """WORKFLOW-RAISED. The iDRAC has Force Change of Password pending, so root's
+    password is correct but the account may do nothing until it is changed.
+
+    A refusal, not a retry: the condition is cleared by a human at the iDRAC (or
+    by the factory order that set it), and no amount of waiting moves it.
+
+    Deliberately NOT worked around, though Dell's own reference client can —
+    `ChangeIdracUserPasswordREDFISH.py --force-change-enabled` writes
+    `Users.2.Password` to the DellAttributes resource, which FCP does not block.
+    That route cannot first READ the account, and this workflow's one hard rule
+    about accounts is that it touches root and never the slot OME uses
+    (CLAUDE.md §4). Writing a password into slot 2 unread, on the assumption
+    that the convention holds, is the single change that loses a server for
+    good. So the run stops and names the fix instead. If these turn out to be
+    common in a real batch, the trade is worth revisiting WITH that evidence.
+    """
+
+
 class TemplatePasswordNotAppliedError(OrchestratorError):
-    """WORKFLOW-RAISED. After the template deployed, root still does not accept
-    the target password — the template does not carry it, or did not apply it."""
+    """WORKFLOW-RAISED. After the template deployed, root no longer accepts the
+    target password.
+
+    This used to mean the template failed to SET the password. Since 2026-09-30
+    the run sets it over Redfish before OME discovery and the template is
+    audited to carry no `Users.*` component at all, so it now means the
+    opposite: something in the deployment MOVED root's password away from the
+    target. Kept as a guard because the cost is one login and the failure mode
+    it catches — a machine OME can no longer reach — is expensive.
+    """
 
 
 class StorageLayoutUnsupportedError(OrchestratorError):

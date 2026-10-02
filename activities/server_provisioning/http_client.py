@@ -46,3 +46,39 @@ def extended_info(resp: httpx.Response) -> str:
     infos = error.get("@Message.ExtendedInfo") or []
     messages = [str(i.get("Message")) for i in infos if isinstance(i, dict) and i.get("Message")]
     return "; ".join(messages) or str(error.get("message") or body)[:500]
+
+
+# The Redfish base registry's id for "this account authenticated, but may do
+# nothing until its password is changed" (DSP2065; DSP0266 §"the session is
+# restricted to performing only the password change operation"). Matched as a
+# SUFFIX because the registry is versioned into the id —
+# `Base.1.18.PasswordChangeRequired` today, a different minor tomorrow.
+_PASSWORD_CHANGE_REQUIRED = "PasswordChangeRequired"
+
+
+def password_change_required(resp: httpx.Response) -> bool:
+    """Whether a refusal means "right password, but change it first".
+
+    Dell's Force Change of Password ships as a factory option, and while it is
+    pending the iDRAC refuses every interface but IPMI — including Redfish —
+    for an account whose password is nonetheless CORRECT. The status code is
+    the same 401/403 a wrong password earns, so without this the credential
+    that works reads as one that does not.
+
+    Keyed on `MessageId` rather than the message text: the id is the registry's
+    stable identifier, the text is prose.
+    """
+    if resp.status_code not in (401, 403):
+        return False
+    try:
+        body = resp.json()
+    except ValueError:
+        return False
+    if not isinstance(body, dict):
+        return False
+    infos = (body.get("error") or {}).get("@Message.ExtendedInfo") or []
+    return any(
+        isinstance(info, dict)
+        and str(info.get("MessageId") or "").endswith(_PASSWORD_CHANGE_REQUIRED)
+        for info in infos
+    )

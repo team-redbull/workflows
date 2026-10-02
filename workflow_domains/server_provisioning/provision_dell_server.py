@@ -17,18 +17,28 @@ Shape of the run:
                             Dell PowerEdge.
      checking-server-scan — and must not be a server a cluster is using:
                             everything after this reboots it.
+     auditing-template    — the template must carry no iDRAC network settings,
+                            no storage and no user accounts. Checked before the
+                            run writes ANYTHING (template_policy.py).
+     clearing-os-hostname — blank the factory OS hostname (`Miniwinpc`), or
+                            OME shows it instead of the machine's address.
+     enforcing-root-password — root goes onto the target password HERE, over
+                            Redfish, while OME has never heard of the machine.
   3. discovering-in-ome   — skipped when OME already has the service tag.
+                            Always with the target credential.
   4. deploying-template   — the template for (model, iDRAC firmware) from
-                            DELL_TEMPLATES. It creates the server profile and
-                            ENFORCES the root password.
-  5. verifying-root-password — root must now accept the target password; if
-                            the machine came in on a factory password, OME is
-                            re-pointed at the new one (rediscovering-in-ome).
-  6. configuring-storage  — RAID 1 on the BOSS, every PERC drive Non-RAID,
-     applying-storage       staged together and applied by ONE reboot, then
-     verifying-storage      read back. Nothing is ever deleted
-                            (storage_plan.py).
-  7. naming-server        — the naming service renames the OME profile, and
+                            DELL_TEMPLATES. It creates the server profile.
+  5. verifying-root-password — nothing in the deployment may have moved root's
+                            password; a guard, not the mechanism.
+  6. verifying-config     — did the template's BIOS attributes ACTUALLY apply?
+                            An SCP import is "continue on error", so a finished
+                            deployment proves nothing. Drift is staged over
+                            Redfish, never by redeploying the profile.
+  7. configuring-storage  — RAID 1 on the BOSS, every PERC drive Non-RAID,
+     applying-storage       staged together and applied by ONE reboot — the
+     verifying-storage      same reboot that applies any BIOS drift — then read
+                            back. Nothing is ever deleted (storage_plan.py).
+  8. naming-server        — the naming service renames the OME profile, and
      verifying-name         the name is read back from OME and checked against
                             the convention, region and service tag included.
 
@@ -40,6 +50,22 @@ add hours to every run to learn something the run cannot influence, and would
 turn a slow or paused collector into a fleet of failed provisions. The early
 server-scan read stays: that one is a SAFETY check (step 2), not a completion
 one.
+
+THE PASSWORD IS SET BEFORE OME EVER SEES THE MACHINE, AND THAT IS WHY THERE IS
+NO REDISCOVERY. OME was once discovered with whatever password the server
+arrived on, the template then enforced the target one, and OME had to be
+re-pointed at it (`rediscovering-in-ome`) or it would lose the machine. That
+repair was wrong in three ways: re-running a discovery over a device that
+already carries a profile is not what OME's own documentation asks for (an
+onboarding operation is, and OME exposes none over REST); it needed a second
+discovery group per run; and the template component that carried the password,
+`Users.*`, is the single most firmware-fragile thing a template can hold — Dell
+KB 000326070, where iDRAC 7.20.30.00 added required SNMPv3 key attributes and
+every older template began failing SYS055. Setting the password over Redfish
+first removes all three at once: OME is discovered ONCE, with the password root
+keeps, so a stale credential cannot exist, and the template needs no `Users.*`
+at all. Reversed 2026-09-30, on the DC team's review. Do not re-add a
+rediscovery — narrow the inputs instead (CLAUDE.md §5).
 
 WHY STORAGE COMES AFTER THE TEMPLATE. The template deployment can reboot the
 machine and apply BIOS attributes; configuring storage afterwards means the
@@ -75,14 +101,17 @@ with workflow.unsafe.imports_passed_through():
         IdracAuthError,
         IdracCredentialsMissingError,
         IdracCredentialsRejectedError,
+        IdracForcePasswordChangeError,
         IdracRequestRejectedError,
         IdracUnreachableError,
         NotADellServerError,
         OmeAuthError,
         OmeDiscoveryFailedError,
         OmeRequestRejectedError,
+        ConfigurationDriftError,
         ProfileConflictError,
         RegionMissingError,
+        RootPasswordNotSetError,
         ServerNameNotAppliedError,
         ServerNamerRejectedError,
         ServerAlreadyInstalledError,
@@ -94,10 +123,12 @@ with workflow.unsafe.imports_passed_through():
         TemplateNotConfiguredError,
         TemplateNotFoundError,
         TemplatePasswordNotAppliedError,
+        TemplateUnsafeError,
     )
     from shared.interfaces.server_provisioning import (
         apply_staged_idrac_jobs,
         check_idrac_login,
+        clear_idrac_os_hostname,
         deploy_ome_template,
         find_in_server_scan,
         find_ome_device,
@@ -106,8 +137,12 @@ with workflow.unsafe.imports_passed_through():
         get_ome_profile,
         probe_idrac_credentials,
         read_idrac_identity,
+        read_ome_template,
         read_storage_layout,
+        stage_bios_attributes,
+        verify_bios_configuration,
         request_server_name,
+        set_idrac_root_password,
         stage_storage_config,
         start_ome_discovery,
     )
@@ -116,6 +151,8 @@ with workflow.unsafe.imports_passed_through():
         IDRAC_JOB_SUCCESS,
         IDRAC_TERMINAL_JOB_STATES,
         TARGET_CREDENTIAL,
+        BiosStageRequest,
+        BiosVerifyRequest,
         IdracIdentity,
         IdracJobsRef,
         IdracJobsState,
@@ -126,6 +163,7 @@ with workflow.unsafe.imports_passed_through():
         OmeDiscoveryRequest,
         OmeJobRef,
         OmeProfileRef,
+        OmeTemplateRef,
         ProvisionDellServerProgress,
         ProvisionDellServerResult,
         ProvisionDellServerRunArgs,
@@ -133,7 +171,16 @@ with workflow.unsafe.imports_passed_through():
         ServerScanLookup,
         StorageConfigRequest,
         StorageLayout,
+        TemplateAttribute,
         TemplateDeployRequest,
+    )
+    from workflow_domains.server_provisioning.template_policy import (
+        audit_template,
+        bios_drift,
+        bios_intent,
+        describe_drift,
+        describe_hazards,
+        unverifiable,
     )
     from workflow_domains.server_provisioning.server_name import (
         model_token,
@@ -218,6 +265,13 @@ def _describe_jobs(state: IdracJobsState) -> str:
 class ProvisionDellServerWorkflow:
     def __init__(self) -> None:
         self._progress = ProvisionDellServerProgress(phase="pending")
+        # How much of the template this run could check, and how much of it the
+        # deployment silently failed to apply. Reported in the result because
+        # it is the evidence for whether one template can serve many firmware
+        # levels (docs/design/dell-scp-template-r660.md).
+        self._bios_checked = 0
+        self._bios_remediated = 0
+        self._bios_unverified = 0
 
     @workflow.query
     def progress(self) -> ProvisionDellServerProgress:
@@ -271,9 +325,59 @@ class ProvisionDellServerWorkflow:
                 ServerAlreadyInstalledError,
             )
 
-        # Step 3 — into OME, unless it is already there.
+        # Step 2b2 — the template must be safe to deploy, checked BEFORE the run
+        # writes anything at all. The worst thing a template can carry is the
+        # reference server's iDRAC network configuration: deploying it moves
+        # this machine's address, or resets it to DHCP, and nothing remote can
+        # get it back. Failing here costs nothing — not a password change, not a
+        # hostname, not an OME device.
+        self._phase("auditing-template")
+        template = await self._run(
+            read_ome_template,
+            OmeTemplateRef(model=identity.model, idrac_firmware=identity.idrac_firmware),
+        )
+        self._progress.template_name = template.template_name
+        hazards = audit_template(template.attributes)
+        if hazards:
+            raise _fail(
+                f"Template {template.template_name!r} carries {len(hazards)} attribute(s) this "
+                f"workflow refuses to deploy — {describe_hazards(hazards)}",
+                TemplateUnsafeError,
+            )
+
+        # Step 2c — blank the factory OS hostname. AFTER the in-use guard above,
+        # because this writes to the machine: `Miniwinpc` is stale factory data
+        # on a server being provisioned, but on a server a cluster is running it
+        # would be the node's real name. Before OME sees it, because while a
+        # hostname is set OME shows it beside the profile instead of the address.
+        self._phase("clearing-os-hostname")
+        self._progress.os_hostname_cleared = await self._run(clear_idrac_os_hostname, initial)
+
+        # Step 2d — root goes onto the target password BEFORE OME sees the
+        # machine, so OME is only ever handed the password root keeps. See the
+        # module docstring: this is what makes rediscovery unnecessary.
+        target = IdracRef(idrac_ip=idrac_ip, credential=TARGET_CREDENTIAL)
+        if initial_credential != TARGET_CREDENTIAL:
+            self._phase("enforcing-root-password")
+            await self._run(set_idrac_root_password, initial)
+            _, on_target = await self._poll(
+                lambda: self._run(check_idrac_login, target),
+                lambda ok: ok,
+                _PASSWORD_DEADLINE,
+                _PASSWORD_POLL,
+            )
+            if not on_target:
+                raise _fail(
+                    f"The iDRAC at {idrac_ip} accepted the change of root's password but root "
+                    f"still does not accept the target one {_PASSWORD_DEADLINE} later — refusing "
+                    "to discover it in OME with a credential that will not keep working",
+                    RootPasswordNotSetError,
+                )
+
+        # Step 3 — into OME, unless it is already there. Always with the TARGET
+        # credential: root is on it by now, whatever the machine arrived with.
         self._phase("discovering-in-ome")
-        device = await self._discover(initial, identity.service_tag, purpose="discover")
+        device = await self._discover(target, identity.service_tag, purpose="discover")
         device_id = int(device.device_id or 0)
         self._progress.ome_device_id = device_id
 
@@ -309,8 +413,10 @@ class ProvisionDellServerWorkflow:
                     TemplateDeployFailedError,
                 )
 
-        # Step 5 — the template must have left root on the target password.
-        target = IdracRef(idrac_ip=idrac_ip, credential=TARGET_CREDENTIAL)
+        # Step 5 — the deployment must not have moved root's password. The
+        # template is audited to carry no Users.* component, so this should
+        # never fire; it stays because it costs one login and the state it
+        # catches — a machine OME can no longer reach — is expensive to undo.
         self._phase("verifying-root-password")
         _, accepted = await self._poll(
             lambda: self._run(check_idrac_login, target),
@@ -320,19 +426,35 @@ class ProvisionDellServerWorkflow:
         )
         if not accepted:
             raise _fail(
-                f"After template {deploy.template_name!r} deployed, root on {idrac_ip} still does "
-                "not accept the target password — check that the template carries the root "
-                "(user 2) password attribute",
+                f"After template {deploy.template_name!r} deployed, root on {idrac_ip} no longer "
+                "accepts the target password — the template carries a Users.* component that "
+                "changed it, which OME's own credential for this machine will not survive",
                 TemplatePasswordNotAppliedError,
             )
-        if initial_credential != TARGET_CREDENTIAL:
-            # OME discovered the machine with the factory password it came in
-            # on; point it at the one root has now, or OME loses the machine.
-            self._phase("rediscovering-in-ome")
-            await self._discover(target, identity.service_tag, purpose="rediscover", force=True)
 
-        # Step 6 — storage: RAID 1 on the BOSS, PERC drives Non-RAID.
-        boss_created, converted = await self._configure_storage(target)
+        # Steps 6 and 7 — storage and configuration drift, applied by ONE reboot.
+        #
+        # Storage is STAGED FIRST, deliberately. A controller that cannot take
+        # the layout fails at staging, and a run that dies there must not leave
+        # a pending BIOS job behind for some unrelated reset to apply weeks
+        # later. So nothing else is staged until the storage jobs exist.
+        plan, storage_jobs = await self._stage_storage(target)
+
+        # Then: did the template's BIOS attributes ACTUALLY apply? A finished
+        # deployment proves nothing — SCP import is "continue on error", so an
+        # attribute this firmware does not know fails while the rest succeed.
+        # Drift is staged as its own job, never by redeploying the profile,
+        # which would re-run everything that already worked.
+        bios_job = await self._verify_configuration(target, template.attributes)
+
+        boss_created, converted = await self._apply_storage(
+            target, plan, storage_jobs + ([bios_job] if bios_job else [])
+        )
+
+        # The reboot has run, so the drift must be gone. Anything left is a
+        # machine that will not take the setting at all.
+        if bios_job:
+            await self._verify_configuration(target, template.attributes, remediating=False)
 
         # Step 7 — the name. The naming service computes it; OME is where it is read back.
         self._phase("naming-server")
@@ -384,6 +506,10 @@ class ProvisionDellServerWorkflow:
             profile_name=profile_name,
             boss_raid1_created=boss_created,
             non_raid_drives_converted=converted,
+            os_hostname_cleared=bool(self._progress.os_hostname_cleared),
+            bios_attributes_checked=self._bios_checked,
+            bios_attributes_remediated=self._bios_remediated,
+            bios_attributes_unverified=self._bios_unverified,
         )
 
     async def _probe(self, idrac_ip: str) -> int:
@@ -401,6 +527,18 @@ class ProvisionDellServerWorkflow:
         while True:
             probe: IdracProbeResult = await self._run(probe_idrac_credentials, idrac_ip)
             last = probe
+            if probe.password_change_required:
+                # Answered, authenticated, and refusing everything anyway. Stop
+                # here rather than at the first write: the run cannot do a
+                # single useful thing on this machine, and the next round would
+                # only re-prove it.
+                raise _fail(
+                    f"iDRAC {idrac_ip} has Force Change of Password pending: root's password is "
+                    "correct, but the iDRAC refuses every interface except IPMI until it is "
+                    "changed. Clear it at the iDRAC and re-run"
+                    f"{f'. Detail: {probe.detail}' if probe.detail else ''}",
+                    IdracForcePasswordChangeError,
+                )
             if probe.credential is not None:
                 return probe.credential
             if not probe.reachable:
@@ -428,16 +566,15 @@ class ProvisionDellServerWorkflow:
             IdracCredentialsRejectedError,
         )
 
-    async def _discover(
-        self, idrac: IdracRef, service_tag: str, purpose: str, force: bool = False
-    ) -> OmeDevice:
+    async def _discover(self, idrac: IdracRef, service_tag: str, purpose: str) -> OmeDevice:
         """The OME device for this service tag, discovering it first if needed.
 
-        `force` runs the discovery even when OME already has the device — that
-        is how OME learns root's new password.
+        There is deliberately no way to force a re-discovery. Root is already on
+        the target password when this runs, so the credential OME is given never
+        goes stale — see the module docstring.
         """
         device: OmeDevice = await self._run(find_ome_device, OmeDeviceRef(service_tag=service_tag))
-        if device.found and not force:
+        if device.found:
             return device
         info = workflow.info()
         job_ref: OmeJobRef = await self._run(
@@ -473,11 +610,76 @@ class ProvisionDellServerWorkflow:
             )
         return device
 
-    async def _configure_storage(self, target: IdracRef) -> tuple[bool, int]:
-        """Take the machine to the required storage layout; (RAID 1 created, drives converted).
+    async def _verify_configuration(
+        self, target: IdracRef, attributes: list[TemplateAttribute], remediating: bool = True
+    ) -> str | None:
+        """Check the template's BIOS attributes really applied; stage the fixes.
 
-        Plan, stage everything, ONE reboot, wait for the jobs, then read the
-        storage back and plan again: a converged plan is the only success.
+        Returns the id of the staged BIOS job when there was drift to fix, so
+        the caller can have one reboot apply it alongside the storage jobs.
+
+        On the second pass (`remediating=False`) there is nothing left to try:
+        the reboot has run, so remaining drift is a machine that will not take
+        the setting, and the run fails by name rather than looping.
+        """
+        self._phase("verifying-config")
+        intended = bios_intent(attributes)
+        if not intended:
+            return None
+        verification = await self._run(
+            verify_bios_configuration, BiosVerifyRequest(idrac=target, intended=intended)
+        )
+        drifted = bios_drift(verification.compared)
+        unchecked = unverifiable(verification.compared)
+        self._progress.bios_attributes_checked = len(verification.compared)
+        self._progress.bios_attributes_drifted = len(drifted)
+        self._bios_checked = len(verification.compared)
+        self._bios_unverified = len(unchecked)
+        if remediating:
+            self._bios_remediated = len(drifted)
+
+        if unchecked:
+            # Not a failure: this is a template naming an attribute the target's
+            # firmware does not have, which is Dell's documented consequence of
+            # a version difference. Loud in the log, and counted in the result,
+            # because it is the evidence for whether a golden template is safe.
+            workflow.logger.warning(
+                "%d template BIOS attribute(s) are not in %s's registry and were not verified: %s",
+                len(unchecked),
+                target.idrac_ip,
+                ", ".join(a.display_name for a in unchecked),
+            )
+        if not drifted:
+            return None
+        if not remediating:
+            raise _fail(
+                f"The template deployed and the reboot ran, but {len(drifted)} BIOS attribute(s) "
+                f"still do not match it: {describe_drift(drifted)}",
+                ConfigurationDriftError,
+            )
+        workflow.logger.info(
+            "Template %s reported success but %d BIOS attribute(s) did not apply; staging them "
+            "over Redfish: %s",
+            self._progress.template_name,
+            len(drifted),
+            describe_drift(drifted),
+        )
+        return await self._run(
+            stage_bios_attributes,
+            BiosStageRequest(
+                idrac=target,
+                attributes={str(a.attribute_name): str(a.intended) for a in drifted},
+            ),
+        )
+
+    async def _stage_storage(self, target: IdracRef) -> tuple[StoragePlan, list[str]]:
+        """Plan the storage and stage it; the jobs waiting for the reset.
+
+        Staging happens BEFORE anything else is staged, and that ordering is
+        load-bearing: a controller that cannot take the layout fails HERE
+        (`stage_storage` checks SupportedRAIDTypes before it posts), and a run
+        that dies then must not leave some other pending job behind to be
+        applied by an unrelated reset weeks later.
         """
         self._phase("configuring-storage")
         layout: StorageLayout = await self._run(read_storage_layout, target)
@@ -488,9 +690,8 @@ class ProvisionDellServerWorkflow:
                 StorageLayoutUnsupportedError,
             )
         if plan.converged:
-            return False, 0
-
-        job_ids: list[str] = await self._run(
+            return plan, []
+        return plan, await self._run(
             stage_storage_config,
             StorageConfigRequest(
                 idrac=target,
@@ -499,6 +700,21 @@ class ProvisionDellServerWorkflow:
                 non_raid_drives=plan.non_raid_drives,
             ),
         )
+
+    async def _apply_storage(
+        self, target: IdracRef, plan: StoragePlan, job_ids: list[str]
+    ) -> tuple[bool, int]:
+        """ONE reboot for every staged job, then read the storage back.
+
+        `job_ids` is the storage jobs plus anything else staged for the same
+        reset — today the BIOS drift job. They are carried through the whole
+        wait together, so one reboot applies everything and one poll watches it.
+        A machine whose storage was already right still reboots when something
+        else is staged: the job is on the iDRAC either way, and leaving it
+        pending would apply it at some unrelated later reset.
+        """
+        if not job_ids:
+            return False, 0
         jobs_ref = IdracJobsRef(idrac=target, job_ids=job_ids)
         # A PERC runs its Non-RAID conversion at once (a real-time job); the
         # reset that applies the BOSS volume must not cut it off mid-apply.

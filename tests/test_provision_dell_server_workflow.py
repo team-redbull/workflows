@@ -33,14 +33,21 @@ from shared.exceptions import (
     IdracUnreachableError,
     NotADellServerError,
     ProfileConflictError,
+    RootPasswordNotSetError,
     RegionMissingError,
     ServerAlreadyInstalledError,
     ServerNameNotAppliedError,
     StorageJobFailedError,
     StorageLayoutUnsupportedError,
+    ConfigurationDriftError,
     TemplatePasswordNotAppliedError,
+    TemplateUnsafeError,
 )
 from shared.models.server_provisioning import (
+    BiosComparison,
+    BiosStageRequest,
+    BiosVerification,
+    BiosVerifyRequest,
     IdracController,
     IdracDrive,
     IdracIdentity,
@@ -57,6 +64,7 @@ from shared.models.server_provisioning import (
     OmeJobState,
     OmeProfile,
     OmeProfileRef,
+    OmeTemplateRef,
     ProvisionDellServerInput,
     ProvisionDellServerRunArgs,
     RebootResult,
@@ -65,6 +73,8 @@ from shared.models.server_provisioning import (
     ServerScanState,
     StorageConfigRequest,
     StorageLayout,
+    TemplateAttribute,
+    TemplateContents,
     TemplateDeployRequest,
     TemplateDeployResult,
 )
@@ -117,6 +127,14 @@ class Fake:
         )
     )
     claimed_by: str | None = None
+    os_hostname_was_set: bool = True
+    # A safe template by default: BIOS settings only.
+    template_attributes: list[TemplateAttribute] = field(default_factory=list)
+    # One list per verify_bios_configuration call, consumed in order.
+    bios_comparisons: list[list[BiosComparison]] = field(default_factory=list)
+    staged_bios: list[dict[str, str]] = field(default_factory=list)
+    # Every job id the one reboot was asked to apply.
+    staged_reboot_jobs: list[str] = field(default_factory=list)
     in_ome: bool = False
     template_job: int | None = 900
     template_error: Exception | None = None
@@ -149,6 +167,36 @@ class Fake:
             fake.calls.append("identity")
             return fake.identity
 
+        @activity.defn(name="read_ome_template")
+        async def read_template(ref: OmeTemplateRef) -> TemplateContents:
+            fake.calls.append("audit")
+            return TemplateContents(
+                template_id=25, template_name="ocp-r660", attributes=fake.template_attributes
+            )
+
+        @activity.defn(name="set_idrac_root_password")
+        async def set_password(ref: IdracRef) -> bool:
+            fake.calls.append(f"set-password:from-{ref.credential}")
+            return True
+
+        @activity.defn(name="clear_idrac_os_hostname")
+        async def clear_hostname(ref: IdracRef) -> bool:
+            fake.calls.append("clear-hostname")
+            return fake.os_hostname_was_set
+
+        @activity.defn(name="verify_bios_configuration")
+        async def verify_bios(request: BiosVerifyRequest) -> BiosVerification:
+            fake.calls.append("verify-bios")
+            return BiosVerification(compared=fake.bios_comparisons.pop(0)
+                                    if len(fake.bios_comparisons) > 1
+                                    else (fake.bios_comparisons[0] if fake.bios_comparisons else []))
+
+        @activity.defn(name="stage_bios_attributes")
+        async def stage_bios(request: BiosStageRequest) -> str:
+            fake.calls.append("stage-bios")
+            fake.staged_bios.append(request.attributes)
+            return "JID_BIOS"
+
         @activity.defn(name="read_storage_layout")
         async def layout(ref: IdracRef) -> StorageLayout:
             fake.calls.append(f"layout:{ref.credential}")
@@ -163,6 +211,7 @@ class Fake:
         @activity.defn(name="apply_staged_idrac_jobs")
         async def apply(ref: IdracJobsRef) -> RebootResult:
             fake.calls.append("reboot")
+            fake.staged_reboot_jobs.extend(ref.job_ids)
             return RebootResult(rebooted=True, reset_type="ForceRestart")
 
         jobs_polls = {"n": 0}
@@ -229,8 +278,9 @@ class Fake:
             fake.calls.append("guard")
             return ServerScanState(claimed_by=fake.claimed_by, name="old-name")
 
-        return [probe, check_login, identity, layout, stage, apply, jobs, find_device, discover,
-                ome_job, deploy, profile, rename, scan]
+        return [probe, check_login, identity, set_password, clear_hostname, layout, stage,
+                apply, jobs, find_device, discover, ome_job, deploy, read_template, profile,
+                rename, scan, verify_bios, stage_bios]
 
 
 class _Harness:
@@ -290,11 +340,15 @@ async def test_happy_path_from_factory_password_to_a_configured_machine():
     # server-scan is read ONCE, as the in-use guard — never again to decide the
     # run is done.
     assert fake.calls.count("guard") == 1
-    # Discovered with the factory password it came in on, then re-pointed at
-    # the target one once the template enforced it.
-    assert [d.idrac.credential for d in fake.discoveries] == [1, 0]
-    # The guard ran before anything touched the machine.
-    assert fake.calls.index("guard") < fake.calls.index("discover:1")
+    # Root was moved onto the target password BEFORE OME was told anything, so
+    # OME is discovered exactly ONCE and with the credential it keeps. The
+    # rediscovery this replaced would have shown up here as a second entry.
+    assert fake.calls.index("set-password:from-1") < fake.calls.index("discover:0")
+    assert [d.idrac.credential for d in fake.discoveries] == [0]
+    # The guard ran before anything touched the machine — including the
+    # password change and the hostname blanking, which both write to it.
+    assert fake.calls.index("guard") < fake.calls.index("set-password:from-1")
+    assert fake.calls.index("guard") < fake.calls.index("clear-hostname")
     # Storage ran as root on the TARGET password, after the template.
     assert fake.calls.index("deploy") < fake.calls.index("layout:0")
     assert fake.calls.count("reboot") == 1
@@ -375,10 +429,32 @@ async def test_a_profile_conflict_fails_the_run_without_retrying():
     assert fake.calls.count("deploy") == 1
 
 
-async def test_a_template_that_leaves_the_old_password_fails():
+async def test_a_password_change_that_does_not_take_stops_before_ome_is_told():
+    """The safety property of setting the password first.
+
+    OME must only ever be handed a credential that will keep working, so a
+    change that did not take has to stop the run BEFORE discovery — otherwise
+    OME is onboarded against a password the machine does not have, which is
+    exactly the stranding the rediscovery used to paper over.
+    """
     fake = Fake(target_login=False)
     error = await _failure(fake)
+    assert error.type == RootPasswordNotSetError.__name__
+    assert fake.discoveries == [] and "deploy" not in fake.calls
+
+
+async def test_a_template_that_moves_the_password_is_still_caught():
+    """A machine already on the target password skips the change, so the only
+    login check left is the one after the template — which is there to catch a
+    template that carries a Users.* component and moves the password itself."""
+    fake = Fake(
+        probes=[IdracProbeResult(reachable=True, credential=0, rejected=0)],
+        target_login=False,
+    )
+    error = await _failure(fake)
     assert error.type == TemplatePasswordNotAppliedError.__name__
+    assert "set-password:from-0" not in fake.calls
+    assert fake.calls.count("deploy") == 1
 
 
 async def test_storage_that_would_destroy_data_is_refused_before_staging():
@@ -414,3 +490,99 @@ async def test_a_name_that_never_matches_fails_the_run():
     error = await _failure(fake)
     assert error.type == ServerNameNotAppliedError.__name__
 
+
+
+async def test_an_unsafe_template_stops_the_run_before_anything_is_written():
+    """The audit's whole value is WHERE it runs.
+
+    A template carrying the reference server's iDRAC address would strand this
+    machine at the rack, so the run must refuse it before it has changed a
+    password, blanked a hostname, or put the device into OME.
+    """
+    fake = Fake(
+        template_attributes=[
+            TemplateAttribute(attribute_id=1, name="Address", group="iDRAC,IPv4 Information"),
+        ]
+    )
+    error = await _failure(fake)
+    assert error.type == TemplateUnsafeError.__name__
+    assert "reachable only at the rack" in error.message
+    # Nothing was written: no password change, no hostname, no OME device.
+    for untouched in ("set-password:from-1", "clear-hostname", "discover:0", "deploy"):
+        assert untouched not in fake.calls
+    # ...and the guard still ran first, so an in-use server is refused even
+    # when the template is also bad.
+    assert fake.calls.index("guard") < fake.calls.index("audit")
+
+
+async def test_a_template_carrying_storage_is_refused():
+    """KB 000384312 and RAIDresetConfig=True both make template-driven RAID
+    unsafe; storage is built over Redfish instead."""
+    fake = Fake(
+        template_attributes=[
+            TemplateAttribute(attribute_id=9, name="Virtual Disk 0", group="Storage,RAID.Integrated.1-1"),
+        ]
+    )
+    error = await _failure(fake)
+    assert error.type == TemplateUnsafeError.__name__
+    assert "stage" not in fake.calls
+
+
+def _bios(display: str, name: str, intended: str, actual: str) -> BiosComparison:
+    return BiosComparison(display_name=display, attribute_name=name, intended=intended, actual=actual)
+
+
+async def test_a_setting_the_template_did_not_apply_is_fixed_over_redfish():
+    """The coworker's requirement: a profile that reports Completed while a
+    setting never landed must be fixed by MODIFYING the setting, not by
+    redeploying the profile."""
+    fake = Fake(
+        template_attributes=[
+            TemplateAttribute(attribute_id=1, name="System Profile", group="BIOS,System Profile Settings",
+                              value="PerfOptimized"),
+        ],
+        bios_comparisons=[
+            [_bios("System Profile", "SysProfile", "PerfOptimized", "PerfPerWattOptimizedOs")],
+            [_bios("System Profile", "SysProfile", "PerfOptimized", "PerfOptimized")],
+        ],
+    )
+    result = await _run(fake)
+
+    assert fake.staged_bios == [{"SysProfile": "PerfOptimized"}]
+    assert result.bios_attributes_remediated == 1
+    # The profile was deployed ONCE — the fix never re-ran it.
+    assert fake.calls.count("deploy") == 1
+    # ONE reboot applied the BIOS job and the storage jobs together.
+    assert fake.calls.count("reboot") == 1
+    assert "JID_BIOS" in fake.staged_reboot_jobs
+
+
+async def test_drift_that_survives_the_reboot_fails_the_run():
+    """Remediation is not assumed to work: the second read is what decides."""
+    drifted = [_bios("System Profile", "SysProfile", "PerfOptimized", "PerfPerWattOptimizedOs")]
+    fake = Fake(
+        template_attributes=[
+            TemplateAttribute(attribute_id=1, name="System Profile", group="BIOS,System Profile Settings",
+                              value="PerfOptimized"),
+        ],
+        bios_comparisons=[drifted, drifted],
+    )
+    error = await _failure(fake)
+    assert error.type == ConfigurationDriftError.__name__
+    assert "SysProfile" in error.message
+
+
+async def test_an_attribute_this_firmware_does_not_have_is_reported_not_failed():
+    """Dell's documented consequence of a template/firmware mismatch: the
+    attribute simply is not there. That is a coverage gap to report, not a
+    machine to fail."""
+    fake = Fake(
+        template_attributes=[
+            TemplateAttribute(attribute_id=1, name="Some New Knob", group="BIOS,Misc", value="On"),
+        ],
+        bios_comparisons=[[BiosComparison(display_name="Some New Knob", intended="On")]],
+    )
+    result = await _run(fake)
+    assert result.bios_attributes_unverified == 1
+    assert result.bios_attributes_remediated == 0
+    assert "stage-bios" not in fake.calls

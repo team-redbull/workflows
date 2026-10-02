@@ -128,12 +128,69 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   The pieces that are decisions, not incidental:
   - **Credentials by POSITION, never by value in history.** Root only (iDRAC user 2); the OME
     account on the iDRAC is NEVER touched (OME would lose the machine). Candidates are
-    `IDRAC_ROOT_PASSWORD` (the one the template enforces) then `IDRAC_FACTORY_PASSWORDS` (≤2), one
+    `IDRAC_ROOT_PASSWORD` (the one the run enforces) then `IDRAC_FACTORY_PASSWORDS` (≤2), one
     request each — iDRAC9 blocks an address after 3 failures, so only an all-wrong round trips it,
-    and the next round waits `_LOCKOUT_WAIT` out. A machine that came in on a factory password is
-    re-discovered in OME with the target one after the template, or OME loses it.
+    and the next round waits `_LOCKOUT_WAIT` out. **A 401 is not automatically a wrong password.**
+    Dell's Force Change of Password (a factory order option) refuses the CORRECT one the same way,
+    differing only by a Redfish `MessageId` ending `PasswordChangeRequired`; read as a rejection it
+    spends the remaining candidates, trips the block with the last of them, and reports that no
+    password worked about the one that did. `password_change_required()` classifies it, the probe
+    returns the credential with the flag set, and the workflow stops at `probing-idrac` with
+    `IdracForcePasswordChangeError` before writing anything. Dell's own workaround — writing
+    `Users.2.Password` to the iDRAC DellAttributes resource, which FCP does not block — is
+    deliberately NOT used: it cannot first read the account, and writing a password into slot 2
+    unread is exactly how the OME account gets clobbered.
+  - **ROOT'S PASSWORD IS SET OVER REDFISH BEFORE OME DISCOVERS THE MACHINE. Do not re-add a
+    rediscovery.** `set_root_password` PATCHes `Managers/iDRAC.Embedded.1/Accounts/2` — the
+    iDRAC8/9 collection, falling back to `AccountService/Accounts/2` on a 404 for iDRAC10, and
+    refusing if slot 2 is not root — then OME is discovered ONCE with the password root keeps. It used to run the
+    other way: OME was discovered on whatever password the server arrived with, the TEMPLATE
+    enforced the target one, and `rediscovering-in-ome` re-ran discovery so OME would not lose
+    the machine. Reversed 2026-09-30 on the DC team's review, for three reasons. OME's documented
+    repair for a changed credential is an ONBOARDING operation, which OME exposes nowhere over
+    REST (it is a GUI wizard), so re-running discovery over a device that already carries a
+    profile was never the right call. Without an OME Advanced licence there is no
+    `OME_<application-GUID>` service account, so OME really does depend on that credential — the
+    hazard was real, only the fix was wrong. And `Users.*` is the most firmware-fragile component
+    a template can carry (KB 000326070: iDRAC 7.20.30.00 added required SNMPv3 key attributes and
+    every older template began failing SYS055), so taking the password out of the template removed
+    a whole class of breakage. Narrow the inputs, never detect the interaction (§5).
   - **The TEMPLATE is per (Redfish model, iDRAC firmware)** — `DELL_TEMPLATES`, no fallback.
-    It sets root's password; the run verifies that by logging in.
+    A template is NOT locked to the firmware it was captured on — the versions in it are ReadOnly,
+    `Set On Import: False` — so a golden template per model is technically sound; the key stays
+    exact until `verifying-config` has measured what real batches differ by. See
+    `docs/design/dell-scp-template-r660.md`.
+  - **A template must carry NO iDRAC network settings, NO storage and NO `Users.*`**, and the run
+    AUDITS it before deploying rather than trusting an operator to have stripped them
+    (`template_policy.py`, phase `auditing-template`, `TemplateUnsafeError`). The audit runs
+    BEFORE the run writes anything at all — no password change, no hostname, no OME device —
+    because the worst hazard is unrecoverable remotely: a template carrying the reference
+    server's iDRAC address moves or DHCPs every target's iDRAC, and the machine is then reachable
+    only at the rack. Storage either wipes the controller (Clone/Replace exports set
+    `RAIDresetConfig=True`) or fails outright on OME 4.5.x (KB 000384312 drops every
+    `IncludedPhysicalDiskID` after the first, and our BOSS mirror spans two) — which is why RAID
+    is built over Redfish. Matching is on OME's DISPLAY names, not SCP attribute names, because
+    `AttributeDetails` reports what the GUI shows and there is no stable id to key on; the rules
+    are deliberately generous, since a false positive fails a run with the offending attributes
+    named while a false negative strands a machine. An attribute marked `IsIgnored` is not
+    deployed, so it is not a hazard.
+  - **A DEPLOYED TEMPLATE IS NOT A VERIFIED ONE.** SCP import is a "continue on error"
+    operation, so an attribute the target's firmware does not know fails while everything else
+    applies and the job still reports success — Dell's own reference client does not trust the
+    job state either, it string-searches the message for failure words. So `verifying-config`
+    reads the template's BIOS attributes back and REMEDIATES drift over Redfish, never by
+    redeploying the profile (which would re-run everything that already worked). The fix is
+    staged as a BIOS job and applied by the SAME reboot the storage jobs need — but storage is
+    STAGED FIRST, because a controller that cannot take the layout fails at staging and a run
+    dying there must not leave a pending BIOS job for an unrelated reset to apply later. Only
+    BIOS is verified: its attribute registry maps OME's display names to the names Redfish
+    accepts, which is what makes an attribute both checkable and fixable, and the iDRAC's own
+    attributes have no such published bridge. An attribute the registry does not know is
+    REPORTED (`bios_attributes_unverified`), never silently passed — that count is the evidence
+    for whether one template can serve several firmware levels.
+  - **The factory OS hostname is blanked** (`Miniwinpc`), unconditionally, after the in-use guard
+    and before OME discovery: while one is set OME shows it instead of the machine's address next
+    to the profile. A machine being provisioned has no OS, so anything there is stale.
   - **Storage: RAID 1 on the BOSS pair, every PERC drive Non-RAID, NEVER a delete.** Policy in
     `storage_plan.py`; staged `OnReset` so ONE reboot applies all; after the template, so the
     layout checked is final. An existing volume or in-use drive fails the run.

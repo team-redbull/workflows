@@ -193,7 +193,6 @@ with workflow.unsafe.imports_passed_through():
         mac_is_valid,
     )
     from workflow_domains.server_lifecycle.bond_selection import (
-        BOND_MEMBER_COUNT,
         describe_candidate,
         select_bond_members,
     )
@@ -299,7 +298,6 @@ def _acquire_request(
             name=server_name,
             count=1,
             health=_REQUIRED_HEALTH,
-            min_nic_macs=BOND_MEMBER_COUNT,
         )
     return AcquireServerRequest(
         # Escaped: the InfraEnv name is caller data going into a regex.
@@ -308,7 +306,6 @@ def _acquire_request(
         pattern=f"^ocp-{re.escape(infra_env)}",
         count=candidate_count,
         health=_REQUIRED_HEALTH,
-        min_nic_macs=BOND_MEMBER_COUNT,
     )
 
 

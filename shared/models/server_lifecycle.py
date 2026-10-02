@@ -137,7 +137,6 @@ class AcquireServerRequest(BaseModel):
     name: str | None = None
     count: int = 1
     health: str = "HEALTHY"
-    min_nic_macs: int = 2
 
 
 class ReserveServerRequest(BaseModel):

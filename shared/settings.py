@@ -201,8 +201,9 @@ class ServerLifecycleActivitySettings(BaseSettings):
 
     # --- server-scan: the inventory platform --------------------------------
     # Base URL INCLUDING the /api/v1 prefix. The token needs server-scan's
-    # VIEWER role only: /servers/available is a GET, and just its four mutation
-    # endpoints require admin. It may be empty — server-scan's auth is disabled
+    # ADMIN role: besides the /servers/available GET, install-server takes and
+    # releases the install lock (POST/DELETE /servers/{id}/reservation, ADR-0035),
+    # and those are mutations. It may be empty — server-scan's auth is disabled
     # by default, which auto-admits every caller.
     server_scan_url: str
     server_scan_api_token: str = ""

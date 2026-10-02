@@ -28,7 +28,12 @@ from shared.consts import (
     SEGMENT_LIFECYCLE_ACTIVITY_QUEUE,
     server_lifecycle_activity_queue,
 )
-from shared.exceptions import InventorySegmentNotFoundError, ServerNotAvailableError
+from shared.exceptions import (
+    InventorySegmentNotFoundError,
+    ServerNotAvailableError,
+    ServerReservedError,
+    ServerScanAuthError,
+)
 from shared.models.segment_lifecycle import SegmentEntry, SegmentType
 from shared.models.server_lifecycle import (
     AcquiredServer,
@@ -43,7 +48,10 @@ from shared.models.server_lifecycle import (
     InstallServerInput,
     InstallServerRunArgs,
     LinkState,
+    ReleaseServerRequest,
+    ReserveServerRequest,
     ServerInterface,
+    ServerReservation,
     TeardownResult,
 )
 from workflow_domains.server_lifecycle.install_server import InstallServerWorkflow
@@ -153,6 +161,10 @@ def make_mock_activities(
     agent_after_polls: int = 0,
     teardown_error: Exception | None = None,
     finalizers_stuck: bool = False,
+    reserved_elsewhere: set[str] | None = None,
+    gone_from_inventory: set[str] | None = None,
+    lock_lapses_for: set[str] | None = None,
+    reserve_error: Exception | None = None,
 ):
     """Build the full mock activity set + a call recorder.
 
@@ -167,6 +179,11 @@ def make_mock_activities(
     polls for the servers that do. Both are per-SERVER rather than global so a
     pool can be set up to fail its first candidate and install its second, which
     is the case the retry loop exists for.
+
+    The install lock behaves as server-scan's does: a claim by the same workflow
+    extends, `reserved_elsewhere` names servers another run holds, and
+    `lock_lapses_for` names servers whose lock another run takes between the
+    first claim and the renewal before the Agent wait.
     """
     calls: dict[str, list] = {
         name: []
@@ -179,6 +196,8 @@ def make_mock_activities(
             "get_baremetal_host",
             "find_agent_for_host",
             "teardown_bmh_resources",
+            "reserve_server",
+            "release_server",
         )
     }
     drawn = candidates if candidates is not None else [bondable_server()]
@@ -284,6 +303,43 @@ def make_mock_activities(
             finalizers_cleared=finalizers_stuck,
         )
 
+    held_elsewhere = set(reserved_elsewhere or ())
+    gone = gone_from_inventory or set()
+    lapses = lock_lapses_for or set()
+    locks: dict[str, str] = {}
+
+    @activity.defn
+    async def reserve_server(request: ReserveServerRequest) -> ServerReservation:
+        calls["reserve_server"].append(request)
+        if reserve_error is not None:
+            raise reserve_error
+        if request.server_name in gone:
+            raise ServerNotAvailableError(f"{request.server_name} is not in inventory")
+        if request.server_name in lapses and request.server_id in locks:
+            held_elsewhere.add(request.server_name)
+            del locks[request.server_id]
+        if request.server_name in held_elsewhere:
+            raise ServerReservedError(
+                f"{request.server_name} is reserved by 'install-server' for MCE "
+                "'ocp4-mce-other'"
+            )
+        locks[request.server_id] = request.workflow_id
+        return ServerReservation(
+            server_id=request.server_id,
+            held=True,
+            expires_at=f"in {request.ttl_seconds}s",
+        )
+
+    @activity.defn
+    async def release_server(request: ReleaseServerRequest) -> ServerReservation:
+        calls["release_server"].append(request)
+        if locks.get(request.server_id) == request.workflow_id:
+            del locks[request.server_id]
+            return ServerReservation(server_id=request.server_id, held=False)
+        return ServerReservation(
+            server_id=request.server_id, held=False, detail="not ours"
+        )
+
     segment_activities = [get_inventory_segment]
     server_activities = [
         acquire_servers,
@@ -293,6 +349,8 @@ def make_mock_activities(
         get_baremetal_host,
         find_agent_for_host,
         teardown_bmh_resources,
+        reserve_server,
+        release_server,
     ]
     return calls, segment_activities, server_activities
 
@@ -935,3 +993,126 @@ class TestPerMceRouting:
             result = await _execute(client, InstallServerRunArgs(input=INPUT))
         assert result.mce_cluster == MCE_CLUSTER
         assert len(calls["create_baremetal_host"]) == 1
+
+
+class TestTheInstallLock:
+    """server-scan's install lock (ADR-0035) — the guard ACROSS MCEs.
+
+    This run's BareMetalHost probe only sees its own MCE, and server-scan
+    reports a machine AVAILABLE until a cluster reports it. Without the lock, a
+    server installed into one MCE is drawn again by a run for another.
+    """
+
+    async def test_the_chosen_machine_is_locked_renewed_and_held_after_success(self):
+        calls, segment_acts, server_acts = make_mock_activities()
+        async with _Harness(segment_acts, server_acts) as client:
+            result = await _execute(client, InstallServerRunArgs(input=INPUT))
+
+        claims = calls["reserve_server"]
+        # Taken, renewed as the Agent wait begins, then held for a day.
+        assert [c.ttl_seconds for c in claims] == [7200, 7200, 86_400]
+        assert {c.server_id for c in claims} == {"srv_001"}
+        assert {c.holder for c in claims} == {"install-server"}
+        # One workflow id across all three: server-scan EXTENDS a lock its own
+        # run re-takes, and treats anyone else's as a lost race.
+        assert len({c.workflow_id for c in claims}) == 1
+        assert claims[0].workflow_id.startswith("test-")
+        assert claims[0].mce_cluster == MCE_CLUSTER
+        assert claims[0].infra_env == INFRA_ENV
+        assert claims[0].namespace == NAMESPACE
+        assert calls["release_server"] == []
+        assert result.reservation_expires_at == "in 86400s"
+
+    async def test_a_machine_another_run_holds_is_skipped_before_anything_is_written(self):
+        held = bondable_server("srv_held", name="ocp-held", mac_prefix="11:22:33:44:55")
+        free = bondable_server("srv_free")
+        calls, segment_acts, server_acts = make_mock_activities(
+            candidates=[held, free], reserved_elsewhere={"ocp-held"}
+        )
+        async with _Harness(segment_acts, server_acts) as client:
+            result = await _execute(client, InstallServerRunArgs(input=INPUT))
+
+        assert result.server_name == SERVER_NAME
+        # A refused lock is not an attempt: nothing was installed or watched.
+        assert result.attempts == 1
+        assert [c.server_name for c in calls["create_bmc_secret"]] == [SERVER_NAME]
+        assert calls["teardown_bmh_resources"] == []
+
+    async def test_a_pool_held_elsewhere_fails_naming_the_holder(self):
+        calls, segment_acts, server_acts = make_mock_activities(
+            reserved_elsewhere={SERVER_NAME}
+        )
+        async with _Harness(segment_acts, server_acts) as client:
+            with pytest.raises(WorkflowFailureError) as excinfo:
+                await _execute(client, InstallServerRunArgs(input=INPUT))
+
+        error = _application_error(excinfo.value)
+        assert error.type == "ServerReservedError"
+        assert "ocp4-mce-other" in error.message
+        assert calls["create_bmc_secret"] == []
+
+    async def test_a_server_gone_from_the_inventory_is_skipped(self):
+        gone = bondable_server("srv_gone", name="ocp-gone", mac_prefix="11:22:33:44:55")
+        calls, segment_acts, server_acts = make_mock_activities(
+            candidates=[gone, bondable_server()], gone_from_inventory={"ocp-gone"}
+        )
+        async with _Harness(segment_acts, server_acts) as client:
+            result = await _execute(client, InstallServerRunArgs(input=INPUT))
+
+        assert result.server_name == SERVER_NAME
+        assert [c.server_name for c in calls["create_bmc_secret"]] == [SERVER_NAME]
+
+    async def test_an_already_installed_candidate_is_never_locked(self):
+        # The probe runs first: locking a machine this MCE already holds would
+        # only withhold it from the operator's view of the fleet.
+        calls, segment_acts, server_acts = make_mock_activities(
+            candidates=[bondable_server("srv_a", name="ocp-a"), bondable_server()],
+            already_installed={"ocp-a"},
+        )
+        async with _Harness(segment_acts, server_acts) as client:
+            await _execute(client, InstallServerRunArgs(input=INPUT))
+
+        assert {c.server_name for c in calls["reserve_server"]} == {SERVER_NAME}
+
+    async def test_a_rolled_back_machine_is_released_after_its_teardown(self):
+        doomed = bondable_server("srv_doomed", name="ocp-doomed", mac_prefix="11:22:33:44:55")
+        calls, segment_acts, server_acts = make_mock_activities(
+            candidates=[doomed, bondable_server()], agent_never_for={"ocp-doomed"}
+        )
+        async with _Harness(segment_acts, server_acts) as client:
+            await _execute(client, InstallServerRunArgs(input=INPUT))
+
+        released = calls["release_server"]
+        assert [r.server_id for r in released] == ["srv_doomed"]
+        assert released[0].holder == "install-server"
+        assert released[0].workflow_id == calls["reserve_server"][0].workflow_id
+
+    async def test_a_lock_lost_before_the_agent_wait_rolls_back_without_releasing(self):
+        """Lapsed and taken by another run: undo OUR resources, leave THEIR lock."""
+        lapsed = bondable_server("srv_lapsed", name="ocp-lapsed", mac_prefix="11:22:33:44:55")
+        calls, segment_acts, server_acts = make_mock_activities(
+            candidates=[lapsed, bondable_server()], lock_lapses_for={"ocp-lapsed"}
+        )
+        async with _Harness(segment_acts, server_acts) as client:
+            result = await _execute(client, InstallServerRunArgs(input=INPUT))
+
+        assert result.server_name == SERVER_NAME
+        assert [t.server_name for t in calls["teardown_bmh_resources"]] == ["ocp-lapsed"]
+        assert calls["release_server"] == []
+        # Never watched for an Agent: the machine is someone else's now.
+        assert all(
+            "11:22:33:44:55:01" not in ref.macs for ref in calls["find_agent_for_host"]
+        )
+
+    async def test_a_token_without_the_admin_role_fails_the_run(self):
+        calls, segment_acts, server_acts = make_mock_activities(
+            reserve_error=ServerScanAuthError("needs the ADMIN role")
+        )
+        async with _Harness(segment_acts, server_acts) as client:
+            with pytest.raises(WorkflowFailureError) as excinfo:
+                await _execute(client, InstallServerRunArgs(input=INPUT))
+
+        assert _application_error(excinfo.value).type == "ServerScanAuthError"
+        # Once: permanent, not retried every minute, and not a per-candidate skip.
+        assert len(calls["reserve_server"]) == 1
+        assert calls["create_bmc_secret"] == []

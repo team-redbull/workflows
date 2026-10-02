@@ -166,7 +166,7 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
 
 - **server-scan is the inventory source of record for install-server**
   (`SERVER_SCAN_URL`). The workflow makes ONE read — `GET /servers/available`
-  — and never queries a vendor manager itself: server-scan already collects HP
+  — plus the install lock below, and never queries a vendor manager itself: server-scan already collects HP
   OneView / UCS Central / Dell OME / Intersight / standalone Redfish on a
   6-hour cron and knows which servers are unclaimed. This is what replaced the
   `bmh-generator-operator` Kopf operator and its four vendor SDKs. The endpoint
@@ -174,6 +174,20 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   ours; `live_recheck_performed` per item says when it degraded to the stored
   document. It returns DATA ONLY — never BMC credentials, which server-scan
   does not hold; those stay in this worker's own Secret.
+- **install-server LOCKS the machine it chose in server-scan** (server-scan's
+  ADR-0035, `POST`/`DELETE /servers/{id}/reservation`, `reserve_server`/
+  `release_server` on the MCE's queue). `/servers/available` hands candidates
+  out unlocked and lists a machine AVAILABLE until a cluster reports it, while
+  the BareMetalHost probe only sees the run's OWN MCE — so without the lock a
+  server installed into MCE-A is drawn again for MCE-B. Taken after the probe,
+  before any write; holder `install-server` + the run's workflow id, so a retry
+  or a renewal EXTENDS it; renewed as the Agent wait begins; held a day after
+  success; released ONLY after a teardown (a failure elsewhere leaves it to its
+  TTL, since half-created resources may still name the machine). A lock held
+  elsewhere is a skip (`reserved`), like every candidate reason. Needs an ADMIN
+  `SERVER_SCAN_API_TOKEN`. Gated by `workflow.patched("server-scan-install-lock")`
+  so runs started before it replay unchanged — keep the patch until none can
+  remain in history.
 - **Select bond members from `interfaces[]`, NEVER from `nic_macs`.**
   server-scan reduces Dell NPAR partitions to one entry per physical port in
   `interfaces` but leaves `nic_macs` whole on purpose, so a 4-port partitioned
@@ -493,9 +507,9 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   InfraEnv to fill plus its MCE cluster; the InfraEnv's name states which hardware it is for
   (`cisco-m6-bat-yam-64c-512gb`) and server names carry the same tokens behind an `ocp-` prefix,
   so the InfraEnv IS the server query. Its id keys on the CANDIDATE POOL — the InfraEnv alone, with
-  no MCE in it — which makes installs drawing from one pool serial: server-scan hands out
-  candidates without reserving them, so two concurrent runs could otherwise draw the same machine,
-  and two MCEs filling an InfraEnv of the same name draw from the same pool.
+  no MCE in it — which makes installs drawing from one pool serial, and two MCEs filling an
+  InfraEnv of the same name draw from the same pool. The install lock (§4) now guards the machine
+  itself, so keying on (pool, MCE) has become possible; it is a separate decision, not yet made.
   `POST /workflows/segment-lifecycle/initialize-segment` is ASYNC (202 + workflow id) and takes
   the full segment definition; poll `GET /workflows/runs/{workflow_id}` for progress/result. The
   `/bulk` variant takes a list and starts ONE WORKFLOW PER SEGMENT (never one batch workflow — each

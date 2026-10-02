@@ -24,6 +24,9 @@ from shared.models.server_lifecycle import (
     BmhResourceRequest,
     BmhState,
     CreatedResource,
+    ReleaseServerRequest,
+    ReserveServerRequest,
+    ServerReservation,
     TeardownResult,
 )
 
@@ -48,6 +51,46 @@ async def acquire_servers(request: AcquireServerRequest) -> list[AcquiredServer]
     AmbiguousServerNameError (409, the name spans several documents) or
     ServerScanAuthError (401/403) — all deterministic and marked non-retryable
     by the workflow; anything else is transient ServerScanError.
+    """
+    ...
+
+
+@activity.defn
+async def reserve_server(request: ReserveServerRequest) -> ServerReservation:
+    """Take server-scan's install lock on one chosen candidate (ADR-0035).
+
+    The guard `/servers/available` cannot give: it hands candidates out
+    unlocked, and a machine stays AVAILABLE there until a cluster reports it.
+    Without the lock a server installed into MCE-A is drawn again by a run
+    for MCE-B, whose BareMetalHost probe only sees MCE-B — two clusters then
+    drive one BMC and nothing reports a conflict.
+
+    Re-taking a lock this run already holds EXTENDS it (same holder and
+    workflow id), so a retry is never a lost race and the same call renews the
+    lock before the Agent wait and after a success.
+
+    Raises ServerReservedError (409, a live lock held by another run — the
+    workflow skips the candidate), ServerNotAvailableError (404, the server left
+    the inventory), ServerScanAuthError (401/403 — the token lacks the ADMIN
+    role) or ServerScanRequestInvalidError (400/422); all non-retryable. A 409
+    for a lost revision race, and anything else, is transient ServerScanError.
+    """
+    ...
+
+
+@activity.defn
+async def release_server(request: ReleaseServerRequest) -> ServerReservation:
+    """Give the install lock back after a candidate was rolled back.
+
+    Not needed for correctness — the lock expires on its own — but without it
+    a rolled-back machine stays undrawable for the rest of its TTL. Never a
+    failure when there is nothing of ours to release: an expired lock, a server
+    gone from the inventory (404) or a lock another run has since taken (409)
+    all answer held=False with `detail` saying which. Only the holder +
+    workflow id release, so another run's lock is never cleared by accident.
+
+    Raises ServerScanAuthError / ServerScanRequestInvalidError (non-retryable);
+    anything else is transient ServerScanError.
     """
     ...
 

@@ -140,6 +140,57 @@ class AcquireServerRequest(BaseModel):
     min_nic_macs: int = 2
 
 
+class ReserveServerRequest(BaseModel):
+    """Take — or extend — server-scan's install lock on one machine (ADR-0035).
+
+    `/servers/available` hands out candidates WITHOUT locking them, because it
+    cannot know which one a caller will choose; the claim belongs to the caller,
+    after it has chosen. server-scan treats a repeat claim with the same
+    `holder` + `workflow_id` as an EXTENSION, never a lost race, which is what
+    makes this safe to retry and lets the same call renew the lock later.
+
+    `server_name` is not sent — the lock is keyed on the `srv_…` id — it only
+    makes a refusal readable.
+    """
+
+    server_id: str = Field(min_length=1)
+    server_name: str
+    holder: str = Field(min_length=1, max_length=64)
+    workflow_id: str = Field(min_length=1)
+    mce_cluster: str = Field(min_length=1)
+    infra_env: str | None = None
+    namespace: str | None = None
+    ttl_seconds: int = Field(ge=300, le=86_400)
+
+
+class ReleaseServerRequest(BaseModel):
+    """Give server-scan's install lock back, so the machine is drawable at once.
+
+    `holder` + `workflow_id` are always sent: without them server-scan treats a
+    release as an operator override and clears ANYONE's lock, and a run whose
+    own lock expired would then free the machine another run had since taken.
+    """
+
+    server_id: str = Field(min_length=1)
+    server_name: str
+    holder: str = Field(min_length=1, max_length=64)
+    workflow_id: str = Field(min_length=1)
+
+
+class ServerReservation(BaseModel):
+    """What a reserve or release left behind on the server.
+
+    `held` is True after a reserve, and False after a release — including the
+    releases server-scan answers without clearing anything (the server has left
+    the inventory, or the lock is no longer ours), which `detail` then names.
+    """
+
+    server_id: str
+    held: bool
+    expires_at: str | None = None
+    detail: str | None = None
+
+
 class BondMember(BaseModel):
     """One resolved bond member: a MAC bound to a logical interface name.
 
@@ -366,3 +417,7 @@ class InstallServerResult(BaseModel):
     # Agent. 1 is the happy path; more means earlier candidates were created,
     # waited on for the full deadline, and rolled back.
     attempts: int = 1
+    # Until when server-scan's install lock keeps the machine out of every
+    # other MCE's draw. None for a run that predates the lock, and for one whose
+    # final extension was refused — which its log then explains.
+    reservation_expires_at: str | None = None

@@ -22,7 +22,11 @@ import respx
 from kubernetes import client as k8s_client
 
 from activities.server_lifecycle import cluster_api
-from activities.server_lifecycle.server_scan import fetch_available_servers
+from activities.server_lifecycle.server_scan import (
+    fetch_available_servers,
+    release_server,
+    reserve_server,
+)
 from shared.exceptions import (
     AmbiguousServerNameError,
     BmhConflictError,
@@ -30,10 +34,17 @@ from shared.exceptions import (
     BmhRequestInvalidError,
     BmhResourceError,
     ServerNotAvailableError,
+    ServerReservedError,
     ServerScanAuthError,
     ServerScanError,
+    ServerScanRequestInvalidError,
 )
-from shared.models.server_lifecycle import AcquireServerRequest, LinkState
+from shared.models.server_lifecycle import (
+    AcquireServerRequest,
+    LinkState,
+    ReleaseServerRequest,
+    ReserveServerRequest,
+)
 
 SS = "http://server-scan.test/api/v1"
 AVAILABLE = f"{SS}/servers/available"
@@ -71,6 +82,139 @@ _ITEM = {
 
 def _payload(*items: dict) -> dict:
     return {"items": list(items), "mode": "pattern", "requested": len(items)}
+
+
+RESERVATION = f"{SS}/servers/srv_1/reservation"
+
+RESERVE = ReserveServerRequest(
+    server_id="srv_1",
+    server_name="ocp-dell-r650-tlv-64c-1024gb-DEL0000485",
+    holder="install-server",
+    workflow_id="install-server-dell-r650-tlv",
+    mce_cluster="ocp4-mce-tlv-01",
+    infra_env="dell-r650-tlv",
+    namespace="multicluster-engine",
+    ttl_seconds=7200,
+)
+RELEASE = ReleaseServerRequest(
+    server_id="srv_1",
+    server_name=RESERVE.server_name,
+    holder="install-server",
+    workflow_id="install-server-dell-r650-tlv",
+)
+
+
+def _problem(status: int, detail: str, **details: object) -> httpx.Response:
+    """server-scan's RFC 9457 envelope, as its exception handler writes it."""
+    return httpx.Response(
+        status, json={"status": status, "detail": detail, "details": details}
+    )
+
+
+class TestTheInstallLock:
+    @respx.mock
+    async def test_a_reserve_sends_who_where_and_for_how_long(self):
+        route = respx.post(RESERVATION).mock(
+            return_value=httpx.Response(
+                200, json={"id": "srv_1", "reservation": {"expires_at": "2026-10-02T12:00:00Z"}}
+            )
+        )
+        held = await reserve_server(SS, "admin-token", RESERVE)
+
+        assert held.held is True
+        assert held.expires_at == "2026-10-02T12:00:00Z"
+        request = route.calls.last.request
+        assert request.headers["Authorization"] == "Bearer admin-token"
+        # The name is for messages only: the lock is keyed on the id in the path.
+        assert json.loads(request.content) == {
+            "holder": "install-server",
+            "workflow_id": "install-server-dell-r650-tlv",
+            "mce_cluster": "ocp4-mce-tlv-01",
+            "infra_env": "dell-r650-tlv",
+            "namespace": "multicluster-engine",
+            "ttl_seconds": 7200,
+        }
+
+    @respx.mock
+    async def test_a_lock_held_by_another_run_is_permanent_and_names_it(self):
+        respx.post(RESERVATION).mock(
+            return_value=_problem(
+                409,
+                "reserved",
+                held_by="install-server",
+                held_for_mce="ocp4-mce-other",
+                workflow_id="install-server-other",
+                expires_at="2026-10-02T12:00:00Z",
+            )
+        )
+        with pytest.raises(ServerReservedError, match="ocp4-mce-other"):
+            await reserve_server(SS, "", RESERVE)
+
+    @respx.mock
+    async def test_a_lost_revision_race_stays_transient(self):
+        # No `held_by`: some other write won (often a collector run), and a
+        # retry either takes the lock or turns into the refusal above.
+        respx.post(RESERVATION).mock(
+            return_value=_problem(409, "modified by another caller", requested_by="install-server")
+        )
+        with pytest.raises(ServerScanError) as excinfo:
+            await reserve_server(SS, "", RESERVE)
+        assert not isinstance(excinfo.value, ServerReservedError)
+
+    @respx.mock
+    async def test_a_server_gone_from_the_inventory_is_permanent(self):
+        respx.post(RESERVATION).mock(return_value=_problem(404, "No server"))
+        with pytest.raises(ServerNotAvailableError):
+            await reserve_server(SS, "", RESERVE)
+
+    @respx.mock
+    @pytest.mark.parametrize("status", [401, 403])
+    async def test_a_token_without_admin_is_permanent_and_says_so(self, status):
+        respx.post(RESERVATION).mock(return_value=_problem(status, "forbidden"))
+        with pytest.raises(ServerScanAuthError, match="ADMIN"):
+            await reserve_server(SS, "viewer-token", RESERVE)
+
+    @respx.mock
+    @pytest.mark.parametrize("status", [400, 422])
+    async def test_a_rejected_body_is_permanent(self, status):
+        respx.post(RESERVATION).mock(return_value=_problem(status, "ttl_seconds"))
+        with pytest.raises(ServerScanRequestInvalidError, match="ttl_seconds"):
+            await reserve_server(SS, "", RESERVE)
+
+    @respx.mock
+    async def test_a_server_error_on_reserve_stays_transient(self):
+        respx.post(RESERVATION).mock(return_value=httpx.Response(503, text="upstream"))
+        with pytest.raises(ServerScanError):
+            await reserve_server(SS, "", RESERVE)
+
+    @respx.mock
+    async def test_a_release_names_its_holder_so_it_never_clears_anothers_lock(self):
+        route = respx.delete(RESERVATION).mock(
+            return_value=httpx.Response(200, json={"id": "srv_1"})
+        )
+        released = await release_server(SS, "", RELEASE)
+
+        assert released.held is False
+        assert released.detail is None
+        # Without both, server-scan treats a release as an operator override.
+        assert json.loads(route.calls.last.request.content) == {
+            "holder": "install-server",
+            "workflow_id": "install-server-dell-r650-tlv",
+        }
+
+    @respx.mock
+    @pytest.mark.parametrize("status", [404, 409])
+    async def test_nothing_of_ours_to_release_is_success(self, status):
+        respx.delete(RESERVATION).mock(return_value=_problem(status, "not yours"))
+        released = await release_server(SS, "", RELEASE)
+        assert released.held is False
+        assert released.detail
+
+    @respx.mock
+    async def test_a_release_without_admin_is_permanent(self):
+        respx.delete(RESERVATION).mock(return_value=_problem(403, "forbidden"))
+        with pytest.raises(ServerScanAuthError):
+            await release_server(SS, "viewer-token", RELEASE)
 
 
 class TestTheInventoryQuery:

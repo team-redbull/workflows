@@ -6,7 +6,8 @@ so what each activity does is readable in one screen. The work itself lives in
 the three modules beside it, each owning one technology and taking plain
 parameters, which is what makes them testable without a Temporal environment:
 
-  * server_scan.py    — the inventory read (httpx against SERVER_SCAN_URL).
+  * server_scan.py    — the inventory read and the install lock (httpx against
+                        SERVER_SCAN_URL).
   * cluster_api.py    — every call to the target cluster's Kubernetes API,
                         including the idempotency rule and error classification.
   * bmh_resources.py  — the three resource BODIES, as pure functions.
@@ -26,7 +27,7 @@ import asyncio
 
 from temporalio import activity
 
-from activities.server_lifecycle import cluster_api
+from activities.server_lifecycle import cluster_api, server_scan
 from activities.server_lifecycle.bmh_resources import (
     AGENT_GROUP,
     AGENT_PLURAL,
@@ -58,6 +59,9 @@ from shared.models.server_lifecycle import (
     BmhResourceRequest,
     BmhState,
     CreatedResource,
+    ReleaseServerRequest,
+    ReserveServerRequest,
+    ServerReservation,
     TeardownResult,
 )
 from shared.settings import ServerLifecycleActivitySettings
@@ -122,6 +126,35 @@ async def acquire_servers(request: AcquireServerRequest) -> list[AcquiredServer]
         request.count,
     )
     return servers
+
+
+@activity.defn
+async def reserve_server(request: ReserveServerRequest) -> ServerReservation:
+    """Take server-scan's install lock on one chosen candidate (ADR-0035)."""
+    reservation = await server_scan.reserve_server(
+        _settings.server_scan_url, _settings.server_scan_api_token, request
+    )
+    activity.logger.info(
+        "Reserved %s in server-scan for MCE %s until %s",
+        request.server_name,
+        request.mce_cluster,
+        reservation.expires_at,
+    )
+    return reservation
+
+
+@activity.defn
+async def release_server(request: ReleaseServerRequest) -> ServerReservation:
+    """Give the install lock back after a candidate was rolled back."""
+    reservation = await server_scan.release_server(
+        _settings.server_scan_url, _settings.server_scan_api_token, request
+    )
+    activity.logger.info(
+        "Released %s in server-scan%s",
+        request.server_name,
+        f" — {reservation.detail}" if reservation.detail else "",
+    )
+    return reservation
 
 
 @activity.defn

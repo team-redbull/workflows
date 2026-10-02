@@ -194,11 +194,23 @@
             <li>it offers two link-up NICs on two distinct physical ports (below);</li>
             <li>those MACs are well-formed;</li>
             <li>it does not already have a <code>BareMetalHost</code> &mdash; one read per surviving
-              candidate, skipped when a <code>server_name</code> was given.</li>
+              candidate, skipped when a <code>server_name</code> was given;</li>
+            <li>no other run holds server-scan&rsquo;s <b>install lock</b> on it (phase
+              <b>reserving-server</b>) &mdash; the lock is taken here, before anything is written.</li>
           </ol>
           <div class="calls">
             <div class="call sm"><span class="verb">GET</span><span class="path">baremetalhosts/&lt;server&gt; <em>· per surviving candidate, on the MCE&rsquo;s queue</em></span></div>
+            <div class="call sm"><span class="verb">POST</span><span class="path">server-scan /servers/{id}/reservation <em>· the chosen candidate</em></span></div>
           </div>
+          <p class="note"><b>The lock is the guard across MCEs.</b> server-scan lists a machine
+          AVAILABLE until a cluster reports it, and the probe above only sees <em>this</em> MCE &mdash; so
+          without it a server installed into MCE-A is drawn again by a run for MCE-B, and both clusters
+          drive one BMC (server-scan&rsquo;s ADR-0035). It is keyed on this run&rsquo;s workflow id, so a
+          retry or a renewal <em>extends</em> it; it is renewed as the Agent wait begins, extended to a day
+          on success (phase <b>holding-server</b>), and released only after a rollback&rsquo;s teardown. A
+          failure anywhere else leaves it to expire, because half-created resources may still name the
+          machine. A lock held elsewhere is a skip; a whole pool held elsewhere fails as
+          <code>ServerReservedError</code>, naming the holder and its MCE.</p>
           <p class="note"><b>Every one of those is a SKIP, not a failed run.</b> The multi-candidate draw
           exists so that one unusable server is a retry, and a reason handled outside this loop would
           quietly break that promise for part of the fleet &mdash; a pool of three would die on a
@@ -271,8 +283,9 @@
             <span class="phase">phase <b>rolling-back</b></span>
           </div>
           <p>No Agent by the deadline is that <b>candidate&rsquo;s</b> failure, not the run&rsquo;s. Its
-          NMStateConfig and BareMetalHost are removed &mdash; which returns the machine to the inventory
-          &mdash; and the loop goes back to step 2 with the next candidate. Only an exhausted pool fails the
+          NMStateConfig and BareMetalHost are removed and its install lock released (phase
+          <b>releasing-server</b>) &mdash; which returns the machine to the inventory &mdash; and the loop
+          goes back to step 2 with the next candidate. Only an exhausted pool fails the
           run, as <code>AgentNeverAppearedError</code>.</p>
           <p>So <b>steps 2&ndash;5 are a loop, not a pipeline.</b> A server cannot be shown to be
           installable without creating its resources and watching what happens, so the draw is a list of
@@ -494,7 +507,7 @@
         &mdash; the bond is the same wiring whichever member became <code>nic1</code>.</p>
       </div>
       <div class="panel">
-        <h3>The id serializes per POOL, and the probe covers the rest</h3>
+        <h3>The id serializes per POOL; the probe and the lock cover the rest</h3>
         <p><code>install-server-&lt;infraEnv&gt;</code> keys on the candidate <b>pool</b>
         (<code>^ocp-&lt;infraEnv&gt;</code>), not on the machine &mdash; which is not known when the run
         starts &mdash; and not on the target. Two MCEs filling an InfraEnv of the same name draw from the
@@ -504,15 +517,16 @@
         &mdash; a second run minutes later, before any cluster has reported the node, so server-scan still
         calls the machine unclaimed &mdash; is what step 3&rsquo;s already-installed probe is for. Without
         it, every create would answer &ldquo;already exists&rdquo; and the run would report success having
-        added nothing.</p>
+        added nothing. A run for a <em>different</em> MCE cannot see that BareMetalHost at all &mdash;
+        that case is the install lock&rsquo;s.</p>
       </div>
     </div>
 
     <div class="panel warn" style="margin-top:20px">
-      <h3>Installing several servers from one pool concurrently is not just a looser id</h3>
-      <p>server-scan hands out candidates <em>without reserving them</em>: two concurrent callers can be
-      drawn the same machine, and nothing changes its lifecycle state until a cluster reports the node
-      minutes later. Parallel installs from one InfraEnv need a real reservation in server-scan first.</p>
+      <h3>Installing several servers from one pool concurrently is now only a looser id</h3>
+      <p>The run locks the machine it chose, so two concurrent runs can no longer end up on the same
+      one. Keying the id on (InfraEnv, MCE) would let two MCEs fill one InfraEnv at once; that is a
+      separate decision and has not been made &mdash; the id is still per pool.</p>
     </div>
   </section>
 
@@ -629,11 +643,14 @@
 
           <tr><td class="k">acquiring-server</td><td class="muted">Asking server-scan for candidates &mdash; it live-rechecks each one</td><td class="muted">seconds to ~1 min (it reaches a vendor manager)</td></tr>
           <tr><td class="k">selecting-server</td><td class="muted">Bond rule + one BareMetalHost read per candidate</td><td class="muted">seconds</td></tr>
+          <tr><td class="k">reserving-server</td><td class="muted">Taking server-scan&rsquo;s install lock on the chosen candidate</td><td class="muted">instant</td></tr>
           <tr><td class="k">creating-secret</td><td class="muted">The BMC credentials Secret</td><td class="muted">instant</td></tr>
           <tr><td class="k">creating-baremetalhost</td><td class="muted">The BareMetalHost</td><td class="muted">instant</td></tr>
           <tr><td class="k">creating-nmstateconfig</td><td class="muted">The bond + tagged VLAN</td><td class="muted">instant</td></tr>
           <tr><td class="k">awaiting-agent</td><td class="muted">Waiting for an Agent to register &mdash; <b>bounded, &le; 1 h</b></td><td class="muted">5&ndash;30 min</td></tr>
           <tr><td class="k">rolling-back</td><td class="muted">Removing a candidate that produced no Agent, then looping to step 3. An exhausted pool fails as <code>AgentNeverAppearedError</code></td><td class="muted">5&ndash;60 s</td></tr>
+          <tr><td class="k">releasing-server</td><td class="muted">Giving the rolled-back candidate&rsquo;s install lock back</td><td class="muted">instant</td></tr>
+          <tr><td class="k">holding-server</td><td class="muted">Extending the lock to a day on success, until server-scan sees the machine in a cluster</td><td class="muted">instant</td></tr>
           <tr><td class="k">completed</td><td class="muted">The server is installable in the InfraEnv</td><td class="muted">&mdash;</td></tr>
         </tbody>
       </table>
@@ -646,7 +663,7 @@
         <tbody>
           <tr><td class="k">MCE_CLUSTER</td><td class="muted"><code>server-lifecycle-config</code></td><td class="muted"><b>Required, no default.</b> Names the queue this worker polls, so it must equal callers&rsquo; <code>mce_cluster</code>.</td></tr>
           <tr><td class="k">SERVER_SCAN_URL</td><td class="muted"><code>server-lifecycle-config</code></td><td class="muted">Inventory API base, <b>including</b> <code>/api/v1</code>.</td></tr>
-          <tr><td class="k">SERVER_SCAN_API_TOKEN</td><td class="muted"><code>server-lifecycle-credentials</code></td><td class="muted">A <b>viewer</b> token is enough &mdash; the endpoint is a GET. May be empty where server-scan runs with auth disabled.</td></tr>
+          <tr><td class="k">SERVER_SCAN_API_TOKEN</td><td class="muted"><code>server-lifecycle-credentials</code></td><td class="muted">An <b>admin</b> token &mdash; the install lock is taken and released through server-scan&rsquo;s mutation endpoints, and a viewer token fails every run with <code>ServerScanAuthError</code>. May be empty where server-scan runs with auth disabled.</td></tr>
           <tr><td class="k">{HP,DELL,CISCO,INTERSIGHT}_BMC_USERNAME / _PASSWORD</td><td class="muted"><code>server-lifecycle-credentials</code></td><td class="muted">What Ironic uses to drive the BMC. server-scan never holds these. A vendor with no pair fails its run with <code>BmcCredentialsMissingError</code>.</td></tr>
           <tr><td class="k">RBAC</td><td class="muted">the chart&rsquo;s Role</td><td class="muted">Namespace-scoped. <code>get</code>,<code>create</code>,<code>delete</code> on <code>secrets</code>; <code>get</code>,<code>create</code>,<code>delete</code>,<code>patch</code> on <code>metal3.io/baremetalhosts</code>; <code>get</code>,<code>create</code>,<code>delete</code> on <code>agent-install.openshift.io/nmstateconfigs</code>; <code>get</code>,<code>list</code> on <code>agent-install.openshift.io/agents</code>. <code>delete</code>+<code>patch</code> are the rollback (detach, then the finalizer); <code>list</code> on agents cannot be a <code>get</code>, because an Agent is matched by MAC. Still no <code>update</code> &mdash; nothing here overwrites an existing resource. A missing verb is a non-retryable <code>BmhPrerequisiteMissingError</code>, not a silent retry loop.</td></tr>
         </tbody>

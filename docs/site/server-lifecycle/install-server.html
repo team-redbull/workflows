@@ -111,6 +111,107 @@
   </section>
 
   <!-- ============================================================== FLOW -->
+  <section id="walkthrough">
+    <div class="sec-head">
+      <div class="eyebrow">Read this first</div>
+      <h2>One run, start to finish &mdash; in plain terms</h2>
+      <p class="lede">The phase-by-phase detail is further down. This is the shape of it: who checks what,
+      which machine is touched when, and what happens when something goes wrong.</p>
+    </div>
+
+    <div class="panel">
+      <h3>The run tries candidates <em>one at a time</em></h3>
+      <p>Say you ask for a server for InfraEnv <code>x</code> on <b>MCE-A</b>, and server-scan returns
+      three candidates, <b>S1, S2, S3</b>. The run does <em>not</em> reserve all three. It takes S1, works
+      on it until S1 either succeeds or is given back, and only then looks at S2. S2 and S3 stay free for
+      everyone else the whole time S1 is being tried.</p>
+      <ol>
+        <li><b>Check S1</b> (seconds, nothing written): a usable name, a known BMC vendor, a BMC address,
+          two link-up NICs on different physical ports, well-formed MACs, and no BareMetalHost for it
+          already in MCE-A. Fails any of these &rarr; skip to S2.</li>
+        <li><b>Lock S1 in server-scan</b> for 2 h, as &ldquo;being installed into MCE-A by this run&rdquo;.
+          Another run already holds it &rarr; skip to S2.</li>
+        <li><b>Create</b> S1&rsquo;s Secret, BareMetalHost and NMStateConfig in MCE-A. Ironic powers the
+          machine on and boots it from the discovery ISO.</li>
+        <li><b>Wait up to 1 hour for an Agent.</b> An Agent is the machine phoning home from the ISO
+          &mdash; proof that the BMC, the bond, the VLAN and DHCP all worked. The lock is renewed for
+          2 h as this wait starts.</li>
+        <li>
+          <b>Agent appears</b> &rarr; extend S1&rsquo;s lock to <b>24 h</b> and finish. The run succeeded;
+          S2 and S3 were never touched.<br>
+          <b>No Agent after 1 h</b> &rarr; delete S1&rsquo;s resources from MCE-A, <b>release</b> its lock
+          (S1 is immediately drawable again) and go back to step 1 with S2.
+        </li>
+      </ol>
+      <p class="note">The run fails only when every candidate was skipped or tried. Its error groups
+      the candidates by reason, because the reasons belong to different people (a pool in use, a collector
+      that cannot read link state, a BMC that never answered, a VLAN with no DHCP). Worst case, three
+      candidates that all fail to boot take about three hours.</p>
+    </div>
+
+    <div class="grid-2" style="margin-top:20px">
+      <div class="panel">
+        <h3>Why the lock exists, and what the 24 h hold is</h3>
+        <p>server-scan learns a machine is taken only when a <b>cluster</b> reports it &mdash; its
+        membership job, every 15 minutes where it is enabled. Until then the machine still reads
+        <code>AVAILABLE</code>. The run&rsquo;s &ldquo;already has a BareMetalHost?&rdquo; check only sees
+        <em>its own</em> MCE, so without a lock a run for <b>MCE-B</b> could draw S1 minutes after MCE-A
+        installed it, and two clusters would drive one BMC.</p>
+        <p>The lock closes that gap: <code>/servers/available</code> never hands out a locked machine. The
+        <b>24 h hold</b> after success writes nothing to any cluster. It only keeps S1 out of every
+        other run&rsquo;s draw until server-scan can see it in a cluster for itself.</p>
+      </div>
+      <div class="panel">
+        <h3>Who checks what</h3>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>Check</th><th>Done by</th></tr></thead>
+            <tbody>
+              <tr><td>Unclaimed by a cluster, not in maintenance, BMC reachable, health tier</td><td class="muted">server-scan</td></tr>
+              <tr><td>Network category HEALTHY &mdash; at least two links observed UP (Dell NPAR already counted per physical port)</td><td class="muted">server-scan (since 2026-09-26)</td></tr>
+              <tr><td>Not locked by another install</td><td class="muted">server-scan (draw) <em>and</em> the lock itself</td></tr>
+              <tr><td>Which two NICs form the bond: MAC present, link UP, different physical ports</td><td class="muted">workflow</td></tr>
+              <tr><td>Name, BMC vendor/driver, BMC address, MAC syntax</td><td class="muted">workflow</td></tr>
+              <tr><td>No BareMetalHost for it in <em>this</em> MCE</td><td class="muted">workflow</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="note">The bond rule overlaps server-scan&rsquo;s network gate on purpose. server-scan
+        decides the machine <em>can</em> be bonded; only the workflow chooses <em>which</em> two NICs, and
+        it is the last check before something is written to a cluster.</p>
+      </div>
+    </div>
+
+    <h3 style="margin:28px 0 10px">What happens when&hellip;</h3>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>Situation</th><th>What the run does</th><th>Where the lock ends up</th></tr></thead>
+        <tbody>
+          <tr><td>A candidate fails a check</td><td class="muted">Skips it, tries the next</td><td class="muted">never taken</td></tr>
+          <tr><td>Another run holds the candidate</td><td class="muted">Skips it, tries the next</td><td class="muted">theirs, untouched</td></tr>
+          <tr><td>The Agent appears</td><td class="muted">Succeeds</td><td class="muted">held 24 h for this run</td></tr>
+          <tr><td>No Agent within 1 h</td><td class="muted">Deletes the candidate&rsquo;s resources, tries the next</td><td class="muted">released at once</td></tr>
+          <tr><td>The lock lapsed mid-install and another run took the machine</td><td class="muted">Deletes <em>its own</em> resources, tries the next</td><td class="muted">the other run&rsquo;s, untouched</td></tr>
+          <tr><td>Every candidate skipped or tried</td><td class="muted">Fails, reasons grouped</td><td class="muted">none left held</td></tr>
+          <tr><td>The run crashes or fails while creating resources (e.g. <code>BmhConflictError</code>)</td><td class="muted">Stops; resources are <b>left</b> on the MCE</td><td class="muted">expires after 2 h</td></tr>
+          <tr><td>An operator cancels the run</td><td class="muted">Stops; resources are <b>left</b>, so you can see how far it got</td><td class="muted">expires on its own</td></tr>
+          <tr><td>No worker is running in that MCE</td><td class="muted">Waits; the <code>progress</code> query names the unserved queue</td><td class="muted">&mdash;</td></tr>
+          <tr><td>The server-scan token lacks the admin role</td><td class="muted">Fails at the first lock, <code>ServerScanAuthError</code></td><td class="muted">never taken</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="panel warn" style="margin-top:20px">
+      <h3>Two known gaps</h3>
+      <p><b>The 24 h hold can run out.</b> If the MCE runs no membership job, or the cluster is not built
+      within a day, server-scan reads the machine as <code>AVAILABLE</code> again and another MCE could
+      draw a machine that is already installed. 24 h is the longest lock server-scan accepts.</p>
+      <p><b>A crash mid-create strands resources.</b> The BareMetalHost stays on the MCE while the lock
+      expires after 2 h, so after that the machine is drawable while still pointing at one cluster.
+      Clean these up by hand, or re-run with <code>server_name</code> set to that machine to converge on them.</p>
+    </div>
+  </section>
+
   <section id="flow">
     <div class="sec-head">
       <div class="eyebrow">Five phases, in order</div>
@@ -380,13 +481,16 @@
     </div>
 
     <div class="panel" style="margin-top:20px">
-      <h3>Why a health filter is not enough on its own</h3>
+      <h3>Why the overall health tier is not enough on its own</h3>
       <p>server-scan&rsquo;s rollup is <code>max(category severities)</code>, and <code>UNKNOWN</code>
       ranks <em>below</em> <code>HEALTHY</code> &mdash; so a category that was never read cannot lower it.
       A server whose NIC read failed has no network facts to fail a policy on, and comes out
-      <code>HEALTHY</code> overall. Hence <code>min_nic_macs=2</code> on the query <em>and</em> the
-      structural rule above: the health tier says nothing bad was observed, and these say the machine is
-      actually installable.</p>
+      <code>HEALTHY</code> overall.</p>
+      <p>server-scan closes that itself since 2026-09-26: <code>/servers/available</code> also requires
+      the <b>network</b> category to be <code>HEALTHY</code>, which it is only when at least two links
+      were observed UP. <code>min_nic_macs=2</code> on the query predates that gate and now adds little
+      beyond &ldquo;the MACs were read this run&rdquo;. The rule above is still applied here, because it
+      is what picks the two bond members.</p>
     </div>
   </section>
 

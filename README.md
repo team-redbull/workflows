@@ -117,7 +117,69 @@ per-segment status — which is what lets the bulk route start N of them.
 ### `install-server` — put a server into an MCE inventory
 
 `POST /workflows/server-lifecycle/install-server` with the **InfraEnv** to fill
-and its **MCE cluster**. The run:
+and its **MCE cluster**.
+
+#### In plain terms — read this first
+
+Say you ask for a server for InfraEnv `x` on **MCE-A** and server-scan returns
+three candidates, **S1, S2, S3**. The run does **not** reserve all three: it
+works on S1 until S1 succeeds or is given back, and only then looks at S2. S2
+and S3 stay free for everyone else meanwhile.
+
+1. **Check S1** (seconds, nothing written): usable name, known BMC vendor, a
+   BMC address, two link-up NICs on different physical ports, well-formed MACs,
+   no BareMetalHost for it already in MCE-A. Fails one → skip to S2.
+2. **Lock S1 in server-scan** for 2 h ("being installed into MCE-A by this
+   run"). Another run holds it → skip to S2.
+3. **Create** S1's Secret, BareMetalHost and NMStateConfig in MCE-A.
+4. **Wait up to 1 h for an Agent** — the machine phoning home from the
+   discovery ISO, proof that the BMC, bond, VLAN and DHCP all worked. The lock
+   is renewed for 2 h as the wait starts.
+5. **Agent** → extend S1's lock to **24 h** and finish; S2 and S3 never touched.
+   **No Agent after 1 h** → delete S1's resources, **release** its lock (S1 is
+   drawable again at once), back to step 1 with S2.
+
+The run fails only when every candidate was skipped or tried (worst case about
+3 h for three that never boot), with the reasons grouped.
+
+**Why the lock, and what the 24 h hold is.** server-scan learns a machine is
+taken only when a *cluster* reports it (its membership job, every 15 min where
+enabled); until then it reads `AVAILABLE`. The "already has a BareMetalHost?"
+check sees only *this* MCE, so without the lock a run for MCE-B could draw S1
+minutes after MCE-A installed it. `/servers/available` never hands out a locked
+machine. The 24 h hold after success writes nothing to any cluster — it only
+keeps S1 out of other draws until server-scan can see it in a cluster itself.
+
+**Who checks what.** server-scan: unclaimed, not in maintenance, BMC
+reachable, health tier, the **network category HEALTHY — at least two links
+observed UP** (since 2026-09-26; Dell NPAR already reduced to one entry per
+physical port), and not locked. The workflow: *which* two NICs form the bond,
+the name, BMC driver and address, MAC syntax, and no BareMetalHost in this MCE.
+The bond rule overlaps server-scan's network gate on purpose — server-scan says
+the machine *can* be bonded; the workflow picks the two NICs and is the last
+check before a cluster write. (`min_nic_macs=2` predates that gate and now adds
+little beyond "the MACs were read this run".)
+
+| What happens when… | The run | The lock |
+| --- | --- | --- |
+| a candidate fails a check | skips it | never taken |
+| another run holds the candidate | skips it | theirs, untouched |
+| the Agent appears | succeeds | held 24 h |
+| no Agent within 1 h | deletes the candidate's resources, tries the next | released at once |
+| the lock lapsed and another run took the machine | deletes its *own* resources, tries the next | theirs, untouched |
+| every candidate skipped or tried | fails, reasons grouped | none held |
+| crash/failure while creating resources | stops, resources **left** on the MCE | expires after 2 h |
+| operator cancels | stops, resources **left** to show progress | expires |
+| no worker in that MCE | waits; `progress` names the queue | — |
+| server-scan token not admin | fails at the first lock (`ServerScanAuthError`) | never taken |
+
+**Known gaps.** (1) The 24 h hold can run out: with no membership job on that
+MCE, or a cluster not built within a day, the machine reads `AVAILABLE` again
+and another MCE could draw it — 24 h is server-scan's ceiling. (2) A crash
+mid-create leaves the BareMetalHost on the MCE while the lock expires after
+2 h; clean up by hand, or re-run with `server_name` set to that machine.
+
+#### Phase by phase
 
 1. **resolving-vlan** — the MCE's `INVENTORY` segment, read from the Segments
    Manager by **cluster name**. Before the draw, because no candidate could make

@@ -386,6 +386,53 @@ class InvalidServerNameError(OrchestratorError):
     """
 
 
+class PxeSiteNotConfiguredError(OrchestratorError):
+    """No PXE map host is configured for the site an IPMI server boots at.
+
+    An IPMI BMC cannot mount virtual media, so a UCS blade boots from the
+    network and the site's PXE VM must be told which iPXE script to hand its
+    MACs. PXE_MAP_URLS on this MCE's worker has no entry for that site, so
+    there is nobody to tell. Deterministic — an operator adds the entry.
+    install-server treats it as a SKIP: a Redfish candidate in the same draw
+    needs no PXE map and may still be installable.
+    """
+
+
+class InfraEnvNotFoundError(OrchestratorError):
+    """The InfraEnv the run fills does not exist in the target namespace.
+
+    Its iPXE script URL is what an IPMI server is pointed at, so without it
+    there is nothing to boot. Deterministic — the InfraEnv is created by
+    whoever defines it, not by a retry.
+    """
+
+
+class InfraEnvNotReadyError(OrchestratorError):
+    """The InfraEnv exists but publishes no iPXE script URL yet.
+
+    assisted-service fills `status.bootArtifacts.ipxeScript` once it has
+    generated the discovery image, which follows the InfraEnv's creation by
+    seconds to minutes. Transient by classification — retried.
+    """
+
+
+class PxeMapError(OrchestratorError):
+    """The site's PXE map service failed or was unreachable. Retried."""
+
+
+class PxeMapAuthError(OrchestratorError):
+    """The PXE map service rejected PXE_MAP_TOKEN (401/403). Deterministic."""
+
+
+class PxeMapRequestRejectedError(OrchestratorError):
+    """The PXE map service refused the request (400/404/422).
+
+    The body is the same on every attempt, so a retry reproduces it. A 404 on
+    the PUT path usually means the configured URL points at the wrong service.
+    Deterministic — non-retryable.
+    """
+
+
 # -- Server-provisioning domain (provision-dell-server) -----------------------
 
 

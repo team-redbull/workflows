@@ -225,6 +225,33 @@ class BmhResourceRequest(BaseModel):
     labels: dict[str, str] = Field(default_factory=dict)
 
 
+class PxeBootRequest(BaseModel):
+    """Point an IPMI server's NICs at the InfraEnv's iPXE script.
+
+    `site` picks the PXE VM: it is the site of the MCE's inventory segment —
+    the network the host DHCPs on, and so the site whose PXE VM answers it.
+    `macs` are BOTH bond members, for the reason AgentRef carries both: which
+    NIC the firmware PXE-boots from is not knowable in advance.
+
+    The iPXE URL is NOT here: the activity reads it from the InfraEnv on the
+    MCE itself, so it never enters workflow history.
+    """
+
+    server_name: str = Field(min_length=1)
+    namespace: str = Field(min_length=1)
+    infra_env: str = Field(min_length=1)
+    site: str = Field(min_length=1)
+    macs: list[str] = Field(min_length=1)
+
+
+class PxeBootRegistration(BaseModel):
+    """What register_pxe_boot told the site's PXE VM."""
+
+    site: str
+    pxe_map_url: str
+    macs: list[str]
+
+
 class CreatedResource(BaseModel):
     """The outcome of one idempotent create.
 
@@ -420,3 +447,7 @@ class InstallServerResult(BaseModel):
     # other MCE's draw. None for a run that predates the lock, and for one whose
     # final extension was refused — which its log then explains.
     reservation_expires_at: str | None = None
+    # Whether the bond MACs were mapped to the InfraEnv's iPXE script on the
+    # site's PXE VM — True only for an IPMI (network-booted) server. Defaulted
+    # for result payloads recorded before the field existed.
+    pxe_registered: bool = False

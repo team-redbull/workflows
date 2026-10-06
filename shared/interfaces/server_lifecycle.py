@@ -24,6 +24,8 @@ from shared.models.server_lifecycle import (
     BmhResourceRequest,
     BmhState,
     CreatedResource,
+    PxeBootRegistration,
+    PxeBootRequest,
     ReleaseServerRequest,
     ReserveServerRequest,
     ServerReservation,
@@ -91,6 +93,30 @@ async def release_server(request: ReleaseServerRequest) -> ServerReservation:
 
     Raises ServerScanAuthError / ServerScanRequestInvalidError (non-retryable);
     anything else is transient ServerScanError.
+    """
+    ...
+
+
+@activity.defn
+async def register_pxe_boot(request: PxeBootRequest) -> PxeBootRegistration:
+    """Map an IPMI server's MACs to the InfraEnv's iPXE script on the site's PXE VM.
+
+    Only for a network-booted host: an IPMI BMC has no virtual media, so Ironic
+    can only power it on and set it to PXE-boot, and the site's PXE VM decides
+    what it boots by MAC. Called BEFORE the BareMetalHost is created — the
+    moment Ironic registers the host it may power it on, and a host that PXE
+    boots before its MACs are mapped boots nothing.
+
+    Reads `status.bootArtifacts.ipxeScript` from the InfraEnv on THIS MCE, then
+    `PUT /pxe-map/<mac>` (lower-case hex, no separators) with that URL, once per
+    MAC, to the PXE VM PXE_MAP_URLS names for the site. A PUT is an upsert, so
+    a retry or a re-run converges.
+
+    Raises PxeSiteNotConfiguredError (no PXE VM for the site — the workflow
+    skips the candidate), InfraEnvNotFoundError, PxeMapAuthError,
+    PxeMapRequestRejectedError (all non-retryable) and the cluster read's own
+    BmhPrerequisiteMissingError (403: no `get` on infraenvs). InfraEnvNotReadyError
+    (no iPXE URL published yet) and PxeMapError are transient.
     """
     ...
 

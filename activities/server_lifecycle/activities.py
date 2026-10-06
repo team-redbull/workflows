@@ -3,11 +3,13 @@
 These run in the `server-lifecycle-worker` deployment, ONE PER MCE CLUSTER. This
 module is deliberately thin: it is the @activity.defn surface and nothing else,
 so what each activity does is readable in one screen. The work itself lives in
-the three modules beside it, each owning one technology and taking plain
+the modules beside it, each owning one technology and taking plain
 parameters, which is what makes them testable without a Temporal environment:
 
   * server_scan.py    — the inventory read and the install lock (httpx against
                         SERVER_SCAN_URL).
+  * pxe_map.py        — the site PXE VM's MAC -> iPXE map, for IPMI servers
+                        (httpx against PXE_MAP_URLS[site]).
   * cluster_api.py    — every call to the target cluster's Kubernetes API,
                         including the idempotency rule and error classification.
   * bmh_resources.py  — the three resource BODIES, as pure functions.
@@ -27,7 +29,7 @@ import asyncio
 
 from temporalio import activity
 
-from activities.server_lifecycle import cluster_api, server_scan
+from activities.server_lifecycle import cluster_api, pxe_map, server_scan
 from activities.server_lifecycle.bmh_resources import (
     AGENT_GROUP,
     AGENT_PLURAL,
@@ -37,6 +39,9 @@ from activities.server_lifecycle.bmh_resources import (
     BMH_PLURAL,
     BMH_VERSION,
     DETACHED_ANNOTATION,
+    INFRAENV_GROUP,
+    INFRAENV_PLURAL,
+    INFRAENV_VERSION,
     NMSTATE_GROUP,
     NMSTATE_PLURAL,
     NMSTATE_VERSION,
@@ -45,11 +50,18 @@ from activities.server_lifecycle.bmh_resources import (
     build_baremetal_host,
     build_bmc_secret,
     build_nmstate_config,
+    infraenv_ipxe_script_url,
     nmstate_config_differences,
 )
 from activities.server_lifecycle.server_scan import fetch_available_servers
 from shared.bmc_address import k8s_resource_name, nmstate_config_name
-from shared.exceptions import BmcCredentialsMissingError, BmhTeardownError
+from shared.exceptions import (
+    BmcCredentialsMissingError,
+    BmhTeardownError,
+    InfraEnvNotFoundError,
+    InfraEnvNotReadyError,
+    PxeSiteNotConfiguredError,
+)
 from shared.models.server_lifecycle import (
     AcquiredServer,
     AcquireServerRequest,
@@ -59,6 +71,8 @@ from shared.models.server_lifecycle import (
     BmhResourceRequest,
     BmhState,
     CreatedResource,
+    PxeBootRegistration,
+    PxeBootRequest,
     ReleaseServerRequest,
     ReserveServerRequest,
     ServerReservation,
@@ -71,6 +85,7 @@ _settings = ServerLifecycleActivitySettings()
 _BMH_KIND = "BareMetalHost"
 _NMSTATE_KIND = "NMStateConfig"
 _AGENT_KIND = "Agent"
+_INFRAENV_KIND = "InfraEnv"
 
 # How long teardown waits for the BareMetalHost to actually disappear after the
 # delete, before dropping the finalizer itself. Short on purpose: the object is
@@ -155,6 +170,54 @@ async def release_server(request: ReleaseServerRequest) -> ServerReservation:
         f" — {reservation.detail}" if reservation.detail else "",
     )
     return reservation
+
+
+@activity.defn
+async def register_pxe_boot(request: PxeBootRequest) -> PxeBootRegistration:
+    """Map an IPMI server's MACs to the InfraEnv's iPXE script on the site's PXE VM."""
+    # The site first: a missing entry is the candidate's skip, and costs nothing
+    # on the cluster to find out.
+    base_url = _settings.pxe_map_urls.get(request.site)
+    if not base_url:
+        raise PxeSiteNotConfiguredError(
+            f"{request.server_name} boots over IPMI from the network, but no PXE "
+            f"map host is configured for site {request.site!r}: add it to "
+            f"PXE_MAP_URLS (configured: {sorted(_settings.pxe_map_urls)})"
+        )
+
+    infra_env = await cluster_api.read_custom_object(
+        group=INFRAENV_GROUP,
+        version=INFRAENV_VERSION,
+        plural=INFRAENV_PLURAL,
+        kind=_INFRAENV_KIND,
+        namespace=request.namespace,
+        name=request.infra_env,
+    )
+    if infra_env is None:
+        raise InfraEnvNotFoundError(
+            f"InfraEnv {request.infra_env} does not exist in {request.namespace}, "
+            "so there is no iPXE script to boot from"
+        )
+    ipxe_url = infraenv_ipxe_script_url(infra_env)
+    if ipxe_url is None:
+        raise InfraEnvNotReadyError(
+            f"InfraEnv {request.infra_env} publishes no "
+            "status.bootArtifacts.ipxeScript yet"
+        )
+
+    for mac in request.macs:
+        await pxe_map.put_mapping(base_url, _settings.pxe_map_token, mac, ipxe_url)
+    activity.logger.info(
+        "Mapped %s (%s) to InfraEnv %s's iPXE script on the %s PXE VM %s",
+        request.server_name,
+        request.macs,
+        request.infra_env,
+        request.site,
+        base_url,
+    )
+    return PxeBootRegistration(
+        site=request.site, pxe_map_url=base_url, macs=list(request.macs)
+    )
 
 
 @activity.defn

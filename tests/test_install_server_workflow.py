@@ -30,6 +30,8 @@ from shared.consts import (
 )
 from shared.exceptions import (
     InventorySegmentNotFoundError,
+    PxeMapAuthError,
+    PxeSiteNotConfiguredError,
     ServerNotAvailableError,
     ServerReservedError,
     ServerScanAuthError,
@@ -48,6 +50,8 @@ from shared.models.server_lifecycle import (
     InstallServerInput,
     InstallServerRunArgs,
     LinkState,
+    PxeBootRegistration,
+    PxeBootRequest,
     ReleaseServerRequest,
     ReserveServerRequest,
     ServerInterface,
@@ -147,6 +151,22 @@ def npar_server(server_id: str = "srv_npar") -> AcquiredServer:
     )
 
 
+def ucs_server(
+    server_id: str = "srv_ucs",
+    name: str = "ocp-cisco-m6-bat-yam-64c-512gb-FCH0001",
+    mac_prefix: str = "00:25:b5:00:00",
+) -> AcquiredServer:
+    """A UCS-managed Cisco blade: driven over IPMI, so it boots from the network."""
+    return bondable_server(server_id, name=name, mac_prefix=mac_prefix).model_copy(
+        update={
+            "vendor": "cisco",
+            "source_provider": "UCS_CENTRAL",
+            "bmc_vendor": "CISCO",
+            "bmc": BmcEndpoint(host="10.11.2.10", host_is_ip=True),
+        }
+    )
+
+
 def make_mock_activities(
     *,
     candidates: list[AcquiredServer] | None = None,
@@ -165,6 +185,8 @@ def make_mock_activities(
     gone_from_inventory: set[str] | None = None,
     lock_lapses_for: set[str] | None = None,
     reserve_error: Exception | None = None,
+    pxe_sites: set[str] | None = None,
+    pxe_error: Exception | None = None,
 ):
     """Build the full mock activity set + a call recorder.
 
@@ -198,8 +220,12 @@ def make_mock_activities(
             "teardown_bmh_resources",
             "reserve_server",
             "release_server",
+            "register_pxe_boot",
+            # Activity names in call order, for the ones whose ORDER matters.
+            "order",
         )
     }
+    configured_pxe_sites = {"bat-yam"} if pxe_sites is None else pxe_sites
     drawn = candidates if candidates is not None else [bondable_server()]
     script = list(bmh_script or [])
     installed = already_installed or set()
@@ -229,13 +255,31 @@ def make_mock_activities(
         return CreatedResource(kind=kind, name=name, changed=not resources_exist)
 
     @activity.defn
+    async def register_pxe_boot(request: PxeBootRequest) -> PxeBootRegistration:
+        calls["register_pxe_boot"].append(request)
+        calls["order"].append("register_pxe_boot")
+        if pxe_error is not None:
+            raise pxe_error
+        if request.site not in configured_pxe_sites:
+            raise PxeSiteNotConfiguredError(
+                f"no PXE map host is configured for site {request.site!r}"
+            )
+        return PxeBootRegistration(
+            site=request.site,
+            pxe_map_url=f"http://pxe.{request.site}.test:8080",
+            macs=request.macs,
+        )
+
+    @activity.defn
     async def create_bmc_secret(request: BmhResourceRequest) -> CreatedResource:
         calls["create_bmc_secret"].append(request)
+        calls["order"].append("create_bmc_secret")
         return _created("Secret", f"dell-cred-{request.server_name}")
 
     @activity.defn
     async def create_baremetal_host(request: BmhResourceRequest) -> CreatedResource:
         calls["create_baremetal_host"].append(request)
+        calls["order"].append("create_baremetal_host")
         return _created("BareMetalHost", request.server_name)
 
     @activity.defn
@@ -351,6 +395,7 @@ def make_mock_activities(
         teardown_bmh_resources,
         reserve_server,
         release_server,
+        register_pxe_boot,
     ]
     return calls, segment_activities, server_activities
 
@@ -1115,3 +1160,103 @@ class TestTheInstallLock:
         # Once: permanent, not retried every minute, and not a per-candidate skip.
         assert len(calls["reserve_server"]) == 1
         assert calls["create_bmc_secret"] == []
+
+
+class TestThePxeBootOfAnIpmiServer:
+    """An IPMI BMC has no virtual media, so a UCS blade boots from the network.
+
+    The site's PXE VM serves the InfraEnv's iPXE script by MAC, and has to be
+    told so BEFORE the BareMetalHost exists: Ironic may power the host on the
+    moment it registers it.
+    """
+
+    async def test_a_ucs_blade_is_mapped_before_anything_is_created(self):
+        calls, segment_acts, server_acts = make_mock_activities(candidates=[ucs_server()])
+        async with _Harness(segment_acts, server_acts) as client:
+            result = await _execute(client, InstallServerRunArgs(input=INPUT))
+
+        assert result.pxe_registered is True
+        assert calls["order"][:3] == [
+            "register_pxe_boot",
+            "create_bmc_secret",
+            "create_baremetal_host",
+        ]
+        request = calls["register_pxe_boot"][0]
+        # The SITE comes from the MCE's inventory segment — the network the host
+        # DHCPs on — and the InfraEnv is the one being filled.
+        assert request.site == INVENTORY_SEGMENT.site
+        assert request.infra_env == INFRA_ENV
+        assert request.namespace == NAMESPACE
+        # Both bond members: which NIC the firmware PXE-boots is not knowable.
+        assert request.macs == ["00:25:b5:00:00:01", "00:25:b5:00:00:02"]
+
+    async def test_a_redfish_server_never_touches_the_pxe_map(self):
+        calls, segment_acts, server_acts = make_mock_activities()
+        async with _Harness(segment_acts, server_acts) as client:
+            result = await _execute(client, InstallServerRunArgs(input=INPUT))
+
+        assert result.pxe_registered is False
+        assert calls["register_pxe_boot"] == []
+
+    async def test_the_mapping_follows_the_lock(self):
+        # Mapping a machine another MCE's run holds would repoint ITS boot.
+        calls, segment_acts, server_acts = make_mock_activities(
+            candidates=[ucs_server()], reserved_elsewhere={ucs_server().name}
+        )
+        async with _Harness(segment_acts, server_acts) as client:
+            with pytest.raises(WorkflowFailureError):
+                await _execute(client, InstallServerRunArgs(input=INPUT))
+
+        assert calls["register_pxe_boot"] == []
+
+    async def test_a_site_without_a_pxe_vm_is_a_skip_and_releases_the_lock(self):
+        """A Redfish machine later in the draw needs no PXE map at all."""
+        calls, segment_acts, server_acts = make_mock_activities(
+            candidates=[ucs_server(), bondable_server()], pxe_sites=set()
+        )
+        async with _Harness(segment_acts, server_acts) as client:
+            result = await _execute(client, InstallServerRunArgs(input=INPUT))
+
+        assert result.server_name == SERVER_NAME
+        assert result.attempts == 1
+        # Nothing was written for the blade, and its lock went straight back.
+        assert [c.server_name for c in calls["create_bmc_secret"]] == [SERVER_NAME]
+        assert calls["teardown_bmh_resources"] == []
+        assert [r.server_id for r in calls["release_server"]] == ["srv_ucs"]
+
+    async def test_a_pool_of_blades_at_an_unmapped_site_fails_naming_the_fix(self):
+        calls, segment_acts, server_acts = make_mock_activities(
+            candidates=[ucs_server()], pxe_sites=set()
+        )
+        async with _Harness(segment_acts, server_acts) as client:
+            with pytest.raises(WorkflowFailureError) as excinfo:
+                await _execute(client, InstallServerRunArgs(input=INPUT))
+
+        error = _application_error(excinfo.value)
+        assert error.type == "PxeSiteNotConfiguredError"
+        assert "PXE_MAP_URLS" in error.message
+        assert "bat-yam" in error.message
+        assert calls["create_bmc_secret"] == []
+
+    async def test_a_rejected_pxe_token_fails_the_run(self):
+        # No other blade would fare differently, so it is not a skip.
+        calls, segment_acts, server_acts = make_mock_activities(
+            candidates=[ucs_server()], pxe_error=PxeMapAuthError("check PXE_MAP_TOKEN")
+        )
+        async with _Harness(segment_acts, server_acts) as client:
+            with pytest.raises(WorkflowFailureError) as excinfo:
+                await _execute(client, InstallServerRunArgs(input=INPUT))
+
+        assert _application_error(excinfo.value).type == "PxeMapAuthError"
+        assert len(calls["register_pxe_boot"]) == 1
+        assert calls["create_bmc_secret"] == []
+
+    async def test_a_blade_with_no_agent_points_the_diagnosis_at_the_pxe_map_too(self):
+        calls, segment_acts, server_acts = make_mock_activities(
+            candidates=[ucs_server()], agent_never_for={ucs_server().name}
+        )
+        async with _Harness(segment_acts, server_acts) as client:
+            with pytest.raises(WorkflowFailureError) as excinfo:
+                await _execute(client, InstallServerRunArgs(input=INPUT))
+
+        assert "PXE map" in _application_error(excinfo.value).message

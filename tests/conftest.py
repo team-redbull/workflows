@@ -49,6 +49,11 @@ os.environ.update(
         "DELL_BMC_PASSWORD": "test-dell-pass",
         "HP_BMC_USERNAME": "test-hp-user",
         "HP_BMC_PASSWORD": "test-hp-pass",
+        "CISCO_BMC_USERNAME": "test-cisco-user",
+        "CISCO_BMC_PASSWORD": "test-cisco-pass",
+        # --- install-server: the site PXE map, for IPMI servers ---
+        "PXE_MAP_URLS": '{"bat-yam": "http://pxe.bat-yam.test:8080"}',
+        "PXE_MAP_TOKEN": "test-pxe-token",
         # --- provision-dell-server: OME, iDRAC root, templates, naming service ---
         "OME_URL": "https://ome.test",
         "OME_USERNAME": "test-ome-user",

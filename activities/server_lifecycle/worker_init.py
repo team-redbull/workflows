@@ -12,8 +12,8 @@ OUT. The hub never needs inbound access to an MCE.
 A separate deployment from the segment-lifecycle limb because the driver for
 one is the dependency + credential set, and this one's is entirely different: a
 Kubernetes client with RBAC to create BareMetalHosts, Secrets and
-NMStateConfigs in the target namespace, plus per-vendor BMC credentials and a
-server-scan token.
+NMStateConfigs (and read InfraEnvs) in the target namespace, plus per-vendor BMC
+credentials, a server-scan token and, for IPMI servers, the site PXE map's.
 
 install-server's VLAN lookup is deliberately NOT registered here: it reads the
 Segments Manager, whose credential lives on the segment-lifecycle limb, so the
@@ -41,6 +41,7 @@ from activities.server_lifecycle.activities import (
     create_nmstate_config,
     find_agent_for_host,
     get_baremetal_host,
+    register_pxe_boot,
     release_server,
     reserve_server,
     teardown_bmh_resources,
@@ -69,6 +70,7 @@ async def main() -> None:
         activities=[
             # install-server
             acquire_servers,
+            register_pxe_boot,
             create_bmc_secret,
             create_baremetal_host,
             create_nmstate_config,

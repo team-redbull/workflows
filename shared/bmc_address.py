@@ -57,6 +57,21 @@ _DEFAULT_IPMI_PORT = 623
 BMC_VENDORS = frozenset(_DRIVER_BY_VENDOR)
 
 
+def boots_from_network(bmc_vendor: str) -> bool:
+    """Whether this vendor's driver has no virtual media, so the host PXE-boots.
+
+    Read off the driver map rather than a second vendor list, so a vendor moved
+    to another driver changes both at once. Today that is IPMI — a UCS-managed
+    Cisco blade — for which Ironic can only power the host on and set it to
+    boot from the network; the site's PXE VM serves it the InfraEnv's iPXE
+    script, by MAC.
+
+    Raises:
+        KeyError: the vendor has no driver mapping (see build_bmc_address).
+    """
+    return _DRIVER_BY_VENDOR[bmc_vendor.upper()] == "ipmi"
+
+
 def build_bmc_address(bmc_vendor: str, bmc: BmcEndpoint) -> str:
     """The Ironic BMC address for a BareMetalHost's `spec.bmc.address`.
 

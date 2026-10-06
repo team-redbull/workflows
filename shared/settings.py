@@ -227,6 +227,31 @@ class ServerLifecycleActivitySettings(BaseSettings):
     intersight_bmc_username: str = ""
     intersight_bmc_password: str = ""
 
+    # --- PXE map: the network-boot path for IPMI servers --------------------
+    # An IPMI BMC (a UCS-managed Cisco blade) has no virtual media, so the host
+    # PXE-boots and the site's PXE VM serves it the InfraEnv's iPXE script by
+    # MAC. Site -> that VM's base URL, e.g. {"bat-yam": "http://10.20.90.5:8080"};
+    # the site is the MCE inventory segment's, as the Segments Manager names it.
+    #
+    # Defaulted EMPTY, unlike most keys: only an IPMI install needs it, and a
+    # required key would crash-loop every MCE's worker until its chart shipped
+    # one. An IPMI candidate at a site that is not listed is skipped with
+    # PxeSiteNotConfiguredError; Redfish candidates never read this.
+    pxe_map_urls: dict[str, str] = {}
+    pxe_map_token: str = ""
+
+    @field_validator("pxe_map_urls")
+    @classmethod
+    def _validate_pxe_map_urls(cls, urls: dict[str, str]) -> dict[str, str]:
+        """Every entry an http(s) base URL — a typo fails at startup, not mid-install."""
+        for site, url in urls.items():
+            if not site or not url.startswith(("http://", "https://")):
+                raise ValueError(
+                    f"pxe_map_urls[{site!r}] must be an http:// or https:// base "
+                    f"URL (got {url!r})"
+                )
+        return {site: url.rstrip("/") for site, url in urls.items()}
+
 
 class ServerProvisioningActivitySettings(BaseSettings):
     """Config for the server-provisioning activity worker only.

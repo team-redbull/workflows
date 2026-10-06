@@ -43,6 +43,10 @@ AGENT_GROUP = "agent-install.openshift.io"
 AGENT_VERSION = "v1beta1"
 AGENT_PLURAL = "agents"
 
+INFRAENV_GROUP = "agent-install.openshift.io"
+INFRAENV_VERSION = "v1beta1"
+INFRAENV_PLURAL = "infraenvs"
+
 # Tells metal3 to stop managing a host WITHOUT deprovisioning it. A teardown
 # sets this before deleting, because deprovisioning talks to the BMC and a
 # rollback happens precisely when that BMC never answered.
@@ -328,6 +332,16 @@ def nmstate_config_differences(
         ),
     ]
     return [c for c in checks if c is not None]
+
+
+def infraenv_ipxe_script_url(infra_env: dict[str, Any]) -> str | None:
+    """The iPXE script URL an InfraEnv publishes, or None until it has one.
+
+    assisted-service fills `status.bootArtifacts.ipxeScript` once the discovery
+    image exists, so an InfraEnv seconds old legitimately has none yet.
+    """
+    artifacts = (infra_env.get("status") or {}).get("bootArtifacts") or {}
+    return artifacts.get("ipxeScript") or None
 
 
 def agent_matches_macs(agent: dict[str, Any], macs: Iterable[str]) -> bool:

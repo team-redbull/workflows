@@ -29,6 +29,13 @@ Shape of the run:
      reserving-server    — server-scan's install lock on the chosen machine
                            (ADR-0035). A lock another run holds is one more
                            skip reason.
+     registering-pxe-boot — IPMI servers only (a UCS-managed blade). IPMI has
+                           no virtual media, so the host PXE-boots and the PXE
+                           VM of the inventory segment's SITE must map both
+                           bond MACs to the InfraEnv's iPXE script BEFORE the
+                           BareMetalHost exists — Ironic may power the host on
+                           the moment it registers it. A site with no PXE VM
+                           configured is a skip.
   4. creating-secret
      creating-baremetalhost
      creating-nmstateconfig  — all idempotent; an existing resource is success.
@@ -131,6 +138,7 @@ from temporalio.exceptions import ActivityError, ApplicationError
 with workflow.unsafe.imports_passed_through():
     from shared.bmc_address import (
         BMC_VENDORS,
+        boots_from_network,
         build_bmc_address,
         is_k8s_resource_name,
     )
@@ -147,11 +155,15 @@ with workflow.unsafe.imports_passed_through():
         AgentNeverAppearedError,
         BmhPrerequisiteMissingError,
         BmhRequestInvalidError,
+        InfraEnvNotFoundError,
         InvalidMacError,
         InvalidServerNameError,
         InventorySegmentMismatchError,
         InventorySegmentNotFoundError,
         NoBondableInterfacesError,
+        PxeMapAuthError,
+        PxeMapRequestRejectedError,
+        PxeSiteNotConfiguredError,
         SegmentsManagerAuthError,
         ServerNotAvailableError,
         ServerReservedError,
@@ -168,6 +180,7 @@ with workflow.unsafe.imports_passed_through():
         create_nmstate_config,
         find_agent_for_host,
         get_baremetal_host,
+        register_pxe_boot,
         release_server,
         reserve_server,
         teardown_bmh_resources,
@@ -186,6 +199,7 @@ with workflow.unsafe.imports_passed_through():
         InstallServerInput,
         InstallServerResult,
         InstallServerRunArgs,
+        PxeBootRequest,
         ReleaseServerRequest,
         ReserveServerRequest,
         ServerReservation,
@@ -228,6 +242,10 @@ _PERMANENT_ACTIVITY_ERRORS: tuple[type[Exception], ...] = (
     AmbiguousInventorySegmentError,
     InventorySegmentNotFoundError,
     SegmentsManagerAuthError,
+    PxeSiteNotConfiguredError,
+    InfraEnvNotFoundError,
+    PxeMapAuthError,
+    PxeMapRequestRejectedError,
 )
 _RETRY_POLICY = RetryPolicy(
     initial_interval=timedelta(seconds=1),
@@ -278,6 +296,10 @@ _RESERVATION_TTL = _AGENT_DEADLINE + timedelta(hours=1)
 _INSTALLED_HOLD = timedelta(hours=24)
 # Gates every lock call, so a run started before the lock replays unchanged.
 _RESERVATION_PATCH = "server-scan-install-lock"
+# Gates the PXE map registration for IPMI servers, for the same reason: an
+# in-flight IPMI run past selection would otherwise meet a new activity in
+# front of its recorded creates.
+_PXE_BOOT_PATCH = "pxe-map-ipmi-boot"
 
 # The server-scan health verdict this workflow accepts. Deliberately only the
 # top tier: the endpoint would otherwise fill HEALTHY, then WARNING, then MAJOR.
@@ -326,6 +348,7 @@ _REJECTION_TYPE = {
     "no-agent": AgentNeverAppearedError,
     "reserved": ServerReservedError,
     "gone": ServerNotAvailableError,
+    "no-pxe-site": PxeSiteNotConfiguredError,
 }
 
 _REJECTION_SUMMARY = {
@@ -369,6 +392,11 @@ _REJECTION_SUMMARY = {
     "gone": (
         "left server-scan's inventory between the draw and the reservation, so "
         "there was nothing to lock"
+    ),
+    "no-pxe-site": (
+        "are driven over IPMI, so they boot from the network, but this MCE's "
+        "server-lifecycle-worker has no PXE map host for their site — add the "
+        "site to PXE_MAP_URLS. Each was released untouched"
     ),
 }
 
@@ -424,7 +452,9 @@ def _describe_bmh_state(state: BmhState) -> str:
     )
 
 
-def _describe_no_agent(server_name: str, state: BmhState | None) -> str:
+def _describe_no_agent(
+    server_name: str, state: BmhState | None, network_boot: bool = False
+) -> str:
     """Why one candidate is believed to have failed, for the rejection group.
 
     The BareMetalHost's own state cannot say an install SUCCEEDED — that is the
@@ -444,11 +474,14 @@ def _describe_no_agent(server_name: str, state: BmhState | None) -> str:
             f"The BMC address or credential is the place to look)"
         )
     observed = _describe_bmh_state(state) if state is not None else "not observed"
+    # A network-booted host has one more link in the chain before the ISO:
+    # the site's PXE VM handing its MAC the InfraEnv's iPXE script.
+    pxe = ", the site's PXE map entry for its MACs" if network_boot else ""
     return (
         f"{server_name} (no Agent in {minutes} min; {observed}. Ironic raised no "
         f"registration error, so the BMC answered and the host was driven to "
-        f"boot — look at the bond, the VLAN and DHCP on this segment, not at "
-        f"the BMC)"
+        f"boot — look at the bond, the VLAN{pxe} and DHCP on this segment, not "
+        f"at the BMC)"
     )
 
 
@@ -459,6 +492,7 @@ class InstallServerWorkflow:
         self._server_name: str | None = None
         self._activity_queue: str | None = None
         self._reserving = False
+        self._pxe_booting = False
 
     @workflow.query
     def progress(self) -> InstallServerProgress:
@@ -485,6 +519,7 @@ class InstallServerWorkflow:
         activity_queue = server_lifecycle_activity_queue(install_input.mce_cluster)
         self._activity_queue = activity_queue
         self._reserving = workflow.patched(_RESERVATION_PATCH)
+        self._pxe_booting = workflow.patched(_PXE_BOOT_PATCH)
         workflow.logger.info(
             "Installing a server into InfraEnv=%s for MCE=%s",
             infra_env,
@@ -549,6 +584,32 @@ class InstallServerWorkflow:
                     candidate, install_input, _RESERVATION_TTL, activity_queue, rejections
                 )
                 if lock is None:
+                    continue
+
+            # An IPMI BMC has no virtual media: the host boots from the network,
+            # so its site's PXE VM must know what to hand its MACs BEFORE the
+            # BareMetalHost exists — Ironic may power it on as soon as it
+            # registers it. After the lock, so another MCE's run can never
+            # overwrite the mapping of a machine this run holds. Narrowed by
+            # the evaluation: the vendor is known to have a driver here.
+            network_boot = boots_from_network(str(candidate.bmc_vendor))
+            pxe_registered = False
+            if self._pxe_booting and network_boot:
+                self._phase = "registering-pxe-boot"
+                pxe_registered = await self._register_pxe_boot(
+                    candidate,
+                    bond_members,
+                    install_input,
+                    segment.site,
+                    activity_queue,
+                    rejections,
+                )
+                if not pxe_registered:
+                    # Nothing was written to the cluster, so the machine can go
+                    # straight back to the inventory.
+                    if self._reserving:
+                        self._phase = "releasing-server"
+                        await self._release(candidate, activity_queue)
                     continue
 
             attempts += 1
@@ -648,6 +709,7 @@ class InstallServerWorkflow:
                     agent_name=agent.name,
                     attempts=attempts,
                     reservation_expires_at=reservation_expires_at,
+                    pxe_registered=pxe_registered,
                 )
 
             # No Agent. Take the machine back out of this MCE before trying
@@ -665,7 +727,10 @@ class InstallServerWorkflow:
                 self._phase = "releasing-server"
                 await self._release(candidate, activity_queue)
             rejections.append(
-                ("no-agent", _describe_no_agent(candidate.name, last_state))
+                (
+                    "no-agent",
+                    _describe_no_agent(candidate.name, last_state, pxe_registered),
+                )
             )
 
         raise _no_installable_candidate(infra_env, namespace, candidates, rejections)
@@ -789,6 +854,54 @@ class InstallServerWorkflow:
             else:
                 rejections.append(("gone", candidate.name))
             return None
+
+    async def _register_pxe_boot(
+        self,
+        candidate: AcquiredServer,
+        bond_members: list[BondMember],
+        install_input: InstallServerInput,
+        site: str,
+        task_queue: str,
+        rejections: list[tuple[str, str]],
+    ) -> bool:
+        """Map the bond MACs to the InfraEnv's iPXE script, or False with a skip recorded.
+
+        Only a site with no PXE VM configured is the CANDIDATE's problem — a
+        Redfish machine later in the draw needs no PXE map at all. Everything
+        else (no InfraEnv, a rejected token) fails the run, because no other
+        IPMI candidate would fare differently.
+        """
+        try:
+            await workflow.execute_activity(
+                register_pxe_boot,
+                PxeBootRequest(
+                    server_name=candidate.name,
+                    namespace=install_input.namespace,
+                    infra_env=install_input.infra_env,
+                    site=site,
+                    macs=[member.mac for member in bond_members],
+                ),
+                task_queue=task_queue,
+                start_to_close_timeout=_ACTIVITY_TIMEOUT,
+                schedule_to_start_timeout=_SCHEDULE_TO_START_TIMEOUT,
+                retry_policy=_RETRY_POLICY,
+            )
+        except ActivityError as err:
+            cause = err.cause
+            if not (
+                isinstance(cause, ApplicationError)
+                and cause.type == PxeSiteNotConfiguredError.__name__
+            ):
+                raise
+            workflow.logger.warning(
+                "No PXE map host for %s at site %s: %s",
+                candidate.name,
+                site,
+                cause.message,
+            )
+            rejections.append(("no-pxe-site", f"{candidate.name} (site {site!r})"))
+            return False
+        return True
 
     async def _release(self, candidate: AcquiredServer, task_queue: str) -> None:
         """Give the lock back once a teardown proved nothing still points at the machine."""

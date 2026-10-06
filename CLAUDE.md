@@ -188,6 +188,17 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   `SERVER_SCAN_API_TOKEN`. Gated by `workflow.patched("server-scan-install-lock")`
   so runs started before it replay unchanged — keep the patch until none can
   remain in history.
+- **An IPMI server boots from the NETWORK, so install-server maps it on the
+  site's PXE VM first.** IPMI (a UCS-managed `CISCO` blade; `boots_from_network`
+  in `shared/bmc_address.py`) has no virtual media. After the install lock and
+  BEFORE the Secret/BareMetalHost, `register_pxe_boot` reads the InfraEnv's
+  `status.bootArtifacts.ipxeScript` on the MCE and `PUT /pxe-map/<mac>`
+  `{"ipxe_url"}` for BOTH bond MACs to `PXE_MAP_URLS[site]` (bearer
+  `PXE_MAP_TOKEN`). The site is the MCE inventory SEGMENT's. A site with no
+  entry is a skip (`no-pxe-site`). The URL never enters history; a rollback
+  leaves the mapping (the next PUT overwrites it). Gated by
+  `workflow.patched("pxe-map-ipmi-boot")`. Needs `get` on `infraenvs` in the
+  limb's RBAC.
 - **Select bond members from `interfaces[]`, NEVER from `nic_macs`.**
   server-scan reduces Dell NPAR partitions to one entry per physical port in
   `interfaces` but leaves `nic_macs` whole on purpose, so a 4-port partitioned

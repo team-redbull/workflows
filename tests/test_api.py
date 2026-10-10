@@ -19,8 +19,13 @@ from temporalio.exceptions import WorkflowAlreadyStartedError
 from shared.consts import (
     ALLOCATE_SEGMENT_WORKFLOW_QUEUE,
     INITIALIZE_SEGMENT_WORKFLOW_QUEUE,
+    RELEASE_SEGMENT_WORKFLOW_QUEUE,
 )
-from shared.models.segment_lifecycle import AllocateSegmentRunArgs, SegmentType
+from shared.models.segment_lifecycle import (
+    AllocateSegmentRunArgs,
+    ReleaseSegmentRunArgs,
+    SegmentType,
+)
 from workflow_domains.routers.deps import get_temporal_client
 from workflow_domains.segment_lifecycle import router as router_module
 
@@ -134,6 +139,7 @@ def test_routes_are_scoped_to_the_workflow_not_the_domain():
         "/workflows/segment-lifecycle/initialize-segment",
         "/workflows/segment-lifecycle/initialize-segment/bulk",
         "/workflows/segment-lifecycle/allocate-segment",
+        "/workflows/segment-lifecycle/release-segment",
     }
 
 
@@ -278,3 +284,63 @@ def test_allocate_dedups_across_branches(make_client):
     )
     assert response.status_code == 409
     assert fake.started == ["allocate-segment-HC-ocp4-prep-a"]
+
+
+
+# --- release-segment ---
+
+_RELEASE = "/workflows/segment-lifecycle/release-segment"
+
+
+def test_release_starts_with_the_deterministic_id(make_client):
+    fake = _FakeClient(expected_queue=RELEASE_SEGMENT_WORKFLOW_QUEUE)
+    response = make_client(fake).post(_RELEASE, json={"cluster": "ocp4-prep-a-site1"})
+
+    assert response.status_code == 202
+    assert response.json()["workflow_id"] == "release-segment-HC-ocp4-prep-a-site1"
+    (args,) = fake.args
+    assert isinstance(args, ReleaseSegmentRunArgs)
+    # The type defaults to HC — what the day1 hook releases.
+    assert args.input.type == SegmentType.HC
+
+
+def test_release_id_carries_the_type(make_client):
+    """The router does not gate the type (the workflow does, as a FAILED run);
+    it only keys the id on it, as allocate-segment does."""
+    fake = _FakeClient(expected_queue=RELEASE_SEGMENT_WORKFLOW_QUEUE)
+    response = make_client(fake).post(
+        _RELEASE, json={"cluster": "ocp4-prep-a-site1", "type": "MCE"}
+    )
+    assert response.status_code == 202
+    assert response.json()["workflow_id"] == "release-segment-MCE-ocp4-prep-a-site1"
+
+
+def test_release_conflicts_when_already_running(make_client):
+    """The PostDelete hook treats this 409 as success: a run for the cluster
+    is already going."""
+    fake = _FakeClient(
+        already_started={"release-segment-HC-ocp4-prep-a-site1"},
+        expected_queue=RELEASE_SEGMENT_WORKFLOW_QUEUE,
+    )
+    response = make_client(fake).post(_RELEASE, json={"cluster": "ocp4-prep-a-site1"})
+    assert response.status_code == 409
+    assert "release-segment-HC-ocp4-prep-a-site1" in response.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"cluster": "ocp4-prep-a-site1", "segment": "10.0.0.0/24"},
+        {"cluster": "ocp4-prep-a-site1", "site": "site1"},
+        {"type": "HC"},
+        {"cluster": ""},
+    ],
+    ids=["segment", "site", "no cluster", "empty cluster"],
+)
+def test_release_rejects_a_body_that_does_not_fit(make_client, body):
+    """Release is keyed by cluster: a CIDR or site would not narrow anything,
+    so the edge refuses it rather than silently ignoring it."""
+    fake = _FakeClient(expected_queue=RELEASE_SEGMENT_WORKFLOW_QUEUE)
+    response = make_client(fake).post(_RELEASE, json=body)
+    assert response.status_code == 422
+    assert fake.started == []

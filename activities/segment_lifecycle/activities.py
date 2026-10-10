@@ -7,13 +7,19 @@ These run in the `segment-lifecycle-worker` deployment. They talk to:
   - the day1 values repo (DAY1_REPO_URL) — git subprocess via
     activities/segment_lifecycle/values_repo.py (clone, append the allocation
     block, push; the token is never logged), on the branch each run names
+  - the DHCP scope API (DHCP_API_URL) — release-segment's safety net: GET a
+    scope (anonymous) and DELETE it (Bearer DHCP_API_TOKEN) if it survived the
+    Argo CD cascade, via activities/segment_lifecycle/dhcp_api.py (plain
+    parameters, no settings). The only write this worker makes there;
+    Crossplane stays the only creator/updater of scopes.
 
 Conventions enforced here:
   * activity.logger only (not the root logger).
   * Idempotency: create accepts an existing segment that matches the requested
     definition; allocate is idempotent server-side per (cluster, site, type);
     the values-repo append is a no-op for a file already recording this
-    allocation.
+    allocation; release answers 200 for an already-released segment and the
+    scope DELETE answers 204 for an absent scope.
   * Every httpx.AsyncClient is created INSIDE the activity via `async with`,
     with an explicit timeout strictly below the workflow's
     start_to_close_timeout (60s < 90s). This frees the worker on a network hang
@@ -29,11 +35,12 @@ import httpx
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
-from activities.segment_lifecycle import values_repo
+from activities.segment_lifecycle import dhcp_api, values_repo
 from activities.segment_lifecycle.dhcp_values import build_dhcp_values
 from shared.exceptions import (
     AmbiguousInventorySegmentError,
     InventorySegmentNotFoundError,
+    AmbiguousAllocationError,
     SegmentConflictError,
     SegmentPoolExhaustedError,
     SegmentsManagerAuthError,
@@ -42,9 +49,12 @@ from shared.exceptions import (
     SegmentValidationError,
 )
 from shared.models.segment_lifecycle import (
+    ClusterAllocationLookup,
+    ClusterAllocationLookupRequest,
     ClusterFileLocation,
     ClusterFileLookupRequest,
     ClusterValuesAppendRequest,
+    DhcpScopeState,
     InitializeSegmentInput,
     SegmentAllocation,
     SegmentAllocationRequest,
@@ -438,3 +448,120 @@ async def get_inventory_segment(mce_cluster: str) -> SegmentEntry:
                 "exactly one is required — resolve the duplicate allocation"
             )
         return SegmentEntry.model_validate(matches[0])
+
+
+# --- release-segment --------------------------------------------------------
+
+
+@activity.defn
+async def find_cluster_allocation(
+    request: ClusterAllocationLookupRequest,
+) -> ClusterAllocationLookup:
+    """The segment the Segments Manager holds for (cluster, type), if any.
+
+    Lists Allocated segments of the type (public GET) and matches the cluster
+    name EXACTLY here: the route has no cluster filter — a `cluster_name`
+    parameter is silently ignored and would return every segment — and its
+    /search is a substring match (`c1` would also hit `c10`). `fresh=true`
+    bypasses the manager's per-process list cache, so a release that just
+    happened is never mistaken for a live allocation.
+    """
+    async with _segments_manager_client() as client:
+        resp = await client.get(
+            "/api/segments",
+            params={"status": "Allocated", "type": request.type.value, "fresh": "true"},
+        )
+        if resp.status_code != 200:
+            _raise_segments_manager_error("List allocated segments", resp)
+        body = resp.json()
+    if not isinstance(body, list):
+        raise SegmentsManagerError(
+            f"GET /api/segments returned no segment list: {resp.text[:500]}"
+        )
+    matches = [
+        row
+        for row in body
+        if isinstance(row, dict)
+        and row.get("cluster_name") == request.cluster
+        and row.get("type") == request.type.value
+    ]
+    if len(matches) > 1:
+        raise AmbiguousAllocationError(
+            f"The Segments Manager holds {len(matches)} Allocated "
+            f"{request.type.value} segments for cluster {request.cluster} "
+            f"({', '.join(sorted(str(row.get('segment')) for row in matches))}) — "
+            "it allows one per (cluster, site, type); resolve it there, the "
+            "run will not guess which to release"
+        )
+    if not matches:
+        activity.logger.info(
+            "No Allocated %s segment for cluster %s", request.type.value, request.cluster
+        )
+        return ClusterAllocationLookup(found=False)
+    entry = SegmentEntry.model_validate(matches[0])
+    activity.logger.info(
+        "Cluster %s holds %s segment %s (vlan=%d, site=%s)",
+        request.cluster,
+        request.type.value,
+        entry.segment,
+        entry.vlan_id,
+        entry.site,
+    )
+    return ClusterAllocationLookup(found=True, entry=entry)
+
+
+@activity.defn
+async def release_segment(segment: str) -> None:
+    """Give the segment back to the pool. Idempotent server-side: an
+    already-Available segment answers 200 "already released"."""
+    async with _segments_manager_client() as client:
+        resp = await client.post(
+            "/api/segments/release",
+            json={"segment": segment},
+            headers=_segments_manager_auth(),
+        )
+        if resp.status_code == 200:
+            try:
+                message = resp.json().get("message")
+            except ValueError:
+                message = None
+            activity.logger.info(
+                "Released segment %s: %s", segment, message or "released"
+            )
+            return
+        if resp.status_code == 404:
+            raise SegmentNotFoundError(
+                f"Segment {segment} not found in the Segments Manager: "
+                f"{_segments_manager_detail(resp)}"
+            )
+        if resp.status_code in (400, 422):
+            raise SegmentValidationError(
+                f"Segments Manager rejected the release of {segment}: "
+                f"{_segments_manager_detail(resp)}"
+            )
+        # A 500 is the manager's "the update changed nothing" — a release that
+        # lost a race. Retried on purpose: the retry answers 200 "already
+        # released".
+        _raise_segments_manager_error("Release segment", resp)
+
+
+@activity.defn
+async def get_dhcp_scope(network: str) -> DhcpScopeState:
+    """Observe the DHCP scope for `network` (anonymous GET). 404 is a normal
+    answer — found=False — never an error."""
+    state = await dhcp_api.fetch_scope(_settings.dhcp_api_url, network)
+    if state.found:
+        activity.logger.info(
+            "DHCP scope %s exists (%d exclusion(s))", network, len(state.exclusions)
+        )
+    else:
+        activity.logger.info("DHCP scope %s does not exist", network)
+    return state
+
+
+@activity.defn
+async def delete_dhcp_scope(network: str) -> None:
+    """Delete the DHCP scope for `network`. Idempotent server-side: 204 whether
+    or not it existed."""
+    await dhcp_api.remove_scope(_settings.dhcp_api_url, _settings.dhcp_api_token, network)
+    activity.logger.info("Deleted DHCP scope %s", network)

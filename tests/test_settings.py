@@ -1,5 +1,5 @@
-"""Fail-fast parsing in SegmentLifecycleActivitySettings: DHCP_EXCLUSION_OCTET_RANGES
-and the DAY1_REPO_URL scheme.
+"""Fail-fast parsing in SegmentLifecycleActivitySettings: DHCP_EXCLUSION_OCTET_RANGES,
+the DAY1_REPO_URL scheme and the DHCP scope API keys.
 
 The activity worker's config is fail-fast by design: it is instantiated at
 module import, so a bad value crash-loops the pod at startup rather than
@@ -119,4 +119,16 @@ class TestDhcpExclusionOctetRanges:
             "DHCP_EXCLUSION_OCTET_RANGES", '{"HC": [[1, 10]], "PXE": [[10, 1]]}'
         )
         with pytest.raises(ValidationError, match="inverted"):
+            SegmentLifecycleActivitySettings()
+
+
+class TestDhcpApiKeys:
+    """release-segment's DHCP scope API: both keys are required, so a chart
+    that forgot either crash-loops the worker at startup instead of failing
+    every release once a cluster is decommissioned."""
+
+    @pytest.mark.parametrize("key", ["DHCP_API_URL", "DHCP_API_TOKEN"])
+    def test_a_missing_key_is_rejected_at_startup(self, monkeypatch, key):
+        monkeypatch.delenv(key)
+        with pytest.raises(ValidationError, match=key.lower()):
             SegmentLifecycleActivitySettings()

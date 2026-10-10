@@ -34,7 +34,7 @@
         },
         {
           name: "release-segment",
-          href: null,
+          href: "/segment-lifecycle/release-segment.html",
           blurb: "give the VLAN back to the pool"
         }
       ]

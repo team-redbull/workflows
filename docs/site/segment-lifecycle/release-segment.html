@@ -1,0 +1,515 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>release-segment — Redbull Workflows</title>
+<meta name="description" content="The release-segment workflow: give a decommissioned hosted cluster's VLAN segment back to the pool, deleting its DHCP scope first if it survived the Argo CD cascade.">
+<link rel="icon" href="/assets/favicon.svg?v=__DOC_VERSION__" type="image/svg+xml">
+<link rel="stylesheet" href="/assets/site.css?v=__DOC_VERSION__">
+</head>
+<body data-page="/segment-lifecycle/release-segment.html">
+
+<a class="skip-link" href="#main">Skip to content</a>
+
+<!-- Topbar: identical on every page. Brand + deployed version upper-left; the
+     "Workflows" menu is built from the catalogue in assets/nav.js. -->
+<header class="topbar">
+  <a class="brand" href="/">
+    <img class="brand-mark" src="/assets/redbull-logo.png?v=__DOC_VERSION__" alt="" aria-hidden="true"
+         width="480" height="179">
+    <span class="brand-name">Redbull Workflows</span>
+    <span class="brand-ver" title="deployed image tag of this documentation site">__DOC_VERSION__</span>
+  </a>
+  <nav class="topnav" aria-label="Site">
+    <a class="topnav-link" href="/">Orchestrator guide</a>
+    <div class="wfmenu">
+      <button class="wfmenu-btn" id="wfmenu-btn" type="button"
+              aria-expanded="false" aria-haspopup="true" aria-controls="wfmenu-panel">
+        Workflows <span class="caret" aria-hidden="true">&#9662;</span>
+      </button>
+      <div class="wfmenu-panel" id="wfmenu-panel" role="menu" aria-label="Workflows by domain" hidden></div>
+    </div>
+    <noscript>
+      <a class="topnav-link" href="/segment-lifecycle/release-segment.html">release-segment</a>
+    </noscript>
+  </nav>
+</header>
+
+<main id="main">
+<header class="masthead">
+  <div class="masthead-inner">
+    <div class="eyebrow">Temporal workflow · domain: segment-lifecycle</div>
+    <h1>release-segment<span class="dim"> — what actually happens</span></h1>
+    <p class="lede">
+      A single request — a <b>cluster name</b> — gives that decommissioned hosted cluster's VLAN segment back
+      to the shared pool. If the cluster's DHCP scope survived the Argo&nbsp;CD teardown, the run deletes it
+      first; then it releases the segment in the Segments Manager and reads it back as <code>Available</code>.
+      It starts only once the cluster's Application and everything it managed are gone — today from a
+      <b>PostDelete hook</b> in the hostedcluster-setup chart.
+    </p>
+    <div class="facts">
+      <div class="fact"><span class="k">Trigger</span><span class="v">POST /workflows/segment-lifecycle/release-segment</span></div>
+      <div class="fact"><span class="k">Workflow id</span><span class="v">release-segment-&lt;TYPE&gt;-&lt;cluster&gt;</span></div>
+      <div class="fact"><span class="k">Workflow queue</span><span class="v">release-segment-workflow</span></div>
+      <div class="fact"><span class="k">Activity queue</span><span class="v">segment-lifecycle-activity</span></div>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <!-- ======================= THE FLOW ======================= -->
+  <section id="flow">
+    <div class="sec-head">
+      <div class="eyebrow">The run, step by step</div>
+      <h2>From “this cluster is gone” to “its segment is Available”</h2>
+      <p class="lede">What happens before the run, then four stages left to right. The colour of each box is
+      the system it talks to. The DHCP scope goes <b>before</b> the segment on purpose: a segment handed to a
+      new cluster while its old scope still serves leases would collide with them.</p>
+    </div>
+
+    <div class="diagram rail">
+      <svg viewBox="0 0 1060 330" role="img"
+           aria-label="Horizontal flow. Before the run: the cluster's values file is deleted from main, Argo CD deletes the Application, its finalizer deletes the Crossplane Request and provider-http deletes the DHCP scope, then Argo CD runs the PostDelete hook, which posts the cluster name to the workflows API. The run then has four stages left to right: locate the cluster's allocation (Segments Manager), remove the DHCP scope if it survived and read back its absence (DHCP API), re-read the owner and release the segment (Segments Manager), and verify by read-back that it is Available with no cluster and no type (Segments Manager). If it fails, nothing is half-released: the scope is gone or still there, and the segment stays Allocated until a re-run.">
+        <defs>
+          <marker id="ah-n"   viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0.5 L8,4 L0,7.5 Z"/></marker>
+          <marker id="a-gh" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0.5 L8,4 L0,7.5 Z"/></marker>
+        </defs>
+
+        <!-- before the run: not a stage, drawn dashed -->
+        <text class="hd mid" x="114" y="128">BEFORE THE RUN</text>
+        <rect class="box ghost" x="30" y="142" width="168" height="112" rx="5"/>
+        <text class="f-title" x="48" y="174">Argo CD teardown</text>
+        <text class="s" x="48" y="196">file deleted on main</text>
+        <text class="s" x="48" y="210">→ Application deleted</text>
+        <text class="s" x="48" y="224">→ Request → scope gone</text>
+        <text class="s" x="48" y="242">→ PostDelete hook</text>
+        <path class="arw ghost" d="M114,142 V33 H234" marker-end="url(#a-gh)"/>
+
+        <!-- entry -->
+        <rect class="entry-pill" x="238" y="18" width="420" height="30" rx="4"/>
+        <text class="entry-t" x="252" y="38">POST …/release-segment · cluster (+ type HC)</text>
+        <path class="f-arrow" d="M322,48 V136" marker-end="url(#ah-n)"/>
+
+        <!-- stage 1 -->
+        <rect class="fbox sm" x="238" y="142" width="168" height="112" rx="5"/>
+        <circle class="stepno sm" cx="260" cy="164" r="12"/>
+        <text class="stepno-t" x="260" y="168">1</text>
+        <text class="f-title" x="256" y="202">Locate</text>
+        <text class="f-sys sm" x="256" y="222">Segments Manager</text>
+        <text class="f-det" x="256" y="240">none → no-op done</text>
+
+        <path class="f-arrow" d="M410,198 H442" marker-end="url(#ah-n)"/>
+
+        <!-- stage 2 -->
+        <rect class="fbox nxt" x="446" y="142" width="168" height="112" rx="5"/>
+        <circle class="stepno nxt" cx="468" cy="164" r="12"/>
+        <text class="stepno-t" x="468" y="168">2</text>
+        <text class="f-title" x="464" y="202">Remove scope</text>
+        <text class="f-sys nxt" x="464" y="222">DHCP API</text>
+        <text class="f-det" x="464" y="240">only if it survived</text>
+
+        <path class="f-arrow" d="M618,198 H650" marker-end="url(#ah-n)"/>
+
+        <!-- stage 3 -->
+        <rect class="fbox sm" x="654" y="142" width="168" height="112" rx="5"/>
+        <circle class="stepno sm" cx="676" cy="164" r="12"/>
+        <text class="stepno-t" x="676" y="168">3</text>
+        <text class="f-title" x="672" y="202">Release</text>
+        <text class="f-sys sm" x="672" y="222">Segments Manager</text>
+        <text class="f-det" x="672" y="240">owner re-read first</text>
+
+        <path class="f-arrow" d="M826,198 H858" marker-end="url(#ah-n)"/>
+
+        <!-- stage 4 -->
+        <rect class="fbox sm" x="862" y="142" width="168" height="112" rx="5"/>
+        <circle class="stepno sm" cx="884" cy="164" r="12"/>
+        <text class="stepno-t" x="884" y="168">4</text>
+        <text class="f-title" x="880" y="202">Verify</text>
+        <text class="f-sys sm" x="880" y="222">Segments Manager</text>
+        <text class="f-det" x="880" y="240">Available, no owner</text>
+
+        <!-- failure strip -->
+        <rect class="failstrip" x="30" y="282" width="1000" height="34" rx="4"/>
+        <text class="fail-t hd" x="46" y="303">IF IT FAILS &#8594;</text>
+        <text class="fail-t" x="152" y="303">nothing is half-released: the segment stays Allocated until a re-run, which converges from wherever the last one stopped.</text>
+      </svg>
+    </div>
+    <div class="diagram-caption">
+      <span class="swatch sm"><i></i>Segments Manager</span>
+      <span class="swatch nxt"><i></i>the DHCP scope API</span>
+      <span>Stages 1&#8211;4 run inside one Temporal workflow; each is a retried activity. The dashed box is
+      not part of the run.</span>
+    </div>
+
+    <h3 style="margin:40px 0 10px">The same run, in detail</h3>
+    <p class="lede" style="margin-bottom:24px">Each card carries a <code>phase</code> — read live off a running
+    workflow through a Temporal <b>query</b>, which is how <code>GET /workflows/runs/{workflow_id}</code> can tell
+    you <em>where inside the run</em> a release currently is.</p>
+
+    <div class="flow">
+
+      <!-- before the run -->
+      <div class="step wait">
+        <div class="marker">⏸</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>Before the run — not part of it</h3>
+            <span class="phase">no phase</span>
+          </div>
+          <p>A hosted cluster is decommissioned by deleting its <code>&lt;cluster&gt;.yaml</code> from the day1
+          values repo's <code>main</code>. The ApplicationSet deletes the Application named after the file; its
+          resources finalizer deletes everything the Application manages — the Crossplane <code>Request</code>
+          among them, whose deletion makes provider-http send the DHCP API its <code>DELETE</code>. Once every
+          resource is gone, Argo&nbsp;CD runs the chart's <b>PostDelete hook</b>: a one-shot Job that POSTs the
+          cluster name to this workflow's route.</p>
+          <p class="note"><b>Why a hook and not an Argo CD notification.</b> The notification catalogue's
+          <code>on-deleted</code> trigger fires when deletion <em>starts</em> (<code>deletionTimestamp</code> set),
+          before the Request — and in production the HostedCluster and NodePool — are gone, and it is
+          fire-and-forget. A PostDelete hook runs only after every resource is deleted, and a failed hook keeps
+          the Application in <code>DeletionError</code> and is retried — visible, not silent.</p>
+        </div>
+      </div>
+
+      <!-- gate -->
+      <div class="step gate">
+        <div class="marker">✓</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>Type check — HC only</h3>
+            <span class="phase">phase <b>pending</b></span>
+          </div>
+          <p>Runs before anything is touched. allocate-segment only ever allocates <b>HC</b>, so any other type
+          was not allocated by this system and its teardown is not this workflow's: it fails immediately with
+          <code>UnsupportedSegmentType</code>.</p>
+        </div>
+      </div>
+
+      <!-- 1 -->
+      <div class="step">
+        <div class="marker">1</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>find_cluster_allocation</h3>
+            <span class="phase">phase <b>locating-allocation</b></span>
+          </div>
+          <p>Lists the Segments Manager's <code>Allocated</code> segments of the type and keeps the one whose
+          <code>cluster_name</code> is <em>exactly</em> the cluster. The match is ours on purpose: the list route
+          has no cluster filter (a <code>cluster_name</code> parameter is silently ignored and returns every
+          segment), and its search is a substring match — <code>c1</code> would also hit <code>c10</code>.</p>
+          <div class="calls">
+            <div class="call sm"><span class="verb">GET</span><span class="path">/api/segments?status=Allocated&amp;type=HC&amp;fresh=true <em>· public GET, no list cache</em></span></div>
+          </div>
+          <p class="note"><b>Nothing found is not a failure.</b> The cluster was already released, or never
+          allocated: the run <em>completes</em> with <code>released: false</code> and touches nothing else, so a
+          retried hook or a second deletion stays green. Two matches is
+          <code>AmbiguousAllocationError</code> — a data error in the Segments Manager a human resolves.</p>
+        </div>
+      </div>
+
+      <!-- 2 -->
+      <div class="step">
+        <div class="marker">2</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>get_dhcp_scope → delete_dhcp_scope → get_dhcp_scope</h3>
+            <span class="phase">phase <b>removing-dhcp-scope</b></span>
+          </div>
+          <p>Looks the scope up by the segment's network address (the CIDR with its mask dropped). Normally it is
+          already gone — the teardown deleted it — and this stage is one 404. If it <b>survived</b> (an orphaned
+          Request, a cascade that never ran) this is the safety net: delete it, then read back its absence before
+          the segment goes anywhere.</p>
+          <div class="calls">
+            <div class="call nxt"><span class="verb">GET</span><span class="path">/api/v1/scopes/&lt;network&gt; <em>· anonymous · 404 = already gone</em></span></div>
+            <div class="call nxt"><span class="verb">DELETE</span><span class="path">/api/v1/scopes/&lt;network&gt; <em>· Bearer DHCP_API_TOKEN · 204 whether or not it existed</em></span></div>
+          </div>
+          <p class="note">A scope still there after the delete is <code>DhcpScopeStillPresentError</code>: something
+          re-created it, almost certainly a Crossplane Request that still exists — the Application is not gone
+          yet. The segment is <b>not</b> released. This is the only write the orchestrator ever makes to the DHCP
+          API, and it is only ever a delete: Crossplane remains the one creator and updater of scopes.</p>
+        </div>
+      </div>
+
+      <!-- 3 -->
+      <div class="step">
+        <div class="marker">3</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>get_segment → release_segment</h3>
+            <span class="phase">phase <b>releasing-segment</b></span>
+          </div>
+          <p>The Segments Manager's release checks nobody's ownership, and the whole DHCP stage — retries
+          included — sits between the lookup and here. So the segment is read again first: held by
+          <em>another</em> cluster means it was released and re-allocated in between
+          (<code>AllocationOwnerMismatchError</code>, nothing released); already <code>Available</code> means someone
+          released it first, which is success. Otherwise it is released.</p>
+          <div class="calls">
+            <div class="call sm"><span class="verb">GET</span><span class="path">/api/segments/by-segment?segment=… <em>· public GET</em></span></div>
+            <div class="call sm"><span class="verb">POST</span><span class="path">/api/segments/release <em>· Bearer · { "segment": &lt;CIDR&gt; } · 200 "released" or "already released"</em></span></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 4 -->
+      <div class="step">
+        <div class="marker">4</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>get_segment</h3>
+            <span class="phase">phase <b>verifying-release</b></span>
+          </div>
+          <p>Reads the segment back and requires <code>status == Available</code>, no <code>cluster_name</code> and
+          no <code>type</code> — release clears both, the way allocation wrote them. Any mismatch is
+          <code>ReleaseNotConfirmedError</code>.</p>
+          <div class="calls">
+            <div class="call sm"><span class="verb">GET</span><span class="path">/api/segments/by-segment?segment=… <em>· public GET</em></span></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- done -->
+      <div class="step done">
+        <div class="marker">✓</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>Done</h3>
+            <span class="phase">phase <b>completed</b></span>
+          </div>
+          <p>The result names the segment, VLAN and site given back, and whether this run had to delete the DHCP
+          scope itself (<code>dhcp_scope_removed</code> — normally <code>false</code>). There is no git step:
+          deleting the cluster's file <em>was</em> the decommission.</p>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ======================= API ======================= -->
+  <section id="api">
+    <div class="sec-head">
+      <div class="eyebrow">HTTP surface</div>
+      <h2>How you start it and how you watch it</h2>
+      <p class="lede">Served by <code>workflows-orchestrator-api</code> (Swagger at <code>/docs</code>). Starting is
+      always async: the run outlives the request by design.</p>
+    </div>
+
+    <div class="api">
+
+      <div class="endpoint">
+        <div class="endpoint-head">
+          <span class="method">POST</span>
+          <span class="path">/workflows/segment-lifecycle/release-segment</span>
+          <span class="ret">202 · 409 if already running</span>
+        </div>
+        <div class="endpoint-body">
+          <p>The body names the <b>cluster</b> and, optionally, the <b>type</b>. The segment, its site and VLAN
+          come from the Segments Manager, so a body carrying <code>segment</code> or <code>site</code> is a
+          <b>422</b> rather than a field silently ignored.</p>
+          <pre><span class="c">// request</span>
+{
+  "cluster": "ocp4-prep-herzi-site1-a",
+  "type":    "HC"                       <span class="c">// optional — HC is the default and the only supported value</span>
+}
+
+<span class="c">// 202 response</span>
+{ "workflow_id": "release-segment-HC-ocp4-prep-herzi-site1-a", "run_id": "…" }</pre>
+          <p class="note"><b>Call it only after the cluster's Application is gone.</b> The PostDelete hook does
+          exactly that. A manual caller who posts too early can have the scope re-created by a Request that still
+          exists. Re-triggering while a run is in flight answers <b>409</b>, which the hook treats as success. The
+          API has no auth of its own.</p>
+        </div>
+      </div>
+
+      <div class="endpoint">
+        <div class="endpoint-head">
+          <span class="method">GET</span>
+          <span class="path">/workflows/runs/{workflow_id}</span>
+          <span class="ret">200 · 404 if unknown id</span>
+        </div>
+        <div class="endpoint-body">
+          <p>The same domain-agnostic status endpoint every workflow uses.</p>
+          <pre><span class="c">// COMPLETED — the segment went back to the pool</span>
+{ …, "status": "COMPLETED",
+  "result": { "cluster": "ocp4-prep-herzi-site1-a", "type": "HC", "released": true,
+              "segment": "10.20.90.0/24", "vlan_id": 23, "site": "site1",
+              "dhcp_scope_removed": false } }
+
+<span class="c">// COMPLETED — nothing was allocated (already released): a no-op</span>
+{ …, "status": "COMPLETED",
+  "result": { "cluster": "ocp4-prep-herzi-site1-a", "type": "HC", "released": false,
+              "segment": null, "vlan_id": null, "site": null,
+              "dhcp_scope_removed": false } }</pre>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ======================= THE HOOK ======================= -->
+  <section id="hook">
+    <div class="sec-head">
+      <div class="eyebrow">Where it is started from</div>
+      <h2>A PostDelete hook in the hostedcluster-setup chart</h2>
+      <p class="lede">Until a deprovision-cluster workflow exists, the chart every hosted-cluster Application
+      renders carries one hook Job. Argo&nbsp;CD creates it only when the Application is deleted, and only after
+      every resource the Application managed is gone.</p>
+    </div>
+
+    <div class="endpoint">
+      <div class="endpoint-head">
+        <span class="method">JOB</span>
+        <span class="path">release-segment-&lt;cluster&gt; · argocd.argoproj.io/hook: PostDelete</span>
+      </div>
+      <div class="endpoint-body">
+        <ol>
+          <li><code>POST /workflows/segment-lifecycle/release-segment</code> with
+          <code>{"cluster": "&lt;clusterName&gt;", "type": "HC"}</code> — <code>clusterName</code> is the
+          ApplicationSet's own parameter, so it survives the values file's deletion.</li>
+          <li><b>202</b> or <b>409</b> → the Job succeeds and Argo&nbsp;CD finishes deleting the Application. It does
+          not wait for the run: the run is durable and answers on its own id.</li>
+          <li>Anything else → a few retries, then the Job fails. The Application stays with a
+          <code>DeletionError</code> condition and Argo&nbsp;CD retries the hook on its next reconcile.</li>
+        </ol>
+      </div>
+    </div>
+
+    <div class="grid-2" style="margin-top:16px">
+      <div class="panel warn">
+        <h3>Deleting a cluster now needs the workflows API</h3>
+        <p style="font-size:var(--fs-14);color:var(--ink-2)">While the API is unreachable, a deleted
+        hosted-cluster Application waits in <code>DeletionError</code>. Its resources are already gone; only the
+        Application object lingers. Fix the API and Argo&nbsp;CD retries — or delete the hook Job by hand to let
+        the deletion finish, then POST the release yourself.</p>
+      </div>
+      <div class="panel">
+        <h3>A bridge, not the end state</h3>
+        <p style="font-size:var(--fs-14);color:var(--ink-2)">A deprovision-cluster workflow will own the teardown:
+        delete the file, wait for the Application to disappear, then start release-segment as a child. The hook
+        is removed then — release-segment itself does not change.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================= FAILURE ======================= -->
+  <section id="failure">
+    <div class="sec-head">
+      <div class="eyebrow">When things go wrong</div>
+      <h2>Outages are out-waited. Real errors stop the run.</h2>
+      <p class="lede">Same rule as every workflow here: <b>retries are unbounded</b> (1 s → doubling → capped at
+      1 min), so an outage never fails a run. Retrying stops <em>only</em> for errors explicitly classified as
+      permanent.</p>
+    </div>
+
+    <div class="grid-2">
+      <div class="panel alarm">
+        <h3>Classified as permanent — these fail the run</h3>
+        <ul>
+          <li><code>UnsupportedSegmentType</code> — not HC (workflow-raised, before anything runs)</li>
+          <li><code>AmbiguousAllocationError</code> — the Segments Manager holds two segments of the type for the cluster</li>
+          <li><code>DhcpScopeStillPresentError</code> — the scope came back after the delete; the Application is not gone</li>
+          <li><code>DhcpApiAuthError</code> — the worker's copy of the DHCP API token is wrong or rotated</li>
+          <li><code>DhcpScopeInvalidError</code> — the DHCP API rejected the network address (400)</li>
+          <li><code>AllocationOwnerMismatchError</code> — the segment now belongs to another cluster; nothing released</li>
+          <li><code>ReleaseNotConfirmedError</code> — the read-back is not Available with no owner and no type</li>
+          <li><code>SegmentsManagerAuthError</code> · <code>SegmentValidationError</code> · <code>SegmentNotFoundError</code></li>
+        </ul>
+      </div>
+      <div class="panel">
+        <h3>Transient by classification</h3>
+        <p style="font-size:var(--fs-14);color:var(--ink-2)"><code>DhcpApiError</code> and
+        <code>SegmentsManagerError</code> — an unreachable service, a 5xx, a lost release race. They retry
+        forever.</p>
+        <h3 style="margin-top:6px">A DHCP API outage holds the release back</h3>
+        <p style="font-size:var(--fs-14);color:var(--ink-2)">The scope goes before the pool, so while the DHCP API
+        is down — or answers 503 because no DHCP server is configured behind it — the run sits RUNNING in
+        <code>removing-dhcp-scope</code> and the segment stays Allocated. That is deliberate: a segment is never
+        handed out again on a guess about its old scope.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================= REFERENCE ======================= -->
+  <section id="reference">
+    <div class="sec-head">
+      <div class="eyebrow">Reference</div>
+      <h2>Inputs, phases, and configuration</h2>
+    </div>
+
+    <h3 style="margin-bottom:10px">Request body — <code>ReleaseSegmentRequest</code></h3>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>Field</th><th>Type</th><th>Rules</th><th>What it's for</th></tr></thead>
+        <tbody>
+          <tr><td class="k">cluster</td><td class="k">str</td><td class="muted">non-empty</td><td class="muted">The decommissioned hosted cluster — the name its values file and Argo CD Application carried.</td></tr>
+          <tr><td class="k">type</td><td class="k">enum</td><td class="muted">default <code>HC</code>; only <code>HC</code> supported</td><td class="muted">Which of the cluster's allocations to give back (one per type). Scopes the lookup and the workflow id.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 style="margin:28px 0 10px">Phases you'll see on the status endpoint</h3>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>phase</th><th>Meaning</th><th>Normal duration</th></tr></thead>
+        <tbody>
+          <tr><td class="k">pending</td><td class="muted">Run accepted, type not yet checked</td><td class="muted">instant</td></tr>
+          <tr><td class="k">locating-allocation</td><td class="muted">Finding the cluster's segment in the Segments Manager</td><td class="muted">seconds</td></tr>
+          <tr><td class="k">removing-dhcp-scope</td><td class="muted">Checking for a surviving scope, deleting it if needed</td><td class="muted">seconds; longer if a delete runs</td></tr>
+          <tr><td class="k">releasing-segment</td><td class="muted">Re-reading the owner, then releasing</td><td class="muted">seconds</td></tr>
+          <tr><td class="k">verifying-release</td><td class="muted">Reading the released segment back</td><td class="muted">seconds</td></tr>
+          <tr><td class="k">completed</td><td class="muted">Done; <code>result</code> is available</td><td class="muted">—</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 style="margin:28px 0 10px">Configuration</h3>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>Key</th><th>Lives in</th><th>Effect</th></tr></thead>
+        <tbody>
+          <tr><td class="k">DHCP_API_URL</td><td class="muted">segment-lifecycle-config</td><td class="muted">Where the DHCP scope API is. Its scope GETs are anonymous.</td></tr>
+          <tr><td class="k">DHCP_API_TOKEN</td><td class="muted">Secret (dhcp-api-token)</td><td class="muted">Bearer token for the scope DELETE — a copy of the DHCP API's own token; rotate both together.</td></tr>
+          <tr><td class="k">SEGMENTS_MANAGER_URL · SEGMENTS_MANAGER_API_TOKEN</td><td class="muted">workflows-orchestrator-config / Secret</td><td class="muted">Shared with the rest of the domain.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ======================= RE-RUNNING ======================= -->
+  <section id="rerun">
+    <div class="sec-head">
+      <div class="eyebrow">Operating it</div>
+      <h2>What happens if you run the same cluster again</h2>
+      <p class="lede">Idempotency is a rule of the orchestrator — see
+      <a href="/#principles">the three rules that surprise people</a>.</p>
+    </div>
+
+    <div class="grid-2">
+      <div class="panel ok">
+        <h3>Re-run after completion — a no-op</h3>
+        <p>The cluster no longer holds a segment, so the run completes at once with <code>released: false</code>.
+        A re-run after a <em>failure</em> picks up from where that one stopped: the scope delete answers 204 for
+        an absent scope, and the release answers "already released" for an Available segment.</p>
+      </div>
+      <div class="panel warn">
+        <h3>The one thing a re-run will not do</h3>
+        <p>Release a segment another cluster now holds. If the segment was re-allocated in between, every run
+        refuses with <code>AllocationOwnerMismatchError</code> — the cluster's own allocation is already gone, and the
+        new owner's is not this run's to give back.</p>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <span>workflow_domains/segment_lifecycle/release_segment.py</span>
+    <span>activities/segment_lifecycle/activities.py</span>
+    <span>activities/segment_lifecycle/dhcp_api.py</span>
+    <span>shared/models/segment_lifecycle.py</span>
+  </footer>
+
+</div>
+</main>
+
+<script src="/assets/nav.js?v=__DOC_VERSION__" defer></script>
+</body>
+</html>

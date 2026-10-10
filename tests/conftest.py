@@ -62,5 +62,8 @@ os.environ.update(
         "IDRAC_FACTORY_PASSWORDS": '["factory-a", "factory-b"]',
         "DELL_TEMPLATES": '{"PowerEdge R660": {"7.10.70.00": "ocp-r660-7.10.70.00"}}',
         "SERVER_NAMER_URL": "https://namer.test/rename",
+        # --- release-segment: the DHCP scope API ---
+        "DHCP_API_URL": "http://dhcp.test",
+        "DHCP_API_TOKEN": "test-dhcp-token",
     }
 )

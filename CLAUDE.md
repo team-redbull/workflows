@@ -28,9 +28,10 @@ activities/<domain>/         The execution "limbs" (one deployment per domain)
                                activity.logger, and a call into a module below
   <technology>.py            One module per dependency, taking PLAIN PARAMETERS and
                                holding no settings and no Temporal, so it is testable
-                               with no worker: values_repo.py (git), server_scan.py
-                               (the inventory API), cluster_api.py (the Kubernetes
-                               API, its idempotency rule and its error classification)
+                               with no worker: values_repo.py (git), dhcp_api.py (the
+                               DHCP scope API), server_scan.py (the inventory API),
+                               cluster_api.py (the Kubernetes API, its idempotency
+                               rule and its error classification)
   worker_init.py             Registers activities, polls that queue
 docs/                             The static documentation site (its own image, no code)
 ```
@@ -93,9 +94,10 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   one id — and, where the workflow's scope includes one, the segment TYPE: allocation is scoped per
   (cluster, site, type), so `allocate-segment-<TYPE>-<cluster>` without the type would make two
   legitimate allocations of one cluster collide. (initialize-segment's id has no type because a
-  segment is created without one — §4.) The domain currently holds TWO workflows
-  (`initialize-segment`, `allocate-segment`), each on its own workflow queue, sharing the one limb
-  deployment. Id builders live in `shared/workflow_ids.py` — ONE definition per scheme, importable
+  segment is created without one — §4.) The domain currently holds THREE workflows
+  (`initialize-segment`, `allocate-segment`, `release-segment`), each on its own workflow queue,
+  sharing the one limb deployment. release-segment's id mirrors allocate's
+  (`release-segment-<TYPE>-<cluster>`): it gives back the one allocation a (cluster, type) holds. Id builders live in `shared/workflow_ids.py` — ONE definition per scheme, importable
   from both routers and workflow code. The routers are the only callers today, but the location is
   deliberate: a workflow file can never import a router (FastAPI ≠ sandbox-safe), so the moment a
   workflow needs a sibling's id a router-side scheme would have to be duplicated.
@@ -116,7 +118,9 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
 - Local kind reaches host services via `host.docker.internal` — that string lives ONLY in Helm
   values, never in code.
 - Env naming: a service prefix is used ONLY for that service's own values (its URL, its URI paths) —
-  `DAY1_*` and `DHCP_*` are the current examples. Our own policy inputs carry no prefix. Do NOT put a
+  `DAY1_*` and `DHCP_*` are the current examples (`DHCP_API_URL`/`DHCP_API_TOKEN` are that
+  service's; `DHCP_EXCLUSION_OCTET_RANGES` predates this rule and is the one exception). Our own
+  policy inputs carry no prefix. Do NOT put a
   policy of ours behind a dependency's prefix: it reads as their config and travels with them when
   they go.
 
@@ -281,10 +285,37 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   `main` ONLY (`hcAppset.yaml` pins `revision`/`targetRevision: main`): the scope appears only after
   the merge, the merge comes after the pipeline, and the pipeline is waiting on this run — a
   deadlock, not a slow wait. The principles it embodied still hold: git is the single source of
-  truth and Crossplane the only writer (we never POST a scope), and convergence is judged on the
-  EXCLUSIONS we wrote, never the DHCP API's own derived range. When create-cluster verifies the scope
-  after ITS merge step, lift the removed code (`git log -S get_dhcp_scope`) into that workflow,
-  bounded deadline and all.
+  truth and Crossplane the only CREATOR/UPDATER of scopes (we never POST or PUT one), and convergence
+  is judged on the EXCLUSIONS we wrote, never the DHCP API's own derived range. `get_dhcp_scope`,
+  `DhcpScopeState`, `DhcpApiError` and `DHCP_API_URL` are back — for release-segment's safety net
+  (next bullet), not for this wait; when create-cluster verifies the scope after ITS merge step, it
+  reuses them with a bounded deadline (`git log -S dhcp_scope_ready` has the removed loop).
+- **release-segment gives a decommissioned cluster's segment back — and is the ONE DHCP API writer,
+  delete-only.** Decommissioning a hosted cluster is deleting its `<cluster>.yaml` from the day1
+  repo's `main`: the ApplicationSet deletes the Application, its resources finalizer deletes the
+  Crossplane `Request`, and provider-http DELETEs the scope. Nothing in that cascade releases the
+  segment, so release-segment (input `cluster` + `type`, HC only) finds the Segments Manager's
+  allocation, deletes the scope IF it survived (an orphaned Request, a cascade that never ran) and
+  reads back its absence, then re-reads the owner, releases and reads back Available/no
+  cluster/no type. The scope goes BEFORE the pool — a re-allocated segment must never collide with
+  live leases — so a DHCP API outage holds the release back (RUNNING, retried) by design. This
+  amends "Crossplane the only writer": it remains the only CREATOR/UPDATER; release-segment DELETEs,
+  and only once the Application and its Request are gone (a Request still alive re-POSTs the scope
+  ~60s later — `DhcpScopeStillPresentError` catches the case where it already has). The DELETE needs
+  a token, so the worker carries a COPY of the DHCP API's (§8). The client is
+  `activities/segment_lifecycle/dhcp_api.py` (plain parameters, §1). No git step: the file deletion
+  IS the decommission. Nothing allocated is a COMPLETED no-op (`released=false`), never a failure.
+- **release-segment's trigger is an Argo CD PostDelete hook — a bridge until deprovision-cluster.**
+  The hostedcluster-setup chart carries a `PostDelete` hook Job that POSTs `{"cluster", "type": "HC"}`
+  to the API (202 and 409 are success). Argo CD runs it only after EVERY resource of the Application
+  is deleted (NodePool and HostedCluster included, in the air-gapped chart), and a failed hook keeps
+  the Application in `DeletionError` and is retried — visible, not silent. Argo CD Notifications were
+  rejected: the catalogue's `on-deleted` trigger fires on `deletionTimestamp != nil`, i.e. at the
+  START of deletion, once and fire-and-forget — the shape this section rejects for every trigger
+  (the workflow is the entry point). Consequence: deleting a hosted-cluster Application now needs the
+  workflows API reachable. When a deprovision-cluster workflow exists it owns the teardown (delete
+  the file, a bounded wait for the Application to disappear) and starts release-segment as a child;
+  the hook is deleted then, release-segment does not change.
 - **THE FIREWALL FLOW IS GONE. Do not re-add it.** There used to be another dependency here: the
   **next** connectivity service, another team's air-gapped firewall approver. initialize-segment
   discovered same-site peers, submitted open-rules requests (plus MCE↔BMC rules from a
@@ -422,13 +453,19 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   re-run as a phantom conflict. The workflow's promise is that the file records the vlan and network
   the Segments Manager confirmed; the DHCP detail around them belongs to day1 and to the operator,
   which also means a changed exclusion POLICY is never retrofitted onto an allocated cluster.
+  `release_segment` answers 200 for an already-Available segment and `delete_dhcp_scope` 204 for an
+  absent scope, both server-side; release-segment itself COMPLETES as a no-op when the cluster holds
+  nothing, so a repeated trigger is harmless.
 - **Verify after mutate, before recording:** allocate-segment reads the allocation back
   (`get_segment`: status/cluster/vlan/type must all match — the allocation WROTE the type) BEFORE the
   git write, so the values repo can
   never record a vlan the Segments Manager does not confirm. A mutation whose outcome another system
-  will act on gets a read-back check between the mutation and the recording.
+  will act on gets a read-back check between the mutation and the recording. release-segment reads
+  the scope back after its DELETE (before the segment returns to the pool) and the segment back
+  after its release.
 - Workflow IDs are deterministic (`initialize-segment-<network address, CIDR mask dropped>`,
-  e.g. `initialize-segment-130.154.20.0`; `allocate-segment-<TYPE>-<cluster>`) for natural dedup — a
+  e.g. `initialize-segment-130.154.20.0`; `allocate-segment-<TYPE>-<cluster>`;
+  `release-segment-<TYPE>-<cluster>`) for natural dedup — a
   duplicate trigger while running gets HTTP 409 (in the bulk route, an `already_running` item).
   Builders in `shared/workflow_ids.py`.
 - **Cross-workflow races on one record: compare-and-set, server-side.** When two runs may mutate the
@@ -436,7 +473,11 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   atomically, so the loser gets a 409 (classified non-retryable) instead of silently overwriting the
   winner — while a plain Temporal retry must still short-circuit as success when the stored value
   already equals the NEW one. Precedent: convert-segment's `expected_type` (removed with the
-  workflow, §4). No current workflow needs it; the rule stands for the next one that does.
+  workflow, §4). release-segment needs it and cannot have it yet: the Segments Manager's release
+  checks no owner, so the workflow RE-READS the owner right before releasing
+  (`AllocationOwnerMismatchError` if another cluster holds it, success if already Available) — a
+  client-side stand-in with a residual window. The proper fix is an `expected_cluster_name` on the
+  SM's release endpoint (a segments-manager change).
 
 ## 7. Strict validation & clean typed state
 
@@ -454,7 +495,7 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   `TEMPORAL_NAMESPACE`, `SEGMENTS_MANAGER_URL`. `<domain>-config` (owned by that domain's
   chart) holds its own endpoints/policy — e.g. `segment-lifecycle-config` = the allocate-segment keys
   (`DAY1_REPO_URL`, `DHCP_EXCLUSION_OCTET_RANGES`; the push credential in the `day1-git-token`
-  Secret). A
+  Secret) and release-segment's `DHCP_API_URL` (its token in the `dhcp-api-token` Secret). A
   domain worker mounts BOTH + its Secrets, so the
   brain release must install before any limb (else `CreateContainerConfigError` on the missing
   global ConfigMap) — and the chart must ship the new keys BEFORE (or with) an image that requires
@@ -464,11 +505,19 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   `ServerProvisioningActivitySettings` (each that domain's activity worker only). Field names = Helm ConfigMap/Secret keys
   lowercased — keep aligned with redbull-platform's `gitops/charts/workflows-orchestrator/templates/config.yaml`
   (global) and `gitops/charts/segment-lifecycle-worker/templates/config.yaml` (day1 URL + DHCP
-  policy + the credential Secret). Which ConfigMap
+  policy + DHCP API URL + the credential Secrets). Which ConfigMap
   a key lives in is INDEPENDENT of which settings class declares it (pydantic reads the flat merged pod
   env — `SEGMENTS_MANAGER_URL` sits in the global ConfigMap yet stays a
   `SegmentLifecycleActivitySettings` field; the brain ignores extras via `extra="ignore"`). Do NOT
   import settings from inside a workflow definition (sandbox) — only from entrypoints / api.py / activities.
+- **`DHCP_API_TOKEN` is a COPY of the DHCP API's own token, rendered from git.** The source of truth is
+  redbull-platform's `gitops/charts/dhcp-scope-manager/charts/dhcp-api-token/values.yaml`, whose Secret
+  is pinned to the `dhcp-scope-manager` namespace (envFrom cannot cross namespaces). The
+  segment-lifecycle-worker chart renders its own `dhcp-api-token` Secret from `secrets.dhcpApiToken`,
+  committed — never `oc create secret` (invisible to git) and never a `lookup`-generated value (Argo CD
+  re-mints it every sync). Rotate both values in ONE commit and roll the worker; a stale copy fails
+  every release with `DhcpApiAuthError` (non-retryable), never silently. `secrets.existingDhcpSecret` is
+  the ESO hook, like the others.
 - **ConfigMaps hold minimum, operator-editable data** — anything changeable without a rebuild (today
   just `DHCP_EXCLUSION_OCTET_RANGES`) is expanded/validated in code (fail-fast at worker startup)
   rather than baked into an image. Its VALUE lives in the chart's `values.yaml`
@@ -527,8 +576,11 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   segment has its own dedup id, its own run status and its own failure), answering 202 with a
   per-item report rather than a single pass/fail code. `POST .../allocate-segment` is normally
   called by the day1 pipeline (`{"cluster", "values_branch": "$CI_COMMIT_BRANCH"}`), which then
-  polls the same runs endpoint until COMPLETED (§4).
+  polls the same runs endpoint until COMPLETED (§4). `POST .../release-segment` (`{"cluster"}`) is
+  called by the hostedcluster-setup chart's PostDelete hook once a cluster's Application is gone (§4).
 - In-cluster the API is `workflows-orchestrator-api` (ClusterIP:8080) plus an OpenShift **Route**
   (`workflowsApi.route.*` in the `workflows-orchestrator` chart) — it needs a hostname because starting a workflow
   is now an operator action. NOTE: `workflow_domains/api.py` has NO auth of its own; anyone who can reach
-  that hostname can start a workflow. Disable the Route (and port-forward) where that matters.
+  that hostname can start a workflow — release-segment's route ends in a DHCP scope DELETE and a
+  segment release. Disable the Route (and port-forward) where that matters; the PostDelete hook
+  reaches the API by its in-cluster Service, not the Route.

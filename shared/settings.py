@@ -7,8 +7,9 @@ Settings groups, matching the deployment boundary:
   - TemporalSettings: needed by anything that connects a Temporal Client
     (every worker and api.py).
   - SegmentLifecycleActivitySettings: needed only by the segment-lifecycle
-    activity worker/tasks (the Segments Manager, the day1 values repo and the
-    DHCP exclusion policy). The workflow worker has no business holding these.
+    activity worker/tasks (the Segments Manager, the day1 values repo, the
+    DHCP exclusion policy and the DHCP scope API). The workflow worker has no
+    business holding these.
   - ServerLifecycleActivitySettings / ServerProvisioningActivitySettings: the
     same, for those domains' activity workers.
 
@@ -27,8 +28,8 @@ charts in the Argo CD repo:
 redbull-platform/gitops/charts/workflows-orchestrator/templates/config.yaml
     (workflows-orchestrator-config: temporal + segments-manager url)
 redbull-platform/gitops/charts/segment-lifecycle-worker/templates/config.yaml
-    (segment-lifecycle-config: the day1 repo URL + the DHCP policy; + the
-    day1-git-token Secret)
+    (segment-lifecycle-config: the day1 repo URL, the DHCP policy and the DHCP
+    API URL; + the day1-git-token and dhcp-api-token Secrets)
 
 Do NOT import this module from inside a workflow definition (it runs in the
 sandbox) — only from worker entrypoints, api.py, and activity
@@ -114,6 +115,20 @@ class SegmentLifecycleActivitySettings(BaseSettings):
     # hand out the addresses production reserves rather than fail. Types listed
     # ahead of the code that allocates them are validated the same way now.
     dhcp_exclusion_octet_ranges: dict[SegmentType, list[tuple[int, int]]]
+
+    # --- release-segment: the DHCP scope API (dhcp_scope_manager) -----------
+    # release-segment checks whether a released cluster's scope survived the
+    # Argo CD cascade (GET, anonymous) and deletes it if so (DELETE, bearer
+    # token). It is the ONLY write this worker makes there, and only a DELETE:
+    # Crossplane stays the only creator/updater of scopes (CLAUDE.md §4).
+    #
+    # The token is a COPY of the DHCP API's own token (redbull-platform:
+    # gitops/charts/dhcp-scope-manager/charts/dhcp-api-token/values.yaml),
+    # rendered into this worker's namespace by the segment-lifecycle-worker
+    # chart. The two must rotate together — a stale copy fails every release
+    # with DhcpApiAuthError (non-retryable), never silently.
+    dhcp_api_url: str
+    dhcp_api_token: str
 
     @field_validator("dhcp_exclusion_octet_ranges")
     @classmethod

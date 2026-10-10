@@ -308,12 +308,15 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
 - **release-segment's trigger is an Argo CD PostDelete hook — a bridge until deprovision-cluster.**
   The hostedcluster-setup chart carries a `PostDelete` hook Job that POSTs `{"cluster", "type": "HC"}`
   to the API (202 and 409 are success). Argo CD runs it only after EVERY resource of the Application
-  is deleted (NodePool and HostedCluster included, in the air-gapped chart), and a failed hook keeps
-  the Application in `DeletionError` and is retried — visible, not silent. Argo CD Notifications were
-  rejected: the catalogue's `on-deleted` trigger fires on `deletionTimestamp != nil`, i.e. at the
-  START of deletion, once and fire-and-forget — the shape this section rejects for every trigger
-  (the workflow is the entry point). Consequence: deleting a hosted-cluster Application now needs the
-  workflows API reachable. When a deprovision-cluster workflow exists it owns the teardown (delete
+  is deleted (NodePool and HostedCluster included, in the air-gapped chart). Argo CD holds the
+  Application while the hook Job RUNS but does NOT retry a FAILED one — verified on GitOps 1.18 /
+  Argo CD 3.1, a Failed hook counts as complete and the Application is deleted anyway (its docs'
+  `DeletionError` hold does not happen here). So the hook's script retries the POST itself, capped
+  backoff, up to 55 min (a bounded MACHINE wait, §5); a final failure leaves the Failed Job as the only
+  record, its log ending with the request to send by hand. Argo CD Notifications were rejected: the
+  catalogue's `on-deleted` trigger fires on `deletionTimestamp != nil`, i.e. at the START of
+  deletion, once and fire-and-forget — the shape this section rejects for every trigger (the
+  workflow is the entry point). When a deprovision-cluster workflow exists it owns the teardown (delete
   the file, a bounded wait for the Application to disappear) and starts release-segment as a child;
   the hook is deleted then, release-segment does not change.
 - **THE FIREWALL FLOW IS GONE. Do not re-add it.** There used to be another dependency here: the

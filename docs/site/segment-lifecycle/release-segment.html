@@ -167,8 +167,8 @@
           <p class="note"><b>Why a hook and not an Argo CD notification.</b> The notification catalogue's
           <code>on-deleted</code> trigger fires when deletion <em>starts</em> (<code>deletionTimestamp</code> set),
           before the Request — and in production the HostedCluster and NodePool — are gone, and it is
-          fire-and-forget. A PostDelete hook runs only after every resource is deleted, and a failed hook keeps
-          the Application in <code>DeletionError</code> and is retried — visible, not silent.</p>
+          fire-and-forget. A PostDelete hook runs only after every resource is deleted, and Argo&nbsp;CD holds the
+          Application while it runs.</p>
         </div>
       </div>
 
@@ -368,19 +368,23 @@
           ApplicationSet's own parameter, so it survives the values file's deletion.</li>
           <li><b>202</b> or <b>409</b> → the Job succeeds and Argo&nbsp;CD finishes deleting the Application. It does
           not wait for the run: the run is durable and answers on its own id.</li>
-          <li>Anything else → a few retries, then the Job fails. The Application stays with a
-          <code>DeletionError</code> condition and Argo&nbsp;CD retries the hook on its next reconcile.</li>
+          <li>Anything else → the script retries, with backoff capped at 60&nbsp;s, for up to 55 minutes. Argo&nbsp;CD
+          holds the Application in deletion meanwhile.</li>
+          <li>Still failing at the deadline → the Job fails, and Argo&nbsp;CD finishes deleting the Application
+          anyway: it does <b>not</b> retry a failed PostDelete hook (verified on GitOps 1.18 / Argo&nbsp;CD 3.1).
+          The Failed Job is left behind as the record, its log ending with the request to send by hand.</li>
         </ol>
       </div>
     </div>
 
     <div class="grid-2" style="margin-top:16px">
       <div class="panel warn">
-        <h3>Deleting a cluster now needs the workflows API</h3>
-        <p style="font-size:var(--fs-14);color:var(--ink-2)">While the API is unreachable, a deleted
-        hosted-cluster Application waits in <code>DeletionError</code>. Its resources are already gone; only the
-        Application object lingers. Fix the API and Argo&nbsp;CD retries — or delete the hook Job by hand to let
-        the deletion finish, then POST the release yourself.</p>
+        <h3>A failed hook is final — look for the Failed Job</h3>
+        <p style="font-size:var(--fs-14);color:var(--ink-2)">If the workflows API is unreachable for the whole
+        55 minutes, the Application is still deleted and the segment stays Allocated. The only trace is a Failed
+        <code>release-segment-&lt;cluster&gt;</code> Job in the Argo&nbsp;CD namespace; its log ends with the exact
+        POST to send once the API is back. A release-segment run is safe to start late — it is a no-op if
+        nothing is allocated.</p>
       </div>
       <div class="panel">
         <h3>A bridge, not the end state</h3>

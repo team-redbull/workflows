@@ -15,8 +15,9 @@ on holding one HTTP connection open.
 PATHS ARE `/workflows/<domain>/<workflow>`. The DOMAIN prefix lives in exactly
 one place (this router, mounted by workflow_domains/api.py) and every workflow in the
 domain adds its own path under it — a domain holds many workflows, so it can
-never be the endpoint of one of them. Adding a third workflow here is then a
-new route, not a redesign.
+never be the endpoint of one of them. Each workflow (initialize, allocate,
+release) is one route here, and the next one is another route, not a
+redesign.
 """
 
 from __future__ import annotations
@@ -33,16 +34,20 @@ from temporalio.exceptions import WorkflowAlreadyStartedError
 from shared.consts import (
     ALLOCATE_SEGMENT_WORKFLOW_QUEUE,
     INITIALIZE_SEGMENT_WORKFLOW_QUEUE,
+    RELEASE_SEGMENT_WORKFLOW_QUEUE,
 )
 from shared.models.segment_lifecycle import (
     AllocateSegmentInput,
     AllocateSegmentRunArgs,
     InitializeSegmentInput,
     InitializeSegmentRunArgs,
+    ReleaseSegmentInput,
+    ReleaseSegmentRunArgs,
 )
 from shared.workflow_ids import (
     allocate_segment_workflow_id,
     initialize_segment_workflow_id,
+    release_segment_workflow_id,
 )
 from workflow_domains.routers.deps import get_temporal_client
 from workflow_domains.routers.models import StartWorkflowResponse
@@ -52,12 +57,16 @@ from workflow_domains.segment_lifecycle.allocate_segment import (
 from workflow_domains.segment_lifecycle.initialize_segment import (
     InitializeSegmentWorkflow,
 )
+from workflow_domains.segment_lifecycle.release_segment import (
+    ReleaseSegmentWorkflow,
+)
 
 router = APIRouter(prefix="/workflows/segment-lifecycle", tags=["segment-lifecycle"])
 
 # One workflow of this domain = one path under the domain prefix.
 _INITIALIZE_SEGMENT_PATH = "/initialize-segment"
 _ALLOCATE_SEGMENT_PATH = "/allocate-segment"
+_RELEASE_SEGMENT_PATH = "/release-segment"
 
 
 # API-layer request/response models — these never cross the workflow boundary.
@@ -125,6 +134,20 @@ class AllocateSegmentRequest(AllocateSegmentInput):
                 "~ ^ : ? * [ \\"
             )
         return value
+
+
+class ReleaseSegmentRequest(ReleaseSegmentInput):
+    """The release-segment request body: ReleaseSegmentInput, refusing
+    unknown fields.
+
+    Release is keyed by CLUSTER (+ type): the segment's CIDR, site and vlan
+    come from the Segments Manager, so a caller sending `segment` or `site`
+    expects it to narrow something it does not — refused here instead of
+    silently ignored. The strictness lives at the edge, never on
+    ReleaseSegmentInput, which is decoded from Temporal history.
+    """
+
+    model_config = ConfigDict(extra="forbid")
 
 
 class BulkInitializeSegmentInput(BaseModel):
@@ -312,6 +335,58 @@ async def start_allocate_segment(
             detail=(
                 "Segment-lifecycle workflow already running: "
                 f"{_allocate_segment_workflow_id(allocate_input)}"
+            ),
+        )
+    return StartWorkflowResponse(
+        workflow_id=handle.id, run_id=handle.result_run_id or ""
+    )
+
+
+def _release_segment_workflow_id(release_input: ReleaseSegmentInput) -> str:
+    return release_segment_workflow_id(release_input.type, release_input.cluster)
+
+
+@router.post(
+    _RELEASE_SEGMENT_PATH,
+    response_model=StartWorkflowResponse,
+    status_code=202,
+)
+async def start_release_segment(
+    release_input: ReleaseSegmentRequest,
+    client: Client = Depends(get_temporal_client),
+) -> StartWorkflowResponse:
+    """Give a decommissioned cluster's segment back to the pool — returns
+    immediately (202).
+
+    Call it only AFTER the cluster's Argo CD Application and everything it
+    managed are gone: the run deletes the cluster's DHCP scope if it is still
+    there, and a Crossplane Request that still exists would re-create it. The
+    hostedcluster-setup chart's PostDelete hook calls this route at exactly
+    that point (a 409 means a run for the cluster is already going, which the
+    hook treats as success).
+
+    The body names the CLUSTER and the TYPE (default HC); the segment is
+    looked up in the Segments Manager. A cluster holding no such segment
+    COMPLETES as a no-op (released=false) rather than failing, so a repeated
+    trigger is harmless. Poll GET /workflows/runs/{workflow_id} for
+    progress/result.
+
+    This API has no auth of its own (CLAUDE.md §9), and this route ends in a
+    DHCP scope DELETE and a segment release.
+    """
+    try:
+        handle = await client.start_workflow(
+            ReleaseSegmentWorkflow.run,
+            ReleaseSegmentRunArgs(input=release_input),
+            id=_release_segment_workflow_id(release_input),
+            task_queue=RELEASE_SEGMENT_WORKFLOW_QUEUE,
+        )
+    except WorkflowAlreadyStartedError:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Segment-lifecycle workflow already running: "
+                f"{_release_segment_workflow_id(release_input)}"
             ),
         )
     return StartWorkflowResponse(

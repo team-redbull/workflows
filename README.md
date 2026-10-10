@@ -3,8 +3,9 @@
 An OpenShift cluster lifecycle orchestrator built on Temporal. Three domains today:
 
 - **segment-lifecycle** owns the segments a hosted cluster runs on: **creating**
-  them in the team's **Segments Manager**, and **allocating** one to a cluster
-  and writing its DHCP block into the day1 values repo.
+  them in the team's **Segments Manager**, **allocating** one to a cluster
+  and writing its DHCP block into the day1 values repo, and **releasing** it
+  back to the pool once the cluster is decommissioned.
 - **server-lifecycle** owns putting physical servers into an MCE inventory:
   **install-server** takes a healthy, unclaimed server from the **server-scan**
   inventory platform and creates the `BareMetalHost` + BMC `Secret` +
@@ -63,6 +64,7 @@ activities/<domain>/              The limbs
   <technology>.py                 One module per dependency, plain parameters, no
                                     settings and no Temporal, so each is testable
                                     with no worker: values_repo.py (git),
+                                    dhcp_api.py (the DHCP scope API),
                                     server_scan.py (the inventory API),
                                     cluster_api.py (the Kubernetes API, its
                                     idempotency rule and error classification),
@@ -88,7 +90,7 @@ Worker-file naming convention: the workflow (brain) worker is
 
 ## The workflows
 
-Each has its own workflow queue and its own deterministic id. The two
+Each has its own workflow queue and its own deterministic id. The three
 segment-lifecycle workflows share the one `segment-lifecycle-activity` queue and
 therefore the one limb deployment; `install-server` runs on
 `server-lifecycle-activity` and reaches back to the segment-lifecycle queue for
@@ -428,6 +430,30 @@ the run, then generates the MachineConfig files from the recorded `vlanId`; a
 human merges afterwards. There is no DHCP scope wait: Argo CD reads `main` only,
 so the scope appears after that merge, outside the run (see CLAUDE.md §4).
 
+### `release-segment` — give a decommissioned cluster's segment back
+
+Takes the cluster and the **type** to release (default `HC`):
+
+```json
+{"cluster": "ocp4-prep-herzi-site1-a"}
+```
+
+Find the segment the Segments Manager holds for that (cluster, type) — none is a
+**completed no-op** (`released: false`), so a repeated trigger stays green. Then
+look up the cluster's DHCP scope: normally it is already gone, because deleting
+the cluster's values file made Argo CD delete the Application, whose finalizer
+deleted the Crossplane `Request`, whose deletion made provider-http delete the
+scope. If it survived, the run deletes it (the orchestrator's one write to the
+DHCP API, and only ever a DELETE) and reads back its absence — **before** the
+segment returns to the pool, so a re-allocated segment never collides with live
+leases. Then it re-reads the segment's owner, releases it, and reads it back as
+`Available` with no cluster and no type. There is no git step: deleting the file
+was the decommission.
+
+It is started by an Argo CD **PostDelete hook** in the hostedcluster-setup chart,
+which runs only after every resource of the cluster's Application is gone. A
+deprovision-cluster workflow will replace the hook later (see CLAUDE.md §4).
+
 ## API
 
 The trigger is async throughout: POST returns **202 + workflow id** immediately;
@@ -439,6 +465,7 @@ result.
 | `POST /workflows/segment-lifecycle/initialize-segment` | one segment |
 | `POST /workflows/segment-lifecycle/initialize-segment/bulk` | one workflow PER segment |
 | `POST /workflows/segment-lifecycle/allocate-segment` | one allocation |
+| `POST /workflows/segment-lifecycle/release-segment` | one release (after the cluster's Application is gone) |
 | `POST /workflows/server-lifecycle/install-server` | one server into an InfraEnv |
 | `POST /workflows/server-provisioning/provision-dell-server` | one Dell server, by iDRAC IP |
 | `POST /workflows/server-provisioning/provision-dell-server/bulk` | one workflow PER iDRAC IP |
@@ -447,7 +474,7 @@ result.
 ### Paths: `/workflows/<domain>/<workflow>`, status on `/workflows/runs`
 
 A domain holds MANY workflows, so it is never itself an endpoint — each workflow
-owns its own path under the `segment-lifecycle` prefix, and a third is then just
+owns its own path under the `segment-lifecycle` prefix, and each new one is just
 another route. Status is deliberately NOT under the domain: Temporal workflow ids
 are globally unique, so one `GET /workflows/runs/{id}` serves every domain — and a
 `{workflow_id}` catch-all under the domain prefix would swallow every sibling
@@ -462,13 +489,13 @@ would hide which segments actually got a workflow.
 ## Design notes
 
 - **Deployment-agnostic:** endpoints come from env (`TEMPORAL_HOST`,
-  `SEGMENTS_MANAGER_URL`, `DAY1_REPO_URL`). The same images run on
+  `SEGMENTS_MANAGER_URL`, `DAY1_REPO_URL`, `DHCP_API_URL`). The same images run on
   kind or OpenShift; only the chart's `values.yaml` (`config.*`) changes.
   `host.docker.internal` appears only there, never in code.
 - **ConfigMap split by scope:** `workflows-orchestrator-config` (owned by the
   always-present brain release) holds what every domain shares — `TEMPORAL_*` and
   `SEGMENTS_MANAGER_URL`. Each domain adds its own `<domain>-config` (here
-  `segment-lifecycle-config`: `DAY1_REPO_URL` and the DHCP policy;
+  `segment-lifecycle-config`: `DAY1_REPO_URL`, the DHCP policy and `DHCP_API_URL`;
   `server-lifecycle-config`: `MCE_CLUSTER` and `SERVER_SCAN_URL`). A domain's
   activity worker mounts both, so the brain must install before any limb.
 - **ConfigMaps hold operator-editable data**, expanded and validated in code at
@@ -489,11 +516,13 @@ would hide which segments actually got a workflow.
   with nothing to notice, while a wrong class name fails at worker startup.
 - **Idempotency:** `create_segment` accepts a matching existing segment;
   `allocate_segment` is idempotent server-side per (cluster, site, type); the
-  values-repo append is a no-op for a file already recording this allocation.
-  install-server's three creates each treat an existing resource as success once
+  values-repo append is a no-op for a file already recording this allocation;
+  `release_segment` answers 200 for an already-released segment and the DHCP
+  scope DELETE 204 for an absent scope. install-server's three creates each treat an existing resource as success once
   it matches, and a run skips candidates that already have a BareMetalHost.
   Workflow ids are deterministic (`initialize-segment-<network>`,
-  `allocate-segment-<TYPE>-<cluster>`, `install-server-<infraEnv>` or
+  `allocate-segment-<TYPE>-<cluster>`, `release-segment-<TYPE>-<cluster>`,
+  `install-server-<infraEnv>` or
   `install-server-name-<server>`), so a duplicate trigger while running gets
   HTTP 409.
 
@@ -505,8 +534,10 @@ would hide which segments actually got a workflow.
 | `SEGMENTS_MANAGER_URL` | `workflows-orchestrator-config` | shared by every domain |
 | `DAY1_REPO_URL` | `segment-lifecycle-config` | allocate-segment's values repo (the branch is per run) |
 | `DHCP_EXCLUSION_OCTET_RANGES` | `segment-lifecycle-config` | DHCP policy |
+| `DHCP_API_URL` | `segment-lifecycle-config` | release-segment's DHCP scope API (GETs anonymous) |
 | `SEGMENTS_MANAGER_API_TOKEN` | Secret | mutating calls only; GETs are public |
 | `DAY1_GIT_TOKEN` | Secret `day1-git-token` | push rights; scrubbed from every error |
+| `DHCP_API_TOKEN` | Secret `dhcp-api-token` | the scope DELETE; a copy of the DHCP API's own token — rotate together |
 | `MCE_CLUSTER` | `server-lifecycle-config` | which MCE this worker serves — names its queue, so it must match callers' `mce_cluster` |
 | `SERVER_SCAN_URL` | `server-lifecycle-config` | inventory API base, INCLUDING `/api/v1` |
 | `SERVER_SCAN_API_TOKEN` | Secret | an **admin** token — install-server takes and releases the install lock |

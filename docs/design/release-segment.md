@@ -1,10 +1,36 @@
-# release-segment — deferred design
+# release-segment — design note
 
-Status: **deferred, not scheduled.** Written down so picking it up later is a
-read, not a re-derivation. It sits under `docs/` (non-code material) but
-outside `docs/site/` on purpose: it is a design note, not published
-documentation — the catalogue lists release-segment as a planned row
-(`href: null` in `docs/site/assets/nav.js`) until it exists.
+Status: **implemented 2026-10-10** (`workflow_domains/segment_lifecycle/release_segment.py`,
+published at `docs/site/segment-lifecycle/release-segment.html`). Everything below the
+"Resolution" section is the deferred design as it was written, kept because its two
+teardown problems are still the reason for the shape that shipped.
+
+## Resolution — how the open questions were answered
+
+1. **Who deletes the live DHCP scope?** The Argo CD cascade, as before (file deleted →
+   Application deleted → resources finalizer → `Request` deleted → provider-http
+   `DELETE`). release-segment is the safety net for a scope that survived it: it GETs
+   the scope and DELETEs it only if it is still there, then reads back its absence. It
+   never POSTs or PUTs, and it only runs once the Application and its `Request` are gone,
+   so it is never a second writer racing Crossplane. It carries a copy of the DHCP API
+   token for that one DELETE (CLAUDE.md §8).
+2. **File deletion vs stub?** Neither, inside this workflow: the trigger IS the file
+   deletion. release-segment makes no git change, and problem 2 (an empty file breaking
+   the generator) cannot arise.
+3. **Cluster or CIDR?** Cluster + type (default HC), symmetric with allocate-segment.
+   The CIDR is looked up (`GET /api/segments?status=Allocated&type=…&fresh=true`,
+   exact `cluster_name` match client-side). Nothing allocated completes as a no-op.
+4. **Ordering?** Scope before pool, enforced by phase order (`removing-dhcp-scope` →
+   `releasing-segment`). A DHCP API outage therefore holds the release back.
+
+**Trigger:** a `PostDelete` hook Job in the hostedcluster-setup chart, which Argo CD runs
+only after every resource of the Application is gone. Argo CD Notifications were rejected
+(`on-deleted` fires when deletion starts, fire-and-forget). The hook is a bridge until a
+deprovision-cluster workflow starts release-segment as a child.
+
+---
+
+*The deferred design, as written:*
 
 ## Why deferred
 

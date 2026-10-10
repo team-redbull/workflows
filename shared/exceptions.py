@@ -21,9 +21,10 @@ TWO KINDS live here, and the difference is which side may RAISE them:
     `non_retryable_error_types` would be inert, because workflow failures are
     never retried. Each is marked WORKFLOW-RAISED below.
 
-The segment-lifecycle workflows still spell their own workflow-raised types as
-literals (`UnsupportedSegmentType`, `DhcpScopeNotConverged`, ...). Those have no
-class yet; the rule above is what a new one follows.
+initialize-segment and allocate-segment still spell their own workflow-raised
+types as literals (`UnknownSite`, `AllocationNotConfirmed`, ...). Those have no
+class yet; the rule above is what a new one follows — release-segment does, and
+`UnsupportedSegmentType`, which it shares with allocate-segment, now has one.
 """
 
 
@@ -139,6 +140,88 @@ class ValuesBranchNotFoundError(OrchestratorError):
     non_retryable_error_types. Any OTHER ls-remote failure (auth, DNS, a
     timeout) stays ValuesRepoGitError and is retried.
     """
+
+
+# --- segment-lifecycle: release-segment ------------------------------------
+
+
+class AmbiguousAllocationError(OrchestratorError):
+    """The Segments Manager holds MORE THAN ONE Allocated segment of one type
+    for one cluster. Its own invariant is one allocation per (cluster, site,
+    type), so this is a data error in the system of record — releasing
+    either segment would be a guess about which one the cluster really uses.
+
+    Deterministic — only a human can decide, so workflows list this type in
+    non_retryable_error_types (precedent: AmbiguousClusterFileError).
+    """
+
+
+class DhcpApiError(OrchestratorError):
+    """The DHCP scope API (dhcp_scope_manager) failed or returned a malformed
+    payload: a network error, a 5xx, a 503 "no DHCP backend configured", a 504
+    from its PowerShell layer.
+
+    Transient — retried. Deliberately NOT in non_retryable_error_types: an
+    outage of the API or of the Windows DHCP server behind it is out-waited.
+    A scope that does not exist is NOT this error — it is a normal
+    DhcpScopeState(found=False).
+    """
+
+
+class DhcpApiAuthError(OrchestratorError):
+    """The DHCP scope API rejected our bearer token (401/403) on a write.
+
+    Deterministic — a wrong or rotated DHCP_API_TOKEN never fixes itself (the
+    worker's copy has to be updated with the API's own token), so workflows
+    list this type in non_retryable_error_types.
+    """
+
+
+class DhcpScopeInvalidError(OrchestratorError):
+    """The DHCP scope API answered 400 INVALID_SCOPE: the network address we
+    derived from the Segments Manager's CIDR is not an IPv4 address it
+    accepts.
+
+    Deterministic — the same address is rejected on every retry, and the
+    cause is bad data or a bug, not an outage. Non-retryable.
+    """
+
+
+class UnsupportedSegmentType(OrchestratorError):
+    """WORKFLOW-RAISED. The run was asked for a segment type it does not handle.
+
+    allocate-segment and release-segment both take HC only (allocate-segment
+    allocates nothing else, so no other allocation was made by this system).
+    Named without the Error suffix because it owns a type name that predates
+    the class: allocate-segment still spells it as a literal, and both
+    workflows must fail under the SAME name for the same condition.
+    """
+
+
+class DhcpScopeStillPresentError(OrchestratorError):
+    """WORKFLOW-RAISED. release-segment deleted a cluster's DHCP scope and read
+    it straight back as present.
+
+    Something re-created it — almost certainly a Crossplane Request for the
+    cluster that still exists, i.e. its Argo CD Application is not gone yet and
+    the run was triggered too early. The segment is NOT released, so it can
+    never be handed out while a scope still serves leases on it.
+    """
+
+
+class AllocationOwnerMismatchError(OrchestratorError):
+    """WORKFLOW-RAISED. The segment release-segment located for a cluster is
+    held by ANOTHER cluster by the time the run re-reads it before releasing.
+
+    It was released and re-allocated in between. The Segments Manager's
+    release checks no owner, so this re-read is the only guard; nothing is
+    released.
+    """
+
+
+class ReleaseNotConfirmedError(OrchestratorError):
+    """WORKFLOW-RAISED. After the release, the segment did not read back as
+    Available with no cluster and no type."""
 
 
 # --- server-lifecycle -------------------------------------------------------
@@ -582,4 +665,3 @@ class StorageNotConvergedError(OrchestratorError):
 class ServerNameNotAppliedError(OrchestratorError):
     """WORKFLOW-RAISED. The OME profile never carried a name matching the
     convention for this machine (region and service tag included) in time."""
-

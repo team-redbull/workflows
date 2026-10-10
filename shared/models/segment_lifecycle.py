@@ -193,7 +193,8 @@ class SegmentEntry(BaseModel):
     the allocation it was just handed.
 
     `type` is None on an Available segment and set on an Allocated one — the
-    allocation wrote it, so the read-back checks it like cluster_name."""
+    allocation wrote it, so the read-back checks it like cluster_name. Release
+    clears both again, so release-segment's read-back expects None for each."""
 
     segment: str = Field(min_length=1)
     site: str
@@ -276,3 +277,92 @@ class AllocateSegmentResult(BaseModel):
     values_branch: str
     commit_sha: str | None
     values_updated: bool
+
+
+# --- release-segment --------------------------------------------------------
+# The domain's third workflow: give a decommissioned cluster's segment back to
+# the pool — delete its DHCP scope if one survived the Argo CD cascade, then
+# release it in the Segments Manager. Workflow-scoped models carry the
+# workflow name; the lookup and DHCP shapes do not (a future deprovision- or
+# create-cluster workflow reuses them).
+
+
+class ReleaseSegmentInput(BaseModel):
+    """Input to ReleaseSegmentWorkflow: which cluster's segment to give back,
+    of which type.
+
+    Keyed by CLUSTER, symmetric with allocate-segment: the caller (today the
+    hostedcluster-setup chart's PostDelete hook, later a deprovision-cluster
+    workflow) knows the cluster it just tore down, never the CIDR. The segment
+    is looked up in the Segments Manager. `type` scopes the lookup — a cluster
+    holds at most one segment per type — and defaults to HC, the only type
+    allocate-segment allocates; anything else is rejected up front with
+    UnsupportedSegmentType.
+    """
+
+    cluster: str = Field(min_length=1)
+    type: SegmentType = SegmentType.HC
+
+
+class ReleaseSegmentRunArgs(BaseModel):
+    """The workflow's single argument (same single-model rule as
+    InitializeSegmentRunArgs)."""
+
+    input: ReleaseSegmentInput
+
+
+class ReleaseSegmentProgress(BaseModel):
+    """Returned by the workflow's `progress` query (surfaced by the status API)."""
+
+    phase: str
+
+
+class ReleaseSegmentResult(BaseModel):
+    """What the run did.
+
+    `released=False` with segment/vlan_id/site None means the Segments
+    Manager held NO allocation of this type for the cluster — already
+    released, or never allocated. That is a completed no-op, not a failure, so
+    a late or repeated trigger stays green.
+
+    `dhcp_scope_removed=True` means the safety net fired: the scope was still
+    there when the run looked, and the run deleted it. Normally False — the
+    Argo CD cascade (Application -> Request CR -> provider-http DELETE) has
+    already removed it by the time the run starts."""
+
+    cluster: str
+    type: SegmentType
+    released: bool
+    segment: str | None
+    vlan_id: int | None
+    site: str | None
+    dhcp_scope_removed: bool
+
+
+class ClusterAllocationLookupRequest(BaseModel):
+    """Input to find_cluster_allocation: whose allocation, of which type."""
+
+    cluster: str = Field(min_length=1)
+    type: SegmentType
+
+
+class ClusterAllocationLookup(BaseModel):
+    """The Segments Manager's allocation for one (cluster, type), if any.
+    `found=False` (entry None) is a normal answer — nothing to release — never
+    an error."""
+
+    found: bool
+    entry: SegmentEntry | None = None
+
+
+class DhcpScopeState(BaseModel):
+    """A read-only observation of the DHCP scope API: does a scope exist for
+    this network, and with which exclusions? `found=False` (a 404) is a normal
+    answer, never an error.
+
+    Release-segment reads only `found`. The exclusions are kept because they
+    are what a scope check compares against what was written to git — the
+    shape a future create-cluster convergence check needs (CLAUDE.md §4)."""
+
+    found: bool
+    exclusions: list[DhcpExclusion] = Field(default_factory=list)

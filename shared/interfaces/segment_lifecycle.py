@@ -10,9 +10,12 @@ from __future__ import annotations
 from temporalio import activity
 
 from shared.models.segment_lifecycle import (
+    ClusterAllocationLookup,
+    ClusterAllocationLookupRequest,
     ClusterFileLocation,
     ClusterFileLookupRequest,
     ClusterValuesAppendRequest,
+    DhcpScopeState,
     InitializeSegmentInput,
     SegmentAllocation,
     SegmentAllocationRequest,
@@ -93,10 +96,13 @@ async def allocate_segment(request: SegmentAllocationRequest) -> SegmentAllocati
 @activity.defn
 async def get_segment(segment: str) -> SegmentEntry:
     """Read one segment back from the Segments Manager
-    (GET /api/segments/by-segment) — the verification step's read-back.
+    (GET /api/segments/by-segment) — the verification step's read-back, used
+    by allocate-segment after allocating and by release-segment before and
+    after releasing.
 
-    Raises SegmentNotFoundError on 404 (the allocation the manager just
-    acknowledged is gone — deterministic, non-retryable).
+    Raises SegmentNotFoundError on 404 (the segment the manager just reported
+    is gone — deterministic, non-retryable). Read-only, so trivially
+    idempotent.
     """
     ...
 
@@ -154,5 +160,66 @@ async def get_inventory_segment(mce_cluster: str) -> SegmentEntry:
     Raises InventorySegmentNotFoundError when the MCE has no INVENTORY segment
     and AmbiguousInventorySegmentError when several do; both deterministic and
     non-retryable.
+    """
+    ...
+
+
+# --- release-segment --------------------------------------------------------
+
+
+@activity.defn
+async def find_cluster_allocation(
+    request: ClusterAllocationLookupRequest,
+) -> ClusterAllocationLookup:
+    """Find the segment the Segments Manager holds for (request.cluster,
+    request.type) — GET /api/segments?status=Allocated&type=<T>&fresh=true,
+    matched on the EXACT cluster_name here.
+
+    The Segments Manager has no cluster filter on that route (a
+    `cluster_name` query parameter is silently ignored and returns every
+    segment), and its search is a substring match, so the exact match has to
+    be ours. Observe-only and idempotent: no allocation is found=False, a
+    normal answer. More than one raises AmbiguousAllocationError
+    (non-retryable).
+    """
+    ...
+
+
+@activity.defn
+async def release_segment(segment: str) -> None:
+    """Release the segment (POST /api/segments/release {"segment": <CIDR>}):
+    status back to Available, cluster_name and type cleared.
+
+    Idempotent server-side: an already-Available segment answers 200 "already
+    released". The Segments Manager does NOT check who holds the segment, so
+    the workflow re-reads its owner first. Raises SegmentNotFoundError (404)
+    or SegmentValidationError (400/422) — both non-retryable; a 500 (a lost
+    release race) is retried and lands on "already released".
+    """
+    ...
+
+
+@activity.defn
+async def get_dhcp_scope(network: str) -> DhcpScopeState:
+    """Observe the DHCP scope for a network address (GET
+    /api/v1/scopes/{network}, anonymous; `network` is the mask-stripped
+    address, e.g. 10.20.90.0).
+
+    404 is NOT an error — it returns found=False. Raises
+    DhcpScopeInvalidError (400, non-retryable); any outage is the retryable
+    DhcpApiError. Read-only, so trivially idempotent.
+    """
+    ...
+
+
+@activity.defn
+async def delete_dhcp_scope(network: str) -> None:
+    """Delete the DHCP scope for a network address (DELETE
+    /api/v1/scopes/{network}, bearer DHCP_API_TOKEN).
+
+    Idempotent server-side: the API answers 204 whether or not the scope
+    existed. Raises DhcpApiAuthError (401/403) or DhcpScopeInvalidError (400)
+    — both non-retryable; any outage is the retryable DhcpApiError. The
+    workflow verifies the deletion with get_dhcp_scope afterwards.
     """
     ...

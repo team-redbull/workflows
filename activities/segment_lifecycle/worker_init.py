@@ -25,9 +25,13 @@ from activities.segment_lifecycle.activities import (
     append_allocation_to_cluster_values,
     create_segment,
     get_inventory_segment,
+    delete_dhcp_scope,
+    find_cluster_allocation,
+    get_dhcp_scope,
     get_segment,
     get_valid_sites,
     locate_cluster_file,
+    release_segment,
 )
 from shared.consts import SEGMENT_LIFECYCLE_ACTIVITY_QUEUE
 from shared.logging_config import configure_logging
@@ -51,7 +55,7 @@ async def main() -> None:
         activities=[
             # initialize-segment
             create_segment,
-            # allocate-segment
+            # allocate-segment (get_segment is release-segment's read-back too)
             get_valid_sites,
             locate_cluster_file,
             allocate_segment,
@@ -60,6 +64,11 @@ async def main() -> None:
             # install-server (server-lifecycle domain) — routed to THIS queue
             # because the Segments Manager credential lives on this limb only.
             get_inventory_segment,
+            # release-segment
+            find_cluster_allocation,
+            get_dhcp_scope,
+            delete_dhcp_scope,
+            release_segment,
         ],
         # In-flight activities get this long to finish after shutdown starts
         # before being cancelled — keep it below the pod's

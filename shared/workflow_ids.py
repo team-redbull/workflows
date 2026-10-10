@@ -22,9 +22,9 @@ from shared.models.segment_lifecycle import SegmentType
 def initialize_segment_workflow_id(segment: str) -> str:
     """`initialize-segment-<network>`: natural dedup per segment.
 
-    Prefixed with the WORKFLOW name, not the domain: a second workflow in this
-    domain acting on the same segment (e.g. a future release-segment) must get
-    a distinct id, or it would collide with this one and be rejected as
+    Prefixed with the WORKFLOW name, not the domain: another workflow in this
+    domain acting on the same segment (release-segment, say) must get a
+    distinct id, or it would collide with this one and be rejected as
     already-started.
 
     No type: a segment is created without one (it is stamped on at
@@ -101,3 +101,14 @@ def provision_dell_server_workflow_id(idrac_ip: str) -> str:
     that races it through the same reboots.
     """
     return f"provision-dell-server-{idrac_ip}"
+
+def release_segment_workflow_id(segment_type: SegmentType, cluster: str) -> str:
+    """`release-segment-<TYPE>-<cluster>`: natural dedup per (type, cluster).
+
+    The mirror of allocate_segment_workflow_id, scoped the same way: a cluster
+    holds at most one segment per type, so (type, cluster) names exactly the
+    allocation a run gives back, and a duplicate trigger while it runs is a
+    409. The distinct prefix keeps an allocate and a release of one cluster
+    from colliding on one id.
+    """
+    return f"release-segment-{segment_type.value}-{cluster}"

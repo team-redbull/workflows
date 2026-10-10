@@ -38,6 +38,7 @@ _WORKFLOW_MODULES = [
     "workflow_domains/segment_lifecycle/allocate_segment.py",
     "workflow_domains/segment_lifecycle/initialize_segment.py",
     "workflow_domains/server_provisioning/provision_dell_server.py",
+    "workflow_domains/segment_lifecycle/release_segment.py",
 ]
 
 
@@ -222,3 +223,40 @@ def test_the_install_server_workflow_reaches_both_queues():
         # inside the target MCE, by a queue name computed from the request.
         "server_lifecycle_activity_queue",
     }
+
+
+def _workflow_classes(relative: str) -> set[str]:
+    """Classes decorated @workflow.defn in a module."""
+    return {
+        node.name
+        for node in ast.walk(_tree(relative))
+        if isinstance(node, ast.ClassDef)
+        and any(
+            getattr(decorator, "attr", None) == "defn"
+            and getattr(getattr(decorator, "value", None), "id", None) == "workflow"
+            for decorator in node.decorator_list
+        )
+    }
+
+
+def test_every_workflow_is_registered_in_the_brain():
+    """The brain-side twin of the test above: a workflow class missing from
+    main_worker_init's _WORKER_SPECS has no worker polling its queue, so a run
+    started through the API sits RUNNING with nothing to execute it. Parsing
+    the module also fails loudly if it does not parse at all — no other test
+    imports it, because importing it needs a Temporal environment."""
+    registry = next(
+        node.value
+        for node in ast.walk(_tree("workflow_domains/main_worker_init.py"))
+        if isinstance(node, ast.AnnAssign)
+        and getattr(node.target, "id", None) == "_WORKER_SPECS"
+    )
+    registered = {
+        element.id
+        for spec in registry.elts
+        for element in spec.elts[1].elts
+        if isinstance(element, ast.Name)
+    }
+    for module in sorted(str(path.relative_to(REPO)) for path in (REPO / "workflow_domains").rglob("*.py")):
+        for name in _workflow_classes(module):
+            assert name in registered, f"{module}: {name} is not in _WORKER_SPECS"

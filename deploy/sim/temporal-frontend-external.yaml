@@ -1,0 +1,31 @@
+# SIMULATION ONLY — applied by hand to the hub (cluster-2qsc5), not by Argo.
+#
+# Exposes the hub's Temporal frontend (gRPC 7233) to MCE workers on OTHER
+# clusters. The existing temporal-frontend Service is ClusterIP, and an
+# OpenShift Route cannot carry plain gRPC without HTTP/2 on the router or TLS
+# on Temporal, so a LoadBalancer is the smallest working path here.
+#
+# Temporal runs WITHOUT TLS or auth in this lab, so the load balancer admits
+# only the listed source CIDRs — each remote MCE's egress IP. Production should
+# put mTLS on the frontend (and TLS support in the workers' Client.connect)
+# before exposing it beyond one network.
+apiVersion: v1
+kind: Service
+metadata:
+  name: temporal-frontend-external
+  namespace: temporal
+  labels:
+    app.kubernetes.io/part-of: workflows-sim
+spec:
+  type: LoadBalancer
+  selector:
+    app.kubernetes.io/component: frontend
+    app.kubernetes.io/instance: temporal
+    app.kubernetes.io/name: temporal-stack
+  ports:
+    - name: grpc-rpc
+      port: 7233
+      targetPort: 7233
+      protocol: TCP
+  loadBalancerSourceRanges:
+    - 75.126.251.7/32   # cluster-64spr egress (the simulated remote MCE)

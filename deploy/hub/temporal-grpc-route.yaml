@@ -1,0 +1,139 @@
+# Hub side of "workers on other clusters reach Temporal over TLS through a
+# passthrough Route" — no IngressController change, no change to Temporal or to
+# any client already on the hub (they keep plain gRPC to temporal-frontend:7233).
+#
+#   remote worker ──TLS :443──► router (passthrough, routes by SNI)
+#                 ──TLS──► temporal-grpc-tls-proxy :8443 ──plain gRPC──► temporal-frontend:7233
+#
+# Placeholders, filled per environment (envsubst, or edit by hand):
+#   ${TEMPORAL_GRPC_HOST}   the Route host workers dial and the certificate names
+#   ${ALLOWED_SOURCE_CIDRS} space-separated egress CIDRs of the MCEs (router allow-list)
+#
+# NOT in this file: the CA Secret `temporal-ca` (tls.crt + tls.key of a CA you
+# create ONCE). It holds a private key — deliver it as a SealedSecret /
+# ExternalSecret. Because cert-manager only SIGNS with it and never renews it,
+# the CA in the workers' values never changes when the server cert renews.
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: temporal-ca
+  namespace: temporal
+spec:
+  ca:
+    secretName: temporal-ca
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: temporal-grpc-tls
+  namespace: temporal
+spec:
+  secretName: temporal-grpc-tls
+  dnsNames:
+    - ${TEMPORAL_GRPC_HOST}
+  duration: 8760h       # 1 year
+  renewBefore: 720h     # renewed 30 days before expiry; workers trust the CA, not this
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  issuerRef:
+    name: temporal-ca
+    kind: Issuer
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: temporal-grpc-tls-proxy
+  namespace: temporal
+data:
+  nginx.conf: |
+    pid /tmp/nginx.pid;
+    error_log /dev/stderr info;
+    events {}
+    stream {
+      server {
+        listen 8443 ssl;
+        ssl_certificate     /certs/tls.crt;
+        ssl_certificate_key /certs/tls.key;
+        ssl_protocols TLSv1.2 TLSv1.3;
+        # gRPC clients negotiate HTTP/2 in the handshake; answer it, then pass
+        # the decrypted HTTP/2 straight to Temporal, which speaks it in clear.
+        ssl_alpn h2;
+        proxy_pass temporal-frontend.temporal.svc.cluster.local:7233;
+        proxy_connect_timeout 10s;
+        # Workers hold one connection and long-poll ~70s with nothing sent.
+        proxy_timeout 10m;
+      }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: temporal-grpc-tls-proxy
+  namespace: temporal
+  annotations:
+    # Restarts the proxy when cert-manager renews the certificate, if Stakater
+    # Reloader runs on the hub; otherwise restart it once a year.
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: temporal-grpc-tls-proxy}
+  template:
+    metadata:
+      labels: {app: temporal-grpc-tls-proxy}
+    spec:
+      containers:
+        - name: nginx
+          image: docker.io/nginxinc/nginx-unprivileged:1.27-alpine   # mirror it when disconnected
+          args: [nginx, -c, /etc/nginx-stream/nginx.conf, -g, "daemon off;"]
+          ports:
+            - {name: tls, containerPort: 8443}
+          readinessProbe:
+            tcpSocket: {port: tls}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+            limits: {memory: 64Mi}
+          volumeMounts:
+            - {name: conf, mountPath: /etc/nginx-stream}
+            - {name: certs, mountPath: /certs, readOnly: true}
+      volumes:
+        - name: conf
+          configMap: {name: temporal-grpc-tls-proxy}
+        - name: certs
+          secret: {secretName: temporal-grpc-tls}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: temporal-grpc-tls-proxy
+  namespace: temporal
+spec:
+  selector: {app: temporal-grpc-tls-proxy}
+  ports:
+    - {name: tls, port: 8443, targetPort: tls}
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: temporal-frontend-grpc
+  namespace: temporal
+  annotations:
+    # Temporal has no auth of its own: the router admits only the MCEs.
+    haproxy.router.openshift.io/ip_whitelist: "${ALLOWED_SOURCE_CIDRS}"
+    # A passthrough connection is a TCP tunnel to HAProxy; keep it well above a
+    # worker's ~70s idle long poll (1h is also the router's default).
+    haproxy.router.openshift.io/timeout-tunnel: 1h
+spec:
+  host: ${TEMPORAL_GRPC_HOST}
+  to:
+    kind: Service
+    name: temporal-grpc-tls-proxy
+  port:
+    targetPort: tls
+  tls:
+    termination: passthrough

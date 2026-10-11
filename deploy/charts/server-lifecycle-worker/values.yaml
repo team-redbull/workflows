@@ -1,0 +1,98 @@
+# server-lifecycle-worker — one release per MCE cluster, installed in that MCE.
+#
+# Argo CD: point one Application per MCE at this chart with that MCE as the
+# destination and its own values file (see values-*.yaml beside this one). The
+# chart creates no Namespace, runs no hooks and renders deterministically, so
+# Argo can sync and diff it as plain manifests.
+
+# REQUIRED. The MCE this worker serves. It names the queue the worker polls
+# (server-lifecycle-activity-<mceCluster>) and MUST equal the `mce_cluster`
+# callers send and the cluster_name of that MCE's INVENTORY segment in the
+# Segments Manager. A wrong value is silent: the worker would serve installs
+# meant for another MCE.
+mceCluster: ""
+
+replicaCount: 2
+
+image:
+  # Disconnected production: the mirror of ghcr.io/team-redbull/server-lifecycle-worker.
+  repository: ghcr.io/team-redbull/server-lifecycle-worker
+  tag: ""            # defaults to the chart's appVersion
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+# The hub's Temporal frontend, as reachable FROM THIS MCE. On the hub itself
+# that is the in-cluster Service; on any other MCE it is whatever exposes the
+# frontend's gRPC port across clusters (a LoadBalancer, NodePort or a TLS
+# passthrough Route). The worker dials OUT, so the hub needs no access to the MCE.
+temporal:
+  host: ""           # REQUIRED, host:port, e.g. temporal.hub.example:7233
+  namespace: default # the TEMPORAL namespace (not the OpenShift project); must match the hub
+  # TLS to the frontend. Required when `host` is a passthrough Route (it routes
+  # by SNI, so it carries TLS only); off for a plain NodePort / in-cluster host.
+  # The CA is PUBLIC — the certificate that signed the frontend's (or its TLS
+  # proxy's) certificate — so it lives here in plain values, the same for every
+  # MCE. The server certificate renewing changes nothing here; only replacing
+  # the CA does.
+  tls:
+    enabled: false
+    serverName: ""   # defaults to the host part of `host`
+    caCert: ""
+    #  -----BEGIN CERTIFICATE-----
+    #  ...
+    #  -----END CERTIFICATE-----
+
+# server-scan, as reachable from this MCE. Base URL INCLUDING /api/v1.
+serverScan:
+  url: ""            # REQUIRED
+
+# IPMI (UCS-managed Cisco) servers boot from the network: site -> base URL of
+# that site's PXE VM. The site is the MCE inventory segment's, spelled as the
+# Segments Manager spells it. Empty = UCS blades are skipped with
+# PxeSiteNotConfiguredError; Redfish servers never read it.
+pxeMap:
+  urls: {}
+  #  bat-yam: http://pxe-vm.bat-yam.example:8080
+
+# Secret keys the worker reads: SERVER_SCAN_API_TOKEN (ADMIN role),
+# <VENDOR>_BMC_USERNAME / <VENDOR>_BMC_PASSWORD for HP, DELL, CISCO, INTERSIGHT,
+# and PXE_MAP_TOKEN.
+#
+# With Argo CD keep credentials OUT of git: set existingSecret to a Secret made
+# by Sealed Secrets / External Secrets / Vault in the same namespace. `create`
+# renders one from `values` and is meant for labs only.
+credentials:
+  existingSecret: ""
+  create: false
+  values: {}
+  #  SERVER_SCAN_API_TOKEN: ""
+  #  CISCO_BMC_USERNAME: ""
+  #  CISCO_BMC_PASSWORD: ""
+  #  PXE_MAP_TOKEN: ""
+
+# Namespaces on THIS cluster where the worker may create install resources —
+# the InfraEnv namespaces. One Role + RoleBinding is rendered in each; the
+# namespaces themselves must already exist.
+rbac:
+  create: true
+  targetNamespaces: []
+
+serviceAccount:
+  create: true
+  name: ""           # defaults to the release's full name
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    memory: 512Mi
+
+# In-flight activities get 20s to finish after SIGTERM (worker_init.py); keep
+# the pod's grace period above it.
+terminationGracePeriodSeconds: 30
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}

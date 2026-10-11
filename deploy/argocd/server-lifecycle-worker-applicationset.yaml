@@ -1,0 +1,48 @@
+# EXAMPLE for production: one server-lifecycle-worker per MCE, generated from
+# the clusters registered in the hub's Argo CD.
+#
+# Label each MCE's cluster Secret in openshift-gitops with
+#   workflows.redbull/server-lifecycle: "true"
+#   workflows.redbull/mce-cluster: <name the Segments Manager uses>
+# and add values-<mce-cluster>.yaml beside the chart for what differs per MCE
+# (target namespaces, PXE map, image mirror). The credentials Secret is created
+# in each MCE by Sealed Secrets / External Secrets, never from these values.
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: server-lifecycle-worker
+  namespace: openshift-gitops
+spec:
+  goTemplate: true
+  goTemplateOptions: ["missingkey=error"]
+  generators:
+    - clusters:
+        selector:
+          matchLabels:
+            workflows.redbull/server-lifecycle: "true"
+  template:
+    metadata:
+      name: 'server-lifecycle-worker-{{ index .metadata.labels "workflows.redbull/mce-cluster" }}'
+    spec:
+      project: default
+      source:
+        repoURL: https://git.example/redbull-platform.git   # your GitOps repo
+        targetRevision: main
+        path: gitops/charts/server-lifecycle-worker
+        helm:
+          releaseName: server-lifecycle-worker
+          valueFiles:
+            - values.yaml
+            - 'values-{{ index .metadata.labels "workflows.redbull/mce-cluster" }}.yaml'
+          parameters:
+            - name: mceCluster
+              value: '{{ index .metadata.labels "workflows.redbull/mce-cluster" }}'
+      destination:
+        server: '{{ .server }}'
+        namespace: redbull-workflows
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true

@@ -1,0 +1,23 @@
+{{- include "slw.validate" . -}}
+# Everything this worker reads that is not a credential. On the hub the worker
+# also mounts the brain's global workflows-orchestrator-config; an MCE has no
+# brain, so the Temporal endpoint is rendered here instead and this one
+# ConfigMap is self-sufficient on any cluster.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "slw.fullname" . }}-config
+  labels:
+    {{- include "slw.labels" . | nindent 4 }}
+data:
+  TEMPORAL_HOST: {{ .Values.temporal.host | quote }}
+  TEMPORAL_NAMESPACE: {{ .Values.temporal.namespace | quote }}
+  MCE_CLUSTER: {{ .Values.mceCluster | quote }}
+  SERVER_SCAN_URL: {{ .Values.serverScan.url | quote }}
+  {{- if .Values.temporal.tls.enabled }}
+  TEMPORAL_TLS_CA: /etc/temporal-tls/ca.crt
+  TEMPORAL_TLS_SERVER_NAME: {{ .Values.temporal.tls.serverName | default (first (splitList ":" .Values.temporal.host)) | quote }}
+  {{- end }}
+  {{- with .Values.pxeMap.urls }}
+  PXE_MAP_URLS: {{ toJson . | quote }}
+  {{- end }}

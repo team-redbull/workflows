@@ -19,8 +19,6 @@ import asyncio
 import logging
 from datetime import timedelta
 
-from temporalio.client import Client
-from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.worker import Worker
 
 from activities.server_provisioning.activities import (
@@ -43,6 +41,7 @@ from shared.consts import SERVER_PROVISIONING_ACTIVITY_QUEUE
 from shared.logging_config import configure_logging
 from shared.settings import TemporalSettings
 from shared.shutdown import install_shutdown_handler
+from shared.temporal_client import connect_temporal
 
 _settings = TemporalSettings()
 
@@ -50,11 +49,7 @@ _settings = TemporalSettings()
 async def main() -> None:
     configure_logging()
     logger = logging.getLogger(__name__)
-    client = await Client.connect(
-        _settings.temporal_host,
-        namespace=_settings.temporal_namespace,
-        data_converter=pydantic_data_converter,
-    )
+    client = await connect_temporal(_settings)
     worker = Worker(
         client,
         task_queue=SERVER_PROVISIONING_ACTIVITY_QUEUE,

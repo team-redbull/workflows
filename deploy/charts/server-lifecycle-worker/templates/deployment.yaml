@@ -1,0 +1,84 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "slw.fullname" . }}
+  labels:
+    {{- include "slw.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "slw.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "slw.selectorLabels" . | nindent 8 }}
+      annotations:
+        # Settings are read once at import (fail-fast), so a config change
+        # only takes effect through a rollout — which this checksum forces.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if .Values.temporal.tls.enabled }}
+        checksum/temporal-ca: {{ include (print $.Template.BasePath "/temporal-tls-ca.yaml") . | sha256sum }}
+        {{- end }}
+        {{- if .Values.credentials.create }}
+        checksum/credentials: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "slw.serviceAccountName" . }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: server-lifecycle-worker
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # No ports and no probes: the worker serves nothing. It dials out to
+          # Temporal, and a worker that cannot reach it exits and restarts.
+          envFrom:
+            - configMapRef:
+                name: {{ include "slw.fullname" . }}-config
+            - secretRef:
+                name: {{ include "slw.credentialsSecret" . }}
+                # Optional, so a release without credentials still starts:
+                # every BMC pair defaults empty and fails only the install that
+                # needs it, with BmcCredentialsMissingError.
+                optional: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          {{- if .Values.temporal.tls.enabled }}
+          volumeMounts:
+            - name: temporal-ca
+              mountPath: /etc/temporal-tls
+              readOnly: true
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      {{- if .Values.temporal.tls.enabled }}
+      volumes:
+        - name: temporal-ca
+          configMap:
+            name: {{ include "slw.fullname" . }}-temporal-ca
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

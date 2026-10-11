@@ -335,8 +335,12 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
 - **Sandbox + Pydantic:** in workflow files wrap all `shared/` imports in
   `with workflow.unsafe.imports_passed_through():` (Pydantic C-extensions crash the sandbox; also
   skips reload). Worker entrypoints run outside the sandbox — import normally.
-- **Pydantic data converter on EVERY `Client.connect(...)`** (workers AND `api.py`): pass
-  `temporalio.contrib.pydantic.pydantic_data_converter`, else Pydantic payloads can't serialize.
+- **Connect ONLY through `shared/temporal_client.connect_temporal`** (workers AND `api.py`). It
+  passes `pydantic_data_converter` (else Pydantic payloads can't serialize) and, when
+  `TEMPORAL_TLS_CA` is set, TLS verified against that CA. Plain gRPC is the default and what
+  every client inside the hub uses; a worker on another MCE reaching Temporal through a Route
+  sets the CA (chart `temporal.tls.*`, `deploy/charts/server-lifecycle-worker/README.md`).
+  Verification is never switched off.
 - **Logging:** `workflow.logger` in workflows (no replay spam), `activity.logger` in activities.
   Shared compact formatter in `shared/logging_config.py` (silences `httpx`, strips the activity-info suffix).
 - **Routing:** every `execute_activity` sets `task_queue=` to the target domain's queue (constants in
@@ -559,8 +563,10 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   `gitops/charts/segment-lifecycle-worker/`, `gitops/charts/server-lifecycle-worker/` and the
   still-to-be-written `gitops/charts/server-provisioning-worker/` (each: ConfigMap + Secrets + limb +
   SA; the provisioning one needs no RBAC, only egress to the iDRACs, OME, the naming service and
-  server-scan). This repo ships NO chart at all — `helm/` is gone with
-  the mock service it held. The server-lifecycle limb is the first to need real RBAC: it creates
+  server-scan). This repo ships ONE chart, `deploy/charts/server-lifecycle-worker/` — the
+  per-MCE limb, written to be copied into redbull-platform for Argo CD (example ApplicationSet in
+  `deploy/argocd/`). On a remote MCE it renders its own Temporal endpoint, since no brain ConfigMap
+  exists there; `deploy/` is in `.dockerignore` and triggers no image build. The server-lifecycle limb is the first to need real RBAC: it creates
   secrets, metal3.io/baremetalhosts and agent-install.openshift.io/nmstateconfigs in the target
   namespace, where segment-lifecycle only makes HTTP and git calls.
 - Assumed already running: a Temporal server and the Segments Manager (via OpenShift routes or

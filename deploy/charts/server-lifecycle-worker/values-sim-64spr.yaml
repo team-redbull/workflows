@@ -1,0 +1,25 @@
+# Simulation: cluster-64spr plays a remote MCE served from the hub cluster-2qsc5.
+#   helm upgrade --install server-lifecycle-worker deploy/charts/server-lifecycle-worker \
+#     -n redbull-workflows -f deploy/charts/server-lifecycle-worker/values-sim-64spr.yaml \
+#     --set temporal.host=<temporal-frontend-external LB hostname>:7233
+mceCluster: ocp4-mce-64spr
+
+replicaCount: 1
+
+# Set at install time from the hub's temporal-frontend-external Service
+# (deploy/sim/temporal-frontend-external.yaml).
+temporal:
+  host: ""
+  namespace: default
+
+# The hub's server-scan API through its frontend Route.
+serverScan:
+  url: https://server-scan.apps.cluster-2qsc5.2qsc5.sandbox5410.opentlc.com/api/v1
+
+# Copied out-of-band from the hub's server-lifecycle-credentials, never via git.
+credentials:
+  existingSecret: server-lifecycle-credentials
+
+rbac:
+  targetNamespaces:
+    - bmh-workflow-test

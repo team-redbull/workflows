@@ -18,10 +18,9 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
-from temporalio.client import Client
-from temporalio.contrib.pydantic import pydantic_data_converter
 
 from shared.settings import TemporalSettings
+from shared.temporal_client import connect_temporal
 from workflow_domains.routers.runs import router as runs_router
 from workflow_domains.segment_lifecycle.router import (
     router as segment_lifecycle_router,
@@ -38,11 +37,7 @@ _settings = TemporalSettings()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.temporal_client = await Client.connect(
-        _settings.temporal_host,
-        namespace=_settings.temporal_namespace,
-        data_converter=pydantic_data_converter,
-    )
+    app.state.temporal_client = await connect_temporal(_settings)
     yield
 
 

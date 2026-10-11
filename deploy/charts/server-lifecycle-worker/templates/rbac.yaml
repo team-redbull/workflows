@@ -1,0 +1,48 @@
+{{- if .Values.rbac.create }}
+{{- $root := . }}
+{{- range $ns := .Values.rbac.targetNamespaces }}
+---
+# Exactly the verbs install-server's activities use in one InfraEnv namespace:
+# creating and tearing down a candidate's three resources, the Agent poll, and
+# the InfraEnv read an IPMI server's network boot needs.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "slw.fullname" $root }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "slw.labels" $root | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get, create, delete]
+  - apiGroups: [metal3.io]
+    resources: [baremetalhosts]
+    verbs: [get, create, delete, patch]
+  - apiGroups: [agent-install.openshift.io]
+    resources: [nmstateconfigs]
+    verbs: [get, create, delete]
+  - apiGroups: [agent-install.openshift.io]
+    resources: [agents]
+    verbs: [get, list]
+  - apiGroups: [agent-install.openshift.io]
+    resources: [infraenvs]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "slw.fullname" $root }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "slw.labels" $root | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "slw.fullname" $root }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "slw.serviceAccountName" $root }}
+    namespace: {{ $root.Release.Namespace }}
+{{- end }}
+{{- end }}

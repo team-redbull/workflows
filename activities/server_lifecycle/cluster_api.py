@@ -318,6 +318,42 @@ async def annotate_custom_object(
     return await asyncio.to_thread(_patch)
 
 
+async def patch_custom_object(
+    *,
+    group: str,
+    version: str,
+    plural: str,
+    kind: str,
+    namespace: str,
+    name: str,
+    body: dict[str, Any],
+) -> bool:
+    """Merge-patch one custom resource. False when it does not exist.
+
+    Idempotent by nature — a merge patch of a value already set changes
+    nothing — so a Temporal retry is harmless.
+    """
+
+    def _patch() -> bool:
+        _load_kube()
+        try:
+            k8s_client.CustomObjectsApi().patch_namespaced_custom_object(
+                group=group,
+                version=version,
+                namespace=namespace,
+                plural=plural,
+                name=name,
+                body=body,
+            )
+        except k8s_client.ApiException as exc:
+            if exc.status == _NOT_FOUND:
+                return False
+            raise _classify(exc, "patch", kind, name) from exc
+        return True
+
+    return await asyncio.to_thread(_patch)
+
+
 async def delete_custom_object(
     *,
     group: str,

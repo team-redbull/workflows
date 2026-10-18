@@ -41,6 +41,7 @@ from __future__ import annotations
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from shared.cluster_names import canonical_mce_cluster
 from shared.models.segment_lifecycle import SegmentType
 
 
@@ -223,7 +224,16 @@ class ServerLifecycleActivitySettings(BaseSettings):
     # runtime: the worker would serve installs meant for a different MCE and
     # create their BareMetalHosts on this cluster, with both halves succeeding.
     # ONE WORKER SERVES ONE MCE; this is the field that says which.
+    #
+    # Canonicalised like the API's `mce_cluster` (the `ocp4-` prefix added when
+    # left out), so `prod-mce-bat-yam` here and `ocp4-prod-mce-bat-yam` in a
+    # request still meet on one queue.
     mce_cluster: str
+
+    @field_validator("mce_cluster")
+    @classmethod
+    def _canonical_mce_cluster(cls, value: str) -> str:
+        return canonical_mce_cluster(value)
 
     # --- server-scan: the inventory platform --------------------------------
     # Base URL INCLUDING the /api/v1 prefix. The token needs server-scan's

@@ -33,6 +33,7 @@ SEGMENT_LIFECYCLE_ACTIVITY_QUEUE = "segment-lifecycle-activity"
 # target, so the MCE whose VLAN is used and the cluster written to cannot
 # disagree.
 INSTALL_SERVER_WORKFLOW_QUEUE = "install-server-workflow"
+REMOVE_SERVER_WORKFLOW_QUEUE = "remove-server-workflow"
 SERVER_LIFECYCLE_ACTIVITY_QUEUE = "server-lifecycle-activity"
 
 

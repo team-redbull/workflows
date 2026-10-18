@@ -499,6 +499,43 @@ class InfraEnvNotReadyError(OrchestratorError):
     """
 
 
+class AgentBoundToClusterError(OrchestratorError):
+    """The server's Agent is bound to a cluster, so it is not just inventory.
+
+    remove-server only takes a host out of an MCE's inventory: one whose Agent
+    is unbound (`spec.clusterDeploymentName` empty). A bound Agent belongs to a
+    cluster — installing or running as a node — and powering it off or
+    deleting it would take a node away from that cluster. Nothing is changed.
+
+    Raised by the activities that re-check right before they act (power-off,
+    Agent delete), so a binding made after the first inspection is still
+    caught; the workflow raises the same type when the inspection finds one.
+    Deterministic — non-retryable.
+    """
+
+
+class ServerStillPresentError(OrchestratorError):
+    """WORKFLOW-RAISED. After the deletes, the server is still on the MCE.
+
+    remove-server ends by reading the cluster again and requires its Agent,
+    BMH and NMStateConfig all gone; an Agent's own finalizer makes that take
+    seconds, so it waits a bounded time first. Still there means something
+    re-created it — most often a host that could not be powered off (no BMH to
+    do it through) and is still running the discovery image, re-registering
+    its Agent. The message names what is left.
+    """
+
+
+class HostPowerOffTimeoutError(OrchestratorError):
+    """WORKFLOW-RAISED. The BareMetalHost never reported the host powered off.
+
+    remove-server powers the host off BEFORE deleting anything: a host left
+    running the discovery image re-registers its Agent within a minute of the
+    Agent being deleted. The BMH is left with `online: false` and nothing is
+    deleted; the usual cause is an unreachable BMC. Re-run once it answers.
+    """
+
+
 class PxeMapError(OrchestratorError):
     """The site's PXE map service failed or was unreachable. Retried."""
 

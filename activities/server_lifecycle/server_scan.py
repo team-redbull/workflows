@@ -193,6 +193,62 @@ def _headers(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"} if token else {}
 
 
+_SEARCH_PAGE_SIZE = 50
+
+
+async def _get_json(client: httpx.AsyncClient, path: str, **params: Any) -> dict[str, Any]:
+    try:
+        resp = await client.get(path, params=params or None)
+    except httpx.HTTPError as exc:
+        raise ServerScanError(f"server-scan unreachable: {type(exc).__name__}: {exc}") from exc
+    if resp.status_code in (401, 403):
+        raise ServerScanAuthError(
+            f"server-scan rejected our credentials ({resp.status_code}): check SERVER_SCAN_API_TOKEN"
+        )
+    if not resp.is_success:
+        raise ServerScanError(f"server-scan GET {path} failed: {resp.status_code} {_detail(resp)}")
+    return resp.json()
+
+
+def _server_macs(detail: dict[str, Any]) -> set[str]:
+    """Every MAC a server document carries, lower-cased.
+
+    Both lists, on purpose: `identity.nic_macs` is whole (every NPAR partition)
+    and `network.interfaces` is one per physical port. For matching an Agent
+    any MAC the machine owns is evidence, so the more the better.
+    """
+    macs = {m for m in (detail.get("identity") or {}).get("nic_macs") or [] if m}
+    for iface in (detail.get("network") or {}).get("interfaces") or []:
+        if iface.get("mac"):
+            macs.add(iface["mac"])
+    return {m.lower() for m in macs}
+
+
+async def server_macs_by_name(base_url: str, token: str, server_name: str) -> list[str]:
+    """Every MAC server-scan holds for the server of this exact name, or [] if unknown.
+
+    `GET /servers?search=<name>` narrows, `GET /servers/{id}` confirms the name
+    EXACTLY (case-insensitive — a search hit alone could be another machine)
+    and carries the MACs. Never `/servers/available`: it hides reserved and
+    claimed machines — an installed one usually is — and live-rechecks a vendor
+    manager on every call. Unknown is not an error: the caller still has the
+    MACs on the cluster to match by.
+    """
+    wanted = server_name.lower()
+    async with httpx.AsyncClient(
+        base_url=base_url, timeout=_HTTP_TIMEOUT, verify=_TLS_VERIFY, headers=_headers(token)
+    ) as client:
+        page = await _get_json(client, "/servers", search=server_name, page_size=_SEARCH_PAGE_SIZE)
+        macs: set[str] = set()
+        for item in page.get("items", []):
+            if str(item.get("name") or "").lower() not in ("", wanted):
+                continue
+            detail = await _get_json(client, f"/servers/{item['id']}")
+            if str(detail.get("name") or "").lower() == wanted:
+                macs |= _server_macs(detail)
+    return sorted(macs)
+
+
 def _raise_for_lock_status(resp: httpx.Response, action: str) -> NoReturn:
     """Classify the answers both lock calls share; 200, 404 and 409 are the caller's."""
     if resp.status_code in (401, 403):

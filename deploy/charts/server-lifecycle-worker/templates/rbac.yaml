@@ -24,7 +24,7 @@ rules:
     verbs: [get, create, delete]
   - apiGroups: [agent-install.openshift.io]
     resources: [agents]
-    verbs: [get, list]
+    verbs: [get, list, delete]       # delete: remove-server
   - apiGroups: [agent-install.openshift.io]
     resources: [infraenvs]
     verbs: [get]

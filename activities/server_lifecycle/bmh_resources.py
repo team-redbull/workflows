@@ -334,6 +334,47 @@ def nmstate_config_differences(
     return [c for c in checks if c is not None]
 
 
+# The label BMAC puts on an Agent it has linked to a BareMetalHost, valued with
+# the BMH's name. Not always present — an Agent can register before BMAC links
+# it — so remove-server matches on MAC as well.
+AGENT_BMH_LABEL = "agent-install.openshift.io/bmh"
+
+
+def host_macs(bmh: dict[str, Any] | None, nmstate: dict[str, Any] | None) -> list[str]:
+    """Every MAC a host's BMH and NMStateConfig name, for matching its Agents."""
+    macs: list[str] = []
+    boot_mac = ((bmh or {}).get("spec") or {}).get("bootMACAddress")
+    if boot_mac:
+        macs.append(boot_mac)
+    for iface in ((nmstate or {}).get("spec") or {}).get("interfaces") or []:
+        if iface.get("macAddress"):
+            macs.append(iface["macAddress"])
+    return sorted({_mac(m) for m in macs})
+
+
+def agent_belongs_to_host(agent: dict[str, Any], bmh_name: str, macs: Iterable[str]) -> bool:
+    """BMAC's link label names this BMH, or the Agent reports one of its MACs."""
+    labels = (agent.get("metadata") or {}).get("labels") or {}
+    if labels.get(AGENT_BMH_LABEL) == bmh_name:
+        return True
+    macs = list(macs)
+    return bool(macs) and agent_matches_macs(agent, macs)
+
+
+def agent_cluster_deployment(agent: dict[str, Any]) -> str | None:
+    """`<namespace>/<name>` of the cluster an Agent is bound to, or None if unbound.
+
+    `spec.clusterDeploymentName` is the binding itself: set when a cluster (or
+    a hosted cluster's NodePool) claims the Agent, empty while it only sits in
+    an InfraEnv's inventory.
+    """
+    ref = (agent.get("spec") or {}).get("clusterDeploymentName") or {}
+    name = ref.get("name")
+    if not name:
+        return None
+    return f"{ref.get('namespace') or '-'}/{name}"
+
+
 def infraenv_ipxe_script_url(infra_env: dict[str, Any]) -> str | None:
     """The iPXE script URL an InfraEnv publishes, or None until it has one.
 

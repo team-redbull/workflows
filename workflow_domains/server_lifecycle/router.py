@@ -16,20 +16,37 @@ uninstall-server later is a new route, not a redesign.
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import ConfigDict
+from pydantic import ConfigDict, Field, field_validator
 from temporalio.client import Client
 from temporalio.exceptions import WorkflowAlreadyStartedError
 
-from shared.consts import INSTALL_SERVER_WORKFLOW_QUEUE
-from shared.models.server_lifecycle import InstallServerInput, InstallServerRunArgs
-from shared.workflow_ids import install_server_workflow_id
+from shared.cluster_names import canonical_mce_cluster
+from shared.consts import INSTALL_SERVER_WORKFLOW_QUEUE, REMOVE_SERVER_WORKFLOW_QUEUE
+from shared.models.server_lifecycle import (
+    InstallServerInput,
+    InstallServerRunArgs,
+    RemoveServerInput,
+    RemoveServerRunArgs,
+)
+from shared.workflow_ids import install_server_workflow_id, remove_server_workflow_id
 from workflow_domains.routers.deps import get_temporal_client
 from workflow_domains.routers.models import StartWorkflowResponse
 from workflow_domains.server_lifecycle.install_server import InstallServerWorkflow
+from workflow_domains.server_lifecycle.remove_server import RemoveServerWorkflow
 
 router = APIRouter(prefix="/workflows/server-lifecycle", tags=["server-lifecycle"])
 
 _INSTALL_SERVER_PATH = "/install-server"
+_REMOVE_SERVER_PATH = "/remove-server"
+
+# Where the inventory InfraEnvs live on an MCE unless the caller says otherwise.
+_DEFAULT_NAMESPACE = "inventory"
+
+_MCE_CLUSTER_DESCRIPTION = (
+    "The target MCE, with or without its `ocp4-` prefix: `prod-mce-bat-yam` "
+    "and `ocp4-prod-mce-bat-yam` name the same cluster, and the run always "
+    "uses the prefixed name."
+)
 
 
 # Deterministic ids come from shared/workflow_ids.py — the ONE definition per
@@ -56,6 +73,26 @@ class InstallServerRequest(InstallServerInput):
     """
 
     model_config = ConfigDict(extra="forbid")
+
+    # Defaulted HERE, at the edge: the run's input always carries the
+    # namespace it was started with, so a later change of this default never
+    # alters what a recorded run targets on replay.
+    namespace: str = Field(
+        default=_DEFAULT_NAMESPACE,
+        min_length=1,
+        description=(
+            "Namespace of the InfraEnv on the MCE, where the BareMetalHost, its "
+            f"Secret and NMStateConfig are created. Defaults to `{_DEFAULT_NAMESPACE}`."
+        ),
+    )
+    mce_cluster: str = Field(min_length=1, description=_MCE_CLUSTER_DESCRIPTION)
+
+    @field_validator("mce_cluster")
+    @classmethod
+    def _canonical_mce_cluster(cls, value: str) -> str:
+        """Canonical before the run starts: the name finds the VLAN in the
+        Segments Manager and builds the queue only that MCE's worker polls."""
+        return canonical_mce_cluster(value)
 
 
 @router.post(_INSTALL_SERVER_PATH, response_model=StartWorkflowResponse, status_code=202)
@@ -102,5 +139,59 @@ async def start_install_server(
                     else f"InfraEnv {install_input.infra_env}"
                 )
             ),
+        )
+    return StartWorkflowResponse(workflow_id=handle.id, run_id=handle.result_run_id or "")
+
+
+class RemoveServerRequest(RemoveServerInput):
+    """The remove-server request body: strict at the edge, namespace defaulted here."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    namespace: str = Field(
+        default=_DEFAULT_NAMESPACE,
+        min_length=1,
+        description=(
+            "Namespace of the server's BareMetalHost, NMStateConfig and Agent on "
+            f"the MCE. Defaults to `{_DEFAULT_NAMESPACE}`."
+        ),
+    )
+    mce_cluster: str = Field(min_length=1, description=_MCE_CLUSTER_DESCRIPTION)
+
+    @field_validator("mce_cluster")
+    @classmethod
+    def _canonical_mce_cluster(cls, value: str) -> str:
+        """Canonical before the run starts: the name builds the queue only
+        that MCE's worker polls."""
+        return canonical_mce_cluster(value)
+
+
+@router.post(_REMOVE_SERVER_PATH, response_model=StartWorkflowResponse, status_code=202)
+async def start_remove_server(
+    remove_input: RemoveServerRequest,
+    client: Client = Depends(get_temporal_client),
+) -> StartWorkflowResponse:
+    """Take one server out of an MCE's inventory — returns immediately (202).
+
+    Deletes the server's Agent, its BareMetalHost (`<server>`) and its
+    NMStateConfig (`nmstate-config-<server>`) after powering the host off.
+    Only for a server that is just inventory: if its Agent is bound to a
+    cluster the run FAILS having changed nothing (`AgentBoundToClusterError`).
+    A server with nothing on the MCE completes as a no-op (`found: false`).
+
+    Poll GET /workflows/runs/{workflow_id} for progress/result. One removal
+    per server at a time: a second trigger while one runs gets a 409.
+    """
+    try:
+        handle = await client.start_workflow(
+            RemoveServerWorkflow.run,
+            RemoveServerRunArgs(input=remove_input),
+            id=remove_server_workflow_id(remove_input.server_name),
+            task_queue=REMOVE_SERVER_WORKFLOW_QUEUE,
+        )
+    except WorkflowAlreadyStartedError:
+        raise HTTPException(
+            status_code=409,
+            detail=f"A remove-server run is already in flight for {remove_input.server_name}",
         )
     return StartWorkflowResponse(workflow_id=handle.id, run_id=handle.result_run_id or "")

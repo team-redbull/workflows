@@ -34,7 +34,11 @@ from temporalio.worker import Worker
 
 from activities.server_lifecycle.activities import (
     acquire_servers,
+    check_infra_env,
     create_baremetal_host,
+    delete_agents,
+    inspect_inventory_host,
+    set_host_online,
     create_bmc_secret,
     create_nmstate_config,
     find_agent_for_host,
@@ -43,6 +47,7 @@ from activities.server_lifecycle.activities import (
     release_server,
     reserve_server,
     teardown_bmh_resources,
+    unregister_pxe_boot,
 )
 from shared.consts import server_lifecycle_activity_queue
 from shared.logging_config import configure_logging
@@ -64,8 +69,10 @@ async def main() -> None:
         task_queue=_TASK_QUEUE,
         activities=[
             # install-server
+            check_infra_env,
             acquire_servers,
             register_pxe_boot,
+            unregister_pxe_boot,
             create_bmc_secret,
             create_baremetal_host,
             create_nmstate_config,
@@ -74,6 +81,10 @@ async def main() -> None:
             reserve_server,
             release_server,
             teardown_bmh_resources,
+            # remove-server
+            inspect_inventory_host,
+            set_host_online,
+            delete_agents,
         ],
         # In-flight activities get this long to finish after shutdown starts
         # before being cancelled — keep it below the pod's

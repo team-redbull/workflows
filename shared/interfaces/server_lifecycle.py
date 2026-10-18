@@ -18,14 +18,22 @@ from temporalio import activity
 from shared.models.server_lifecycle import (
     AcquireServerRequest,
     AcquiredServer,
+    AgentDeleteRequest,
+    AgentDeletion,
     AgentRef,
     AgentState,
     BmhRef,
     BmhResourceRequest,
     BmhState,
     CreatedResource,
+    HostPowerRequest,
+    InfraEnvRef,
+    InfraEnvState,
+    InventoryHostState,
     PxeBootRegistration,
     PxeBootRequest,
+    PxeMapRef,
+    PxeUnregistration,
     ReleaseServerRequest,
     ReserveServerRequest,
     ServerReservation,
@@ -93,6 +101,81 @@ async def release_server(request: ReleaseServerRequest) -> ServerReservation:
 
     Raises ServerScanAuthError / ServerScanRequestInvalidError (non-retryable);
     anything else is transient ServerScanError.
+    """
+    ...
+
+
+@activity.defn
+async def inspect_inventory_host(ref: BmhRef) -> InventoryHostState:
+    """remove-server: what one server has on this MCE — BMH, NMStateConfig, Agents.
+
+    Reads only. The BMH is `<server>` and the NMStateConfig
+    `nmstate-config-<server>` (both lowercased); Agents are matched by BMAC's
+    `agent-install.openshift.io/bmh` label or by ANY MAC of the machine — from
+    either resource, and every MAC server-scan holds for the server's name
+    (`GET /servers?search=`, confirmed by exact name). server-scan's MACs are
+    what find an Agent whose BMH and NMStateConfig are gone. Each Agent comes
+    back with the cluster it is bound to, if any. Absent resources and a server
+    server-scan does not know are not errors.
+
+    Raises ServerScanAuthError (non-retryable) on a rejected token; server-scan
+    unreachable is transient ServerScanError.
+    """
+    ...
+
+
+@activity.defn
+async def set_host_online(request: HostPowerRequest) -> bool:
+    """Set a BareMetalHost's `spec.online`; False when the BMH does not exist.
+
+    First re-reads every Agent in `agents_must_be_unbound` and raises
+    AgentBoundToClusterError (non-retryable) if any is now bound — the guard
+    against a NodePool or an operator binding the host between the
+    inspection and this power-off. Does not wait: the workflow polls
+    `status.poweredOn` on a durable timer.
+    """
+    ...
+
+
+@activity.defn
+async def delete_agents(request: AgentDeleteRequest) -> AgentDeletion:
+    """Delete Agents, each re-checked as still unbound right before its delete.
+
+    An Agent already gone is `absent` (success). A bound one raises
+    AgentBoundToClusterError (non-retryable) and is left alone. Needs the
+    `delete` verb on agents.agent-install.openshift.io in this worker's RBAC.
+    """
+    ...
+
+
+@activity.defn
+async def check_infra_env(ref: InfraEnvRef) -> InfraEnvState:
+    """Confirm the InfraEnv the run fills exists on THIS MCE, before any server is drawn.
+
+    Without it every candidate would be locked, booted and waited on for an
+    hour only to fail — the BareMetalHost and NMStateConfig carry its label,
+    and nothing registers into an InfraEnv that is not there.
+
+    Raises InfraEnvNotFoundError (non-retryable) when it is absent, and the
+    cluster read's BmhPrerequisiteMissingError (403: no `get` on infraenvs;
+    404 of the type: the Assisted Installer is not installed on this MCE).
+    """
+    ...
+
+
+@activity.defn
+async def unregister_pxe_boot(ref: PxeMapRef) -> PxeUnregistration:
+    """Remove a rolled-back IPMI candidate's MACs from its site's PXE VM.
+
+    `DELETE /pxe-map/<mac>` per bond MAC. A MAC with no entry (404) is success:
+    it is the state the rollback wants, and what a retry finds. Only called
+    while this run still holds the server's lock — after that another run may
+    have mapped the same MACs to its own InfraEnv.
+
+    A site no longer configured on this worker is reported in `detail`, not
+    raised: the rollback cannot reach that VM, and the next registration of the
+    machine overwrites the entry anyway. Raises PxeMapAuthError /
+    PxeMapRequestRejectedError (non-retryable); PxeMapError is transient.
     """
     ...
 

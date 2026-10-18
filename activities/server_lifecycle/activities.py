@@ -45,17 +45,21 @@ from activities.server_lifecycle.bmh_resources import (
     NMSTATE_GROUP,
     NMSTATE_PLURAL,
     NMSTATE_VERSION,
+    agent_belongs_to_host,
+    agent_cluster_deployment,
     agent_matches_macs,
     baremetal_host_differences,
     build_baremetal_host,
     build_bmc_secret,
     build_nmstate_config,
+    host_macs,
     infraenv_ipxe_script_url,
     nmstate_config_differences,
 )
 from activities.server_lifecycle.server_scan import fetch_available_servers
 from shared.bmc_address import k8s_resource_name, nmstate_config_name
 from shared.exceptions import (
+    AgentBoundToClusterError,
     BmcCredentialsMissingError,
     BmhTeardownError,
     InfraEnvNotFoundError,
@@ -65,14 +69,23 @@ from shared.exceptions import (
 from shared.models.server_lifecycle import (
     AcquiredServer,
     AcquireServerRequest,
+    AgentBinding,
+    AgentDeleteRequest,
+    AgentDeletion,
     AgentRef,
     AgentState,
     BmhRef,
     BmhResourceRequest,
     BmhState,
     CreatedResource,
+    HostPowerRequest,
+    InfraEnvRef,
+    InfraEnvState,
+    InventoryHostState,
     PxeBootRegistration,
     PxeBootRequest,
+    PxeMapRef,
+    PxeUnregistration,
     ReleaseServerRequest,
     ReserveServerRequest,
     ServerReservation,
@@ -170,6 +183,196 @@ async def release_server(request: ReleaseServerRequest) -> ServerReservation:
         f" — {reservation.detail}" if reservation.detail else "",
     )
     return reservation
+
+
+async def _read(group: str, version: str, plural: str, kind: str, namespace: str, name: str):
+    return await cluster_api.read_custom_object(
+        group=group, version=version, plural=plural, kind=kind, namespace=namespace, name=name
+    )
+
+
+async def _list_agents(namespace: str) -> list[dict]:
+    return await cluster_api.list_custom_objects(
+        group=AGENT_GROUP,
+        version=AGENT_VERSION,
+        plural=AGENT_PLURAL,
+        kind=_AGENT_KIND,
+        namespace=namespace,
+    )
+
+
+def _refuse_if_bound(agent: dict, namespace: str) -> None:
+    bound_to = agent_cluster_deployment(agent)
+    if bound_to:
+        name = (agent.get("metadata") or {}).get("name")
+        raise AgentBoundToClusterError(
+            f"Agent {namespace}/{name} is bound to cluster {bound_to}: it is not "
+            "just inventory, so nothing was changed. Remove it from that cluster first"
+        )
+
+
+@activity.defn
+async def inspect_inventory_host(ref: BmhRef) -> InventoryHostState:
+    """What one server has on this MCE — BMH, NMStateConfig, Agents. Reads only."""
+    bmh_name = k8s_resource_name(ref.server_name)
+    bmh = await _read(BMH_GROUP, BMH_VERSION, BMH_PLURAL, _BMH_KIND, ref.namespace, bmh_name)
+    nmstate = await _read(
+        NMSTATE_GROUP,
+        NMSTATE_VERSION,
+        NMSTATE_PLURAL,
+        _NMSTATE_KIND,
+        ref.namespace,
+        nmstate_config_name(ref.server_name),
+    )
+    # server-scan's MACs find an Agent with no BMH / NMStateConfig left to
+    # take a MAC from.
+    scan_macs = await server_scan.server_macs_by_name(
+        _settings.server_scan_url, _settings.server_scan_api_token, ref.server_name
+    )
+    macs = sorted(set(host_macs(bmh, nmstate)) | set(scan_macs))
+    agents = [
+        AgentBinding(
+            name=(agent.get("metadata") or {}).get("name", ""),
+            cluster_deployment=agent_cluster_deployment(agent),
+        )
+        for agent in await _list_agents(ref.namespace)
+        if agent_belongs_to_host(agent, bmh_name, macs)
+    ]
+    state = InventoryHostState(
+        bmh_found=bmh is not None,
+        nmstate_found=nmstate is not None,
+        powered_on=((bmh or {}).get("status") or {}).get("poweredOn"),
+        agents=agents,
+        server_scan_macs=scan_macs,
+    )
+    activity.logger.info(
+        "%s in %s: bmh=%s nmstate=%s poweredOn=%s agents=%s server-scan macs=%d",
+        bmh_name,
+        ref.namespace,
+        state.bmh_found,
+        state.nmstate_found,
+        state.powered_on,
+        [(a.name, a.cluster_deployment) for a in agents],
+        len(scan_macs),
+    )
+    return state
+
+
+@activity.defn
+async def set_host_online(request: HostPowerRequest) -> bool:
+    """Set a BareMetalHost's spec.online, after re-checking its Agents are unbound."""
+    for name in request.agents_must_be_unbound:
+        agent = await _read(
+            AGENT_GROUP, AGENT_VERSION, AGENT_PLURAL, _AGENT_KIND, request.namespace, name
+        )
+        if agent is not None:
+            _refuse_if_bound(agent, request.namespace)
+
+    bmh_name = k8s_resource_name(request.server_name)
+    patched = await cluster_api.patch_custom_object(
+        group=BMH_GROUP,
+        version=BMH_VERSION,
+        plural=BMH_PLURAL,
+        kind=_BMH_KIND,
+        namespace=request.namespace,
+        name=bmh_name,
+        body={"spec": {"online": request.online}},
+    )
+    activity.logger.info(
+        "BareMetalHost %s/%s online=%s%s",
+        request.namespace,
+        bmh_name,
+        request.online,
+        "" if patched else " (absent — nothing to do)",
+    )
+    return patched
+
+
+@activity.defn
+async def delete_agents(request: AgentDeleteRequest) -> AgentDeletion:
+    """Delete Agents, each re-checked as still unbound right before its delete."""
+    deleted: list[str] = []
+    absent: list[str] = []
+    for name in request.names:
+        agent = await _read(
+            AGENT_GROUP, AGENT_VERSION, AGENT_PLURAL, _AGENT_KIND, request.namespace, name
+        )
+        if agent is None:
+            absent.append(name)
+            continue
+        _refuse_if_bound(agent, request.namespace)
+        if await cluster_api.delete_custom_object(
+            group=AGENT_GROUP,
+            version=AGENT_VERSION,
+            plural=AGENT_PLURAL,
+            kind=_AGENT_KIND,
+            namespace=request.namespace,
+            name=name,
+        ):
+            deleted.append(name)
+        else:
+            absent.append(name)
+    activity.logger.info(
+        "Agents in %s: deleted %s, already absent %s", request.namespace, deleted, absent
+    )
+    return AgentDeletion(deleted=deleted, absent=absent)
+
+
+@activity.defn
+async def check_infra_env(ref: InfraEnvRef) -> InfraEnvState:
+    """Confirm the InfraEnv the run fills exists on this MCE."""
+    infra_env = await cluster_api.read_custom_object(
+        group=INFRAENV_GROUP,
+        version=INFRAENV_VERSION,
+        plural=INFRAENV_PLURAL,
+        kind=_INFRAENV_KIND,
+        namespace=ref.namespace,
+        name=ref.name,
+    )
+    if infra_env is None:
+        raise InfraEnvNotFoundError(
+            f"InfraEnv {ref.name} does not exist in namespace {ref.namespace} on "
+            f"MCE {_settings.mce_cluster}: create it, or fix infra_env / namespace "
+            "in the request"
+        )
+    cluster_ref = ((infra_env.get("spec") or {}).get("clusterRef") or {}).get("name")
+    activity.logger.info(
+        "InfraEnv %s/%s exists%s",
+        ref.namespace,
+        ref.name,
+        f" (early-bound to cluster {cluster_ref})" if cluster_ref else "",
+    )
+    return InfraEnvState(name=ref.name, namespace=ref.namespace, cluster_ref=cluster_ref)
+
+
+@activity.defn
+async def unregister_pxe_boot(ref: PxeMapRef) -> PxeUnregistration:
+    """Remove a rolled-back IPMI candidate's MACs from its site's PXE VM."""
+    base_url = _settings.pxe_map_urls.get(ref.site)
+    if not base_url:
+        detail = (
+            f"no PXE map host configured for site {ref.site!r} any more; the "
+            f"entries of {ref.server_name} were left in place"
+        )
+        activity.logger.warning("%s", detail)
+        return PxeUnregistration(detail=detail)
+
+    removed: list[str] = []
+    absent: list[str] = []
+    for mac in ref.macs:
+        if await pxe_map.delete_mapping(base_url, _settings.pxe_map_token, mac):
+            removed.append(mac)
+        else:
+            absent.append(mac)
+    activity.logger.info(
+        "Unmapped %s on the %s PXE VM %s: removed %s, already absent %s",
+        ref.server_name,
+        ref.site,
+        base_url,
+        removed,
+        absent,
+    )
+    return PxeUnregistration(removed=removed, absent=absent)
 
 
 @activity.defn
@@ -296,6 +499,7 @@ async def get_baremetal_host(ref: BmhRef) -> BmhState:
         operational_status=status.get("operationalStatus"),
         error_type=status.get("errorType") or None,
         error_message=status.get("errorMessage") or None,
+        powered_on=status.get("poweredOn"),
     )
 
 

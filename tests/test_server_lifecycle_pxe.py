@@ -16,7 +16,7 @@ import respx
 from pydantic import ValidationError
 
 from activities.server_lifecycle import activities, cluster_api
-from activities.server_lifecycle.pxe_map import map_key, put_mapping
+from activities.server_lifecycle.pxe_map import delete_mapping, map_key, put_mapping
 from shared.bmc_address import BMC_VENDORS, boots_from_network
 from shared.exceptions import (
     InfraEnvNotFoundError,
@@ -26,7 +26,7 @@ from shared.exceptions import (
     PxeMapRequestRejectedError,
     PxeSiteNotConfiguredError,
 )
-from shared.models.server_lifecycle import PxeBootRequest
+from shared.models.server_lifecycle import InfraEnvRef, PxeBootRequest, PxeMapRef
 from shared.settings import ServerLifecycleActivitySettings
 
 PXE = "http://pxe.bat-yam.test:8080"  # PXE_MAP_URLS["bat-yam"] in conftest
@@ -179,3 +179,82 @@ class TestRegisterPxeBoot:
         with pytest.raises(InfraEnvNotReadyError):
             await activities.register_pxe_boot(REQUEST)
         assert not route.called
+
+
+MAP_REF = PxeMapRef(
+    server_name=REQUEST.server_name, site="bat-yam", macs=REQUEST.macs
+)
+
+
+class TestThePxeMapDelete:
+    @respx.mock
+    async def test_a_delete_addresses_the_mac_key_with_the_token(self):
+        route = respx.delete(f"{PXE}/pxe-map/0025b5000001").mock(
+            return_value=httpx.Response(204)
+        )
+        assert await delete_mapping(PXE, "secret", MAC) is True
+        assert route.calls.last.request.headers["Authorization"] == "Bearer secret"
+
+    @respx.mock
+    async def test_an_entry_already_gone_is_success_not_an_error(self):
+        respx.delete(url__startswith=PXE).mock(return_value=httpx.Response(404))
+        assert await delete_mapping(PXE, "t", MAC) is False
+
+    @pytest.mark.parametrize("status", [401, 403])
+    @respx.mock
+    async def test_a_rejected_token_is_permanent(self, status):
+        respx.delete(url__startswith=PXE).mock(return_value=httpx.Response(status))
+        with pytest.raises(PxeMapAuthError):
+            await delete_mapping(PXE, "bad", MAC)
+
+    @respx.mock
+    async def test_a_server_error_is_retried(self):
+        respx.delete(url__startswith=PXE).mock(return_value=httpx.Response(503))
+        with pytest.raises(PxeMapError):
+            await delete_mapping(PXE, "t", MAC)
+
+
+class TestUnregisterPxeBoot:
+    @respx.mock
+    async def test_both_macs_are_deleted_and_a_missing_one_is_reported_absent(self):
+        respx.delete(f"{PXE}/pxe-map/0025b5000001").mock(return_value=httpx.Response(200))
+        respx.delete(f"{PXE}/pxe-map/0025b5000002").mock(return_value=httpx.Response(404))
+
+        result = await activities.unregister_pxe_boot(MAP_REF)
+
+        assert result.removed == ["00:25:b5:00:00:01"]
+        assert result.absent == ["00:25:b5:00:00:02"]
+        assert result.detail is None
+
+    @respx.mock
+    async def test_a_site_no_longer_configured_is_reported_not_raised(self):
+        route = respx.delete(url__startswith="http")
+        result = await activities.unregister_pxe_boot(
+            MAP_REF.model_copy(update={"site": "haifa"})
+        )
+        assert result.removed == [] and "haifa" in (result.detail or "")
+        assert not route.called
+
+
+class TestCheckInfraEnv:
+    REF = InfraEnvRef(name="cisco-m6-bat-yam-64c-512gb", namespace="inventory")
+
+    async def test_an_existing_late_binding_infraenv_passes(self, infra_env):
+        reads = infra_env({"spec": {}})
+        state = await activities.check_infra_env(self.REF)
+        assert (state.name, state.namespace, state.cluster_ref) == (
+            self.REF.name, "inventory", None
+        )
+        assert (reads[0]["plural"], reads[0]["name"], reads[0]["namespace"]) == (
+            "infraenvs", self.REF.name, "inventory"
+        )
+
+    async def test_an_early_bound_infraenv_reports_its_cluster(self, infra_env):
+        infra_env({"spec": {"clusterRef": {"name": "ocp4-hc-01", "namespace": "x"}}})
+        state = await activities.check_infra_env(self.REF)
+        assert state.cluster_ref == "ocp4-hc-01"
+
+    async def test_a_missing_infraenv_is_permanent_and_names_where_it_looked(self, infra_env):
+        infra_env(None)
+        with pytest.raises(InfraEnvNotFoundError, match="namespace inventory"):
+            await activities.check_infra_env(self.REF)

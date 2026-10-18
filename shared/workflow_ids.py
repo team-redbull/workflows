@@ -92,6 +92,18 @@ def install_server_workflow_id(infra_env: str, server_name: str | None = None) -
     return f"install-server-{infra_env}"
 
 
+def remove_server_workflow_id(server_name: str) -> str:
+    """`remove-server-<server>`: one removal of a machine at a time.
+
+    Keyed on the MACHINE, unlike install-server: the server is named up front,
+    and it is what two removals would race on. The distinct prefix keeps a
+    removal from colliding with an install of the same server. Lowercased for
+    the reason install_server_workflow_id gives — one machine, one id, however
+    a caller typed its uppercase serial.
+    """
+    return f"remove-server-{server_name.lower()}"
+
+
 def provision_dell_server_workflow_id(idrac_ip: str) -> str:
     """`provision-dell-server-<idrac ip>`: natural dedup per machine at the rack.
 

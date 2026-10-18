@@ -252,6 +252,45 @@ class PxeBootRegistration(BaseModel):
     macs: list[str]
 
 
+class PxeMapRef(BaseModel):
+    """The PXE map entries one candidate's rollback removes: its bond MACs at its site."""
+
+    server_name: str = Field(min_length=1)
+    site: str = Field(min_length=1)
+    macs: list[str] = Field(min_length=1)
+
+
+class PxeUnregistration(BaseModel):
+    """What a rollback removed from the site's PXE VM.
+
+    `absent` MACs had no entry left — success, since that is the state the
+    rollback wants. `detail` says why nothing could be removed at all (the
+    site's PXE VM is no longer configured on this worker).
+    """
+
+    removed: list[str] = Field(default_factory=list)
+    absent: list[str] = Field(default_factory=list)
+    detail: str | None = None
+
+
+class InfraEnvRef(BaseModel):
+    """One InfraEnv on the target MCE: the one this run fills."""
+
+    name: str = Field(min_length=1)
+    namespace: str = Field(min_length=1)
+
+
+class InfraEnvState(BaseModel):
+    """The InfraEnv as read back. Only returned when it exists — absence raises."""
+
+    name: str
+    namespace: str
+    # Set for an EARLY-binding InfraEnv: every Agent registering in it is bound
+    # to this cluster at once, so a host added to it can be installed rather
+    # than wait in the inventory. Reported, not refused.
+    cluster_ref: str | None = None
+
+
 class CreatedResource(BaseModel):
     """The outcome of one idempotent create.
 
@@ -294,6 +333,10 @@ class BmhState(BaseModel):
     operational_status: str | None = None
     error_type: str | None = None
     error_message: str | None = None
+    # `status.poweredOn` as metal3 last observed it through the BMC. None from
+    # a limb that predates the field — read only by remove-server, which also
+    # needs that newer limb for its own activities.
+    powered_on: bool | None = None
 
     def is_errored(self) -> bool:
         """Metal3 has recorded a failure rather than work still in progress."""
@@ -361,6 +404,102 @@ class TeardownResult(BaseModel):
 
     removed: list[str] = Field(default_factory=list)
     finalizers_cleared: bool = False
+
+
+class AgentBinding(BaseModel):
+    """One Agent found for a host, and the cluster it is bound to, if any."""
+
+    name: str
+    # `<namespace>/<name>` of `spec.clusterDeploymentName`; None = unbound,
+    # i.e. the host only sits in the MCE's inventory.
+    cluster_deployment: str | None = None
+
+
+class InventoryHostState(BaseModel):
+    """What one server has on its MCE: the BMH, its NMStateConfig, its Agents.
+
+    Agents are matched to the host by BMAC's `agent-install.openshift.io/bmh`
+    label OR by any MAC of the machine — those the BMH / NMStateConfig carry
+    and every one server-scan holds for the server's name. server-scan's are
+    what still find an Agent whose BMH and NMStateConfig are already gone, or
+    that registered before BMAC linked it.
+    """
+
+    bmh_found: bool = False
+    nmstate_found: bool = False
+    powered_on: bool | None = None
+    agents: list[AgentBinding] = Field(default_factory=list)
+    # The MACs server-scan holds for the server; [] when it does not know it.
+    server_scan_macs: list[str] = Field(default_factory=list)
+
+    @property
+    def bound_agents(self) -> list[AgentBinding]:
+        return [a for a in self.agents if a.cluster_deployment]
+
+
+class HostPowerRequest(BaseModel):
+    """Set a BareMetalHost's `spec.online`.
+
+    `agents_must_be_unbound` is re-checked by the activity right before it
+    acts: a host whose Agent was bound to a cluster since the inspection is
+    refused rather than powered off under that cluster.
+    """
+
+    server_name: str = Field(min_length=1)
+    namespace: str = Field(min_length=1)
+    online: bool
+    agents_must_be_unbound: list[str] = Field(default_factory=list)
+
+
+class AgentDeleteRequest(BaseModel):
+    """Agents to delete in one namespace. Each is re-checked as unbound first."""
+
+    namespace: str = Field(min_length=1)
+    names: list[str] = Field(min_length=1)
+
+
+class AgentDeletion(BaseModel):
+    """`absent` Agents were already gone — success, it is the state wanted."""
+
+    deleted: list[str] = Field(default_factory=list)
+    absent: list[str] = Field(default_factory=list)
+
+
+class RemoveServerInput(BaseModel):
+    """Input to RemoveServerWorkflow: which server to take out of which MCE's inventory.
+
+    `namespace` is required HERE; the API defaults it to `inventory` on its
+    edge model, so a recorded run always carries the namespace it acted on.
+    """
+
+    server_name: str = Field(min_length=1)
+    mce_cluster: str = Field(min_length=1)
+    namespace: str = Field(min_length=1)
+
+
+class RemoveServerRunArgs(BaseModel):
+    """The workflow's single argument (see InstallServerRunArgs for why a wrapper)."""
+
+    input: RemoveServerInput
+
+
+class RemoveServerProgress(BaseModel):
+    """Returned by the `progress` query; `activity_queue` names the MCE's queue."""
+
+    phase: str
+    activity_queue: str | None = None
+
+
+class RemoveServerResult(BaseModel):
+    """What the removal did. `found=False`: nothing of the server was on the MCE."""
+
+    server_name: str
+    namespace: str
+    mce_cluster: str
+    found: bool
+    powered_off: bool = False
+    agents_removed: list[str] = Field(default_factory=list)
+    resources_removed: list[str] = Field(default_factory=list)
 
 
 class InstallServerInput(BaseModel):

@@ -199,10 +199,47 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   `status.bootArtifacts.ipxeScript` on the MCE and `PUT /pxe-map/<mac>`
   `{"ipxe_url"}` for BOTH bond MACs to `PXE_MAP_URLS[site]` (bearer
   `PXE_MAP_TOKEN`). The site is the MCE inventory SEGMENT's. A site with no
-  entry is a skip (`no-pxe-site`). The URL never enters history; a rollback
-  leaves the mapping (the next PUT overwrites it). Gated by
-  `workflow.patched("pxe-map-ipmi-boot")`. Needs `get` on `infraenvs` in the
-  limb's RBAC.
+  entry is a skip (`no-pxe-site`). The URL never enters history. The no-Agent
+  rollback DELETEs `/pxe-map/<mac>` (404 = success) between the teardown and the
+  lock release — never after the release, and never on the lock-LAPSE rollback,
+  because another run may by then have mapped the same MACs to its own InfraEnv.
+  An installed host keeps its mapping. Gated by `workflow.patched`
+  (`pxe-map-ipmi-boot`, `pxe-map-rollback-cleanup`). Needs `get` on `infraenvs`
+  in the limb's RBAC.
+- **install-server checks the InfraEnv exists on the MCE before drawing**
+  (`check_infra_env`, phase `validating-infraenv`, gated by
+  `infraenv-precheck`): a missing one fails the run with `InfraEnvNotFoundError`
+  instead of locking, booting and waiting an hour on every candidate. An
+  early-bound InfraEnv (`spec.clusterRef`) is logged, not refused. The API
+  defaults `namespace` to `inventory` — on the edge model only, so a recorded
+  run's input never changes on replay.
+- **An MCE name is accepted with or without its `ocp4-` prefix, and always used
+  WITH it** (`shared/cluster_names.canonical_mce_cluster`). Applied on the
+  server-lifecycle API's request models and to the worker's `MCE_CLUSTER`
+  setting — the two ends of the queue name — and NEVER on a model decoded from
+  history, where renaming a recorded run's MCE would change the queue it replays
+  against.
+- **remove-server takes a server OUT of an MCE's inventory — only inventory.**
+  (`workflow_domains/server_lifecycle/remove_server.py`, own queue
+  `remove-server-workflow`, id `remove-server-<server lowercased>`, API
+  `POST /workflows/server-lifecycle/remove-server`, `namespace` defaulting to
+  `inventory`.) It finds the host's Agents by BMAC's `agent-install.openshift.io/bmh`
+  label or by ANY MAC of the machine — from the BMH / NMStateConfig and every
+  MAC server-scan holds for the name (`GET /servers?search=` + exact name on
+  `/servers/{id}`, never `/servers/available`), which is what finds an Agent
+  whose BMH is already gone. Any of the three may be missing. It refuses with
+  `AgentBoundToClusterError` — changing nothing — if any is bound
+  (`spec.clusterDeploymentName`). Order is load-bearing: POWER OFF first
+  (`spec.online: false`, bounded wait on `status.poweredOn`, else
+  `HostPowerOffTimeoutError` with nothing deleted), then the BMH + NMStateConfig
+  via the same `teardown_bmh_resources` as install-server's rollback, and the
+  Agent LAST — a host still running discovery re-registers a deleted Agent
+  within a minute. The power-off and the Agent delete each re-check the binding
+  right before acting. It ENDS by re-inspecting until none of the three is left
+  (bounded, 5 min): anything still there — typically an Agent re-registered by
+  a host with no BMH to power it off through — fails with
+  `ServerStillPresentError` naming it, never a success. Leaves server-scan's lock and the PXE map entry alone.
+  Needs `delete` on agents in the limb's RBAC.
 - **Select bond members from `interfaces[]`, NEVER from `nic_macs`.**
   server-scan reduces Dell NPAR partitions to one entry per physical port in
   `interfaces` but leaves `nic_macs` whole on purpose, so a 4-port partitioned

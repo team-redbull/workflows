@@ -29,6 +29,7 @@ from shared.consts import (
     server_lifecycle_activity_queue,
 )
 from shared.exceptions import (
+    InfraEnvNotFoundError,
     InventorySegmentNotFoundError,
     PxeMapAuthError,
     PxeSiteNotConfiguredError,
@@ -47,11 +48,15 @@ from shared.models.server_lifecycle import (
     BmhResourceRequest,
     BmhState,
     CreatedResource,
+    InfraEnvRef,
+    InfraEnvState,
     InstallServerInput,
     InstallServerRunArgs,
     LinkState,
     PxeBootRegistration,
     PxeBootRequest,
+    PxeMapRef,
+    PxeUnregistration,
     ReleaseServerRequest,
     ReserveServerRequest,
     ServerInterface,
@@ -187,6 +192,7 @@ def make_mock_activities(
     reserve_error: Exception | None = None,
     pxe_sites: set[str] | None = None,
     pxe_error: Exception | None = None,
+    infra_env_missing: bool = False,
 ):
     """Build the full mock activity set + a call recorder.
 
@@ -221,6 +227,8 @@ def make_mock_activities(
             "reserve_server",
             "release_server",
             "register_pxe_boot",
+            "unregister_pxe_boot",
+            "check_infra_env",
             # Activity names in call order, for the ones whose ORDER matters.
             "order",
         )
@@ -247,12 +255,29 @@ def make_mock_activities(
     @activity.defn
     async def acquire_servers(request: AcquireServerRequest) -> list[AcquiredServer]:
         calls["acquire_servers"].append(request)
+        calls["order"].append("acquire_servers")
         if acquire_error is not None:
             raise acquire_error
         return list(drawn)
 
     def _created(kind: str, name: str) -> CreatedResource:
         return CreatedResource(kind=kind, name=name, changed=not resources_exist)
+
+    @activity.defn
+    async def check_infra_env(ref: InfraEnvRef) -> InfraEnvState:
+        calls["check_infra_env"].append(ref)
+        calls["order"].append("check_infra_env")
+        if infra_env_missing:
+            raise InfraEnvNotFoundError(
+                f"InfraEnv {ref.name} does not exist in namespace {ref.namespace}"
+            )
+        return InfraEnvState(name=ref.name, namespace=ref.namespace)
+
+    @activity.defn
+    async def unregister_pxe_boot(ref: PxeMapRef) -> PxeUnregistration:
+        calls["unregister_pxe_boot"].append(ref)
+        calls["order"].append("unregister_pxe_boot")
+        return PxeUnregistration(removed=list(ref.macs))
 
     @activity.defn
     async def register_pxe_boot(request: PxeBootRequest) -> PxeBootRegistration:
@@ -336,6 +361,7 @@ def make_mock_activities(
     @activity.defn
     async def teardown_bmh_resources(ref: BmhRef) -> TeardownResult:
         calls["teardown_bmh_resources"].append(ref)
+        calls["order"].append("teardown_bmh_resources")
         if teardown_error is not None:
             raise teardown_error
         torn_down.add(ref.server_name)
@@ -377,6 +403,7 @@ def make_mock_activities(
     @activity.defn
     async def release_server(request: ReleaseServerRequest) -> ServerReservation:
         calls["release_server"].append(request)
+        calls["order"].append("release_server")
         if locks.get(request.server_id) == request.workflow_id:
             del locks[request.server_id]
             return ServerReservation(server_id=request.server_id, held=False)
@@ -396,6 +423,8 @@ def make_mock_activities(
         reserve_server,
         release_server,
         register_pxe_boot,
+        unregister_pxe_boot,
+        check_infra_env,
     ]
     return calls, segment_activities, server_activities
 
@@ -1029,7 +1058,9 @@ class TestPerMceRouting:
         # ...and the stall says which queue is unserved, so "the run is stuck"
         # reads as "that MCE has no server-lifecycle-worker".
         assert progress.activity_queue == f"server-lifecycle-activity-{other_mce}"
-        assert progress.phase == "acquiring-server"
+        # The first step on the MCE's queue is the InfraEnv check.
+        assert progress.phase == "validating-infraenv"
+        assert calls["check_infra_env"] == []
 
     async def test_the_result_still_reports_which_mce_was_targeted(self) -> None:
         calls, segment_acts, server_acts = make_mock_activities()
@@ -1176,7 +1207,8 @@ class TestThePxeBootOfAnIpmiServer:
             result = await _execute(client, InstallServerRunArgs(input=INPUT))
 
         assert result.pxe_registered is True
-        assert calls["order"][:3] == [
+        watched = {"register_pxe_boot", "create_bmc_secret", "create_baremetal_host"}
+        assert [name for name in calls["order"] if name in watched] == [
             "register_pxe_boot",
             "create_bmc_secret",
             "create_baremetal_host",
@@ -1260,3 +1292,92 @@ class TestThePxeBootOfAnIpmiServer:
                 await _execute(client, InstallServerRunArgs(input=INPUT))
 
         assert "PXE map" in _application_error(excinfo.value).message
+
+
+class TestTheInfraEnvIsCheckedFirst:
+    """No server is drawn, locked or booted for an InfraEnv the MCE does not have."""
+
+    async def test_the_infraenv_is_checked_on_the_mce_before_the_draw(self):
+        calls, segment_acts, server_acts = make_mock_activities()
+        async with _Harness(segment_acts, server_acts) as client:
+            await _execute(client, InstallServerRunArgs(input=INPUT))
+
+        assert calls["check_infra_env"] == [
+            InfraEnvRef(name=INFRA_ENV, namespace=NAMESPACE)
+        ]
+        order = calls["order"]
+        assert order.index("check_infra_env") < order.index("acquire_servers")
+
+    async def test_a_missing_infraenv_fails_the_run_before_anything_is_drawn(self):
+        calls, segment_acts, server_acts = make_mock_activities(infra_env_missing=True)
+        async with _Harness(segment_acts, server_acts) as client:
+            with pytest.raises(WorkflowFailureError) as excinfo:
+                await _execute(client, InstallServerRunArgs(input=INPUT))
+
+        assert _application_error(excinfo.value).type == "InfraEnvNotFoundError"
+        # Once: permanent, not retried every minute.
+        assert len(calls["check_infra_env"]) == 1
+        assert calls["acquire_servers"] == []
+        assert calls["reserve_server"] == []
+        assert calls["create_bmc_secret"] == []
+
+
+class TestThePxeMapIsCleanedOnRollback:
+    """A rolled-back IPMI candidate must not keep booting this InfraEnv's discovery image."""
+
+    async def test_a_blade_with_no_agent_is_unmapped_between_teardown_and_release(self):
+        blade = ucs_server()
+        calls, segment_acts, server_acts = make_mock_activities(
+            candidates=[blade, bondable_server()], agent_never_for={blade.name}
+        )
+        async with _Harness(segment_acts, server_acts) as client:
+            result = await _execute(client, InstallServerRunArgs(input=INPUT))
+
+        assert result.server_name == SERVER_NAME
+        assert calls["unregister_pxe_boot"] == [
+            PxeMapRef(
+                server_name=blade.name,
+                site=INVENTORY_SEGMENT.site,
+                macs=["00:25:b5:00:00:01", "00:25:b5:00:00:02"],
+            )
+        ]
+        # Teardown first (Ironic lets go), then the PXE map, THEN the lock:
+        # after the release another run may map the same MACs.
+        watched = {"teardown_bmh_resources", "unregister_pxe_boot", "release_server"}
+        assert [name for name in calls["order"] if name in watched] == [
+            "teardown_bmh_resources",
+            "unregister_pxe_boot",
+            "release_server",
+        ]
+
+    async def test_a_redfish_server_rolled_back_never_touches_the_pxe_map(self):
+        doomed = bondable_server("srv_doomed", name="ocp-doomed", mac_prefix="11:22:33:44:55")
+        calls, segment_acts, server_acts = make_mock_activities(
+            candidates=[doomed, bondable_server()], agent_never_for={"ocp-doomed"}
+        )
+        async with _Harness(segment_acts, server_acts) as client:
+            await _execute(client, InstallServerRunArgs(input=INPUT))
+
+        assert [t.server_name for t in calls["teardown_bmh_resources"]] == ["ocp-doomed"]
+        assert calls["unregister_pxe_boot"] == []
+
+    async def test_a_lapsed_lock_leaves_the_pxe_map_to_the_run_that_took_it(self):
+        """Another run holds the machine now and may have mapped the same MACs."""
+        blade = ucs_server()
+        calls, segment_acts, server_acts = make_mock_activities(
+            candidates=[blade, bondable_server()], lock_lapses_for={blade.name}
+        )
+        async with _Harness(segment_acts, server_acts) as client:
+            result = await _execute(client, InstallServerRunArgs(input=INPUT))
+
+        assert result.server_name == SERVER_NAME
+        assert [t.server_name for t in calls["teardown_bmh_resources"]] == [blade.name]
+        assert calls["unregister_pxe_boot"] == []
+
+    async def test_an_installed_blade_keeps_its_mapping(self):
+        calls, segment_acts, server_acts = make_mock_activities(candidates=[ucs_server()])
+        async with _Harness(segment_acts, server_acts) as client:
+            result = await _execute(client, InstallServerRunArgs(input=INPUT))
+
+        assert result.pxe_registered is True
+        assert calls["unregister_pxe_boot"] == []

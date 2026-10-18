@@ -16,6 +16,9 @@ Shape of the run:
                            segment, looked up in the Segments Manager by
                            cluster name. Runs on the SEGMENT-LIFECYCLE queue,
                            where that credential already lives.
+     validating-infraenv — the InfraEnv must exist on the MCE, in the run's
+                           namespace, before any server is drawn; missing
+                           fails the run (no candidate could fix it).
   2. acquiring-server    — GET /servers/available. The InfraEnv name states
                            which hardware it is for
                            (cisco-m6-bat-yam-64c-512gb), and server names carry
@@ -52,10 +55,12 @@ Shape of the run:
                            machine stays out of every other MCE's draw until
                            server-scan's membership jobs see it in a cluster.
   6. rolling-back        — no Agent by the deadline is that CANDIDATE's
-     releasing-server      failure, not the run's: the NMStateConfig and
-                           BareMetalHost are removed and the lock released,
-                           which returns the machine to the inventory, and the
-                           next candidate is tried from step 3.
+     unregistering-pxe-boot failure, not the run's: the NMStateConfig and
+     releasing-server      BareMetalHost are removed, an IPMI candidate's MACs
+                           are deleted from its site's PXE VM (while the lock
+                           is still ours), and the lock released, which returns
+                           the machine to the inventory; the next candidate is
+                           tried from step 3.
 
 Steps 3-6 are therefore a LOOP, not a pipeline. A candidate cannot be shown to
 be installable without creating its resources and watching what happens, so the
@@ -175,6 +180,7 @@ with workflow.unsafe.imports_passed_through():
     from shared.models.segment_lifecycle import SegmentEntry
     from shared.interfaces.server_lifecycle import (
         acquire_servers,
+        check_infra_env,
         create_baremetal_host,
         create_bmc_secret,
         create_nmstate_config,
@@ -184,6 +190,7 @@ with workflow.unsafe.imports_passed_through():
         release_server,
         reserve_server,
         teardown_bmh_resources,
+        unregister_pxe_boot,
     )
     from shared.models.server_lifecycle import (
         AcquiredServer,
@@ -198,8 +205,10 @@ with workflow.unsafe.imports_passed_through():
         InstallServerProgress,
         InstallServerInput,
         InstallServerResult,
+        InfraEnvRef,
         InstallServerRunArgs,
         PxeBootRequest,
+        PxeMapRef,
         ReleaseServerRequest,
         ReserveServerRequest,
         ServerReservation,
@@ -300,6 +309,10 @@ _RESERVATION_PATCH = "server-scan-install-lock"
 # in-flight IPMI run past selection would otherwise meet a new activity in
 # front of its recorded creates.
 _PXE_BOOT_PATCH = "pxe-map-ipmi-boot"
+# Gate the InfraEnv pre-check and the rollback's PXE map cleanup, for the same
+# reason: each puts a new activity where an in-flight run recorded another.
+_INFRAENV_CHECK_PATCH = "infraenv-precheck"
+_PXE_CLEANUP_PATCH = "pxe-map-rollback-cleanup"
 
 # The server-scan health verdict this workflow accepts. Deliberately only the
 # top tier: the endpoint would otherwise fill HEALTHY, then WARNING, then MAJOR.
@@ -493,6 +506,8 @@ class InstallServerWorkflow:
         self._activity_queue: str | None = None
         self._reserving = False
         self._pxe_booting = False
+        self._checking_infra_env = False
+        self._pxe_cleanup = False
 
     @workflow.query
     def progress(self) -> InstallServerProgress:
@@ -520,6 +535,8 @@ class InstallServerWorkflow:
         self._activity_queue = activity_queue
         self._reserving = workflow.patched(_RESERVATION_PATCH)
         self._pxe_booting = workflow.patched(_PXE_BOOT_PATCH)
+        self._checking_infra_env = workflow.patched(_INFRAENV_CHECK_PATCH)
+        self._pxe_cleanup = workflow.patched(_PXE_CLEANUP_PATCH)
         workflow.logger.info(
             "Installing a server into InfraEnv=%s for MCE=%s",
             infra_env,
@@ -533,6 +550,30 @@ class InstallServerWorkflow:
         # the segment-lifecycle queue, which already holds that credential.
         self._phase = "resolving-vlan"
         segment = await self._inventory_segment(install_input.mce_cluster)
+
+        # The InfraEnv must exist on the MCE before any server is drawn: every
+        # resource carries its label and every host registers into it, so a
+        # missing one would lock, boot and wait an hour on each candidate only
+        # to fail them all. Raised by the activity (InfraEnvNotFoundError) —
+        # no candidate could fix it, so it fails the run.
+        if self._checking_infra_env:
+            self._phase = "validating-infraenv"
+            state = await workflow.execute_activity(
+                check_infra_env,
+                InfraEnvRef(name=infra_env, namespace=namespace),
+                task_queue=activity_queue,
+                start_to_close_timeout=_ACTIVITY_TIMEOUT,
+                schedule_to_start_timeout=_SCHEDULE_TO_START_TIMEOUT,
+                retry_policy=_RETRY_POLICY,
+            )
+            if state.cluster_ref:
+                workflow.logger.warning(
+                    "InfraEnv %s/%s is early-bound to cluster %s: hosts added to "
+                    "it are bound to that cluster at once, not held in inventory",
+                    namespace,
+                    infra_env,
+                    state.cluster_ref,
+                )
 
         # Step 2 — the InfraEnv name IS the hardware query. It encodes vendor,
         # model, site and spec, and server names carry the same tokens behind
@@ -723,6 +764,17 @@ class InstallServerWorkflow:
                 _AGENT_DEADLINE,
                 teardown.removed or "nothing (already absent)",
             )
+            # An IPMI candidate's MACs still point at this InfraEnv's discovery
+            # image on its site's PXE VM; left there, the machine would boot
+            # into it again whoever draws it next. Removed while the lock is
+            # still ours — after the release another run may map the same MACs
+            # to its own InfraEnv, which this must never delete. (The lock-lapse
+            # rollback above skips this for exactly that reason.)
+            if self._pxe_cleanup and pxe_registered:
+                self._phase = "unregistering-pxe-boot"
+                await self._unregister_pxe_boot(
+                    candidate, bond_members, segment.site, activity_queue
+                )
             if self._reserving:
                 self._phase = "releasing-server"
                 await self._release(candidate, activity_queue)
@@ -902,6 +954,31 @@ class InstallServerWorkflow:
             rejections.append(("no-pxe-site", f"{candidate.name} (site {site!r})"))
             return False
         return True
+
+    async def _unregister_pxe_boot(
+        self,
+        candidate: AcquiredServer,
+        bond_members: list[BondMember],
+        site: str,
+        task_queue: str,
+    ) -> None:
+        """Take a rolled-back IPMI candidate's MACs off its site's PXE VM."""
+        result = await workflow.execute_activity(
+            unregister_pxe_boot,
+            PxeMapRef(
+                server_name=candidate.name,
+                site=site,
+                macs=[member.mac for member in bond_members],
+            ),
+            task_queue=task_queue,
+            start_to_close_timeout=_ACTIVITY_TIMEOUT,
+            schedule_to_start_timeout=_SCHEDULE_TO_START_TIMEOUT,
+            retry_policy=_RETRY_POLICY,
+        )
+        if result.detail:
+            workflow.logger.warning(
+                "PXE map cleanup of %s skipped: %s", candidate.name, result.detail
+            )
 
     async def _release(self, candidate: AcquiredServer, task_queue: str) -> None:
         """Give the lock back once a teardown proved nothing still points at the machine."""

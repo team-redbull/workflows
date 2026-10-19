@@ -36,6 +36,7 @@ _WORKERS = {
 _WORKFLOW_MODULES = [
     "workflow_domains/server_lifecycle/install_server.py",
     "workflow_domains/server_lifecycle/remove_server.py",
+    "workflow_domains/server_lifecycle/publish_infraenv_boot.py",
     "workflow_domains/segment_lifecycle/allocate_segment.py",
     "workflow_domains/segment_lifecycle/initialize_segment.py",
     "workflow_domains/server_provisioning/provision_dell_server.py",

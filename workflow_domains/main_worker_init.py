@@ -27,6 +27,7 @@ from shared.consts import (
     INITIALIZE_SEGMENT_WORKFLOW_QUEUE,
     INSTALL_SERVER_WORKFLOW_QUEUE,
     PROVISION_DELL_SERVER_WORKFLOW_QUEUE,
+    PUBLISH_INFRAENV_BOOT_WORKFLOW_QUEUE,
     RELEASE_SEGMENT_WORKFLOW_QUEUE,
     REMOVE_SERVER_WORKFLOW_QUEUE,
 )
@@ -44,6 +45,9 @@ from workflow_domains.segment_lifecycle.release_segment import (
     ReleaseSegmentWorkflow,
 )
 from workflow_domains.server_lifecycle.install_server import InstallServerWorkflow
+from workflow_domains.server_lifecycle.publish_infraenv_boot import (
+    PublishInfraEnvBootWorkflow,
+)
 from workflow_domains.server_lifecycle.remove_server import RemoveServerWorkflow
 from workflow_domains.server_provisioning.provision_dell_server import (
     ProvisionDellServerWorkflow,
@@ -61,6 +65,7 @@ _WORKER_SPECS: list[tuple[str, list[type]]] = [
     (PROVISION_DELL_SERVER_WORKFLOW_QUEUE, [ProvisionDellServerWorkflow]),
     (RELEASE_SEGMENT_WORKFLOW_QUEUE, [ReleaseSegmentWorkflow]),
     (REMOVE_SERVER_WORKFLOW_QUEUE, [RemoveServerWorkflow]),
+    (PUBLISH_INFRAENV_BOOT_WORKFLOW_QUEUE, [PublishInfraEnvBootWorkflow]),
 ]
 
 

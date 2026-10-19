@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import pytest
 
+from activities.server_lifecycle.bmh_resources import build_baremetal_host
 from shared.bmc_address import bmc_secret_name, build_bmc_address
 from shared.workflow_ids import install_server_workflow_id
 from shared.models.server_lifecycle import (
     AcquiredServer,
     BmcEndpoint,
+    BmhResourceRequest,
     LinkState,
     ServerInterface,
 )
@@ -153,6 +155,62 @@ class TestStrictLinkUp:
         members = select_bond_members(server)
         assert members is not None
         assert [m.mac for m in members] == ["aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:03"]
+
+
+class TestTheBootNicIsTheFirstLinkUpOne:
+    """nic1 is the BareMetalHost's bootMACAddress and an IPMI host's only PXE map
+    entry, so it must be the FIRST link-up NIC server-scan lists — whatever
+    comes before or after it."""
+
+    def test_down_unknown_and_mac_less_nics_before_it_are_stepped_over(self) -> None:
+        server = _server(
+            [
+                _nic("NIC.Slot.1-1-1", "aa:bb:cc:dd:ee:01", "1/1/1", LinkState.DOWN),
+                _nic("NIC.Slot.1-2-1", "aa:bb:cc:dd:ee:02", "1/2/1", LinkState.UNKNOWN),
+                ServerInterface(
+                    name="NIC.Slot.1-3-1", mac=None, location="1/3/1", link_state=LinkState.UP
+                ),
+                _nic("NIC.Slot.1-4-1", "aa:bb:cc:dd:ee:04", "1/4/1", LinkState.UP),
+                _nic("NIC.Slot.2-1-1", "aa:bb:cc:dd:ee:05", "2/1/1", LinkState.UP),
+            ]
+        )
+        members = select_bond_members(server)
+        assert members is not None
+        assert (members[0].logical_name, members[0].mac) == ("nic1", "aa:bb:cc:dd:ee:04")
+
+    def test_it_is_never_displaced_by_a_later_partition_of_its_own_port(self) -> None:
+        server = _server(
+            [
+                _nic("NIC.Slot.2-1-1", "aa:bb:cc:dd:ee:01", "2/1/1", LinkState.UP),
+                _nic("NIC.Slot.2-1-2", "aa:bb:cc:dd:ee:02", "2/1/2", LinkState.UP),
+                _nic("NIC.Slot.2-2-1", "aa:bb:cc:dd:ee:03", "2/2/1", LinkState.UP),
+            ]
+        )
+        members = select_bond_members(server)
+        assert members is not None
+        assert members[0].mac == "aa:bb:cc:dd:ee:01"
+
+    def test_the_bmh_boots_from_it(self) -> None:
+        server = _server(
+            [
+                _nic("NIC.Slot.1-1-1", "aa:bb:cc:dd:ee:01", "1/1/1", LinkState.DOWN),
+                _nic("NIC.Slot.1-2-1", "aa:bb:cc:dd:ee:02", "1/2/1", LinkState.UP),
+                _nic("NIC.Slot.1-3-1", "aa:bb:cc:dd:ee:03", "1/3/1", LinkState.UP),
+            ]
+        )
+        members = select_bond_members(server)
+        bmh = build_baremetal_host(
+            BmhResourceRequest(
+                server_name=server.name,
+                namespace="inventory",
+                infra_env="dell-r650-tlv-64c-1024gb",
+                bmc_vendor="DELL",
+                bmc=IP_BMC,
+                bond_members=members,
+                vlan_id=24,
+            )
+        )
+        assert bmh["spec"]["bootMACAddress"] == "aa:bb:cc:dd:ee:02"
 
 
 class TestDegenerateInterfaceSets:

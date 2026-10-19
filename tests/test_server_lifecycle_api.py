@@ -121,3 +121,47 @@ class TestRemoveServer:
 
     def test_unknown_fields_are_refused(self, client):
         assert client.post(self.PATH, json={**self.BODY, "force": True}).status_code == 422
+
+
+class TestPublishInfraEnvBoot:
+    PATH = "/workflows/server-lifecycle/publish-infraenv-boot"
+    BODY = {"mce_cluster": "mce-bat-yam-01", "infra_env": "cisco-m6-bat-yam-64c-512gb"}
+
+    @pytest.fixture
+    def client(self, fake: _FakeClient) -> TestClient:
+        from shared.consts import PUBLISH_INFRAENV_BOOT_WORKFLOW_QUEUE
+
+        async def start_workflow(_run, args, *, id: str, task_queue: str):
+            assert task_queue == PUBLISH_INFRAENV_BOOT_WORKFLOW_QUEUE
+            fake.args.append(args)
+            return _FakeHandle(id)
+
+        fake.start_workflow = start_workflow
+        app = FastAPI()
+        app.include_router(router_module.router)
+        app.dependency_overrides[get_temporal_client] = lambda: fake
+        return TestClient(app)
+
+    def test_the_run_carries_the_canonical_mce_and_inventory_by_default(self, client, fake):
+        response = client.post(self.PATH, json=self.BODY)
+        assert response.status_code == 202
+        run_input = fake.args[0].input
+        # The MCE name is the entry's directory on the PXE VM, so both
+        # spellings must land on one file.
+        assert run_input.mce_cluster == "ocp4-mce-bat-yam-01"
+        assert run_input.namespace == "inventory"
+        assert response.json()["workflow_id"] == (
+            "publish-infraenv-boot-ocp4-mce-bat-yam-01-cisco-m6-bat-yam-64c-512gb"
+        )
+
+    def test_an_explicit_namespace_is_kept(self, client, fake):
+        client.post(self.PATH, json={**self.BODY, "namespace": "lab-kv"})
+        assert fake.args[0].input.namespace == "lab-kv"
+
+    @pytest.mark.parametrize("missing", ["mce_cluster", "infra_env"])
+    def test_both_names_are_required(self, client, missing):
+        body = {k: v for k, v in self.BODY.items() if k != missing}
+        assert client.post(self.PATH, json=body).status_code == 422
+
+    def test_unknown_fields_are_refused(self, client):
+        assert client.post(self.PATH, json={**self.BODY, "ipxe_url": "http://x"}).status_code == 422

@@ -195,17 +195,68 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
 - **An IPMI server boots from the NETWORK, so install-server maps it on the
   site's PXE VM first.** IPMI (a UCS-managed `CISCO` blade; `boots_from_network`
   in `shared/bmc_address.py`) has no virtual media. After the install lock and
-  BEFORE the Secret/BareMetalHost, `register_pxe_boot` reads the InfraEnv's
-  `status.bootArtifacts.ipxeScript` on the MCE and `PUT /pxe-map/<mac>`
-  `{"ipxe_url"}` for BOTH bond MACs to `PXE_MAP_URLS[site]` (bearer
-  `PXE_MAP_TOKEN`). The site is the MCE inventory SEGMENT's. A site with no
-  entry is a skip (`no-pxe-site`). The URL never enters history. The no-Agent
+  BEFORE the Secret/BareMetalHost, `register_pxe_boot` `PUT /pxe-map/<mac>`
+  `{"infra_env": {"mce_cluster", "name"}}` for the BareMetalHost's BOOT MAC
+  ONLY to `PXE_MAP_URLS[site]` (bearer `PXE_MAP_TOKEN`). The boot MAC is bond
+  member nic1, which `select_bond_members` takes from the FIRST link-up NIC
+  server-scan lists — the same MAC is the BMH's `bootMACAddress`, so the PXE VM
+  answers exactly the NIC Ironic boots. Decided with the operator 2026-10-19;
+  it replaced mapping both bond MACs (a blade whose firmware PXE-boots from the
+  other NIC now gets a 404). Runs recorded before `pxe-map-boot-mac-only` map
+  and unmap both. The Agent is still matched on BOTH. The MAC chains to the
+  InfraEnv's BOOT ENTRY, `/var/www/pxe-map/<mce_cluster>/<infra_env>.ipxe`, ONE
+  per InfraEnv. The site is the MCE inventory SEGMENT's. A site with no entry is
+  a skip (`no-pxe-site`).
+- **The boot entry is published only once the discovery image includes the
+  blade's NMStateConfig.** Every NMStateConfig regenerates the InfraEnv's image
+  and the image carries only the configs it was generated from, so with
+  installs of one InfraEnv in parallel a host could otherwise boot an image
+  from before its own static network config. So for an IPMI blade the
+  NMStateConfig is created FIRST (before the Secret/BMH that let Ironic power it
+  on), then `publish_infra_env_boot` polls (`publishing-pxe-boot`, 10 s, bounded
+  10 min) until the InfraEnv shows `ImageCreated=True` and `status.createdTime`
+  >= the NMStateConfig's `creationTimestamp`, and only then `PUT
+  /pxe-map/<mce_cluster>/<infra_env>` `{"ipxe_url", "image_created_at"}`. The
+  PXE VM compares-and-sets on `image_created_at` (§6): older is 409, which is
+  SUCCESS for the caller (`superseded` — the newer image includes its config).
+  No new image by the deadline fails the run with
+  `InfraEnvImageNotUpdatedError` after a full rollback (NMStateConfig, MACs,
+  lock) — assisted-service not regenerating is the InfraEnv's problem, not the
+  candidate's. Both timestamps are whole seconds; the same-second window is
+  harmless because assisted-service builds the PXE initrd per DOWNLOAD from the
+  InfraEnv's current static network config (verified in assisted-image-service
+  `initrd.go`) and the host fetches it minutes later. A REST check of
+  assisted-service's `static_network_config` was ruled out: its plain-HTTP
+  listener serves only `ipxe-script` (`WithIPXEScriptMiddleware`). Redfish
+  servers keep Secret → BMH → NMStateConfig and never touch the PXE VM.
+- The URL never enters history (read and PUT inside the activity). The no-Agent
   rollback DELETEs `/pxe-map/<mac>` (404 = success) between the teardown and the
   lock release — never after the release, and never on the lock-LAPSE rollback,
   because another run may by then have mapped the same MACs to its own InfraEnv.
-  An installed host keeps its mapping. Gated by `workflow.patched`
-  (`pxe-map-ipmi-boot`, `pxe-map-rollback-cleanup`). Needs `get` on `infraenvs`
-  in the limb's RBAC.
+  An installed host keeps its mapping; the boot entry is shared and never
+  deleted by a run. Gated by `workflow.patched` (`pxe-map-ipmi-boot`,
+  `pxe-map-rollback-cleanup`, `pxe-map-infraenv-boot` — runs recorded before
+  it map the URL straight onto the MACs, `PxeBootRequest.mce_cluster` None —
+  and `pxe-map-boot-mac-only`). The PXE VMs' pxe-map-api must be upgraded BEFORE this limb: an old one
+  refuses the `infra_env` body (422) and lacks the entry route (404), both
+  non-retryable and named in the error. Needs `get` on `infraenvs` and
+  `nmstateconfigs` in the limb's RBAC (both already granted).
+- **publish-infraenv-boot republishes one InfraEnv's boot entry on demand, tied
+  to no host.** (`workflow_domains/server_lifecycle/publish_infraenv_boot.py`,
+  own queue `publish-infraenv-boot-workflow`, id
+  `publish-infraenv-boot-<mce>-<infra_env>` — keyed on the FILE it writes, one
+  per (MCE, InfraEnv) — API `POST /workflows/server-lifecycle/publish-infraenv-boot`,
+  `namespace` defaulting to `inventory`, MCE canonicalised at the edge because
+  it is also the entry's directory on the PXE VM.) Site from the MCE's
+  inventory segment (`get_inventory_segment`, segment-lifecycle queue,
+  cluster re-checked) — the same PXE VM install-server maps hosts on; then
+  `check_infra_env`; then the SAME `publish_infra_env_boot` activity with
+  `server_name=None`, which skips the NMStateConfig comparison and publishes
+  the InfraEnv's current image once `infraenv_image_not_ready_reason` passes
+  (ImageCreated True, ipxeScript, createdTime), polled 10 s / bounded 10 min →
+  `InfraEnvImageNotUpdatedError`. The PXE VM's compare-and-set means it can
+  never roll an entry back: a newer image there is `superseded`, success.
+  Writes nothing on the MCE.
 - **install-server checks the InfraEnv exists on the MCE before drawing**
   (`check_infra_env`, phase `validating-infraenv`, gated by
   `infraenv-precheck`): a missing one fails the run with `InfraEnvNotFoundError`
@@ -238,8 +289,22 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   right before acting. It ENDS by re-inspecting until none of the three is left
   (bounded, 5 min): anything still there — typically an Agent re-registered by
   a host with no BMH to power it off through — fails with
-  `ServerStillPresentError` naming it, never a success. Leaves server-scan's lock and the PXE map entry alone.
-  Needs `delete` on agents in the limb's RBAC.
+  `ServerStillPresentError` naming it, never a success. After the Agent delete
+  and before that check (`removing-pxe-boot`, gated `remove-server-pxe-cleanup`)
+  it clears EVERY MAC the host is known by (`InventoryHostState.macs`: BMH boot
+  MAC + NMStateConfig + server-scan; a limb predating the field falls back to
+  `server_scan_macs` by `model_fields_set`) from EVERY PXE VM in the worker's
+  `PXE_MAP_URLS`, with `DELETE /pxe-map/<mac>?mce_cluster=<this MCE>`: the PXE
+  VM refuses (409, reported in `pxe_kept`, not a failure) a MAC chaining to
+  ANOTHER MCE's boot entry and removes anything else — this MCE's entry, a
+  pre-boot-entry direct URL, a corrupt file — under the lock MAC writes take
+  (compare-and-delete server-side, §6). Without it a removed blade powered on
+  again would PXE-boot this MCE's discovery image and re-register. A server
+  found NOWHERE on the MCE touches the PXE map neither (nothing ties its MACs
+  to this MCE). The InfraEnv's boot entry is shared and never removed. An OLD
+  pxe-map-api ignores `?mce_cluster` and deletes unconditionally — upgrade the
+  PXE VMs first. Leaves server-scan's lock alone. Needs `delete` on agents in
+  the limb's RBAC.
 - **Select bond members from `interfaces[]`, NEVER from `nic_macs`.**
   server-scan reduces Dell NPAR partitions to one entry per physical port in
   `interfaces` but leaves `nic_macs` whole on purpose, so a 4-port partitioned

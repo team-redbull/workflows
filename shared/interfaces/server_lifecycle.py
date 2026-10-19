@@ -27,11 +27,15 @@ from shared.models.server_lifecycle import (
     BmhState,
     CreatedResource,
     HostPowerRequest,
+    InfraEnvBootRequest,
+    InfraEnvBootState,
     InfraEnvRef,
     InfraEnvState,
     InventoryHostState,
     PxeBootRegistration,
     PxeBootRequest,
+    PxeHostEntriesRef,
+    PxeHostEntriesRemoval,
     PxeMapRef,
     PxeUnregistration,
     ReleaseServerRequest,
@@ -125,6 +129,30 @@ async def inspect_inventory_host(ref: BmhRef) -> InventoryHostState:
 
 
 @activity.defn
+async def remove_host_pxe_entries(ref: PxeHostEntriesRef) -> PxeHostEntriesRemoval:
+    """remove-server: clear the host's MACs from the site PXE VMs.
+
+    For every PXE VM in this worker's PXE_MAP_URLS and every MAC in `ref.macs`:
+    `DELETE /pxe-map/<mac>?mce_cluster=<ref.mce_cluster>`. The PXE VM refuses
+    (409) a MAC that chains to ANOTHER MCE's boot entry — the machine was
+    mapped by that MCE since, and its boot is not this removal's to take — and
+    removes anything else: this MCE's entry, a direct-URL entry from before
+    boot entries, a corrupt file. 409 is reported in `kept`, not raised.
+    Absent is success (204), so a retry converges.
+
+    Every configured VM, not the site of the MCE's inventory segment: the MAC
+    can only have been mapped through this worker's PXE_MAP_URLS, the
+    condition makes a VM that never held it a no-op, and it needs no
+    Segments Manager read. No VM configured is reported in `detail`.
+
+    Requires the PXE VMs' pxe-map-api to know `?mce_cluster`: an older one
+    IGNORES the parameter and deletes unconditionally. Raises PxeMapAuthError /
+    PxeMapRequestRejectedError (non-retryable); PxeMapError is transient.
+    """
+    ...
+
+
+@activity.defn
 async def set_host_online(request: HostPowerRequest) -> bool:
     """Set a BareMetalHost's `spec.online`; False when the BMH does not exist.
 
@@ -167,7 +195,9 @@ async def check_infra_env(ref: InfraEnvRef) -> InfraEnvState:
 async def unregister_pxe_boot(ref: PxeMapRef) -> PxeUnregistration:
     """Remove a rolled-back IPMI candidate's MACs from its site's PXE VM.
 
-    `DELETE /pxe-map/<mac>` per bond MAC. A MAC with no entry (404) is success:
+    `DELETE /pxe-map/<mac>` per MAC the registration mapped (the boot MAC; both
+    bond MACs for a run recorded before `pxe-map-boot-mac-only`). A MAC with no
+    entry (404) is success:
     it is the state the rollback wants, and what a retry finds. Only called
     while this run still holds the server's lock — after that another run may
     have mapped the same MACs to its own InfraEnv.
@@ -190,16 +220,68 @@ async def register_pxe_boot(request: PxeBootRequest) -> PxeBootRegistration:
     moment Ironic registers the host it may power it on, and a host that PXE
     boots before its MACs are mapped boots nothing.
 
-    Reads `status.bootArtifacts.ipxeScript` from the InfraEnv on THIS MCE, then
-    `PUT /pxe-map/<mac>` (lower-case hex, no separators) with that URL, once per
-    MAC, to the PXE VM PXE_MAP_URLS names for the site. A PUT is an upsert, so
-    a retry or a re-run converges.
+    With `request.mce_cluster` set (every run since `pxe-map-infraenv-boot`),
+    each MAC is pointed at the InfraEnv's boot entry: `PUT /pxe-map/<mac>`
+    (lower-case hex, no separators) with `{"infra_env": {"mce_cluster",
+    "name"}}`, which the PXE VM writes as a relative `chain
+    <mce_cluster>/<infra_env>.ipxe`. The entry itself is published later, by
+    publish_infra_env_boot, once the host's NMStateConfig is in the image — the
+    MACs go first so that a site with no PXE VM is still a skip that has cost
+    nothing on the cluster. Nothing boots the host in between: its BareMetalHost
+    does not exist yet.
+
+    Without it (a run recorded before the boot entry), reads
+    `status.bootArtifacts.ipxeScript` from the InfraEnv on THIS MCE and PUTs
+    `{"ipxe_url"}` instead. Either way a PUT is an upsert, so a retry or a
+    re-run converges.
 
     Raises PxeSiteNotConfiguredError (no PXE VM for the site — the workflow
     skips the candidate), InfraEnvNotFoundError, PxeMapAuthError,
-    PxeMapRequestRejectedError (all non-retryable) and the cluster read's own
-    BmhPrerequisiteMissingError (403: no `get` on infraenvs). InfraEnvNotReadyError
-    (no iPXE URL published yet) and PxeMapError are transient.
+    PxeMapRequestRejectedError (all non-retryable — including a PXE VM whose
+    pxe-map-api predates the boot entry, which refuses the `infra_env` body
+    with 422) and the cluster read's own BmhPrerequisiteMissingError (403: no
+    `get` on infraenvs). InfraEnvNotReadyError (no iPXE URL published yet) and
+    PxeMapError are transient.
+    """
+    ...
+
+
+@activity.defn
+async def publish_infra_env_boot(request: InfraEnvBootRequest) -> InfraEnvBootState:
+    """Publish the InfraEnv's iPXE script as its boot entry — once it includes this host.
+
+    Every NMStateConfig added to an InfraEnv makes assisted-service regenerate
+    the discovery image, and the image carries the static network config of
+    every NMStateConfig it was generated from. So the entry is written only
+    once the InfraEnv shows an image generated after THIS host's
+    NMStateConfig: its `ImageCreated` condition True, an
+    `status.bootArtifacts.ipxeScript` published, and `status.createdTime` no
+    older than the NMStateConfig's `metadata.creationTimestamp`. Until then it
+    answers published=False with `detail` naming what is awaited — an
+    observation, not an error; the workflow polls on a bounded timer.
+
+    With `request.server_name` None (publish-infraenv-boot) no NMStateConfig is
+    read: the InfraEnv's CURRENT image is published as soon as it is ready
+    (the same three conditions minus the comparison).
+
+    Then `PUT /pxe-map/<mce_cluster>/<infra_env>` `{"ipxe_url",
+    "image_created_at"}` to the site's PXE VM, which keeps one file per
+    (MCE, InfraEnv) and compares on `image_created_at`: a 409 means it already
+    holds a NEWER image — another install of the same InfraEnv published after
+    a later NMStateConfig — and is success here (superseded=True), since that
+    image includes this host's config as well. An equal time overwrites, so a
+    retry converges.
+
+    Both timestamps are whole seconds, so an image generated in the same second
+    as the NMStateConfig — but just before it — would pass. That window is not
+    a wrong boot: assisted-service builds the PXE initrd per download from the
+    InfraEnv's CURRENT static network config, and the host fetches it minutes
+    later, after Ironic powers it on and it POSTs.
+
+    Raises PxeSiteNotConfiguredError, InfraEnvNotFoundError, PxeMapAuthError,
+    PxeMapRequestRejectedError (all non-retryable — a 404 on this path most
+    likely means the PXE VM's pxe-map-api predates boot entries) and the
+    cluster read's BmhPrerequisiteMissingError. PxeMapError is transient.
     """
     ...
 

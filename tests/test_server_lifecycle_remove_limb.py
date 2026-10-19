@@ -122,6 +122,19 @@ class TestInspect:
         state = await activities.inspect_inventory_host(REF)
         assert not (state.bmh_found or state.nmstate_found or state.agents)
 
+    async def test_every_mac_the_host_is_known_by_is_reported_for_the_pxe_cleanup(self, cluster):
+        cluster(_FakeCluster(), scan_macs=["00:25:b5:00:00:02", "00:25:b5:00:00:09"])
+        state = await activities.inspect_inventory_host(REF)
+        # BMH boot MAC (upper case there) + NMStateConfig + server-scan, deduped.
+        assert state.macs == ["00:25:b5:00:00:01", "00:25:b5:00:00:02", "00:25:b5:00:00:09"]
+        # Emitted explicitly, even when empty — the workflow keys on its presence.
+        assert "macs" in state.model_fields_set
+
+    async def test_no_mac_at_all_is_still_emitted(self, cluster):
+        cluster(_FakeCluster(bmh=False, nmstate=False))
+        state = await activities.inspect_inventory_host(REF)
+        assert state.macs == [] and "macs" in state.model_fields_set
+
 
 SS = "http://server-scan.test/api/v1"
 

@@ -351,6 +351,28 @@ There is deliberately **no `vlan_id`**: it belongs to the MCE's segment, and a
 supplied one could contradict it. The request body forbids unknown fields, so
 sending `vlan_id` is a 422 rather than a silently ignored value.
 
+### `publish-infraenv-boot` — an InfraEnv's current iPXE script onto its PXE VM
+
+`POST /workflows/server-lifecycle/publish-infraenv-boot` with
+`{"mce_cluster": "mce-bat-yam-01", "infra_env": "cisco-m6-bat-yam-64c-512gb"}`
+(`namespace` defaults to `inventory`; the MCE is accepted with or without
+`ocp4-`). It writes the InfraEnv's **boot entry**,
+`/var/www/pxe-map/<mce_cluster>/<infra_env>.ipxe`, on the PXE VM of the MCE's
+inventory-segment site — the file every IPMI host install-server mapped to that
+InfraEnv chains to. Use it to seed the entry before the first install, to repair
+one lost on the VM, or to point it at a regenerated image without installing
+anything; install-server does the same publish itself, per host.
+
+Phases: `resolving-site` (Segments Manager) → `validating-infraenv` (missing
+fails the run) → `publishing`, which waits — bounded, 10 min, else
+`InfraEnvImageNotUpdatedError` — for the InfraEnv to show a ready image
+(`ImageCreated` True, an `ipxeScript`, a `createdTime`) and writes it with that
+`createdTime` as its version. A VM already holding a newer image keeps it and
+the run completes with `superseded: true`. Nothing is written on the MCE; the
+URL (it carries an `api_key`) never enters workflow history. Id:
+`publish-infraenv-boot-<mce>-<infra_env>`, so a second trigger for the same
+entry while one runs is a 409.
+
 ### `provision-dell-server` — from an iDRAC IP to a server install-server can use
 
 `POST /workflows/server-provisioning/provision-dell-server` with `{"idrac_ip": "134.1.2.1"}`
@@ -467,6 +489,8 @@ result.
 | `POST /workflows/segment-lifecycle/allocate-segment` | one allocation |
 | `POST /workflows/segment-lifecycle/release-segment` | one release (after the cluster's Application is gone) |
 | `POST /workflows/server-lifecycle/install-server` | one server into an InfraEnv |
+| `POST /workflows/server-lifecycle/remove-server` | one server out of an MCE's inventory |
+| `POST /workflows/server-lifecycle/publish-infraenv-boot` | an InfraEnv's current iPXE script onto its site's PXE VM |
 | `POST /workflows/server-provisioning/provision-dell-server` | one Dell server, by iDRAC IP |
 | `POST /workflows/server-provisioning/provision-dell-server/bulk` | one workflow PER iDRAC IP |
 | `GET  /workflows/runs/{workflow_id}` | (status, every domain) |

@@ -48,6 +48,8 @@ from shared.models.server_lifecycle import (
     BmhResourceRequest,
     BmhState,
     CreatedResource,
+    InfraEnvBootRequest,
+    InfraEnvBootState,
     InfraEnvRef,
     InfraEnvState,
     InstallServerInput,
@@ -193,6 +195,9 @@ def make_mock_activities(
     pxe_sites: set[str] | None = None,
     pxe_error: Exception | None = None,
     infra_env_missing: bool = False,
+    image_after_polls: int = 0,
+    image_never_updates: bool = False,
+    boot_superseded: bool = False,
 ):
     """Build the full mock activity set + a call recorder.
 
@@ -212,6 +217,11 @@ def make_mock_activities(
     extends, `reserved_elsewhere` names servers another run holds, and
     `lock_lapses_for` names servers whose lock another run takes between the
     first claim and the renewal before the Agent wait.
+
+    `publish_infra_env_boot` answers as assisted-service + the PXE VM would:
+    unpublished for the first `image_after_polls` polls (the image is still
+    being regenerated), or forever with `image_never_updates`; `boot_superseded`
+    makes the PXE VM report a newer image already published.
     """
     calls: dict[str, list] = {
         name: []
@@ -228,6 +238,7 @@ def make_mock_activities(
             "release_server",
             "register_pxe_boot",
             "unregister_pxe_boot",
+            "publish_infra_env_boot",
             "check_infra_env",
             # Activity names in call order, for the ones whose ORDER matters.
             "order",
@@ -296,6 +307,26 @@ def make_mock_activities(
         )
 
     @activity.defn
+    async def publish_infra_env_boot(request: InfraEnvBootRequest) -> InfraEnvBootState:
+        calls["publish_infra_env_boot"].append(request)
+        calls["order"].append("publish_infra_env_boot")
+        polls = sum(
+            1
+            for c in calls["publish_infra_env_boot"]
+            if c.server_name == request.server_name
+        )
+        if image_never_updates or polls <= image_after_polls:
+            return InfraEnvBootState(
+                published=False,
+                detail="InfraEnv condition ImageCreated is not True: nmstate invalid",
+            )
+        return InfraEnvBootState(
+            published=True,
+            image_created_at="2026-10-19T10:00:05Z",
+            superseded=boot_superseded,
+        )
+
+    @activity.defn
     async def create_bmc_secret(request: BmhResourceRequest) -> CreatedResource:
         calls["create_bmc_secret"].append(request)
         calls["order"].append("create_bmc_secret")
@@ -310,6 +341,7 @@ def make_mock_activities(
     @activity.defn
     async def create_nmstate_config(request: BmhResourceRequest) -> CreatedResource:
         calls["create_nmstate_config"].append(request)
+        calls["order"].append("create_nmstate_config")
         return _created("NMStateConfig", f"nmstate-config-{request.server_name}")
 
     @activity.defn
@@ -424,6 +456,7 @@ def make_mock_activities(
         release_server,
         register_pxe_boot,
         unregister_pxe_boot,
+        publish_infra_env_boot,
         check_infra_env,
     ]
     return calls, segment_activities, server_activities
@@ -1219,8 +1252,14 @@ class TestThePxeBootOfAnIpmiServer:
         assert request.site == INVENTORY_SEGMENT.site
         assert request.infra_env == INFRA_ENV
         assert request.namespace == NAMESPACE
-        # Both bond members: which NIC the firmware PXE-boots is not knowable.
-        assert request.macs == ["00:25:b5:00:00:01", "00:25:b5:00:00:02"]
+        # The BareMetalHost's boot MAC alone — the first link-up NIC.
+        assert request.macs == ["00:25:b5:00:00:01"]
+        assert request.macs == [result.boot_mac]
+        # The Agent is still matched on BOTH bond MACs: it may report either.
+        assert calls["find_agent_for_host"][0].macs == [
+            "00:25:b5:00:00:01",
+            "00:25:b5:00:00:02",
+        ]
 
     async def test_a_redfish_server_never_touches_the_pxe_map(self):
         calls, segment_acts, server_acts = make_mock_activities()
@@ -1294,6 +1333,117 @@ class TestThePxeBootOfAnIpmiServer:
         assert "PXE map" in _application_error(excinfo.value).message
 
 
+class TestTheInfraEnvBootEntry:
+    """An IPMI blade boots its InfraEnv's boot entry, published only once the
+    discovery image includes the blade's own NMStateConfig.
+
+    Every NMStateConfig regenerates the InfraEnv's image, so with installs
+    running in parallel an entry published before THIS host's NMStateConfig
+    reached the image could hand it an image without its static network
+    config. Hence: MACs -> entry, NMStateConfig, wait for the image, publish,
+    and only then the BareMetalHost that lets Ironic power the host on.
+    """
+
+    _WATCHED = {
+        "register_pxe_boot",
+        "create_nmstate_config",
+        "publish_infra_env_boot",
+        "create_bmc_secret",
+        "create_baremetal_host",
+    }
+
+    async def test_the_entry_is_published_after_the_nmstateconfig_and_before_the_bmh(self):
+        calls, segment_acts, server_acts = make_mock_activities(candidates=[ucs_server()])
+        async with _Harness(segment_acts, server_acts) as client:
+            result = await _execute(client, InstallServerRunArgs(input=INPUT))
+
+        assert result.pxe_registered is True
+        assert [name for name in calls["order"] if name in self._WATCHED] == [
+            "register_pxe_boot",
+            "create_nmstate_config",
+            "publish_infra_env_boot",
+            "create_bmc_secret",
+            "create_baremetal_host",
+        ]
+        # Created once, not again after the BareMetalHost.
+        assert len(calls["create_nmstate_config"]) == 1
+        # The MACs chain to THIS MCE's entry for the InfraEnv being filled.
+        assert calls["register_pxe_boot"][0].mce_cluster == MCE_CLUSTER
+        assert calls["publish_infra_env_boot"] == [
+            InfraEnvBootRequest(
+                server_name=ucs_server().name,
+                namespace=NAMESPACE,
+                infra_env=INFRA_ENV,
+                mce_cluster=MCE_CLUSTER,
+                site=INVENTORY_SEGMENT.site,
+            )
+        ]
+
+    async def test_nothing_is_powered_on_until_the_image_includes_the_host(self):
+        calls, segment_acts, server_acts = make_mock_activities(
+            candidates=[ucs_server()], image_after_polls=3
+        )
+        async with _Harness(segment_acts, server_acts) as client:
+            result = await _execute(client, InstallServerRunArgs(input=INPUT))
+
+        assert result.pxe_registered is True
+        assert len(calls["publish_infra_env_boot"]) == 4
+        order = calls["order"]
+        last_publish = len(order) - 1 - order[::-1].index("publish_infra_env_boot")
+        assert last_publish < order.index("create_baremetal_host")
+
+    async def test_a_newer_image_already_published_is_success(self):
+        calls, segment_acts, server_acts = make_mock_activities(
+            candidates=[ucs_server()], boot_superseded=True
+        )
+        async with _Harness(segment_acts, server_acts) as client:
+            result = await _execute(client, InstallServerRunArgs(input=INPUT))
+
+        assert result.agent_name == f"agent-{ucs_server().name}"
+        assert len(calls["publish_infra_env_boot"]) == 1
+
+    async def test_an_image_that_never_updates_rolls_back_and_fails_the_run(self):
+        # The InfraEnv's problem, not the machine's: the Dell behind the blade
+        # would need the same InfraEnv, so it is not tried.
+        blade = ucs_server()
+        calls, segment_acts, server_acts = make_mock_activities(
+            candidates=[blade, bondable_server()], image_never_updates=True
+        )
+        async with _Harness(segment_acts, server_acts) as client:
+            with pytest.raises(WorkflowFailureError) as excinfo:
+                await _execute(client, InstallServerRunArgs(input=INPUT))
+
+        error = _application_error(excinfo.value)
+        assert error.type == "InfraEnvImageNotUpdatedError"
+        assert "ImageCreated is not True: nmstate invalid" in error.message
+        assert blade.name in error.message
+        # Bounded: 10 min of 10 s polls, give or take the first and last.
+        assert 55 <= len(calls["publish_infra_env_boot"]) <= 62
+        # Never powered on; undone in the rollback order, lock last.
+        assert calls["create_bmc_secret"] == []
+        assert calls["create_baremetal_host"] == []
+        watched = {"teardown_bmh_resources", "unregister_pxe_boot", "release_server"}
+        assert [name for name in calls["order"] if name in watched] == [
+            "teardown_bmh_resources",
+            "unregister_pxe_boot",
+            "release_server",
+        ]
+        assert [t.server_name for t in calls["teardown_bmh_resources"]] == [blade.name]
+        assert [r.server_name for r in calls["unregister_pxe_boot"]] == [blade.name]
+
+    async def test_a_redfish_server_keeps_its_order_and_never_publishes(self):
+        calls, segment_acts, server_acts = make_mock_activities()
+        async with _Harness(segment_acts, server_acts) as client:
+            await _execute(client, InstallServerRunArgs(input=INPUT))
+
+        assert calls["publish_infra_env_boot"] == []
+        assert [name for name in calls["order"] if name in self._WATCHED] == [
+            "create_bmc_secret",
+            "create_baremetal_host",
+            "create_nmstate_config",
+        ]
+
+
 class TestTheInfraEnvIsCheckedFirst:
     """No server is drawn, locked or booted for an InfraEnv the MCE does not have."""
 
@@ -1334,13 +1484,15 @@ class TestThePxeMapIsCleanedOnRollback:
             result = await _execute(client, InstallServerRunArgs(input=INPUT))
 
         assert result.server_name == SERVER_NAME
+        # Exactly what was mapped: the boot MAC.
         assert calls["unregister_pxe_boot"] == [
             PxeMapRef(
                 server_name=blade.name,
                 site=INVENTORY_SEGMENT.site,
-                macs=["00:25:b5:00:00:01", "00:25:b5:00:00:02"],
+                macs=["00:25:b5:00:00:01"],
             )
         ]
+        assert calls["unregister_pxe_boot"][0].macs == calls["register_pxe_boot"][0].macs
         # Teardown first (Ironic lets go), then the PXE map, THEN the lock:
         # after the release another run may map the same MACs.
         watched = {"teardown_bmh_resources", "unregister_pxe_boot", "release_server"}

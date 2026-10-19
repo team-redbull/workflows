@@ -19,7 +19,7 @@ from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
 from shared.consts import REMOVE_SERVER_WORKFLOW_QUEUE, server_lifecycle_activity_queue
-from shared.exceptions import AgentBoundToClusterError
+from shared.exceptions import AgentBoundToClusterError, PxeMapAuthError
 from shared.models.server_lifecycle import (
     AgentBinding,
     AgentDeleteRequest,
@@ -28,6 +28,8 @@ from shared.models.server_lifecycle import (
     BmhState,
     HostPowerRequest,
     InventoryHostState,
+    PxeHostEntriesRef,
+    PxeHostEntriesRemoval,
     RemoveServerInput,
     RemoveServerRunArgs,
     TeardownResult,
@@ -52,10 +54,15 @@ def make_mocks(
     never_powers_off: bool = False,
     power_error: Exception | None = None,
     after: InventoryHostState | None = None,
+    pxe_kept: set[str] | None = None,
+    pxe_error: Exception | None = None,
+    legacy_limb: bool = False,
 ):
     """`state` is what the first inspection finds; `after` what every later
-    one finds (the final check) — gone by default."""
+    one finds (the final check) — gone by default. `pxe_kept` names the MACs
+    the PXE VM keeps because another MCE's boot entry owns them."""
     leftover = after if after is not None else InventoryHostState()
+    kept = pxe_kept or set()
     calls: dict[str, list] = {
         k: []
         for k in (
@@ -64,6 +71,7 @@ def make_mocks(
             "get_baremetal_host",
             "teardown_bmh_resources",
             "delete_agents",
+            "remove_host_pxe_entries",
             "order",
         )
     }
@@ -73,7 +81,11 @@ def make_mocks(
         calls["inspect_inventory_host"].append(ref)
         first = len(calls["inspect_inventory_host"]) == 1
         calls["order"].append("inspect" if first else "verify")
-        return state if first else leftover
+        found = state if first else leftover
+        if legacy_limb:
+            # A limb that predates `macs` sends a payload without the key.
+            return found.model_dump(exclude={"macs"})
+        return found
 
     @activity.defn
     async def set_host_online(request: HostPowerRequest) -> bool:
@@ -104,12 +116,25 @@ def make_mocks(
         calls["order"].append("delete-agents")
         return AgentDeletion(deleted=list(request.names))
 
+    @activity.defn
+    async def remove_host_pxe_entries(ref: PxeHostEntriesRef) -> PxeHostEntriesRemoval:
+        calls["remove_host_pxe_entries"].append(ref)
+        calls["order"].append("pxe")
+        if pxe_error is not None:
+            raise pxe_error
+        keys = [mac.replace(":", "") for mac in ref.macs]
+        return PxeHostEntriesRemoval(
+            cleared=[f"bat-yam/{k}" for k in keys if k not in kept],
+            kept=[f"bat-yam/{k}: chains to ocp4-mce-other" for k in keys if k in kept],
+        )
+
     return calls, [
         inspect_inventory_host,
         set_host_online,
         get_baremetal_host,
         teardown_bmh_resources,
         delete_agents,
+        remove_host_pxe_entries,
     ]
 
 
@@ -234,6 +259,7 @@ async def test_a_host_without_an_agent_still_has_its_resources_removed():
 AGENT_ONLY = InventoryHostState(
     bmh_found=False, nmstate_found=False, agents=[UNBOUND],
     server_scan_macs=["00:25:b5:00:00:01", "00:25:b5:00:00:02"],
+    macs=["00:25:b5:00:00:01", "00:25:b5:00:00:02"],
 )
 
 
@@ -243,9 +269,11 @@ async def test_an_agent_left_without_its_bmh_is_still_deleted():
     async with _Harness(acts) as client:
         result = await _execute(client)
 
-    assert calls["order"] == ["inspect", "delete-agents", "verify"]
+    assert calls["order"] == ["inspect", "delete-agents", "pxe", "verify"]
     assert result.powered_off is False
     assert result.agents_removed == ["agent-1"]
+    # Its MACs are still cleared from the PXE map: found by server-scan's.
+    assert calls["remove_host_pxe_entries"][0].macs == AGENT_ONLY.macs
 
 
 async def test_an_agent_that_comes_back_fails_the_run_and_says_why():
@@ -276,6 +304,73 @@ async def test_a_resource_that_lingers_is_named_in_the_failure():
     assert "BareMetalHost" in error.message
     # Powered off through its BMH, so no "power it off" hint.
     assert "BMC" not in error.message
+
+
+WITH_MACS = FULL.model_copy(
+    update={"macs": ["00:25:b5:00:00:01", "00:25:b5:00:00:02", "00:25:b5:00:00:09"]}
+)
+
+
+class TestThePxeMapIsCleared:
+    """A removed host must not be able to PXE-boot this MCE's discovery image again."""
+
+    async def test_every_mac_is_cleared_after_the_agent_and_before_the_check(self):
+        calls, acts = make_mocks(state=WITH_MACS)
+        async with _Harness(acts) as client:
+            result = await _execute(client)
+
+        assert calls["order"] == [
+            "inspect", "power-off", "teardown", "delete-agents", "pxe", "verify",
+        ]
+        # Every MAC the host is known by, conditional on THIS MCE.
+        assert calls["remove_host_pxe_entries"] == [
+            PxeHostEntriesRef(server_name=SERVER, mce_cluster=MCE, macs=WITH_MACS.macs)
+        ]
+        assert result.pxe_cleared == [
+            "bat-yam/0025b5000001", "bat-yam/0025b5000002", "bat-yam/0025b5000009",
+        ]
+        assert result.pxe_kept == []
+
+    async def test_another_mces_entry_is_kept_and_reported_not_failed(self):
+        calls, acts = make_mocks(state=WITH_MACS, pxe_kept={"0025b5000002"})
+        async with _Harness(acts) as client:
+            result = await _execute(client)
+
+        assert result.pxe_kept == ["bat-yam/0025b5000002: chains to ocp4-mce-other"]
+        assert "bat-yam/0025b5000002" not in result.pxe_cleared
+
+    async def test_nothing_on_the_mce_leaves_the_pxe_map_alone_too(self):
+        # Nothing ties the MACs to this MCE any more; another may own them now.
+        calls, acts = make_mocks(
+            state=InventoryHostState(server_scan_macs=["00:25:b5:00:00:01"], macs=["00:25:b5:00:00:01"])
+        )
+        async with _Harness(acts) as client:
+            result = await _execute(client)
+
+        assert result.found is False
+        assert calls["remove_host_pxe_entries"] == []
+
+    async def test_a_host_with_no_known_mac_skips_the_step(self):
+        calls, acts = make_mocks(state=FULL.model_copy(update={"macs": []}))
+        async with _Harness(acts) as client:
+            await _execute(client)
+        assert calls["remove_host_pxe_entries"] == []
+
+    async def test_a_limb_that_predates_macs_falls_back_to_server_scans(self):
+        legacy = WITH_MACS.model_copy(update={"server_scan_macs": ["00:25:b5:00:00:07"]})
+        calls, acts = make_mocks(state=legacy, legacy_limb=True)
+        async with _Harness(acts) as client:
+            await _execute(client)
+        assert calls["remove_host_pxe_entries"][0].macs == ["00:25:b5:00:00:07"]
+
+    async def test_a_rejected_pxe_token_fails_the_run_once(self):
+        calls, acts = make_mocks(state=WITH_MACS, pxe_error=PxeMapAuthError("check PXE_MAP_TOKEN"))
+        async with _Harness(acts) as client:
+            with pytest.raises(WorkflowFailureError) as excinfo:
+                await _execute(client)
+
+        assert _error(excinfo.value).type == "PxeMapAuthError"
+        assert len(calls["remove_host_pxe_entries"]) == 1
 
 
 async def test_every_step_runs_on_the_target_mces_queue():

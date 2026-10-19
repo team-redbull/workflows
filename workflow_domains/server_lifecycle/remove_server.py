@@ -28,6 +28,14 @@ Shape of the run:
                         BMC, then delete, then drop the finalizer if it sticks.
   5. removing-agent   — the Agent(s), each re-checked as unbound right before
                         its delete.
+     removing-pxe-boot — every MAC the host is known by is cleared from every
+                        site PXE VM this MCE's worker has configured, so the
+                        machine can no longer network-boot this MCE's discovery
+                        image and re-register. CONDITIONAL on the PXE VM: a MAC
+                        chaining to ANOTHER MCE's boot entry is kept (reported
+                        in `pxe_kept`), since that MCE has mapped the machine
+                        since. Runs for every server — a Redfish one simply has
+                        no entries.
   6. verifying        — inspect again until no Agent, BMH or NMStateConfig is
                         left (an Agent's finalizer takes seconds). Anything
                         still there after a bounded wait fails the run with
@@ -43,8 +51,10 @@ means nothing is left to bring it back. (The detach in step 4 is then safe: the
 host is already off, so there is nothing for a deprovision to do.)
 
 The BMC Secret goes with the BMH (ownerReference, or explicitly). Not touched:
-server-scan's install lock (it expires on its own) and, for an IPMI server, its
-site PXE map entry.
+server-scan's install lock (it expires on its own) and the InfraEnv's boot
+entry on the PXE VM (`<mce>/<infraenv>.ipxe`), which every other host of the
+InfraEnv chains through. A server found NOWHERE on the MCE is a no-op that
+touches the PXE map neither: nothing then ties its MACs to this MCE.
 """
 
 from __future__ import annotations
@@ -63,6 +73,8 @@ with workflow.unsafe.imports_passed_through():
         BmhRequestInvalidError,
         HostPowerOffTimeoutError,
         InvalidServerNameError,
+        PxeMapAuthError,
+        PxeMapRequestRejectedError,
         ServerScanAuthError,
         ServerStillPresentError,
     )
@@ -70,6 +82,7 @@ with workflow.unsafe.imports_passed_through():
         delete_agents,
         get_baremetal_host,
         inspect_inventory_host,
+        remove_host_pxe_entries,
         set_host_online,
         teardown_bmh_resources,
     )
@@ -78,6 +91,7 @@ with workflow.unsafe.imports_passed_through():
         BmhRef,
         HostPowerRequest,
         InventoryHostState,
+        PxeHostEntriesRef,
         RemoveServerProgress,
         RemoveServerResult,
         RemoveServerRunArgs,
@@ -97,6 +111,8 @@ _PERMANENT_ACTIVITY_ERRORS: tuple[type[Exception], ...] = (
     BmhRequestInvalidError,
     InvalidServerNameError,
     ServerScanAuthError,
+    PxeMapAuthError,
+    PxeMapRequestRejectedError,
 )
 _RETRY_POLICY = RetryPolicy(
     initial_interval=timedelta(seconds=1),
@@ -117,6 +133,10 @@ _POWER_POLL_INTERVAL = timedelta(seconds=15)
 _GONE_DEADLINE = timedelta(minutes=5)
 _GONE_POLL_INTERVAL = timedelta(seconds=10)
 
+# Gates the PXE map cleanup: a run recorded before it would otherwise meet a
+# new activity between its Agent delete and its final check.
+_PXE_CLEANUP_PATCH = "remove-server-pxe-cleanup"
+
 
 def _describe_leftover(state: InventoryHostState) -> str:
     parts = []
@@ -133,6 +153,7 @@ class RemoveServerWorkflow:
     def __init__(self) -> None:
         self._phase = "pending"
         self._activity_queue: str | None = None
+        self._pxe_cleanup = False
 
     @workflow.query
     def progress(self) -> RemoveServerProgress:
@@ -143,6 +164,7 @@ class RemoveServerWorkflow:
         request = run_args.input
         activity_queue = server_lifecycle_activity_queue(request.mce_cluster)
         self._activity_queue = activity_queue
+        self._pxe_cleanup = workflow.patched(_PXE_CLEANUP_PATCH)
         ref = BmhRef(server_name=request.server_name, namespace=request.namespace)
 
         def result(**fields) -> RemoveServerResult:
@@ -222,6 +244,38 @@ class RemoveServerWorkflow:
             )
             agents_removed = list(deletion.deleted)
 
+        # Step 5b — the host's MACs off the site PXE VMs, once nothing on the
+        # MCE drives it any more: a host left mapped would PXE-boot this MCE's
+        # discovery image on its next power-on and re-register its Agent.
+        pxe_cleared: list[str] = []
+        pxe_kept: list[str] = []
+        if self._pxe_cleanup:
+            # A limb that predates `macs` sent only server-scan's (CLAUDE.md §5).
+            macs = (
+                state.macs if "macs" in state.model_fields_set else state.server_scan_macs
+            )
+            if macs:
+                self._phase = "removing-pxe-boot"
+                removal = await self._call(
+                    remove_host_pxe_entries,
+                    PxeHostEntriesRef(
+                        server_name=request.server_name,
+                        mce_cluster=request.mce_cluster,
+                        macs=macs,
+                    ),
+                    activity_queue,
+                )
+                pxe_cleared = list(removal.cleared)
+                pxe_kept = list(removal.kept)
+                if removal.kept:
+                    workflow.logger.warning(
+                        "Left %s mapped on the PXE VM: another MCE's boot entry — %s",
+                        request.server_name,
+                        removal.kept,
+                    )
+                if removal.detail:
+                    workflow.logger.info("PXE map cleanup: %s", removal.detail)
+
         # Step 6 — nothing of the server may be left on the MCE.
         self._phase = "verifying"
         leftover = await self._await_gone(ref, activity_queue)
@@ -254,6 +308,8 @@ class RemoveServerWorkflow:
             powered_off=powered_off,
             agents_removed=agents_removed,
             resources_removed=resources_removed,
+            pxe_cleared=pxe_cleared,
+            pxe_kept=pxe_kept,
         )
 
     async def _call(self, activity_fn, arg, task_queue: str):

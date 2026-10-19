@@ -43,8 +43,10 @@ from activities.server_lifecycle.activities import (
     create_nmstate_config,
     find_agent_for_host,
     get_baremetal_host,
+    publish_infra_env_boot,
     register_pxe_boot,
     release_server,
+    remove_host_pxe_entries,
     reserve_server,
     teardown_bmh_resources,
     unregister_pxe_boot,
@@ -72,6 +74,7 @@ async def main() -> None:
             check_infra_env,
             acquire_servers,
             register_pxe_boot,
+            publish_infra_env_boot,
             unregister_pxe_boot,
             create_bmc_secret,
             create_baremetal_host,
@@ -85,6 +88,7 @@ async def main() -> None:
             inspect_inventory_host,
             set_host_online,
             delete_agents,
+            remove_host_pxe_entries,
         ],
         # In-flight activities get this long to finish after shutdown starts
         # before being cancelled — keep it below the pod's

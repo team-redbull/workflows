@@ -104,6 +104,18 @@ def remove_server_workflow_id(server_name: str) -> str:
     return f"remove-server-{server_name.lower()}"
 
 
+def publish_infraenv_boot_workflow_id(mce_cluster: str, infra_env: str) -> str:
+    """`publish-infraenv-boot-<mce>-<infraEnv>`: one publish of a boot entry at a time.
+
+    Keyed on what it writes — ONE file per (MCE, InfraEnv) on the PXE VM — so
+    two triggers for the same entry dedup, while the same InfraEnv name on two
+    MCEs (two different files) does not serialize. Two runs racing would be
+    harmless anyway (the PXE VM keeps the newer image), so this is dedup, not
+    a safety lock.
+    """
+    return f"publish-infraenv-boot-{mce_cluster}-{infra_env}"
+
+
 def provision_dell_server_workflow_id(idrac_ip: str) -> str:
     """`provision-dell-server-<idrac ip>`: natural dedup per machine at the rack.
 

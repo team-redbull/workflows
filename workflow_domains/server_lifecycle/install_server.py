@@ -35,10 +35,20 @@ Shape of the run:
      registering-pxe-boot — IPMI servers only (a UCS-managed blade). IPMI has
                            no virtual media, so the host PXE-boots and the PXE
                            VM of the inventory segment's SITE must map both
-                           bond MACs to the InfraEnv's iPXE script BEFORE the
-                           BareMetalHost exists — Ironic may power the host on
-                           the moment it registers it. A site with no PXE VM
-                           configured is a skip.
+                           bond MACs BEFORE the BareMetalHost exists — Ironic
+                           may power the host on the moment it registers it.
+                           The MACs chain to the InfraEnv's BOOT ENTRY on that
+                           VM (`<mce>/<infraenv>.ipxe`), one per InfraEnv. A
+                           site with no PXE VM configured is a skip.
+     creating-nmstateconfig — IPMI only, ahead of the BareMetalHost, then
+     publishing-pxe-boot    a BOUNDED wait for the InfraEnv to show a
+                           discovery image generated after it, at which point
+                           its iPXE script is published as the boot entry —
+                           so the host can never boot an image without its own
+                           static network config, however many installs of the
+                           InfraEnv run at once. No new image in 10 min fails
+                           the run (rolled back first): assisted-service is not
+                           regenerating, which no other candidate changes.
   4. creating-secret
      creating-baremetalhost
      creating-nmstateconfig  — all idempotent; an existing resource is success.
@@ -160,6 +170,7 @@ with workflow.unsafe.imports_passed_through():
         AgentNeverAppearedError,
         BmhPrerequisiteMissingError,
         BmhRequestInvalidError,
+        InfraEnvImageNotUpdatedError,
         InfraEnvNotFoundError,
         InvalidMacError,
         InvalidServerNameError,
@@ -186,6 +197,7 @@ with workflow.unsafe.imports_passed_through():
         create_nmstate_config,
         find_agent_for_host,
         get_baremetal_host,
+        publish_infra_env_boot,
         register_pxe_boot,
         release_server,
         reserve_server,
@@ -205,6 +217,8 @@ with workflow.unsafe.imports_passed_through():
         InstallServerProgress,
         InstallServerInput,
         InstallServerResult,
+        InfraEnvBootRequest,
+        InfraEnvBootState,
         InfraEnvRef,
         InstallServerRunArgs,
         PxeBootRequest,
@@ -313,6 +327,24 @@ _PXE_BOOT_PATCH = "pxe-map-ipmi-boot"
 # reason: each puts a new activity where an in-flight run recorded another.
 _INFRAENV_CHECK_PATCH = "infraenv-precheck"
 _PXE_CLEANUP_PATCH = "pxe-map-rollback-cleanup"
+# Gates the InfraEnv BOOT ENTRY for IPMI servers: MACs mapped to
+# `<mce>/<infraenv>.ipxe` on the PXE VM, the NMStateConfig created before the
+# BareMetalHost, and the entry published only once the discovery image
+# includes it. A run recorded before it maps the URL straight onto the MACs.
+_PXE_INFRAENV_BOOT_PATCH = "pxe-map-infraenv-boot"
+# Gates mapping ONLY the BareMetalHost's boot MAC on the PXE VM (the first
+# link-up NIC server-scan lists — bond member nic1). A run recorded before it
+# mapped both bond MACs, so its rollback must unmap both.
+_PXE_BOOT_MAC_ONLY_PATCH = "pxe-map-boot-mac-only"
+
+# assisted-service regenerates the discovery image within seconds of an
+# NMStateConfig change; ten minutes of no new image means it is not going to
+# (an NMStateConfig it rejected, or a fault of its own), which no other
+# candidate would change — so the deadline fails the run. MACHINE convergence,
+# so a real deadline, on a durable timer. Changing either constant is a
+# non-deterministic change for in-flight runs.
+_INFRAENV_IMAGE_DEADLINE = timedelta(minutes=10)
+_INFRAENV_IMAGE_POLL_INTERVAL = timedelta(seconds=10)
 
 # The server-scan health verdict this workflow accepts. Deliberately only the
 # top tier: the endpoint would otherwise fill HEALTHY, then WARNING, then MAJOR.
@@ -508,6 +540,8 @@ class InstallServerWorkflow:
         self._pxe_booting = False
         self._checking_infra_env = False
         self._pxe_cleanup = False
+        self._infra_env_boot = False
+        self._pxe_boot_mac_only = False
 
     @workflow.query
     def progress(self) -> InstallServerProgress:
@@ -537,6 +571,8 @@ class InstallServerWorkflow:
         self._pxe_booting = workflow.patched(_PXE_BOOT_PATCH)
         self._checking_infra_env = workflow.patched(_INFRAENV_CHECK_PATCH)
         self._pxe_cleanup = workflow.patched(_PXE_CLEANUP_PATCH)
+        self._infra_env_boot = workflow.patched(_PXE_INFRAENV_BOOT_PATCH)
+        self._pxe_boot_mac_only = workflow.patched(_PXE_BOOT_MAC_ONLY_PATCH)
         workflow.logger.info(
             "Installing a server into InfraEnv=%s for MCE=%s",
             infra_env,
@@ -667,6 +703,58 @@ class InstallServerWorkflow:
                 vlan_id=segment.vlan_id,
                 labels=install_input.labels,
             )
+            bmh_ref = BmhRef(server_name=candidate.name, namespace=namespace)
+
+            # Step 3b — an IPMI host boots whatever its site's PXE VM hands it,
+            # the moment Ironic powers it on, and the discovery image carries
+            # only the NMStateConfigs it was generated from. So for one, the
+            # NMStateConfig comes FIRST, ahead of the BareMetalHost, and the
+            # InfraEnv's boot entry on the PXE VM — which its MACs already chain
+            # to — is published only once assisted-service shows an image
+            # generated after it. Every other install of the InfraEnv publishes
+            # through the same entry, newest image winning on the PXE VM, so
+            # parallel installs cannot leave a host on an image that predates
+            # its own NMStateConfig.
+            nmstate: CreatedResource | None = None
+            if pxe_registered and self._infra_env_boot:
+                self._phase = "creating-nmstateconfig"
+                nmstate = await self._create(
+                    create_nmstate_config, resource_request, activity_queue
+                )
+                self._phase = "publishing-pxe-boot"
+                boot = await self._await_infra_env_boot(
+                    candidate, install_input, segment.site, activity_queue
+                )
+                if not boot.published:
+                    # Not this machine's fault, so not a skip — but undo the
+                    # candidate (NMStateConfig, MAC entries, lock) before failing.
+                    self._phase = "rolling-back"
+                    await self._teardown(bmh_ref, activity_queue)
+                    if self._pxe_cleanup:
+                        self._phase = "unregistering-pxe-boot"
+                        await self._unregister_pxe_boot(
+                            candidate, bond_members, segment.site, activity_queue
+                        )
+                    if self._reserving:
+                        self._phase = "releasing-server"
+                        await self._release(candidate, activity_queue)
+                    minutes = int(_INFRAENV_IMAGE_DEADLINE.total_seconds() // 60)
+                    raise ApplicationError(
+                        f"InfraEnv {namespace}/{infra_env} published no discovery "
+                        f"image generated after {candidate.name}'s NMStateConfig "
+                        f"within {minutes} min: {boot.detail}. assisted-service "
+                        "regenerates within seconds of an NMStateConfig change, so "
+                        "it is not regenerating — check the InfraEnv's ImageCreated "
+                        f"condition and the assisted-service log. {candidate.name} "
+                        "was rolled back",
+                        type=InfraEnvImageNotUpdatedError.__name__,
+                    )
+                if boot.superseded:
+                    workflow.logger.info(
+                        "Boot entry for %s already held a newer image than %s",
+                        infra_env,
+                        boot.image_created_at,
+                    )
 
             # Step 4 — the three resources, in dependency order: the
             # BareMetalHost references the Secret by name, so the Secret goes
@@ -682,16 +770,16 @@ class InstallServerWorkflow:
                 create_baremetal_host, resource_request, activity_queue
             )
 
-            self._phase = "creating-nmstateconfig"
-            nmstate = await self._create(
-                create_nmstate_config, resource_request, activity_queue
-            )
+            if nmstate is None:
+                self._phase = "creating-nmstateconfig"
+                nmstate = await self._create(
+                    create_nmstate_config, resource_request, activity_queue
+                )
 
             # Step 5 — wait for the host to actually come up. An Agent existing
             # is the only observation that proves the BMC accepted virtual
             # media, the bond formed, the VLAN was right and DHCP answered.
             self._phase = "awaiting-agent"
-            bmh_ref = BmhRef(server_name=candidate.name, namespace=namespace)
             # Renewed so the lock covers the whole wait however long the creates
             # took. Refused means it lapsed and another run took the machine:
             # undo ours, and leave theirs alone.
@@ -907,6 +995,20 @@ class InstallServerWorkflow:
                 rejections.append(("gone", candidate.name))
             return None
 
+    def _pxe_macs(self, bond_members: list[BondMember]) -> list[str]:
+        """The MACs an IPMI host gets on its site's PXE VM.
+
+        The BareMetalHost's `bootMACAddress` alone — bond member nic1, which
+        select_bond_members takes from the FIRST link-up NIC server-scan lists
+        — so the PXE VM answers exactly the NIC Ironic is told the host boots
+        from. Runs recorded before `pxe-map-boot-mac-only` mapped both bond
+        members (in case the firmware PXE-boots from the other one) and keep
+        doing so on replay.
+        """
+        if self._pxe_boot_mac_only:
+            return [bond_members[0].mac]
+        return [member.mac for member in bond_members]
+
     async def _register_pxe_boot(
         self,
         candidate: AcquiredServer,
@@ -916,7 +1018,9 @@ class InstallServerWorkflow:
         task_queue: str,
         rejections: list[tuple[str, str]],
     ) -> bool:
-        """Map the bond MACs to the InfraEnv's iPXE script, or False with a skip recorded.
+        """Map the host's MAC(s) to the InfraEnv's iPXE script, or False with a skip recorded.
+
+        Which MACs is _pxe_macs: the BareMetalHost's boot MAC alone.
 
         Only a site with no PXE VM configured is the CANDIDATE's problem — a
         Redfish machine later in the draw needs no PXE map at all. Everything
@@ -931,7 +1035,13 @@ class InstallServerWorkflow:
                     namespace=install_input.namespace,
                     infra_env=install_input.infra_env,
                     site=site,
-                    macs=[member.mac for member in bond_members],
+                    macs=self._pxe_macs(bond_members),
+                    # Set: map the MACs to the InfraEnv's boot entry, which
+                    # _await_infra_env_boot publishes. Unset (a recorded run):
+                    # map them straight to the InfraEnv's iPXE URL.
+                    mce_cluster=(
+                        install_input.mce_cluster if self._infra_env_boot else None
+                    ),
                 ),
                 task_queue=task_queue,
                 start_to_close_timeout=_ACTIVITY_TIMEOUT,
@@ -955,6 +1065,43 @@ class InstallServerWorkflow:
             return False
         return True
 
+    async def _await_infra_env_boot(
+        self,
+        candidate: AcquiredServer,
+        install_input: InstallServerInput,
+        site: str,
+        task_queue: str,
+    ) -> InfraEnvBootState:
+        """Publish the InfraEnv's boot entry once its image includes this host, bounded.
+
+        Each poll is one publish ATTEMPT: the activity writes the entry the
+        first time it sees an image generated after the NMStateConfig, and
+        otherwise reports what it is still waiting for. On the deadline the
+        last unpublished state is returned, whose `detail` names that.
+        """
+        request = InfraEnvBootRequest(
+            server_name=candidate.name,
+            namespace=install_input.namespace,
+            infra_env=install_input.infra_env,
+            mce_cluster=install_input.mce_cluster,
+            site=site,
+        )
+        started_at = workflow.now()
+        while True:
+            state = await workflow.execute_activity(
+                publish_infra_env_boot,
+                request,
+                task_queue=task_queue,
+                start_to_close_timeout=_ACTIVITY_TIMEOUT,
+                schedule_to_start_timeout=_SCHEDULE_TO_START_TIMEOUT,
+                retry_policy=_RETRY_POLICY,
+            )
+            if state.published:
+                return state
+            if workflow.now() - started_at >= _INFRAENV_IMAGE_DEADLINE:
+                return state
+            await workflow.sleep(_INFRAENV_IMAGE_POLL_INTERVAL)  # durable, replay-safe
+
     async def _unregister_pxe_boot(
         self,
         candidate: AcquiredServer,
@@ -962,13 +1109,17 @@ class InstallServerWorkflow:
         site: str,
         task_queue: str,
     ) -> None:
-        """Take a rolled-back IPMI candidate's MACs off its site's PXE VM."""
+        """Take a rolled-back IPMI candidate's MACs off its site's PXE VM.
+
+        The same _pxe_macs the registration mapped — so a run recorded before
+        the boot-MAC-only patch unmaps both bond MACs it mapped.
+        """
         result = await workflow.execute_activity(
             unregister_pxe_boot,
             PxeMapRef(
                 server_name=candidate.name,
                 site=site,
-                macs=[member.mac for member in bond_members],
+                macs=self._pxe_macs(bond_members),
             ),
             task_queue=task_queue,
             start_to_close_timeout=_ACTIVITY_TIMEOUT,

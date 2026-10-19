@@ -34,6 +34,7 @@ SEGMENT_LIFECYCLE_ACTIVITY_QUEUE = "segment-lifecycle-activity"
 # disagree.
 INSTALL_SERVER_WORKFLOW_QUEUE = "install-server-workflow"
 REMOVE_SERVER_WORKFLOW_QUEUE = "remove-server-workflow"
+PUBLISH_INFRAENV_BOOT_WORKFLOW_QUEUE = "publish-infraenv-boot-workflow"
 SERVER_LIFECYCLE_ACTIVITY_QUEUE = "server-lifecycle-activity"
 
 

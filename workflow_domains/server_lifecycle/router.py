@@ -21,23 +21,37 @@ from temporalio.client import Client
 from temporalio.exceptions import WorkflowAlreadyStartedError
 
 from shared.cluster_names import canonical_mce_cluster
-from shared.consts import INSTALL_SERVER_WORKFLOW_QUEUE, REMOVE_SERVER_WORKFLOW_QUEUE
+from shared.consts import (
+    INSTALL_SERVER_WORKFLOW_QUEUE,
+    PUBLISH_INFRAENV_BOOT_WORKFLOW_QUEUE,
+    REMOVE_SERVER_WORKFLOW_QUEUE,
+)
 from shared.models.server_lifecycle import (
     InstallServerInput,
     InstallServerRunArgs,
+    PublishInfraEnvBootInput,
+    PublishInfraEnvBootRunArgs,
     RemoveServerInput,
     RemoveServerRunArgs,
 )
-from shared.workflow_ids import install_server_workflow_id, remove_server_workflow_id
+from shared.workflow_ids import (
+    install_server_workflow_id,
+    publish_infraenv_boot_workflow_id,
+    remove_server_workflow_id,
+)
 from workflow_domains.routers.deps import get_temporal_client
 from workflow_domains.routers.models import StartWorkflowResponse
 from workflow_domains.server_lifecycle.install_server import InstallServerWorkflow
+from workflow_domains.server_lifecycle.publish_infraenv_boot import (
+    PublishInfraEnvBootWorkflow,
+)
 from workflow_domains.server_lifecycle.remove_server import RemoveServerWorkflow
 
 router = APIRouter(prefix="/workflows/server-lifecycle", tags=["server-lifecycle"])
 
 _INSTALL_SERVER_PATH = "/install-server"
 _REMOVE_SERVER_PATH = "/remove-server"
+_PUBLISH_INFRAENV_BOOT_PATH = "/publish-infraenv-boot"
 
 # Where the inventory InfraEnvs live on an MCE unless the caller says otherwise.
 _DEFAULT_NAMESPACE = "inventory"
@@ -193,5 +207,63 @@ async def start_remove_server(
         raise HTTPException(
             status_code=409,
             detail=f"A remove-server run is already in flight for {remove_input.server_name}",
+        )
+    return StartWorkflowResponse(workflow_id=handle.id, run_id=handle.result_run_id or "")
+
+
+class PublishInfraEnvBootRequest(PublishInfraEnvBootInput):
+    """The publish-infraenv-boot request body: strict at the edge, namespace defaulted here."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    namespace: str = Field(
+        default=_DEFAULT_NAMESPACE,
+        min_length=1,
+        description=f"Namespace of the InfraEnv on the MCE. Defaults to `{_DEFAULT_NAMESPACE}`.",
+    )
+    mce_cluster: str = Field(min_length=1, description=_MCE_CLUSTER_DESCRIPTION)
+
+    @field_validator("mce_cluster")
+    @classmethod
+    def _canonical_mce_cluster(cls, value: str) -> str:
+        """Canonical before the run starts: the name finds the site in the
+        Segments Manager, builds the MCE's queue, and is the boot entry's
+        directory on the PXE VM — so `prod-mce-x` and `ocp4-prod-mce-x` must
+        land on the same file."""
+        return canonical_mce_cluster(value)
+
+
+@router.post(_PUBLISH_INFRAENV_BOOT_PATH, response_model=StartWorkflowResponse, status_code=202)
+async def start_publish_infraenv_boot(
+    publish_input: PublishInfraEnvBootRequest,
+    client: Client = Depends(get_temporal_client),
+) -> StartWorkflowResponse:
+    """Put an InfraEnv's current iPXE script on its site's PXE VM — returns immediately (202).
+
+    Writes `/var/www/pxe-map/<mce_cluster>/<infra_env>.ipxe` on the PXE VM of
+    the MCE's inventory-segment site: the boot entry every IPMI host mapped to
+    the InfraEnv chains to. Waits (bounded, 10 min) for the InfraEnv to have a
+    ready discovery image; a VM already holding a newer image keeps it, and
+    the run completes as `superseded`.
+
+    Poll GET /workflows/runs/{workflow_id} for progress/result. One publish per
+    (MCE, InfraEnv) at a time: a second trigger while one runs gets a 409.
+    """
+    try:
+        handle = await client.start_workflow(
+            PublishInfraEnvBootWorkflow.run,
+            PublishInfraEnvBootRunArgs(input=publish_input),
+            id=publish_infraenv_boot_workflow_id(
+                publish_input.mce_cluster, publish_input.infra_env
+            ),
+            task_queue=PUBLISH_INFRAENV_BOOT_WORKFLOW_QUEUE,
+        )
+    except WorkflowAlreadyStartedError:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "A publish-infraenv-boot run is already in flight for "
+                f"{publish_input.mce_cluster}/{publish_input.infra_env}"
+            ),
         )
     return StartWorkflowResponse(workflow_id=handle.id, run_id=handle.result_run_id or "")

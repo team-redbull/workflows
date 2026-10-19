@@ -230,11 +230,19 @@ class PxeBootRequest(BaseModel):
 
     `site` picks the PXE VM: it is the site of the MCE's inventory segment —
     the network the host DHCPs on, and so the site whose PXE VM answers it.
-    `macs` are BOTH bond members, for the reason AgentRef carries both: which
-    NIC the firmware PXE-boots from is not knowable in advance.
+    `macs` is the BareMetalHost's boot MAC alone (the first link-up NIC
+    server-scan lists). Runs recorded before `pxe-map-boot-mac-only` carry BOTH
+    bond members here, from when the NIC the firmware PXE-boots from was
+    treated as unknowable; the limb maps whatever list it is given.
 
     The iPXE URL is NOT here: the activity reads it from the InfraEnv on the
     MCE itself, so it never enters workflow history.
+
+    `mce_cluster` set means the MACs are pointed at the InfraEnv's BOOT ENTRY
+    on the PXE VM (`<mce_cluster>/<infra_env>.ipxe`) instead of at the URL
+    itself — see InfraEnvBootRequest. None in payloads recorded before the
+    entry existed, and from a brain that predates it: the limb then maps the
+    URL directly, as it always did.
     """
 
     server_name: str = Field(min_length=1)
@@ -242,6 +250,7 @@ class PxeBootRequest(BaseModel):
     infra_env: str = Field(min_length=1)
     site: str = Field(min_length=1)
     macs: list[str] = Field(min_length=1)
+    mce_cluster: str | None = None
 
 
 class PxeBootRegistration(BaseModel):
@@ -252,8 +261,49 @@ class PxeBootRegistration(BaseModel):
     macs: list[str]
 
 
+class InfraEnvBootRequest(BaseModel):
+    """Publish an InfraEnv's iPXE script as its boot entry on the site's PXE VM.
+
+    ONE entry per (MCE, InfraEnv) — `/var/www/pxe-map/<mce_cluster>/<infra_env>.ipxe`
+    — that every MAC mapped to the InfraEnv chains to, so a newer discovery
+    image is one write instead of one per host.
+
+    `server_name` is the host whose NMStateConfig the published image must
+    already include: the activity publishes only once the InfraEnv's
+    `status.createdTime` is no older than that NMStateConfig. None
+    (publish-infraenv-boot) publishes the InfraEnv's CURRENT image as soon as
+    it is ready, tied to no host. Like PxeBootRequest, the URL itself never
+    enters history.
+    """
+
+    server_name: str | None = Field(default=None, min_length=1)
+    namespace: str = Field(min_length=1)
+    infra_env: str = Field(min_length=1)
+    mce_cluster: str = Field(min_length=1)
+    site: str = Field(min_length=1)
+
+
+class InfraEnvBootState(BaseModel):
+    """What one publish attempt found.
+
+    `published=False` is the normal answer while assisted-service regenerates
+    the discovery image after the NMStateConfig — `detail` says what is still
+    awaited, and the workflow's bounded timer owns the waiting.
+
+    `superseded` means the PXE VM already held an entry for a NEWER image (a
+    concurrent install of the same InfraEnv published after a later
+    NMStateConfig). That is success: the newer image includes this host's
+    config too.
+    """
+
+    published: bool = False
+    image_created_at: str | None = None
+    superseded: bool = False
+    detail: str | None = None
+
+
 class PxeMapRef(BaseModel):
-    """The PXE map entries one candidate's rollback removes: its bond MACs at its site."""
+    """The PXE map entries one candidate's rollback removes: the MACs it mapped, at its site."""
 
     server_name: str = Field(min_length=1)
     site: str = Field(min_length=1)
@@ -270,6 +320,33 @@ class PxeUnregistration(BaseModel):
 
     removed: list[str] = Field(default_factory=list)
     absent: list[str] = Field(default_factory=list)
+    detail: str | None = None
+
+
+class PxeHostEntriesRef(BaseModel):
+    """remove-server: clear one host's MACs from every PXE VM this MCE's worker knows.
+
+    `mce_cluster` is the MCE the host is being removed from. The PXE VM deletes
+    a MAC only if it does NOT chain to another MCE's boot entry, so a machine
+    since mapped by another MCE keeps its boot.
+    """
+
+    server_name: str = Field(min_length=1)
+    mce_cluster: str = Field(min_length=1)
+    macs: list[str] = Field(min_length=1)
+
+
+class PxeHostEntriesRemoval(BaseModel):
+    """What remove-server's PXE cleanup did, as `<site>/<mac key>` entries.
+
+    `cleared` MACs are no longer mapped on that VM — removed, or never there
+    (the PXE map answers 204 for both). `kept` belong to another MCE's boot
+    entry and were left in place, with the PXE VM's reason. `detail` says why
+    nothing was tried (no PXE VM configured on this worker).
+    """
+
+    cleared: list[str] = Field(default_factory=list)
+    kept: list[str] = Field(default_factory=list)
     detail: str | None = None
 
 
@@ -431,6 +508,12 @@ class InventoryHostState(BaseModel):
     agents: list[AgentBinding] = Field(default_factory=list)
     # The MACs server-scan holds for the server; [] when it does not know it.
     server_scan_macs: list[str] = Field(default_factory=list)
+    # EVERY MAC the host is known by — the BMH's boot MAC, the NMStateConfig's
+    # and server-scan's — which is what remove-server clears from the PXE map.
+    # Always emitted by the limb (an empty list included); absent from payloads
+    # of a limb that predates it, which the workflow tells apart by
+    # `model_fields_set` and falls back to `server_scan_macs` for (CLAUDE.md §5).
+    macs: list[str] = Field(default_factory=list)
 
     @property
     def bound_agents(self) -> list[AgentBinding]:
@@ -500,6 +583,51 @@ class RemoveServerResult(BaseModel):
     powered_off: bool = False
     agents_removed: list[str] = Field(default_factory=list)
     resources_removed: list[str] = Field(default_factory=list)
+    # `<site>/<mac key>` entries cleared from / kept on the site PXE VMs (see
+    # PxeHostEntriesRemoval). Defaulted for results recorded before the cleanup.
+    pxe_cleared: list[str] = Field(default_factory=list)
+    pxe_kept: list[str] = Field(default_factory=list)
+
+
+class PublishInfraEnvBootInput(BaseModel):
+    """Input to PublishInfraEnvBootWorkflow: which InfraEnv's boot entry to (re)publish.
+
+    `namespace` is required HERE; the API defaults it to `inventory` on its
+    edge model, so a recorded run always carries the namespace it read.
+    """
+
+    mce_cluster: str = Field(min_length=1)
+    infra_env: str = Field(min_length=1)
+    namespace: str = Field(min_length=1)
+
+
+class PublishInfraEnvBootRunArgs(BaseModel):
+    """The workflow's single argument (see InstallServerRunArgs for why a wrapper)."""
+
+    input: PublishInfraEnvBootInput
+
+
+class PublishInfraEnvBootProgress(BaseModel):
+    """Returned by the `progress` query; `activity_queue` names the MCE's queue."""
+
+    phase: str
+    activity_queue: str | None = None
+
+
+class PublishInfraEnvBootResult(BaseModel):
+    """What the PXE VM of the MCE's site now serves as the InfraEnv's boot entry.
+
+    `superseded` means the VM already held a NEWER image than the one read
+    (another publish got there first) and kept it — the entry is current
+    either way.
+    """
+
+    mce_cluster: str
+    infra_env: str
+    namespace: str
+    site: str
+    image_created_at: str | None = None
+    superseded: bool = False
 
 
 class InstallServerInput(BaseModel):

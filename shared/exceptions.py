@@ -499,6 +499,23 @@ class InfraEnvNotReadyError(OrchestratorError):
     """
 
 
+class InfraEnvImageNotUpdatedError(OrchestratorError):
+    """WORKFLOW-RAISED. The InfraEnv never published a discovery image created
+    after this host's NMStateConfig — or, for publish-infraenv-boot, never
+    showed a ready image at all (ImageCreated True, an ipxeScript, a
+    createdTime) within its deadline.
+
+    install-server publishes an IPMI host's iPXE boot entry only once
+    `status.createdTime` is no older than the NMStateConfig, so the host never
+    boots an image that lacks its own static network config. assisted-service
+    regenerates within seconds of an NMStateConfig change, so a deadline here
+    means it is not regenerating at all — an invalid NMStateConfig, or an
+    assisted-service fault (the InfraEnv's ImageCreated condition, quoted in
+    the message, says which). That is the InfraEnv's problem, not the
+    candidate's, so it fails the run; the candidate is rolled back first.
+    """
+
+
 class AgentBoundToClusterError(OrchestratorError):
     """The server's Agent is bound to a cluster, so it is not just inventory.
 

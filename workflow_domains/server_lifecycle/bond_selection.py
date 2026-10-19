@@ -52,6 +52,12 @@ def select_bond_members(server: AcquiredServer) -> list[BondMember] | None:
     one port are two interfaces with two MACs on ONE wire, and bonding them
     yields no redundancy at all.
 
+    ORDER IS SERVER-SCAN'S, and it is load-bearing: the first link-up NIC with
+    a MAC that server-scan lists is always `nic1`, and `nic1` is the
+    BareMetalHost's `bootMACAddress` — and, for an IPMI host, the only MAC
+    mapped on the site's PXE VM. Port distinctness only ever rejects a LATER
+    interface, so it can never displace the first.
+
     Returns None rather than raising, because "this candidate is no use" is a
     normal answer the caller acts on by trying the next one — and because a bare
     exception raised in workflow code fails the workflow task and retries

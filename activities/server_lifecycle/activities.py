@@ -53,6 +53,9 @@ from activities.server_lifecycle.bmh_resources import (
     build_bmc_secret,
     build_nmstate_config,
     host_macs,
+    infraenv_image_created_at,
+    infraenv_image_not_ready_reason,
+    infraenv_image_wait_reason,
     infraenv_ipxe_script_url,
     nmstate_config_differences,
 )
@@ -79,11 +82,15 @@ from shared.models.server_lifecycle import (
     BmhState,
     CreatedResource,
     HostPowerRequest,
+    InfraEnvBootRequest,
+    InfraEnvBootState,
     InfraEnvRef,
     InfraEnvState,
     InventoryHostState,
     PxeBootRegistration,
     PxeBootRequest,
+    PxeHostEntriesRef,
+    PxeHostEntriesRemoval,
     PxeMapRef,
     PxeUnregistration,
     ReleaseServerRequest,
@@ -244,6 +251,8 @@ async def inspect_inventory_host(ref: BmhRef) -> InventoryHostState:
         powered_on=((bmh or {}).get("status") or {}).get("poweredOn"),
         agents=agents,
         server_scan_macs=scan_macs,
+        # Always set explicitly — the workflow keys on its presence.
+        macs=macs,
     )
     activity.logger.info(
         "%s in %s: bmh=%s nmstate=%s poweredOn=%s agents=%s server-scan macs=%d",
@@ -256,6 +265,36 @@ async def inspect_inventory_host(ref: BmhRef) -> InventoryHostState:
         len(scan_macs),
     )
     return state
+
+
+@activity.defn
+async def remove_host_pxe_entries(ref: PxeHostEntriesRef) -> PxeHostEntriesRemoval:
+    """Clear a removed host's MACs from every PXE VM, except another MCE's entries."""
+    if not _settings.pxe_map_urls:
+        detail = "no PXE map host is configured on this worker (PXE_MAP_URLS); nothing to clear"
+        activity.logger.info("%s: %s", ref.server_name, detail)
+        return PxeHostEntriesRemoval(detail=detail)
+
+    keys = sorted({pxe_map.map_key(mac) for mac in ref.macs})
+    cleared: list[str] = []
+    kept: list[str] = []
+    for site, base_url in sorted(_settings.pxe_map_urls.items()):
+        for key in keys:
+            reason = await pxe_map.delete_mapping_for_mce(
+                base_url, _settings.pxe_map_token, key, ref.mce_cluster
+            )
+            if reason is None:
+                cleared.append(f"{site}/{key}")
+            else:
+                kept.append(f"{site}/{key}: {reason}")
+    activity.logger.info(
+        "PXE map for %s (MCE %s): cleared %s, kept %s",
+        ref.server_name,
+        ref.mce_cluster,
+        cleared,
+        kept,
+    )
+    return PxeHostEntriesRemoval(cleared=cleared, kept=kept)
 
 
 @activity.defn
@@ -375,32 +414,70 @@ async def unregister_pxe_boot(ref: PxeMapRef) -> PxeUnregistration:
     return PxeUnregistration(removed=removed, absent=absent)
 
 
-@activity.defn
-async def register_pxe_boot(request: PxeBootRequest) -> PxeBootRegistration:
-    """Map an IPMI server's MACs to the InfraEnv's iPXE script on the site's PXE VM."""
-    # The site first: a missing entry is the candidate's skip, and costs nothing
-    # on the cluster to find out.
-    base_url = _settings.pxe_map_urls.get(request.site)
+def _pxe_map_url(site: str, needed_by: str) -> str:
+    """The site's PXE VM. Checked FIRST by every PXE activity: a missing entry
+    is the candidate's skip, and costs nothing on the cluster to find out."""
+    base_url = _settings.pxe_map_urls.get(site)
     if not base_url:
         raise PxeSiteNotConfiguredError(
-            f"{request.server_name} boots over IPMI from the network, but no PXE "
-            f"map host is configured for site {request.site!r}: add it to "
-            f"PXE_MAP_URLS (configured: {sorted(_settings.pxe_map_urls)})"
+            f"{needed_by}, but no PXE map host is configured for site "
+            f"{site!r}: add it to PXE_MAP_URLS (configured: "
+            f"{sorted(_settings.pxe_map_urls)})"
         )
+    return base_url
 
+
+def _boots_from_network(server_name: str) -> str:
+    return f"{server_name} boots over IPMI from the network"
+
+
+async def _read_infra_env(namespace: str, name: str) -> dict:
     infra_env = await cluster_api.read_custom_object(
         group=INFRAENV_GROUP,
         version=INFRAENV_VERSION,
         plural=INFRAENV_PLURAL,
         kind=_INFRAENV_KIND,
-        namespace=request.namespace,
-        name=request.infra_env,
+        namespace=namespace,
+        name=name,
     )
     if infra_env is None:
         raise InfraEnvNotFoundError(
-            f"InfraEnv {request.infra_env} does not exist in {request.namespace}, "
+            f"InfraEnv {name} does not exist in {namespace}, "
             "so there is no iPXE script to boot from"
         )
+    return infra_env
+
+
+@activity.defn
+async def register_pxe_boot(request: PxeBootRequest) -> PxeBootRegistration:
+    """Map an IPMI server's MACs to the InfraEnv's boot entry (or iPXE script) on the site's PXE VM."""
+    base_url = _pxe_map_url(request.site, _boots_from_network(request.server_name))
+
+    if request.mce_cluster:
+        # The boot entry this points at is published by publish_infra_env_boot
+        # once the host's NMStateConfig is in the image; no InfraEnv read here.
+        for mac in request.macs:
+            await pxe_map.put_mapping_to_infra_env(
+                base_url,
+                _settings.pxe_map_token,
+                mac,
+                request.mce_cluster,
+                request.infra_env,
+            )
+        activity.logger.info(
+            "Mapped %s (%s) to boot entry %s/%s on the %s PXE VM %s",
+            request.server_name,
+            request.macs,
+            request.mce_cluster,
+            request.infra_env,
+            request.site,
+            base_url,
+        )
+        return PxeBootRegistration(
+            site=request.site, pxe_map_url=base_url, macs=list(request.macs)
+        )
+
+    infra_env = await _read_infra_env(request.namespace, request.infra_env)
     ipxe_url = infraenv_ipxe_script_url(infra_env)
     if ipxe_url is None:
         raise InfraEnvNotReadyError(
@@ -420,6 +497,71 @@ async def register_pxe_boot(request: PxeBootRequest) -> PxeBootRegistration:
     )
     return PxeBootRegistration(
         site=request.site, pxe_map_url=base_url, macs=list(request.macs)
+    )
+
+
+@activity.defn
+async def publish_infra_env_boot(request: InfraEnvBootRequest) -> InfraEnvBootState:
+    """Publish the InfraEnv's iPXE script as its boot entry, once its image includes this host.
+
+    Without a `server_name` (publish-infraenv-boot): its current image, as soon
+    as there is a ready one.
+    """
+    if request.server_name:
+        needed_by = _boots_from_network(request.server_name)
+    else:
+        needed_by = f"InfraEnv {request.mce_cluster}/{request.infra_env} is to be published"
+    base_url = _pxe_map_url(request.site, needed_by)
+    infra_env = await _read_infra_env(request.namespace, request.infra_env)
+
+    if request.server_name:
+        awaited = nmstate_config_name(request.server_name)
+        nmstate = await _read(
+            NMSTATE_GROUP,
+            NMSTATE_VERSION,
+            NMSTATE_PLURAL,
+            _NMSTATE_KIND,
+            request.namespace,
+            awaited,
+        )
+        waiting = infraenv_image_wait_reason(infra_env, nmstate)
+    else:
+        awaited = "its current image"
+        waiting = infraenv_image_not_ready_reason(infra_env)
+    if waiting is not None:
+        activity.logger.info(
+            "Not publishing InfraEnv %s/%s for %s yet: %s",
+            request.namespace,
+            request.infra_env,
+            awaited,
+            waiting,
+        )
+        return InfraEnvBootState(published=False, detail=waiting)
+
+    # Both non-None: infraenv_image_wait_reason only passes an InfraEnv that
+    # publishes a script and a createdTime.
+    ipxe_url = infraenv_ipxe_script_url(infra_env)
+    image_created_at = infraenv_image_created_at(infra_env)
+    written = await pxe_map.put_infra_env_boot(
+        base_url,
+        _settings.pxe_map_token,
+        request.mce_cluster,
+        request.infra_env,
+        ipxe_url,
+        image_created_at,
+    )
+    activity.logger.info(
+        "Boot entry %s/%s on the %s PXE VM %s: %s (image of %s, after %s)",
+        request.mce_cluster,
+        request.infra_env,
+        request.site,
+        base_url,
+        "published" if written else "already holds a newer image",
+        image_created_at,
+        awaited,
+    )
+    return InfraEnvBootState(
+        published=True, image_created_at=image_created_at, superseded=not written
     )
 
 

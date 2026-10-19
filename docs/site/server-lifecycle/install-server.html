@@ -750,9 +750,11 @@
           <tr><td class="k">acquiring-server</td><td class="muted">Asking server-scan for candidates &mdash; it live-rechecks each one</td><td class="muted">seconds to ~1 min (it reaches a vendor manager)</td></tr>
           <tr><td class="k">selecting-server</td><td class="muted">Bond rule + one BareMetalHost read per candidate</td><td class="muted">seconds</td></tr>
           <tr><td class="k">reserving-server</td><td class="muted">Taking server-scan&rsquo;s install lock on the chosen candidate</td><td class="muted">instant</td></tr>
+          <tr><td class="k">registering-pxe-boot</td><td class="muted">IPMI (UCS) blades only: pointing the BareMetalHost&rsquo;s boot MAC (the first link-up NIC server-scan lists) on the site&rsquo;s PXE VM at the InfraEnv&rsquo;s boot entry, <code>&lt;mce&gt;/&lt;infraenv&gt;.ipxe</code></td><td class="muted">instant</td></tr>
+          <tr><td class="k">publishing-pxe-boot</td><td class="muted">IPMI only, after the blade&rsquo;s NMStateConfig: waiting for the InfraEnv to show a discovery image generated after it, then publishing its iPXE script as the boot entry &mdash; <b>bounded, &le; 10 min</b>, else <code>InfraEnvImageNotUpdatedError</code></td><td class="muted">seconds</td></tr>
           <tr><td class="k">creating-secret</td><td class="muted">The BMC credentials Secret</td><td class="muted">instant</td></tr>
           <tr><td class="k">creating-baremetalhost</td><td class="muted">The BareMetalHost</td><td class="muted">instant</td></tr>
-          <tr><td class="k">creating-nmstateconfig</td><td class="muted">The bond + tagged VLAN</td><td class="muted">instant</td></tr>
+          <tr><td class="k">creating-nmstateconfig</td><td class="muted">The bond + tagged VLAN (for an IPMI blade this comes first, before <code>publishing-pxe-boot</code>)</td><td class="muted">instant</td></tr>
           <tr><td class="k">awaiting-agent</td><td class="muted">Waiting for an Agent to register &mdash; <b>bounded, &le; 1 h</b></td><td class="muted">5&ndash;30 min</td></tr>
           <tr><td class="k">rolling-back</td><td class="muted">Removing a candidate that produced no Agent, then looping to step 3. An exhausted pool fails as <code>AgentNeverAppearedError</code></td><td class="muted">5&ndash;60 s</td></tr>
           <tr><td class="k">releasing-server</td><td class="muted">Giving the rolled-back candidate&rsquo;s install lock back</td><td class="muted">instant</td></tr>

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import base64
 from collections.abc import Iterable
+from datetime import datetime
 from typing import Any
 
 from shared.bmc_address import (
@@ -383,6 +384,86 @@ def infraenv_ipxe_script_url(infra_env: dict[str, Any]) -> str | None:
     """
     artifacts = (infra_env.get("status") or {}).get("bootArtifacts") or {}
     return artifacts.get("ipxeScript") or None
+
+
+def _k8s_time(value: Any) -> datetime | None:
+    """A Kubernetes RFC 3339 timestamp (`2026-10-19T10:00:05Z`), or None."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def _image_created_condition(infra_env: dict[str, Any]) -> dict[str, Any]:
+    for condition in (infra_env.get("status") or {}).get("conditions") or []:
+        if condition.get("type") == "ImageCreated":
+            return condition
+    return {}
+
+
+def infraenv_image_created_at(infra_env: dict[str, Any]) -> str | None:
+    """`status.createdTime`: when assisted-service last generated the discovery image."""
+    created_at = (infra_env.get("status") or {}).get("createdTime")
+    return created_at if _k8s_time(created_at) is not None else None
+
+
+def infraenv_image_not_ready_reason(infra_env: dict[str, Any]) -> str | None:
+    """Why the InfraEnv has no publishable image right now — None once it has one.
+
+    Publishable = `ImageCreated` True, `status.bootArtifacts.ipxeScript` set and
+    a `status.createdTime` to version it by. `ImageCreated` False means the
+    last generation FAILED (typically an NMStateConfig assisted-service could
+    not validate); its message is carried, since that is where the cause is.
+    """
+    condition = _image_created_condition(infra_env)
+    if condition.get("status") != "True":
+        message = condition.get("message") or "no ImageCreated condition yet"
+        return f"InfraEnv condition ImageCreated is not True: {message}"
+    if infraenv_ipxe_script_url(infra_env) is None:
+        return "the InfraEnv publishes no status.bootArtifacts.ipxeScript yet"
+    if _k8s_time((infra_env.get("status") or {}).get("createdTime")) is None:
+        return "the InfraEnv has no status.createdTime yet"
+    return None
+
+
+def infraenv_image_wait_reason(
+    infra_env: dict[str, Any], nmstate: dict[str, Any] | None
+) -> str | None:
+    """Why the InfraEnv's image may not include this NMStateConfig yet — None once it does.
+
+    assisted-service regenerates the discovery image whenever an NMStateConfig
+    matching the InfraEnv's selector changes, and stamps `status.createdTime`
+    with the generation time; the image carries the static network config of
+    every NMStateConfig it was generated from. So an image whose createdTime is
+    no older than the NMStateConfig's creationTimestamp was generated after the
+    NMStateConfig existed. (Red Hat's own guidance after adding NMStateConfigs
+    is the same check: wait for createdTime to move.)
+
+    `ImageCreated` must be True as well: assisted-service sets it False when a
+    generation FAILED — typically an NMStateConfig it could not validate — and
+    a createdTime from before the failure would otherwise pass. Its message is
+    carried into the reason, since that is the one place the cause is stated.
+    """
+    if nmstate is None:
+        return "the host's NMStateConfig is not on the cluster"
+    nmstate_created = _k8s_time((nmstate.get("metadata") or {}).get("creationTimestamp"))
+    if nmstate_created is None:
+        return "the host's NMStateConfig carries no creationTimestamp"
+
+    not_ready = infraenv_image_not_ready_reason(infra_env)
+    if not_ready is not None:
+        return not_ready
+
+    image_created = _k8s_time((infra_env.get("status") or {}).get("createdTime"))
+    if image_created < nmstate_created:
+        return (
+            f"the discovery image was generated at {image_created.isoformat()}, "
+            f"before the NMStateConfig was created at {nmstate_created.isoformat()}"
+        )
+    return None
 
 
 def agent_matches_macs(agent: dict[str, Any], macs: Iterable[str]) -> bool:

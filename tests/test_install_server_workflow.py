@@ -425,6 +425,15 @@ def make_mock_activities(
                 f"{request.server_name} is reserved by 'install-server' for MCE "
                 "'ocp4-mce-other'"
             )
+        # server-scan's rule (reservation_service.py there): a live lock is
+        # refused to any OTHER workflow id; the same id re-claiming extends it.
+        # No await between this check and the write below, so - like the
+        # store's compare-and-set - two concurrent claims cannot both pass it.
+        held_by = locks.get(request.server_id)
+        if held_by is not None and held_by != request.workflow_id:
+            raise ServerReservedError(
+                f"{request.server_name} is reserved by 'install-server' (run {held_by!r})"
+            )
         locks[request.server_id] = request.workflow_id
         return ServerReservation(
             server_id=request.server_id,
@@ -1331,6 +1340,44 @@ class TestThePxeBootOfAnIpmiServer:
                 await _execute(client, InstallServerRunArgs(input=INPUT))
 
         assert "PXE map" in _application_error(excinfo.value).message
+
+
+class TestParallelRunsOnOnePool:
+    """install-server/bulk's premise: N runs drawing one pool AT ONCE land on N machines.
+
+    Both runs share one mock server-scan, whose lock behaves as the real one
+    (reservation_service.py there): a live lock is refused to any other
+    workflow id. Every run draws the same candidates in the same order, so
+    the second must skip what the first locked rather than share it.
+    """
+
+    async def test_two_concurrent_runs_install_two_different_servers(self):
+        pool = [
+            bondable_server("srv_a", name="ocp-dell-a", mac_prefix="aa:aa:aa:aa:aa"),
+            bondable_server("srv_b", name="ocp-dell-b", mac_prefix="bb:bb:bb:bb:bb"),
+            bondable_server("srv_c", name="ocp-dell-c", mac_prefix="cc:cc:cc:cc:cc"),
+        ]
+        calls, segment_acts, server_acts = make_mock_activities(candidates=pool)
+        args = InstallServerRunArgs(input=INPUT.model_copy(update={"candidate_count": 3}))
+        async with _Harness(segment_acts, server_acts) as client:
+            handles = [
+                await client.start_workflow(
+                    InstallServerWorkflow.run,
+                    args,
+                    id=f"install-server-{INFRA_ENV}_{slot}",
+                    task_queue=INSTALL_SERVER_WORKFLOW_QUEUE,
+                )
+                for slot in (1, 2)
+            ]
+            results = await asyncio.wait_for(
+                asyncio.gather(*(h.result() for h in handles)), timeout=60
+            )
+
+        installed = [r.server_name for r in results]
+        assert len(set(installed)) == 2, f"two runs installed the same server: {installed}"
+        # And no machine ever had BareMetalHosts created by both runs.
+        created = [c.server_name for c in calls["create_baremetal_host"]]
+        assert sorted(created) == sorted(installed)
 
 
 class TestTheInfraEnvBootEntry:

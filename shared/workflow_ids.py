@@ -72,9 +72,9 @@ def install_server_workflow_id(infra_env: str, server_name: str | None = None) -
     run now also takes server-scan's install lock on the machine it chooses
     (ADR-0035 there), which covers what this id never could: a run for ANOTHER
     MCE drawing a server already installed elsewhere, invisible to its own
-    BareMetalHost probe. With the lock, keying on (pool, MCE) would let two MCEs
-    fill one InfraEnv concurrently — a deliberate change still to be made, not
-    a consequence of adding the lock.
+    BareMetalHost probe. With the lock, a pool CAN be drawn from in parallel —
+    install-server/bulk does it, with install_server_slot_workflow_id below —
+    so this id now only keeps the single route at one run per pool.
 
     An explicitly named server draws from a pool of one, so it gets its own id
     and does not serialize against pattern draws for the same InfraEnv.
@@ -90,6 +90,25 @@ def install_server_workflow_id(infra_env: str, server_name: str | None = None) -
     if server_name:
         return f"install-server-name-{server_name.lower()}"
     return f"install-server-{infra_env}"
+
+
+def install_server_slot_workflow_id(infra_env: str, slot: int) -> str:
+    """`install-server-<infraEnv>_<slot>`: one of N PARALLEL pool draws (install-server/bulk).
+
+    The id above serializes a pool to one run, which was the defence against two
+    runs drawing one machine before the install lock existed. The lock is that
+    defence now, and it holds for any number of runs: server-scan takes it by
+    compare-and-set on the document revision, refuses a live lock to any OTHER
+    workflow id, and the run writes nothing until it holds it — a run that loses
+    the race skips the machine (`reserved`) and tries its next candidate. So N
+    slots may draw from one pool at once and still land on N different machines,
+    while a repeated request for a slot that is still running is a dedup hit,
+    exactly as the single id is.
+
+    `_` because a Kubernetes name cannot contain it: a slot id can never equal
+    the single id of an InfraEnv whose own name ends in `-<digits>`.
+    """
+    return f"install-server-{infra_env}_{slot}"
 
 
 def remove_server_workflow_id(server_name: str) -> str:

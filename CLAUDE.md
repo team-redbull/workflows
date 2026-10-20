@@ -680,7 +680,14 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   so the InfraEnv IS the server query. Its id keys on the CANDIDATE POOL — the InfraEnv alone, with
   no MCE in it — which makes installs drawing from one pool serial, and two MCEs filling an
   InfraEnv of the same name draw from the same pool. The install lock (§4) now guards the machine
-  itself, so keying on (pool, MCE) has become possible; it is a separate decision, not yet made.
+  itself, so PARALLEL draws exist: `POST .../install-server/bulk` (`count` 1-20) starts one run
+  per SLOT, id `install-server-<infraEnv>_<slot>` (`_` cannot occur in a Kubernetes name, so it
+  never equals another InfraEnv's single id), each drawing `candidate_count` = `count + 2` (max
+  20) by default because every slot draws the same top of the pool and loses lock races to its
+  siblings. Safe because server-scan's reserve is a compare-and-set on the document revision that
+  refuses a live lock to any other workflow id, and the run writes nothing before holding it —
+  `TestParallelRunsOnOnePool` runs two at once. The test harness's mock lock must keep refusing
+  another workflow id's live lock, or that test proves nothing.
   `POST /workflows/segment-lifecycle/initialize-segment` is ASYNC (202 + workflow id) and takes
   the full segment definition; poll `GET /workflows/runs/{workflow_id}` for progress/result. The
   `/bulk` variant takes a list and starts ONE WORKFLOW PER SEGMENT (never one batch workflow — each

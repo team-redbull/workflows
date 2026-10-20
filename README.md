@@ -351,6 +351,25 @@ There is deliberately **no `vlan_id`**: it belongs to the MCE's segment, and a
 supplied one could contradict it. The request body forbids unknown fields, so
 sending `vlan_id` is a 422 rather than a silently ignored value.
 
+### `install-server/bulk` — several servers from one pool at once
+
+The single route keys on the pool (`install-server-<infraEnv>`), so it installs
+ONE server per InfraEnv at a time. `POST /workflows/server-lifecycle/install-server/bulk`
+with `{"infra_env", "mce_cluster", "count": N}` (optional `namespace`,
+`candidate_count`, `labels`; no `server_name`, no `vlan_id`) starts N runs in
+parallel, `install-server-<infraEnv>_1` … `_N`, and answers 202 with a per-slot
+report (`started` / `already_running` / `failed`). A slot still running is
+reported, not restarted, so a repeated request only refills finished slots.
+
+Two runs cannot take one machine: each takes server-scan's install lock before
+writing anything, server-scan takes it by compare-and-set on the document
+revision and refuses a live lock to any other workflow id, and a run that
+loses the race skips that machine and tries its next candidate. Because every
+slot draws the same top of the pool at once, `candidate_count` defaults to
+`count + 2` (max 20); a slot that finds only locked machines fails with
+`ServerReservedError` — the pool was smaller than `count`, or raise
+`candidate_count`.
+
 ### `publish-infraenv-boot` — an InfraEnv's current iPXE script onto its PXE VM
 
 `POST /workflows/server-lifecycle/publish-infraenv-boot` with
@@ -489,6 +508,7 @@ result.
 | `POST /workflows/segment-lifecycle/allocate-segment` | one allocation |
 | `POST /workflows/segment-lifecycle/release-segment` | one release (after the cluster's Application is gone) |
 | `POST /workflows/server-lifecycle/install-server` | one server into an InfraEnv |
+| `POST /workflows/server-lifecycle/install-server/bulk` | `count` servers from one InfraEnv's pool, in parallel (one run per slot) |
 | `POST /workflows/server-lifecycle/remove-server` | one server out of an MCE's inventory |
 | `POST /workflows/server-lifecycle/publish-infraenv-boot` | an InfraEnv's current iPXE script onto its site's PXE VM |
 | `POST /workflows/server-provisioning/provision-dell-server` | one Dell server, by iDRAC IP |

@@ -82,6 +82,66 @@ def test_a_vlan_is_still_refused(client):
     assert client.post(PATH, json={**BODY, "vlan_id": 24}).status_code == 422
 
 
+class TestInstallServerBulk:
+    PATH = "/workflows/server-lifecycle/install-server/bulk"
+
+    def test_count_runs_start_each_on_its_own_slot_id(self, client, fake):
+        response = client.post(self.PATH, json={**BODY, "count": 3})
+
+        assert response.status_code == 202
+        body = response.json()
+        assert body["started"] == 3 and body["already_running"] == 0
+        assert [r["workflow_id"] for r in body["results"]] == [
+            "install-server-cisco-m6-bat-yam-64c-512gb_1",
+            "install-server-cisco-m6-bat-yam-64c-512gb_2",
+            "install-server-cisco-m6-bat-yam-64c-512gb_3",
+        ]
+        # Pool draws, never a named server; inventory by default.
+        assert all(a.input.server_name is None for a in fake.args)
+        assert all(a.input.namespace == "inventory" for a in fake.args)
+
+    def test_each_run_draws_spares_for_the_races_it_will_lose(self, client, fake):
+        client.post(self.PATH, json={**BODY, "count": 4})
+        assert {a.input.candidate_count for a in fake.args} == {6}
+
+    def test_the_spares_are_capped_and_an_explicit_count_wins(self, client, fake):
+        client.post(self.PATH, json={**BODY, "count": 20})
+        assert {a.input.candidate_count for a in fake.args} == {20}
+        fake.args.clear()
+        client.post(self.PATH, json={**BODY, "count": 2, "candidate_count": 9})
+        assert {a.input.candidate_count for a in fake.args} == {9}
+
+    def test_a_slot_still_running_is_reported_not_restarted(self, client, fake):
+        from temporalio.exceptions import WorkflowAlreadyStartedError
+
+        running = {"install-server-cisco-m6-bat-yam-64c-512gb_2"}
+        original = fake.start_workflow
+
+        async def start_workflow(run, args, *, id: str, task_queue: str):
+            if id in running:
+                raise WorkflowAlreadyStartedError(id, "InstallServerWorkflow")
+            return await original(run, args, id=id, task_queue=task_queue)
+
+        fake.start_workflow = start_workflow
+        body = client.post(self.PATH, json={**BODY, "count": 3}).json()
+
+        assert (body["started"], body["already_running"]) == (2, 1)
+        assert [r["status"] for r in body["results"]] == [
+            "started", "already_running", "started",
+        ]
+
+    def test_the_mce_is_canonical(self, client, fake):
+        client.post(self.PATH, json={**BODY, "mce_cluster": "prod-mce-bat-yam", "count": 1})
+        assert fake.args[0].input.mce_cluster == "ocp4-prod-mce-bat-yam"
+
+    @pytest.mark.parametrize(
+        "extra",
+        [{"count": 0}, {"count": 21}, {"count": 2, "server_name": "ocp-x"}, {"count": 2, "vlan_id": 24}, {}],
+    )
+    def test_invalid_requests_are_422(self, client, extra):
+        assert client.post(self.PATH, json={**BODY, **extra}).status_code == 422
+
+
 class TestRemoveServer:
     PATH = "/workflows/server-lifecycle/remove-server"
     BODY = {"server_name": "ocp-cisco-m6-bat-yam-64c-512gb-FCH0001",

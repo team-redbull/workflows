@@ -564,6 +564,37 @@ class TestRemoveHostPxeEntries:
         assert result.cleared == ["bat-yam/0025b5000001"]
         assert result.kept == ["bat-yam/0025b5000002: chains to ocp4-mce-other"]
 
+    @respx.mock
+    async def test_with_a_site_only_that_sites_vm_is_called(self, monkeypatch):
+        # The failure this fixes: the worker's one token belongs to its own
+        # site's VM, so calling any other site's VM got a 401.
+        monkeypatch.setattr(
+            activities._settings,
+            "pxe_map_urls",
+            {"bat-yam": PXE, "haifa": "http://pxe.haifa.test:8080"},
+        )
+        own = respx.delete(url__startswith=PXE).mock(return_value=httpx.Response(204))
+        other = respx.delete(url__startswith="http://pxe.haifa.test").mock(
+            return_value=httpx.Response(401)
+        )
+
+        result = await activities.remove_host_pxe_entries(
+            HOST_REF.model_copy(update={"site": "bat-yam"})
+        )
+
+        assert not other.called
+        assert own.call_count == 2
+        assert result.cleared == ["bat-yam/0025b5000001", "bat-yam/0025b5000002"]
+
+    @respx.mock
+    async def test_a_site_without_a_vm_is_reported_not_raised(self):
+        route = respx.delete(url__startswith="http")
+        result = await activities.remove_host_pxe_entries(
+            HOST_REF.model_copy(update={"site": "haifa"})
+        )
+        assert result.cleared == [] and "haifa" in (result.detail or "")
+        assert not route.called
+
     async def test_no_vm_configured_is_reported_not_raised(self, monkeypatch):
         monkeypatch.setattr(activities._settings, "pxe_map_urls", {})
         result = await activities.remove_host_pxe_entries(HOST_REF)

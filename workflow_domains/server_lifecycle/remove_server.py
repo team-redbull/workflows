@@ -28,14 +28,17 @@ Shape of the run:
                         BMC, then delete, then drop the finalizer if it sticks.
   5. removing-agent   — the Agent(s), each re-checked as unbound right before
                         its delete.
-     removing-pxe-boot — every MAC the host is known by is cleared from every
-                        site PXE VM this MCE's worker has configured, so the
-                        machine can no longer network-boot this MCE's discovery
-                        image and re-register. CONDITIONAL on the PXE VM: a MAC
+     removing-pxe-boot — every MAC the host is known by is cleared from the
+                        PXE VM of the MCE's OWN site (its inventory segment's,
+                        the same VM install-server mapped it on), so the machine
+                        can no longer network-boot this MCE's discovery image
+                        and re-register. CONDITIONAL on the PXE VM: a MAC
                         chaining to ANOTHER MCE's boot entry is kept (reported
-                        in `pxe_kept`), since that MCE has mapped the machine
-                        since. Runs for every server — a Redfish one simply has
-                        no entries.
+                        in `pxe_kept`). BEST EFFORT: no segment, a rejected
+                        token or request, or a VM unreachable for 10 min is
+                        reported in `pxe_failed` and logged — the removal still
+                        completes. Runs for every server — a Redfish one simply
+                        has no entries.
   6. verifying        — inspect again until no Agent, BMH or NMStateConfig is
                         left (an Agent's finalizer takes seconds). Anything
                         still there after a bounded wait fails the run with
@@ -63,21 +66,28 @@ from datetime import timedelta
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
-from temporalio.exceptions import ApplicationError
+from temporalio.exceptions import ActivityError, ApplicationError
 
 with workflow.unsafe.imports_passed_through():
-    from shared.consts import server_lifecycle_activity_queue
+    from shared.consts import (
+        SEGMENT_LIFECYCLE_ACTIVITY_QUEUE,
+        server_lifecycle_activity_queue,
+    )
     from shared.exceptions import (
         AgentBoundToClusterError,
+        AmbiguousInventorySegmentError,
         BmhPrerequisiteMissingError,
         BmhRequestInvalidError,
         HostPowerOffTimeoutError,
         InvalidServerNameError,
+        InventorySegmentNotFoundError,
         PxeMapAuthError,
         PxeMapRequestRejectedError,
+        SegmentsManagerAuthError,
         ServerScanAuthError,
         ServerStillPresentError,
     )
+    from shared.interfaces.segment_lifecycle import get_inventory_segment
     from shared.interfaces.server_lifecycle import (
         delete_agents,
         get_baremetal_host,
@@ -113,6 +123,9 @@ _PERMANENT_ACTIVITY_ERRORS: tuple[type[Exception], ...] = (
     ServerScanAuthError,
     PxeMapAuthError,
     PxeMapRequestRejectedError,
+    InventorySegmentNotFoundError,
+    AmbiguousInventorySegmentError,
+    SegmentsManagerAuthError,
 )
 _RETRY_POLICY = RetryPolicy(
     initial_interval=timedelta(seconds=1),
@@ -136,6 +149,25 @@ _GONE_POLL_INTERVAL = timedelta(seconds=10)
 # Gates the PXE map cleanup: a run recorded before it would otherwise meet a
 # new activity between its Agent delete and its final check.
 _PXE_CLEANUP_PATCH = "remove-server-pxe-cleanup"
+# Gates cleaning ONLY the MCE's own site (an inventory-segment read first) and
+# making the cleanup best effort. Runs recorded before it swept every VM in
+# PXE_MAP_URLS and failed the removal on the first one that refused.
+_PXE_OWN_SITE_PATCH = "remove-server-pxe-own-site"
+
+# The cleanup is BEST EFFORT — the host is already off the MCE when it runs —
+# so unlike every other call here it is not retried without bound: a PXE VM
+# unreachable for this long is reported in `pxe_failed` and the run moves on
+# to its final check. (CLAUDE.md §5's unbounded retries out-wait outages the
+# RUN depends on; nothing about this removal depends on the PXE VM.)
+_PXE_CLEANUP_DEADLINE = timedelta(minutes=10)
+
+
+def _cause(err: ActivityError) -> str:
+    """The failure behind an activity error, as `Type: message` for the result."""
+    cause = err.cause
+    if isinstance(cause, ApplicationError):
+        return f"{cause.type}: {cause.message}"
+    return f"{type(cause).__name__ if cause else 'ActivityError'}: {cause or err}"
 
 
 def _describe_leftover(state: InventoryHostState) -> str:
@@ -154,6 +186,7 @@ class RemoveServerWorkflow:
         self._phase = "pending"
         self._activity_queue: str | None = None
         self._pxe_cleanup = False
+        self._pxe_own_site = False
 
     @workflow.query
     def progress(self) -> RemoveServerProgress:
@@ -165,6 +198,7 @@ class RemoveServerWorkflow:
         activity_queue = server_lifecycle_activity_queue(request.mce_cluster)
         self._activity_queue = activity_queue
         self._pxe_cleanup = workflow.patched(_PXE_CLEANUP_PATCH)
+        self._pxe_own_site = workflow.patched(_PXE_OWN_SITE_PATCH)
         ref = BmhRef(server_name=request.server_name, namespace=request.namespace)
 
         def result(**fields) -> RemoveServerResult:
@@ -249,12 +283,19 @@ class RemoveServerWorkflow:
         # discovery image on its next power-on and re-register its Agent.
         pxe_cleared: list[str] = []
         pxe_kept: list[str] = []
+        pxe_failed: list[str] = []
         if self._pxe_cleanup:
             # A limb that predates `macs` sent only server-scan's (CLAUDE.md §5).
             macs = (
                 state.macs if "macs" in state.model_fields_set else state.server_scan_macs
             )
-            if macs:
+            if macs and self._pxe_own_site:
+                self._phase = "removing-pxe-boot"
+                pxe_cleared, pxe_kept, pxe_failed = await self._clear_pxe_own_site(
+                    request.server_name, request.mce_cluster, macs, activity_queue
+                )
+            elif macs:
+                # A run recorded before `remove-server-pxe-own-site`.
                 self._phase = "removing-pxe-boot"
                 removal = await self._call(
                     remove_host_pxe_entries,
@@ -310,7 +351,73 @@ class RemoveServerWorkflow:
             resources_removed=resources_removed,
             pxe_cleared=pxe_cleared,
             pxe_kept=pxe_kept,
+            pxe_failed=pxe_failed,
         )
+
+    async def _clear_pxe_own_site(
+        self, server_name: str, mce_cluster: str, macs: list[str], task_queue: str
+    ) -> tuple[list[str], list[str], list[str]]:
+        """(cleared, kept, failed) for the host's MACs on its OWN site's PXE VM.
+
+        The site is the MCE's inventory segment's — the same rule
+        install-server maps the host by, so this is the one VM that can hold
+        its entries, and the one whose token and network path the worker has.
+        BEST EFFORT throughout: a missing segment, a rejected token or request,
+        or a VM unreachable for the whole deadline is recorded as `failed`, and
+        the removal still completes.
+        """
+        try:
+            segment = await workflow.execute_activity(
+                get_inventory_segment,
+                mce_cluster,
+                task_queue=SEGMENT_LIFECYCLE_ACTIVITY_QUEUE,
+                start_to_close_timeout=_ACTIVITY_TIMEOUT,
+                schedule_to_close_timeout=_PXE_CLEANUP_DEADLINE,
+                retry_policy=_RETRY_POLICY,
+            )
+        except ActivityError as err:
+            reason = f"no site to clean: inventory segment lookup failed ({_cause(err)})"
+            workflow.logger.warning("PXE map cleanup of %s skipped — %s", server_name, reason)
+            return [], [], [reason]
+        if segment.cluster_name != mce_cluster:
+            reason = (
+                f"no site to clean: the Segments Manager returned segment "
+                f"{segment.segment} of {segment.cluster_name!r}, not {mce_cluster!r}"
+            )
+            workflow.logger.warning("PXE map cleanup of %s skipped — %s", server_name, reason)
+            return [], [], [reason]
+
+        try:
+            removal = await workflow.execute_activity(
+                remove_host_pxe_entries,
+                PxeHostEntriesRef(
+                    server_name=server_name,
+                    mce_cluster=mce_cluster,
+                    macs=macs,
+                    site=segment.site,
+                ),
+                task_queue=task_queue,
+                start_to_close_timeout=_ACTIVITY_TIMEOUT,
+                schedule_to_start_timeout=_SCHEDULE_TO_START_TIMEOUT,
+                schedule_to_close_timeout=_PXE_CLEANUP_DEADLINE,
+                retry_policy=_RETRY_POLICY,
+            )
+        except ActivityError as err:
+            reason = f"{segment.site}: {_cause(err)}"
+            workflow.logger.warning(
+                "PXE map cleanup of %s failed, entries may remain — %s", server_name, reason
+            )
+            return [], [], [reason]
+
+        if removal.kept:
+            workflow.logger.warning(
+                "Left %s mapped on the PXE VM: another MCE's boot entry — %s",
+                server_name,
+                removal.kept,
+            )
+        if removal.detail:
+            workflow.logger.info("PXE map cleanup: %s", removal.detail)
+        return list(removal.cleared), list(removal.kept), []
 
     async def _call(self, activity_fn, arg, task_queue: str):
         """One cluster call on the target MCE's queue, under the domain's budget."""

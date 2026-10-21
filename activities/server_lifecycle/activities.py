@@ -269,8 +269,22 @@ async def inspect_inventory_host(ref: BmhRef) -> InventoryHostState:
 
 @activity.defn
 async def remove_host_pxe_entries(ref: PxeHostEntriesRef) -> PxeHostEntriesRemoval:
-    """Clear a removed host's MACs from every PXE VM, except another MCE's entries."""
-    if not _settings.pxe_map_urls:
+    """Clear a removed host's MACs from its site's PXE VM, except another MCE's entries."""
+    if ref.site is not None:
+        # Its own site only — the VM install-server mapped it on.
+        base_url = _settings.pxe_map_urls.get(ref.site)
+        if not base_url:
+            detail = (
+                f"no PXE map host is configured for site {ref.site!r} on this worker "
+                f"(PXE_MAP_URLS: {sorted(_settings.pxe_map_urls)}); nothing to clear"
+            )
+            activity.logger.info("%s: %s", ref.server_name, detail)
+            return PxeHostEntriesRemoval(detail=detail)
+        targets = {ref.site: base_url}
+    else:
+        # A run recorded before `remove-server-pxe-own-site`: every VM.
+        targets = dict(_settings.pxe_map_urls)
+    if not targets:
         detail = "no PXE map host is configured on this worker (PXE_MAP_URLS); nothing to clear"
         activity.logger.info("%s: %s", ref.server_name, detail)
         return PxeHostEntriesRemoval(detail=detail)
@@ -278,7 +292,7 @@ async def remove_host_pxe_entries(ref: PxeHostEntriesRef) -> PxeHostEntriesRemov
     keys = sorted({pxe_map.map_key(mac) for mac in ref.macs})
     cleared: list[str] = []
     kept: list[str] = []
-    for site, base_url in sorted(_settings.pxe_map_urls.items()):
+    for site, base_url in sorted(targets.items()):
         for key in keys:
             reason = await pxe_map.delete_mapping_for_mce(
                 base_url, _settings.pxe_map_token, key, ref.mce_cluster

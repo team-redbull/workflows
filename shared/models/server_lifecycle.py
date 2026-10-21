@@ -334,6 +334,12 @@ class PxeHostEntriesRef(BaseModel):
     server_name: str = Field(min_length=1)
     mce_cluster: str = Field(min_length=1)
     macs: list[str] = Field(min_length=1)
+    # The MCE's inventory-segment site: only THAT site's PXE VM is cleared,
+    # the same one install-server mapped the host on. None in payloads of a
+    # run recorded before `remove-server-pxe-own-site`, which tried every VM
+    # in PXE_MAP_URLS — and failed on every site but its own, whose token and
+    # network path the worker does not have.
+    site: str | None = None
 
 
 class PxeHostEntriesRemoval(BaseModel):
@@ -587,6 +593,10 @@ class RemoveServerResult(BaseModel):
     # PxeHostEntriesRemoval). Defaulted for results recorded before the cleanup.
     pxe_cleared: list[str] = Field(default_factory=list)
     pxe_kept: list[str] = Field(default_factory=list)
+    # Why the PXE cleanup could not be done, when it could not. Best effort:
+    # by then the host is gone from the MCE, so a PXE VM that rejects the token
+    # or cannot be reached is reported here (and logged), never a failed run.
+    pxe_failed: list[str] = Field(default_factory=list)
 
 
 class PublishInfraEnvBootInput(BaseModel):

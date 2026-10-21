@@ -293,8 +293,16 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   and before that check (`removing-pxe-boot`, gated `remove-server-pxe-cleanup`)
   it clears EVERY MAC the host is known by (`InventoryHostState.macs`: BMH boot
   MAC + NMStateConfig + server-scan; a limb predating the field falls back to
-  `server_scan_macs` by `model_fields_set`) from EVERY PXE VM in the worker's
-  `PXE_MAP_URLS`, with `DELETE /pxe-map/<mac>?mce_cluster=<this MCE>`: the PXE
+  `server_scan_macs` by `model_fields_set`) from the PXE VM of the MCE's OWN
+  site only (`get_inventory_segment` on the segment-lifecycle queue, cluster
+  re-checked; gated `remove-server-pxe-own-site`), with
+  `DELETE /pxe-map/<mac>?mce_cluster=<this MCE>`. It used to sweep EVERY VM in
+  `PXE_MAP_URLS` and failed there: the worker has ONE `PXE_MAP_TOKEN`, each
+  site's VM its own, so every other site answered 401 — install worked, remove
+  failed. BEST EFFORT since: no segment, a rejected token/request, or a VM
+  unreachable for 10 min (`schedule_to_close_timeout`, the one bounded call in
+  the domain — nothing about the removal depends on the PXE VM) goes into
+  `pxe_failed` and the run still completes. The PXE
   VM refuses (409, reported in `pxe_kept`, not a failure) a MAC chaining to
   ANOTHER MCE's boot entry and removes anything else — this MCE's entry, a
   pre-boot-entry direct URL, a corrupt file — under the lock MAC writes take

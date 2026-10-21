@@ -140,10 +140,13 @@ async def remove_host_pxe_entries(ref: PxeHostEntriesRef) -> PxeHostEntriesRemov
     boot entries, a corrupt file. 409 is reported in `kept`, not raised.
     Absent is success (204), so a retry converges.
 
-    Every configured VM, not the site of the MCE's inventory segment: the MAC
-    can only have been mapped through this worker's PXE_MAP_URLS, the
-    condition makes a VM that never held it a no-op, and it needs no
-    Segments Manager read. No VM configured is reported in `detail`.
+    With `ref.site` (every run since `remove-server-pxe-own-site`) ONLY that
+    site's VM — the MCE's inventory-segment site, the one install-server
+    mapped the host on. Without it, every VM in PXE_MAP_URLS, which is what
+    runs recorded before did — and why they failed: the worker holds ONE
+    PXE_MAP_TOKEN, each site's VM its own token, so every other site answered
+    401 (or could not be reached from this MCE at all). A site with no VM
+    configured, or none configured at all, is reported in `detail`.
 
     Requires the PXE VMs' pxe-map-api to know `?mce_cluster`: an older one
     IGNORES the parameter and deletes unconditionally. Raises PxeMapAuthError /

@@ -1,8 +1,10 @@
 """remove-server: real RemoveServerWorkflow, mock activities, time-skipping env.
 
-The mocks are registered ONLY on the target MCE's activity queue — every step
-of a removal acts on that MCE — so a dispatch anywhere else would hang the run.
-The time-skipping environment collapses the power-off poll's durable timers.
+The cluster mocks are registered ONLY on the target MCE's activity queue —
+every step that acts on the MCE goes there — and the inventory-segment read
+(the site for the PXE cleanup) on the segment-lifecycle queue, as in
+production; a dispatch anywhere else would hang the run. The time-skipping
+environment collapses the power-off poll's durable timers.
 """
 
 from __future__ import annotations
@@ -18,8 +20,18 @@ from temporalio.exceptions import ActivityError, ApplicationError
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
-from shared.consts import REMOVE_SERVER_WORKFLOW_QUEUE, server_lifecycle_activity_queue
-from shared.exceptions import AgentBoundToClusterError, PxeMapAuthError
+from shared.consts import (
+    REMOVE_SERVER_WORKFLOW_QUEUE,
+    SEGMENT_LIFECYCLE_ACTIVITY_QUEUE,
+    server_lifecycle_activity_queue,
+)
+from shared.exceptions import (
+    AgentBoundToClusterError,
+    InventorySegmentNotFoundError,
+    PxeMapAuthError,
+    PxeMapError,
+)
+from shared.models.segment_lifecycle import SegmentEntry, SegmentType
 from shared.models.server_lifecycle import (
     AgentBinding,
     AgentDeleteRequest,
@@ -42,6 +54,15 @@ SERVER = "ocp-cisco-m6-bat-yam-64c-512gb-FCH0001"
 NS = "inventory"
 INPUT = RemoveServerInput(server_name=SERVER, mce_cluster=MCE, namespace=NS)
 
+SEGMENT = SegmentEntry(
+    segment="10.20.90.0/24",
+    site="bat-yam",
+    vlan_id=24,
+    status="Allocated",
+    type=SegmentType.INVENTORY.value,
+    cluster_name=MCE,
+)
+
 UNBOUND = AgentBinding(name="agent-1")
 BOUND = AgentBinding(name="agent-1", cluster_deployment="clusters/hc-01")
 FULL = InventoryHostState(bmh_found=True, nmstate_found=True, powered_on=True, agents=[UNBOUND])
@@ -57,6 +78,8 @@ def make_mocks(
     pxe_kept: set[str] | None = None,
     pxe_error: Exception | None = None,
     legacy_limb: bool = False,
+    segment: SegmentEntry | None = None,
+    segment_error: Exception | None = None,
 ):
     """`state` is what the first inspection finds; `after` what every later
     one finds (the final check) — gone by default. `pxe_kept` names the MACs
@@ -72,9 +95,18 @@ def make_mocks(
             "teardown_bmh_resources",
             "delete_agents",
             "remove_host_pxe_entries",
+            "get_inventory_segment",
             "order",
         )
     }
+
+    @activity.defn
+    async def get_inventory_segment(mce_cluster: str) -> SegmentEntry:
+        calls["get_inventory_segment"].append(mce_cluster)
+        calls["order"].append("segment")
+        if segment_error is not None:
+            raise segment_error
+        return segment or SEGMENT
 
     @activity.defn
     async def inspect_inventory_host(ref: BmhRef) -> InventoryHostState:
@@ -123,19 +155,23 @@ def make_mocks(
         if pxe_error is not None:
             raise pxe_error
         keys = [mac.replace(":", "") for mac in ref.macs]
+        site = ref.site or "bat-yam"
         return PxeHostEntriesRemoval(
-            cleared=[f"bat-yam/{k}" for k in keys if k not in kept],
-            kept=[f"bat-yam/{k}: chains to ocp4-mce-other" for k in keys if k in kept],
+            cleared=[f"{site}/{k}" for k in keys if k not in kept],
+            kept=[f"{site}/{k}: chains to ocp4-mce-other" for k in keys if k in kept],
         )
 
-    return calls, [
-        inspect_inventory_host,
-        set_host_online,
-        get_baremetal_host,
-        teardown_bmh_resources,
-        delete_agents,
-        remove_host_pxe_entries,
-    ]
+    return calls, {
+        QUEUE: [
+            inspect_inventory_host,
+            set_host_online,
+            get_baremetal_host,
+            teardown_bmh_resources,
+            delete_agents,
+            remove_host_pxe_entries,
+        ],
+        SEGMENT_LIFECYCLE_ACTIVITY_QUEUE: [get_inventory_segment],
+    }
 
 
 class _Harness:
@@ -149,7 +185,10 @@ class _Harness:
         client = Client(**config)
         self._workers = [
             Worker(client, task_queue=REMOVE_SERVER_WORKFLOW_QUEUE, workflows=[RemoveServerWorkflow]),
-            Worker(client, task_queue=QUEUE, activities=self._activities),
+            *(
+                Worker(client, task_queue=queue, activities=activities)
+                for queue, activities in self._activities.items()
+            ),
         ]
         for worker in self._workers:
             await worker.__aenter__()
@@ -269,7 +308,7 @@ async def test_an_agent_left_without_its_bmh_is_still_deleted():
     async with _Harness(acts) as client:
         result = await _execute(client)
 
-    assert calls["order"] == ["inspect", "delete-agents", "pxe", "verify"]
+    assert calls["order"] == ["inspect", "delete-agents", "segment", "pxe", "verify"]
     assert result.powered_off is False
     assert result.agents_removed == ["agent-1"]
     # Its MACs are still cleared from the PXE map: found by server-scan's.
@@ -320,11 +359,15 @@ class TestThePxeMapIsCleared:
             result = await _execute(client)
 
         assert calls["order"] == [
-            "inspect", "power-off", "teardown", "delete-agents", "pxe", "verify",
+            "inspect", "power-off", "teardown", "delete-agents", "segment", "pxe", "verify",
         ]
-        # Every MAC the host is known by, conditional on THIS MCE.
+        # Every MAC the host is known by, conditional on THIS MCE, and only on
+        # the MCE's own site's VM — the one install-server mapped it on.
+        assert calls["get_inventory_segment"] == [MCE]
         assert calls["remove_host_pxe_entries"] == [
-            PxeHostEntriesRef(server_name=SERVER, mce_cluster=MCE, macs=WITH_MACS.macs)
+            PxeHostEntriesRef(
+                server_name=SERVER, mce_cluster=MCE, macs=WITH_MACS.macs, site="bat-yam"
+            )
         ]
         assert result.pxe_cleared == [
             "bat-yam/0025b5000001", "bat-yam/0025b5000002", "bat-yam/0025b5000009",
@@ -363,14 +406,49 @@ class TestThePxeMapIsCleared:
             await _execute(client)
         assert calls["remove_host_pxe_entries"][0].macs == ["00:25:b5:00:00:07"]
 
-    async def test_a_rejected_pxe_token_fails_the_run_once(self):
+    async def test_a_rejected_pxe_token_is_reported_and_the_removal_completes(self):
+        # Best effort: the host is already off the MCE by now.
         calls, acts = make_mocks(state=WITH_MACS, pxe_error=PxeMapAuthError("check PXE_MAP_TOKEN"))
         async with _Harness(acts) as client:
-            with pytest.raises(WorkflowFailureError) as excinfo:
-                await _execute(client)
+            result = await _execute(client)
 
-        assert _error(excinfo.value).type == "PxeMapAuthError"
+        assert result.found and result.agents_removed == ["agent-1"]
+        assert result.pxe_failed == ["bat-yam: PxeMapAuthError: check PXE_MAP_TOKEN"]
+        assert result.pxe_cleared == []
+        # Once — non-retryable — and the final check still ran.
         assert len(calls["remove_host_pxe_entries"]) == 1
+        assert calls["order"][-1] == "verify"
+
+    async def test_an_unreachable_pxe_vm_is_given_up_on_after_the_deadline(self):
+        calls, acts = make_mocks(state=WITH_MACS, pxe_error=PxeMapError("connection refused"))
+        async with _Harness(acts) as client:
+            result = await _execute(client)
+
+        assert len(result.pxe_failed) == 1 and result.pxe_failed[0].startswith("bat-yam: ")
+        # Retried (transient) - but bounded, not forever.
+        assert len(calls["remove_host_pxe_entries"]) > 1
+        assert calls["order"][-1] == "verify"
+
+    async def test_no_inventory_segment_skips_the_cleanup_and_says_why(self):
+        calls, acts = make_mocks(
+            state=WITH_MACS, segment_error=InventorySegmentNotFoundError("no INVENTORY segment")
+        )
+        async with _Harness(acts) as client:
+            result = await _execute(client)
+
+        assert calls["remove_host_pxe_entries"] == []
+        assert "InventorySegmentNotFoundError" in result.pxe_failed[0]
+        assert len(calls["get_inventory_segment"]) == 1
+
+    async def test_a_segment_of_another_cluster_is_not_used(self):
+        calls, acts = make_mocks(
+            state=WITH_MACS, segment=SEGMENT.model_copy(update={"cluster_name": "ocp4-mce-other"})
+        )
+        async with _Harness(acts) as client:
+            result = await _execute(client)
+
+        assert calls["remove_host_pxe_entries"] == []
+        assert "ocp4-mce-other" in result.pxe_failed[0]
 
 
 async def test_every_step_runs_on_the_target_mces_queue():

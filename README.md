@@ -356,17 +356,21 @@ sending `vlan_id` is a 422 rather than a silently ignored value.
 The single route keys on the pool (`install-server-<infraEnv>`), so it installs
 ONE server per InfraEnv at a time. `POST /workflows/server-lifecycle/install-server/bulk`
 with `{"infra_env", "mce_cluster", "count": N}` (optional `namespace`,
-`candidate_count`, `labels`; no `server_name`, no `vlan_id`) starts N runs in
-parallel, `install-server-<infraEnv>_1` … `_N`, and answers 202 with a per-slot
-report (`started` / `already_running` / `failed`). A slot still running is
-reported, not restarted, so a repeated request only refills finished slots.
+`candidate_count`, `labels`; no `server_name`, no `vlan_id`) starts N NEW runs
+in parallel. Runs are `install-server-<infraEnv>_<slot>`: the route walks the
+slots from `_1` up, steps over every slot whose run is still going
+(`already_running` in the report) and starts one in each free slot until N have
+started — so a second request while the first batch is still installing ADDS
+installs instead of colliding with it. A finished slot is free again (Temporal
+reuses a closed run's id). Answers 202 with a per-slot report (`started` /
+`already_running` / `failed`).
 
 Two runs cannot take one machine: each takes server-scan's install lock before
 writing anything, server-scan takes it by compare-and-set on the document
 revision and refuses a live lock to any other workflow id, and a run that
 loses the race skips that machine and tries its next candidate. Because every
-slot draws the same top of the pool at once, `candidate_count` defaults to
-`count + 2` (max 20); a slot that finds only locked machines fails with
+run on the pool draws the same top of it, `candidate_count` defaults to
+(slots still running) + `count` + 2 (max 20); a slot that finds only locked machines fails with
 `ServerReservedError` — the pool was smaller than `count`, or raise
 `candidate_count`.
 

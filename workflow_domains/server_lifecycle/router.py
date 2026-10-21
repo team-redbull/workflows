@@ -15,7 +15,6 @@ uninstall-server later is a new route, not a redesign.
 
 from __future__ import annotations
 
-import asyncio
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -164,6 +163,9 @@ async def start_install_server(
 # The most servers one bulk request installs at once — the candidate_count
 # ceiling, so every slot can still be given a spare candidate or more.
 _MAX_BULK_COUNT = 20
+# Slots a bulk request looks through for free ones: `_1` … `_100`. Far more
+# than can run at once on one pool; it only bounds the scan.
+_MAX_SLOTS = 100
 
 
 class BulkInstallServerRequest(BaseModel):
@@ -183,15 +185,23 @@ class BulkInstallServerRequest(BaseModel):
         min_length=1,
         description=f"Namespace of the InfraEnv on the MCE. Defaults to `{_DEFAULT_NAMESPACE}`.",
     )
-    count: int = Field(ge=1, le=_MAX_BULK_COUNT, description="How many servers to install.")
+    count: int = Field(
+        ge=1,
+        le=_MAX_BULK_COUNT,
+        description=(
+            "How many NEW installs to start. Slots whose run is still going are "
+            "skipped, so a second request while the first batch runs adds more."
+        ),
+    )
     candidate_count: int | None = Field(
         default=None,
         ge=1,
         le=20,
         description=(
-            "Candidates EACH run draws. Defaults to count + 2 (at most 20): all "
-            "runs draw the same top of the pool at once, and every machine "
-            "another run locks first is a skip, so each needs that many spares."
+            "Candidates EACH run draws. Defaults to (slots still running) + "
+            "count + 2, at most 20: every run on the pool - earlier ones "
+            "included - locks one machine from the same top of the list, and "
+            "each machine locked first is a skip, so each needs that many spares."
         ),
     )
     labels: dict[str, str] = Field(default_factory=dict)
@@ -213,6 +223,14 @@ class BulkInstallServerItem(BaseModel):
 
 
 class BulkStartInstallServerResponse(BaseModel):
+    """`started` new runs, after skipping `already_running` busy slots.
+
+    `results` lists every slot looked at, in order: the busy ones it stepped
+    over (`already_running`), the ones it started, and a `failed` start, if
+    any. `started` < `count` means not enough free slots were found, or a start
+    failed (the scan stops there rather than failing slot after slot).
+    """
+
     started: int
     already_running: int
     failed: int
@@ -228,30 +246,40 @@ async def start_install_server_bulk(
     bulk: BulkInstallServerRequest,
     client: Client = Depends(get_temporal_client),
 ) -> BulkStartInstallServerResponse:
-    """Install `count` servers from one InfraEnv's pool IN PARALLEL — one run per slot (202).
+    """Start `count` NEW installs from one InfraEnv's pool, in parallel — one run per slot (202).
 
-    Starts runs `install-server-<infraEnv>_1` … `_<count>`. They cannot take the
-    same machine: each takes server-scan's install lock (an atomic
-    compare-and-set there) before writing anything, and a machine another run
-    locked is a skip to its next candidate. Always 202 with a per-slot report;
-    a slot whose run is still going is `already_running`, so repeating a
-    request starts only the slots that have finished.
+    Runs are `install-server-<infraEnv>_<slot>`. The route walks the slots from
+    `_1` up, steps over every slot whose run is still going, and starts a run
+    in each free one until `count` have started — so a second request while
+    the first batch is still installing ADDS installs rather than colliding
+    with it. A slot whose run has finished is free again (Temporal reuses the
+    id of a closed run). Two requests at once cannot start one slot twice:
+    Temporal allows one running workflow per id, and the loser moves on.
 
-    Poll GET /workflows/runs/{workflow_id} per slot. A run that finds every
+    The runs cannot take the same machine: each takes server-scan's install
+    lock (an atomic compare-and-set there) before writing anything, and a
+    machine another run locked is a skip to its next candidate. Poll
+    GET /workflows/runs/{workflow_id} per slot. A run that finds every
     candidate locked by its siblings fails with ServerReservedError — raise
-    `candidate_count`, or the pool is smaller than `count`.
+    `candidate_count`, or the pool has fewer free servers than are installing.
     """
-    candidate_count = bulk.candidate_count or min(20, bulk.count + 2)
-    run_input = InstallServerInput(
-        infra_env=bulk.infra_env,
-        mce_cluster=bulk.mce_cluster,
-        namespace=bulk.namespace,
-        candidate_count=candidate_count,
-        labels=bulk.labels,
-    )
-
-    async def _start_one(slot: int) -> BulkInstallServerItem:
+    results: list[BulkInstallServerItem] = []
+    started = busy = 0
+    for slot in range(1, _MAX_SLOTS + 1):
+        if started == bulk.count:
+            break
         workflow_id = install_server_slot_workflow_id(bulk.infra_env, slot)
+        # Every run on the pool - the busy slots below this one and the ones
+        # this request has started - takes one machine from the same top of
+        # the list, so each new run needs that many spares, plus its own.
+        candidate_count = bulk.candidate_count or min(20, busy + bulk.count + 2)
+        run_input = InstallServerInput(
+            infra_env=bulk.infra_env,
+            mce_cluster=bulk.mce_cluster,
+            namespace=bulk.namespace,
+            candidate_count=candidate_count,
+            labels=bulk.labels,
+        )
         try:
             handle = await client.start_workflow(
                 InstallServerWorkflow.run,
@@ -260,21 +288,30 @@ async def start_install_server_bulk(
                 task_queue=INSTALL_SERVER_WORKFLOW_QUEUE,
             )
         except WorkflowAlreadyStartedError:
-            return BulkInstallServerItem(slot=slot, workflow_id=workflow_id, status="already_running")
-        except Exception as exc:  # noqa: BLE001 — one failed start must not sink the batch
-            return BulkInstallServerItem(
-                slot=slot, workflow_id=workflow_id, status="failed", error=str(exc)
+            busy += 1
+            results.append(
+                BulkInstallServerItem(slot=slot, workflow_id=workflow_id, status="already_running")
             )
-        return BulkInstallServerItem(
-            slot=slot,
-            workflow_id=handle.id,
-            status="started",
-            run_id=handle.result_run_id or "",
+            continue
+        except Exception as exc:  # noqa: BLE001 — reported, not raised
+            # Not a busy slot: Temporal itself refused. Every further slot would
+            # fail the same way, so stop and report what did start.
+            results.append(
+                BulkInstallServerItem(
+                    slot=slot, workflow_id=workflow_id, status="failed", error=str(exc)
+                )
+            )
+            break
+        started += 1
+        results.append(
+            BulkInstallServerItem(
+                slot=slot,
+                workflow_id=handle.id,
+                status="started",
+                run_id=handle.result_run_id or "",
+            )
         )
 
-    results = list(
-        await asyncio.gather(*(_start_one(slot) for slot in range(1, bulk.count + 1)))
-    )
     counts = {status: 0 for status in ("started", "already_running", "failed")}
     for item in results:
         counts[item.status] += 1

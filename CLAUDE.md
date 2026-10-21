@@ -688,11 +688,15 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   so the InfraEnv IS the server query. Its id keys on the CANDIDATE POOL — the InfraEnv alone, with
   no MCE in it — which makes installs drawing from one pool serial, and two MCEs filling an
   InfraEnv of the same name draw from the same pool. The install lock (§4) now guards the machine
-  itself, so PARALLEL draws exist: `POST .../install-server/bulk` (`count` 1-20) starts one run
-  per SLOT, id `install-server-<infraEnv>_<slot>` (`_` cannot occur in a Kubernetes name, so it
-  never equals another InfraEnv's single id), each drawing `candidate_count` = `count + 2` (max
-  20) by default because every slot draws the same top of the pool and loses lock races to its
-  siblings. Safe because server-scan's reserve is a compare-and-set on the document revision that
+  itself, so PARALLEL draws exist: `POST .../install-server/bulk` (`count` 1-20) starts `count`
+  NEW runs, one per SLOT, id `install-server-<infraEnv>_<slot>` (`_` cannot occur in a Kubernetes
+  name, so it never equals another InfraEnv's single id). It walks slots `_1`..`_100`, steps over
+  every slot whose run is still RUNNING (WorkflowAlreadyStartedError) and fills free ones, so a
+  second request during the first batch adds installs — it used to collide on `_1`..`_N`. A
+  closed slot is reused (Temporal's default ALLOW_DUPLICATE id reuse; `TestAFinishedSlotIsFreeAgain`).
+  A start Temporal refuses for any other reason stops the scan. Each run draws `candidate_count` =
+  (busy slots) + `count` + 2 (max 20) by default, because every run on the pool locks one
+  machine from the same top of the list. Safe because server-scan's reserve is a compare-and-set on the document revision that
   refuses a live lock to any other workflow id, and the run writes nothing before holding it —
   `TestParallelRunsOnOnePool` runs two at once. The test harness's mock lock must keep refusing
   another workflow id's live lock, or that test proves nothing.

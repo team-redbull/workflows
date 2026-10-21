@@ -111,24 +111,59 @@ class TestInstallServerBulk:
         client.post(self.PATH, json={**BODY, "count": 2, "candidate_count": 9})
         assert {a.input.candidate_count for a in fake.args} == {9}
 
-    def test_a_slot_still_running_is_reported_not_restarted(self, client, fake):
+    SLOT = "install-server-cisco-m6-bat-yam-64c-512gb_{}"
+
+    def _with_temporal(self, fake, *, running: set[str], fail_on: str | None = None):
+        """Make the fake behave as Temporal does: one RUNNING workflow per id."""
         from temporalio.exceptions import WorkflowAlreadyStartedError
 
-        running = {"install-server-cisco-m6-bat-yam-64c-512gb_2"}
         original = fake.start_workflow
 
         async def start_workflow(run, args, *, id: str, task_queue: str):
+            if id == fail_on:
+                raise RuntimeError("Temporal unavailable")
             if id in running:
                 raise WorkflowAlreadyStartedError(id, "InstallServerWorkflow")
+            running.add(id)
             return await original(run, args, id=id, task_queue=task_queue)
 
         fake.start_workflow = start_workflow
+        return running
+
+    def test_a_busy_slot_is_stepped_over_and_count_new_runs_still_start(self, client, fake):
+        self._with_temporal(fake, running={self.SLOT.format(2)})
         body = client.post(self.PATH, json={**BODY, "count": 3}).json()
 
-        assert (body["started"], body["already_running"]) == (2, 1)
-        assert [r["status"] for r in body["results"]] == [
-            "started", "already_running", "started",
+        assert (body["started"], body["already_running"]) == (3, 1)
+        assert [(r["slot"], r["status"]) for r in body["results"]] == [
+            (1, "started"), (2, "already_running"), (3, "started"), (4, "started"),
         ]
+
+    def test_a_second_request_while_the_first_batch_runs_adds_more(self, client, fake):
+        # The reported failure: the second request used to collide on _1.._N.
+        running = self._with_temporal(fake, running=set())
+        first = client.post(self.PATH, json={**BODY, "count": 3}).json()
+        second = client.post(self.PATH, json={**BODY, "count": 2}).json()
+
+        assert first["started"] == 3 and second["started"] == 2
+        assert [r["workflow_id"] for r in second["results"] if r["status"] == "started"] == [
+            self.SLOT.format(4), self.SLOT.format(5),
+        ]
+        assert len(running) == 5
+
+    def test_spares_count_the_runs_already_on_the_pool(self, client, fake):
+        self._with_temporal(fake, running={self.SLOT.format(n) for n in (1, 2, 3)})
+        client.post(self.PATH, json={**BODY, "count": 2})
+        # 3 busy + 2 new + 2 spare.
+        assert {a.input.candidate_count for a in fake.args} == {7}
+
+    def test_a_start_temporal_refuses_stops_the_scan_and_is_reported(self, client, fake):
+        self._with_temporal(fake, running=set(), fail_on=self.SLOT.format(2))
+        body = client.post(self.PATH, json={**BODY, "count": 3}).json()
+
+        assert (body["started"], body["failed"]) == (1, 1)
+        assert [r["status"] for r in body["results"]] == ["started", "failed"]
+        assert "Temporal unavailable" in body["results"][1]["error"]
 
     def test_the_mce_is_canonical(self, client, fake):
         client.post(self.PATH, json={**BODY, "mce_cluster": "prod-mce-bat-yam", "count": 1})

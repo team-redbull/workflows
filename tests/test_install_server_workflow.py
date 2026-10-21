@@ -1380,6 +1380,36 @@ class TestParallelRunsOnOnePool:
         assert sorted(created) == sorted(installed)
 
 
+class TestAFinishedSlotIsFreeAgain:
+    """install-server/bulk reuses a slot whose run has finished: Temporal must allow it."""
+
+    async def test_a_completed_slot_id_starts_a_new_run(self):
+        pool = [
+            bondable_server("srv_a", name="ocp-dell-a", mac_prefix="aa:aa:aa:aa:aa"),
+            bondable_server("srv_b", name="ocp-dell-b", mac_prefix="bb:bb:bb:bb:bb"),
+        ]
+        _, segment_acts, server_acts = make_mock_activities(candidates=pool)
+        slot = f"install-server-{INFRA_ENV}_1"
+        args = InstallServerRunArgs(input=INPUT.model_copy(update={"candidate_count": 2}))
+        async with _Harness(segment_acts, server_acts) as client:
+            first = await asyncio.wait_for(
+                client.execute_workflow(
+                    InstallServerWorkflow.run, args, id=slot, task_queue=INSTALL_SERVER_WORKFLOW_QUEUE
+                ),
+                timeout=60,
+            )
+            # Same id again, the first run COMPLETED: a new run, not a refusal.
+            second = await asyncio.wait_for(
+                client.execute_workflow(
+                    InstallServerWorkflow.run, args, id=slot, task_queue=INSTALL_SERVER_WORKFLOW_QUEUE
+                ),
+                timeout=60,
+            )
+
+        # And it installed the next machine: the first one now has a BMH.
+        assert (first.server_name, second.server_name) == ("ocp-dell-a", "ocp-dell-b")
+
+
 class TestTheInfraEnvBootEntry:
     """An IPMI blade boots its InfraEnv's boot entry, published only once the
     discovery image includes the blade's own NMStateConfig.

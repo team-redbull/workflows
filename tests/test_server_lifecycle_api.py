@@ -363,6 +363,12 @@ class TestInstallServerByName:
 
         assert response.status_code == 422
         assert not fake.args
+        # ONE error saying what is wrong — not one per shape (string, list)
+        # the value failed to be, which put "Input should be a valid string"
+        # in front of a list's real complaint.
+        errors = response.json()["detail"]
+        assert len(errors) == 1
+        assert "valid string" not in errors[0]["msg"]
 
 
 class TestRemoveServer:

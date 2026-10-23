@@ -199,6 +199,28 @@ class InstallServerRequest(BaseModel):
         Segments Manager and builds the queue only that MCE's worker polls."""
         return canonical_mce_cluster(value)
 
+    @field_validator("server_names", mode="before")
+    @classmethod
+    def _one_name_or_a_list(cls, value: Any) -> Any:
+        # Checked BEFORE the str-or-list union, so a bad value gets ONE error
+        # saying what is wrong, not one per shape it failed to be ("Input
+        # should be a valid string" next to the list's real complaint).
+        if value is None:
+            return value
+        names = [value] if isinstance(value, str) else value
+        if not isinstance(names, list) or not all(isinstance(name, str) for name in names):
+            raise ValueError("`server_names` takes one server name or a list of them")
+        if not names:
+            raise ValueError("`server_names` lists no server; omit it to let the pool pick")
+        if len(names) > _MAX_INSTALLS_PER_REQUEST:
+            raise ValueError(
+                f"`server_names` lists {len(names)} servers; at most "
+                f"{_MAX_INSTALLS_PER_REQUEST} per request"
+            )
+        if not all(names):
+            raise ValueError("a server name cannot be empty")
+        return value
+
     @field_validator("server_names")
     @classmethod
     def _each_server_once(cls, names: str | list[str] | None) -> str | list[str] | None:

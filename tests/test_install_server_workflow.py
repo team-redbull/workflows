@@ -1343,7 +1343,7 @@ class TestThePxeBootOfAnIpmiServer:
 
 
 class TestParallelRunsOnOnePool:
-    """install-server/bulk's premise: N runs drawing one pool AT ONCE land on N machines.
+    """install-server `count`'s premise: N runs drawing one pool AT ONCE land on N machines.
 
     Both runs share one mock server-scan, whose lock behaves as the real one
     (reservation_service.py there): a live lock is refused to any other
@@ -1381,7 +1381,7 @@ class TestParallelRunsOnOnePool:
 
 
 class TestAFinishedSlotIsFreeAgain:
-    """install-server/bulk reuses a slot whose run has finished: Temporal must allow it."""
+    """install-server `count` reuses a slot whose run has finished: Temporal must allow it."""
 
     async def test_a_completed_slot_id_starts_a_new_run(self):
         pool = [

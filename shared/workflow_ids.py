@@ -73,11 +73,14 @@ def install_server_workflow_id(infra_env: str, server_name: str | None = None) -
     (ADR-0035 there), which covers what this id never could: a run for ANOTHER
     MCE drawing a server already installed elsewhere, invisible to its own
     BareMetalHost probe. With the lock, a pool CAN be drawn from in parallel —
-    install-server/bulk does it, with install_server_slot_workflow_id below —
-    so this id now only keeps the single route at one run per pool.
+    install-server with `count` does it, with install_server_slot_workflow_id
+    below — so this id now only keeps a request WITHOUT `count` at one run per
+    pool, which is what stops a retried POST installing a second server.
 
     An explicitly named server draws from a pool of one, so it gets its own id
     and does not serialize against pattern draws for the same InfraEnv.
+    install-server builds it for every name in `server_names`, one or a list,
+    so one machine is one run however it is asked for.
 
     That name is LOWERCASED, which is not cosmetic: server-scan names carry an
     uppercase vendor serial, the run lowercases it to build the resource names,
@@ -93,7 +96,7 @@ def install_server_workflow_id(infra_env: str, server_name: str | None = None) -
 
 
 def install_server_slot_workflow_id(infra_env: str, slot: int) -> str:
-    """`install-server-<infraEnv>_<slot>`: one of N PARALLEL pool draws (install-server/bulk).
+    """`install-server-<infraEnv>_<slot>`: one of N PARALLEL pool draws (install-server + `count`).
 
     The id above serializes a pool to one run, which was the defence against two
     runs drawing one machine before the install lock existed. The lock is that

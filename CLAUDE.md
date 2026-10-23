@@ -685,10 +685,12 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   `POST /workflows/server-lifecycle/install-server` is ASYNC (202 + workflow id) and takes the
   InfraEnv to fill plus its MCE cluster; the InfraEnv's name states which hardware it is for
   (`cisco-m6-bat-yam-64c-512gb`) and server names carry the same tokens behind an `ocp-` prefix,
-  so the InfraEnv IS the server query. Its id keys on the CANDIDATE POOL — the InfraEnv alone, with
-  no MCE in it — which makes installs drawing from one pool serial, and two MCEs filling an
-  InfraEnv of the same name draw from the same pool. The install lock (§4) now guards the machine
-  itself, so PARALLEL draws exist: `POST .../install-server/bulk` (`count` 1-20) starts `count`
+  so the InfraEnv IS the server query. Without `count` its id keys on the CANDIDATE POOL — the
+  InfraEnv alone, with no MCE in it — so such requests on one pool are serial (the 409 on a
+  duplicate is what stops a retried POST installing twice), and two MCEs filling an InfraEnv of
+  the same name draw from the same pool. The install lock (§4) now guards the machine itself, so
+  PARALLEL draws exist: `count` (1-20, on the request ONLY — never in a run's input,
+  which is decoded from history) starts `count`
   NEW runs, one per SLOT, id `install-server-<infraEnv>_<slot>` (`_` cannot occur in a Kubernetes
   name, so it never equals another InfraEnv's single id). It walks slots `_1`..`_100`, steps over
   every slot whose run is still RUNNING (WorkflowAlreadyStartedError) and fills free ones, so a
@@ -700,6 +702,19 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   refuses a live lock to any other workflow id, and the run writes nothing before holding it —
   `TestParallelRunsOnOnePool` runs two at once. The test harness's mock lock must keep refusing
   another workflow id's live lock, or that test proves nothing.
+  ONE ROUTE, ONE RUN PER SERVER — never a batch workflow. Named machines are `server_names`: a
+  string is one run (`{workflow_id, run_id}`, 409 while it installs), a list (1-20, each once,
+  case-insensitively) one run per name with a per-run report, even for a list of one — the reply
+  follows the request's shape. Every named run is on `install-server-name-<server>`, so one machine
+  is one run however it is asked for. `count` and `candidate_count` size a POOL draw, so either
+  next to `server_names` is a 422, never silently ignored. `InstallServerRequest` is therefore its
+  OWN model, not an InstallServerInput subclass: one request is many runs, each built by
+  `run_input` with ONE `server_name`; `test_every_run_field_can_be_sent` keeps the two in step,
+  and the old `server_name` field is a 422 pointing at `server_names`. Decided with the operator
+  2026-10-23: `install-server/bulk` (the `count` draw from 2026-10-20) read as "a list of
+  servers", the parallel draw went unfound, and a caller asking twice for one InfraEnv met the
+  409 — so `/bulk` was REMOVED (404) and everything moved onto install-server. Retry-safety of a
+  `count` request was weighed and left out: its callers are humans, not controllers.
   `POST /workflows/segment-lifecycle/initialize-segment` is ASYNC (202 + workflow id) and takes
   the full segment definition; poll `GET /workflows/runs/{workflow_id}` for progress/result. The
   `/bulk` variant takes a list and starts ONE WORKFLOW PER SEGMENT (never one batch workflow — each

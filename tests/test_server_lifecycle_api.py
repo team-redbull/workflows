@@ -9,8 +9,10 @@ from __future__ import annotations
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from temporalio.exceptions import WorkflowAlreadyStartedError
 
 from shared.consts import INSTALL_SERVER_WORKFLOW_QUEUE
+from shared.models.server_lifecycle import InstallServerInput
 from workflow_domains.routers.deps import get_temporal_client
 from workflow_domains.server_lifecycle import router as router_module
 
@@ -82,99 +84,285 @@ def test_a_vlan_is_still_refused(client):
     assert client.post(PATH, json={**BODY, "vlan_id": 24}).status_code == 422
 
 
-class TestInstallServerBulk:
-    PATH = "/workflows/server-lifecycle/install-server/bulk"
+POOL_ID = "install-server-cisco-m6-bat-yam-64c-512gb"
+SLOT = POOL_ID + "_{}"
+NAMES = ["ocp-cisco-m6-bat-yam-64c-512gb-WZP1", "ocp-cisco-m6-bat-yam-64c-512gb-WZP2"]
+
+
+def _named_id(name: str) -> str:
+    return f"install-server-name-{name.lower()}"
+
+
+def _with_temporal(fake, *, running: set[str], fail_on: str | None = None) -> set[str]:
+    """Make the fake behave as Temporal does: one RUNNING workflow per id."""
+    original = fake.start_workflow
+
+    async def start_workflow(run, args, *, id: str, task_queue: str):
+        if id == fail_on:
+            raise RuntimeError("Temporal unavailable")
+        if id in running:
+            raise WorkflowAlreadyStartedError(id, "InstallServerWorkflow")
+        running.add(id)
+        return await original(run, args, id=id, task_queue=task_queue)
+
+    fake.start_workflow = start_workflow
+    return running
+
+
+def test_without_count_it_is_one_run_on_the_pool_id(client, fake):
+    response = client.post(PATH, json=BODY)
+
+    assert response.status_code == 202
+    assert response.json() == {"workflow_id": POOL_ID, "run_id": "run-1"}
+    # The pool picks the server; the run's own default number of candidates.
+    assert fake.args[0].input.server_name is None
+    assert fake.args[0].input.candidate_count == 3
+
+
+def test_an_explicit_candidate_count_is_the_run_s(client, fake):
+    client.post(PATH, json={**BODY, "candidate_count": 7})
+    assert fake.args[0].input.candidate_count == 7
+
+
+def test_a_second_single_install_while_one_runs_is_409_and_points_at_count(client, fake):
+    # The reported failure: asking again for the same InfraEnv answers 409.
+    # That stays (it is what stops a retried POST installing two servers), but
+    # it now says how to install several.
+    _with_temporal(fake, running={POOL_ID})
+    response = client.post(PATH, json=BODY)
+
+    assert response.status_code == 409
+    assert "`count`" in response.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [{}, {"count": 2}, {"server_names": NAMES[0]}, {"server_names": NAMES}],
+)
+def test_every_run_input_is_exactly_install_server_input(client, fake, extra):
+    # `count` and a list of names are how many runs the ROUTE starts; a run's
+    # input is decoded from history on every replay and must stay exactly
+    # InstallServerInput, one server per run.
+    assert client.post(PATH, json={**BODY, **extra}).status_code == 202
+    assert fake.args and all(type(a.input) is InstallServerInput for a in fake.args)
+
+
+def test_every_run_field_can_be_sent():
+    # The request is its own model, not a subclass of the run's input, so a
+    # field added to InstallServerInput must be added to it too.
+    # `server_name` is the one exception: the request takes `server_names`.
+    run_fields = set(InstallServerInput.model_fields) - {"server_name"}
+    assert run_fields <= set(router_module.InstallServerRequest.model_fields)
+
+
+def test_the_old_server_name_field_points_at_server_names(client, fake):
+    response = client.post(PATH, json={**BODY, "server_name": NAMES[0]})
+
+    assert response.status_code == 422
+    assert "`server_names`" in response.text
+    assert not fake.args
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"count": 2},
+        {"candidate_count": 5},
+        {"count": 2, "candidate_count": 5},
+    ],
+)
+@pytest.mark.parametrize("names", [NAMES[0], NAMES])
+def test_count_and_candidate_count_are_only_for_the_pool(client, fake, extra, names):
+    # Both size a draw from the pool; a named server is drawn alone.
+    response = client.post(PATH, json={**BODY, "server_names": names, **extra})
+
+    assert response.status_code == 422
+    assert "send one or the other" in response.text
+    assert not fake.args
+
+
+class TestInstallServerCount:
+    """install-server with `count`: N servers from ONE InfraEnv's pool, in parallel."""
 
     def test_count_runs_start_each_on_its_own_slot_id(self, client, fake):
-        response = client.post(self.PATH, json={**BODY, "count": 3})
+        response = client.post(PATH, json={**BODY, "count": 3})
 
         assert response.status_code == 202
         body = response.json()
         assert body["started"] == 3 and body["already_running"] == 0
-        assert [r["workflow_id"] for r in body["results"]] == [
-            "install-server-cisco-m6-bat-yam-64c-512gb_1",
-            "install-server-cisco-m6-bat-yam-64c-512gb_2",
-            "install-server-cisco-m6-bat-yam-64c-512gb_3",
+        assert [(r["slot"], r["workflow_id"]) for r in body["results"]] == [
+            (1, SLOT.format(1)), (2, SLOT.format(2)), (3, SLOT.format(3)),
         ]
-        # Pool draws, never a named server; inventory by default.
+        # Pool draws: the run picks the machine, so the report names none.
+        assert all(r["server_name"] is None for r in body["results"])
         assert all(a.input.server_name is None for a in fake.args)
         assert all(a.input.namespace == "inventory" for a in fake.args)
 
+    def test_a_single_install_in_flight_does_not_block_count(self, client, fake):
+        # What the reporter needed: more servers while one install is running.
+        _with_temporal(fake, running={POOL_ID})
+        body = client.post(PATH, json={**BODY, "count": 2}).json()
+
+        assert body["started"] == 2
+        assert [r["workflow_id"] for r in body["results"]] == [SLOT.format(1), SLOT.format(2)]
+
     def test_each_run_draws_spares_for_the_races_it_will_lose(self, client, fake):
-        client.post(self.PATH, json={**BODY, "count": 4})
+        client.post(PATH, json={**BODY, "count": 4})
         assert {a.input.candidate_count for a in fake.args} == {6}
 
-    def test_the_spares_are_capped_and_an_explicit_count_wins(self, client, fake):
-        client.post(self.PATH, json={**BODY, "count": 20})
+    def test_the_spares_are_capped_and_an_explicit_candidate_count_wins(self, client, fake):
+        client.post(PATH, json={**BODY, "count": 20})
         assert {a.input.candidate_count for a in fake.args} == {20}
         fake.args.clear()
-        client.post(self.PATH, json={**BODY, "count": 2, "candidate_count": 9})
+        client.post(PATH, json={**BODY, "count": 2, "candidate_count": 9})
         assert {a.input.candidate_count for a in fake.args} == {9}
-
-    SLOT = "install-server-cisco-m6-bat-yam-64c-512gb_{}"
-
-    def _with_temporal(self, fake, *, running: set[str], fail_on: str | None = None):
-        """Make the fake behave as Temporal does: one RUNNING workflow per id."""
-        from temporalio.exceptions import WorkflowAlreadyStartedError
-
-        original = fake.start_workflow
-
-        async def start_workflow(run, args, *, id: str, task_queue: str):
-            if id == fail_on:
-                raise RuntimeError("Temporal unavailable")
-            if id in running:
-                raise WorkflowAlreadyStartedError(id, "InstallServerWorkflow")
-            running.add(id)
-            return await original(run, args, id=id, task_queue=task_queue)
-
-        fake.start_workflow = start_workflow
-        return running
+        fake.args.clear()
+        # An explicit value equal to the run's default is still the caller's.
+        client.post(PATH, json={**BODY, "count": 4, "candidate_count": 3})
+        assert {a.input.candidate_count for a in fake.args} == {3}
 
     def test_a_busy_slot_is_stepped_over_and_count_new_runs_still_start(self, client, fake):
-        self._with_temporal(fake, running={self.SLOT.format(2)})
-        body = client.post(self.PATH, json={**BODY, "count": 3}).json()
+        _with_temporal(fake, running={SLOT.format(2)})
+        body = client.post(PATH, json={**BODY, "count": 3}).json()
 
         assert (body["started"], body["already_running"]) == (3, 1)
         assert [(r["slot"], r["status"]) for r in body["results"]] == [
             (1, "started"), (2, "already_running"), (3, "started"), (4, "started"),
         ]
 
-    def test_a_second_request_while_the_first_batch_runs_adds_more(self, client, fake):
-        # The reported failure: the second request used to collide on _1.._N.
-        running = self._with_temporal(fake, running=set())
-        first = client.post(self.PATH, json={**BODY, "count": 3}).json()
-        second = client.post(self.PATH, json={**BODY, "count": 2}).json()
+    def test_a_second_batch_while_the_first_runs_adds_more(self, client, fake):
+        # A batch of 5, then another 5 while the first installs: ten runs on
+        # ten different ids. Which MACHINE each gets is the install lock's job.
+        running = _with_temporal(fake, running=set())
+        first = client.post(PATH, json={**BODY, "count": 5}).json()
+        second = client.post(PATH, json={**BODY, "count": 5}).json()
 
-        assert first["started"] == 3 and second["started"] == 2
+        assert first["started"] == 5 and second["started"] == 5
         assert [r["workflow_id"] for r in second["results"] if r["status"] == "started"] == [
-            self.SLOT.format(4), self.SLOT.format(5),
+            SLOT.format(n) for n in range(6, 11)
         ]
-        assert len(running) == 5
+        assert len(running) == 10
 
     def test_spares_count_the_runs_already_on_the_pool(self, client, fake):
-        self._with_temporal(fake, running={self.SLOT.format(n) for n in (1, 2, 3)})
-        client.post(self.PATH, json={**BODY, "count": 2})
+        _with_temporal(fake, running={SLOT.format(n) for n in (1, 2, 3)})
+        client.post(PATH, json={**BODY, "count": 2})
         # 3 busy + 2 new + 2 spare.
         assert {a.input.candidate_count for a in fake.args} == {7}
 
     def test_a_start_temporal_refuses_stops_the_scan_and_is_reported(self, client, fake):
-        self._with_temporal(fake, running=set(), fail_on=self.SLOT.format(2))
-        body = client.post(self.PATH, json={**BODY, "count": 3}).json()
+        _with_temporal(fake, running=set(), fail_on=SLOT.format(2))
+        body = client.post(PATH, json={**BODY, "count": 3}).json()
 
         assert (body["started"], body["failed"]) == (1, 1)
         assert [r["status"] for r in body["results"]] == ["started", "failed"]
         assert "Temporal unavailable" in body["results"][1]["error"]
 
     def test_the_mce_is_canonical(self, client, fake):
-        client.post(self.PATH, json={**BODY, "mce_cluster": "prod-mce-bat-yam", "count": 1})
+        client.post(PATH, json={**BODY, "mce_cluster": "prod-mce-bat-yam", "count": 1})
         assert fake.args[0].input.mce_cluster == "ocp4-prod-mce-bat-yam"
 
     @pytest.mark.parametrize(
         "extra",
-        [{"count": 0}, {"count": 21}, {"count": 2, "server_name": "ocp-x"}, {"count": 2, "vlan_id": 24}, {}],
+        [{"count": 0}, {"count": 21}, {"candidate_count": 0}, {"candidate_count": 21},
+         {"count": 2, "vlan_id": 24}],
     )
     def test_invalid_requests_are_422(self, client, extra):
-        assert client.post(self.PATH, json={**BODY, **extra}).status_code == 422
+        assert client.post(PATH, json={**BODY, **extra}).status_code == 422
+
+
+class TestInstallServerByName:
+    """install-server with `server_names`: SPECIFIC machines, one run per name."""
+
+    def test_one_name_is_one_run_on_its_named_id(self, client, fake):
+        response = client.post(PATH, json={**BODY, "server_names": NAMES[0]})
+
+        assert response.status_code == 202
+        assert response.json() == {"workflow_id": _named_id(NAMES[0]), "run_id": "run-1"}
+        assert fake.args[0].input.server_name == NAMES[0]
+
+    def test_one_name_already_installing_is_409(self, client, fake):
+        _with_temporal(fake, running={_named_id(NAMES[0])})
+        response = client.post(PATH, json={**BODY, "server_names": NAMES[0]})
+
+        assert response.status_code == 409
+        assert NAMES[0] in response.json()["detail"]
+
+    def test_a_list_starts_one_run_per_name(self, client, fake):
+        response = client.post(PATH, json={**BODY, "server_names": NAMES})
+
+        assert response.status_code == 202
+        body = response.json()
+        assert body["started"] == 2
+        assert [(r["server_name"], r["workflow_id"], r["slot"]) for r in body["results"]] == [
+            (name, _named_id(name), None) for name in NAMES
+        ]
+        assert sorted(a.input.server_name for a in fake.args) == NAMES
+        assert {a.input.infra_env for a in fake.args} == {BODY["infra_env"]}
+        assert {a.input.namespace for a in fake.args} == {"inventory"}
+
+    def test_a_list_of_one_is_still_a_report(self, client, fake):
+        # The reply follows what was sent: a list is always answered per run,
+        # so a caller iterating `results` never meets the single shape.
+        body = client.post(PATH, json={**BODY, "server_names": NAMES[:1]}).json()
+        assert body["started"] == 1 and len(body["results"]) == 1
+
+    def test_a_name_already_installing_is_reported_and_the_rest_start(self, client, fake):
+        _with_temporal(fake, running={_named_id(NAMES[0])})
+        body = client.post(PATH, json={**BODY, "server_names": NAMES}).json()
+
+        assert (body["started"], body["already_running"]) == (1, 1)
+        assert {r["server_name"]: r["status"] for r in body["results"]} == {
+            NAMES[0]: "already_running", NAMES[1]: "started",
+        }
+
+    def test_a_name_and_a_list_holding_it_are_one_run(self, client, fake):
+        # The same machine asked for twice is ONE run, never two.
+        _with_temporal(fake, running=set())
+        assert client.post(PATH, json={**BODY, "server_names": NAMES[0]}).status_code == 202
+        body = client.post(PATH, json={**BODY, "server_names": NAMES}).json()
+
+        assert [r["status"] for r in body["results"]] == ["already_running", "started"]
+
+    def test_named_runs_and_pool_runs_do_not_collide(self, client, fake):
+        # 5 from the pool, then 5 by name: ten runs on ten ids. The ids cannot
+        # tell whether a named machine is one a pool run already took — the
+        # install lock does, and the named run fails rather than install twice.
+        names = [f"ocp-cisco-m6-bat-yam-64c-512gb-WZP{n}" for n in range(1, 6)]
+        running = _with_temporal(fake, running=set())
+        pool = client.post(PATH, json={**BODY, "count": 5}).json()
+        named = client.post(PATH, json={**BODY, "server_names": names}).json()
+
+        assert pool["started"] == 5 and named["started"] == 5
+        assert len(running) == 10
+
+    def test_a_refused_start_does_not_stop_the_others(self, client, fake):
+        _with_temporal(fake, running=set(), fail_on=_named_id(NAMES[0]))
+        body = client.post(PATH, json={**BODY, "server_names": NAMES}).json()
+
+        assert (body["started"], body["failed"]) == (1, 1)
+        assert "Temporal unavailable" in body["results"][0]["error"]
+
+    def test_the_mce_is_canonical(self, client, fake):
+        client.post(PATH, json={**BODY, "server_names": NAMES, "mce_cluster": "prod-mce-bat-yam"})
+        assert {a.input.mce_cluster for a in fake.args} == {"ocp4-prod-mce-bat-yam"}
+
+    def test_a_name_listed_twice_is_refused(self, client, fake):
+        # Case-insensitively: the run id lowercases the name.
+        names = [NAMES[0], NAMES[0].lower()]
+        response = client.post(PATH, json={**BODY, "server_names": names})
+
+        assert response.status_code == 422
+        assert not fake.args
+
+    @pytest.mark.parametrize(
+        "server_names",
+        ["", [], [""], [f"ocp-x-{n}" for n in range(21)], 5, {"name": "ocp-x"}],
+    )
+    def test_invalid_names_are_422(self, client, fake, server_names):
+        response = client.post(PATH, json={**BODY, "server_names": server_names})
+
+        assert response.status_code == 422
+        assert not fake.args
 
 
 class TestRemoveServer:

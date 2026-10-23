@@ -183,7 +183,7 @@ would read the machine `AVAILABLE` again after the 24 h (server-scan's ceiling).
 
 **Known gap.** A crash
 mid-create leaves the BareMetalHost on the MCE while the lock expires after
-2 h; clean up by hand, or re-run with `server_name` set to that machine.
+2 h; clean up by hand, or re-run with `server_names` set to that machine.
 
 #### Phase by phase
 
@@ -313,15 +313,16 @@ A run whose MCE has no worker waits instead of acting; `GET
 /workflows/runs/{workflow_id}` reports `activity_queue`, which says which MCE
 to go and look at.
 
-**Two ways to trigger it.** `server_name` is optional, and leaving it out is the
-normal mode:
+**Two ways to pick the server.** `server_names` is optional, and leaving it out
+is the normal mode. Either way a run installs ONE server; several servers are
+several runs (next sections).
 
-| | `server_name` omitted — *"fill this InfraEnv"* | `server_name` given — *"install this machine"* |
+| | `server_names` omitted — *"fill this InfraEnv"* | `server_names` given — *"install this machine"* |
 | --- | --- | --- |
-| server-scan query | `?pattern=^ocp-<infraEnv>&count=<candidate_count>` | `?name=<server_name>&count=1` |
+| server-scan query | `?pattern=^ocp-<infraEnv>&count=<candidate_count>` | `?name=<server>&count=1` |
 | candidates drawn | `candidate_count` (default 3, 1–20) | one |
 | already has a BareMetalHost | **skipped**, next candidate tried | **converged** — that is the point |
-| workflow id | `install-server-<infraEnv>` | `install-server-name-<server_name>` |
+| workflow id | `install-server-<infraEnv>`, or `…_<slot>` with `count` | `install-server-name-<server>` |
 | use it for | routine capacity: take whatever is free and healthy | re-running a specific host, or repairing one |
 
 Both modes apply every other rule identically: `HEALTHY` only, at least two NIC
@@ -336,43 +337,87 @@ its provider and each interface's link state, and lists separately those skipped
 as already installed and those whose server-scan name cannot be a Kubernetes
 resource name — three different people's problem, so they are never merged.
 
-### Request body — `InstallServerInput`
+### Request body — `InstallServerRequest`
 
 | field | type | rules | what it is for |
 | --- | --- | --- | --- |
 | `infra_env` | str | non-empty | The InfraEnv to fill. Labels both resources, **and** is the server query (`^ocp-<infra_env>`). Must already exist, in `namespace`. |
 | `mce_cluster` | str | non-empty | Which MCE. Names the `INVENTORY` segment the VLAN comes from **and** the activity queue the cluster writes go to. |
 | `namespace` | str | non-empty | Where the three resources go. **Must be the InfraEnv's own namespace** — BMAC looks for the InfraEnv beside the BareMetalHost. |
-| `server_name` | str \| null | default `null` | Install one specific machine instead of drawing from the pool (see above). |
-| `candidate_count` | int | 1–20, default 3 | How many candidates to draw. Ignored when `server_name` is given. |
+| `server_names` | str \| list \| null | default `null`; a list is 1–20 names, each once | Install these machines instead of letting the pool pick (see above): one name, or a list — one run per name. |
+| `count` | int \| null | 1–20, default `null` | Let the pool pick this many and install them in parallel, one run each (see below). Not with `server_names`. |
+| `candidate_count` | int \| null | 1–20, default `null` | How many candidates each pool run draws: 3 if unset, or with `count` (runs on the pool) + `count` + 2, max 20. Not with `server_names`. |
 | `labels` | map | default `{}` | Extra labels for the BareMetalHost. Cannot override the InfraEnv label — that would split the host from its NMStateConfig. |
 
 There is deliberately **no `vlan_id`**: it belongs to the MCE's segment, and a
 supplied one could contradict it. The request body forbids unknown fields, so
-sending `vlan_id` is a 422 rather than a silently ignored value.
+sending `vlan_id` is a 422 rather than a silently ignored value. So is the old
+`server_name` field, with a message pointing at `server_names`.
 
-### `install-server/bulk` — several servers from one pool at once
+The request is not what a run is started with: each run gets an
+`InstallServerInput` for ONE server — `server_name` set from a name, or null
+for a pool draw — and never `count`. That model is decoded from Temporal
+history on every replay, so it keeps its shape.
 
-The single route keys on the pool (`install-server-<infraEnv>`), so it installs
-ONE server per InfraEnv at a time. `POST /workflows/server-lifecycle/install-server/bulk`
-with `{"infra_env", "mce_cluster", "count": N}` (optional `namespace`,
-`candidate_count`, `labels`; no `server_name`, no `vlan_id`) starts N NEW runs
-in parallel. Runs are `install-server-<infraEnv>_<slot>`: the route walks the
-slots from `_1` up, steps over every slot whose run is still going
-(`already_running` in the report) and starts one in each free slot until N have
-started — so a second request while the first batch is still installing ADDS
-installs instead of colliding with it. A finished slot is free again (Temporal
-reuses a closed run's id). Answers 202 with a per-slot report (`started` /
-`already_running` / `failed`).
+### Several servers at once — `count`, or a list of `server_names`
 
-Two runs cannot take one machine: each takes server-scan's install lock before
-writing anything, server-scan takes it by compare-and-set on the document
-revision and refuses a live lock to any other workflow id, and a run that
-loses the race skips that machine and tries its next candidate. Because every
-run on the pool draws the same top of it, `candidate_count` defaults to
-(slots still running) + `count` + 2 (max 20); a slot that finds only locked machines fails with
-`ServerReservedError` — the pool was smaller than `count`, or raise
-`candidate_count`.
+Every server is its own workflow run, with its own id, status and failure —
+never one run for a batch. What the body says decides how many, and the reply
+follows what was sent:
+
+| body | runs | reply |
+| --- | --- | --- |
+| neither | 1, the pool picks | `{workflow_id, run_id}`; 409 while one runs |
+| `"count": N` | N, the pool picks, in parallel | per-run report |
+| `"server_names": "ocp-…"` | 1, that machine | `{workflow_id, run_id}`; 409 while it installs |
+| `"server_names": ["ocp-…", …]` | 1 per name, in parallel | per-run report (even for a list of one) |
+
+The per-run report is 202 with `started` / `already_running` / `failed` and one
+`results` item per run (`workflow_id`, `status`, `run_id`, plus `slot` for a
+pool run or `server_name` for a named one). `count` and `candidate_count` size a
+draw from the pool, so either one with `server_names` is a 422.
+
+**From the pool: `count`.** Without it, install-server is ONE install keyed on
+the pool (`install-server-<infraEnv>`), so a second request while it runs is a
+409 — which is what keeps a double-click or a retried POST from installing two
+servers. With `count: N` it starts N NEW runs in parallel instead, as
+`install-server-<infraEnv>_<slot>`: the route walks the slots from `_1` up,
+steps over every slot whose run is still going and starts one in each free slot
+until N have started — so a second batch of 5 while the first 5 still install
+takes `_6`–`_10` instead of colliding. A finished slot is free again (Temporal
+reuses a closed run's id).
+
+**By name: a list of `server_names`.** One run per name, on the same id a single
+named install uses (`install-server-name-<server>`), so a machine is one run
+however it was asked for: a name already installing reports `already_running`
+rather than being installed twice. One refused start does not stop the others.
+
+**No two runs take one machine**, however they were asked for — two batches,
+or 5 from the pool and then 5 by name. Each run takes server-scan's install
+lock before writing anything; server-scan takes it by compare-and-set on the
+document revision, refuses a live lock to any other workflow id, and stops
+listing a locked machine. A pool run that loses the race skips that machine and
+tries its next candidate. Because every run on the pool draws the same top of
+it, `candidate_count` defaults to (slots still running) + `count` + 2 (max 20);
+a pool run that finds only locked machines fails with `ServerReservedError` —
+the pool was smaller than the installs asked for, or raise `candidate_count`.
+A named machine another run took first fails its own run instead.
+
+**Why one route.** Decided with the operator 2026-10-23. Someone asked for a
+second healthy server from one InfraEnv and got the 409. The parallel draw
+existed as `install-server/bulk` with `count`, but "bulk" reads as a list of
+named servers, and nobody found it. With one route, the body is the only thing
+to learn.
+
+- **One workflow per server.** Each has its own id, status and failure, and
+  Temporal refuses a second run for the same machine.
+- **The single-install 409 stays.** It makes a double-click harmless.
+- **`count` and `candidate_count` next to names are refused, not ignored.**
+
+`install-server/bulk` is gone (404). A `count` request starts N more each time,
+so it is not retry-safe. That was accepted because its callers are people, not
+controllers. The options weighed and the collision cases are in
+[`docs/design/install-server-api.md`](docs/design/install-server-api.md).
 
 ### `publish-infraenv-boot` — an InfraEnv's current iPXE script onto its PXE VM
 
@@ -511,8 +556,7 @@ result.
 | `POST /workflows/segment-lifecycle/initialize-segment/bulk` | one workflow PER segment |
 | `POST /workflows/segment-lifecycle/allocate-segment` | one allocation |
 | `POST /workflows/segment-lifecycle/release-segment` | one release (after the cluster's Application is gone) |
-| `POST /workflows/server-lifecycle/install-server` | one server into an InfraEnv |
-| `POST /workflows/server-lifecycle/install-server/bulk` | `count` servers from one InfraEnv's pool, in parallel (one run per slot) |
+| `POST /workflows/server-lifecycle/install-server` | one workflow PER server into an InfraEnv: one from its pool, `count` from its pool in parallel, or the machines in `server_names` |
 | `POST /workflows/server-lifecycle/remove-server` | one server out of an MCE's inventory |
 | `POST /workflows/server-lifecycle/publish-infraenv-boot` | an InfraEnv's current iPXE script onto its site's PXE VM |
 | `POST /workflows/server-provisioning/provision-dell-server` | one Dell server, by iDRAC IP |

@@ -5,8 +5,9 @@ an untyped dict.
 
 None of these models carries `extra="forbid"`: they are decoded from Temporal
 history on every replay, so a field removed later would wedge in-flight runs.
-Strictness about unknown fields belongs on an API-edge subclass in the router
-(InstallServerRequest), exactly as InitializeSegmentRequest does it.
+Strictness about unknown fields belongs on the API-edge request models in the
+router (RemoveServerRequest, InstallServerRequest), exactly as
+InitializeSegmentRequest does it.
 """
 
 from __future__ import annotations

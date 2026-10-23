@@ -15,10 +15,11 @@ uninstall-server later is a new route, not a redesign.
 
 from __future__ import annotations
 
-from typing import Literal
+import asyncio
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from temporalio.client import Client
 from temporalio.exceptions import WorkflowAlreadyStartedError
 
@@ -66,6 +67,23 @@ _MCE_CLUSTER_DESCRIPTION = (
 )
 
 
+# The most runs one request starts: `count` and a `server_names` list alike.
+_MAX_INSTALLS_PER_REQUEST = 20
+# InstallServerInput.candidate_count's ceiling, which caps the spares a
+# `count` request gives each run by default.
+_MAX_CANDIDATES = 20
+# Slots a `count` request looks through for free ones: `_1` … `_100`. Far more
+# than can run at once on one pool; it only bounds the scan.
+_MAX_SLOTS = 100
+
+_StartStatus = Literal["started", "already_running", "failed"]
+
+_ServerName = Annotated[str, Field(min_length=1)]
+_ServerNameList = Annotated[
+    list[_ServerName], Field(min_length=1, max_length=_MAX_INSTALLS_PER_REQUEST)
+]
+
+
 # Deterministic ids come from shared/workflow_ids.py — the ONE definition per
 # scheme, so the id this route builds and the id anything else builds for the
 # same target can never drift apart.
@@ -75,22 +93,51 @@ def _workflow_id(install_input: InstallServerInput) -> str:
     )
 
 
-class InstallServerRequest(InstallServerInput):
-    """The install-server request body: InstallServerInput, refusing unknown fields.
+async def _start(client: Client, run_input: InstallServerInput, workflow_id: str):
+    """Start one install-server run. The ways of asking differ only in which id
+    each run gets and how the outcome is reported, never in how a run starts."""
+    return await client.start_workflow(
+        InstallServerWorkflow.run,
+        InstallServerRunArgs(input=run_input),
+        id=workflow_id,
+        task_queue=INSTALL_SERVER_WORKFLOW_QUEUE,
+    )
 
-    Chiefly a `vlan_id`: the VLAN belongs to the target MCE's inventory segment
-    and is looked up in the Segments Manager, so a caller supplying one expects
-    it to be used. Ignoring it would tag the host with a different VLAN than
-    was asked for; refusing says so.
 
-    The strictness lives HERE, at the edge, not on InstallServerInput — that
-    model is decoded from Temporal history on every replay, and a forbidding
-    model would fail to decode a payload recorded before a field was removed
-    and wedge the run.
+def _count_statuses(results: list[Any]) -> dict[str, int]:
+    counts = {status: 0 for status in ("started", "already_running", "failed")}
+    for item in results:
+        counts[item.status] += 1
+    return counts
+
+
+class InstallServerRequest(BaseModel):
+    """The install-server request body: one shape for every way of asking.
+
+    Which servers: with none named, the InfraEnv's pool picks healthy ones
+    (one, or `count` of them); `server_names` names the machines instead, one
+    or a list. Either way every server is a run of its own (`run_input`).
+
+    Deliberately NOT InstallServerInput, nor a subclass of it: a request is no
+    longer one run. That model is decoded from Temporal history on every
+    replay, so it keeps its shape (`server_name` singular, no `count`) and the
+    strictness lives here, at the edge, instead — chiefly a `vlan_id` is
+    refused: the VLAN belongs to the MCE's inventory segment, so a caller
+    supplying one expects it to be used, and ignoring it would tag the host
+    with a different VLAN than was asked for.
     """
 
     model_config = ConfigDict(extra="forbid")
 
+    infra_env: str = Field(
+        min_length=1,
+        description=(
+            "The InfraEnv to fill. Its name states the hardware "
+            "(`cisco-m6-bat-yam-64c-512gb`), so it is also the pool: the healthy, "
+            "unclaimed servers server-scan lists as `ocp-<infra_env>…`."
+        ),
+    )
+    mce_cluster: str = Field(min_length=1, description=_MCE_CLUSTER_DESCRIPTION)
     # Defaulted HERE, at the edge: the run's input always carries the
     # namespace it was started with, so a later change of this default never
     # alters what a recorded run targets on replay.
@@ -102,7 +149,48 @@ class InstallServerRequest(InstallServerInput):
             f"Secret and NMStateConfig are created. Defaults to `{_DEFAULT_NAMESPACE}`."
         ),
     )
-    mce_cluster: str = Field(min_length=1, description=_MCE_CLUSTER_DESCRIPTION)
+    server_names: _ServerName | _ServerNameList | None = Field(
+        default=None,
+        description=(
+            "Install exactly these machines (server-scan names) instead of letting "
+            f"the pool pick: one name, or a list of up to {_MAX_INSTALLS_PER_REQUEST}, "
+            "each once. Each is its own run. Not with `count` or `candidate_count`."
+        ),
+    )
+    count: int | None = Field(
+        default=None,
+        ge=1,
+        le=_MAX_INSTALLS_PER_REQUEST,
+        description=(
+            "Let the pool pick this many healthy servers and install them IN "
+            "PARALLEL, one run each. Omit it for a single install, which a second "
+            "request gets a 409 for while it runs. With `count`, runs still going "
+            "are stepped over, so a second request adds this many more."
+        ),
+    )
+    candidate_count: int | None = Field(
+        default=None,
+        ge=1,
+        le=_MAX_CANDIDATES,
+        description=(
+            "How many healthy servers each pool run asks server-scan for, so it "
+            "has others to try when one is unusable or another run takes it. "
+            "Defaults to 3, or with `count` to one per run on the pool plus 2 "
+            f"(at most {_MAX_CANDIDATES})."
+        ),
+    )
+    labels: dict[str, str] = Field(
+        default_factory=dict, description="Extra labels for each BareMetalHost."
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _server_name_became_server_names(cls, data: Any) -> Any:
+        # The field was `server_name`, one machine. A caller still sending it
+        # is told what replaced it, not just "extra field".
+        if isinstance(data, dict) and "server_name" in data:
+            raise ValueError("`server_name` is now `server_names`, which takes one name or a list")
+        return data
 
     @field_validator("mce_cluster")
     @classmethod
@@ -111,200 +199,210 @@ class InstallServerRequest(InstallServerInput):
         Segments Manager and builds the queue only that MCE's worker polls."""
         return canonical_mce_cluster(value)
 
+    @field_validator("server_names")
+    @classmethod
+    def _each_server_once(cls, names: str | list[str] | None) -> str | list[str] | None:
+        # Case-insensitive, because the run id lowercases the name: `ocp-X` and
+        # `ocp-x` are one run, and the second would only report already_running.
+        if isinstance(names, list):
+            seen: set[str] = set()
+            for name in names:
+                if name.lower() in seen:
+                    raise ValueError(f"server {name} is listed more than once")
+                seen.add(name.lower())
+        return names
 
-@router.post(_INSTALL_SERVER_PATH, response_model=StartWorkflowResponse, status_code=202)
+    @model_validator(mode="after")
+    def _pool_options_need_the_pool(self) -> InstallServerRequest:
+        # Both size a draw from the pool. A named server is drawn alone, so
+        # either one next to `server_names` could only be ignored.
+        if self.server_names is not None:
+            sent = [
+                f"`{field}`"
+                for field in ("count", "candidate_count")
+                if getattr(self, field) is not None
+            ]
+            if sent:
+                verb = "apply" if len(sent) > 1 else "applies"
+                raise ValueError(
+                    f"{' and '.join(sent)} only {verb} when the pool picks the servers, "
+                    "and `server_names` installs exactly the machines named; send one "
+                    "or the other"
+                )
+        return self
+
+    def run_input(
+        self, *, server_name: str | None = None, candidate_count: int | None = None
+    ) -> InstallServerInput:
+        """The input ONE run is started with: one named server, or one pool draw."""
+        fields: dict[str, Any] = {
+            "infra_env": self.infra_env,
+            "mce_cluster": self.mce_cluster,
+            "namespace": self.namespace,
+            "server_name": server_name,
+            "labels": self.labels,
+        }
+        chosen = candidate_count if candidate_count is not None else self.candidate_count
+        if chosen is not None:  # unset, the run's own default applies
+            fields["candidate_count"] = chosen
+        return InstallServerInput(**fields)
+
+
+class InstallServerItem(BaseModel):
+    """One run of a multi-server request: its START only — the run has barely begun.
+
+    `server_name` for a named server; `slot` for a pool run, whose machine the
+    run itself picks (its progress and result name it).
+    """
+
+    workflow_id: str
+    status: _StartStatus
+    server_name: str | None = None
+    slot: int | None = None
+    run_id: str | None = None
+    error: str | None = None
+
+
+class InstallServerBatchResponse(BaseModel):
+    """The answer to `count` or a `server_names` list: one item per run.
+
+    Always 202 with a per-run report, never one pass/fail code: starting
+    several runs is partial by nature (some start, some are already running,
+    Temporal may refuse one), and one status code would hide which got a run.
+
+    For `count`, `results` lists every slot looked at, in order: the busy ones
+    stepped over, the ones started, and a `failed` start if any. `started` <
+    `count` means not enough free slots were found, or a start failed (the
+    scan stops there rather than failing slot after slot). For a list of
+    names, one item per name, in order; a refused name does not stop the rest.
+    """
+
+    started: int
+    already_running: int
+    failed: int
+    results: list[InstallServerItem]
+
+
+@router.post(
+    _INSTALL_SERVER_PATH,
+    response_model=StartWorkflowResponse | InstallServerBatchResponse,
+    status_code=202,
+)
 async def start_install_server(
-    install_input: InstallServerRequest,
+    install_request: InstallServerRequest,
     client: Client = Depends(get_temporal_client),
-) -> StartWorkflowResponse:
-    """Install one server into an InfraEnv — returns immediately (202).
+) -> StartWorkflowResponse | InstallServerBatchResponse:
+    """Install servers into an InfraEnv — returns immediately (202).
 
     The body names the INFRAENV to fill and the MCE cluster it belongs to. The
     InfraEnv's name states which hardware it is for
     (`cisco-m6-bat-yam-64c-512gb` — vendor, model, site, cores, memory), so it
-    also selects the server; pass `server_name` to install one specific machine
-    instead. The VLAN is not an input: it is read from the MCE's own inventory
-    segment in the Segments Manager.
+    also selects the servers: the healthy, unclaimed machines server-scan lists
+    under that name. The VLAN is not an input: it is read from the MCE's own
+    inventory segment in the Segments Manager.
 
-    Poll GET /workflows/runs/{workflow_id} for progress/result. No healthy
-    server matching the InfraEnv, no candidate with two link-up NICs on
-    distinct physical ports, or a BareMetalHost that never registers all
-    surface there as a FAILED run — not as a 4xx here.
+    EVERY SERVER IS ITS OWN WORKFLOW RUN, with its own id, status and failure;
+    there is never one run for a batch. The body decides how many:
 
-    Installs from one InfraEnv are SERIAL: the workflow id keys on the
-    candidate pool, so a second trigger while one is in flight gets a 409 here
-    — including one aimed at a different MCE, because both draw from the same
-    pool. That is deliberate: server-scan hands out candidates without
-    reserving them, so two concurrent runs could otherwise draw the same
-    machine.
+    - **Neither `count` nor `server_names`**: the pool picks ONE server,
+      answered with `{workflow_id, run_id}`. Its id is the pool's
+      (`install-server-<infraEnv>`), so a second such request while it runs is
+      a 409 — which keeps a double-click or a retried POST from installing two.
+    - **`count: N`**: the pool picks N, installed IN PARALLEL, one run per
+      slot (`install-server-<infraEnv>_<slot>`), answered with a per-run
+      report. Slots still running are stepped over, so a second request adds
+      N more rather than colliding.
+    - **`server_names: "<name>"`**: that one machine
+      (`install-server-name-<server>`), answered with `{workflow_id, run_id}`;
+      a 409 while it is already installing.
+    - **`server_names: [...]`**: each named machine in parallel, answered with
+      a per-run report — always, even for a list of one — in which a machine
+      already installing is `already_running`.
+
+    Runs cannot take the same machine, whichever way they were asked for: each
+    takes server-scan's install lock (an atomic compare-and-set there) before
+    writing anything, and server-scan stops listing a locked machine. A pool
+    run that loses the race skips to its next candidate, and one left with
+    none fails with ServerReservedError — raise `candidate_count`, or the pool
+    has fewer free servers than are being installed. A named machine another
+    run took first fails its own run.
+
+    Poll GET /workflows/runs/{workflow_id} (one per run) for progress/result.
+    No healthy server matching, no candidate with two link-up NICs on distinct
+    physical ports, or a BareMetalHost that never registers all surface there
+    as a FAILED run — not as a 4xx here.
     """
+    if install_request.count is not None:
+        return await _start_pool_installs(client, install_request, install_request.count)
+    if isinstance(install_request.server_names, list):
+        return await _start_named_installs(client, install_request, install_request.server_names)
+
+    # One run: the pool's, or the one named server's.
+    run_input = install_request.run_input(server_name=install_request.server_names)
     try:
-        handle = await client.start_workflow(
-            InstallServerWorkflow.run,
-            InstallServerRunArgs(input=install_input),
-            id=_workflow_id(install_input),
-            task_queue=INSTALL_SERVER_WORKFLOW_QUEUE,
-        )
+        handle = await _start(client, run_input, _workflow_id(run_input))
     except WorkflowAlreadyStartedError:
         raise HTTPException(
             status_code=409,
             detail=(
-                "An install-server run is already in flight for "
-                + (
-                    f"server {install_input.server_name}"
-                    if install_input.server_name
-                    else f"InfraEnv {install_input.infra_env}"
+                f"An install-server run is already in flight for server {run_input.server_name}"
+                if run_input.server_name
+                else (
+                    "An install-server run is already in flight for InfraEnv "
+                    f"{run_input.infra_env}. To install more servers from it in "
+                    f"parallel, send `count` (1-{_MAX_INSTALLS_PER_REQUEST})."
                 )
             ),
         )
     return StartWorkflowResponse(workflow_id=handle.id, run_id=handle.result_run_id or "")
 
 
-# The most servers one bulk request installs at once — the candidate_count
-# ceiling, so every slot can still be given a spare candidate or more.
-_MAX_BULK_COUNT = 20
-# Slots a bulk request looks through for free ones: `_1` … `_100`. Far more
-# than can run at once on one pool; it only bounds the scan.
-_MAX_SLOTS = 100
+async def _start_pool_installs(
+    client: Client, request: InstallServerRequest, count: int
+) -> InstallServerBatchResponse:
+    """`count` NEW runs from the InfraEnv's pool, each in the first free slot.
 
-
-class BulkInstallServerRequest(BaseModel):
-    """install-server/bulk: N servers from ONE InfraEnv's pool, in parallel.
-
-    No `server_name`: naming machines already parallelizes (one id per name);
-    this is for pool draws. Strict like InstallServerRequest — a `vlan_id`
-    is refused for the same reason.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    infra_env: str = Field(min_length=1)
-    mce_cluster: str = Field(min_length=1, description=_MCE_CLUSTER_DESCRIPTION)
-    namespace: str = Field(
-        default=_DEFAULT_NAMESPACE,
-        min_length=1,
-        description=f"Namespace of the InfraEnv on the MCE. Defaults to `{_DEFAULT_NAMESPACE}`.",
-    )
-    count: int = Field(
-        ge=1,
-        le=_MAX_BULK_COUNT,
-        description=(
-            "How many NEW installs to start. Slots whose run is still going are "
-            "skipped, so a second request while the first batch runs adds more."
-        ),
-    )
-    candidate_count: int | None = Field(
-        default=None,
-        ge=1,
-        le=20,
-        description=(
-            "Candidates EACH run draws. Defaults to (slots still running) + "
-            "count + 2, at most 20: every run on the pool - earlier ones "
-            "included - locks one machine from the same top of the list, and "
-            "each machine locked first is a skip, so each needs that many spares."
-        ),
-    )
-    labels: dict[str, str] = Field(default_factory=dict)
-
-    @field_validator("mce_cluster")
-    @classmethod
-    def _canonical_mce_cluster(cls, value: str) -> str:
-        return canonical_mce_cluster(value)
-
-
-class BulkInstallServerItem(BaseModel):
-    """Per-slot outcome of the FAN-OUT only; the run itself has barely begun."""
-
-    slot: int
-    workflow_id: str
-    status: Literal["started", "already_running", "failed"]
-    run_id: str | None = None
-    error: str | None = None
-
-
-class BulkStartInstallServerResponse(BaseModel):
-    """`started` new runs, after skipping `already_running` busy slots.
-
-    `results` lists every slot looked at, in order: the busy ones it stepped
-    over (`already_running`), the ones it started, and a `failed` start, if
-    any. `started` < `count` means not enough free slots were found, or a start
-    failed (the scan stops there rather than failing slot after slot).
-    """
-
-    started: int
-    already_running: int
-    failed: int
-    results: list[BulkInstallServerItem]
-
-
-@router.post(
-    f"{_INSTALL_SERVER_PATH}/bulk",
-    response_model=BulkStartInstallServerResponse,
-    status_code=202,
-)
-async def start_install_server_bulk(
-    bulk: BulkInstallServerRequest,
-    client: Client = Depends(get_temporal_client),
-) -> BulkStartInstallServerResponse:
-    """Start `count` NEW installs from one InfraEnv's pool, in parallel — one run per slot (202).
-
-    Runs are `install-server-<infraEnv>_<slot>`. The route walks the slots from
-    `_1` up, steps over every slot whose run is still going, and starts a run
-    in each free one until `count` have started — so a second request while
-    the first batch is still installing ADDS installs rather than colliding
-    with it. A slot whose run has finished is free again (Temporal reuses the
-    id of a closed run). Two requests at once cannot start one slot twice:
+    Walks the slots from `_1` up and steps over every one whose run is still
+    going. A slot whose run has finished is free again (Temporal reuses the id
+    of a closed run), and two requests at once cannot start one slot twice:
     Temporal allows one running workflow per id, and the loser moves on.
-
-    The runs cannot take the same machine: each takes server-scan's install
-    lock (an atomic compare-and-set there) before writing anything, and a
-    machine another run locked is a skip to its next candidate. Poll
-    GET /workflows/runs/{workflow_id} per slot. A run that finds every
-    candidate locked by its siblings fails with ServerReservedError — raise
-    `candidate_count`, or the pool has fewer free servers than are installing.
     """
-    results: list[BulkInstallServerItem] = []
+    results: list[InstallServerItem] = []
     started = busy = 0
     for slot in range(1, _MAX_SLOTS + 1):
-        if started == bulk.count:
+        if started == count:
             break
-        workflow_id = install_server_slot_workflow_id(bulk.infra_env, slot)
+        workflow_id = install_server_slot_workflow_id(request.infra_env, slot)
         # Every run on the pool - the busy slots below this one and the ones
         # this request has started - takes one machine from the same top of
         # the list, so each new run needs that many spares, plus its own.
-        candidate_count = bulk.candidate_count or min(20, busy + bulk.count + 2)
-        run_input = InstallServerInput(
-            infra_env=bulk.infra_env,
-            mce_cluster=bulk.mce_cluster,
-            namespace=bulk.namespace,
-            candidate_count=candidate_count,
-            labels=bulk.labels,
+        run_input = request.run_input(
+            candidate_count=(
+                request.candidate_count
+                if request.candidate_count is not None
+                else min(_MAX_CANDIDATES, busy + count + 2)
+            )
         )
         try:
-            handle = await client.start_workflow(
-                InstallServerWorkflow.run,
-                InstallServerRunArgs(input=run_input),
-                id=workflow_id,
-                task_queue=INSTALL_SERVER_WORKFLOW_QUEUE,
-            )
+            handle = await _start(client, run_input, workflow_id)
         except WorkflowAlreadyStartedError:
             busy += 1
             results.append(
-                BulkInstallServerItem(slot=slot, workflow_id=workflow_id, status="already_running")
+                InstallServerItem(slot=slot, workflow_id=workflow_id, status="already_running")
             )
             continue
         except Exception as exc:  # noqa: BLE001 — reported, not raised
             # Not a busy slot: Temporal itself refused. Every further slot would
             # fail the same way, so stop and report what did start.
             results.append(
-                BulkInstallServerItem(
+                InstallServerItem(
                     slot=slot, workflow_id=workflow_id, status="failed", error=str(exc)
                 )
             )
             break
         started += 1
         results.append(
-            BulkInstallServerItem(
+            InstallServerItem(
                 slot=slot,
                 workflow_id=handle.id,
                 status="started",
@@ -312,15 +410,37 @@ async def start_install_server_bulk(
             )
         )
 
-    counts = {status: 0 for status in ("started", "already_running", "failed")}
-    for item in results:
-        counts[item.status] += 1
-    return BulkStartInstallServerResponse(
-        started=counts["started"],
-        already_running=counts["already_running"],
-        failed=counts["failed"],
-        results=results,
-    )
+    return InstallServerBatchResponse(**_count_statuses(results), results=results)
+
+
+async def _start_named_installs(
+    client: Client, request: InstallServerRequest, server_names: list[str]
+) -> InstallServerBatchResponse:
+    """One run per named server, all started at once, on the same id a single
+    named install uses — so one machine is one run however it was asked for."""
+
+    async def _start_one(server_name: str) -> InstallServerItem:
+        run_input = request.run_input(server_name=server_name)
+        workflow_id = _workflow_id(run_input)
+        try:
+            handle = await _start(client, run_input, workflow_id)
+        except WorkflowAlreadyStartedError:
+            return InstallServerItem(
+                server_name=server_name, workflow_id=workflow_id, status="already_running"
+            )
+        except Exception as exc:  # noqa: BLE001 — one bad name must not sink the rest
+            return InstallServerItem(
+                server_name=server_name, workflow_id=workflow_id, status="failed", error=str(exc)
+            )
+        return InstallServerItem(
+            server_name=server_name,
+            workflow_id=handle.id,
+            status="started",
+            run_id=handle.result_run_id or "",
+        )
+
+    results = list(await asyncio.gather(*(_start_one(name) for name in server_names)))
+    return InstallServerBatchResponse(**_count_statuses(results), results=results)
 
 
 class RemoveServerRequest(RemoveServerInput):

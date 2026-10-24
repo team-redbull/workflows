@@ -363,10 +363,33 @@ def agent_state(agent: dict[str, Any]) -> str | None:
     return ((agent.get("status") or {}).get("debugInfo") or {}).get("state") or None
 
 
-def agent_binding_state(agent: dict[str, Any] | None) -> AgentBindingState:
-    """One Agent's binding as read now; found=False for None."""
+def labelled_agent_machine(agent: dict[str, Any] | None) -> str | None:
+    """`<namespace>/<name>` of the AgentMachine the provider's label on this Agent names.
+
+    The provider writes both when it takes an Agent (`updateFoundAgent`): the
+    `agentMachineRef` label carries the AgentMachine's NAME, the
+    `agentMachineRefNamespace` annotation its namespace — and removes both when
+    it releases it. None when unlabelled. A missing annotation reads as `-`,
+    the same on every read, so two reads of one Agent compare.
+    """
     if agent is None:
-        return AgentBindingState(found=False)
+        return None
+    metadata = _metadata(agent)
+    name = (metadata.get("labels") or {}).get(AGENT_MACHINE_REF_LABEL)
+    if not name:
+        return None
+    namespace = (metadata.get("annotations") or {}).get(AGENT_MACHINE_REF_NAMESPACE_ANNOTATION)
+    return f"{namespace or '-'}/{name}"
+
+
+def agent_binding_state(agent: dict[str, Any] | None) -> AgentBindingState:
+    """One Agent's binding as read now; found=False for None.
+
+    `agent_machine` is always passed, a None included, so the key is in the
+    payload and the workflow can tell this limb from one predating the field.
+    """
+    if agent is None:
+        return AgentBindingState(found=False, agent_machine=None)
     ref = (agent.get("spec") or {}).get("clusterDeploymentName") or {}
     labels = _metadata(agent).get("labels") or {}
     return AgentBindingState(
@@ -375,6 +398,7 @@ def agent_binding_state(agent: dict[str, Any] | None) -> AgentBindingState:
             f"{ref.get('namespace') or '-'}/{ref['name']}" if ref.get("name") else None
         ),
         agent_machine_label=bool(labels.get(AGENT_MACHINE_REF_LABEL)),
+        agent_machine=labelled_agent_machine(agent),
         state=agent_state(agent),
         approved=(agent.get("spec") or {}).get("approved"),
     )

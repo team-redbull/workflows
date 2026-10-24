@@ -708,11 +708,29 @@ class HostedNodeStillPresentError(OrchestratorError):
 
 
 class AgentBindingChangedError(OrchestratorError):
-    """The Agent is now bound to another cluster than the one being cleared. Deterministic.
+    """The Agent is now held by something this run must not release it from. Deterministic.
 
-    release_agent unbinds an Agent only from the ClusterDeployment of the hosted
-    cluster the run inspected; one bound elsewhere since is not this run's to
-    touch. Non-retryable: the binding will not change back by itself.
+    release_agent makes the Agent provider's unbind only where the provider
+    cannot. It refuses an Agent bound to another cluster than the one the run
+    inspected, and one whose `agentMachineRef` label names an AgentMachine a
+    live Machine still holds — the provider releases that one itself, and it
+    is typically the NodePool's replacement Machine having taken the same
+    server again. Non-retryable: neither changes back by itself.
+    """
+
+
+class AgentRetakenError(OrchestratorError):
+    """WORKFLOW-RAISED. Another AgentMachine took the Agent while the run was taking it out.
+
+    A NodePool's new AgentMachine takes ANY free Agent its selector matches
+    (cluster-api-provider-agent `findAgent`). Two ways that meets this run:
+    NodePool replicas are not uninstall-server's, so the NodePool replaces the
+    Machine the run deleted — with this server's own Agent once released, when
+    the InfraEnv has no other; and an inventory host's Agent is free from the
+    start, so any NodePool may take it between the inspection and the removal.
+    The run sees the Agent bound, or its `agentMachineRef` label naming an
+    AgentMachine it did not start from, changes nothing further and stops:
+    fighting the NodePool for the host would unbind a node being installed.
     """
 
 

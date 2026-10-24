@@ -59,9 +59,10 @@ Shape of the run (the `progress` query exposes the phase and the MCE's queue):
                                  drain would (20 min, NodeDrainTimeoutError).
                                  A NotReady one is not drained, as CAPI skips
                                  an unreachable Node.
-       deleting-machine          ensure the Machine is deleting: a no-op when
-                                 it already is (a scale-down, an earlier run)
-                                 or is gone.
+       deleting-machine          the run's own DELETE of the Machine — nothing
+                                 has to happen first; a no-op when it already
+                                 is deleting (an operator, an earlier run) or
+                                 is gone.
        awaiting-machine-deletion every 30 s, until the Machine is gone and the
                                  Agent is `known-unbound`: `draining` while
                                  the Agent is still bound (20 min from when
@@ -92,7 +93,14 @@ Shape of the run (the `progress` query exposes the phase and the MCE's queue):
                                  known-unbound, approved, BMH present and not
                                  in error (bounded 5 min) — what remove-server
                                  needs to take it.
-  6. holding-server      — the lock extended to 24 h BEFORE the child starts,
+       Every awaiting pass also stops (AgentRetakenError) when ANOTHER
+       AgentMachine holds the Agent: the NodePool replacing the deleted Machine
+       with this same server.
+     For an INVENTORY HOST, only verifying-agentmachine: inspected again,
+       fresh, by step 2's links — its Agent is free, so any NodePool may take
+       it. Bound or labelled = AgentRetakenError; any other AgentMachine,
+       Machine or control-plane link = ServerStillPresentError. Nothing written.
+  6. holding-server     — the lock extended to 24 h BEFORE the child starts,
                            so the hold covers the inventory half too.
   7. removing-from-inventory — remove-server, awaited; its result is embedded.
 
@@ -112,16 +120,17 @@ missing write only where its owner cannot, and verifies everything gone before
 the inventory half. Decided with the operator 2026-10-24. Runs recorded before
 that (`uninstall-server-hosted-leftovers` unpatched) keep the old flow.
 
-STANDALONE IS A REPLACE; A SCALE-DOWN IS A SHRINK. NodePool replicas are NOT
-this workflow's business, and that has a consequence an operator must know:
-run on its own, the Machine is deleted but the NodePool still wants the same
-number of nodes, so its MachineSet creates a replacement Machine and the Agent
-provider binds ANOTHER Agent from the InfraEnv — the hosted cluster ends with
-the same size, on a different server. Only a caller that lowered the replicas
-first — the future `scale-down-nodepool` workflow, which owns the NodePool's
-annotation and replicas and then triggers this run per server — shrinks the
-cluster; it reaches this run with the Machine already deleting, and step 4's
-delete is a no-op.
+IT REPLACES A NODE; IT NEVER SHRINKS THE CLUSTER. The run deletes the Machine
+itself — nothing has to happen first. NodePool replicas are NOT this
+workflow's business (who owns them is not decided, 2026-10-24), so the NodePool
+still wants the same number of nodes: its MachineSet creates a replacement
+Machine and the Agent provider binds ANOTHER free Agent the NodePool matches —
+the hosted cluster keeps its size, on a different server. The provider takes
+ANY free Agent (`findAgent`), this server's own once released; when it is the
+only one, the replacement takes it back, and the run stops with
+AgentRetakenError rather than release it again from a Machine the provider is
+installing. A Machine someone else already started deleting is waited on, and
+step 4's delete is a no-op.
 
 WHY THE LOCK, EVEN FOR AN UNINSTALL. Two server-scan jobs see this machine
 and neither sees the whole move: the hosted cluster's nodes job frees it the
@@ -165,6 +174,7 @@ with workflow.unsafe.imports_passed_through():
     )
     from shared.exceptions import (
         AgentBindingChangedError,
+        AgentRetakenError,
         AgentStillBoundError,
         AgentUnbindTimeoutError,
         AmbiguousServerNameError,
@@ -304,6 +314,9 @@ _RELEASED_HOLD = timedelta(hours=24)
 # new run clears what a broken HyperShift deletion left (see the module
 # docstring). Keep it until no run started before it can remain in history.
 _LEFTOVERS_PATCH = "uninstall-server-hosted-leftovers"
+# An inventory host is inspected again right before remove-server. Runs
+# recorded before it go straight to the hold.
+_INVENTORY_VERIFY_PATCH = "uninstall-server-inventory-verify"
 # The leftover flow can drain a lost Node AND wait out a Machine drain, and
 # verifies three things after the unbind instead of two.
 _LEFTOVERS_RESERVATION_TTL = (
@@ -334,6 +347,30 @@ def _machine_detail(machine: MachineState) -> str:
     conditions = "; ".join(machine.conditions) or "none reported"
     hooks = ", ".join(machine.pending_hooks) or "none"
     return f"deletion conditions: {conditions}. Pending delete hooks: {hooks}"
+
+
+def _started_from(agent: HostAgent) -> frozenset[str] | None:
+    """The AgentMachines the run found the Agent with — None when the limb could not say.
+
+    Both the one found behind it (label or agentRef) and the one its label
+    named, which may be long gone in a broken deletion: neither is a retake.
+    """
+    if "labelled_agent_machine" not in agent.model_fields_set:
+        return None
+    return frozenset(am for am in (agent.agent_machine, agent.labelled_agent_machine) if am)
+
+
+def _retaken_by(binding: AgentBindingState, started_from: frozenset[str] | None) -> str | None:
+    """The AgentMachine that took the Agent since the run started, if any.
+
+    Gated on the key's presence (CLAUDE.md §5): a payload from a limb
+    predating the field never reads as a retake, on replay or live.
+    """
+    if started_from is None or "agent_machine" not in binding.model_fields_set:
+        return None
+    if binding.agent_machine and binding.agent_machine not in started_from:
+        return binding.agent_machine
+    return None
 
 
 def _agent_problems(agent: AgentBindingState, bmh: BmhState) -> list[str]:
@@ -427,6 +464,25 @@ class UninstallServerWorkflow:
             )
             result.leftovers_at_start = self._leftovers(host, hosted_agent, nodes)
 
+            if request.keep_inventory and hosted_agent is None and not nodes:
+                # Already only inventory, and asked to stay there: nothing to
+                # write, so no lock either.
+                skipped.append(
+                    "hosted-cluster half: nothing links the host to a hosted cluster — no "
+                    "AgentMachine, no Machine, no binding into a control plane, and no Node"
+                )
+                skipped.append(self._kept_note(request, host))
+                result.kept_in_inventory = True
+                result.skipped = skipped
+                self._phase = "completed"
+                workflow.logger.info(
+                    "%s is already only inventory on MCE %s and keep_inventory was asked — "
+                    "nothing to do",
+                    request.server_name,
+                    request.mce_cluster,
+                )
+                return result
+
             self._phase = "reserving-server"
             await self._reserve(
                 request, membership, host, activity_queue, ttl=_LEFTOVERS_RESERVATION_TTL
@@ -441,6 +497,8 @@ class UninstallServerWorkflow:
                     "hosted-cluster half: nothing links the host to a hosted cluster — no "
                     "AgentMachine, no Machine, no binding into a control plane, and no Node"
                 )
+                if workflow.patched(_INVENTORY_VERIFY_PATCH):
+                    await self._verify_still_inventory(request, activity_queue)
             return await self._remove_and_finish(request, membership, host, result, skipped, activity_queue)
 
         # Step 3 — the lock, before anything is written.
@@ -462,6 +520,55 @@ class UninstallServerWorkflow:
 
         return await self._remove_and_finish(request, membership, host, result, skipped, activity_queue)
 
+    async def _verify_still_inventory(self, request: UninstallServerInput, task_queue: str) -> None:
+        """An inventory host, inspected again right before remove-server: nothing hosted links it.
+
+        The first inspection found no AgentMachine, Machine or binding into a
+        control plane. But a free Agent is exactly what any NodePool's new
+        AgentMachine takes, at any moment (cluster-api-provider-agent
+        `findAgent`), so the same links are derived again, fresh, before the
+        child powers the host off and deletes it. One found means the host is
+        a node again, or on its way to being one, and the run leaves it alone.
+        """
+        self._phase = "verifying-agentmachine"
+        fresh: BoundHostState = await self._call(
+            inspect_bound_host,
+            BmhRef(server_name=request.server_name, namespace=request.namespace),
+            task_queue,
+        )
+        taken = [a for a in fresh.agents if a.cluster_deployment or a.agent_machine_label]
+        if taken:
+            held = "; ".join(
+                f"Agent {a.name} is bound to {a.cluster_deployment or '(nothing yet)'}"
+                + (f", held by AgentMachine {a.agent_machine}" if a.agent_machine else "")
+                for a in taken
+            )
+            raise ApplicationError(
+                f"{request.server_name} was taken while the run was taking it out of the "
+                f"inventory of MCE {request.mce_cluster}: {held}. A free Agent is what a "
+                "NodePool's new Machine takes. Nothing on the MCE was changed — re-run to take "
+                "it out of that hosted cluster as well, or leave it to install",
+                type=AgentRetakenError.__name__,
+            )
+        links = [
+            f"AgentMachine {a.agent_machine} names Agent {a.name}"
+            for a in fresh.agents
+            if a.agent_machine
+        ]
+        links += [f"Machine {m} is linked to it" for m in fresh.machines_matched]
+        links += [
+            f"Agent {a.name} is linked into control plane {', '.join(a.hcp_namespaces)}"
+            for a in fresh.agents
+            if a.hcp_namespaces and not a.agent_machine
+        ]
+        if links:
+            raise ApplicationError(
+                f"{request.server_name} is no longer only inventory on MCE "
+                f"{request.mce_cluster}: " + "; ".join(links) + ". Nothing on the MCE was "
+                "changed — re-run: it takes the server out of the hosted cluster first",
+                type=ServerStillPresentError.__name__,
+            )
+
     async def _remove_and_finish(
         self,
         request: UninstallServerInput,
@@ -471,9 +578,27 @@ class UninstallServerWorkflow:
         skipped: list[str],
         activity_queue: str,
     ) -> UninstallServerResult:
-        # Step 5 — hold the machine through the inventory half and beyond.
+        # Step 5 — hold the machine through the inventory half and beyond. Kept
+        # in the inventory too: it stays in this InfraEnv, and server-scan may
+        # read it AVAILABLE until the MCE's agents job reports it.
         self._phase = "holding-server"
         result.reservation_expires_at = await self._hold(request, membership, host, activity_queue)
+
+        if request.keep_inventory:
+            skipped.append(self._kept_note(request, host))
+            result.kept_in_inventory = True
+            result.skipped = skipped
+            self._phase = "completed"
+            workflow.logger.info(
+                "Took %s out of hosted cluster %s and kept it in the inventory of MCE %s: "
+                "machine=%s node=%s",
+                request.server_name,
+                result.hosted_cluster,
+                request.mce_cluster,
+                result.machine,
+                result.node_name,
+            )
+            return result
 
         # Step 6 — the inventory half: remove-server, awaited.
         self._phase = "removing-from-inventory"
@@ -494,6 +619,15 @@ class UninstallServerWorkflow:
             result.remove_server.found,
         )
         return result
+
+    @staticmethod
+    def _kept_note(request: UninstallServerInput, host: BoundHostState) -> str:
+        where = f"InfraEnv {host.infra_env}" if host.infra_env else f"namespace {request.namespace}"
+        return (
+            f"removing-from-inventory: keep_inventory was asked — the server stays in {where} "
+            f"of MCE {request.mce_cluster}: its BareMetalHost, NMStateConfig, Agent and PXE "
+            "mapping are left as they are"
+        )
 
     # --- refusals --------------------------------------------------------------
 
@@ -1134,7 +1268,8 @@ class UninstallServerWorkflow:
             self._phase = "awaiting-machine-deletion"
             agent_ref = AgentNameRef(namespace=agent.namespace, name=agent.name)
             captured = await self._await_release(
-                request, machine_ref if live else None, agent_ref, cluster, result, task_queue
+                request, machine_ref if live else None, agent_ref, cluster, result, task_queue,
+                started_from=_started_from(agent),
             )
             self._sub_phase = None
             node_name = node_name or captured
@@ -1211,6 +1346,7 @@ class UninstallServerWorkflow:
         cluster: HostedClusterRef,
         result: UninstallServerResult,
         task_queue: str,
+        started_from: frozenset[str] | None = None,
     ) -> str | None:
         """_await_machine_gone, doing the Agent provider's writes when it can no longer make them.
 
@@ -1220,6 +1356,11 @@ class UninstallServerWorkflow:
         hook but its AgentMachine gone, the run releases the Agent, waits for
         the state the provider waits for, then removes the provider's hook.
         Same deadlines as _await_machine_gone.
+
+        It stops the moment another AgentMachine holds the Agent: the NodePool
+        replacing the deleted Machine with this same server. Releasing it then
+        would unbind a node the provider is installing, and the release checks
+        alone cannot tell — the replacement binds into the same control plane.
         """
         expected = _qualified(cluster.hcp_namespace, cluster.name)
         hosted_cluster = _qualified(cluster.namespace, cluster.name)
@@ -1235,6 +1376,19 @@ class UninstallServerWorkflow:
             agent = await self._call(get_agent_binding, agent_ref, task_queue)
             self._agent_state = agent.state
             node_name = machine.node_name or node_name
+            taken_by = _retaken_by(agent, started_from)
+            if taken_by is not None:
+                raise ApplicationError(
+                    f"AgentMachine {taken_by} took Agent {agent_ref.name} of "
+                    f"{request.server_name} again while the run was taking it out of hosted "
+                    f"cluster {hosted_cluster}: the NodePool replaced the deleted Machine, and "
+                    "this server was the free Agent its selector found — the InfraEnv has no "
+                    "other. Nothing further was changed, and the run does not fight the "
+                    "NodePool for the host. Free another Agent the NodePool matches (or lower "
+                    "its replicas), then re-run: it deletes the replacement Machine and the "
+                    "NodePool takes the other Agent",
+                    type=AgentRetakenError.__name__,
+                )
             released = not agent.cluster_deployment and not agent.agent_machine_label
             if not machine.found and agent.found and released and agent.state == _KNOWN_UNBOUND:
                 return node_name

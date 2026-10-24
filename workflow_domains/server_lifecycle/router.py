@@ -633,6 +633,16 @@ class UninstallServerRequest(BaseModel):
             f"InfraEnv's). Defaults to `{_DEFAULT_NAMESPACE}`."
         ),
     )
+    keep_inventory: bool = Field(
+        default=False,
+        description=(
+            "Keep the server in the MCE's inventory: take it out of its hosted cluster "
+            "and stop there. Its BareMetalHost, NMStateConfig, Agent and PXE mapping "
+            "stay, and the host is left powered on in discovery — a free Agent of the "
+            "InfraEnv. For a server already only in the inventory there is then nothing "
+            "to do. Default false: the server also leaves the MCE, through remove-server."
+        ),
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -659,7 +669,10 @@ class UninstallServerRequest(BaseModel):
     def run_input(self, server_name: str) -> UninstallServerInput:
         """The input ONE run is started with: one server."""
         return UninstallServerInput(
-            server_name=server_name, mce_cluster=self.mce_cluster, namespace=self.namespace
+            server_name=server_name,
+            mce_cluster=self.mce_cluster,
+            namespace=self.namespace,
+            keep_inventory=self.keep_inventory,
         )
 
 
@@ -703,11 +716,16 @@ async def start_uninstall_server(
     inventory, leaves the MCE through remove-server, run as the uninstall's
     child (`remove-server-<server>`).
 
-    **Standalone, this REPLACES the node, it does not shrink the cluster.**
-    NodePool replicas are not touched, so the MachineSet backfills a new
-    Machine from the InfraEnv's other Agents. To shrink, lower the NodePool's
-    replicas first (the future scale-down-nodepool workflow does both): the
-    Machine is then already deleting and this run only waits for it.
+    **Nothing has to be done first: the run deletes the node's Machine itself.**
+    NodePool replicas are never touched, so the NodePool backfills a new
+    Machine from another free Agent it matches — the node is REPLACED, the
+    cluster keeps its size. If this server is the only free Agent, the
+    replacement takes it back and the run stops (AgentRetakenError) without
+    writing anything more.
+
+    `keep_inventory: true` stops after the hosted cluster: no remove-server, so
+    the server stays in the MCE's inventory as a free Agent (on an inventory
+    host there is then nothing to do). Default false.
 
     The reply follows what was sent: one name is `{workflow_id, run_id}` on
     `uninstall-server-<server>` and a 409 while that server is uninstalling;

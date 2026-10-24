@@ -1022,6 +1022,7 @@ async def inspect_bound_host(ref: BmhRef) -> BoundHostState:
                 approved=binding.approved,
                 agent_machine=_qualified(agent_machine) if agent_machine else None,
                 agent_machine_label=binding.agent_machine_label,
+                labelled_agent_machine=binding.agent_machine,
                 hostname=hosted_resources.agent_hostname(agent),
                 hcp_namespaces=sorted(namespaces),
             )
@@ -1346,6 +1347,15 @@ async def release_agent(request: AgentReleaseRequest) -> AgentRelease:
     if not binding.cluster_deployment and not binding.agent_machine_label:
         activity.logger.info("Agent %s/%s is already released", ref.namespace, ref.name)
         return AgentRelease(found=True)
+    holder = await _agent_machine_holder(binding.agent_machine)
+    if holder is not None:
+        agent_machine, machine = holder
+        raise AgentBindingChangedError(
+            f"Agent {ref.namespace}/{ref.name} is held by AgentMachine {agent_machine} of "
+            f"Machine {machine} — a live Machine, so the Agent provider can release it itself "
+            "and the run does not. Typically the NodePool replaced the Machine this run "
+            "deleted and took this same server again. Nothing was changed"
+        )
     resource_version = (agent.get("metadata") or {}).get("resourceVersion")
     patched = await cluster_api.patch_custom_object(
         group=AGENT_GROUP,
@@ -1399,6 +1409,33 @@ async def release_machine_hook(ref: MachineRef) -> MachineHookRelease:
         "removed" if patched else "— the Machine went meanwhile",
     )
     return MachineHookRelease(found=patched, released=patched)
+
+
+async def _agent_machine_holder(labelled: str | None) -> tuple[str, str] | None:
+    """(AgentMachine, Machine) when the AgentMachine an Agent's label names still has a Machine.
+
+    Then the Agent provider can still act through it, so the run must not.
+    `labelled` is `<namespace>/<name>`, or `-/<name>` without the namespace
+    annotation — matched by name in every namespace then.
+    """
+    if not labelled:
+        return None
+    namespace, name = labelled.split("/", 1)
+    if namespace == "-":
+        candidates = [
+            am for am in await _list_agent_machines() if (am.get("metadata") or {}).get("name") == name
+        ]
+    else:
+        found = await _read_agent_machine(namespace, name)
+        candidates = [found] if found is not None else []
+    if not candidates:
+        return None
+    machines = await _list_machines()
+    for agent_machine in candidates:
+        machine = await _machine_holding(agent_machine, machines)
+        if machine is not None:
+            return _qualified(agent_machine), machine
+    return None
 
 
 async def _machine_holding(agent_machine: dict, machines: list[dict]) -> str | None:

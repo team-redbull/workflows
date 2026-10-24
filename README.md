@@ -464,19 +464,32 @@ state string:
   sub-phase). The result lists them in `leftovers_at_start` and `cleaned_up`.
   Decided with the operator 2026-10-24.
 - **An inventory host** — nothing links it to a hosted cluster; that half is
-  skipped (but a stale Node in the cluster server-scan names is deleted).
+  skipped (but a stale Node in the cluster server-scan names is deleted). Its
+  Agent is free, so any NodePool may take it at any moment: right before
+  remove-server the run inspects it again and stops, changing nothing, if an
+  AgentMachine, a Machine or a binding now links it (`AgentRetakenError` when a
+  NodePool took it, `ServerStillPresentError` otherwise).
 
 Either way it then runs **remove-server as an awaited child**
 (`remove-server-<server>`): power off, BareMetalHost, NMStateConfig, the Agent
 last, the PXE map of the MCE's own site. A server with nothing on the MCE ends
 there as a no-op (`found: false`). Every skipped step is named in `skipped`.
 
-> **Standalone this REPLACES the node; it does not shrink the cluster.**
-> NodePool replicas are not this workflow's business, so after the Machine
-> goes, the MachineSet backfills a new one from the InfraEnv's other Agents.
-> Lower the replicas first to shrink — the future `scale-down-nodepool`
-> workflow does that and then starts this run per server, which finds the
-> Machine already deleting.
+**`"keep_inventory": true`** (default `false`) stops after the hosted-cluster
+half and the day-long hold: no remove-server, so the server stays in the
+InfraEnv as a free Agent — powered on in discovery, its BareMetalHost,
+NMStateConfig, Agent and PXE mapping untouched (`kept_in_inventory: true`,
+`remove_server: null`). The console's *Remove from the cluster* without
+*Remove host*. On an inventory host there is nothing to do: the run completes
+after its reads, with no lock.
+
+> **Nothing has to be done first: the run deletes the node's Machine itself.**
+> NodePool replicas are never changed (who owns them is not decided), so the
+> NodePool backfills a new Machine from another free Agent it matches — the
+> node is REPLACED, the cluster keeps its size. If this server is the only
+> free Agent, the replacement takes it back: the run stops with
+> `AgentRetakenError` and writes nothing more. A Machine someone else already
+> started deleting is waited on, not deleted again.
 
 Before anything is written it **refuses** on a contradiction: a name
 server-scan does not know (`ServerNotInServerScanError`); server-scan saying
@@ -501,7 +514,9 @@ same id resumes: `MachineDrainTimeoutError` names the Machine's deletion
 conditions and pending delete hooks; `AgentUnbindTimeoutError` the Agent's
 state; `ServerStillPresentError` an AgentMachine or Machine still linked;
 `HostedNodeStillPresentError` a Node still Ready after the host left it (a
-NotReady one is deleted).
+NotReady one is deleted); `AgentRetakenError` the NodePool's replacement
+AgentMachine that took this same server back (free another Agent the NodePool
+matches, or lower its replicas, then re-run).
 
 The Node is read through the HostedCluster's admin kubeconfig
 (`status.kubeconfig`), with the server replaced by the control plane's

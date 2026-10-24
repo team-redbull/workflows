@@ -610,6 +610,18 @@ class TestTheLinks:
         assert state.provider_hook and state.at_pre_terminate_hook is at_hook
         assert state.agent_machine == f"{HCP}/am"
 
+    def test_the_agentmachine_an_agents_label_names(self):
+        assert hosted_resources.labelled_agent_machine(_agent(label_am="am-1")) == f"{HCP}/am-1"
+        assert hosted_resources.labelled_agent_machine(_agent(label_am="am-1", label_ns=None)) == "-/am-1"
+        assert hosted_resources.labelled_agent_machine(_agent()) is None
+        # The key is always sent, a None included: the workflow tells this limb
+        # from one predating the field by its presence.
+        for agent in (_agent(), None):
+            binding = hosted_resources.agent_binding_state(agent)
+            assert "agent_machine" in binding.model_fields_set and binding.agent_machine is None
+        bound = hosted_resources.agent_binding_state(_agent(label_am="am-1", bound="hc-01"))
+        assert bound.agent_machine == f"{HCP}/am-1"
+
     def test_the_release_is_the_providers_own_write(self):
         assert hosted_resources.agent_release_patch("42") == {
             "metadata": {
@@ -671,6 +683,8 @@ class TestInspectingLeftovers:
 
         [agent] = state.hosted_agents
         assert agent.agent_machine is None and agent.hcp_namespaces == [HCP]
+        # What the run started from, though that AgentMachine is gone: not a retake later.
+        assert agent.labelled_agent_machine == f"{HCP}/hc-01-np-am-x7k2p"
         assert state.machine == MachineRef(namespace=HCP, name="hc-01-np-x7k2p")
         assert state.machine_state.provider_hook and state.machine_state.agent_machine_found is False
         assert state.hosted_cluster.name == "hc-01"
@@ -741,6 +755,42 @@ class TestTheProvidersWrites:
     async def test_an_agent_bound_elsewhere_is_never_released(self, mce):
         fake = mce(_FakeMce(agents=[_agent(bound="hc-02")]))
         with pytest.raises(AgentBindingChangedError, match="hc-02"):
+            await activities.release_agent(
+                AgentReleaseRequest(agent=AGENT_REF, cluster_deployment=f"{HCP}/hc-01")
+            )
+        assert fake.patched == []
+
+    async def test_an_agent_a_live_machine_holds_is_never_released(self, mce):
+        """The NodePool's replacement took it again — same control plane, so only the holder tells."""
+        fake = mce(_FakeMce(
+            agents=[_agent(label_am="hc-01-np-am-q9z4d", bound="hc-01", state="binding")],
+            agent_machines=[_agent_machine("hc-01-np-am-q9z4d", machine="hc-01-np-q9z4d")],
+            machines={(HCP, "hc-01-np-q9z4d"): _machine("hc-01-np-q9z4d")},
+        ))
+        with pytest.raises(AgentBindingChangedError,
+                           match=f"AgentMachine {HCP}/hc-01-np-am-q9z4d of Machine {HCP}/hc-01-np-q9z4d"):
+            await activities.release_agent(
+                AgentReleaseRequest(agent=AGENT_REF, cluster_deployment=f"{HCP}/hc-01")
+            )
+        assert fake.patched == []
+
+    async def test_an_agent_whose_agentmachine_no_machine_holds_is_released(self, mce):
+        fake = mce(_FakeMce(
+            agents=[_agent(label_am="hc-01-np-am-x7k2p", bound="hc-01")],
+            agent_machines=[_agent_machine(machine=None)],
+        ))
+        release = await activities.release_agent(
+            AgentReleaseRequest(agent=AGENT_REF, cluster_deployment=f"{HCP}/hc-01")
+        )
+        assert release.released and len(fake.patched) == 1
+
+    async def test_without_the_namespace_annotation_the_holder_is_found_by_name(self, mce):
+        fake = mce(_FakeMce(
+            agents=[_agent(label_am="hc-01-np-am-q9z4d", label_ns=None, bound="hc-01")],
+            agent_machines=[_agent_machine("hc-01-np-am-q9z4d", machine="hc-01-np-q9z4d")],
+            machines={(HCP, "hc-01-np-q9z4d"): _machine("hc-01-np-q9z4d")},
+        ))
+        with pytest.raises(AgentBindingChangedError, match="a live Machine"):
             await activities.release_agent(
                 AgentReleaseRequest(agent=AGENT_REF, cluster_deployment=f"{HCP}/hc-01")
             )

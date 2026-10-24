@@ -320,7 +320,11 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   queue `uninstall-server-workflow`, id `uninstall-server-<server lowercased>`,
   API `POST /workflows/server-lifecycle/uninstall-server` — `server_names` ONLY,
   a string or a list of 1-20, each once case-insensitively, plus `mce_cluster`
-  canonicalised and `namespace` defaulting to `inventory`; NO `count`, NodePool or
+  canonicalised and `namespace` defaulting to `inventory`, and `keep_inventory`
+  (default false; the operator, 2026-10-24) which STOPS after the hosted half and
+  the day-long hold — no remove-server child, the server left in the InfraEnv as
+  a free Agent, `kept_in_inventory: true`; on an inventory host that is a no-op
+  with NO lock. Absent from recorded runs = false, so no patch gate. NO `count`, NodePool or
   HostedCluster field: server-scan and the Agent's binding say where it is. A
   string is `{workflow_id, run_id}` and a 409 while it runs, a list the per-run
   report install-server's named list uses (`ServerRunItem`); `UninstallServerRequest`
@@ -334,7 +338,12 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   `pre-terminate.delete.hook.machine.cluster.x-k8s.io/agentmachine` until the
   Agent is unbound), so without the agentRef match a re-run mid-unbinding would
   skip the hosted half instead of resuming it. Anything else is an INVENTORY HOST
-  and skips that half. EVERY path ends in remove-server as an AWAITED CHILD
+  and skips that half — but is INSPECTED AGAIN, fresh, right before remove-server
+  (`verifying-agentmachine`, gated `uninstall-server-inventory-verify`; the
+  operator, 2026-10-24: "should still verify no AgentMachine, Machine"): a free
+  Agent is what ANY NodePool's new AgentMachine takes, so one now bound or
+  labelled fails `AgentRetakenError`, any other AgentMachine / Machine /
+  control-plane link `ServerStillPresentError`, nothing on the MCE written. EVERY path ends in remove-server as an AWAITED CHILD
   (`remove_server_workflow_id`, `REMOVE_SERVER_WORKFLOW_QUEUE`, ABANDON on parent
   close) — the inventory half, PXE cleanup included, is never reimplemented here
   and remove-server's own route keeps working alone; `WorkflowAlreadyStartedError`
@@ -370,10 +379,16 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   covers the inventory half) → `removing-from-inventory`. Every skip goes into
   `result.skipped`. NOTHING IS UNDONE after the Machine delete — it cannot be —
   and a re-run of the same id RESUMES. NODEPOOL REPLICAS ARE NOT ITS BUSINESS:
-  standalone = REPLACE (the MachineSet backfills from the InfraEnv),
-  scale-down-driven = SHRINK — a future `scale-down-nodepool` owns the
-  annotation + replicas and triggers this run per server, which then finds the
-  Machine already deleting. THE LOCK even for an uninstall (holder
+  the run deletes the Machine ITSELF (no prerequisite) and the NodePool backfills
+  = REPLACE. Who owns `NodePool.spec.replicas` (a shrink) is NOT DECIDED — the
+  operator is taking it to the team (2026-10-24); never change them here. The
+  provider's `findAgent` takes ANY free Agent the NodePool matches, so with no
+  other free Agent the replacement takes THIS server back: every wait pass checks
+  the Agent's `agentMachineRef` label (+ namespace annotation) against the
+  AgentMachines the run started from (`HostAgent.labelled_agent_machine`,
+  `AgentBindingState.agent_machine`, both gated on key presence) and stops with
+  `AgentRetakenError`; `release_agent` refuses an Agent whose labelled
+  AgentMachine a live Machine holds (`AgentBindingChangedError`). THE LOCK even for an uninstall (holder
   `uninstall-server`, TTL = two drains + unbind + three verifications + 10 min): the
   hosted cluster's nodes job frees the server on its Node's absence and the MCE's
   agents job re-claims it INSTALLED_TO_INVENTORY on its own 15-min cadence, so

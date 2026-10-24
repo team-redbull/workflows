@@ -42,15 +42,19 @@
     <div class="eyebrow">Temporal workflow &middot; domain: server-lifecycle</div>
     <h1>uninstall-server<span class="dim"> &mdash; what actually happens</span></h1>
     <p class="lede">
-      One request takes <b>one server all the way out of an MCE</b>, whatever state its Agent is in. A
-      hosted cluster&rsquo;s node first leaves the <b>hosted cluster</b>: its CAPI <code>Machine</code> is
-      deleted, CAPI drains the Node, the Agent provider releases the Agent and the host reboots back into
-      discovery. Then &mdash; for every server, a node or not &mdash; it leaves the MCE&rsquo;s
-      <b>inventory</b> through <b>remove-server</b>, run as an awaited child.
+      One request takes <b>one named server all the way out of an MCE</b>, whatever state it is in
+      &mdash; what an operator otherwise does by hand from the console&rsquo;s host list: take the node out
+      of its hosted cluster, then <b>Remove host</b>.
     </p>
-    <p class="lede">The inventory half is never reimplemented here: remove-server&rsquo;s power-off,
-    BareMetalHost, NMStateConfig, Agent and PXE cleanup run exactly as they do on its own route, which
-    keeps working alone.</p>
+    <p class="lede">A <b>node of a hosted cluster</b>: the run <b>deletes its Machine itself</b> &mdash;
+    nothing has to be done first &mdash; then CAPI drains the Node, the Agent provider releases the Agent
+    and the host reboots into discovery. An <b>inventory host</b> (Agent <em>Available</em>) has no
+    hosted-cluster half. Then, for both, <b>remove-server</b> runs as an awaited child: power off, then
+    delete the NMStateConfig, the BareMetalHost with its BMC Secret, and the Agent.
+    <a href="#cases">Both cases, step by step</a>.</p>
+    <p class="lede">With <code>"keep_inventory": true</code> it stops after the hosted cluster: the
+    server stays in the MCE&rsquo;s inventory as a free Agent, as the console&rsquo;s <b>Remove from the
+    cluster</b> leaves it. <a href="#keep-inventory">How</a>.</p>
     <p class="lede">When a HyperShift deletion broke half-way &mdash; an AgentMachine with no Machine, a
     Machine with no AgentMachine, a Node with neither &mdash; it <b>finishes what the controllers could
     not</b>, and checks that every one of them is gone before the server leaves the MCE.
@@ -68,35 +72,99 @@
 
 <div class="wrap">
 
-  <!-- ========================================================== REPLACE -->
-  <section id="replace-or-shrink">
+  <!-- ============================================================ CASES -->
+  <section id="cases">
     <div class="sec-head">
-      <div class="eyebrow">Read this before you run it</div>
-      <h2>On its own it <em>replaces</em> a node &mdash; it does not shrink the cluster</h2>
-      <p class="lede"><b>NodePool replicas are not this workflow&rsquo;s business.</b> It deletes the
-      Machine behind the server and nothing else on the NodePool, so what happens next depends on who
-      lowered the replicas &mdash; or didn&rsquo;t.</p>
+      <div class="eyebrow">What happens to your server</div>
+      <h2>Two cases, end to end</h2>
+      <p class="lede">The run picks the path from what it finds on the MCE, never from a field in the
+      request. <b>Nothing has to be done to the server first</b> &mdash; no scale-down, no annotation, no
+      Machine already deleting.</p>
     </div>
 
     <div class="grid-2">
       <div class="panel">
-        <h3>Standalone = REPLACE</h3>
-        <p>Run on its own, the NodePool still wants the same number of nodes. Its MachineSet creates a
-        <b>new Machine</b> the moment the old one goes, and the Agent provider binds <b>another Agent from
-        the InfraEnv</b> to it. The hosted cluster ends the same size, on a different server; this one
-        leaves the MCE.</p>
-        <p class="note">Use it to swap a broken or reassigned machine out of a hosted cluster. If the
-        InfraEnv has no other free Agent, the new Machine waits for one &mdash; that is the NodePool&rsquo;s
-        problem, not this run&rsquo;s.</p>
+        <h3>A node running in a hosted cluster</h3>
+        <p class="note">Its Agent is bound to the hosted cluster, an AgentMachine and a Machine stand
+        behind it, and its Node is Ready.</p>
+        <ol>
+          <li><b>Reads</b> server-scan and the MCE, and finds the server&rsquo;s Node in the hosted
+            cluster. Nothing is written.</li>
+          <li><b>Locks</b> the server in server-scan.</li>
+          <li><b>Deletes the Machine</b> &mdash; <code>DELETE machines/&lt;machine&gt;</code> in the
+            control-plane namespace, the run&rsquo;s own write.</li>
+          <li><b>CAPI drains the Node</b>: cordon, then evictions that respect PodDisruptionBudgets
+            (20 min).</li>
+          <li><b>The Agent provider releases the Agent</b>, the host reboots into the discovery image, and
+            CAPI removes the Machine and the Node (1 h, until the Agent is <code>known-unbound</code>).</li>
+          <li><b>Verifies</b> that no Machine, AgentMachine or Node is left and that the Agent is
+            clean.</li>
+          <li><b>remove-server</b> &mdash; exactly as for an inventory host &rarr;</li>
+        </ol>
       </div>
       <div class="panel">
-        <h3>Driven by a scale-down = SHRINK</h3>
-        <p>A caller that <b>lowers the replicas first</b> shrinks the cluster. That is the job of the
-        future <code>scale-down-nodepool</code> workflow: it owns the NodePool&rsquo;s annotation and
-        replicas, then triggers uninstall-server once per server.</p>
-        <p class="note">Such a run finds the Machine <b>already deleting</b>, so its one write &mdash; the
-        Machine delete &mdash; is a no-op recorded in <code>skipped</code>, and it only waits for CAPI and
-        removes the host from the inventory.</p>
+        <h3>An inventory host &mdash; Agent <em>Available</em></h3>
+        <p class="note">A BareMetalHost, an NMStateConfig and an unbound Agent in the InfraEnv &mdash; the
+        host the console offers <b>Remove host</b> for.</p>
+        <ol>
+          <li><b>Reads</b> server-scan and the MCE: no AgentMachine names the Agent, no Machine is linked
+            to it (owner, infrastructureRef or providerID <code>agent://&lt;agent&gt;</code>), no binding.
+            So the hosted-cluster half is skipped and named in <code>skipped</code>.</li>
+          <li><b>Locks</b> the server in server-scan.</li>
+          <li><b>Checks again</b>, fresh, right before removing it: still no AgentMachine, no Machine,
+            no binding. An Available Agent is free for any NodePool to take at any moment; if one took
+            it, the run stops (<code>AgentRetakenError</code>) and touches nothing.</li>
+          <li><b>remove-server</b>, awaited:
+            <ol type="a">
+              <li><b>power off</b> &mdash; <code>spec.online: false</code> on the BareMetalHost, then wait
+                for <code>status.poweredOn: false</code> (10 min). A host left running discovery would
+                register a new Agent within a minute;</li>
+              <li><b>delete the NMStateConfig</b> <code>nmstate-config-&lt;server&gt;</code>;</li>
+              <li><b>delete the BareMetalHost</b> &mdash; marked <code>detached</code> first, so metal3
+                does not try to deprovision it through the BMC &mdash; and its <b>BMC Secret</b> if that
+                outlives the host;</li>
+              <li><b>delete the Agent</b>, last;</li>
+              <li><b>clear the host&rsquo;s MACs</b> from its site&rsquo;s PXE VM;</li>
+              <li><b>verify</b> that no BareMetalHost, NMStateConfig or Agent of it is left (5 min).</li>
+            </ol>
+          </li>
+        </ol>
+      </div>
+    </div>
+
+    <div class="panel" id="keep-inventory" style="margin-top:18px">
+      <h3><code>"keep_inventory": true</code> &mdash; out of the hosted cluster, still in the inventory</h3>
+      <p>Everything up to the end of the hosted-cluster half runs exactly as above &mdash; Machine deleted,
+      Agent released and back in discovery, Machine, AgentMachine and Node verified gone, the Agent verified
+      <code>known-unbound</code> and approved &mdash; and the lock is held for a day. Then the run
+      <b>stops</b>: no remove-server. The host stays <b>powered on in discovery</b>, a free Agent of the
+      InfraEnv; its BareMetalHost, NMStateConfig, Agent and PXE mapping are left as they are. The result
+      says <code>kept_in_inventory: true</code>, with <code>remove_server: null</code>.</p>
+      <p class="note">On a server that is already only inventory there is nothing to do: the run completes
+      after its reads, with no lock and nothing written. Being a free Agent, a kept server is one any
+      NodePool may take next &mdash; including the replacement for the Machine just deleted, when it is the
+      only one. The default, <code>false</code>, takes the server out of the MCE too.</p>
+    </div>
+
+    <div class="grid-2" style="margin-top:18px">
+      <div class="panel">
+        <h3>NodePool replicas are never changed &mdash; so a node is <em>replaced</em></h3>
+        <p>The NodePool still wants the same number of nodes, so it creates a <b>new Machine</b> as soon
+        as the old one is deleted, and the Agent provider binds it to <b>another free Agent</b> the
+        NodePool matches. The hosted cluster keeps its size, on a different server; this one leaves the
+        MCE.</p>
+        <p class="note">Shrinking a hosted cluster needs someone to own <code>NodePool.spec.replicas</code>.
+        That is not decided, so this run never touches them.</p>
+      </div>
+      <div class="panel">
+        <h3>When this server is the only free Agent</h3>
+        <p>The new Machine takes <b>any</b> free Agent the NodePool matches &mdash; this server&rsquo;s
+        too, once it is released. The run then stops with <code>AgentRetakenError</code>, naming the new
+        AgentMachine, and <b>writes nothing more</b>: releasing the Agent again would pull out a node the
+        provider is installing. Free another Agent the NodePool matches, or lower its replicas, then
+        re-run.</p>
+        <p class="note">A Machine someone else already started deleting is not deleted again: the run
+        waits for it and records the no-op in <code>skipped</code>.</p>
       </div>
     </div>
   </section>
@@ -116,8 +184,8 @@
         <thead><tr><th></th><th>a hosted cluster&rsquo;s node</th><th>an inventory host</th></tr></thead>
         <tbody>
           <tr><td class="k">what inspection sees</td><td class="muted">an Agent bound (<code>spec.clusterDeploymentName</code>) <b>and</b> an AgentMachine behind it &mdash; <em>or</em> an AgentMachine whose <code>status.agentRef</code> still names the Agent (a Machine deletion already under way: the run <b>resumes</b> it) &mdash; <em>or</em> whatever a broken deletion left of one: a Machine found by the Agent&rsquo;s providerID, a binding into a HostedCluster&rsquo;s control plane (<a href="#leftovers">leftovers</a>)</td><td class="muted">nothing links the Agent to a hosted cluster &mdash; or no Agent at all</td></tr>
-          <tr><td class="k">hosted-cluster half</td><td class="muted">runs: drain a Node no Machine stands behind, delete the Machine, wait for CAPI and the provider &mdash; making the provider&rsquo;s writes where it cannot &mdash; then verify Machine, AgentMachine, Node and Agent all gone</td><td class="muted"><b>skipped</b>, and named in <code>skipped</code> &mdash; unless the cluster server-scan names still has a stale Node of it, which is deleted</td></tr>
-          <tr><td class="k">inventory half</td><td class="muted">remove-server, awaited</td><td class="muted">remove-server, awaited</td></tr>
+          <tr><td class="k">hosted-cluster half</td><td class="muted">runs: drain a Node no Machine stands behind, delete the Machine, wait for CAPI and the provider &mdash; making the provider&rsquo;s writes where it cannot &mdash; then verify Machine, AgentMachine, Node and Agent all gone</td><td class="muted"><b>skipped</b>, and named in <code>skipped</code> &mdash; unless the cluster server-scan names still has a stale Node of it, which is deleted. <b>Checked again</b>, fresh, right before remove-server: no AgentMachine, no Machine, no binding</td></tr>
+          <tr><td class="k">inventory half</td><td class="muted" colspan="2">remove-server, awaited, the same for both: power off, then the NMStateConfig, the BareMetalHost and its Secret, the Agent, the PXE map (<a href="#cases">step by step</a>)</td></tr>
           <tr><td class="k">result</td><td class="muted"><code>hosted: true</code>, the hosted cluster, Machine, AgentMachine and Node</td><td class="muted"><code>hosted: false</code></td></tr>
         </tbody>
       </table>
@@ -159,7 +227,8 @@
     <div class="grid-2" style="margin-top:18px">
       <div class="panel">
         <h3>Checked, never assumed</h3>
-        <p>Before remove-server starts, each is re-derived <b>fresh</b>, not from what inspection saw:</p>
+        <p>Before remove-server starts, each is re-derived <b>fresh</b>, not from what inspection saw
+        &mdash; for an inventory host too, whose free Agent any NodePool may take:</p>
         <ul>
           <li><b>no Machine</b> &mdash; by the AgentMachine&rsquo;s owner, an infrastructureRef, or the providerID;</li>
           <li><b>no AgentMachine</b> names the Agent &mdash; by <code>status.agentRef</code> or the Agent&rsquo;s label;</li>
@@ -305,14 +374,21 @@
             <h3>the hosted-cluster half</h3>
             <span class="phase">hosted nodes, and what is left of one</span>
           </div>
+          <p class="note">An <b>inventory host</b> has none of this but its last check:
+          <b>verifying-agentmachine</b> inspects it again, fresh, with the same links as step 2 &mdash; an
+          Agent now bound or held by an AgentMachine fails <code>AgentRetakenError</code>, any other
+          AgentMachine, Machine or control-plane link <code>ServerStillPresentError</code>, with nothing on
+          the MCE written.</p>
           <p><b>draining-node</b> &mdash; only for a Node <b>no Machine stands behind</b>, which nothing else
           will drain: cordon it, then evict every Pod CAPI&rsquo;s drain would (all but DaemonSet and mirror
           Pods) through the Eviction API, pass after pass every 30 s. <b>20 minutes</b>, else
           <code>NodeDrainTimeoutError</code> naming the Pods left and why. A NotReady Node is not drained,
           as CAPI skips an unreachable one.</p>
-          <p><b>deleting-machine</b> &mdash; <code>ensure_machine_deleting</code>: a Machine already carrying a
-          deletionTimestamp (a scale-down, an operator, an earlier run) or already gone is left alone and named
-          in <code>skipped</code>; otherwise one DELETE.</p>
+          <p><b>deleting-machine</b> &mdash; <code>ensure_machine_deleting</code>, the run&rsquo;s own
+          <b>DELETE</b> of the Machine. That is the normal case: a running node&rsquo;s Machine has no
+          deletionTimestamp until this step gives it one. A Machine someone else already started deleting
+          (an operator, an earlier run) or one already gone is left alone and named in
+          <code>skipped</code>.</p>
           <p><b>awaiting-machine-deletion</b> &mdash; every 30 s, until the Machine is gone <em>and</em> the
           Agent is <code>known-unbound</code>, in two sub-phases with their own clocks, each started when this
           run first sees it:</p>
@@ -328,6 +404,11 @@
               provider&rsquo;s own unbind of the Agent, and &mdash; once the Agent is in a state the provider
               itself would release in &mdash; removes the provider&rsquo;s hook from the Machine.</li>
           </ul>
+          <p class="note">Every pass also checks that no <b>other</b> AgentMachine holds the Agent. One that
+          does is the NodePool&rsquo;s replacement Machine taking this same server
+          (<a href="#cases">above</a>): the run stops with <code>AgentRetakenError</code> and writes nothing
+          more. The release itself refuses an Agent a live Machine holds, too
+          (<code>AgentBindingChangedError</code>).</p>
           <p><b>verifying-agentmachine</b> &mdash; re-derived fresh: no AgentMachine names the Agent. One with
           no Machine is deleted; one stuck deleting on the provider&rsquo;s finalizer (it drops it only through
           a Machine) has that finalizer dropped after a minute; a Machine still linked fails the run (5 min,
@@ -364,6 +445,9 @@
           <p class="note">Refused now (the lock lapsed and another run took the machine), the run logs it,
           reports <code>reservation_expires_at: null</code> and still removes the host: it must not stay in
           this InfraEnv either way.</p>
+          <p class="note">Held with <code>keep_inventory</code> too: the server stays in this InfraEnv, and
+          server-scan may read it AVAILABLE until the MCE&rsquo;s agents job reports it
+          <code>INSTALLED_TO_INVENTORY</code>. With it, the run <b>ends here</b>.</p>
         </div>
       </div>
 
@@ -377,9 +461,32 @@
           </div>
           <p><code>execute_child_workflow</code> on <code>remove-server-&lt;server&gt;</code> and its own
           queue, <b>awaited</b>; its <code>RemoveServerResult</code> is embedded in this run&rsquo;s result.
-          The child powers the host off, removes the BareMetalHost and NMStateConfig, deletes the Agent last
-          and clears the host&rsquo;s MACs from its own site&rsquo;s PXE VM &mdash; all its own rules,
-          unchanged. Nothing on the MCE is its <code>found: false</code>, and this run completes.</p>
+          This is where the server leaves the MCE, for a hosted node and an inventory host alike &mdash;
+          remove-server&rsquo;s own rules, unchanged:</p>
+          <ol>
+            <li><b>powering-off</b> &mdash; <code>spec.online: false</code>, then <code>status.poweredOn</code>
+              read until false (10 min, else <code>HostPowerOffTimeoutError</code> with nothing deleted). It
+              re-checks right before that no Agent of the host is bound.</li>
+            <li><b>removing-host</b> &mdash; the BareMetalHost annotated <code>detached</code>, the
+              NMStateConfig deleted, the BareMetalHost deleted and waited on (a stuck metal3 finalizer is
+              dropped), and its BMC Secret deleted if it outlives the host.</li>
+            <li><b>removing-agent</b> &mdash; the Agent deleted last: nothing can boot the host into
+              discovery to re-register it any more.</li>
+            <li><b>removing-pxe-boot</b> &mdash; every MAC the host is known by, cleared from its own
+              site&rsquo;s PXE VM (best effort).</li>
+            <li><b>verifying</b> &mdash; no BareMetalHost, NMStateConfig or Agent of it left (5 min, else
+              <code>ServerStillPresentError</code>).</li>
+          </ol>
+          <div class="calls">
+            <div class="call sm"><span class="verb">PATCH</span><span class="path">baremetalhosts/&lt;server&gt; <em>&middot; spec.online: false, then annotation detached</em></span></div>
+            <div class="call sm"><span class="verb">DELETE</span><span class="path">nmstateconfigs/nmstate-config-&lt;server&gt;</span></div>
+            <div class="call sm"><span class="verb">DELETE</span><span class="path">baremetalhosts/&lt;server&gt;</span></div>
+            <div class="call sm"><span class="verb">DELETE</span><span class="path">secrets/&lt;bmc secret&gt; <em>&middot; only if it outlives the host</em></span></div>
+            <div class="call sm"><span class="verb">DELETE</span><span class="path">agents/&lt;agent&gt;</span></div>
+            <div class="call sm"><span class="verb">DELETE</span><span class="path">/pxe-map/&lt;mac&gt;?mce_cluster=&lt;mce&gt; <em>&middot; on the site&rsquo;s PXE VM</em></span></div>
+          </div>
+          <p class="note">Nothing of the server on the MCE is its <code>found: false</code>, and this run
+          completes. Never started with <code>keep_inventory</code>.</p>
           <p class="note">Parent-close policy <code>ABANDON</code>: closing this run never cuts the child off
           between its power-off and its deletes. A remove-server already running on that id fails this run
           (<code>RemoveServerAlreadyRunningError</code>, naming it); a child that fails fails it too
@@ -423,9 +530,11 @@
         <tbody>
           <tr><td class="k">NodeDrainTimeoutError</td><td class="muted">A Node no Machine stands behind did not drain in 20 min. Names the Pods left and why their evictions were refused &mdash; a PodDisruptionBudget, typically. The Node stays cordoned (<code>oc adm uncordon</code> undoes it); nothing else was changed.</td></tr>
           <tr><td class="k">MachineDrainTimeoutError</td><td class="muted">Still draining 20 min after the Machine was first seen deleting. Names the Machine&rsquo;s deletion conditions and every pending <code>pre-drain.delete.hook.*</code> / <code>pre-terminate.delete.hook.*</code> annotation &mdash; usually a PodDisruptionBudget or a hook nobody releases.</td></tr>
+          <tr><td class="k">AgentRetakenError</td><td class="muted">Another AgentMachine took the Agent while the run was taking it out &mdash; the NodePool replaced the deleted Machine with this same server, the only free Agent it matches; or, for an <b>inventory host</b>, a NodePool took its free Agent between the inspection and the removal. Nothing further was written. Free another matching Agent (or lower the replicas), then re-run: it deletes the replacement Machine and the NodePool takes the other Agent.</td></tr>
+          <tr><td class="k">AgentBindingChangedError</td><td class="muted">The run went to make the provider&rsquo;s unbind and found the Agent bound to another cluster, or held by an AgentMachine a live Machine still owns &mdash; the provider releases that one itself. Nothing was changed.</td></tr>
           <tr><td class="k">AgentUnbindTimeoutError</td><td class="muted">The released Agent did not reach <code>known-unbound</code> within an hour; names its last state (or that it is gone).</td></tr>
           <tr><td class="k">MachineDeletionTimeoutError</td><td class="muted">The Agent is free, but the Machine is still there an hour on &mdash; another pre-terminate hook, or a Node deletion CAPI cannot finish.</td></tr>
-          <tr><td class="k">ServerStillPresentError</td><td class="muted">An AgentMachine still names the Agent 5 min after its release (names its finalizers), or a Machine is still linked to it &mdash; a NodePool&rsquo;s replacement Machine may have taken the host again.</td></tr>
+          <tr><td class="k">ServerStillPresentError</td><td class="muted">An AgentMachine still names the Agent 5 min after its release (names its finalizers), or a Machine is still linked to it &mdash; a NodePool&rsquo;s replacement Machine may have taken the host again. For an <b>inventory host</b>: the last look before remove-server found an AgentMachine, Machine or control-plane link the first one did not; nothing on the MCE was changed.</td></tr>
           <tr><td class="k">HostedNodeStillPresentError</td><td class="muted">A Node that is the server is still <b>Ready</b> 5 min after the host left it &mdash; something still runs as it. A NotReady one is deleted instead. remove-server is not started.</td></tr>
           <tr><td class="k">AgentStillBoundError</td><td class="muted">After the Machine went, the Agent is not a clean inventory host within 5 min; names every unmet condition. remove-server is not started.</td></tr>
           <tr><td class="k">RemoveServerAlreadyRunningError</td><td class="muted"><code>remove-server-&lt;server&gt;</code> is already running (started on its own route). Let it finish, then re-run.</td></tr>
@@ -569,7 +678,8 @@
           a list of 1&ndash;20, each once (case-insensitively); <code>mce_cluster</code> is accepted with or
           without <code>ocp4-</code> and is needed because it names the activity queue of the worker inside
           that MCE; <code>namespace</code> (the InfraEnv&rsquo;s, where the BMH and Agent live) defaults to
-          <code>inventory</code>. The reply follows what was sent: one name is
+          <code>inventory</code>; <code>keep_inventory</code> (default <code>false</code>) stops the run
+          after the hosted cluster, leaving the server in the inventory (<a href="#keep-inventory">above</a>). The reply follows what was sent: one name is
           <code>{workflow_id, run_id}</code>, a list is a per-run report &mdash; even a list of one.</p>
           <pre><span class="c">// request — one server</span>
 {
@@ -580,12 +690,13 @@
 <span class="c">// 202 response</span>
 { "workflow_id": "uninstall-server-ocp-cisco-m6-bat-yam-64c-512gb-wzp12345", "run_id": "…" }
 
-<span class="c">// request — several, one run each</span>
+<span class="c">// request — several, one run each, kept in the inventory</span>
 {
-  "server_names": [ "ocp-cisco-m6-bat-yam-64c-512gb-WZP12345",
-                    "ocp-cisco-m6-bat-yam-64c-512gb-WZP67890" ],
-  "mce_cluster":  "ocp4-mce-bat-yam-01",
-  "namespace":    "inventory"
+  "server_names":   [ "ocp-cisco-m6-bat-yam-64c-512gb-WZP12345",
+                      "ocp-cisco-m6-bat-yam-64c-512gb-WZP67890" ],
+  "mce_cluster":    "ocp4-mce-bat-yam-01",
+  "namespace":      "inventory",
+  "keep_inventory": true                       <span class="c">// default false</span>
 }
 
 <span class="c">// 202 response — a server already uninstalling is "already_running"</span>
@@ -646,12 +757,14 @@
     "leftovers_at_start": [],                     <span class="c">// what HyperShift had left, in words</span>
     "cleaned_up": [],                             <span class="c">// every write made on a controller's behalf, and why</span>
     "reservation_expires_at": "2026-10-25T09:00:00Z",
+    "kept_in_inventory": false,                   <span class="c">// true: remove_server* are null</span>
     "remove_server_workflow_id": "remove-server-ocp-cisco-m6-bat-yam-64c-512gb-wzp12345",
     "remove_server": { "found": true, "powered_off": true, "agents_removed": [ "…" ], … }
   }
 }</pre>
           <p class="note"><code>machine_deleted_by_run: false</code> with a <code>deleting-machine:</code>
-          entry in <code>skipped</code> is the scale-down shape &mdash; the Machine was already going.</p>
+          entry in <code>skipped</code> means the Machine was already deleting when the run reached it
+          &mdash; someone else had started it.</p>
           <pre><span class="c">// a node HyperShift lost: an AgentMachine with no Machine, still Ready</span>
 "leftovers_at_start": [
   "AgentMachine clusters-hc-01/hc-01-np-am-x7k2p has no Machine",
@@ -685,12 +798,12 @@
           <tr><td class="k">reserving-server</td><td class="muted">The install lock, before any write</td><td class="muted">instant</td></tr>
           <tr><td class="k">draining-node</td><td class="muted">A Node no Machine stands behind: cordon + evictions, every 30 s</td><td class="muted">&le; 20 min</td></tr>
           <tr><td class="k">deleting-machine</td><td class="muted">Hosted nodes: the Machine delete, or a recorded no-op</td><td class="muted">instant</td></tr>
-          <tr><td class="k">awaiting-machine-deletion</td><td class="muted">Hosted nodes: <code>sub_phase</code> <b>draining</b> (Agent still bound), <b>releasing</b> (the run makes the provider&rsquo;s writes) and <b>unbinding</b> (released, rebooting), polled every 30 s</td><td class="muted"><b>&le; 20 min</b> draining, <b>&le; 1 h</b> unbinding</td></tr>
-          <tr><td class="k">verifying-agentmachine</td><td class="muted">No AgentMachine names the Agent, and no Machine is linked to it; a Machine-less one deleted, a stuck provider finalizer dropped</td><td class="muted">&le; 5 min</td></tr>
+          <tr><td class="k">awaiting-machine-deletion</td><td class="muted">Hosted nodes: <code>sub_phase</code> <b>draining</b> (Agent still bound), <b>releasing</b> (the run makes the provider&rsquo;s writes) and <b>unbinding</b> (released, rebooting), polled every 30 s; stops if another AgentMachine takes the Agent</td><td class="muted"><b>&le; 20 min</b> draining, <b>&le; 1 h</b> unbinding</td></tr>
+          <tr><td class="k">verifying-agentmachine</td><td class="muted">No AgentMachine names the Agent, and no Machine is linked to it; a Machine-less one deleted, a stuck provider finalizer dropped. An inventory host: inspected again, fresh &mdash; anything linked stops the run</td><td class="muted">&le; 5 min</td></tr>
           <tr><td class="k">verifying-node</td><td class="muted">No Node of the hosted cluster is the server; a stale (NotReady) one deleted</td><td class="muted">&le; 5 min</td></tr>
           <tr><td class="k">verifying-agent</td><td class="muted">Hosted nodes: the Agent is a clean inventory host</td><td class="muted">&le; 5 min</td></tr>
           <tr><td class="k">holding-server</td><td class="muted">The lock extended to 24 h</td><td class="muted">instant</td></tr>
-          <tr><td class="k">removing-from-inventory</td><td class="muted">remove-server, awaited (its own phases are on its own id)</td><td class="muted">minutes &mdash; remove-server&rsquo;s bounds</td></tr>
+          <tr><td class="k">removing-from-inventory</td><td class="muted">remove-server, awaited (its own phases are on its own id); never with <code>keep_inventory</code></td><td class="muted">minutes &mdash; remove-server&rsquo;s bounds</td></tr>
           <tr><td class="k">completed</td><td class="muted">The server is off the hosted cluster and out of the MCE</td><td class="muted">&mdash;</td></tr>
         </tbody>
       </table>
@@ -725,7 +838,8 @@
 
     <h3 style="margin:28px 0 10px">What it never does</h3>
     <ul>
-      <li>No NodePool or replicas change &mdash; that is <code>scale-down-nodepool</code>&rsquo;s (<a href="#replace-or-shrink">above</a>).</li>
+      <li>No NodePool or replicas change &mdash; who owns replicas is not decided (<a href="#cases">above</a>).</li>
+      <li>No fight with the NodePool &mdash; an Agent its replacement Machine took is left to it.</li>
       <li>No drain or Node delete where CAPI can still do it &mdash; only for a Node no Machine stands
         behind, and a Node is deleted only once NotReady.</li>
       <li>No finalizer or hook of anyone but the Agent provider&rsquo;s, and those only once its unbind is done.</li>

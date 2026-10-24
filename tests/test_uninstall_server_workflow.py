@@ -177,6 +177,7 @@ def make_mocks(
     *,
     membership: ServerMembership = INSTALLED,
     host: BoundHostState = HOSTED_NODE,
+    rechecks: list[BoundHostState] | None = None,
     deletion: MachineDeletion | None = None,
     machines: list[MachineState] | None = None,
     agents: list[AgentBindingState] | None = None,
@@ -195,7 +196,10 @@ def make_mocks(
 
     `nodes` is what find_hosted_nodes answers, call after call: by default the
     hosted node's own Node at the first look and none once its Machine went.
+    `rechecks` is what inspect_bound_host answers after the lock is taken (an
+    inventory host's last look); by default `host` again.
     """
+    recheck_seq = list(rechecks or [host])
     machine_seq = list(machines or MACHINE_TIMELINE)
     agent_seq = list(agents or AGENT_TIMELINE)
     nodes_seq = list(nodes if nodes is not None else ([[THE_NODE], []] if host.machine else [[]]))
@@ -231,8 +235,11 @@ def make_mocks(
     @activity.defn
     async def inspect_bound_host(ref: BmhRef) -> BoundHostState:
         calls["inspect_bound_host"].append(ref)
-        _mark("inspect")
-        return host
+        if not calls["reserve_server"]:
+            _mark("inspect")
+            return host
+        _mark("verify-inventory")
+        return recheck_seq[min(len(calls["inspect_bound_host"]) - 2, len(recheck_seq) - 1)]
 
     @activity.defn
     async def reserve_server(request: ReserveServerRequest) -> ServerReservation:
@@ -651,6 +658,13 @@ AGENT_RECLAIM_FAILED = AgentBindingState(
 )
 RELEASED_AND_FREE = [AGENT_BOUND, AGENT_UNBINDING, AGENT_DISCOVERING, AGENT_FREE]
 
+# The NodePool's replacement for the deleted Machine, holding this server again.
+NEW_AM = "clusters-hc-01/hc-01-np-am-q9z4d"
+RETAKEN = AgentBindingState(
+    found=True, cluster_deployment="clusters-hc-01/hc-01", agent_machine_label=True,
+    agent_machine=NEW_AM, state="binding", approved=True,
+)
+
 
 class TestHyperShiftLeftovers:
     async def test_an_agentmachine_with_no_machine_is_released_and_removed(self):
@@ -849,13 +863,72 @@ class TestHyperShiftLeftovers:
         assert result.remove_server.found
 
 
+class TestTheNodePoolTakingTheServerBack:
+    """Replicas are not the run's: the NodePool replaces the Machine it deletes — with
+    this very server when it is the only free Agent the NodePool's selector matches."""
+
+    async def test_the_run_stops_and_never_releases_it_from_the_replacement(self):
+        labelled = HOSTED_NODE.model_copy(update={
+            "agents": [BOUND_AGENT.model_copy(update={"labelled_agent_machine": AM})],
+        })
+        calls, acts = make_mocks(
+            host=labelled,
+            machines=[DELETING, GONE],
+            agents=[AGENT_BOUND.model_copy(update={"agent_machine": AM}), AGENT_UNBINDING, RETAKEN],
+        )
+        async with _Harness(acts) as client:
+            error = await _fails(client)
+
+        assert error.type == "AgentRetakenError"
+        assert NEW_AM in error.message and "Free another Agent" in error.message
+        assert calls["ensure_machine_deleting"] == [MACHINE]
+        # Bound into the same control plane, so a release would have passed its
+        # own checks — and unbound a node the provider is installing.
+        assert calls["release_agent"] == [] and calls["release_machine_hook"] == []
+        assert calls["inspect_inventory_host"] == []  # no child
+        assert len(calls["reserve_server"]) == 1  # no day-long hold
+
+    async def test_a_label_naming_the_agentmachine_already_gone_is_not_a_retake(self):
+        """A broken deletion can leave the provider's label behind: that Agent is the run's to release."""
+        stale = BOUND_AGENT.model_copy(update={"agent_machine": None, "labelled_agent_machine": AM})
+        calls, acts = make_mocks(
+            host=NO_AGENT_MACHINE.model_copy(update={"agents": [stale]}),
+            machines=[AT_THE_HOOK, AT_THE_HOOK, GONE],
+            agents=[AGENT_BOUND.model_copy(update={"agent_machine": AM}), AGENT_RECLAIM_FAILED, AGENT_FREE],
+        )
+        async with _Harness(acts) as client:
+            result = await _execute(client)
+
+        assert len(calls["release_agent"]) == 1 and calls["release_machine_hook"] == [MACHINE]
+        assert result.remove_server.found
+
+    def test_a_limb_predating_the_field_never_reads_as_a_retake(self):
+        # Built in-process, so an unsent key is really absent — as in an old limb's payload.
+        old_inspection = HostAgent(name="agent-1", namespace=NS, agent_machine=AM)
+        assert uninstall_server._started_from(old_inspection) is None
+        assert uninstall_server._retaken_by(RETAKEN, None) is None
+
+        started = uninstall_server._started_from(old_inspection.model_copy(
+            update={"labelled_agent_machine": None}))
+        assert started == frozenset({AM})
+        old_poll = AgentBindingState(found=True, cluster_deployment="clusters-hc-01/hc-01",
+                                     agent_machine_label=True)
+        assert uninstall_server._retaken_by(old_poll, started) is None
+        assert uninstall_server._retaken_by(RETAKEN, started) == NEW_AM
+        assert uninstall_server._retaken_by(AGENT_UNBINDING.model_copy(
+            update={"agent_machine": None}), started) is None
+
+
 class TestAnInventoryHost:
     async def test_it_skips_the_hosted_half_and_still_removes(self):
         calls, acts = make_mocks(membership=IN_INVENTORY, host=INVENTORY_HOST)
         async with _Harness(acts) as client:
             result = await _execute(client)
 
-        assert calls["order"] == ["lookup", "inspect", "reserve", "hold", *CHILD]
+        # Looked at again, fresh, right before remove-server: a free Agent is
+        # what any NodePool's new Machine takes.
+        assert calls["order"] == ["lookup", "inspect", "reserve", "verify-inventory", "hold", *CHILD]
+        assert len(calls["inspect_bound_host"]) == 2
         assert not result.hosted and not result.bound_at_start
         assert result.agent_state_at_start == "known-unbound"
         assert [s.split(":")[0] for s in result.skipped] == [
@@ -884,7 +957,8 @@ class TestAnInventoryHost:
             result = await _execute(client)
 
         assert result.remove_server.found is False
-        assert calls["order"] == ["lookup", "inspect", "reserve", "hold", "child-inspect"]
+        assert calls["order"] == ["lookup", "inspect", "reserve", "verify-inventory", "hold",
+                                  "child-inspect"]
 
     async def test_a_stale_installed_reading_after_an_unbind_is_not_a_contradiction(self):
         """A re-run's normal view: server-scan has not caught up with the unbinding yet."""
@@ -895,6 +969,89 @@ class TestAnInventoryHost:
         # The cluster server-scan names is still asked whether the server is a Node there.
         [query] = calls["find_hosted_nodes"]
         assert query.hosted_cluster is None and query.cluster_name == "hc-01"
+
+
+    async def test_taken_by_a_nodepool_after_the_inspection_it_is_left_to_install(self):
+        taken = INVENTORY_HOST.model_copy(update={"agents": [HostAgent(
+            name="agent-1", namespace=NS, cluster_deployment="clusters-hc-01/hc-01",
+            state="binding", approved=True, agent_machine=AM, agent_machine_label=True,
+            hcp_namespaces=["clusters-hc-01"],
+        )]})
+        calls, acts = make_mocks(membership=IN_INVENTORY, host=INVENTORY_HOST, rechecks=[taken])
+        async with _Harness(acts) as client:
+            error = await _fails(client)
+
+        assert error.type == "AgentRetakenError"
+        assert AM in error.message and "clusters-hc-01/hc-01" in error.message
+        assert calls["inspect_inventory_host"] == []  # no child: nothing powered off or deleted
+        assert len(calls["reserve_server"]) == 1  # no day-long hold
+
+    async def test_a_machine_linked_since_the_inspection_stops_the_removal(self):
+        linked = INVENTORY_HOST.model_copy(update={
+            "agents": [HostAgent(name="agent-1", namespace=NS, state="known-unbound", approved=True,
+                                 hcp_namespaces=["clusters-hc-01"])],
+            "machines_matched": ["clusters-hc-01/hc-01-np-x7k2p"],
+        })
+        calls, acts = make_mocks(membership=IN_INVENTORY, host=INVENTORY_HOST, rechecks=[linked])
+        async with _Harness(acts) as client:
+            error = await _fails(client)
+
+        assert error.type == "ServerStillPresentError"
+        assert "Machine clusters-hc-01/hc-01-np-x7k2p is linked to it" in error.message
+        assert calls["inspect_inventory_host"] == []
+
+    async def test_a_run_recorded_before_the_recheck_goes_straight_to_the_hold(self, monkeypatch):
+        monkeypatch.setattr(
+            workflow, "patched",
+            lambda patch_id: patch_id != uninstall_server._INVENTORY_VERIFY_PATCH,
+        )
+        calls, acts = make_mocks(membership=IN_INVENTORY, host=INVENTORY_HOST)
+        async with _Harness(acts) as client:
+            result = await _execute(client)
+
+        assert calls["order"] == ["lookup", "inspect", "reserve", "hold", *CHILD]
+        assert result.remove_server.found
+
+
+KEEP = INPUT.model_copy(update={"keep_inventory": True})
+
+
+class TestKeepInventory:
+    """keep_inventory: out of the hosted cluster, and no further — no remove-server."""
+
+    async def test_a_hosted_node_leaves_its_cluster_and_stays_in_the_inventory(self):
+        calls, acts = make_mocks()
+        async with _Harness(acts) as client:
+            result = await _execute(client, KEEP)
+
+        # The whole hosted-cluster half and the day-long hold, then nothing more.
+        assert calls["order"] == ["lookup", "inspect", "find-nodes", "reserve", *HOSTED_HALF, "hold"]
+        assert result.kept_in_inventory and result.hosted and result.machine_deleted_by_run
+        assert result.remove_server is None and result.remove_server_workflow_id is None
+        for untouched in ("inspect_inventory_host", "set_host_online", "teardown_bmh_resources",
+                          "delete_agents", "remove_host_pxe_entries"):
+            assert calls[untouched] == [], untouched
+        assert result.reservation_expires_at == "2026-10-25T09:00:00Z"
+        assert result.skipped[-1].startswith("removing-from-inventory: keep_inventory was asked")
+        assert "InfraEnv cisco-m6-bat-yam-64c-512gb" in result.skipped[-1]
+
+    async def test_an_inventory_host_has_nothing_to_do_and_takes_no_lock(self):
+        calls, acts = make_mocks(membership=IN_INVENTORY, host=INVENTORY_HOST)
+        async with _Harness(acts) as client:
+            result = await _execute(client, KEEP)
+
+        assert calls["order"] == ["lookup", "inspect"]
+        assert calls["reserve_server"] == []
+        assert result.kept_in_inventory and not result.hosted and result.remove_server is None
+        assert [s.split(":")[0] for s in result.skipped] == [
+            "checking-hosted-node", "hosted-cluster half", "removing-from-inventory",
+        ]
+
+    async def test_the_default_still_takes_it_out_of_the_mce(self):
+        _calls, acts = make_mocks()
+        async with _Harness(acts) as client:
+            result = await _execute(client)
+        assert not result.kept_in_inventory and result.remove_server.found
 
 
 class TestRefusedBeforeAnyWrite:

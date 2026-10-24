@@ -612,6 +612,25 @@ class TestUninstallServer:
         assert words in response.text
         assert fake.started == []
 
+    def test_keep_inventory_reaches_every_run_and_defaults_to_false(self):
+        fake = _FakeUninstallClient()
+        response = _uninstall_client(fake).post(
+            UNINSTALL, json={**UNINSTALL_BODY, "server_names": NAMES, "keep_inventory": True}
+        )
+        assert response.status_code == 202
+        assert [run_input.keep_inventory for _, _, run_input in fake.started] == [True, True]
+
+        fake = _FakeUninstallClient()
+        _uninstall_client(fake).post(UNINSTALL, json={**UNINSTALL_BODY, "server_names": NAMES[0]})
+        assert [run_input.keep_inventory for _, _, run_input in fake.started] == [False]
+
+    def test_a_mistyped_keep_inventory_is_422_never_ignored(self):
+        fake = _FakeUninstallClient()
+        response = _uninstall_client(fake).post(
+            UNINSTALL, json={**UNINSTALL_BODY, "server_names": NAMES[0], "keep_inventry": True}
+        )
+        assert response.status_code == 422 and fake.started == []
+
     def test_every_run_field_can_be_sent(self):
         # Its own model, not a subclass of the run's input: a field added to
         # UninstallServerInput must be added to the request too.

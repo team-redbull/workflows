@@ -795,6 +795,11 @@ class HostAgent(BaseModel):
     agent_machine: str | None = None
     # Whether the Agent still carries the provider's `agentMachineRef` label.
     agent_machine_label: bool = False
+    # `<namespace>/<name>` that label (+ its namespace annotation) names, whether
+    # or not that AgentMachine still exists — what the run started from, so a
+    # NodePool replacement taking the Agent again reads as a DIFFERENT one.
+    # The limb always sends the key; absent = a limb predating the field.
+    labelled_agent_machine: str | None = None
     # The name its Node registers under (`spec.hostname`, else the discovered
     # one). None from a limb predating the field.
     hostname: str | None = None
@@ -929,6 +934,10 @@ class AgentBindingState(BaseModel):
     found: bool = False
     cluster_deployment: str | None = None
     agent_machine_label: bool = False
+    # `<namespace>/<name>` of the AgentMachine the provider's label names now
+    # (hosted_resources.labelled_agent_machine). The limb always sends the key;
+    # absent = a limb predating the field, so the workflow gates on its presence.
+    agent_machine: str | None = None
     state: str | None = None
     approved: bool | None = None
 
@@ -1092,6 +1101,10 @@ class UninstallServerInput(BaseModel):
     server_name: str = Field(min_length=1)
     mce_cluster: str = Field(min_length=1)
     namespace: str = Field(min_length=1)
+    # Take the server out of its hosted cluster and STOP: no remove-server, so it
+    # stays in this MCE's inventory as a free Agent. False — also for every run
+    # recorded before the field — takes it out of the MCE too.
+    keep_inventory: bool = False
 
 
 class UninstallServerRunArgs(BaseModel):
@@ -1125,7 +1138,7 @@ class UninstallServerResult(BaseModel):
     that did not need doing and why — a Machine already deleting, a Node
     check with no Node to check, the whole hosted-cluster half for an
     inventory host. `remove_server` is the awaited remove-server child's own
-    result, on `remove_server_workflow_id`. `leftovers_at_start` and
+    result, on `remove_server_workflow_id` — None with `kept_in_inventory`. `leftovers_at_start` and
     `cleaned_up` say what HyperShift had left behind and what the run did
     about it.
     """
@@ -1152,5 +1165,8 @@ class UninstallServerResult(BaseModel):
     leftovers_at_start: list[str] = Field(default_factory=list)
     cleaned_up: list[str] = Field(default_factory=list)
     reservation_expires_at: str | None = None
+    # keep_inventory was asked: the server was left in the MCE's inventory, and
+    # remove-server never started (remove_server* stay None).
+    kept_in_inventory: bool = False
     remove_server_workflow_id: str | None = None
     remove_server: RemoveServerResult | None = None

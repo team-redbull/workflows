@@ -52,7 +52,7 @@
     already collects all of that on a 6-hour cron, so one HTTP call replaced four vendor SDKs.</p>
     <div class="facts">
       <div class="fact"><span class="k">Trigger</span><span class="v">POST /workflows/server-lifecycle/install-server</span></div>
-      <div class="fact"><span class="k">Workflow id</span><span class="v">one per server: install-server-&lt;infraEnv&gt; &middot; &hellip;_&lt;slot&gt; with <code>count</code> &middot; install-server-name-&lt;server&gt;</span></div>
+      <div class="fact"><span class="k">Workflow id</span><span class="v">one per server: install-server-&lt;infraEnv&gt;_&lt;slot&gt; from the pool &middot; install-server-name-&lt;server&gt;</span></div>
       <div class="fact"><span class="k">Workflow queue</span><span class="v">install-server-workflow</span></div>
       <div class="fact"><span class="k">Activity queue</span><span class="v">server-lifecycle-activity-&lt;mce_cluster&gt;</span></div>
     </div>
@@ -78,9 +78,9 @@
         <tbody>
           <tr><td class="k">reads as</td><td class="muted"><em>&ldquo;fill this InfraEnv&rdquo;</em></td><td class="muted"><em>&ldquo;install this machine&rdquo;</em></td></tr>
           <tr><td class="k">server-scan query</td><td class="muted"><code>?pattern=^ocp-&lt;infraEnv&gt;&amp;count=&lt;candidate_count&gt;</code></td><td class="muted"><code>?name=&lt;server&gt;&amp;count=1</code></td></tr>
-          <tr><td class="k">candidates drawn</td><td class="muted"><code>candidate_count</code> &mdash; default 3, range 1&ndash;20</td><td class="muted">one</td></tr>
+          <tr><td class="k">candidates drawn</td><td class="muted"><code>candidate_count</code> &mdash; default runs on the pool + 2 (3 for a lone install), range 1&ndash;20</td><td class="muted">one</td></tr>
           <tr><td class="k">already has a BareMetalHost</td><td class="muted"><b>skipped</b>, next candidate tried</td><td class="muted"><b>converged</b> &mdash; that is the point</td></tr>
-          <tr><td class="k">workflow id</td><td class="muted"><code>install-server-&lt;infraEnv&gt;</code>, or <code>&hellip;_&lt;slot&gt;</code> with <code>count</code></td><td class="muted"><code>install-server-name-&lt;server&gt;</code></td></tr>
+          <tr><td class="k">workflow id</td><td class="muted"><code>install-server-&lt;infraEnv&gt;_&lt;slot&gt;</code>, the first free slot</td><td class="muted"><code>install-server-name-&lt;server&gt;</code></td></tr>
           <tr><td class="k">use it for</td><td class="muted">routine capacity: take whatever is free and healthy</td><td class="muted">re-running or repairing one known host</td></tr>
         </tbody>
       </table>
@@ -614,14 +614,13 @@
         &mdash; the bond is the same wiring whichever member became <code>nic1</code>.</p>
       </div>
       <div class="panel">
-        <h3>The id serializes per POOL; the probe and the lock cover the rest</h3>
-        <p><code>install-server-&lt;infraEnv&gt;</code> keys on the candidate <b>pool</b>
+        <h3>The id names a slot of the POOL; the probe and the lock cover the rest</h3>
+        <p><code>install-server-&lt;infraEnv&gt;_&lt;slot&gt;</code> keys on the candidate <b>pool</b>
         (<code>^ocp-&lt;infraEnv&gt;</code>), not on the machine &mdash; which is not known when the run
-        starts &mdash; and not on the target. Two MCEs filling an InfraEnv of the same name draw from the
-        same pool, so a second trigger while one is in flight gets <b>409</b> even when it names a
-        different MCE &mdash; unless it sends <code>count</code>, which starts parallel runs on slot ids
-        instead. Without <code>count</code> the 409 is the point: a double-click or a retried POST must
-        not install a second server.</p>
+        starts &mdash; and not on the target. Two MCEs filling an InfraEnv of the same name share one set
+        of slots. A second trigger while one is in flight takes the next slot: it is a <b>second
+        install</b>, never a 409, because asking the pool again is asking for one more server. A
+        double-click therefore installs two; its callers are people, which is why that was accepted.</p>
         <p class="note">That covers concurrent runs. The <em>sequential</em> case an id cannot cover
         &mdash; a second run minutes later, before any cluster has reported the node, so server-scan still
         calls the machine unclaimed &mdash; is what step 3&rsquo;s already-installed probe is for. Without
@@ -634,9 +633,11 @@
     <div class="panel" style="margin-top:20px">
       <h3>Several servers at once: <code>count</code>, or a list of <code>server_names</code></h3>
       <p>Every server is <b>its own workflow run</b> &mdash; its own id, status and failure, never one
-      run for a batch. Send <code>count: N</code> and the pool picks N, installed in parallel, one run
-      per slot (<code>install-server-&lt;infraEnv&gt;_&lt;slot&gt;</code>); slots still running are
-      stepped over, so a second batch of 5 while the first installs takes <code>_6</code>&ndash;<code>_10</code>.
+      run for a batch. Every run the pool picks for is on a slot
+      (<code>install-server-&lt;infraEnv&gt;_&lt;slot&gt;</code>), and slots still running are stepped
+      over: send nothing more and one install takes the first free slot; send <code>count: N</code> and
+      N are installed in parallel. So a second install while the first runs takes <code>_2</code>, and a
+      second batch of 5 while the first installs takes <code>_6</code>&ndash;<code>_10</code>.
       Send a list of <code>server_names</code> and each machine gets its own run, on the same id a single
       named install uses.</p>
       <p>No two runs take one machine, however they were asked for &mdash; two batches, or 5 from the
@@ -644,7 +645,7 @@
       anything, and server-scan stops listing a locked machine. A pool run that loses the race tries its
       next candidate; a named machine another run took first fails its own run.</p>
       <p class="note">Every run on the pool draws the same top of it, so <code>candidate_count</code>
-      defaults to (slots still running) + <code>count</code> + 2, at most 20. A run that finds every
+      defaults to (slots still running) + new runs + 2, at most 20. A run that finds every
       candidate locked by its siblings fails with <code>ServerReservedError</code>: the pool had fewer
       free servers than were installing.</p>
     </div>
@@ -660,9 +661,10 @@
         <li><b>One workflow per server, never a batch workflow.</b> Each server gets its own id, status,
         failure and history, and Temporal&rsquo;s one-run-per-id rule is what refuses a second run for the
         same machine. Every other <code>/bulk</code> in this repo works the same way.</li>
-        <li><b>The 409 stays for a single install.</b> It is what makes a double-click or a retried POST
-        harmless. That ruled out always answering with a report, and making <code>count</code> default
-        to 1.</li>
+        <li><b>No 409 from the pool</b> (revised 2026-10-24). A single install sent while another ran
+        used to be refused until the first finished &mdash; up to an hour. Asking the pool again is asking
+        for one more server, so it now takes the next slot, like <code>count: 1</code>, and keeps the
+        simple reply. A named machine keeps its 409: asking twice for one machine is one install.</li>
         <li><b><code>server_names</code> takes a string or a list, and the reply follows what was sent.</b>
         One name keeps the simple <code>{workflow_id, run_id}</code>. A list always gets the report, so a
         script that sends a list can always loop over <code>results</code>.</li>
@@ -693,13 +695,14 @@
         <div class="endpoint-head">
           <span class="method">POST</span>
           <span class="path">/workflows/server-lifecycle/install-server</span>
-          <span class="ret">202 &middot; 409 if that one run is already going</span>
+          <span class="ret">202 &middot; 409 if that named machine is already installing</span>
         </div>
         <div class="endpoint-body">
           <p>The minimum body is two fields &mdash; the InfraEnv to fill and its MCE; <code>namespace</code>
           defaults to <code>inventory</code>. The reply follows what was sent: one run (nothing more, or one
-          name) is <code>{workflow_id, run_id}</code> and a 409 while it is already going; several
-          (<code>count</code>, or a list of names &mdash; even a list of one) is a per-run report.</p>
+          name) is <code>{workflow_id, run_id}</code>; several (<code>count</code>, or a list of names
+          &mdash; even a list of one) is a per-run report. From the pool, sending again while it runs
+          starts another install on the next slot; one name already installing is a 409.</p>
           <pre><span class="c">// request — fill the InfraEnv from the pool</span>
 {
   "infra_env":   "cisco-m6-bat-yam-64c-512gb",
@@ -716,7 +719,7 @@
 }
 
 <span class="c">// 202 response</span>
-{ "workflow_id": "install-server-cisco-m6-bat-yam-64c-512gb", "run_id": "…" }
+{ "workflow_id": "install-server-cisco-m6-bat-yam-64c-512gb_1", "run_id": "…" }
 
 <span class="c">// request — three servers from the pool, in parallel</span>
 {
@@ -806,8 +809,8 @@
           <tr><td class="k">mce_cluster</td><td class="k">str</td><td class="muted">required, non-empty</td><td class="muted">Which MCE. Selects the <code>INVENTORY</code> segment the VLAN comes from <b>and</b> the activity queue the cluster writes go to.</td></tr>
           <tr><td class="k">namespace</td><td class="k">str</td><td class="muted">non-empty, default <code>inventory</code></td><td class="muted">Where the three resources go. Must be the InfraEnv&rsquo;s own namespace.</td></tr>
           <tr><td class="k">server_names</td><td class="k">str | list | null</td><td class="muted">default <code>null</code>; a list is 1&ndash;20 names, each once</td><td class="muted">Install these machines instead of letting the pool pick: one name, or a list &mdash; one run per name. Turns the already-installed skip off; changes the workflow id.</td></tr>
-          <tr><td class="k">count</td><td class="k">int | null</td><td class="muted">1&ndash;20, default <code>null</code></td><td class="muted">Let the pool pick this many and install them in parallel, one run per slot. Not with <code>server_names</code>.</td></tr>
-          <tr><td class="k">candidate_count</td><td class="k">int | null</td><td class="muted">1&ndash;20, default <code>null</code></td><td class="muted">How many candidates each pool run draws: 3 if unset, or with <code>count</code> (runs on the pool) + <code>count</code> + 2. Not with <code>server_names</code>.</td></tr>
+          <tr><td class="k">count</td><td class="k">int | null</td><td class="muted">1&ndash;20, default <code>null</code> (the pool picks one)</td><td class="muted">Let the pool pick this many and install them in parallel, one run per slot. Sending it asks for the per-run report. Not with <code>server_names</code>.</td></tr>
+          <tr><td class="k">candidate_count</td><td class="k">int | null</td><td class="muted">1&ndash;20, default <code>null</code></td><td class="muted">How many candidates each pool run draws: if unset, (runs on the pool) + new runs + 2, at most 20 &mdash; 3 for a lone install. Not with <code>server_names</code>.</td></tr>
           <tr><td class="k">labels</td><td class="k">map</td><td class="muted">default <code>{}</code></td><td class="muted">Extra labels for the BareMetalHost. Cannot override the InfraEnv label &mdash; that would split the host from its NMStateConfig.</td></tr>
         </tbody>
       </table>

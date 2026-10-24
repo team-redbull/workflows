@@ -12,13 +12,16 @@ import pytest
 
 from activities.server_lifecycle.bmh_resources import build_baremetal_host
 from shared.bmc_address import bmc_secret_name, build_bmc_address
-from shared.workflow_ids import install_server_workflow_id
 from shared.models.server_lifecycle import (
     AcquiredServer,
     BmcEndpoint,
     BmhResourceRequest,
     LinkState,
     ServerInterface,
+)
+from shared.workflow_ids import (
+    install_server_name_workflow_id,
+    install_server_slot_workflow_id,
 )
 from workflow_domains.server_lifecycle.bond_selection import select_bond_members
 
@@ -307,30 +310,30 @@ class TestBmcAddress:
 
 
 class TestWorkflowIdKeysOnTheCandidatePool:
-    """The id must serialize whatever decides which servers a run can draw.
+    """A pool run's id names the pool it draws from, plus a slot.
 
     It first keyed on (InfraEnv, MCE), which was wrong: the pool is
     `^ocp-<infraEnv>` with no MCE in it, so two MCEs filling an InfraEnv of the
-    same name got different ids while drawing from the same pool — the one race
-    the serialization exists to prevent.
+    same name got different ids while drawing from the same pool. Sharing the
+    slots is what lets a new run count every run already on the pool.
     """
 
-    def test_the_same_infraenv_on_two_mces_shares_one_id(self) -> None:
-        assert install_server_workflow_id("dell-r650-tlv-64c-1024gb") == (
-            install_server_workflow_id("dell-r650-tlv-64c-1024gb")
+    def test_the_same_infraenv_on_two_mces_shares_its_slots(self) -> None:
+        assert install_server_slot_workflow_id("dell-r650-tlv-64c-1024gb", 1) == (
+            "install-server-dell-r650-tlv-64c-1024gb_1"
         )
 
-    def test_different_infraenvs_do_not_serialize_against_each_other(self) -> None:
-        assert install_server_workflow_id("dell-r650-tlv-64c-1024gb") != (
-            install_server_workflow_id("hp-gen11-nyc-64c-128gb")
+    def test_different_infraenvs_and_slots_get_different_ids(self) -> None:
+        assert install_server_slot_workflow_id("dell-r650-tlv-64c-1024gb", 1) != (
+            install_server_slot_workflow_id("hp-gen11-nyc-64c-128gb", 1)
         )
+        assert install_server_slot_workflow_id("ie", 1) != install_server_slot_workflow_id("ie", 2)
 
-    def test_a_named_server_is_a_pool_of_one_and_gets_its_own_id(self) -> None:
-        # Naming a machine draws from a pool of one, so it need not queue
-        # behind a pattern draw for the same InfraEnv.
-        by_name = install_server_workflow_id("dell-r650-tlv-64c-1024gb", "ocp-dell-x")
+    def test_a_named_server_gets_its_own_id(self) -> None:
+        # Naming a machine draws from a pool of one, so it does not take a slot.
+        by_name = install_server_name_workflow_id("ocp-dell-x")
         assert by_name == "install-server-name-ocp-dell-x"
-        assert by_name != install_server_workflow_id("dell-r650-tlv-64c-1024gb")
+        assert by_name != install_server_slot_workflow_id("dell-r650-tlv-64c-1024gb", 1)
 
     def test_one_machine_gets_one_id_however_the_caller_cased_its_name(self) -> None:
         """server-scan names carry an uppercase vendor serial.
@@ -340,13 +343,13 @@ class TestWorkflowIdKeysOnTheCandidatePool:
         both racing onto the same BareMetalHost, which is the collision the id
         exists to prevent.
         """
-        upper = install_server_workflow_id("ie", "ocp-hp-gen11-nyc-64c-128gb-HP0001592")
-        lower = install_server_workflow_id("ie", "ocp-hp-gen11-nyc-64c-128gb-hp0001592")
+        upper = install_server_name_workflow_id("ocp-hp-gen11-nyc-64c-128gb-HP0001592")
+        lower = install_server_name_workflow_id("ocp-hp-gen11-nyc-64c-128gb-hp0001592")
         assert upper == lower
 
     def test_two_different_servers_still_get_different_ids(self) -> None:
         # Lowercasing cannot merge two machines: server-scan names differ by
         # more than case.
-        assert install_server_workflow_id("ie", "ocp-a-HP0001592") != (
-            install_server_workflow_id("ie", "ocp-a-HP0001593")
+        assert install_server_name_workflow_id("ocp-a-HP0001592") != (
+            install_server_name_workflow_id("ocp-a-HP0001593")
         )

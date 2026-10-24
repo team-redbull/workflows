@@ -38,8 +38,8 @@ from shared.models.server_lifecycle import (
     RemoveServerRunArgs,
 )
 from shared.workflow_ids import (
+    install_server_name_workflow_id,
     install_server_slot_workflow_id,
-    install_server_workflow_id,
     publish_infraenv_boot_workflow_id,
     remove_server_workflow_id,
 )
@@ -70,9 +70,9 @@ _MCE_CLUSTER_DESCRIPTION = (
 # The most runs one request starts: `count` and a `server_names` list alike.
 _MAX_INSTALLS_PER_REQUEST = 20
 # InstallServerInput.candidate_count's ceiling, which caps the spares a
-# `count` request gives each run by default.
+# pool run gets by default.
 _MAX_CANDIDATES = 20
-# Slots a `count` request looks through for free ones: `_1` … `_100`. Far more
+# Slots a pool request looks through for free ones: `_1` … `_100`. Far more
 # than can run at once on one pool; it only bounds the scan.
 _MAX_SLOTS = 100
 
@@ -86,11 +86,9 @@ _ServerNameList = Annotated[
 
 # Deterministic ids come from shared/workflow_ids.py — the ONE definition per
 # scheme, so the id this route builds and the id anything else builds for the
-# same target can never drift apart.
-def _workflow_id(install_input: InstallServerInput) -> str:
-    return install_server_workflow_id(
-        install_input.infra_env, install_input.server_name
-    )
+# same target can never drift apart: a pool run is on a slot of its InfraEnv
+# (install_server_slot_workflow_id), a named run on its machine
+# (install_server_name_workflow_id).
 
 
 async def _start(client: Client, run_input: InstallServerInput, workflow_id: str):
@@ -114,9 +112,9 @@ def _count_statuses(results: list[Any]) -> dict[str, int]:
 class InstallServerRequest(BaseModel):
     """The install-server request body: one shape for every way of asking.
 
-    Which servers: with none named, the InfraEnv's pool picks healthy ones
-    (one, or `count` of them); `server_names` names the machines instead, one
-    or a list. Either way every server is a run of its own (`run_input`).
+    Which servers: with none named, the InfraEnv's pool picks `count` healthy
+    ones (1 unless sent); `server_names` names the machines instead, one or a
+    list. Either way every server is a run of its own (`run_input`).
 
     Deliberately NOT InstallServerInput, nor a subclass of it: a request is no
     longer one run. That model is decoded from Temporal history on every
@@ -157,15 +155,17 @@ class InstallServerRequest(BaseModel):
             "each once. Each is its own run. Not with `count` or `candidate_count`."
         ),
     )
+    # None, not 1: it must stay unset next to `server_names` (a 422 there),
+    # and sending it is what asks for the per-run report.
     count: int | None = Field(
         default=None,
         ge=1,
         le=_MAX_INSTALLS_PER_REQUEST,
         description=(
             "Let the pool pick this many healthy servers and install them IN "
-            "PARALLEL, one run each. Omit it for a single install, which a second "
-            "request gets a 409 for while it runs. With `count`, runs still going "
-            "are stepped over, so a second request adds this many more."
+            "PARALLEL, one run each. Omitted, the pool picks one. Runs already "
+            "going on the pool are stepped over, so asking again — with or "
+            "without `count` — adds installs rather than colliding."
         ),
     )
     candidate_count: int | None = Field(
@@ -175,8 +175,8 @@ class InstallServerRequest(BaseModel):
         description=(
             "How many healthy servers each pool run asks server-scan for, so it "
             "has others to try when one is unusable or another run takes it. "
-            "Defaults to 3, or with `count` to one per run on the pool plus 2 "
-            f"(at most {_MAX_CANDIDATES})."
+            "Defaults to one per run on the pool plus 2 "
+            f"(at most {_MAX_CANDIDATES}): 3 for a lone install."
         ),
     )
     labels: dict[str, str] = Field(
@@ -326,14 +326,13 @@ async def start_install_server(
     EVERY SERVER IS ITS OWN WORKFLOW RUN, with its own id, status and failure;
     there is never one run for a batch. The body decides how many:
 
-    - **Neither `count` nor `server_names`**: the pool picks ONE server,
-      answered with `{workflow_id, run_id}`. Its id is the pool's
-      (`install-server-<infraEnv>`), so a second such request while it runs is
-      a 409 — which keeps a double-click or a retried POST from installing two.
-    - **`count: N`**: the pool picks N, installed IN PARALLEL, one run per
-      slot (`install-server-<infraEnv>_<slot>`), answered with a per-run
-      report. Slots still running are stepped over, so a second request adds
-      N more rather than colliding.
+    - **Neither `count` nor `server_names`**: the pool picks ONE server, in
+      the first free slot (`install-server-<infraEnv>_<slot>`), answered with
+      `{workflow_id, run_id}`. Slots still running are stepped over, so the
+      same request sent again while it installs starts a SECOND install — it
+      is never a 409 (only when all 100 slots are busy).
+    - **`count: N`**: the pool picks N, installed IN PARALLEL, one per free
+      slot, answered with a per-run report. A second request adds N more.
     - **`server_names: "<name>"`**: that one machine
       (`install-server-name-<server>`), answered with `{workflow_id, run_id}`;
       a 409 while it is already installing.
@@ -354,34 +353,54 @@ async def start_install_server(
     physical ports, or a BareMetalHost that never registers all surface there
     as a FAILED run — not as a 4xx here.
     """
-    if install_request.count is not None:
-        return await _start_pool_installs(client, install_request, install_request.count)
     if isinstance(install_request.server_names, list):
         return await _start_named_installs(client, install_request, install_request.server_names)
+    if install_request.server_names is not None:
+        return await _start_named_install(client, install_request, install_request.server_names)
 
-    # One run: the pool's, or the one named server's.
-    run_input = install_request.run_input(server_name=install_request.server_names)
+    results = await _start_pool_installs(client, install_request, install_request.count or 1)
+    if install_request.count is not None:
+        return InstallServerBatchResponse(**_count_statuses(results), results=results)
+    # A lone pool install answers like any single run.
+    last = results[-1]
+    if last.status == "started":
+        return StartWorkflowResponse(workflow_id=last.workflow_id, run_id=last.run_id or "")
+    if last.status == "failed":
+        raise HTTPException(status_code=502, detail=_temporal_refused(last.workflow_id, last.error))
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            f"Every slot of InfraEnv {install_request.infra_env} (`_1` to "
+            f"`_{_MAX_SLOTS}`) has an install-server run in flight"
+        ),
+    )
+
+
+def _temporal_refused(workflow_id: str, error: str | None) -> str:
+    return f"Temporal did not start {workflow_id}: {error}"
+
+
+async def _start_named_install(
+    client: Client, request: InstallServerRequest, server_name: str
+) -> StartWorkflowResponse:
+    """One named machine, answered as one run: a 409 while it is installing."""
+    run_input = request.run_input(server_name=server_name)
+    workflow_id = install_server_name_workflow_id(server_name)
     try:
-        handle = await _start(client, run_input, _workflow_id(run_input))
+        handle = await _start(client, run_input, workflow_id)
     except WorkflowAlreadyStartedError:
         raise HTTPException(
             status_code=409,
-            detail=(
-                f"An install-server run is already in flight for server {run_input.server_name}"
-                if run_input.server_name
-                else (
-                    "An install-server run is already in flight for InfraEnv "
-                    f"{run_input.infra_env}. To install more servers from it in "
-                    f"parallel, send `count` (1-{_MAX_INSTALLS_PER_REQUEST})."
-                )
-            ),
+            detail=f"An install-server run is already in flight for server {server_name}",
         )
+    except Exception as exc:  # noqa: BLE001 — answered with its reason, not a bare 500
+        raise HTTPException(status_code=502, detail=_temporal_refused(workflow_id, str(exc)))
     return StartWorkflowResponse(workflow_id=handle.id, run_id=handle.result_run_id or "")
 
 
 async def _start_pool_installs(
     client: Client, request: InstallServerRequest, count: int
-) -> InstallServerBatchResponse:
+) -> list[InstallServerItem]:
     """`count` NEW runs from the InfraEnv's pool, each in the first free slot.
 
     Walks the slots from `_1` up and steps over every one whose run is still
@@ -432,7 +451,7 @@ async def _start_pool_installs(
             )
         )
 
-    return InstallServerBatchResponse(**_count_statuses(results), results=results)
+    return results
 
 
 async def _start_named_installs(
@@ -443,7 +462,7 @@ async def _start_named_installs(
 
     async def _start_one(server_name: str) -> InstallServerItem:
         run_input = request.run_input(server_name=server_name)
-        workflow_id = _workflow_id(run_input)
+        workflow_id = install_server_name_workflow_id(server_name)
         try:
             handle = await _start(client, run_input, workflow_id)
         except WorkflowAlreadyStartedError:

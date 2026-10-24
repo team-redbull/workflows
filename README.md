@@ -255,9 +255,11 @@ mid-create leaves the BareMetalHost on the MCE while the lock expires after
    watch — 14 hours, measured — so only the deadline itself distinguished a dead
    host from a slow one.
 
-Its id is `install-server-<infraEnv>` — the **candidate pool**, not the target
-pair, because the pool is `^ocp-<infraEnv>` with no MCE in it. Installs drawing
-from one pool are therefore serial.
+Its id is `install-server-<infraEnv>_<slot>` — the **candidate pool** plus a
+slot, not the target pair, because the pool is `^ocp-<infraEnv>` with no MCE in
+it. Installs drawing from one pool run in parallel, one per slot (see
+[Several servers at once](#several-servers-at-once--count-or-a-list-of-server_names));
+a named machine's is `install-server-name-<server>`.
 
 **The install lock is the guard across MCEs.** server-scan lists a machine
 `AVAILABLE` until a cluster reports it, and the BareMetalHost probe in step 3
@@ -269,8 +271,8 @@ machine), and is released only after a teardown proved nothing on the cluster
 still points at the machine; a failure anywhere else leaves it to expire,
 because half-created resources may still name it. It needs server-scan's
 **admin** role. Runs started before it existed replay without it
-(`workflow.patched`). With the lock in place the per-pool id could become
-per-(pool, MCE); that is a separate decision and not made here.
+(`workflow.patched`). The lock is what lets a pool be drawn from in
+parallel: the id no longer has to keep one run per pool.
 
 **The inventory VLAN is the MCE's, and is read before anything is drawn.** An
 MCE owns one inventory network, allocated in the Segments Manager as
@@ -320,9 +322,9 @@ several runs (next sections).
 | | `server_names` omitted — *"fill this InfraEnv"* | `server_names` given — *"install this machine"* |
 | --- | --- | --- |
 | server-scan query | `?pattern=^ocp-<infraEnv>&count=<candidate_count>` | `?name=<server>&count=1` |
-| candidates drawn | `candidate_count` (default 3, 1–20) | one |
+| candidates drawn | `candidate_count` (default: runs on the pool + 2, so 3 for a lone install; 1–20) | one |
 | already has a BareMetalHost | **skipped**, next candidate tried | **converged** — that is the point |
-| workflow id | `install-server-<infraEnv>`, or `…_<slot>` with `count` | `install-server-name-<server>` |
+| workflow id | `install-server-<infraEnv>_<slot>`, the first free slot | `install-server-name-<server>` |
 | use it for | routine capacity: take whatever is free and healthy | re-running a specific host, or repairing one |
 
 Both modes apply every other rule identically: `HEALTHY` only, at least two NIC
@@ -345,8 +347,8 @@ resource name — three different people's problem, so they are never merged.
 | `mce_cluster` | str | non-empty | Which MCE. Names the `INVENTORY` segment the VLAN comes from **and** the activity queue the cluster writes go to. |
 | `namespace` | str | non-empty | Where the three resources go. **Must be the InfraEnv's own namespace** — BMAC looks for the InfraEnv beside the BareMetalHost. |
 | `server_names` | str \| list \| null | default `null`; a list is 1–20 names, each once | Install these machines instead of letting the pool pick (see above): one name, or a list — one run per name. |
-| `count` | int \| null | 1–20, default `null` | Let the pool pick this many and install them in parallel, one run each (see below). Not with `server_names`. |
-| `candidate_count` | int \| null | 1–20, default `null` | How many candidates each pool run draws: 3 if unset, or with `count` (runs on the pool) + `count` + 2, max 20. Not with `server_names`. |
+| `count` | int \| null | 1–20, default `null` (the pool picks one) | Let the pool pick this many and install them in parallel, one run each (see below). Sending it asks for the per-run report. Not with `server_names`. |
+| `candidate_count` | int \| null | 1–20, default `null` | How many candidates each pool run draws: if unset, (runs on the pool) + new runs + 2, max 20 — 3 for a lone install. Not with `server_names`. |
 | `labels` | map | default `{}` | Extra labels for the BareMetalHost. Cannot override the InfraEnv label — that would split the host from its NMStateConfig. |
 
 There is deliberately **no `vlan_id`**: it belongs to the MCE's segment, and a
@@ -367,7 +369,7 @@ follows what was sent:
 
 | body | runs | reply |
 | --- | --- | --- |
-| neither | 1, the pool picks | `{workflow_id, run_id}`; 409 while one runs |
+| neither | 1, the pool picks | `{workflow_id, run_id}`; sent again while it runs, a second install |
 | `"count": N` | N, the pool picks, in parallel | per-run report |
 | `"server_names": "ocp-…"` | 1, that machine | `{workflow_id, run_id}`; 409 while it installs |
 | `"server_names": ["ocp-…", …]` | 1 per name, in parallel | per-run report (even for a list of one) |
@@ -377,15 +379,13 @@ The per-run report is 202 with `started` / `already_running` / `failed` and one
 pool run or `server_name` for a named one). `count` and `candidate_count` size a
 draw from the pool, so either one with `server_names` is a 422.
 
-**From the pool: `count`.** Without it, install-server is ONE install keyed on
-the pool (`install-server-<infraEnv>`), so a second request while it runs is a
-409 — which is what keeps a double-click or a retried POST from installing two
-servers. With `count: N` it starts N NEW runs in parallel instead, as
-`install-server-<infraEnv>_<slot>`: the route walks the slots from `_1` up,
+**From the pool: slots.** Every run the pool picks for is on a slot,
+`install-server-<infraEnv>_<slot>`. The route walks the slots from `_1` up,
 steps over every slot whose run is still going and starts one in each free slot
-until N have started — so a second batch of 5 while the first 5 still install
-takes `_6`–`_10` instead of colliding. A finished slot is free again (Temporal
-reuses a closed run's id).
+— one without `count`, N with `count: N`. So a second install while the first
+still runs takes `_2` instead of a 409, and a second batch of 5 while the first
+5 install takes `_6`–`_10`. A finished slot is free again (Temporal reuses a
+closed run's id). The only 409 left from the pool is all 100 slots running.
 
 **By name: a list of `server_names`.** One run per name, on the same id a single
 named install uses (`install-server-name-<server>`), so a machine is one run
@@ -411,12 +411,16 @@ to learn.
 
 - **One workflow per server.** Each has its own id, status and failure, and
   Temporal refuses a second run for the same machine.
-- **The single-install 409 stays.** It makes a double-click harmless.
+- **No 409 from the pool** (revised 2026-10-24). A single install sent while
+  another runs used to be refused until the first finished — up to an hour.
+  Asking the pool again is asking for one more server, so it takes the next
+  slot. The 409 stays for a named machine.
 - **`count` and `candidate_count` next to names are refused, not ignored.**
 
-`install-server/bulk` is gone (404). A `count` request starts N more each time,
-so it is not retry-safe. That was accepted because its callers are people, not
-controllers. The options weighed and the collision cases are in
+`install-server/bulk` is gone (404). A request to the pool, with or without
+`count`, starts more installs each time it is sent, so it is not retry-safe: a
+double-click installs two. That was accepted because its callers are people,
+not controllers. The options weighed and the collision cases are in
 [`docs/design/install-server-api.md`](docs/design/install-server-api.md).
 
 ### `publish-infraenv-boot` — an InfraEnv's current iPXE script onto its PXE VM
@@ -614,9 +618,10 @@ would hide which segments actually got a workflow.
   it matches, and a run skips candidates that already have a BareMetalHost.
   Workflow ids are deterministic (`initialize-segment-<network>`,
   `allocate-segment-<TYPE>-<cluster>`, `release-segment-<TYPE>-<cluster>`,
-  `install-server-<infraEnv>` or
   `install-server-name-<server>`), so a duplicate trigger while running gets
-  HTTP 409.
+  HTTP 409. install-server's pool draws are the exception on purpose: each takes
+  a free slot (`install-server-<infraEnv>_<slot>`), and the install lock keeps
+  them on different machines.
 
 ## Configuration
 

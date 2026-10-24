@@ -50,37 +50,12 @@ def allocate_segment_workflow_id(segment_type: SegmentType, cluster: str) -> str
     return f"allocate-segment-{segment_type.value}-{cluster}"
 
 
-def install_server_workflow_id(infra_env: str, server_name: str | None = None) -> str:
-    """`install-server-<infraEnv>`, or `install-server-name-<server>` when named.
+def install_server_name_workflow_id(server_name: str) -> str:
+    """`install-server-name-<server>`: an install of ONE NAMED machine.
 
-    Keyed on the CANDIDATE POOL, not on the machine and not on the target.
-
-    Not the machine, because it is not known when the run starts: which server
-    gets installed is decided inside the workflow, by asking server-scan.
-    Building the id from it would mean acquiring the server in the router
-    first — putting the decision the run's outcome depends on outside the run,
-    which is exactly the shape initialize-segment was changed to avoid.
-
-    Not the (InfraEnv, MCE) pair either, which is what this keyed on first and
-    was wrong: the pool a run draws from is `^ocp-<infraEnv>`, with no MCE in
-    it. Two MCEs each filling an InfraEnv of the same name would get DIFFERENT
-    ids while drawing from the SAME pool — the one case the serialization
-    exists to prevent. The pool is the InfraEnv, so the id is too.
-
-    Serializing per pool was the first defence against two runs racing onto
-    one machine, since server-scan's draw hands candidates out unlocked. The
-    run now also takes server-scan's install lock on the machine it chooses
-    (ADR-0035 there), which covers what this id never could: a run for ANOTHER
-    MCE drawing a server already installed elsewhere, invisible to its own
-    BareMetalHost probe. With the lock, a pool CAN be drawn from in parallel —
-    install-server with `count` does it, with install_server_slot_workflow_id
-    below — so this id now only keeps a request WITHOUT `count` at one run per
-    pool, which is what stops a retried POST installing a second server.
-
-    An explicitly named server draws from a pool of one, so it gets its own id
-    and does not serialize against pattern draws for the same InfraEnv.
     install-server builds it for every name in `server_names`, one or a list,
-    so one machine is one run however it is asked for.
+    so one machine is one run however it is asked for: a second request for it
+    while it installs is a dedup hit, never a second run.
 
     That name is LOWERCASED, which is not cosmetic: server-scan names carry an
     uppercase vendor serial, the run lowercases it to build the resource names,
@@ -90,26 +65,44 @@ def install_server_workflow_id(infra_env: str, server_name: str | None = None) -
     exists to prevent. Two different servers cannot collide by lowercasing:
     server-scan names differ by more than case.
     """
-    if server_name:
-        return f"install-server-name-{server_name.lower()}"
-    return f"install-server-{infra_env}"
+    return f"install-server-name-{server_name.lower()}"
 
 
 def install_server_slot_workflow_id(infra_env: str, slot: int) -> str:
-    """`install-server-<infraEnv>_<slot>`: one of N PARALLEL pool draws (install-server + `count`).
+    """`install-server-<infraEnv>_<slot>`: one of the PARALLEL draws from a pool.
 
-    The id above serializes a pool to one run, which was the defence against two
-    runs drawing one machine before the install lock existed. The lock is that
-    defence now, and it holds for any number of runs: server-scan takes it by
-    compare-and-set on the document revision, refuses a live lock to any OTHER
-    workflow id, and the run writes nothing until it holds it — a run that loses
-    the race skips the machine (`reserved`) and tries its next candidate. So N
-    slots may draw from one pool at once and still land on N different machines,
-    while a repeated request for a slot that is still running is a dedup hit,
-    exactly as the single id is.
+    Every install-server run that lets the pool pick is on a slot: `count: N`
+    fills N free ones, and a request without `count` fills one. Keyed on the
+    CANDIDATE POOL plus a slot number, and on neither of the obvious things:
+
+    Not the machine, because it is not known when the run starts: which server
+    gets installed is decided inside the workflow, by asking server-scan.
+    Building the id from it would mean acquiring the server in the router
+    first — putting the decision the run's outcome depends on outside the run,
+    which is exactly the shape initialize-segment was changed to avoid.
+
+    Not the MCE: the pool a run draws from is `^ocp-<infraEnv>`, with no MCE in
+    it, so two MCEs filling an InfraEnv of the same name share ONE set of
+    slots — which is what lets each new run count every run already drawing
+    from the pool when it sizes its spares.
+
+    The id does not stop two runs taking one machine; the install lock does,
+    for any number of runs: server-scan takes it by compare-and-set on the
+    document revision, refuses a live lock to any OTHER workflow id, and the
+    run writes nothing until it holds it — a run that loses the race skips the
+    machine (`reserved`) and tries its next candidate. So any number of slots
+    may draw from one pool at once and still land on different machines.
+
+    Pool draws used to be serialized on ONE id per pool,
+    `install-server-<infraEnv>`, so a repeated request was a 409: first as the
+    only defence against two runs drawing one machine (before the lock), then
+    only to stop a double-click or a retried POST installing two. Dropped on
+    2026-10-24:
+    its callers are people asking for one more server, and the 409 refused
+    exactly that. Runs started on it before then keep that id.
 
     `_` because a Kubernetes name cannot contain it: a slot id can never equal
-    the single id of an InfraEnv whose own name ends in `-<digits>`.
+    the old id of an InfraEnv whose own name ends in `-<digits>`.
     """
     return f"install-server-{infra_env}_{slot}"
 
@@ -120,7 +113,7 @@ def remove_server_workflow_id(server_name: str) -> str:
     Keyed on the MACHINE, unlike install-server: the server is named up front,
     and it is what two removals would race on. The distinct prefix keeps a
     removal from colliding with an install of the same server. Lowercased for
-    the reason install_server_workflow_id gives — one machine, one id, however
+    the reason install_server_name_workflow_id gives — one machine, one id, however
     a caller typed its uppercase serial.
     """
     return f"remove-server-{server_name.lower()}"

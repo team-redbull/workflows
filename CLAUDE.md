@@ -685,19 +685,19 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   `POST /workflows/server-lifecycle/install-server` is ASYNC (202 + workflow id) and takes the
   InfraEnv to fill plus its MCE cluster; the InfraEnv's name states which hardware it is for
   (`cisco-m6-bat-yam-64c-512gb`) and server names carry the same tokens behind an `ocp-` prefix,
-  so the InfraEnv IS the server query. Without `count` its id keys on the CANDIDATE POOL — the
-  InfraEnv alone, with no MCE in it — so such requests on one pool are serial (the 409 on a
-  duplicate is what stops a retried POST installing twice), and two MCEs filling an InfraEnv of
-  the same name draw from the same pool. The install lock (§4) now guards the machine itself, so
-  PARALLEL draws exist: `count` (1-20, on the request ONLY — never in a run's input,
-  which is decoded from history) starts `count`
-  NEW runs, one per SLOT, id `install-server-<infraEnv>_<slot>` (`_` cannot occur in a Kubernetes
-  name, so it never equals another InfraEnv's single id). It walks slots `_1`..`_100`, steps over
+  so the InfraEnv IS the server query. EVERY POOL RUN IS ON A SLOT of its CANDIDATE POOL — the
+  InfraEnv alone, with no MCE in it, so two MCEs filling an InfraEnv of the same name share one
+  set of slots. The install lock (§4) guards the machine itself, so draws are PARALLEL: a request
+  without `count` starts ONE new run and `count` (1-20, on the request ONLY — never in a run's
+  input, which is decoded from history) starts `count`, one per SLOT, id
+  `install-server-<infraEnv>_<slot>` (`_` cannot occur in a Kubernetes name, so it never equals
+  another InfraEnv's old single id). It walks slots `_1`..`_100`, steps over
   every slot whose run is still RUNNING (WorkflowAlreadyStartedError) and fills free ones, so a
   second request during the first batch adds installs — it used to collide on `_1`..`_N`. A
   closed slot is reused (Temporal's default ALLOW_DUPLICATE id reuse; `TestAFinishedSlotIsFreeAgain`).
-  A start Temporal refuses for any other reason stops the scan. Each run draws `candidate_count` =
-  (busy slots) + `count` + 2 (max 20) by default, because every run on the pool locks one
+  A start Temporal refuses for any other reason stops the scan (a 502 with its reason when the
+  request is one run). Each run draws `candidate_count` =
+  (busy slots) + new runs + 2 (max 20) by default, because every run on the pool locks one
   machine from the same top of the list. Safe because server-scan's reserve is a compare-and-set on the document revision that
   refuses a live lock to any other workflow id, and the run writes nothing before holding it —
   `TestParallelRunsOnOnePool` runs two at once. The test harness's mock lock must keep refusing
@@ -714,7 +714,13 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   2026-10-23: `install-server/bulk` (the `count` draw from 2026-10-20) read as "a list of
   servers", the parallel draw went unfound, and a caller asking twice for one InfraEnv met the
   409 — so `/bulk` was REMOVED (404) and everything moved onto install-server. Retry-safety of a
-  `count` request was weighed and left out: its callers are humans, not controllers.
+  `count` request was weighed and left out: its callers are humans, not controllers. REVISED with
+  the operator 2026-10-24: a request WITHOUT `count` was still ONE run on the pool's id
+  (`install-server-<infraEnv>`), a 409 until the first finished — up to an hour — and asking the
+  pool again IS asking for one more server, so it now takes a slot too and is never a 409 (only
+  when all 100 slots run). Its reply stays `{workflow_id, run_id}`; only `count` asks for the
+  report. The id builder is `install_server_name_workflow_id`, named-only: nothing builds the pool
+  id any more, and runs started on it keep it. A named machine keeps its 409.
   `POST /workflows/segment-lifecycle/initialize-segment` is ASYNC (202 + workflow id) and takes
   the full segment definition; poll `GET /workflows/runs/{workflow_id}` for progress/result. The
   `/bulk` variant takes a list and starts ONE WORKFLOW PER SEGMENT (never one batch workflow — each

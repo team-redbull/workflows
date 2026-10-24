@@ -84,8 +84,7 @@ def test_a_vlan_is_still_refused(client):
     assert client.post(PATH, json={**BODY, "vlan_id": 24}).status_code == 422
 
 
-POOL_ID = "install-server-cisco-m6-bat-yam-64c-512gb"
-SLOT = POOL_ID + "_{}"
+SLOT = "install-server-cisco-m6-bat-yam-64c-512gb_{}"
 NAMES = ["ocp-cisco-m6-bat-yam-64c-512gb-WZP1", "ocp-cisco-m6-bat-yam-64c-512gb-WZP2"]
 
 
@@ -109,12 +108,13 @@ def _with_temporal(fake, *, running: set[str], fail_on: str | None = None) -> se
     return running
 
 
-def test_without_count_it_is_one_run_on_the_pool_id(client, fake):
+def test_without_count_it_is_one_run_in_the_first_slot(client, fake):
     response = client.post(PATH, json=BODY)
 
     assert response.status_code == 202
-    assert response.json() == {"workflow_id": POOL_ID, "run_id": "run-1"}
-    # The pool picks the server; the run's own default number of candidates.
+    # One run, answered as one run - only `count` asks for the report.
+    assert response.json() == {"workflow_id": SLOT.format(1), "run_id": "run-1"}
+    # The pool picks the server: itself plus 2 spares.
     assert fake.args[0].input.server_name is None
     assert fake.args[0].input.candidate_count == 3
 
@@ -124,15 +124,57 @@ def test_an_explicit_candidate_count_is_the_run_s(client, fake):
     assert fake.args[0].input.candidate_count == 7
 
 
-def test_a_second_single_install_while_one_runs_is_409_and_points_at_count(client, fake):
-    # The reported failure: asking again for the same InfraEnv answers 409.
-    # That stays (it is what stops a retried POST installing two servers), but
-    # it now says how to install several.
-    _with_temporal(fake, running={POOL_ID})
+def test_one_install_after_another_both_start(client, fake):
+    # Asking the pool again while an install runs is asking for one MORE
+    # server, so it takes the next slot - never a 409 (decided 2026-10-24).
+    running = _with_temporal(fake, running=set())
+    first = client.post(PATH, json=BODY)
+    second = client.post(PATH, json=BODY)
+
+    assert (first.status_code, second.status_code) == (202, 202)
+    assert [first.json()["workflow_id"], second.json()["workflow_id"]] == [
+        SLOT.format(1), SLOT.format(2),
+    ]
+    assert running == {SLOT.format(1), SLOT.format(2)}
+    # The second run knows the first draws from the same pool.
+    assert [a.input.candidate_count for a in fake.args] == [3, 4]
+
+
+def test_a_lone_install_and_count_share_the_slots(client, fake):
+    _with_temporal(fake, running=set())
+    client.post(PATH, json=BODY)
+    body = client.post(PATH, json={**BODY, "count": 2}).json()
+    after = client.post(PATH, json=BODY).json()
+
+    assert [r["slot"] for r in body["results"]] == [1, 2, 3]
+    assert [r["status"] for r in body["results"]] == ["already_running", "started", "started"]
+    assert after["workflow_id"] == SLOT.format(4)
+
+
+def test_a_finished_install_frees_its_slot(client, fake):
+    running = _with_temporal(fake, running=set())
+    client.post(PATH, json=BODY)
+    running.clear()  # the run on _1 closed
+    assert client.post(PATH, json=BODY).json()["workflow_id"] == SLOT.format(1)
+
+
+def test_a_lone_install_with_every_slot_busy_is_409(client, fake):
+    _with_temporal(fake, running={SLOT.format(n) for n in range(1, 101)})
     response = client.post(PATH, json=BODY)
 
     assert response.status_code == 409
-    assert "`count`" in response.json()["detail"]
+    assert "Every slot" in response.json()["detail"]
+
+
+@pytest.mark.parametrize("extra", [{}, {"server_names": NAMES[0]}])
+def test_a_start_temporal_refuses_is_502_with_its_reason(client, fake, extra):
+    wid = _named_id(NAMES[0]) if extra else SLOT.format(1)
+    _with_temporal(fake, running=set(), fail_on=wid)
+    response = client.post(PATH, json={**BODY, **extra})
+
+    assert response.status_code == 502
+    assert wid in response.json()["detail"]
+    assert "Temporal unavailable" in response.json()["detail"]
 
 
 @pytest.mark.parametrize(
@@ -198,9 +240,9 @@ class TestInstallServerCount:
         assert all(a.input.server_name is None for a in fake.args)
         assert all(a.input.namespace == "inventory" for a in fake.args)
 
-    def test_a_single_install_in_flight_does_not_block_count(self, client, fake):
-        # What the reporter needed: more servers while one install is running.
-        _with_temporal(fake, running={POOL_ID})
+    def test_a_run_on_the_retired_pool_id_does_not_block_count(self, client, fake):
+        # Runs started before 2026-10-24 sit on `install-server-<infraEnv>`.
+        _with_temporal(fake, running={"install-server-cisco-m6-bat-yam-64c-512gb"})
         body = client.post(PATH, json={**BODY, "count": 2}).json()
 
         assert body["started"] == 2

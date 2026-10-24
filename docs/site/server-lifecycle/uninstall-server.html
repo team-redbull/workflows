@@ -113,7 +113,8 @@
           <li><b>Locks</b> the server in server-scan.</li>
           <li><b>Checks again</b>, fresh, right before removing it: still no AgentMachine, no Machine,
             no binding. An Available Agent is free for any NodePool to take at any moment; if one took
-            it, the run stops (<code>AgentRetakenError</code>) and touches nothing.</li>
+            it, the run stops (<code>AgentRetakenError</code>) and touches nothing
+            (<a href="#checked-twice">why twice</a>).</li>
           <li><b>remove-server</b>, awaited:
             <ol type="a">
               <li><b>power off</b> &mdash; <code>spec.online: false</code> on the BareMetalHost, then wait
@@ -130,6 +131,52 @@
           </li>
         </ol>
       </div>
+    </div>
+
+    <div class="panel" id="checked-twice" style="margin-top:18px">
+      <h3>Why an inventory host is checked twice</h3>
+      <p>The first look, <b>inspecting</b>, <b>picks the path</b>: nothing hosted is linked to the server,
+      so the hosted-cluster half is skipped. The second, <b>verifying-agentmachine</b>, runs right before
+      remove-server &mdash; <b>the step that cannot be undone</b> &mdash; to make sure that answer has not
+      changed in between.</p>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>phase</th><th>what it looks at</th></tr></thead>
+          <tbody>
+            <tr><td class="k">inspecting</td><td class="muted"><b>check 1</b> &mdash; is any AgentMachine, Machine or binding linked to the Agent? None: an inventory host</td></tr>
+            <tr><td class="k">checking-hosted-node</td><td class="muted">the hosted cluster server-scan names, for a stale Node of the server</td></tr>
+            <tr><td class="k">reserving-server</td><td class="muted">server-scan&rsquo;s lock &mdash; which no NodePool knows about</td></tr>
+            <tr><td class="k">verifying-agentmachine</td><td class="muted"><b>check 2</b> &mdash; still none? Read fresh, with the same links as check 1</td></tr>
+            <tr><td class="k">holding-server</td><td class="muted">the lock extended to 24 h</td></tr>
+            <tr><td class="k">remove-server</td><td class="muted">refuses a bound Agent at its inspection, again right before the power-off, and again right before the Agent delete</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p><b>Why the answer can change.</b> An <em>Available</em> Agent is exactly what any NodePool&rsquo;s
+      new AgentMachine takes, at any moment: the Agent provider picks any approved, validated, connected,
+      unbound Agent the NodePool matches (<code>findAgent</code>). The server-scan lock does not stop it
+      &mdash; the provider knows nothing about server-scan. The gap between the two looks is usually
+      seconds, but the lock and the hosted-Node read both retry with no limit, so during a server-scan or
+      hosted-cluster outage the first answer can be <b>hours old</b> by the time the run reaches
+      remove-server.</p>
+      <p><b>Where it overlaps with remove-server.</b> remove-server already refuses a bound Agent before it
+      powers the host off, and the provider writes the binding and its <code>agentMachineRef</code> label in
+      <b>the same update</b>, so a retake would be caught there too. Once the host is off, assisted-service
+      marks its Agent disconnected and no NodePool can pick it; remove-server&rsquo;s check right before the
+      Agent delete covers the minutes until then. So the race ends inside remove-server. The second look
+      still earns its one read:</p>
+      <ul>
+        <li><b>A clear stop, before the child starts</b> &mdash; <code>AgentRetakenError</code> from this run,
+          naming the AgentMachine that took the server, instead of <code>RemoveServerFailedError</code>
+          wrapping the child&rsquo;s <code>AgentBoundToClusterError</code>.</li>
+        <li><b>The links remove-server does not read</b> &mdash; an AgentMachine, a Machine, a binding into a
+          HostedCluster&rsquo;s control plane (<code>ServerStillPresentError</code>); remove-server looks at
+          the binding only. The provider writes these after the binding, so on their own they rarely decide
+          anything.</li>
+      </ul>
+      <p class="note">For a <b>hosted node</b> the second look has a different job: the first finds the
+      AgentMachine and Machine so the run can delete them, and <b>verifying-agentmachine</b> confirms they
+      are gone.</p>
     </div>
 
     <div class="panel" id="keep-inventory" style="margin-top:18px">
@@ -184,7 +231,7 @@
         <thead><tr><th></th><th>a hosted cluster&rsquo;s node</th><th>an inventory host</th></tr></thead>
         <tbody>
           <tr><td class="k">what inspection sees</td><td class="muted">an Agent bound (<code>spec.clusterDeploymentName</code>) <b>and</b> an AgentMachine behind it &mdash; <em>or</em> an AgentMachine whose <code>status.agentRef</code> still names the Agent (a Machine deletion already under way: the run <b>resumes</b> it) &mdash; <em>or</em> whatever a broken deletion left of one: a Machine found by the Agent&rsquo;s providerID, a binding into a HostedCluster&rsquo;s control plane (<a href="#leftovers">leftovers</a>)</td><td class="muted">nothing links the Agent to a hosted cluster &mdash; or no Agent at all</td></tr>
-          <tr><td class="k">hosted-cluster half</td><td class="muted">runs: drain a Node no Machine stands behind, delete the Machine, wait for CAPI and the provider &mdash; making the provider&rsquo;s writes where it cannot &mdash; then verify Machine, AgentMachine, Node and Agent all gone</td><td class="muted"><b>skipped</b>, and named in <code>skipped</code> &mdash; unless the cluster server-scan names still has a stale Node of it, which is deleted. <b>Checked again</b>, fresh, right before remove-server: no AgentMachine, no Machine, no binding</td></tr>
+          <tr><td class="k">hosted-cluster half</td><td class="muted">runs: drain a Node no Machine stands behind, delete the Machine, wait for CAPI and the provider &mdash; making the provider&rsquo;s writes where it cannot &mdash; then verify Machine, AgentMachine, Node and Agent all gone</td><td class="muted"><b>skipped</b>, and named in <code>skipped</code> &mdash; unless the cluster server-scan names still has a stale Node of it, which is deleted. <b>Checked again</b>, fresh, right before remove-server: no AgentMachine, no Machine, no binding (<a href="#checked-twice">why twice</a>)</td></tr>
           <tr><td class="k">inventory half</td><td class="muted" colspan="2">remove-server, awaited, the same for both: power off, then the NMStateConfig, the BareMetalHost and its Secret, the Agent, the PXE map (<a href="#cases">step by step</a>)</td></tr>
           <tr><td class="k">result</td><td class="muted"><code>hosted: true</code>, the hosted cluster, Machine, AgentMachine and Node</td><td class="muted"><code>hosted: false</code></td></tr>
         </tbody>
@@ -378,7 +425,7 @@
           <b>verifying-agentmachine</b> inspects it again, fresh, with the same links as step 2 &mdash; an
           Agent now bound or held by an AgentMachine fails <code>AgentRetakenError</code>, any other
           AgentMachine, Machine or control-plane link <code>ServerStillPresentError</code>, with nothing on
-          the MCE written.</p>
+          the MCE written (<a href="#checked-twice">why twice</a>).</p>
           <p><b>draining-node</b> &mdash; only for a Node <b>no Machine stands behind</b>, which nothing else
           will drain: cordon it, then evict every Pod CAPI&rsquo;s drain would (all but DaemonSet and mirror
           Pods) through the Eviction API, pass after pass every 30 s. <b>20 minutes</b>, else

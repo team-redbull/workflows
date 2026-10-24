@@ -778,6 +778,11 @@ class HostAgent(BaseModel):
     Agent's binding and label FIRST and then holds the Machine on its
     pre-terminate hook until the host is unbound — an Agent that reads unbound
     while its Machine is still going away.
+
+    A HyperShift deletion that broke half-way leaves other shapes, and
+    `hcp_namespaces` is what still recognises them: a Machine found by the
+    Agent's providerID with no AgentMachine left, or a binding into a
+    HostedCluster's control plane with neither left.
     """
 
     name: str
@@ -790,6 +795,14 @@ class HostAgent(BaseModel):
     agent_machine: str | None = None
     # Whether the Agent still carries the provider's `agentMachineRef` label.
     agent_machine_label: bool = False
+    # The name its Node registers under (`spec.hostname`, else the discovered
+    # one). None from a limb predating the field.
+    hostname: str | None = None
+    # Every hosted control-plane namespace something of this Agent's points
+    # into: its AgentMachine's, its Machine's (any link), and its binding's when
+    # that namespace is a HostedCluster's. Normally one; several is a
+    # contradiction. Empty from a limb predating the field.
+    hcp_namespaces: list[str] = Field(default_factory=list)
 
 
 class MachineRef(BaseModel):
@@ -823,6 +836,16 @@ class MachineState(BaseModel):
     phase: str | None = None
     pending_hooks: list[str] = Field(default_factory=list)
     conditions: list[str] = Field(default_factory=list)
+    # The Agent provider's own pre-terminate hook is on it.
+    provider_hook: bool = False
+    # Deleting and past its drain, waiting on its pre-terminate hooks — where
+    # the provider would unbind the Agent and release its hook.
+    at_pre_terminate_hook: bool = False
+    # `<namespace>/<name>` of the AgentMachine its infrastructureRef names, and
+    # whether that AgentMachine still exists (None: not read — a limb
+    # predating the field, or no AgentMachine named).
+    agent_machine: str | None = None
+    agent_machine_found: bool | None = None
 
 
 class HostedClusterRef(BaseModel):
@@ -841,10 +864,10 @@ class BoundHostState(BaseModel):
     """inspect_bound_host: one server on its MCE, as a hosted-cluster node or not.
 
     Reads only. `machine` and `hosted_cluster` are resolved for the ONE Agent
-    with an AgentMachine behind it; with none (an inventory host) or more than
-    one (the workflow refuses) they stay None. `machine_state` is that
-    Machine's state at inspection — None when the AgentMachine names no
-    Machine any more.
+    linked to a hosted cluster — by an AgentMachine, a Machine, or a binding
+    into a HostedCluster's control plane; with none (an inventory host) or more
+    than one (the workflow refuses) they stay None. `machine_state` is that
+    Machine's state at inspection — None when no Machine is linked any more.
     """
 
     bmh_found: bool = False
@@ -855,6 +878,9 @@ class BoundHostState(BaseModel):
     machine: MachineRef | None = None
     machine_state: MachineState | None = None
     hosted_cluster: HostedClusterRef | None = None
+    # Every Machine linked to the hosted Agent (owner, infrastructureRef,
+    # providerID), `<namespace>/<name>`. More than one is refused.
+    machines_matched: list[str] = Field(default_factory=list)
 
     @property
     def bound_agents(self) -> list[HostAgent]:
@@ -862,7 +888,7 @@ class BoundHostState(BaseModel):
 
     @property
     def hosted_agents(self) -> list[HostAgent]:
-        return [a for a in self.agents if a.agent_machine]
+        return [a for a in self.agents if a.agent_machine or a.hcp_namespaces]
 
 
 class MachineDeletion(BaseModel):
@@ -919,6 +945,139 @@ class HostedNodeState(BaseModel):
     node_name: str
 
 
+# --- uninstall-server: what a broken HyperShift deletion left behind ----------
+
+
+class HostedNodeQuery(BaseModel):
+    """find_hosted_nodes: which hosted cluster to look in, and what makes a Node this server's.
+
+    The cluster is `hosted_cluster` when the MCE links the server to one, else
+    `cluster_name` — server-scan's INSTALLED reading — resolved to the one
+    HostedCluster of that name on the MCE. A Node is the server's by
+    `provider_id` (`agent://<agent>`, CAPI's own link), or by name — the
+    Machine's nodeRef, the Agent's hostname, the server's own name — when it
+    carries no other providerID.
+    """
+
+    hosted_cluster: HostedClusterRef | None = None
+    cluster_name: str | None = None
+    server_name: str = Field(min_length=1)
+    agent_name: str | None = None
+    hostname: str | None = None
+    node_name: str | None = None
+
+
+class HostedNode(BaseModel):
+    """One Node of the hosted cluster that is this server."""
+
+    name: str
+    provider_id: str | None = None
+    # Ready=True: a kubelet is running as it.
+    ready: bool = False
+    unschedulable: bool = False
+    # `provider-id` and/or `name`.
+    matched_by: list[str] = Field(default_factory=list)
+
+
+class HostedNodes(BaseModel):
+    """find_hosted_nodes' answer. `hosted_cluster` None: no cluster to look in (`reason` says why)."""
+
+    hosted_cluster: HostedClusterRef | None = None
+    reason: str | None = None
+    nodes: list[HostedNode] = Field(default_factory=list)
+
+
+class HostedNodeAction(BaseModel):
+    """One Node to drain or delete, with the providerID it was matched with (None: it had none).
+
+    Acted on only while the Node still carries exactly that providerID.
+    """
+
+    hosted_cluster: HostedClusterRef
+    node_name: str = Field(min_length=1)
+    provider_id: str | None = None
+
+
+class HostedNodeDrain(BaseModel):
+    """One drain pass: cordon, then an eviction for every Pod a drain moves.
+
+    `remaining` are those Pods still on the Node (evicted or not yet);
+    `blocked` the evictions refused this pass, with why — a
+    PodDisruptionBudget, typically. `matches=False`: the Node's providerID is
+    no longer the one it was matched with, and nothing was done.
+    """
+
+    found: bool = False
+    matches: bool = True
+    cordoned: bool = False
+    evicted: list[str] = Field(default_factory=list)
+    remaining: list[str] = Field(default_factory=list)
+    blocked: list[str] = Field(default_factory=list)
+
+
+class HostedNodeDeletion(BaseModel):
+    """delete_hosted_node: deleted only when NOT Ready — nothing runs as it any more."""
+
+    found: bool = False
+    matches: bool = True
+    ready: bool = False
+    deleted: bool = False
+
+
+class AgentReleaseRequest(BaseModel):
+    """release_agent: unbind this Agent from THIS ClusterDeployment (`<namespace>/<name>`)."""
+
+    agent: AgentNameRef
+    cluster_deployment: str = Field(min_length=1)
+
+
+class AgentRelease(BaseModel):
+    """`released`: this call wrote the unbind. Already released is found=True, released=False."""
+
+    found: bool = False
+    released: bool = False
+
+
+class MachineHookRelease(BaseModel):
+    """release_machine_hook: the provider's hook removed from a Machine whose AgentMachine is gone.
+
+    `released=False` with a `reason` when it was not the run's to remove: no
+    hook, not deleting, or the AgentMachine is back (then it is the provider's).
+    """
+
+    found: bool = False
+    released: bool = False
+    reason: str | None = None
+
+
+class AgentMachineCleanupRequest(BaseModel):
+    """clean_up_agent_machines: every AgentMachine that still names this Agent, plus `known`.
+
+    `clear_finalizers`: also drop the provider's own finalizer from one that is
+    deleting with no Machine — the provider removes it only through a Machine.
+    """
+
+    agent: AgentNameRef
+    known: list[AgentMachineRef] = Field(default_factory=list)
+    clear_finalizers: bool = False
+
+
+class AgentMachineCleanup(BaseModel):
+    """What is left of the Agent's AgentMachines and Machines, and what this pass did.
+
+    `remaining`: AgentMachines still there after the pass (`<ns>/<name>`, with
+    their finalizers). `held_by_machine`: ones a Machine still owns or names —
+    never touched, the Machine's deletion is CAPI's. `machines`: Machines still
+    linked to the Agent by providerID or to one of its AgentMachines.
+    """
+
+    remaining: list[str] = Field(default_factory=list)
+    deleted: list[str] = Field(default_factory=list)
+    finalizers_cleared: list[str] = Field(default_factory=list)
+    held_by_machine: list[str] = Field(default_factory=list)
+    machines: list[str] = Field(default_factory=list)
+
+
 class UninstallServerInput(BaseModel):
     """Input to UninstallServerWorkflow: which server to take out of which MCE.
 
@@ -946,9 +1105,10 @@ class UninstallServerProgress(BaseModel):
 
     `sub_phase` is set while the run waits for the Machine to go:
     `draining` (the Agent is still bound — pre-drain hooks, the drain, volume
-    detach) or `unbinding` (the provider has released the Agent; the host is
-    rebooting back into the discovery image). `agent_state` is the Agent's
-    last `status.debugInfo.state`.
+    detach), `releasing` (the provider cannot release the Agent — its Machine
+    or AgentMachine is gone — so the run does it) or `unbinding` (the Agent is
+    released; the host is rebooting back into the discovery image).
+    `agent_state` is the Agent's last `status.debugInfo.state`.
     """
 
     phase: str
@@ -965,7 +1125,9 @@ class UninstallServerResult(BaseModel):
     that did not need doing and why — a Machine already deleting, a Node
     check with no Node to check, the whole hosted-cluster half for an
     inventory host. `remove_server` is the awaited remove-server child's own
-    result, on `remove_server_workflow_id`.
+    result, on `remove_server_workflow_id`. `leftovers_at_start` and
+    `cleaned_up` say what HyperShift had left behind and what the run did
+    about it.
     """
 
     server_name: str
@@ -984,6 +1146,11 @@ class UninstallServerResult(BaseModel):
     node_name: str | None = None
     machine_deleted_by_run: bool = False
     skipped: list[str] = Field(default_factory=list)
+    # What a broken HyperShift deletion had left, as found at inspection, and
+    # every write the run made on HyperShift's behalf because the controller
+    # that owns it could no longer make it (each with why).
+    leftovers_at_start: list[str] = Field(default_factory=list)
+    cleaned_up: list[str] = Field(default_factory=list)
     reservation_expires_at: str | None = None
     remove_server_workflow_id: str | None = None
     remove_server: RemoveServerResult | None = None

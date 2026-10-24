@@ -14,6 +14,21 @@ documented as an API:
     annotation and `spec.clusterDeploymentName` FIRST, then waits for the
     Agent to reach an unbound state before releasing the hook — so for that
     whole stretch only the AgentMachine's `agentRef` still links the two.
+  * The same controller unbinds ONLY from a Machine's pre-terminate hook
+    (`handleDeletionHook`). With no Machine — none owns the AgentMachine, or
+    the owner is gone — it does nothing for the Agent: an AgentMachine whose
+    owner is missing has its `agentmachine.agent-install.openshift.io/deprovision`
+    finalizer dropped WITHOUT the unbind, and one with no owner at all keeps
+    the finalizer for ever. A Machine whose AgentMachine is gone keeps the
+    provider's hook for ever. These are the leftovers a broken HyperShift
+    deletion leaves, and why uninstall-server does the provider's writes
+    itself when the provider cannot (`agent_release_patch`, the hook, the
+    finalizer).
+  * It sets the AgentMachine's — and so the Machine's — `spec.providerID` to
+    `agent://<agent name>`, and CAPI links a Machine to the Node whose
+    `spec.providerID` matches. The Node's name is the Agent's hostname
+    (`spec.hostname`, else `status.inventory.hostname`, as `getAddresses`
+    reports it).
   * HyperShift (`hypershift-operator/.../platform/agent/agent.go`) creates the
     AgentCluster — and so the ClusterDeployment an Agent binds to — in the
     hosted control-plane namespace, named after the HostedCluster; that
@@ -50,6 +65,24 @@ HOSTED_CLUSTER_KIND = "HostedCluster"
 AGENT_MACHINE_REF_LABEL = "agentMachineRef"
 AGENT_MACHINE_REF_NAMESPACE_ANNOTATION = "agentMachineRefNamespace"
 
+# The provider's own hold on a Machine, and on its AgentMachine.
+PROVIDER_MACHINE_HOOK = "pre-terminate.delete.hook.machine.cluster.x-k8s.io/agentmachine"
+AGENT_MACHINE_FINALIZER = "agentmachine.agent-install.openshift.io/deprovision"
+_PROVIDER_ID_PREFIX = "agent://"
+
+# Where the provider releases its hook: the Agent is back in some unbound state,
+# or assisted-service has given up on the reclaim (handleDeletionHook's
+# removeHookStates).
+PROVIDER_RELEASE_STATES = frozenset({
+    "discovering-unbound",
+    "known-unbound",
+    "disconnected-unbound",
+    "insufficient-unbound",
+    "disabled-unbound",
+    "unbinding-pending-user-action",
+    "error",
+})
+
 _DELETE_HOOK_PREFIXES = (
     "pre-drain.delete.hook.machine.cluster.x-k8s.io",
     "pre-terminate.delete.hook.machine.cluster.x-k8s.io",
@@ -64,6 +97,10 @@ _DELETION_STEP_CONDITIONS = (
 )
 # v1beta2's single condition: True WHILE deleting, its reason naming the step.
 _DELETING_CONDITION = "Deleting"
+# Where the provider's hook takes over: past the drain, waiting on the
+# pre-terminate hooks — as handleDeletionHook itself reads it.
+_WAITING_FOR_PRE_TERMINATE_HOOK = "WaitingForPreTerminateHook"
+_PRE_TERMINATE_STEP = "PreTerminateDeleteHookSucceeded"
 
 
 def _metadata(obj: dict[str, Any]) -> dict[str, Any]:
@@ -118,6 +155,125 @@ def machine_owner(agent_machine: dict[str, Any]) -> tuple[str, str] | None:
     return None
 
 
+def provider_id(agent_name: str) -> str:
+    """The providerID the Agent provider gives an Agent's Machine, and CAPI its Node."""
+    return f"{_PROVIDER_ID_PREFIX}{agent_name}"
+
+
+def agent_hostname(agent: dict[str, Any]) -> str | None:
+    """The hostname the Agent's Node registers under: requested, else discovered."""
+    requested = (agent.get("spec") or {}).get("hostname")
+    discovered = ((agent.get("status") or {}).get("inventory") or {}).get("hostname")
+    return requested or discovered or None
+
+
+def machine_agent_machine(machine: dict[str, Any]) -> str | None:
+    """`<namespace>/<name>` of the AgentMachine a Machine's infrastructureRef names, if any.
+
+    v1beta1 refs carry `apiVersion` (+ optional namespace), v1beta2 refs
+    `apiGroup`; both carry `kind` and `name`, which is all that is compared.
+    """
+    ref = (machine.get("spec") or {}).get("infrastructureRef") or {}
+    if ref.get("kind") != AGENT_MACHINE_KIND or not ref.get("name"):
+        return None
+    namespace = ref.get("namespace") or _metadata(machine).get("namespace")
+    return f"{namespace}/{ref['name']}"
+
+
+def machines_for(
+    agent_name: str,
+    agent_machine: dict[str, Any] | None,
+    machines: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Every Machine that belongs to this Agent, by any of the three links.
+
+    The AgentMachine's owner, a Machine whose infrastructureRef names that
+    AgentMachine (an ownerReference can be lost), and a Machine whose
+    providerID is the Agent's — the one link left once the AgentMachine is
+    gone. A healthy node has exactly one; more is a contradiction the caller
+    refuses.
+    """
+    wanted_owner = None
+    am_qualified = None
+    if agent_machine is not None:
+        owner = machine_owner(agent_machine)
+        am_namespace = _metadata(agent_machine).get("namespace")
+        wanted_owner = (am_namespace, owner[0]) if owner else None
+        am_qualified = qualified_name(agent_machine)
+    wanted_provider_id = provider_id(agent_name)
+    found: dict[str, dict[str, Any]] = {}
+    for machine in machines:
+        metadata = _metadata(machine)
+        key = (metadata.get("namespace"), metadata.get("name"))
+        linked = (
+            key == wanted_owner
+            or (am_qualified is not None and machine_agent_machine(machine) == am_qualified)
+            or (machine.get("spec") or {}).get("providerID") == wanted_provider_id
+        )
+        if linked:
+            found[qualified_name(machine)] = machine
+    return [found[name] for name in sorted(found)]
+
+
+def agent_machines_naming(
+    agent: dict[str, Any] | None,
+    agent_name: str,
+    agent_namespace: str,
+    agent_machines: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Every AgentMachine that names this Agent — by its `agentRef`, or the Agent's own label.
+
+    `agent_machine_for` picks THE one behind an Agent; this is the
+    verification's question, "is anything left?", so it returns all of them.
+    `agent` may be None (deleted): then only `agentRef`s can name it.
+    """
+    labelled = None
+    if agent is not None:
+        metadata = _metadata(agent)
+        label = (metadata.get("labels") or {}).get(AGENT_MACHINE_REF_LABEL)
+        namespace = (metadata.get("annotations") or {}).get(AGENT_MACHINE_REF_NAMESPACE_ANNOTATION)
+        labelled = (label, namespace) if label else None
+    found = []
+    for agent_machine in agent_machines:
+        am = _metadata(agent_machine)
+        ref = (agent_machine.get("status") or {}).get("agentRef") or {}
+        by_ref = ref.get("name") == agent_name and (ref.get("namespace") or agent_namespace) == agent_namespace
+        by_label = labelled is not None and am.get("name") == labelled[0] and labelled[1] in (
+            None,
+            am.get("namespace"),
+        )
+        if by_ref or by_label:
+            found.append(agent_machine)
+    return found
+
+
+def agent_release_patch(resource_version: str | None) -> dict[str, Any]:
+    """The provider's own unbind of an Agent, as a merge patch.
+
+    Exactly what `handleDeletionHook` writes — the `agentMachineRef` label and
+    namespace annotation removed, `machineConfigPool` emptied, the ignition
+    token reference and headers dropped, `clusterDeploymentName` cleared — so
+    assisted-service sees the same release it would have seen from the
+    provider. With the resourceVersion it was read at, a concurrent change is
+    a 409 and the activity re-reads before writing again.
+    """
+    metadata: dict[str, Any] = {
+        "labels": {AGENT_MACHINE_REF_LABEL: None},
+        "annotations": {AGENT_MACHINE_REF_NAMESPACE_ANNOTATION: None},
+    }
+    if resource_version:
+        metadata["resourceVersion"] = resource_version
+    return {
+        "metadata": metadata,
+        "spec": {
+            "machineConfigPool": "",
+            "ignitionEndpointTokenReference": None,
+            "ignitionEndpointHTTPHeaders": None,
+            "clusterDeploymentName": None,
+        },
+    }
+
+
 def _conditions(status: dict[str, Any]) -> list[dict[str, Any]]:
     """Every condition list a Machine may carry, whichever CAPI API version wrote it.
 
@@ -148,15 +304,24 @@ def machine_state(machine: dict[str, Any] | None) -> MachineState:
     deletion_timestamp = metadata.get("deletionTimestamp") or None
     pending: list[str] = []
     seen: set[str] = set()
+    at_hook = False
     for condition in _conditions(status):
         kind = condition.get("type")
         unfinished_step = kind in _DELETION_STEP_CONDITIONS and condition.get("status") != "True"
         deleting = kind == _DELETING_CONDITION and condition.get("status") == "True"
+        if (deleting and condition.get("reason") == _WAITING_FOR_PRE_TERMINATE_HOOK) or (
+            kind == _PRE_TERMINATE_STEP and condition.get("status") != "True"
+        ):
+            at_hook = True
         described = _describe(condition)
         if (unfinished_step or deleting) and described not in seen:
             seen.add(described)
             pending.append(described)
+    annotations = metadata.get("annotations") or {}
     return MachineState(
+        provider_hook=PROVIDER_MACHINE_HOOK in annotations,
+        at_pre_terminate_hook=deletion_timestamp is not None and at_hook,
+        agent_machine=machine_agent_machine(machine),
         found=True,
         deleting=deletion_timestamp is not None,
         deletion_timestamp=deletion_timestamp,
@@ -212,4 +377,61 @@ def agent_binding_state(agent: dict[str, Any] | None) -> AgentBindingState:
         agent_machine_label=bool(labels.get(AGENT_MACHINE_REF_LABEL)),
         state=agent_state(agent),
         approved=(agent.get("spec") or {}).get("approved"),
+    )
+
+
+# --- a hosted cluster's Nodes and Pods ------------------------------------------------
+#
+# Read through the hosted cluster's admin kubeconfig (hosted_cluster_api.py) and
+# passed here as plain dicts.
+
+_MIRROR_POD_ANNOTATION = "kubernetes.io/config.mirror"
+
+
+def node_ready(node: dict[str, Any]) -> bool:
+    """Whether the kubelet is posting Ready=True — i.e. something is running as this Node."""
+    for condition in (node.get("status") or {}).get("conditions") or []:
+        if isinstance(condition, dict) and condition.get("type") == "Ready":
+            return condition.get("status") == "True"
+    return False
+
+
+def node_provider_id(node: dict[str, Any]) -> str | None:
+    return (node.get("spec") or {}).get("providerID") or None
+
+
+def node_matches(
+    node: dict[str, Any], wanted_provider_id: str | None, names: set[str]
+) -> list[str]:
+    """Why this Node is this server's: `provider-id`, `name`, or nothing ([]).
+
+    The providerID is CAPI's own link and decides alone. A name — the Machine's
+    nodeRef, the Agent's hostname, the server's own name — counts only when
+    the Node carries no providerID or this one: a Node of that name with
+    ANOTHER Agent's providerID is another machine's.
+    """
+    reasons = []
+    found = node_provider_id(node)
+    if wanted_provider_id and found == wanted_provider_id:
+        reasons.append("provider-id")
+    name = _metadata(node).get("name")
+    if name in names and (found is None or wanted_provider_id is None or found == wanted_provider_id):
+        reasons.append("name")
+    return reasons
+
+
+def pod_to_evict(pod: dict[str, Any]) -> bool:
+    """Whether a drain evicts this Pod — CAPI's drain rules, which kubectl's are.
+
+    CAPI drains with IgnoreAllDaemonSets, DeleteEmptyDirData and Force, so
+    everything goes except DaemonSet pods (their controller would put them
+    straight back) and mirror pods (the kubelet's static pods, which the API
+    cannot remove).
+    """
+    metadata = _metadata(pod)
+    if _MIRROR_POD_ANNOTATION in (metadata.get("annotations") or {}):
+        return False
+    return not any(
+        owner.get("kind") == "DaemonSet" and owner.get("controller")
+        for owner in metadata.get("ownerReferences") or []
     )

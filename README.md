@@ -442,13 +442,29 @@ state string:
   clears the Agent's binding *before* the Machine finishes (it holds the
   Machine on its `pre-terminate.delete.hook…/agentmachine` hook until the host
   is unbound), so a re-run must recognise it and resume. The run deletes the
-  CAPI Machine (a no-op when it is already deleting or gone — its one write on
-  the MCE), waits for CAPI to drain the Node (`draining`, 20 min) and for the
-  provider to release the Agent and the host to reboot into discovery
-  (`unbinding`, 1 h, until `known-unbound`), then checks the AgentMachine is
-  gone, the hosted cluster has no Node of that name, and the Agent is a clean
-  inventory host.
-- **An inventory host** — nothing binds it; that half is skipped.
+  CAPI Machine (a no-op when it is already deleting or gone), waits for CAPI to
+  drain the Node (`draining`, 20 min) and for the provider to release the
+  Agent and the host to reboot into discovery (`unbinding`, 1 h, until
+  `known-unbound`), then verifies — re-derived fresh, never assumed — that no
+  Machine or AgentMachine is linked to the Agent, no Node of the hosted
+  cluster is the server, and the Agent is a clean inventory host.
+- **What a broken HyperShift deletion left of one** is that shape too, and
+  cleared. Each object is normally cleaned up by a finalizer or hook — CAPI
+  drains and deletes the Node through the Machine, the Agent provider unbinds
+  the Agent only from the Machine's pre-terminate hook — so when the chain is
+  broken nothing finishes it. The Machine is found by any link (owner,
+  infrastructureRef, providerID `agent://<agent>`) and the Node by providerID,
+  nodeRef or hostname, and where the owner cannot act the run makes its write:
+  an AgentMachine with no Machine → the provider's unbind of the Agent, the
+  AgentMachine deleted (its stuck finalizer dropped); a Machine with no
+  AgentMachine → the unbind at its pre-terminate hook, then the provider's hook
+  removed; a binding with both gone → the unbind; a Node with neither → cordon
+  and evict (20 min, `NodeDrainTimeoutError`) before the unbind, and the Node
+  deleted once the host left it and it is NotReady (`releasing` is the
+  sub-phase). The result lists them in `leftovers_at_start` and `cleaned_up`.
+  Decided with the operator 2026-10-24.
+- **An inventory host** — nothing links it to a hosted cluster; that half is
+  skipped (but a stale Node in the cluster server-scan names is deleted).
 
 Either way it then runs **remove-server as an awaited child**
 (`remove-server-<server>`): power off, BareMetalHost, NMStateConfig, the Agent
@@ -466,9 +482,12 @@ Before anything is written it **refuses** on a contradiction: a name
 server-scan does not know (`ServerNotInServerScanError`); server-scan saying
 another MCE, another cluster than the Agent's, `INSTALLED_TO_INVENTORY` while
 the Agent is bound, or `contested_with` (`ClusterMembershipMismatchError`);
-two bound Agents (`MultipleBoundAgentsError`); an Agent bound with no
-AgentMachine behind it — an early-bound ACM/ZTP cluster
-(`NotHostedClusterNodeError`). `AVAILABLE` is not a contradiction. Then it
+two bound Agents (`MultipleBoundAgentsError`); an Agent bound into no
+HostedCluster's control plane with nothing behind it — an early-bound ACM/ZTP
+cluster (`NotHostedClusterNodeError`); two Machines, two Nodes, or links into
+two control planes (`ConflictingHostedObjectsError`); a Ready Node nothing on
+the MCE links any more (`HostedNodeStillPresentError`). `AVAILABLE` is not a
+contradiction. Then it
 takes server-scan's **install lock** (holder `uninstall-server`): the hosted
 cluster's nodes job frees the server the moment its Node is gone while the
 MCE's agents job re-claims it only every 15 min, so in between it can read
@@ -480,8 +499,9 @@ fails the run (`ServerReservedError`); release it in server-scan and re-run.
 After the Machine delete nothing is undone (it cannot be) and a re-run of the
 same id resumes: `MachineDrainTimeoutError` names the Machine's deletion
 conditions and pending delete hooks; `AgentUnbindTimeoutError` the Agent's
-state; `HostedNodeStillPresentError` the orphaned Node, with the
-`oc delete node` to run — this workflow never deletes a Node.
+state; `ServerStillPresentError` an AgentMachine or Machine still linked;
+`HostedNodeStillPresentError` a Node still Ready after the host left it (a
+NotReady one is deleted).
 
 The Node is read through the HostedCluster's admin kubeconfig
 (`status.kubeconfig`), with the server replaced by the control plane's
@@ -490,8 +510,9 @@ verified against the kubeconfig's CA; nothing from it reaches history or a
 log. An Agent's `clusterDeploymentName.namespace` is that control-plane
 namespace, not the HostedCluster's (HyperShift creates the ClusterDeployment
 there), so the HostedCluster is found by HyperShift's namespace rule. This
-needs a **ClusterRole** on the limb — Machines get/list/delete, AgentMachines
-and HostedClusters get/list, Secrets get cluster-wide — see
+needs a **ClusterRole** on the limb — Machines and AgentMachines
+get/list/delete/patch, HostedClusters get/list, Secrets get cluster-wide — and
+`patch` on Agents in the InfraEnv Role; see
 [the chart README](deploy/charts/server-lifecycle-worker/README.md).
 
 ### `publish-infraenv-boot` — an InfraEnv's current iPXE script onto its PXE VM

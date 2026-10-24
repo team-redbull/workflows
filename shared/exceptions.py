@@ -630,12 +630,35 @@ class MultipleBoundAgentsError(OrchestratorError):
 class NotHostedClusterNodeError(OrchestratorError):
     """WORKFLOW-RAISED. The Agent is bound, but not as a hosted cluster's node.
 
-    uninstall-server takes a node out of a HyperShift HostedCluster through its
-    CAPI Machine. An Agent bound to a ClusterDeployment with NO AgentMachine
-    behind it — an early-bound ACM/ZTP cluster, or a binding left behind by a
-    cluster that is gone — has no Machine to delete, and an AgentMachine whose
-    namespace belongs to no HostedCluster has no cluster to verify against.
-    Nothing is changed.
+    uninstall-server takes a node out of a HyperShift HostedCluster. An Agent
+    bound to a ClusterDeployment that is no HostedCluster's control plane, with
+    no AgentMachine or Machine behind it — an early-bound ACM/ZTP cluster — is
+    not one; nor is an AgentMachine whose namespace belongs to no HostedCluster
+    (no cluster to verify the Node against). A binding into a HostedCluster's
+    control plane with its AgentMachine and Machine gone IS one: that is a
+    leftover the run clears. Nothing is changed.
+    """
+
+
+class ConflictingHostedObjectsError(OrchestratorError):
+    """WORKFLOW-RAISED. Two hosted-cluster objects claim the one server.
+
+    Two Machines linked to its Agent, two Nodes that are it, or its links
+    pointing into two control planes. A server is one node of one cluster; the
+    run cannot pick which object is the real one, so it changes nothing (or
+    nothing further) and names them all.
+    """
+
+
+class NodeDrainTimeoutError(OrchestratorError):
+    """WORKFLOW-RAISED. A Node with no Machine behind it did not drain within 20 minutes.
+
+    CAPI drains a Node only through its Machine, so for a Node HyperShift lost
+    track of, uninstall-server cordons it and evicts its Pods itself — CAPI's
+    drain rules: everything but DaemonSet and mirror Pods. The message names
+    the Pods left and why their evictions were refused (a PodDisruptionBudget,
+    typically). The Node stays cordoned (`oc adm uncordon` undoes it); a re-run
+    resumes the drain.
     """
 
 
@@ -673,12 +696,23 @@ class MachineDeletionTimeoutError(OrchestratorError):
 
 
 class HostedNodeStillPresentError(OrchestratorError):
-    """WORKFLOW-RAISED. The hosted cluster still has the server's Node.
+    """WORKFLOW-RAISED. The hosted cluster still has the server's Node, and it cannot go.
 
-    CAPI deletes a Machine's Node as the Machine goes, so a Node left behind is
-    an orphan. uninstall-server NEVER deletes a Node itself: the message names
-    it, with the `oc delete node` to run against the hosted cluster, and the
-    inventory half is not started.
+    CAPI deletes a Machine's Node as the Machine goes; a Node left behind with
+    nothing running as it, uninstall-server deletes itself. It raises this
+    instead when the Node is still Ready — a kubelet still runs as it — once
+    the host should no longer be (back in discovery), or before any write when
+    a Ready Node has nothing left on the MCE to release the host through. The
+    message names the Node; the inventory half is not started.
+    """
+
+
+class AgentBindingChangedError(OrchestratorError):
+    """The Agent is now bound to another cluster than the one being cleared. Deterministic.
+
+    release_agent unbinds an Agent only from the ClusterDeployment of the hosted
+    cluster the run inspected; one bound elsewhere since is not this run's to
+    touch. Non-retryable: the binding will not change back by itself.
     """
 
 

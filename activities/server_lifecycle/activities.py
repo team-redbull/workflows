@@ -74,6 +74,7 @@ from activities.server_lifecycle.bmh_resources import (
 from activities.server_lifecycle.server_scan import fetch_available_servers
 from shared.bmc_address import k8s_resource_name, nmstate_config_name
 from shared.exceptions import (
+    AgentBindingChangedError,
     AgentBoundToClusterError,
     BmcCredentialsMissingError,
     BmhTeardownError,
@@ -89,10 +90,14 @@ from shared.models.server_lifecycle import (
     AgentBindingState,
     AgentDeleteRequest,
     AgentDeletion,
+    AgentMachineCleanup,
+    AgentMachineCleanupRequest,
     AgentMachineRef,
     AgentMachineState,
     AgentNameRef,
     AgentRef,
+    AgentRelease,
+    AgentReleaseRequest,
     AgentState,
     BmhRef,
     BmhResourceRequest,
@@ -100,7 +105,14 @@ from shared.models.server_lifecycle import (
     BoundHostState,
     CreatedResource,
     HostAgent,
+    HostedClusterRef,
+    HostedNode,
+    HostedNodeAction,
+    HostedNodeDeletion,
+    HostedNodeDrain,
+    HostedNodeQuery,
     HostedNodeRef,
+    HostedNodes,
     HostedNodeState,
     HostPowerRequest,
     InfraEnvBootRequest,
@@ -109,6 +121,7 @@ from shared.models.server_lifecycle import (
     InfraEnvState,
     InventoryHostState,
     MachineDeletion,
+    MachineHookRelease,
     MachineRef,
     MachineState,
     PxeBootRegistration,
@@ -891,6 +904,60 @@ async def _read_machine(ref: MachineRef) -> dict | None:
     )
 
 
+async def _read_agent_machine(namespace: str, name: str) -> dict | None:
+    return await cluster_api.read_custom_object(
+        group=hosted_resources.AGENT_MACHINE_GROUP,
+        version=hosted_resources.AGENT_MACHINE_VERSION,
+        plural=hosted_resources.AGENT_MACHINE_PLURAL,
+        kind=hosted_resources.AGENT_MACHINE_KIND,
+        namespace=namespace,
+        name=name,
+    )
+
+
+async def _list_agent_machines() -> list[dict]:
+    return await cluster_api.list_cluster_custom_objects(
+        group=hosted_resources.AGENT_MACHINE_GROUP,
+        version=hosted_resources.AGENT_MACHINE_VERSION,
+        plural=hosted_resources.AGENT_MACHINE_PLURAL,
+        kind=hosted_resources.AGENT_MACHINE_KIND,
+    )
+
+
+async def _list_machines() -> list[dict]:
+    # v1beta1 is served by every CAPI the MCE ships, v1beta2 storage included.
+    # A Machine is also always READ by the apiVersion its AgentMachine's owner
+    # reference names, so a CAPI that stopped serving v1beta1 loses only the
+    # providerID / infrastructureRef links, never the owner.
+    return await cluster_api.list_cluster_custom_objects(
+        group=hosted_resources.MACHINE_GROUP,
+        version="v1beta1",
+        plural=hosted_resources.MACHINE_PLURAL,
+        kind=hosted_resources.MACHINE_KIND,
+    )
+
+
+async def _list_hosted_clusters() -> list[dict]:
+    return await cluster_api.list_cluster_custom_objects(
+        group=hosted_resources.HOSTED_CLUSTER_GROUP,
+        version=hosted_resources.HOSTED_CLUSTER_VERSION,
+        plural=hosted_resources.HOSTED_CLUSTER_PLURAL,
+        kind=hosted_resources.HOSTED_CLUSTER_KIND,
+    )
+
+
+async def _with_agent_machine_found(state: MachineState) -> MachineState:
+    """A Machine's state plus whether the AgentMachine its infrastructureRef names exists."""
+    if state.found and state.agent_machine:
+        namespace, name = state.agent_machine.split("/", 1)
+        state.agent_machine_found = await _read_agent_machine(namespace, name) is not None
+    return state
+
+
+def _qualified(obj: dict) -> str:
+    return hosted_resources.qualified_name(obj)
+
+
 @activity.defn
 async def inspect_bound_host(ref: BmhRef) -> BoundHostState:
     """The host on this MCE and, if it is one, the hosted-cluster node it is. Reads only."""
@@ -914,26 +981,38 @@ async def inspect_bound_host(ref: BmhRef) -> BoundHostState:
         if agent_belongs_to_host(agent, bmh_name, macs)
     ]
     # Only listed when there is an Agent to look for: an inventory-only MCE
-    # need not have the CAPI provider at all.
-    agent_machines = (
-        await cluster_api.list_cluster_custom_objects(
-            group=hosted_resources.AGENT_MACHINE_GROUP,
-            version=hosted_resources.AGENT_MACHINE_VERSION,
-            plural=hosted_resources.AGENT_MACHINE_PLURAL,
-            kind=hosted_resources.AGENT_MACHINE_KIND,
+    # need not have the CAPI provider or HyperShift at all (and an absent API
+    # lists as empty).
+    agent_machines: list[dict] = []
+    machines: list[dict] = []
+    hosted_clusters: list[dict] = []
+    if matched:
+        agent_machines = await _list_agent_machines()
+        machines = await _list_machines()
+        hosted_clusters = await _list_hosted_clusters()
+    control_planes = {
+        hosted_resources.hosted_control_plane_namespace(
+            (hc.get("metadata") or {}).get("namespace", ""), (hc.get("metadata") or {}).get("name", "")
         )
-        if matched
-        else []
-    )
+        for hc in hosted_clusters
+    }
 
     agents: list[HostAgent] = []
-    behind: dict[str, dict] = {}
+    linked: dict[str, tuple[dict | None, list[dict]]] = {}
     for agent in matched:
         name = (agent.get("metadata") or {}).get("name", "")
         agent_machine = hosted_resources.agent_machine_for(agent, ref.namespace, agent_machines)
-        if agent_machine is not None:
-            behind[name] = agent_machine
+        its_machines = hosted_resources.machines_for(name, agent_machine, machines)
         binding = hosted_resources.agent_binding_state(agent)
+        namespaces = {(m.get("metadata") or {}).get("namespace") for m in its_machines}
+        if agent_machine is not None:
+            namespaces.add((agent_machine.get("metadata") or {}).get("namespace"))
+        bound_namespace = ((agent.get("spec") or {}).get("clusterDeploymentName") or {}).get("namespace")
+        if bound_namespace in control_planes:
+            namespaces.add(bound_namespace)
+        namespaces.discard(None)
+        if agent_machine is not None or namespaces:
+            linked[name] = (agent_machine, its_machines)
         agents.append(
             HostAgent(
                 name=name,
@@ -941,32 +1020,56 @@ async def inspect_bound_host(ref: BmhRef) -> BoundHostState:
                 cluster_deployment=binding.cluster_deployment,
                 state=binding.state,
                 approved=binding.approved,
-                agent_machine=(
-                    hosted_resources.qualified_name(agent_machine) if agent_machine else None
-                ),
+                agent_machine=_qualified(agent_machine) if agent_machine else None,
                 agent_machine_label=binding.agent_machine_label,
+                hostname=hosted_resources.agent_hostname(agent),
+                hcp_namespaces=sorted(namespaces),
             )
         )
 
     machine: MachineRef | None = None
     machine_state: MachineState | None = None
     hosted_cluster = None
-    if len(behind) == 1:
-        agent_machine = next(iter(behind.values()))
-        hcp_namespace = (agent_machine.get("metadata") or {}).get("namespace", "")
-        owner = hosted_resources.machine_owner(agent_machine)
-        if owner is not None:
-            machine = MachineRef(namespace=hcp_namespace, name=owner[0], api_version=owner[1])
-            machine_state = hosted_resources.machine_state(await _read_machine(machine))
-        hosted_cluster = hosted_resources.hosted_cluster_for(
-            hcp_namespace,
-            await cluster_api.list_cluster_custom_objects(
-                group=hosted_resources.HOSTED_CLUSTER_GROUP,
-                version=hosted_resources.HOSTED_CLUSTER_VERSION,
-                plural=hosted_resources.HOSTED_CLUSTER_PLURAL,
-                kind=hosted_resources.HOSTED_CLUSTER_KIND,
-            ),
-        )
+    machines_matched: list[str] = []
+    if len(linked) == 1:
+        agent_name, (agent_machine, its_machines) = next(iter(linked.items()))
+        candidates = {_qualified(m): m for m in its_machines}
+        owner_ref = None
+        if agent_machine is not None:
+            owner = hosted_resources.machine_owner(agent_machine)
+            am_namespace = (agent_machine.get("metadata") or {}).get("namespace", "")
+            if owner is not None:
+                # Read by the version the owner reference names, whatever the list saw.
+                owner_ref = MachineRef(namespace=am_namespace, name=owner[0], api_version=owner[1])
+                owner_machine = await _read_machine(owner_ref)
+                key = f"{am_namespace}/{owner[0]}"
+                if owner_machine is not None:
+                    candidates[key] = owner_machine
+                else:
+                    candidates.pop(key, None)
+        machines_matched = sorted(candidates)
+        if len(candidates) == 1:
+            key, found_machine = next(iter(candidates.items()))
+            namespace, name = key.split("/", 1)
+            if owner_ref is not None and (owner_ref.namespace, owner_ref.name) == (namespace, name):
+                machine = owner_ref
+            else:
+                machine = MachineRef(
+                    namespace=namespace,
+                    name=name,
+                    api_version=found_machine.get("apiVersion") or "cluster.x-k8s.io/v1beta1",
+                )
+            machine_state = await _with_agent_machine_found(
+                hosted_resources.machine_state(found_machine)
+            )
+        elif not candidates and owner_ref is not None:
+            # The owner reference names a Machine that is gone.
+            machine, machine_state = owner_ref, MachineState(found=False)
+        [hosted] = [a for a in agents if a.name == agent_name]
+        if len(hosted.hcp_namespaces) == 1:
+            hosted_cluster = hosted_resources.hosted_cluster_for(
+                hosted.hcp_namespaces[0], hosted_clusters
+            )
 
     state = BoundHostState(
         bmh_found=bmh is not None,
@@ -976,14 +1079,15 @@ async def inspect_bound_host(ref: BmhRef) -> BoundHostState:
         machine=machine,
         machine_state=machine_state,
         hosted_cluster=hosted_cluster,
+        machines_matched=machines_matched,
     )
     activity.logger.info(
-        "%s in %s: bmh=%s agents=%s machine=%s deleting=%s node=%s hosted cluster=%s",
+        "%s in %s: bmh=%s agents=%s machines=%s deleting=%s node=%s hosted cluster=%s",
         bmh_name,
         ref.namespace,
         state.bmh_found,
-        [(a.name, a.cluster_deployment, a.state, a.agent_machine) for a in agents],
-        f"{machine.namespace}/{machine.name}" if machine else None,
+        [(a.name, a.cluster_deployment, a.state, a.agent_machine, a.hcp_namespaces) for a in agents],
+        machines_matched,
         machine_state.deleting if machine_state else None,
         machine_state.node_name if machine_state else None,
         f"{hosted_cluster.namespace}/{hosted_cluster.name}" if hosted_cluster else None,
@@ -1023,21 +1127,14 @@ async def ensure_machine_deleting(ref: MachineRef) -> MachineDeletion:
 
 @activity.defn
 async def get_machine_state(ref: MachineRef) -> MachineState:
-    """One Machine as it is now."""
-    return hosted_resources.machine_state(await _read_machine(ref))
+    """One Machine as it is now, and whether its AgentMachine still exists."""
+    return await _with_agent_machine_found(hosted_resources.machine_state(await _read_machine(ref)))
 
 
 @activity.defn
 async def get_agent_machine_state(ref: AgentMachineRef) -> AgentMachineState:
     """Whether one AgentMachine is still on the MCE."""
-    agent_machine = await cluster_api.read_custom_object(
-        group=hosted_resources.AGENT_MACHINE_GROUP,
-        version=hosted_resources.AGENT_MACHINE_VERSION,
-        plural=hosted_resources.AGENT_MACHINE_PLURAL,
-        kind=hosted_resources.AGENT_MACHINE_KIND,
-        namespace=ref.namespace,
-        name=ref.name,
-    )
+    agent_machine = await _read_agent_machine(ref.namespace, ref.name)
     if agent_machine is None:
         return AgentMachineState(found=False)
     return AgentMachineState(
@@ -1053,10 +1150,8 @@ async def get_agent_binding(ref: AgentNameRef) -> AgentBindingState:
     return hosted_resources.agent_binding_state(agent)
 
 
-@activity.defn
-async def check_hosted_node(ref: HostedNodeRef) -> HostedNodeState:
-    """Whether the hosted cluster still has this Node, through its admin kubeconfig."""
-    cluster = ref.hosted_cluster
+async def _hosted_kubeconfig(cluster: HostedClusterRef) -> str | None:
+    """The hosted cluster's admin kubeconfig text; None when the HostedCluster is gone."""
     label = f"{cluster.namespace}/{cluster.name}"
     hosted = await cluster_api.read_custom_object(
         group=hosted_resources.HOSTED_CLUSTER_GROUP,
@@ -1067,9 +1162,7 @@ async def check_hosted_node(ref: HostedNodeRef) -> HostedNodeState:
         name=cluster.name,
     )
     if hosted is None:
-        # No HostedCluster, no control plane, no Nodes: nothing can be left.
-        activity.logger.info("HostedCluster %s is gone, so Node %s is too", label, ref.node_name)
-        return HostedNodeState(found=False, node_name=ref.node_name)
+        return None
     secret_name = ((hosted.get("status") or {}).get("kubeconfig") or {}).get("name")
     if not secret_name:
         raise HostedClusterAccessError(
@@ -1083,12 +1176,24 @@ async def check_hosted_node(ref: HostedNodeRef) -> HostedNodeState:
             f"{'does not exist' if data is None else f'has no {_KUBECONFIG_KEY!r} key'}"
         )
     try:
-        kubeconfig = base64.b64decode(encoded, validate=True).decode()
+        return base64.b64decode(encoded, validate=True).decode()
     except (binascii.Error, UnicodeDecodeError, ValueError):
         raise HostedClusterAccessError(
             f"Secret {cluster.namespace}/{secret_name} of HostedCluster {label} holds "
             "no readable kubeconfig"
         ) from None
+
+
+@activity.defn
+async def check_hosted_node(ref: HostedNodeRef) -> HostedNodeState:
+    """Whether the hosted cluster still has this Node, through its admin kubeconfig."""
+    cluster = ref.hosted_cluster
+    label = f"{cluster.namespace}/{cluster.name}"
+    kubeconfig = await _hosted_kubeconfig(cluster)
+    if kubeconfig is None:
+        # No HostedCluster, no control plane, no Nodes: nothing can be left.
+        activity.logger.info("HostedCluster %s is gone, so Node %s is too", label, ref.node_name)
+        return HostedNodeState(found=False, node_name=ref.node_name)
     found = await hosted_cluster_api.node_exists(
         kubeconfig,
         hosted_cluster_api.kas_service_url(cluster.hcp_namespace),
@@ -1099,3 +1204,291 @@ async def check_hosted_node(ref: HostedNodeRef) -> HostedNodeState:
         "Hosted cluster %s: Node %s %s", label, ref.node_name, "present" if found else "absent"
     )
     return HostedNodeState(found=found, node_name=ref.node_name)
+
+
+# --- uninstall-server: leftovers of a broken HyperShift deletion ----------------------
+
+
+@activity.defn
+async def find_hosted_nodes(query: HostedNodeQuery) -> HostedNodes:
+    """Every Node of the hosted cluster that is this server. Reads only."""
+    cluster = query.hosted_cluster
+    if cluster is None and query.cluster_name:
+        named = [
+            hc for hc in await _list_hosted_clusters()
+            if ((hc.get("metadata") or {}).get("name") or "").lower() == query.cluster_name.lower()
+        ]
+        if len(named) != 1:
+            reason = (
+                f"no HostedCluster on this MCE is named {query.cluster_name}"
+                if not named
+                else f"{len(named)} HostedClusters on this MCE are named {query.cluster_name}: "
+                + ", ".join(_qualified(hc) for hc in named)
+            )
+            activity.logger.info("No hosted cluster to look in for %s: %s", query.server_name, reason)
+            return HostedNodes(reason=reason)
+        metadata = named[0]["metadata"]
+        cluster = HostedClusterRef(
+            namespace=metadata["namespace"],
+            name=metadata["name"],
+            hcp_namespace=hosted_resources.hosted_control_plane_namespace(
+                metadata["namespace"], metadata["name"]
+            ),
+        )
+    if cluster is None:
+        return HostedNodes(reason="nothing names a hosted cluster for this server")
+    label = f"{cluster.namespace}/{cluster.name}"
+    kubeconfig = await _hosted_kubeconfig(cluster)
+    if kubeconfig is None:
+        return HostedNodes(
+            hosted_cluster=cluster, reason=f"HostedCluster {label} is gone, and its Nodes with it"
+        )
+    nodes = await hosted_cluster_api.list_nodes(
+        kubeconfig, hosted_cluster_api.kas_service_url(cluster.hcp_namespace), label
+    )
+    wanted = hosted_resources.provider_id(query.agent_name) if query.agent_name else None
+    names = {
+        n.lower()
+        for n in (query.node_name, query.hostname, k8s_resource_name(query.server_name))
+        if n
+    }
+    matched = []
+    for node in nodes:
+        why = hosted_resources.node_matches(node, wanted, names)
+        if why:
+            matched.append(
+                HostedNode(
+                    name=(node.get("metadata") or {}).get("name", ""),
+                    provider_id=hosted_resources.node_provider_id(node),
+                    ready=hosted_resources.node_ready(node),
+                    unschedulable=bool((node.get("spec") or {}).get("unschedulable")),
+                    matched_by=why,
+                )
+            )
+    activity.logger.info(
+        "Hosted cluster %s: %s's Nodes: %s",
+        label,
+        query.server_name,
+        [(n.name, n.matched_by, "Ready" if n.ready else "NotReady") for n in matched] or "none",
+    )
+    return HostedNodes(hosted_cluster=cluster, nodes=matched)
+
+
+@activity.defn
+async def drain_hosted_node(action: HostedNodeAction) -> HostedNodeDrain:
+    """One drain pass over a Node with no Machine behind it: cordon, evict."""
+    cluster = action.hosted_cluster
+    label = f"{cluster.namespace}/{cluster.name}"
+    kubeconfig = await _hosted_kubeconfig(cluster)
+    if kubeconfig is None:
+        return HostedNodeDrain(found=False)
+    outcome = await hosted_cluster_api.drain_node(
+        kubeconfig,
+        hosted_cluster_api.kas_service_url(cluster.hcp_namespace),
+        action.node_name,
+        action.provider_id,
+        label,
+    )
+    drain = HostedNodeDrain(**outcome)
+    activity.logger.info(
+        "Hosted cluster %s: drain of Node %s — cordoned now=%s evicted=%s remaining=%s blocked=%s",
+        label,
+        action.node_name,
+        drain.cordoned,
+        drain.evicted,
+        len(drain.remaining),
+        drain.blocked,
+    )
+    return drain
+
+
+@activity.defn
+async def delete_hosted_node(action: HostedNodeAction) -> HostedNodeDeletion:
+    """Delete a Node nothing runs as any more (NotReady), when nothing else will."""
+    cluster = action.hosted_cluster
+    label = f"{cluster.namespace}/{cluster.name}"
+    kubeconfig = await _hosted_kubeconfig(cluster)
+    if kubeconfig is None:
+        return HostedNodeDeletion(found=False)
+    outcome = await hosted_cluster_api.delete_node(
+        kubeconfig,
+        hosted_cluster_api.kas_service_url(cluster.hcp_namespace),
+        action.node_name,
+        action.provider_id,
+        label,
+    )
+    deletion = HostedNodeDeletion(**outcome)
+    activity.logger.info(
+        "Hosted cluster %s: Node %s found=%s ready=%s deleted=%s",
+        label,
+        action.node_name,
+        deletion.found,
+        deletion.ready,
+        deletion.deleted,
+    )
+    return deletion
+
+
+@activity.defn
+async def release_agent(request: AgentReleaseRequest) -> AgentRelease:
+    """The Agent provider's unbind, written by the run because the provider no longer can."""
+    ref = request.agent
+    agent = await _read(AGENT_GROUP, AGENT_VERSION, AGENT_PLURAL, _AGENT_KIND, ref.namespace, ref.name)
+    if agent is None:
+        return AgentRelease(found=False)
+    binding = hosted_resources.agent_binding_state(agent)
+    if binding.cluster_deployment and binding.cluster_deployment != request.cluster_deployment:
+        raise AgentBindingChangedError(
+            f"Agent {ref.namespace}/{ref.name} is bound to {binding.cluster_deployment}, "
+            f"not {request.cluster_deployment} — the cluster this run is taking it out of. "
+            "Nothing was changed"
+        )
+    if not binding.cluster_deployment and not binding.agent_machine_label:
+        activity.logger.info("Agent %s/%s is already released", ref.namespace, ref.name)
+        return AgentRelease(found=True)
+    resource_version = (agent.get("metadata") or {}).get("resourceVersion")
+    patched = await cluster_api.patch_custom_object(
+        group=AGENT_GROUP,
+        version=AGENT_VERSION,
+        plural=AGENT_PLURAL,
+        kind=_AGENT_KIND,
+        namespace=ref.namespace,
+        name=ref.name,
+        body=hosted_resources.agent_release_patch(resource_version),
+    )
+    activity.logger.info(
+        "Agent %s/%s: %s", ref.namespace, ref.name,
+        f"released from {request.cluster_deployment}" if patched else "gone meanwhile",
+    )
+    return AgentRelease(found=patched, released=patched)
+
+
+@activity.defn
+async def release_machine_hook(ref: MachineRef) -> MachineHookRelease:
+    """Remove the provider's pre-terminate hook from a deleting Machine whose AgentMachine is gone."""
+    machine = await _read_machine(ref)
+    if machine is None:
+        return MachineHookRelease(found=False)
+    state = await _with_agent_machine_found(hosted_resources.machine_state(machine))
+    reason = None
+    if not state.provider_hook:
+        reason = "it carries no provider hook"
+    elif not state.deleting:
+        reason = "it is not deleting"
+    elif state.agent_machine_found is not False:
+        reason = (
+            f"its AgentMachine {state.agent_machine} exists — the provider releases its own hook"
+            if state.agent_machine_found
+            else "its infrastructureRef names no AgentMachine"
+        )
+    if reason is not None:
+        activity.logger.info("Machine %s/%s: hook left alone — %s", ref.namespace, ref.name, reason)
+        return MachineHookRelease(found=True, reason=reason)
+    group, version = hosted_resources.split_api_version(ref.api_version)
+    patched = await cluster_api.patch_custom_object(
+        group=group,
+        version=version,
+        plural=hosted_resources.MACHINE_PLURAL,
+        kind=hosted_resources.MACHINE_KIND,
+        namespace=ref.namespace,
+        name=ref.name,
+        body={"metadata": {"annotations": {hosted_resources.PROVIDER_MACHINE_HOOK: None}}},
+    )
+    activity.logger.info(
+        "Machine %s/%s: provider hook %s", ref.namespace, ref.name,
+        "removed" if patched else "— the Machine went meanwhile",
+    )
+    return MachineHookRelease(found=patched, released=patched)
+
+
+async def _machine_holding(agent_machine: dict, machines: list[dict]) -> str | None:
+    """The Machine that owns or names this AgentMachine, if one still exists."""
+    key = _qualified(agent_machine)
+    for machine in machines:
+        if hosted_resources.machine_agent_machine(machine) == key:
+            return _qualified(machine)
+    owner = hosted_resources.machine_owner(agent_machine)
+    if owner is not None:
+        namespace = (agent_machine.get("metadata") or {}).get("namespace", "")
+        ref = MachineRef(namespace=namespace, name=owner[0], api_version=owner[1])
+        if await _read_machine(ref) is not None:
+            return f"{namespace}/{owner[0]}"
+    return None
+
+
+@activity.defn
+async def clean_up_agent_machines(request: AgentMachineCleanupRequest) -> AgentMachineCleanup:
+    """Remove every Machine-less AgentMachine that still names the Agent; report what is left."""
+    ref = request.agent
+    agent = await _read(AGENT_GROUP, AGENT_VERSION, AGENT_PLURAL, _AGENT_KIND, ref.namespace, ref.name)
+    agent_machines = await _list_agent_machines()
+    machines = await _list_machines()
+    naming = {
+        _qualified(am): am
+        for am in hosted_resources.agent_machines_naming(agent, ref.name, ref.namespace, agent_machines)
+    }
+    for known in request.known:
+        key = f"{known.namespace}/{known.name}"
+        if key not in naming:
+            existing = await _read_agent_machine(known.namespace, known.name)
+            if existing is not None:
+                naming[key] = existing
+    linked_machines = {
+        _qualified(m)
+        for am in [None, *naming.values()]
+        for m in hosted_resources.machines_for(ref.name, am, machines)
+    }
+    binding = hosted_resources.agent_binding_state(agent)
+    released = not binding.cluster_deployment and not binding.agent_machine_label
+
+    result = AgentMachineCleanup(machines=sorted(linked_machines))
+    for key, agent_machine in sorted(naming.items()):
+        holder = await _machine_holding(agent_machine, machines)
+        if holder is not None:
+            result.held_by_machine.append(f"{key} (Machine {holder})")
+            continue
+        namespace, name = key.split("/", 1)
+        metadata = agent_machine.get("metadata") or {}
+        if not metadata.get("deletionTimestamp"):
+            await cluster_api.delete_custom_object(
+                group=hosted_resources.AGENT_MACHINE_GROUP,
+                version=hosted_resources.AGENT_MACHINE_VERSION,
+                plural=hosted_resources.AGENT_MACHINE_PLURAL,
+                kind=hosted_resources.AGENT_MACHINE_KIND,
+                namespace=namespace,
+                name=name,
+            )
+            result.deleted.append(key)
+        elif (
+            request.clear_finalizers
+            and released
+            and hosted_resources.AGENT_MACHINE_FINALIZER in (metadata.get("finalizers") or [])
+        ):
+            # The finalizer's one job is the unbind, which is done; with no
+            # Machine the provider never removes it (handleDeletionHook).
+            if await cluster_api.clear_custom_object_finalizers(
+                group=hosted_resources.AGENT_MACHINE_GROUP,
+                version=hosted_resources.AGENT_MACHINE_VERSION,
+                plural=hosted_resources.AGENT_MACHINE_PLURAL,
+                kind=hosted_resources.AGENT_MACHINE_KIND,
+                namespace=namespace,
+                name=name,
+                finalizers=frozenset({hosted_resources.AGENT_MACHINE_FINALIZER}),
+            ):
+                result.finalizers_cleared.append(key)
+        left = await _read_agent_machine(namespace, name)
+        if left is not None:
+            finalizers = ", ".join((left.get("metadata") or {}).get("finalizers") or []) or "none"
+            result.remaining.append(f"{key} (deleting; finalizers: {finalizers})")
+    activity.logger.info(
+        "AgentMachines of Agent %s/%s: deleted=%s finalizers cleared=%s remaining=%s "
+        "held by a Machine=%s, Machines=%s",
+        ref.namespace,
+        ref.name,
+        result.deleted,
+        result.finalizers_cleared,
+        result.remaining,
+        result.held_by_machine,
+        result.machines,
+    )
+    return result

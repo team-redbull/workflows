@@ -21,17 +21,26 @@ from shared.models.server_lifecycle import (
     AgentBindingState,
     AgentDeleteRequest,
     AgentDeletion,
+    AgentMachineCleanup,
+    AgentMachineCleanupRequest,
     AgentMachineRef,
     AgentMachineState,
     AgentNameRef,
     AgentRef,
+    AgentRelease,
+    AgentReleaseRequest,
     AgentState,
     BmhRef,
     BmhResourceRequest,
     BmhState,
     BoundHostState,
     CreatedResource,
+    HostedNodeAction,
+    HostedNodeDeletion,
+    HostedNodeDrain,
+    HostedNodeQuery,
     HostedNodeRef,
+    HostedNodes,
     HostedNodeState,
     HostPowerRequest,
     InfraEnvBootRequest,
@@ -40,6 +49,7 @@ from shared.models.server_lifecycle import (
     InfraEnvState,
     InventoryHostState,
     MachineDeletion,
+    MachineHookRelease,
     MachineRef,
     MachineState,
     PxeBootRegistration,
@@ -470,16 +480,23 @@ async def inspect_bound_host(ref: BmhRef) -> BoundHostState:
     Reads only. The BMH `<server>` (its operational status and InfraEnv
     label); the Agents matched to it by BMAC's bmh label or any MAC (the BMH's,
     the NMStateConfig's and server-scan's), each with its binding, its
-    `status.debugInfo.state` and the AgentMachine behind it — by the
-    `agentMachineRef` label + `agentMachineRefNamespace` annotation, or by an
-    AgentMachine whose `status.agentRef` still names it (a Machine already on
-    its way out). For the one Agent with an AgentMachine: the owning Machine
-    (ownerReference kind Machine, group cluster.x-k8s.io) with its
-    deletionTimestamp, nodeRef, pending delete hooks and deletion conditions,
-    and the HostedCluster whose control-plane namespace the AgentMachine is in.
+    `status.debugInfo.state`, its hostname and the AgentMachine behind it — by
+    the `agentMachineRef` label + `agentMachineRefNamespace` annotation, or by
+    an AgentMachine whose `status.agentRef` still names it (a Machine already
+    on its way out). For the one Agent linked to a hosted cluster: its Machine
+    by ANY link — the AgentMachine's owner (read by the owner reference's own
+    apiVersion), a Machine whose infrastructureRef names the AgentMachine, or
+    one whose providerID is `agent://<agent>` (the only link left once the
+    AgentMachine is gone) — with its deletionTimestamp, nodeRef, pending
+    delete hooks, deletion conditions and whether its AgentMachine still
+    exists; every Machine matched (`machines_matched`, refused when several);
+    and the HostedCluster whose control-plane namespace its links point into —
+    the AgentMachine's, the Machine's, or the binding's when a HostedCluster
+    has it. So a binding with BOTH AgentMachine and Machine gone is still
+    recognised as a hosted node.
 
-    Needs, beyond the InfraEnv namespace's Role: list on AgentMachines and
-    HostedClusters cluster-wide, get on Machines. A 403 is
+    Needs, beyond the InfraEnv namespace's Role: list on AgentMachines,
+    Machines and HostedClusters cluster-wide, get on Machines. A 403 is
     BmhPrerequisiteMissingError (non-retryable); an absent CAPI or HyperShift
     API is no AgentMachine / no HostedCluster, not an error.
     """
@@ -513,7 +530,10 @@ async def get_machine_state(ref: MachineRef) -> MachineState:
     deletion conditions not yet True (v1beta1's DrainingSucceeded,
     PreDrainDeleteHookSucceeded, VolumeDetachSucceeded,
     PreTerminateDeleteHookSucceeded and v1beta2's Deleting, whichever the
-    installed CAPI writes).
+    installed CAPI writes). Also whether it holds the Agent provider's own
+    hook, whether it has reached its pre-terminate hooks (past the drain), and
+    whether the AgentMachine its infrastructureRef names still exists — the
+    three facts that say the provider can no longer release it.
     """
     ...
 
@@ -550,5 +570,102 @@ async def check_hosted_node(ref: HostedNodeRef) -> HostedNodeState:
     Raises HostedClusterUnreachableError (connection failures, 5xx, 401 —
     retried without bound) and HostedClusterAccessError (no kubeconfig
     published, a Secret without a usable one, a 403 — non-retryable).
+    """
+    ...
+
+
+# --- uninstall-server: what a broken HyperShift deletion left behind -----------
+
+
+@activity.defn
+async def find_hosted_nodes(query: HostedNodeQuery) -> HostedNodes:
+    """uninstall-server: every Node of the hosted cluster that IS this server. Reads only.
+
+    The cluster is `query.hosted_cluster`, else the one HostedCluster on the
+    MCE named `query.cluster_name` (server-scan's INSTALLED reading) —
+    several or none is `hosted_cluster=None` with a `reason`, as is a
+    HostedCluster that is gone. Lists the Nodes through the admin kubeconfig
+    (as check_hosted_node reaches it) and keeps those whose providerID is
+    `agent://<agent>`, or whose name is the Machine's nodeRef, the Agent's
+    hostname or the server's own name while carrying no OTHER providerID.
+    Each with Ready and unschedulable.
+
+    Raises HostedClusterUnreachableError (retried) and HostedClusterAccessError
+    (non-retryable), as check_hosted_node.
+    """
+    ...
+
+
+@activity.defn
+async def drain_hosted_node(action: HostedNodeAction) -> HostedNodeDrain:
+    """uninstall-server: one drain pass over a Node HyperShift lost track of.
+
+    Only for a Node with no Machine behind it — CAPI drains a Node only
+    through its Machine. Cordons it (`spec.unschedulable`), then evicts, through
+    the Eviction API so PodDisruptionBudgets hold, every Pod CAPI's drain would
+    move: everything but DaemonSet and mirror Pods. Pods already terminating
+    are waited for, not evicted again. A refused eviction (429, 5xx) is
+    reported in `blocked` and retried on the next pass — the workflow owns the
+    deadline. A Node now carrying another providerID is left alone
+    (`matches=False`). Errors as find_hosted_nodes.
+    """
+    ...
+
+
+@activity.defn
+async def delete_hosted_node(action: HostedNodeAction) -> HostedNodeDeletion:
+    """uninstall-server: delete a Node nothing runs as any more.
+
+    Only when it is NOT Ready — a running kubelet would register it again at
+    once — and carries no other providerID. A Ready one is `ready=True`,
+    untouched. Absent is found=False. Errors as find_hosted_nodes.
+    """
+    ...
+
+
+@activity.defn
+async def release_agent(request: AgentReleaseRequest) -> AgentRelease:
+    """uninstall-server: unbind the Agent the way the Agent provider would.
+
+    For an Agent the provider can no longer release: it unbinds only from a
+    Machine's pre-terminate hook, so with the Machine (or the AgentMachine)
+    gone nothing else ever will. The exact write `handleDeletionHook` makes —
+    `agentMachineRef` label and namespace annotation removed,
+    `machineConfigPool` emptied, ignition token reference and headers dropped,
+    `clusterDeploymentName` cleared — as a merge patch carrying the
+    resourceVersion it was read at (a concurrent change is a 409, retried after
+    a re-read). An Agent already released is a no-op; one bound to another
+    ClusterDeployment than `request.cluster_deployment` raises
+    AgentBindingChangedError (non-retryable). Needs patch on agents.
+    """
+    ...
+
+
+@activity.defn
+async def release_machine_hook(ref: MachineRef) -> MachineHookRelease:
+    """uninstall-server: remove the Agent provider's hook from a Machine it can no longer release.
+
+    `pre-terminate.delete.hook.machine.cluster.x-k8s.io/agentmachine`, and only
+    while the Machine is deleting and the AgentMachine its infrastructureRef
+    names is GONE — with it there, the hook is the provider's to remove. The
+    workflow calls it once the Agent is released and in one of the provider's
+    own release states, as the provider would. Needs patch on machines.
+    """
+    ...
+
+
+@activity.defn
+async def clean_up_agent_machines(request: AgentMachineCleanupRequest) -> AgentMachineCleanup:
+    """uninstall-server: every AgentMachine still naming the Agent, gone — and what is left.
+
+    Re-derived fresh on every call, never from the inspection: AgentMachines
+    whose `status.agentRef` names the Agent, the one its label names, and
+    `request.known`. One that a Machine still owns or names is never touched
+    (`held_by_machine` — that is CAPI's deletion). Any other is deleted; one
+    already deleting has the provider's own finalizer dropped when
+    `clear_finalizers` is set and the Agent is released — the provider removes
+    it only through a Machine, so without one it would hold for ever. Also
+    reports every Machine still linked to the Agent (`machines`). Needs list,
+    delete and patch on agentmachines, list on machines.
     """
     ...

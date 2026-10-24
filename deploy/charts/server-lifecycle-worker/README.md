@@ -393,14 +393,16 @@ The credentials Secret must exist in that namespace first. Its keys:
 ### RBAC: one Role per InfraEnv namespace, plus one ClusterRole for uninstall-server
 
 `rbac.targetNamespaces` gets a Role each: everything install-server and
-remove-server do happens in an InfraEnv namespace. uninstall-server reaches
+remove-server do happens in an InfraEnv namespace — and uninstall-server's
+`patch` on agents, the Agent provider's own unbind for an Agent whose Machine
+or AgentMachine a broken HyperShift deletion left behind. uninstall-server reaches
 further, so `rbac.hostedClusters` (default `true`) adds a **ClusterRole** —
 **a widening, and the widest grant in this chart**:
 
 | group / resource | verbs | why |
 |---|---|---|
-| `cluster.x-k8s.io` machines | get, list, delete | the Machine behind a hosted node's Agent; the delete is uninstall-server's only write |
-| `capi-provider.agent-install.openshift.io` agentmachines | get, list | found by its `status.agentRef` — the only link once the Agent provider starts unbinding |
+| `cluster.x-k8s.io` machines | get, list, delete, patch | the Machine behind a hosted node's Agent, found by owner, infrastructureRef or providerID; patch removes the Agent provider's pre-terminate hook from one whose AgentMachine is gone (the provider never can) |
+| `capi-provider.agent-install.openshift.io` agentmachines | get, list, delete, patch | found by its `status.agentRef` — the only link once the Agent provider starts unbinding; delete one left with no Machine, patch to drop the provider's finalizer it only drops through a Machine |
 | `hypershift.openshift.io` hostedclusters | get, list | found by its control-plane namespace; its `status.kubeconfig` |
 | `""` secrets | get | the HostedCluster's admin kubeconfig — **every Secret on the MCE** |
 

@@ -348,22 +348,23 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   (`inspect_bound_host`: BMH, Agents by bmh label / any MAC, AgentMachines listed
   cluster-wide, the owning Machine via ownerReferences — deletionTimestamp,
   nodeRef, hooks, conditions — and the HostedCluster; the Node name is captured
-  HERE; refused: two bound Agents `MultipleBoundAgentsError`, bound with no
-  AgentMachine — early-bound ACM/ZTP or an orphan binding, v2 —
-  `NotHostedClusterNodeError`, server-scan INSTALLED naming another cluster or
+  HERE; refused: two bound Agents `MultipleBoundAgentsError`, bound into no
+  HostedCluster's control plane with nothing behind it — early-bound ACM/ZTP —
+  `NotHostedClusterNodeError` (an ORPHAN binding into a control plane is a
+  leftover, next bullet), server-scan INSTALLED naming another cluster or
   INSTALLED_TO_INVENTORY while bound — an unbound Agent contradicts no
   INSTALLED reading, a re-run's normal view) → `reserving-server` ALWAYS → the
-  hosted half: `deleting-machine` (`ensure_machine_deleting`, the ONE write on
-  the MCE, a no-op when it already has a deletionTimestamp or is gone) →
+  hosted half: `deleting-machine` (`ensure_machine_deleting`, the one write the
+  NORMAL path makes, a no-op when it already has a deletionTimestamp or is gone) →
   `awaiting-machine-deletion` (30 s polls of Machine + Agent: `draining` while the
   Agent is bound, 20 min from the first deleting observation, then
   `MachineDrainTimeoutError` naming conditions and pending hooks; `unbinding`
   once released, 1 h to `known-unbound` — install-server's bare-metal reasoning —
   then `AgentUnbindTimeoutError`, or `MachineDeletionTimeoutError` when the Agent
   is free and the Machine still stands) → `verifying-agentmachine` (gone, 5 min,
-  `ServerStillPresentError`) → `verifying-node` (`check_hosted_node`; SKIPPED when
-  the Machine never had a nodeRef; present = `HostedNodeStillPresentError` with
-  an `oc delete node` hint — a Node is NEVER deleted) → `verifying-agent` (no
+  `ServerStillPresentError`) → `verifying-node` (no Node is the server — by
+  providerID, nodeRef or hostname, NEVER skipped for a missing nodeRef) →
+  `verifying-agent` (no
   binding, no label, known-unbound, approved, BMH present and not in error; 5 min,
   `AgentStillBoundError`) → `holding-server` (24 h BEFORE the child, so the hold
   covers the inventory half) → `removing-from-inventory`. Every skip goes into
@@ -373,7 +374,7 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   scale-down-driven = SHRINK — a future `scale-down-nodepool` owns the
   annotation + replicas and triggers this run per server, which then finds the
   Machine already deleting. THE LOCK even for an uninstall (holder
-  `uninstall-server`, TTL = drain + unbind + both verifications + 10 min): the
+  `uninstall-server`, TTL = two drains + unbind + three verifications + 10 min): the
   hosted cluster's nodes job frees the server on its Node's absence and the MCE's
   agents job re-claims it INSTALLED_TO_INVENTORY on its own 15-min cadence, so
   between them it can read AVAILABLE while still in this InfraEnv and be drawn by
@@ -398,12 +399,55 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   `<ns>-<name, dots as dashes>` against the AgentMachine's namespace
   (`hosted_resources.hosted_cluster_for`). Shapes are taken from
   cluster-api-provider-agent and HyperShift's own code, cited in
-  `hosted_resources.py`. Needs, beyond the InfraEnv Roles, a ClusterRole
-  (`rbac.hostedClusters`): machines get/list/delete, agentmachines get/list,
-  hostedclusters get/list and secrets get CLUSTER-WIDE — the widest grant the
-  limb holds; the vendored chart in redbull-platform needs the same. Never: a
-  NodePool change, a Node delete, Node-side drain logic, a PXE map write
-  (remove-server's), a new deployment.
+  `hosted_resources.py`. Needs, beyond the InfraEnv Roles (plus `patch` on
+  agents there), a ClusterRole (`rbac.hostedClusters`): machines and
+  agentmachines get/list/delete/patch, hostedclusters get/list and secrets get
+  CLUSTER-WIDE — the widest grant the limb holds; the vendored chart in
+  redbull-platform needs the same. Never: a NodePool change, a drain or Node
+  delete CAPI can still do, anyone's finalizer or hook but the Agent provider's,
+  a PXE map write (remove-server's), a new deployment.
+- **uninstall-server CLEARS what a broken HyperShift deletion left, and verifies
+  every finalizer's job instead of assuming it** (`workflow.patched(
+  "uninstall-server-hosted-leftovers")`; runs recorded before it keep the flow
+  above). Decided with the operator 2026-10-24: HyperShift bugs leave an
+  AgentMachine + Machine with no Node, a Machine with no AgentMachine, an
+  AgentMachine with no Machine, a Node with neither. Each object is cleaned up
+  by a finalizer or hook — CAPI drains and deletes a Node ONLY through its
+  Machine; cluster-api-provider-agent unbinds an Agent ONLY from its Machine's
+  pre-terminate hook (`handleDeletionHook`), drops its AgentMachine finalizer
+  WITHOUT the unbind when the owner Machine is gone and keeps it for ever with
+  no owner at all — so a broken chain never finishes on its own. Read
+  upstream (cited in `hosted_resources.py`): the Machine's and the Node's
+  `spec.providerID` is `agent://<agent name>`, the Node's name the Agent's
+  hostname. So: INSPECTION finds the Machine by ANY link (owner, an
+  infrastructureRef naming the AgentMachine, providerID) and the HostedCluster
+  by whatever points into its control plane (AgentMachine, Machine, or a
+  binding whose namespace a HostedCluster uses); two Machines / two Nodes /
+  two control planes = `ConflictingHostedObjectsError`. `checking-hosted-node`
+  (`find_hosted_nodes`, BEFORE the lock) finds the Node that IS the server —
+  providerID, or a name (nodeRef, hostname, server name) with no OTHER
+  providerID — in the MCE-linked cluster, else the one server-scan says it is
+  INSTALLED in; a READY Node nothing on the MCE links is refused
+  (`HostedNodeStillPresentError`, nothing to release the host through). Then,
+  where the owner cannot act, the run makes ITS write: `draining-node` — a Node
+  no Machine stands behind, cordon + Eviction API for all but DaemonSet and
+  mirror Pods (CAPI's drain rules), 20 min, `NodeDrainTimeoutError`, BEFORE the
+  unbind that reboots the host, never for a NotReady Node; `releasing` — the
+  provider's EXACT unbind (`release_agent`: label + namespace annotation,
+  machineConfigPool "", ignition token ref + headers, clusterDeploymentName,
+  merge patch with the read resourceVersion, `AgentBindingChangedError` for a
+  binding elsewhere) when no Machine is left, or the Machine sits at its
+  pre-terminate hook with its AgentMachine gone — then, once the Agent is in a
+  provider release state, `release_machine_hook` drops the provider's hook;
+  `verifying-agentmachine` (`clean_up_agent_machines`, re-derived FRESH: any
+  AgentMachine naming the Agent by agentRef or label, a Machine-less one deleted,
+  one stuck deleting has ONLY the provider's finalizer dropped after 1 min and
+  only once the Agent is released; any Machine still linked =
+  `ServerStillPresentError`, a NodePool replacement taking it again);
+  `verifying-node` deletes a Node still there once NotReady (the host is back in
+  discovery) and fails on one still Ready. Writes go in `result.cleaned_up`, each
+  with why the owner could not; the shape found in `leftovers_at_start`. Needs
+  the new limb (new activities) AND the widened RBAC — ship the RBAC first.
 - **Select bond members from `interfaces[]`, NEVER from `nic_macs`.**
   server-scan reduces Dell NPAR partitions to one entry per physical port in
   `interfaces` but leaves `nic_macs` whole on purpose, so a 4-port partitioned

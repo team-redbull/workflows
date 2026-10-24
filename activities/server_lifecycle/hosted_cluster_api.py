@@ -1,4 +1,4 @@
-"""A hosted cluster's own API server — the one read uninstall-server makes of it.
+"""A hosted cluster's own API server — what uninstall-server reads and writes there.
 
 Split out like cluster_api.py: one technology, plain parameters, no settings and
 no Temporal. cluster_api.py talks to the MCE this worker runs in, as the pod's
@@ -23,6 +23,12 @@ kubeconfig is ever handled, and it handles one per call:
   * NOTHING FROM THE KUBECONFIG ENTERS AN ERROR. Activity errors are recorded
     verbatim in Temporal history; messages here name only the hosted cluster
     and what was wrong, never a value read from the file.
+
+The WRITES — a cordon, Pod evictions, a Node delete — are only ever for a Node
+HyperShift lost track of (no Machine behind it), the one case where CAPI will
+not drain and delete it itself. Which Node is the server's and which Pods a
+drain moves are decided in hosted_resources.py; this module only carries them
+out.
 """
 
 from __future__ import annotations
@@ -30,6 +36,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import contextlib
+import json
 import pathlib
 import tempfile
 from typing import Any
@@ -38,11 +46,16 @@ import urllib3
 import yaml
 from kubernetes import client as k8s_client
 
+from activities.server_lifecycle import hosted_resources
 from shared.exceptions import HostedClusterAccessError, HostedClusterUnreachableError
 
 _NOT_FOUND = 404
 _UNAUTHORIZED = 401
 _FORBIDDEN = 403
+_TOO_MANY_REQUESTS = 429
+
+# `_call(..., absent=...)` without `absent`: a 404 is an error like any other.
+_RAISE = object()
 
 # (connect, read) seconds — well under the activity's 90 s start_to_close.
 _REQUEST_TIMEOUT = (10, 30)
@@ -115,13 +128,17 @@ def _credentials(kubeconfig: str, cluster: str) -> dict[str, Any]:
     return {"ca": ca, "cert": cert, "key": key, "token": token}
 
 
-def _classify(exc: Exception, cluster: str, node_name: str) -> Exception:
-    """One failure of the hosted API call as a classified domain error."""
+def _classify(exc: Exception, cluster: str, what: str) -> Exception:
+    """One failure of a hosted API call as a classified domain error.
+
+    `what` names the call (`a read of Node node-1`), never anything from the
+    kubeconfig.
+    """
     if isinstance(exc, k8s_client.ApiException):
         if exc.status == _FORBIDDEN:
             return HostedClusterAccessError(
                 f"the API server of hosted cluster {cluster} refused the admin "
-                f"kubeconfig a read of Node {node_name} (403)"
+                f"kubeconfig {what} (403)"
             )
         if exc.status == _UNAUTHORIZED:
             return HostedClusterUnreachableError(
@@ -129,8 +146,7 @@ def _classify(exc: Exception, cluster: str, node_name: str) -> Exception:
                 "credential (401); it is re-read on the next attempt"
             )
         return HostedClusterUnreachableError(
-            f"the API server of hosted cluster {cluster} answered {exc.status} "
-            f"reading Node {node_name}"
+            f"the API server of hosted cluster {cluster} answered {exc.status} to {what}"
         )
     reason = getattr(exc, "reason", None)
     if isinstance(exc, urllib3.exceptions.SSLError) or isinstance(
@@ -147,7 +163,21 @@ def _classify(exc: Exception, cluster: str, node_name: str) -> Exception:
     )
 
 
-def _node_exists(kubeconfig: str, server: str, node_name: str, cluster: str) -> bool:
+def _status_message(exc: k8s_client.ApiException) -> str:
+    """The API server's own sentence (`Cannot evict pod as it would violate…`)."""
+    try:
+        body = json.loads(exc.body or "")
+    except (TypeError, ValueError):
+        return str(exc.reason)
+    return str(body.get("message") or exc.reason) if isinstance(body, dict) else str(exc.reason)
+
+
+@contextlib.contextmanager
+def _hosted_api(kubeconfig: str, server: str, cluster: str):
+    """(ApiClient, CoreV1Api) as the hosted cluster's admin, credentials in a temp dir.
+
+    The directory — CA, certificate, key — is deleted the moment the block ends.
+    """
     credentials = _credentials(kubeconfig, cluster)
     with tempfile.TemporaryDirectory(prefix="hosted-kas-") as tmp:
         directory = pathlib.Path(tmp)
@@ -170,18 +200,42 @@ def _node_exists(kubeconfig: str, server: str, node_name: str, cluster: str) -> 
         # No retries inside the call: the activity's own retry policy owns that.
         configuration.retries = False
 
-        try:
-            with k8s_client.ApiClient(configuration) as api_client:
-                k8s_client.CoreV1Api(api_client).read_node(
-                    name=node_name, _request_timeout=_REQUEST_TIMEOUT
-                )
-        except k8s_client.ApiException as exc:
-            if exc.status == _NOT_FOUND:
-                return False
-            raise _classify(exc, cluster, node_name) from None
-        except urllib3.exceptions.HTTPError as exc:
-            raise _classify(exc, cluster, node_name) from None
-    return True
+        with k8s_client.ApiClient(configuration) as api_client:
+            yield api_client, k8s_client.CoreV1Api(api_client)
+
+
+def _call(fn, cluster: str, what: str, *, absent: Any = _RAISE):
+    """One hosted API call; a 404 is `absent` when given, every other failure classified."""
+    try:
+        return fn()
+    except k8s_client.ApiException as exc:
+        if exc.status == _NOT_FOUND and absent is not _RAISE:
+            return absent
+        raise _classify(exc, cluster, what) from None
+    except urllib3.exceptions.HTTPError as exc:
+        raise _classify(exc, cluster, what) from None
+
+
+def _plain(api_client, obj: Any) -> dict[str, Any]:
+    """An SDK model as the API's own JSON shape (camelCase), so hosted_resources reads dicts."""
+    plain = api_client.sanitize_for_serialization(obj)
+    return plain if isinstance(plain, dict) else {}
+
+
+def _qualified(obj: dict[str, Any]) -> str:
+    metadata = obj.get("metadata") or {}
+    return f"{metadata.get('namespace')}/{metadata.get('name')}"
+
+
+def _node_exists(kubeconfig: str, server: str, node_name: str, cluster: str) -> bool:
+    with _hosted_api(kubeconfig, server, cluster) as (_api_client, core):
+        node = _call(
+            lambda: core.read_node(name=node_name, _request_timeout=_REQUEST_TIMEOUT),
+            cluster,
+            f"a read of Node {node_name}",
+            absent=None,
+        )
+    return node is not None
 
 
 async def node_exists(kubeconfig: str, server: str, node_name: str, cluster: str) -> bool:
@@ -192,3 +246,145 @@ async def node_exists(kubeconfig: str, server: str, node_name: str, cluster: str
     SDK, so it runs in a thread, like every call in cluster_api.py.
     """
     return await asyncio.to_thread(_node_exists, kubeconfig, server, node_name, cluster)
+
+
+def _list_nodes(kubeconfig: str, server: str, cluster: str) -> list[dict[str, Any]]:
+    with _hosted_api(kubeconfig, server, cluster) as (api_client, core):
+        nodes = _call(
+            lambda: core.list_node(_request_timeout=_REQUEST_TIMEOUT), cluster, "a list of Nodes"
+        )
+        return list(_plain(api_client, nodes).get("items") or [])
+
+
+async def list_nodes(kubeconfig: str, server: str, cluster: str) -> list[dict[str, Any]]:
+    """Every Node of the hosted cluster, as plain dicts."""
+    return await asyncio.to_thread(_list_nodes, kubeconfig, server, cluster)
+
+
+def _read_owned_node(core, api_client, node_name: str, provider_id: str | None, cluster: str):
+    """(node, matches): None when absent; matches=False when its providerID is not the one matched."""
+    node = _call(
+        lambda: core.read_node(name=node_name, _request_timeout=_REQUEST_TIMEOUT),
+        cluster,
+        f"a read of Node {node_name}",
+        absent=None,
+    )
+    if node is None:
+        return None, True
+    plain = _plain(api_client, node)
+    # Still exactly the Node that was matched: same providerID, or still none.
+    return plain, hosted_resources.node_provider_id(plain) == provider_id
+
+
+def _drain_node(
+    kubeconfig: str, server: str, node_name: str, provider_id: str | None, cluster: str
+) -> dict[str, Any]:
+    with _hosted_api(kubeconfig, server, cluster) as (api_client, core):
+        node, matches = _read_owned_node(core, api_client, node_name, provider_id, cluster)
+        if node is None:
+            return {"found": False}
+        if not matches:
+            return {"found": True, "matches": False}
+        cordoned = False
+        if not (node.get("spec") or {}).get("unschedulable"):
+            _call(
+                lambda: core.patch_node(
+                    name=node_name, body={"spec": {"unschedulable": True}},
+                    _request_timeout=_REQUEST_TIMEOUT,
+                ),
+                cluster,
+                f"a cordon of Node {node_name}",
+            )
+            cordoned = True
+        pods = _call(
+            lambda: core.list_pod_for_all_namespaces(
+                field_selector=f"spec.nodeName={node_name}", _request_timeout=_REQUEST_TIMEOUT
+            ),
+            cluster,
+            f"a list of the Pods on Node {node_name}",
+        )
+        to_move = [
+            pod for pod in _plain(api_client, pods).get("items") or []
+            if hosted_resources.pod_to_evict(pod)
+        ]
+        evicted: list[str] = []
+        blocked: list[str] = []
+        for pod in to_move:
+            metadata = pod.get("metadata") or {}
+            if metadata.get("deletionTimestamp"):
+                continue  # already going: wait for it, do not evict it twice
+            name, namespace = metadata.get("name"), metadata.get("namespace")
+            eviction = k8s_client.V1Eviction(
+                metadata=k8s_client.V1ObjectMeta(name=name, namespace=namespace)
+            )
+            try:
+                core.create_namespaced_pod_eviction(
+                    name=name, namespace=namespace, body=eviction, _request_timeout=_REQUEST_TIMEOUT
+                )
+            except k8s_client.ApiException as exc:
+                if exc.status == _NOT_FOUND:
+                    continue
+                # 429: a PodDisruptionBudget refuses it now; 5xx: e.g. a Pod
+                # under two budgets. Both are reported and retried next pass,
+                # inside the workflow's drain deadline, not by an activity
+                # retry that would hide them.
+                if exc.status == _TOO_MANY_REQUESTS or exc.status >= 500:
+                    blocked.append(f"{namespace}/{name}: {_status_message(exc)}")
+                    continue
+                raise _classify(exc, cluster, f"an eviction of Pod {namespace}/{name}") from None
+            except urllib3.exceptions.HTTPError as exc:
+                raise _classify(exc, cluster, f"an eviction of Pod {namespace}/{name}") from None
+            evicted.append(f"{namespace}/{name}")
+        return {
+            "found": True,
+            "cordoned": cordoned,
+            "evicted": evicted,
+            "remaining": sorted(_qualified(pod) for pod in to_move),
+            "blocked": blocked,
+        }
+
+
+async def drain_node(
+    kubeconfig: str, server: str, node_name: str, provider_id: str | None, cluster: str
+) -> dict[str, Any]:
+    """One drain pass over a Node: cordon it, evict every Pod a drain moves.
+
+    Returns {found, matches, cordoned, evicted, remaining, blocked}: `remaining`
+    lists the Pods to move that were still on the Node when the pass began —
+    the drain is done when a pass finds none. Nothing is done to a Node whose
+    providerID is no longer the one it was matched with (`matches` False).
+    """
+    return await asyncio.to_thread(_drain_node, kubeconfig, server, node_name, provider_id, cluster)
+
+
+def _delete_node(
+    kubeconfig: str, server: str, node_name: str, provider_id: str | None, cluster: str
+) -> dict[str, Any]:
+    with _hosted_api(kubeconfig, server, cluster) as (api_client, core):
+        node, matches = _read_owned_node(core, api_client, node_name, provider_id, cluster)
+        if node is None:
+            return {"found": False}
+        if not matches:
+            return {"found": True, "matches": False}
+        if hosted_resources.node_ready(node):
+            # A kubelet still runs as it: deleting would only see it registered again.
+            return {"found": True, "ready": True}
+        deleted = _call(
+            lambda: core.delete_node(name=node_name, _request_timeout=_REQUEST_TIMEOUT),
+            cluster,
+            f"a delete of Node {node_name}",
+            absent=False,
+        )
+        return {"found": deleted is not False, "deleted": deleted is not False}
+
+
+async def delete_node(
+    kubeconfig: str, server: str, node_name: str, provider_id: str | None, cluster: str
+) -> dict[str, Any]:
+    """Delete a Node nothing runs as any more. Returns {found, matches, ready, deleted}.
+
+    Refuses (deleted False) a Node still Ready — a running kubelet would
+    register it again at once — or one whose providerID is no longer the one it
+    was matched with (`matches` False).
+    """
+    return await asyncio.to_thread(_delete_node, kubeconfig, server, node_name, provider_id, cluster)

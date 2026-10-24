@@ -29,16 +29,21 @@ from activities.server_lifecycle import (
 )
 from activities.server_lifecycle.bmh_resources import AGENT_BMH_LABEL
 from shared.exceptions import (
+    AgentBindingChangedError,
     AmbiguousServerNameError,
     HostedClusterAccessError,
     HostedClusterUnreachableError,
     ServerScanAuthError,
 )
 from shared.models.server_lifecycle import (
+    AgentMachineCleanupRequest,
     AgentMachineRef,
     AgentNameRef,
+    AgentReleaseRequest,
     BmhRef,
     HostedClusterRef,
+    HostedNodeAction,
+    HostedNodeQuery,
     HostedNodeRef,
     MachineRef,
     ServerMembershipRequest,
@@ -245,6 +250,8 @@ class _FakeMce:
             self.namespaced[("hostedclusters", hc["metadata"]["namespace"], hc["metadata"]["name"])] = hc
         self.secrets = secrets or {}
         self.deleted: list = []
+        self.patched: list = []
+        self.finalizers_cleared: list = []
         self.cluster_lists: list = []
 
     async def read_custom_object(self, *, plural, namespace, name, **_):
@@ -259,7 +266,29 @@ class _FakeMce:
 
     async def delete_custom_object(self, *, plural, namespace, name, **_):
         self.deleted.append((plural, namespace, name))
-        return self.namespaced.pop((plural, namespace, name), None) is not None
+        existing = self.namespaced.get((plural, namespace, name))
+        if existing is None:
+            return False
+        if (existing.get("metadata") or {}).get("finalizers"):
+            existing["metadata"]["deletionTimestamp"] = "2026-10-24T09:00:00Z"
+        else:
+            del self.namespaced[(plural, namespace, name)]
+        return True
+
+    async def patch_custom_object(self, *, plural, namespace, name, body, **_):
+        self.patched.append((plural, namespace, name, body))
+        return (plural, namespace, name) in self.namespaced
+
+    async def clear_custom_object_finalizers(self, *, plural, namespace, name, finalizers, **_):
+        existing = self.namespaced.get((plural, namespace, name))
+        if existing is None:
+            return False
+        self.finalizers_cleared.append((plural, namespace, name, sorted(finalizers)))
+        remaining = [f for f in existing["metadata"].get("finalizers", []) if f not in finalizers]
+        existing["metadata"]["finalizers"] = remaining
+        if not remaining and existing["metadata"].get("deletionTimestamp"):
+            del self.namespaced[(plural, namespace, name)]
+        return True
 
     async def read_secret_data(self, namespace, name):
         return self.secrets.get((namespace, name))
@@ -269,7 +298,8 @@ class _FakeMce:
 def mce(monkeypatch):
     def _install(fake: _FakeMce) -> _FakeMce:
         for fn in ("read_custom_object", "list_custom_objects", "list_cluster_custom_objects",
-                   "delete_custom_object", "read_secret_data"):
+                   "delete_custom_object", "read_secret_data", "patch_custom_object",
+                   "clear_custom_object_finalizers"):
             monkeypatch.setattr(cluster_api, fn, getattr(fake, fn))
 
         async def _macs(_url, _token, server_name):
@@ -326,7 +356,7 @@ class TestInspectBoundHost:
         state = await activities.inspect_bound_host(REF)
 
         assert state.hosted_agents == [] and state.machine is None and state.hosted_cluster is None
-        assert fake.cluster_lists == ["agentmachines"]  # no HostedCluster list needed
+        assert fake.cluster_lists == ["agentmachines", "machines", "hostedclusters"]
 
     async def test_no_agent_lists_nothing_cluster_wide(self, mce):
         fake = mce(_FakeMce())
@@ -500,3 +530,403 @@ class TestTheHostedApiServerCall:
         with pytest.raises(HostedClusterAccessError, match=words) as excinfo:
             await hosted_cluster_api.node_exists(kubeconfig, self.SERVER, "node-1", "clusters/hc-01")
         assert SECRET_MARKER not in str(excinfo.value)
+
+
+# --- what a broken HyperShift deletion leaves behind ------------------------------------
+
+PROVIDER_HOOK = hosted_resources.PROVIDER_MACHINE_HOOK
+AM_FINALIZER = hosted_resources.AGENT_MACHINE_FINALIZER
+
+
+def _machine(name="hc-01-np-x7k2p", namespace=HCP, *, provider_id=None, agent_machine=None,
+             node=None, deleting=False, hook=False, conditions=()):
+    machine = {
+        "apiVersion": "cluster.x-k8s.io/v1beta1",
+        "metadata": {"name": name, "namespace": namespace, "annotations": {}},
+        "spec": {},
+        "status": {"conditions": list(conditions)},
+    }
+    if provider_id:
+        machine["spec"]["providerID"] = provider_id
+    if agent_machine:
+        machine["spec"]["infrastructureRef"] = {
+            "apiVersion": "capi-provider.agent-install.openshift.io/v1beta1",
+            "kind": "AgentMachine", "name": agent_machine,
+        }
+    if node:
+        machine["status"]["nodeRef"] = {"name": node}
+    if deleting:
+        machine["metadata"]["deletionTimestamp"] = "2026-10-24T08:00:00Z"
+    if hook:
+        machine["metadata"]["annotations"][PROVIDER_HOOK] = ""
+    return machine
+
+
+class TestTheLinks:
+    def test_a_machine_is_found_by_any_of_three_links(self):
+        am = _agent_machine()
+        by_owner = _machine()
+        by_infra = _machine("by-infra", agent_machine="hc-01-np-am-x7k2p")
+        by_provider_id = _machine("by-pid", provider_id="agent://agent-1")
+        unrelated = _machine("other", provider_id="agent://agent-2", agent_machine="am-other")
+        found = hosted_resources.machines_for("agent-1", am, [unrelated, by_provider_id, by_infra, by_owner])
+        assert [m["metadata"]["name"] for m in found] == ["by-infra", "by-pid", "hc-01-np-x7k2p"]
+
+    def test_with_the_agentmachine_gone_the_provider_id_still_finds_it(self):
+        machine = _machine(provider_id="agent://agent-1", agent_machine="gone-am")
+        assert hosted_resources.machines_for("agent-1", None, [machine]) == [machine]
+
+    def test_every_agentmachine_that_names_the_agent(self):
+        by_ref = _agent_machine("am-ref", agent_ref={"name": "agent-1", "namespace": NS})
+        by_label = _agent_machine("am-label")
+        other = _agent_machine("am-other", agent_ref={"name": "agent-2", "namespace": NS})
+        agent = _agent(label_am="am-label")
+        found = hosted_resources.agent_machines_naming(agent, "agent-1", NS, [by_ref, by_label, other])
+        assert [a["metadata"]["name"] for a in found] == ["am-ref", "am-label"]
+        # A deleted Agent: only agentRefs can still name it.
+        assert hosted_resources.agent_machines_naming(None, "agent-1", NS, [by_ref, by_label]) == [by_ref]
+
+    def test_the_hostname_is_the_requested_one_else_the_discovered_one(self):
+        agent = _agent()
+        agent["status"]["inventory"]["hostname"] = "discovered"
+        assert hosted_resources.agent_hostname(agent) == "discovered"
+        agent["spec"]["hostname"] = "requested"
+        assert hosted_resources.agent_hostname(agent) == "requested"
+
+    @pytest.mark.parametrize(
+        ("conditions", "at_hook"),
+        [
+            ([{"type": "Deleting", "status": "True", "reason": "WaitingForPreTerminateHook"}], True),
+            ([{"type": "Deleting", "status": "True", "reason": "DrainingNode"}], False),
+            ([{"type": "PreTerminateDeleteHookSucceeded", "status": "False", "reason": "WaitingExternalHook"}], True),
+            ([{"type": "PreTerminateDeleteHookSucceeded", "status": "True"}], False),
+            ([], False),
+        ],
+    )
+    def test_where_the_providers_hook_takes_over(self, conditions, at_hook):
+        state = hosted_resources.machine_state(
+            _machine(deleting=True, hook=True, agent_machine="am", conditions=conditions)
+        )
+        assert state.provider_hook and state.at_pre_terminate_hook is at_hook
+        assert state.agent_machine == f"{HCP}/am"
+
+    def test_the_release_is_the_providers_own_write(self):
+        assert hosted_resources.agent_release_patch("42") == {
+            "metadata": {
+                "resourceVersion": "42",
+                "labels": {"agentMachineRef": None},
+                "annotations": {"agentMachineRefNamespace": None},
+            },
+            "spec": {
+                "machineConfigPool": "",
+                "ignitionEndpointTokenReference": None,
+                "ignitionEndpointHTTPHeaders": None,
+                "clusterDeploymentName": None,
+            },
+        }
+
+
+def _node(name="node-1", *, provider_id="agent://agent-1", ready=True):
+    node = {"metadata": {"name": name}, "spec": {},
+            "status": {"conditions": [{"type": "Ready", "status": "True" if ready else "Unknown"}]}}
+    if provider_id:
+        node["spec"]["providerID"] = provider_id
+    return node
+
+
+class TestNodesAndPods:
+    def test_a_node_is_the_servers_by_provider_id_or_by_name_without_another_one(self):
+        names = {"node-1", "ocp-x"}
+        assert hosted_resources.node_matches(_node(), "agent://agent-1", names) == ["provider-id", "name"]
+        assert hosted_resources.node_matches(_node("worker-9"), "agent://agent-1", names) == ["provider-id"]
+        assert hosted_resources.node_matches(_node(provider_id=None), "agent://agent-1", names) == ["name"]
+        # Same name, another Agent's providerID: another machine.
+        assert hosted_resources.node_matches(_node(provider_id="agent://agent-2"), "agent://agent-1", names) == []
+
+    def test_ready_is_the_kubelets_ready_true(self):
+        assert hosted_resources.node_ready(_node())
+        assert not hosted_resources.node_ready(_node(ready=False))
+        assert not hosted_resources.node_ready({"status": {}})
+
+    def test_a_drain_moves_everything_but_daemonset_and_mirror_pods(self):
+        def pod(**metadata):
+            return {"metadata": {"name": "p", "namespace": "n", **metadata}}
+
+        assert hosted_resources.pod_to_evict(pod())
+        assert hosted_resources.pod_to_evict(pod(ownerReferences=[{"kind": "ReplicaSet", "controller": True}]))
+        assert not hosted_resources.pod_to_evict(pod(ownerReferences=[{"kind": "DaemonSet", "controller": True}]))
+        assert not hosted_resources.pod_to_evict(pod(annotations={"kubernetes.io/config.mirror": "x"}))
+
+
+class TestInspectingLeftovers:
+    async def test_a_machine_whose_agentmachine_is_gone_is_found_by_provider_id(self, mce):
+        machine = _machine(provider_id="agent://agent-1", agent_machine="hc-01-np-am-x7k2p",
+                           node="node-1", hook=True)
+        mce(_FakeMce(
+            agents=[_agent(label_am="hc-01-np-am-x7k2p", bound="hc-01", state="added-to-existing-cluster")],
+            machines={(HCP, "hc-01-np-x7k2p"): machine},
+            hosted_clusters=[HOSTED_CLUSTER],
+        ))
+        state = await activities.inspect_bound_host(REF)
+
+        [agent] = state.hosted_agents
+        assert agent.agent_machine is None and agent.hcp_namespaces == [HCP]
+        assert state.machine == MachineRef(namespace=HCP, name="hc-01-np-x7k2p")
+        assert state.machine_state.provider_hook and state.machine_state.agent_machine_found is False
+        assert state.hosted_cluster.name == "hc-01"
+
+    async def test_a_binding_with_both_gone_still_resolves_its_hosted_cluster(self, mce):
+        mce(_FakeMce(
+            agents=[_agent(label_am="gone-am", bound="hc-01", state="added-to-existing-cluster")],
+            hosted_clusters=[HOSTED_CLUSTER],
+        ))
+        state = await activities.inspect_bound_host(REF)
+
+        [agent] = state.hosted_agents
+        assert agent.hcp_namespaces == [HCP] and state.machine is None and state.machines_matched == []
+        assert state.hosted_cluster == HostedClusterRef(namespace="clusters", name="hc-01", hcp_namespace=HCP)
+
+    async def test_a_binding_into_no_control_plane_is_not_hosted(self, mce):
+        mce(_FakeMce(agents=[_agent(bound="ztp-cluster", state="installed")]))
+        state = await activities.inspect_bound_host(REF)
+        assert state.bound_agents and state.hosted_agents == []
+
+    async def test_every_machine_linked_is_reported(self, mce):
+        mce(_FakeMce(
+            agents=[_agent(label_am="hc-01-np-am-x7k2p", bound="hc-01")],
+            agent_machines=[_agent_machine()],
+            machines={
+                (HCP, "hc-01-np-x7k2p"): _machine(),
+                (HCP, "stray"): _machine("stray", provider_id="agent://agent-1"),
+            },
+            hosted_clusters=[HOSTED_CLUSTER],
+        ))
+        state = await activities.inspect_bound_host(REF)
+        assert state.machines_matched == [f"{HCP}/hc-01-np-x7k2p", f"{HCP}/stray"]
+        assert state.machine is None
+
+    async def test_the_machine_poll_says_whether_its_agentmachine_exists(self, mce):
+        mce(_FakeMce(
+            agent_machines=[_agent_machine()],
+            machines={(HCP, "a"): _machine("a", agent_machine="hc-01-np-am-x7k2p"),
+                      (HCP, "b"): _machine("b", agent_machine="gone")},
+        ))
+        assert (await activities.get_machine_state(MachineRef(namespace=HCP, name="a"))).agent_machine_found
+        assert (await activities.get_machine_state(MachineRef(namespace=HCP, name="b"))).agent_machine_found is False
+
+
+AGENT_REF = AgentNameRef(namespace=NS, name="agent-1")
+
+
+class TestTheProvidersWrites:
+    async def test_the_agent_is_released_with_its_resource_version(self, mce):
+        agent = _agent(label_am="gone-am", bound="hc-01")
+        agent["metadata"]["resourceVersion"] = "77"
+        fake = mce(_FakeMce(agents=[agent]))
+        release = await activities.release_agent(
+            AgentReleaseRequest(agent=AGENT_REF, cluster_deployment=f"{HCP}/hc-01")
+        )
+        assert release.released
+        [(plural, namespace, name, body)] = fake.patched
+        assert (plural, namespace, name) == ("agents", NS, "agent-1")
+        assert body == hosted_resources.agent_release_patch("77")
+
+    async def test_an_agent_already_released_is_left_alone(self, mce):
+        fake = mce(_FakeMce(agents=[_agent(state="known-unbound")]))
+        release = await activities.release_agent(
+            AgentReleaseRequest(agent=AGENT_REF, cluster_deployment=f"{HCP}/hc-01")
+        )
+        assert release.found and not release.released and fake.patched == []
+
+    async def test_an_agent_bound_elsewhere_is_never_released(self, mce):
+        fake = mce(_FakeMce(agents=[_agent(bound="hc-02")]))
+        with pytest.raises(AgentBindingChangedError, match="hc-02"):
+            await activities.release_agent(
+                AgentReleaseRequest(agent=AGENT_REF, cluster_deployment=f"{HCP}/hc-01")
+            )
+        assert fake.patched == []
+
+    async def test_the_hook_is_removed_only_when_its_agentmachine_is_gone(self, mce):
+        orphan = _machine("orphan", agent_machine="gone", deleting=True, hook=True)
+        cared_for = _machine("cared-for", agent_machine="hc-01-np-am-x7k2p", deleting=True, hook=True)
+        fake = mce(_FakeMce(agent_machines=[_agent_machine()],
+                            machines={(HCP, "orphan"): orphan, (HCP, "cared-for"): cared_for}))
+
+        released = await activities.release_machine_hook(MachineRef(namespace=HCP, name="orphan"))
+        kept = await activities.release_machine_hook(MachineRef(namespace=HCP, name="cared-for"))
+
+        assert released.released
+        assert not kept.released and "the provider releases its own hook" in kept.reason
+        assert fake.patched == [("machines", HCP, "orphan",
+                                 {"metadata": {"annotations": {PROVIDER_HOOK: None}}})]
+
+    async def test_a_machineless_agentmachine_is_deleted_one_a_machine_owns_is_not(self, mce):
+        orphan = _agent_machine("orphan", machine=None, agent_ref={"name": "agent-1", "namespace": NS})
+        owned = _agent_machine("owned", agent_ref={"name": "agent-1", "namespace": NS})
+        fake = mce(_FakeMce(
+            agents=[_agent(state="known-unbound")],
+            agent_machines=[orphan, owned],
+            machines={(HCP, "hc-01-np-x7k2p"): _machine()},
+        ))
+        cleanup = await activities.clean_up_agent_machines(AgentMachineCleanupRequest(agent=AGENT_REF))
+
+        assert cleanup.deleted == [f"{HCP}/orphan"] and cleanup.remaining == []
+        assert cleanup.held_by_machine == [f"{HCP}/owned (Machine {HCP}/hc-01-np-x7k2p)"]
+        assert fake.deleted == [("agentmachines", HCP, "orphan")]
+
+    async def test_the_providers_finalizer_is_dropped_only_when_asked_and_released(self, mce):
+        stuck = _agent_machine("stuck", machine=None, agent_ref={"name": "agent-1", "namespace": NS})
+        stuck["metadata"].update(deletionTimestamp="2026-10-24T08:00:00Z",
+                                 finalizers=[AM_FINALIZER, "someone-else/keep"])
+        fake = mce(_FakeMce(agents=[_agent(state="known-unbound")], agent_machines=[stuck]))
+
+        waiting = await activities.clean_up_agent_machines(AgentMachineCleanupRequest(agent=AGENT_REF))
+        assert waiting.finalizers_cleared == [] and waiting.remaining[0].startswith(f"{HCP}/stuck")
+
+        cleared = await activities.clean_up_agent_machines(
+            AgentMachineCleanupRequest(agent=AGENT_REF, clear_finalizers=True)
+        )
+        assert cleared.finalizers_cleared == [f"{HCP}/stuck"]
+        assert fake.finalizers_cleared == [("agentmachines", HCP, "stuck", [AM_FINALIZER])]
+        # Only the provider's own finalizer: another controller's stays.
+        assert "someone-else/keep" in cleared.remaining[0]
+
+    async def test_a_bound_agent_keeps_the_finalizer(self, mce):
+        stuck = _agent_machine("stuck", machine=None, agent_ref={"name": "agent-1", "namespace": NS})
+        stuck["metadata"].update(deletionTimestamp="2026-10-24T08:00:00Z", finalizers=[AM_FINALIZER])
+        fake = mce(_FakeMce(agents=[_agent(label_am="stuck", bound="hc-01")], agent_machines=[stuck]))
+        cleanup = await activities.clean_up_agent_machines(
+            AgentMachineCleanupRequest(agent=AGENT_REF, clear_finalizers=True)
+        )
+        assert cleanup.finalizers_cleared == [] and fake.finalizers_cleared == []
+
+
+HC_REF = HostedClusterRef(namespace="clusters", name="hc-01", hcp_namespace=HCP)
+SECRETS = {("clusters", "hc-01-admin-kubeconfig"): {
+    "kubeconfig": base64.b64encode(KUBECONFIG.encode()).decode()}}
+
+
+class TestFindHostedNodes:
+    async def test_by_cluster_name_and_every_identity(self, mce, monkeypatch):
+        mce(_FakeMce(hosted_clusters=[HOSTED_CLUSTER], secrets=SECRETS))
+
+        async def _list_nodes(kubeconfig, server, cluster):
+            assert server == f"https://kube-apiserver.{HCP}.svc:6443" and kubeconfig == KUBECONFIG
+            return [_node("worker-9"), _node(BMH, provider_id=None, ready=False),
+                    _node("node-1", provider_id="agent://agent-2"), _node("unrelated", provider_id=None)]
+
+        monkeypatch.setattr(hosted_cluster_api, "list_nodes", _list_nodes)
+        found = await activities.find_hosted_nodes(HostedNodeQuery(
+            cluster_name="HC-01", server_name=SERVER, agent_name="agent-1", hostname="node-1",
+        ))
+        assert found.hosted_cluster == HC_REF
+        assert [(n.name, n.matched_by, n.ready) for n in found.nodes] == [
+            ("worker-9", ["provider-id"], True),
+            (BMH, ["name"], False),
+        ]
+
+    async def test_a_name_no_hosted_cluster_has_is_a_reason_not_an_error(self, mce):
+        mce(_FakeMce(hosted_clusters=[HOSTED_CLUSTER]))
+        found = await activities.find_hosted_nodes(HostedNodeQuery(cluster_name="hc-9", server_name=SERVER))
+        assert found.hosted_cluster is None and "hc-9" in found.reason
+
+    async def test_a_hosted_cluster_that_is_gone_has_no_nodes(self, mce):
+        mce(_FakeMce())
+        found = await activities.find_hosted_nodes(HostedNodeQuery(hosted_cluster=HC_REF, server_name=SERVER))
+        assert found.nodes == [] and "gone" in found.reason
+
+
+class _FakeHostedCore:
+    """A hosted cluster's CoreV1Api: Nodes and Pods, recording every write."""
+
+    nodes: ClassVar[dict] = {}
+    pods: ClassVar[list] = []
+    refuse: ClassVar[dict] = {}
+    writes: ClassVar[list] = []
+
+    def __init__(self, api_client):
+        pass
+
+    def read_node(self, name, _request_timeout):
+        if name not in self.nodes:
+            raise k8s_client.ApiException(status=404)
+        return self.nodes[name]
+
+    def patch_node(self, name, body, _request_timeout):
+        self.writes.append(("cordon", name, body))
+        self.nodes[name]["spec"].update(body["spec"])
+
+    def list_pod_for_all_namespaces(self, field_selector, _request_timeout):
+        node = field_selector.removeprefix("spec.nodeName=")
+        return {"items": [p for p in self.pods if p["spec"]["nodeName"] == node]}
+
+    def create_namespaced_pod_eviction(self, name, namespace, body, _request_timeout):
+        if name in self.refuse:
+            raise self.refuse[name]
+        self.writes.append(("evict", f"{namespace}/{name}"))
+
+    def delete_node(self, name, _request_timeout):
+        self.writes.append(("delete", name))
+        self.nodes.pop(name)
+
+
+def _pod(name, node="node-1", **metadata):
+    return {"metadata": {"name": name, "namespace": "app", **metadata}, "spec": {"nodeName": node}}
+
+
+class TestTheHostedWrites:
+    SERVER = f"https://kube-apiserver.{HCP}.svc:6443"
+
+    @pytest.fixture(autouse=True)
+    def _fake_core(self, monkeypatch):
+        monkeypatch.setattr(k8s_client, "CoreV1Api", _FakeHostedCore)
+        _FakeHostedCore.nodes = {"node-1": _node()}
+        _FakeHostedCore.pods = []
+        _FakeHostedCore.refuse = {}
+        _FakeHostedCore.writes = []
+
+    async def test_a_drain_pass_cordons_and_evicts_what_a_drain_moves(self):
+        refused = k8s_client.ApiException(status=429)
+        refused.body = '{"message": "Cannot evict pod as it would violate the pod\'s disruption budget."}'
+        _FakeHostedCore.refuse = {"db-0": refused}
+        _FakeHostedCore.pods = [
+            _pod("web-1"), _pod("db-0"), _pod("going", deletionTimestamp="2026-10-24T09:00:00Z"),
+            _pod("ds", ownerReferences=[{"kind": "DaemonSet", "controller": True}]),
+            _pod("elsewhere", node="node-2"),
+        ]
+        outcome = await hosted_cluster_api.drain_node(KUBECONFIG, self.SERVER, "node-1", "agent://agent-1", "c/h")
+
+        assert outcome["cordoned"] and outcome["evicted"] == ["app/web-1"]
+        assert outcome["remaining"] == ["app/db-0", "app/going", "app/web-1"]
+        assert outcome["blocked"] == ["app/db-0: Cannot evict pod as it would violate the pod's disruption budget."]
+        assert _FakeHostedCore.writes == [("cordon", "node-1", {"spec": {"unschedulable": True}}),
+                                          ("evict", "app/web-1")]
+
+    async def test_a_node_now_carrying_another_provider_id_is_not_touched(self):
+        assert await hosted_cluster_api.drain_node(
+            KUBECONFIG, self.SERVER, "node-1", "agent://agent-2", "c/h"
+        ) == {"found": True, "matches": False}
+        assert await hosted_cluster_api.delete_node(
+            KUBECONFIG, self.SERVER, "node-1", None, "c/h"
+        ) == {"found": True, "matches": False}
+        assert _FakeHostedCore.writes == []
+
+    async def test_only_a_node_nothing_runs_as_is_deleted(self):
+        ready = await hosted_cluster_api.delete_node(KUBECONFIG, self.SERVER, "node-1", "agent://agent-1", "c/h")
+        assert ready == {"found": True, "ready": True} and _FakeHostedCore.writes == []
+
+        _FakeHostedCore.nodes["node-1"] = _node(ready=False)
+        deleted = await hosted_cluster_api.delete_node(KUBECONFIG, self.SERVER, "node-1", "agent://agent-1", "c/h")
+        assert deleted == {"found": True, "deleted": True}
+        assert _FakeHostedCore.writes == [("delete", "node-1")]
+
+    async def test_a_node_already_gone_is_found_false(self):
+        assert await hosted_cluster_api.drain_node(KUBECONFIG, self.SERVER, "gone", None, "c/h") == {"found": False}
+
+    async def test_the_activities_reach_it_through_the_admin_kubeconfig(self, mce):
+        mce(_FakeMce(hosted_clusters=[HOSTED_CLUSTER], secrets=SECRETS))
+        _FakeHostedCore.nodes["node-1"] = _node(ready=False)
+        action = HostedNodeAction(hosted_cluster=HC_REF, node_name="node-1", provider_id="agent://agent-1")
+        drain = await activities.drain_hosted_node(action)
+        assert drain.found and drain.remaining == []
+        assert (await activities.delete_hosted_node(action)).deleted

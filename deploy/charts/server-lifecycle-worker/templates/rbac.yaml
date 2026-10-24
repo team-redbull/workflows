@@ -24,7 +24,9 @@ rules:
     verbs: [get, create, delete]
   - apiGroups: [agent-install.openshift.io]
     resources: [agents]
-    verbs: [get, list, delete]       # delete: remove-server
+    # delete: remove-server; patch: uninstall-server releasing an Agent the
+    # provider no longer can (its Machine or AgentMachine gone)
+    verbs: [get, list, delete, patch]
   - apiGroups: [agent-install.openshift.io]
     resources: [infraenvs]
     verbs: [get]
@@ -47,16 +49,20 @@ subjects:
 {{- end }}
 {{- if .Values.rbac.hostedClusters }}
 ---
-# uninstall-server's reads of a hosted cluster, and its ONE write. Cluster-wide
+# uninstall-server's reads of a hosted cluster, and its writes there. Cluster-wide
 # because what it touches lives in each hosted cluster's control-plane
 # namespace (`<hc-ns>-<hc>`) and the HostedCluster's own namespace — neither
 # is an InfraEnv namespace, and neither is named in the request:
-#   * machines            get + delete the Machine behind the Agent (the
-#                         delete is the run's only write). `list` is in the
-#                         agreed grant but no code lists Machines today
+#   * machines            get + delete the Machine behind the Agent; list to
+#                         find it by providerID or infrastructureRef when its
+#                         AgentMachine is gone; patch to remove the Agent
+#                         provider's pre-terminate hook from such a Machine,
+#                         which the provider can no longer remove itself
 #   * agentmachines       list to find the one whose agentRef names the Agent
 #                         — the only link left once the provider starts
-#                         unbinding — and get to confirm it went
+#                         unbinding — and get to confirm it went; delete one
+#                         left with no Machine, patch to drop the provider's
+#                         finalizer it would only drop through a Machine
 #   * hostedclusters      list to find the HostedCluster by its control-plane
 #                         namespace, get for its status.kubeconfig
 #   * secrets             get the HostedCluster's admin kubeconfig. This is the
@@ -72,10 +78,10 @@ metadata:
 rules:
   - apiGroups: [cluster.x-k8s.io]
     resources: [machines]
-    verbs: [get, list, delete]
+    verbs: [get, list, delete, patch]
   - apiGroups: [capi-provider.agent-install.openshift.io]
     resources: [agentmachines]
-    verbs: [get, list]
+    verbs: [get, list, delete, patch]
   - apiGroups: [hypershift.openshift.io]
     resources: [hostedclusters]
     verbs: [get, list]

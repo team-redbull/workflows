@@ -73,9 +73,17 @@ credentials:
 # Namespaces on THIS cluster where the worker may create install resources —
 # the InfraEnv namespaces. One Role + RoleBinding is rendered in each; the
 # namespaces themselves must already exist.
+#
+# hostedClusters: uninstall-server's ClusterRole — get/list/delete on CAPI
+# Machines, get/list on AgentMachines and HostedClusters, and get on Secrets
+# CLUSTER-WIDE (the HostedCluster's admin kubeconfig). Turn it off on an MCE
+# that runs no hosted clusters: uninstall-server then fails its inspection of
+# any host with an Agent (403, before anything is written) — use remove-server
+# there instead.
 rbac:
   create: true
   targetNamespaces: []
+  hostedClusters: true
 
 serviceAccount:
   create: true

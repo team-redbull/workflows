@@ -11,8 +11,9 @@ RELEASE_SEGMENT_WORKFLOW_QUEUE = "release-segment-workflow"
 SEGMENT_LIFECYCLE_ACTIVITY_QUEUE = "segment-lifecycle-activity"
 
 # -- Server-lifecycle domain --
-# Same split as above for the WORKFLOW queue — each workflow gets its own, so a
-# future uninstall-server registers its own against the same limbs.
+# Same split as above for the WORKFLOW queue — each workflow gets its own, and
+# every one of them (install, remove, uninstall, publish-infraenv-boot) runs
+# its activities on the same per-MCE limb.
 #
 # The ACTIVITY queue is NOT the same, and this is the one place the pattern
 # differs. It is scoped to the domain AND to one MCE cluster, because these
@@ -34,6 +35,7 @@ SEGMENT_LIFECYCLE_ACTIVITY_QUEUE = "segment-lifecycle-activity"
 # disagree.
 INSTALL_SERVER_WORKFLOW_QUEUE = "install-server-workflow"
 REMOVE_SERVER_WORKFLOW_QUEUE = "remove-server-workflow"
+UNINSTALL_SERVER_WORKFLOW_QUEUE = "uninstall-server-workflow"
 PUBLISH_INFRAENV_BOOT_WORKFLOW_QUEUE = "publish-infraenv-boot-workflow"
 SERVER_LIFECYCLE_ACTIVITY_QUEUE = "server-lifecycle-activity"
 

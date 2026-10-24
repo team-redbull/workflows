@@ -34,6 +34,7 @@ from shared.models.server_lifecycle import (
     ReleaseServerRequest,
     ReserveServerRequest,
     ServerInterface,
+    ServerMembership,
     ServerReservation,
 )
 
@@ -247,6 +248,53 @@ async def server_macs_by_name(base_url: str, token: str, server_name: str) -> li
             if str(detail.get("name") or "").lower() == wanted:
                 macs |= _server_macs(detail)
     return sorted(macs)
+
+
+async def server_membership_by_name(
+    base_url: str, token: str, server_name: str
+) -> ServerMembership:
+    """server-scan's record of where the server of this exact name is.
+
+    The same two steps as server_macs_by_name — search narrows, the detail
+    confirms the name exactly — but here two documents of one name are an
+    ERROR, not a union: the answer is one machine's membership and its
+    `srv_…` id, which the install lock is then taken on.
+    """
+    wanted = server_name.lower()
+    async with httpx.AsyncClient(
+        base_url=base_url, timeout=_HTTP_TIMEOUT, verify=_TLS_VERIFY, headers=_headers(token)
+    ) as client:
+        page = await _get_json(client, "/servers", search=server_name, page_size=_SEARCH_PAGE_SIZE)
+        matches: list[dict[str, Any]] = []
+        for item in page.get("items", []):
+            if str(item.get("name") or "").lower() not in ("", wanted):
+                continue
+            detail = await _get_json(client, f"/servers/{item['id']}")
+            if str(detail.get("name") or "").lower() == wanted:
+                matches.append({"id": item["id"], **detail})
+
+    if not matches:
+        return ServerMembership(found=False)
+    if len(matches) > 1:
+        raise AmbiguousServerNameError(
+            f"server name {server_name!r} matches {len(matches)} server-scan documents "
+            f"({', '.join(sorted(str(m.get('id')) for m in matches))}): which machine "
+            "to uninstall is ambiguous"
+        )
+    detail = matches[0]
+    openshift = detail.get("openshift") or {}
+    maintenance = detail.get("maintenance") or {}
+    return ServerMembership(
+        found=True,
+        server_id=str(detail.get("id")),
+        server_name=detail.get("name"),
+        lifecycle_state=openshift.get("lifecycle_state"),
+        cluster_name=openshift.get("cluster_name") or None,
+        mce_name=openshift.get("mce_name") or None,
+        contested_with=openshift.get("contested_with") or None,
+        maintenance=bool(maintenance.get("enabled", False)),
+        maintenance_reason=maintenance.get("reason") or None,
+    )
 
 
 def _raise_for_lock_status(resp: httpx.Response, action: str) -> NoReturn:

@@ -18,20 +18,30 @@ from temporalio import activity
 from shared.models.server_lifecycle import (
     AcquireServerRequest,
     AcquiredServer,
+    AgentBindingState,
     AgentDeleteRequest,
     AgentDeletion,
+    AgentMachineRef,
+    AgentMachineState,
+    AgentNameRef,
     AgentRef,
     AgentState,
     BmhRef,
     BmhResourceRequest,
     BmhState,
+    BoundHostState,
     CreatedResource,
+    HostedNodeRef,
+    HostedNodeState,
     HostPowerRequest,
     InfraEnvBootRequest,
     InfraEnvBootState,
     InfraEnvRef,
     InfraEnvState,
     InventoryHostState,
+    MachineDeletion,
+    MachineRef,
+    MachineState,
     PxeBootRegistration,
     PxeBootRequest,
     PxeHostEntriesRef,
@@ -40,6 +50,8 @@ from shared.models.server_lifecycle import (
     PxeUnregistration,
     ReleaseServerRequest,
     ReserveServerRequest,
+    ServerMembership,
+    ServerMembershipRequest,
     ServerReservation,
     TeardownResult,
 )
@@ -425,5 +437,118 @@ async def teardown_bmh_resources(ref: BmhRef) -> TeardownResult:
     lets Temporal retry this. Raises BmhTeardownError (retryable) only when
     something is STILL there afterwards — the server must not be reported back
     to the inventory while a BareMetalHost still points at it.
+    """
+    ...
+
+
+# --- uninstall-server ---------------------------------------------------------
+
+
+@activity.defn
+async def lookup_server_membership(request: ServerMembershipRequest) -> ServerMembership:
+    """uninstall-server: server-scan's record of where this server is.
+
+    `GET /servers?search=<name>`, then `GET /servers/{id}` for every hit whose
+    name matches EXACTLY (case-insensitive) — the same two-step read
+    remove-server's MAC lookup makes, and never `/servers/available`, which
+    hides claimed and reserved machines. Returns the `srv_…` id (the install
+    lock's key), `openshift.{lifecycle_state, cluster_name, mce_name,
+    contested_with}` and `maintenance`. found=False for a name server-scan
+    does not know — the workflow decides what that means.
+
+    Raises AmbiguousServerNameError when two documents carry the name and
+    ServerScanAuthError on a rejected token (both non-retryable);
+    ServerScanError (unreachable, 5xx) is transient.
+    """
+    ...
+
+
+@activity.defn
+async def inspect_bound_host(ref: BmhRef) -> BoundHostState:
+    """uninstall-server: the host on this MCE, and the hosted-cluster node it is, if any.
+
+    Reads only. The BMH `<server>` (its operational status and InfraEnv
+    label); the Agents matched to it by BMAC's bmh label or any MAC (the BMH's,
+    the NMStateConfig's and server-scan's), each with its binding, its
+    `status.debugInfo.state` and the AgentMachine behind it — by the
+    `agentMachineRef` label + `agentMachineRefNamespace` annotation, or by an
+    AgentMachine whose `status.agentRef` still names it (a Machine already on
+    its way out). For the one Agent with an AgentMachine: the owning Machine
+    (ownerReference kind Machine, group cluster.x-k8s.io) with its
+    deletionTimestamp, nodeRef, pending delete hooks and deletion conditions,
+    and the HostedCluster whose control-plane namespace the AgentMachine is in.
+
+    Needs, beyond the InfraEnv namespace's Role: list on AgentMachines and
+    HostedClusters cluster-wide, get on Machines. A 403 is
+    BmhPrerequisiteMissingError (non-retryable); an absent CAPI or HyperShift
+    API is no AgentMachine / no HostedCluster, not an error.
+    """
+    ...
+
+
+@activity.defn
+async def ensure_machine_deleting(ref: MachineRef) -> MachineDeletion:
+    """uninstall-server's ONE write on the MCE: make sure the Machine is being deleted.
+
+    A Machine already carrying a deletionTimestamp — a NodePool scale-down, an
+    operator, or an earlier run of this same id — is left exactly as it is
+    (already_deleting=True). A Machine already gone is found=False. Otherwise
+    one DELETE; a 404 in between is the same as gone. The NodePool's replicas
+    are NOT touched: standalone, the MachineSet backfills a replacement from
+    the InfraEnv (REPLACE); driven by a scale-down that lowered replicas
+    first, the Machine is already deleting and this is a no-op (SHRINK).
+
+    Needs delete on machines.cluster.x-k8s.io. 403 is
+    BmhPrerequisiteMissingError (non-retryable).
+    """
+    ...
+
+
+@activity.defn
+async def get_machine_state(ref: MachineRef) -> MachineState:
+    """uninstall-server: one Machine as it is now — the deletion wait's observation.
+
+    found=False once it is gone. While it is going: its deletionTimestamp, its
+    nodeRef, the pre-drain / pre-terminate hook annotations still on it and its
+    deletion conditions not yet True (v1beta1's DrainingSucceeded,
+    PreDrainDeleteHookSucceeded, VolumeDetachSucceeded,
+    PreTerminateDeleteHookSucceeded and v1beta2's Deleting, whichever the
+    installed CAPI writes).
+    """
+    ...
+
+
+@activity.defn
+async def get_agent_machine_state(ref: AgentMachineRef) -> AgentMachineState:
+    """uninstall-server: whether one AgentMachine is still on the MCE."""
+    ...
+
+
+@activity.defn
+async def get_agent_binding(ref: AgentNameRef) -> AgentBindingState:
+    """uninstall-server: one Agent's binding and state as they are now.
+
+    `spec.clusterDeploymentName`, the provider's `agentMachineRef` label,
+    `status.debugInfo.state` and `spec.approved`. found=False when the Agent
+    is gone.
+    """
+    ...
+
+
+@activity.defn
+async def check_hosted_node(ref: HostedNodeRef) -> HostedNodeState:
+    """uninstall-server: whether the hosted cluster still has this Node. Reads only.
+
+    Reaches the hosted cluster through its admin kubeconfig: the Secret the
+    HostedCluster names in `status.kubeconfig`, in the HostedCluster's
+    namespace, with the server REPLACED by the control plane's in-cluster
+    Service, `https://kube-apiserver.<hcp-namespace>.svc:6443` — the external
+    route may not be reachable from the pod network, the Service always is
+    from the MCE. TLS is verified against the kubeconfig's own CA. Nothing
+    from the kubeconfig enters an error, a log line or workflow history.
+
+    Raises HostedClusterUnreachableError (connection failures, 5xx, 401 —
+    retried without bound) and HostedClusterAccessError (no kubeconfig
+    published, a Secret without a usable one, a 403 — non-retryable).
     """
     ...

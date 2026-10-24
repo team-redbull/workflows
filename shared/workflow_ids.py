@@ -119,6 +119,27 @@ def remove_server_workflow_id(server_name: str) -> str:
     return f"remove-server-{server_name.lower()}"
 
 
+def uninstall_server_workflow_id(server_name: str) -> str:
+    """`uninstall-server-<server>`: one uninstall of a machine at a time.
+
+    Keyed on the MACHINE, like remove-server: the server is named up front and
+    it is what two uninstalls would race on — two runs deleting one Machine and
+    waiting on one Agent. The `uninstall-` prefix is what keeps it apart from
+    the other two ids of the same machine, and both distinctions matter:
+
+      * `install-server-name-<server>` — an install and an uninstall of one
+        machine are different operations, and refusing one because the other
+        once ran (or is running) would be wrong in both directions;
+      * `remove-server-<server>` — uninstall-server STARTS that id as its
+        last step, an awaited child, so sharing it would make every uninstall
+        collide with itself.
+
+    Lowercased for the reason install_server_name_workflow_id gives — one
+    machine, one id, however a caller typed its uppercase serial.
+    """
+    return f"uninstall-server-{server_name.lower()}"
+
+
 def publish_infraenv_boot_workflow_id(mce_cluster: str, infra_env: str) -> str:
     """`publish-infraenv-boot-<mce>-<infraEnv>`: one publish of a boot entry at a time.
 

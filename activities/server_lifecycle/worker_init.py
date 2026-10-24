@@ -12,7 +12,9 @@ OUT. The hub never needs inbound access to an MCE.
 A separate deployment from the segment-lifecycle limb because the driver for
 one is the dependency + credential set, and this one's is entirely different: a
 Kubernetes client with RBAC to create BareMetalHosts, Secrets and
-NMStateConfigs (and read InfraEnvs) in the target namespace, plus per-vendor BMC
+NMStateConfigs (and read InfraEnvs) in the target namespace — and, for
+uninstall-server, to read AgentMachines, HostedClusters and their admin
+kubeconfig Secrets and delete CAPI Machines cluster-wide — plus per-vendor BMC
 credentials, a server-scan token and, for IPMI servers, the site PXE map's.
 
 install-server's VLAN lookup is deliberately NOT registered here: it reads the
@@ -34,20 +36,27 @@ from temporalio.worker import Worker
 
 from activities.server_lifecycle.activities import (
     acquire_servers,
+    check_hosted_node,
     check_infra_env,
     create_baremetal_host,
-    delete_agents,
-    inspect_inventory_host,
-    set_host_online,
     create_bmc_secret,
     create_nmstate_config,
+    delete_agents,
+    ensure_machine_deleting,
     find_agent_for_host,
+    get_agent_binding,
+    get_agent_machine_state,
     get_baremetal_host,
+    get_machine_state,
+    inspect_bound_host,
+    inspect_inventory_host,
+    lookup_server_membership,
     publish_infra_env_boot,
     register_pxe_boot,
     release_server,
     remove_host_pxe_entries,
     reserve_server,
+    set_host_online,
     teardown_bmh_resources,
     unregister_pxe_boot,
 )
@@ -89,6 +98,14 @@ async def main() -> None:
             set_host_online,
             delete_agents,
             remove_host_pxe_entries,
+            # uninstall-server (plus reserve_server and get_baremetal_host above)
+            lookup_server_membership,
+            inspect_bound_host,
+            ensure_machine_deleting,
+            get_machine_state,
+            get_agent_machine_state,
+            get_agent_binding,
+            check_hosted_node,
         ],
         # In-flight activities get this long to finish after shutdown starts
         # before being cancelled — keep it below the pod's

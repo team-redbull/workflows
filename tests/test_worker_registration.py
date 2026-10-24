@@ -36,6 +36,7 @@ _WORKERS = {
 _WORKFLOW_MODULES = [
     "workflow_domains/server_lifecycle/install_server.py",
     "workflow_domains/server_lifecycle/remove_server.py",
+    "workflow_domains/server_lifecycle/uninstall_server.py",
     "workflow_domains/server_lifecycle/publish_infraenv_boot.py",
     "workflow_domains/segment_lifecycle/allocate_segment.py",
     "workflow_domains/segment_lifecycle/initialize_segment.py",
@@ -262,3 +263,14 @@ def test_every_workflow_is_registered_in_the_brain():
     for module in sorted(str(path.relative_to(REPO)) for path in (REPO / "workflow_domains").rglob("*.py")):
         for name in _workflow_classes(module):
             assert name in registered, f"{module}: {name} is not in _WORKER_SPECS"
+
+
+def test_uninstall_server_dispatches_everything_to_the_mces_own_worker():
+    """No Segments Manager read of its own: the site lookup is remove-server's, in the child."""
+    dispatched = _dispatched("workflow_domains/server_lifecycle/uninstall_server.py")
+    assert {queue for _, queue in dispatched} == {"server_lifecycle_activity_queue"}
+    assert {name for name, _ in dispatched} >= {
+        "lookup_server_membership", "inspect_bound_host", "reserve_server",
+        "ensure_machine_deleting", "get_machine_state", "get_agent_binding",
+        "get_agent_machine_state", "check_hosted_node", "get_baremetal_host",
+    }

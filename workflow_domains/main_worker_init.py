@@ -30,6 +30,7 @@ from shared.consts import (
     PUBLISH_INFRAENV_BOOT_WORKFLOW_QUEUE,
     RELEASE_SEGMENT_WORKFLOW_QUEUE,
     REMOVE_SERVER_WORKFLOW_QUEUE,
+    UNINSTALL_SERVER_WORKFLOW_QUEUE,
 )
 from shared.logging_config import configure_logging
 from shared.settings import TemporalSettings
@@ -49,6 +50,7 @@ from workflow_domains.server_lifecycle.publish_infraenv_boot import (
     PublishInfraEnvBootWorkflow,
 )
 from workflow_domains.server_lifecycle.remove_server import RemoveServerWorkflow
+from workflow_domains.server_lifecycle.uninstall_server import UninstallServerWorkflow
 from workflow_domains.server_provisioning.provision_dell_server import (
     ProvisionDellServerWorkflow,
 )
@@ -66,6 +68,7 @@ _WORKER_SPECS: list[tuple[str, list[type]]] = [
     (RELEASE_SEGMENT_WORKFLOW_QUEUE, [ReleaseSegmentWorkflow]),
     (REMOVE_SERVER_WORKFLOW_QUEUE, [RemoveServerWorkflow]),
     (PUBLISH_INFRAENV_BOOT_WORKFLOW_QUEUE, [PublishInfraEnvBootWorkflow]),
+    (UNINSTALL_SERVER_WORKFLOW_QUEUE, [UninstallServerWorkflow]),
 ]
 
 

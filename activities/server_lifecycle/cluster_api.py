@@ -481,3 +481,56 @@ async def delete_secret_if_present(namespace: str, name: str) -> bool:
         return True
 
     return await asyncio.to_thread(_delete)
+
+
+async def list_cluster_custom_objects(
+    *,
+    group: str,
+    version: str,
+    plural: str,
+    kind: str,
+) -> list[dict[str, Any]]:
+    """Every custom resource of one kind across ALL namespaces, or [] when there are none.
+
+    uninstall-server's reads of AgentMachines and HostedClusters: they live in
+    hosted control-plane namespaces the request does not name, so they are
+    found by listing. A 404 is an empty list for the reason
+    list_custom_objects gives — an MCE without HyperShift has no such type,
+    and that means no hosted cluster, not a failure. 403 stays classified:
+    a missing `list` in the worker's ClusterRole fails the run.
+    """
+
+    def _list() -> list[dict[str, Any]]:
+        _load_kube()
+        try:
+            response = k8s_client.CustomObjectsApi().list_cluster_custom_object(
+                group=group, version=version, plural=plural
+            )
+        except k8s_client.ApiException as exc:
+            if exc.status == _NOT_FOUND:
+                return []
+            raise _classify(exc, "list", kind, "in any namespace") from exc
+        items = response.get("items") if isinstance(response, dict) else None
+        return list(items or [])
+
+    return await asyncio.to_thread(_list)
+
+
+async def read_secret_data(namespace: str, name: str) -> dict[str, str] | None:
+    """One Secret's `data` (base64 values, as the API returns them), or None when absent.
+
+    The caller owns what it decodes. Nothing here logs or raises with the
+    contents: an error names the Secret, never a value in it.
+    """
+
+    def _read() -> dict[str, str] | None:
+        _load_kube()
+        try:
+            secret = k8s_client.CoreV1Api().read_namespaced_secret(name=name, namespace=namespace)
+        except k8s_client.ApiException as exc:
+            if exc.status == _NOT_FOUND:
+                return None
+            raise _classify(exc, "read", "Secret", f"{namespace}/{name}") from None
+        return dict(secret.data or {})
+
+    return await asyncio.to_thread(_read)

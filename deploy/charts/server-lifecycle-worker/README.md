@@ -390,6 +390,33 @@ The credentials Secret must exist in that namespace first. Its keys:
 `SERVER_SCAN_API_TOKEN` (server-scan ADMIN role), `<VENDOR>_BMC_USERNAME` /
 `<VENDOR>_BMC_PASSWORD` for HP, DELL, CISCO, INTERSIGHT, and `PXE_MAP_TOKEN`.
 
+### RBAC: one Role per InfraEnv namespace, plus one ClusterRole for uninstall-server
+
+`rbac.targetNamespaces` gets a Role each: everything install-server and
+remove-server do happens in an InfraEnv namespace. uninstall-server reaches
+further, so `rbac.hostedClusters` (default `true`) adds a **ClusterRole** —
+**a widening, and the widest grant in this chart**:
+
+| group / resource | verbs | why |
+|---|---|---|
+| `cluster.x-k8s.io` machines | get, list, delete | the Machine behind a hosted node's Agent; the delete is uninstall-server's only write |
+| `capi-provider.agent-install.openshift.io` agentmachines | get, list | found by its `status.agentRef` — the only link once the Agent provider starts unbinding |
+| `hypershift.openshift.io` hostedclusters | get, list | found by its control-plane namespace; its `status.kubeconfig` |
+| `""` secrets | get | the HostedCluster's admin kubeconfig — **every Secret on the MCE** |
+
+They are cluster-wide because a hosted cluster's Machines live in its
+control-plane namespace (`<hc-ns>-<hc>`) and its kubeconfig in the
+HostedCluster's own, neither of which is an InfraEnv namespace or named in
+the request. On an MCE that runs no hosted clusters, set
+`rbac.hostedClusters: false`; uninstall-server then fails its inspection of
+any host with an Agent (a 403 on the AgentMachine list, before anything is
+written), so take inventory hosts out there with remove-server.
+
+The Node check reaches the hosted API server through its in-cluster Service,
+`https://kube-apiserver.<hc-ns>-<hc>.svc:6443`, so this worker's pods need
+network access to that Service — check NetworkPolicies on the control-plane
+namespaces if `check_hosted_node` keeps retrying `HostedClusterUnreachableError`.
+
 ---
 
 ## Verify
@@ -456,5 +483,6 @@ temporal task-queue describe \
 | `pxeMap.urls` | | Site → PXE VM base URL, for IPMI (UCS) servers |
 | `credentials.existingSecret` | | Secret with server-scan token, BMC credentials, PXE token |
 | `rbac.targetNamespaces` | | InfraEnv namespaces the worker may write to |
+| `rbac.hostedClusters` | | uninstall-server's ClusterRole (Machines, AgentMachines, HostedClusters, Secrets get); default `true` |
 | `image.repository` / `image.tag` | | Mirror path and tag in a disconnected environment |
 | `replicaCount` | | Pods polling the same queue (load sharing + failover) |

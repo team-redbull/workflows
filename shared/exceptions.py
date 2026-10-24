@@ -570,6 +570,150 @@ class PxeMapRequestRejectedError(OrchestratorError):
     """
 
 
+# --- server-lifecycle: uninstall-server -------------------------------------
+
+
+class HostedClusterUnreachableError(OrchestratorError):
+    """A hosted cluster's API server could not be reached. Retried without bound.
+
+    uninstall-server reads one Node from the hosted cluster, through its
+    control plane's in-cluster Service (`kube-apiserver.<hcp-ns>.svc:6443`).
+    A control plane that is restarting, a Service with no ready endpoints or a
+    5xx all clear on their own, so the run waits them out (CLAUDE.md §5) rather
+    than fail an uninstall whose Machine is already gone. 401 is here too: the
+    admin kubeconfig is re-read on every attempt, so a rotated certificate is
+    picked up by the next one.
+    """
+
+
+class HostedClusterAccessError(OrchestratorError):
+    """The hosted cluster's admin kubeconfig cannot be used. Deterministic.
+
+    The HostedCluster publishes no `status.kubeconfig`, its Secret lacks the
+    `kubeconfig` key or does not parse, or the hosted API server answers 403.
+    None of those changes on a retry. The message names which, and never any
+    of the kubeconfig's contents.
+    """
+
+
+class ServerNotInServerScanError(OrchestratorError):
+    """WORKFLOW-RAISED. server-scan has no server of this exact name.
+
+    uninstall-server takes server-scan's install lock on the machine before it
+    changes anything, and the lock is keyed on server-scan's `srv_…` id, so a
+    machine server-scan does not know cannot be held. Nothing is changed. A
+    host that is only on the MCE, unknown to server-scan, is remove-server's.
+    """
+
+
+class ClusterMembershipMismatchError(OrchestratorError):
+    """WORKFLOW-RAISED. server-scan's record of the server contradicts the MCE.
+
+    server-scan is the authority on WHERE a server is. uninstall-server refuses,
+    changing nothing, when that record contradicts the request or the MCE: it
+    names another MCE, it names another cluster than the one the Agent is
+    bound to, it says INSTALLED_TO_INVENTORY while the Agent is bound, or two
+    claims are contesting the server (`contested_with`). AVAILABLE contradicts
+    nothing — it is what an unbound host often reads as between membership
+    runs. The message names both sides.
+    """
+
+
+class MultipleBoundAgentsError(OrchestratorError):
+    """WORKFLOW-RAISED. More than one of the host's Agents is bound to a cluster.
+
+    One machine is one node; two bound Agents matched to it mean the inventory
+    is broken in a way no single Machine deletion can fix. Nothing is changed.
+    """
+
+
+class NotHostedClusterNodeError(OrchestratorError):
+    """WORKFLOW-RAISED. The Agent is bound, but not as a hosted cluster's node.
+
+    uninstall-server takes a node out of a HyperShift HostedCluster through its
+    CAPI Machine. An Agent bound to a ClusterDeployment with NO AgentMachine
+    behind it — an early-bound ACM/ZTP cluster, or a binding left behind by a
+    cluster that is gone — has no Machine to delete, and an AgentMachine whose
+    namespace belongs to no HostedCluster has no cluster to verify against.
+    Nothing is changed.
+    """
+
+
+class MachineDrainTimeoutError(OrchestratorError):
+    """WORKFLOW-RAISED. The Machine did not get past its drain within 20 minutes.
+
+    The clock starts when the run first sees the Machine deleting. Usually a
+    PodDisruptionBudget, or a pre-drain hook nobody releases; the message names
+    the Machine's deletion conditions and every pending
+    `pre-drain.delete.hook.*` / `pre-terminate.delete.hook.*` annotation.
+    Nothing further is deleted and nothing is undone — a Machine delete cannot
+    be — and a re-run of the same id RESUMES: it finds the Machine deleting and
+    skips the delete.
+    """
+
+
+class AgentUnbindTimeoutError(OrchestratorError):
+    """WORKFLOW-RAISED. The released Agent did not reach `known-unbound` within an hour.
+
+    Once the Machine is past its drain, the Agent provider clears the Agent's
+    binding and the host reboots into the discovery image, which on bare
+    metal is the same POST-and-boot install-server allows an hour for. The
+    message names the Agent's last state. A re-run resumes the wait.
+    """
+
+
+class MachineDeletionTimeoutError(OrchestratorError):
+    """WORKFLOW-RAISED. The Agent is released, but the Machine never went away.
+
+    After the provider releases the Agent, CAPI deletes the AgentMachine and
+    the Node and drops its finalizer in seconds; a Machine still there an hour
+    later is held by something else (another pre-terminate hook, or a Node
+    deletion CAPI cannot complete). The message names what holds it.
+    """
+
+
+class HostedNodeStillPresentError(OrchestratorError):
+    """WORKFLOW-RAISED. The hosted cluster still has the server's Node.
+
+    CAPI deletes a Machine's Node as the Machine goes, so a Node left behind is
+    an orphan. uninstall-server NEVER deletes a Node itself: the message names
+    it, with the `oc delete node` to run against the hosted cluster, and the
+    inventory half is not started.
+    """
+
+
+class AgentStillBoundError(OrchestratorError):
+    """WORKFLOW-RAISED. After the Machine went, the Agent is not a clean inventory host.
+
+    Required before remove-server may take it: the Agent exists, carries no
+    `clusterDeploymentName` and no `agentMachineRef` label, is `known-unbound`
+    and approved, and its BareMetalHost is present and not in error (remove-
+    server powers the host off through it). Polled for a bounded five minutes;
+    the message names every condition still unmet.
+    """
+
+
+class RemoveServerAlreadyRunningError(OrchestratorError):
+    """WORKFLOW-RAISED. remove-server is already running for this server.
+
+    uninstall-server ends by running remove-server as its child on the shared
+    id `remove-server-<server>`. One already running there — started on its
+    own route — would be a second removal of the same host, so the uninstall
+    stops instead. The message names the id: let that run finish, then re-run.
+    """
+
+
+class RemoveServerFailedError(OrchestratorError):
+    """WORKFLOW-RAISED. The remove-server child failed.
+
+    The hosted-cluster half had completed; the inventory half did not. The
+    message carries the child's own failure type and message, and its id — the
+    child's history has the detail. Re-running the uninstall skips the
+    hosted-cluster half (the Agent is no longer bound) and runs the removal
+    again.
+    """
+
+
 # -- Server-provisioning domain (provision-dell-server) -----------------------
 
 

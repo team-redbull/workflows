@@ -9,14 +9,15 @@ registration wait that can take minutes.
 
 PATHS ARE `/workflows/<domain>/<workflow>`. The domain prefix lives here and
 every workflow in the domain adds its own path under it — a domain holds many
-workflows, so it can never be the endpoint of one of them. Adding
-uninstall-server later is a new route, not a redesign.
+workflows, so it can never be the endpoint of one of them: install-server,
+remove-server, uninstall-server and publish-infraenv-boot each add a path.
 """
 
 from __future__ import annotations
 
 import asyncio
-from typing import Annotated, Any, Literal
+from collections.abc import Awaitable, Callable
+from typing import Annotated, Any, Literal, TypeVar
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -28,6 +29,7 @@ from shared.consts import (
     INSTALL_SERVER_WORKFLOW_QUEUE,
     PUBLISH_INFRAENV_BOOT_WORKFLOW_QUEUE,
     REMOVE_SERVER_WORKFLOW_QUEUE,
+    UNINSTALL_SERVER_WORKFLOW_QUEUE,
 )
 from shared.models.server_lifecycle import (
     InstallServerInput,
@@ -36,12 +38,15 @@ from shared.models.server_lifecycle import (
     PublishInfraEnvBootRunArgs,
     RemoveServerInput,
     RemoveServerRunArgs,
+    UninstallServerInput,
+    UninstallServerRunArgs,
 )
 from shared.workflow_ids import (
     install_server_name_workflow_id,
     install_server_slot_workflow_id,
     publish_infraenv_boot_workflow_id,
     remove_server_workflow_id,
+    uninstall_server_workflow_id,
 )
 from workflow_domains.routers.deps import get_temporal_client
 from workflow_domains.routers.models import StartWorkflowResponse
@@ -50,11 +55,13 @@ from workflow_domains.server_lifecycle.publish_infraenv_boot import (
     PublishInfraEnvBootWorkflow,
 )
 from workflow_domains.server_lifecycle.remove_server import RemoveServerWorkflow
+from workflow_domains.server_lifecycle.uninstall_server import UninstallServerWorkflow
 
 router = APIRouter(prefix="/workflows/server-lifecycle", tags=["server-lifecycle"])
 
 _INSTALL_SERVER_PATH = "/install-server"
 _REMOVE_SERVER_PATH = "/remove-server"
+_UNINSTALL_SERVER_PATH = "/uninstall-server"
 _PUBLISH_INFRAENV_BOOT_PATH = "/publish-infraenv-boot"
 
 # Where the inventory InfraEnvs live on an MCE unless the caller says otherwise.
@@ -82,6 +89,50 @@ _ServerName = Annotated[str, Field(min_length=1)]
 _ServerNameList = Annotated[
     list[_ServerName], Field(min_length=1, max_length=_MAX_INSTALLS_PER_REQUEST)
 ]
+
+
+def _check_server_names(value: Any, *, empty_hint: str) -> Any:
+    """`server_names` is one name or a list of 1-20 non-empty names.
+
+    Called BEFORE the str-or-list union is tried, so a bad value gets ONE error
+    saying what is wrong, not one per shape it failed to be ("Input should be a
+    valid string" next to the list's real complaint).
+    """
+    if value is None:
+        return value
+    names = [value] if isinstance(value, str) else value
+    if not isinstance(names, list) or not all(isinstance(name, str) for name in names):
+        raise ValueError("`server_names` takes one server name or a list of them")
+    if not names:
+        raise ValueError(f"`server_names` lists no server{empty_hint}")
+    if len(names) > _MAX_INSTALLS_PER_REQUEST:
+        raise ValueError(
+            f"`server_names` lists {len(names)} servers; at most "
+            f"{_MAX_INSTALLS_PER_REQUEST} per request"
+        )
+    if not all(names):
+        raise ValueError("a server name cannot be empty")
+    return value
+
+
+def _check_each_server_once(names: str | list[str] | None) -> str | list[str] | None:
+    """Case-insensitive, because the run id lowercases the name: `ocp-X` and
+    `ocp-x` are one run, and the second would only report already_running."""
+    if isinstance(names, list):
+        seen: set[str] = set()
+        for name in names:
+            if name.lower() in seen:
+                raise ValueError(f"server {name} is listed more than once")
+            seen.add(name.lower())
+    return names
+
+
+def _refuse_server_name(data: Any) -> Any:
+    """`server_name` (one machine) is spelled `server_names` on these routes.
+    A caller sending it is told what to send, not just "extra field"."""
+    if isinstance(data, dict) and "server_name" in data:
+        raise ValueError("`server_name` is now `server_names`, which takes one name or a list")
+    return data
 
 
 # Deterministic ids come from shared/workflow_ids.py — the ONE definition per
@@ -186,11 +237,8 @@ class InstallServerRequest(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def _server_name_became_server_names(cls, data: Any) -> Any:
-        # The field was `server_name`, one machine. A caller still sending it
-        # is told what replaced it, not just "extra field".
-        if isinstance(data, dict) and "server_name" in data:
-            raise ValueError("`server_name` is now `server_names`, which takes one name or a list")
-        return data
+        # The field was `server_name`, one machine.
+        return _refuse_server_name(data)
 
     @field_validator("mce_cluster")
     @classmethod
@@ -202,37 +250,12 @@ class InstallServerRequest(BaseModel):
     @field_validator("server_names", mode="before")
     @classmethod
     def _one_name_or_a_list(cls, value: Any) -> Any:
-        # Checked BEFORE the str-or-list union, so a bad value gets ONE error
-        # saying what is wrong, not one per shape it failed to be ("Input
-        # should be a valid string" next to the list's real complaint).
-        if value is None:
-            return value
-        names = [value] if isinstance(value, str) else value
-        if not isinstance(names, list) or not all(isinstance(name, str) for name in names):
-            raise ValueError("`server_names` takes one server name or a list of them")
-        if not names:
-            raise ValueError("`server_names` lists no server; omit it to let the pool pick")
-        if len(names) > _MAX_INSTALLS_PER_REQUEST:
-            raise ValueError(
-                f"`server_names` lists {len(names)} servers; at most "
-                f"{_MAX_INSTALLS_PER_REQUEST} per request"
-            )
-        if not all(names):
-            raise ValueError("a server name cannot be empty")
-        return value
+        return _check_server_names(value, empty_hint="; omit it to let the pool pick")
 
     @field_validator("server_names")
     @classmethod
     def _each_server_once(cls, names: str | list[str] | None) -> str | list[str] | None:
-        # Case-insensitive, because the run id lowercases the name: `ocp-X` and
-        # `ocp-x` are one run, and the second would only report already_running.
-        if isinstance(names, list):
-            seen: set[str] = set()
-            for name in names:
-                if name.lower() in seen:
-                    raise ValueError(f"server {name} is listed more than once")
-                seen.add(name.lower())
-        return names
+        return _check_each_server_once(names)
 
     @model_validator(mode="after")
     def _pool_options_need_the_pool(self) -> InstallServerRequest:
@@ -270,19 +293,29 @@ class InstallServerRequest(BaseModel):
         return InstallServerInput(**fields)
 
 
-class InstallServerItem(BaseModel):
+class ServerRunItem(BaseModel):
     """One run of a multi-server request: its START only — the run has barely begun.
 
-    `server_name` for a named server; `slot` for a pool run, whose machine the
-    run itself picks (its progress and result name it).
+    The shape every per-server report in this domain shares: install-server's
+    and uninstall-server's alike, so a caller reads one the way it reads the
+    other.
     """
 
     workflow_id: str
     status: _StartStatus
     server_name: str | None = None
-    slot: int | None = None
     run_id: str | None = None
     error: str | None = None
+
+
+class InstallServerItem(ServerRunItem):
+    """One install of a multi-server request.
+
+    `server_name` for a named server; `slot` for a pool run, whose machine the
+    run itself picks (its progress and result name it).
+    """
+
+    slot: int | None = None
 
 
 class InstallServerBatchResponse(BaseModel):
@@ -380,22 +413,64 @@ def _temporal_refused(workflow_id: str, error: str | None) -> str:
     return f"Temporal did not start {workflow_id}: {error}"
 
 
+_Item = TypeVar("_Item", bound=ServerRunItem)
+
+
+async def _start_one_by_name(
+    start: Callable[[], Awaitable[Any]], workflow_id: str, in_flight: str
+) -> StartWorkflowResponse:
+    """One named machine, answered as one run: a 409 while it already runs."""
+    try:
+        handle = await start()
+    except WorkflowAlreadyStartedError:
+        raise HTTPException(status_code=409, detail=in_flight)
+    except Exception as exc:  # noqa: BLE001 — answered with its reason, not a bare 500
+        raise HTTPException(status_code=502, detail=_temporal_refused(workflow_id, str(exc)))
+    return StartWorkflowResponse(workflow_id=handle.id, run_id=handle.result_run_id or "")
+
+
+async def _start_each_by_name(
+    server_names: list[str],
+    start: Callable[[str], Awaitable[Any]],
+    workflow_id_for: Callable[[str], str],
+    item: type[_Item],
+) -> list[_Item]:
+    """One run per name, all started at once, each reported — never one pass/fail.
+
+    A name already running is `already_running`; one Temporal refuses is
+    `failed` with its reason, and does not stop the rest.
+    """
+
+    async def _start_one(server_name: str) -> _Item:
+        workflow_id = workflow_id_for(server_name)
+        try:
+            handle = await start(server_name)
+        except WorkflowAlreadyStartedError:
+            return item(server_name=server_name, workflow_id=workflow_id, status="already_running")
+        except Exception as exc:  # noqa: BLE001 — one bad name must not sink the rest
+            return item(
+                server_name=server_name, workflow_id=workflow_id, status="failed", error=str(exc)
+            )
+        return item(
+            server_name=server_name,
+            workflow_id=handle.id,
+            status="started",
+            run_id=handle.result_run_id or "",
+        )
+
+    return list(await asyncio.gather(*(_start_one(name) for name in server_names)))
+
+
 async def _start_named_install(
     client: Client, request: InstallServerRequest, server_name: str
 ) -> StartWorkflowResponse:
     """One named machine, answered as one run: a 409 while it is installing."""
-    run_input = request.run_input(server_name=server_name)
     workflow_id = install_server_name_workflow_id(server_name)
-    try:
-        handle = await _start(client, run_input, workflow_id)
-    except WorkflowAlreadyStartedError:
-        raise HTTPException(
-            status_code=409,
-            detail=f"An install-server run is already in flight for server {server_name}",
-        )
-    except Exception as exc:  # noqa: BLE001 — answered with its reason, not a bare 500
-        raise HTTPException(status_code=502, detail=_temporal_refused(workflow_id, str(exc)))
-    return StartWorkflowResponse(workflow_id=handle.id, run_id=handle.result_run_id or "")
+    return await _start_one_by_name(
+        lambda: _start(client, request.run_input(server_name=server_name), workflow_id),
+        workflow_id,
+        f"An install-server run is already in flight for server {server_name}",
+    )
 
 
 async def _start_pool_installs(
@@ -459,28 +534,14 @@ async def _start_named_installs(
 ) -> InstallServerBatchResponse:
     """One run per named server, all started at once, on the same id a single
     named install uses — so one machine is one run however it was asked for."""
-
-    async def _start_one(server_name: str) -> InstallServerItem:
-        run_input = request.run_input(server_name=server_name)
-        workflow_id = install_server_name_workflow_id(server_name)
-        try:
-            handle = await _start(client, run_input, workflow_id)
-        except WorkflowAlreadyStartedError:
-            return InstallServerItem(
-                server_name=server_name, workflow_id=workflow_id, status="already_running"
-            )
-        except Exception as exc:  # noqa: BLE001 — one bad name must not sink the rest
-            return InstallServerItem(
-                server_name=server_name, workflow_id=workflow_id, status="failed", error=str(exc)
-            )
-        return InstallServerItem(
-            server_name=server_name,
-            workflow_id=handle.id,
-            status="started",
-            run_id=handle.result_run_id or "",
-        )
-
-    results = list(await asyncio.gather(*(_start_one(name) for name in server_names)))
+    results = await _start_each_by_name(
+        server_names,
+        lambda name: _start(
+            client, request.run_input(server_name=name), install_server_name_workflow_id(name)
+        ),
+        install_server_name_workflow_id,
+        InstallServerItem,
+    )
     return InstallServerBatchResponse(**_count_statuses(results), results=results)
 
 
@@ -536,6 +597,141 @@ async def start_remove_server(
             detail=f"A remove-server run is already in flight for {remove_input.server_name}",
         )
     return StartWorkflowResponse(workflow_id=handle.id, run_id=handle.result_run_id or "")
+
+
+class UninstallServerRequest(BaseModel):
+    """The uninstall-server request body: which machines, on which MCE.
+
+    `server_names` ONLY — no cluster, NodePool or HostedCluster field, and no
+    `count`: server-scan and each Agent's own binding say where a server is,
+    and a caller-supplied cluster could only contradict them. Its OWN model,
+    not an UninstallServerInput subclass, for install-server's reason: one
+    request is many runs, each built by `run_input` with ONE `server_name`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    server_names: _ServerName | _ServerNameList = Field(
+        description=(
+            "The machines to uninstall (server-scan names): one name, or a list of "
+            f"up to {_MAX_INSTALLS_PER_REQUEST}, each once. Each is its own run."
+        ),
+    )
+    mce_cluster: str = Field(
+        min_length=1,
+        description=(
+            _MCE_CLUSTER_DESCRIPTION + " Needed because it names the activity queue "
+            "of the worker inside that MCE."
+        ),
+    )
+    # Defaulted HERE, at the edge, for the reason InstallServerRequest gives.
+    namespace: str = Field(
+        default=_DEFAULT_NAMESPACE,
+        min_length=1,
+        description=(
+            "Namespace of the server's BareMetalHost and Agent on the MCE (the "
+            f"InfraEnv's). Defaults to `{_DEFAULT_NAMESPACE}`."
+        ),
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _server_names_not_server_name(cls, data: Any) -> Any:
+        return _refuse_server_name(data)
+
+    @field_validator("mce_cluster")
+    @classmethod
+    def _canonical_mce_cluster(cls, value: str) -> str:
+        """Canonical before the run starts: it builds the queue only that MCE's
+        worker polls, and is compared with the MCE server-scan names."""
+        return canonical_mce_cluster(value)
+
+    @field_validator("server_names", mode="before")
+    @classmethod
+    def _one_name_or_a_list(cls, value: Any) -> Any:
+        return _check_server_names(value, empty_hint="")
+
+    @field_validator("server_names")
+    @classmethod
+    def _each_server_once(cls, names: str | list[str]) -> str | list[str]:
+        return _check_each_server_once(names)
+
+    def run_input(self, server_name: str) -> UninstallServerInput:
+        """The input ONE run is started with: one server."""
+        return UninstallServerInput(
+            server_name=server_name, mce_cluster=self.mce_cluster, namespace=self.namespace
+        )
+
+
+class UninstallServerBatchResponse(BaseModel):
+    """The answer to a `server_names` list: one item per server, in order.
+
+    Always 202 with a per-run report (see InstallServerBatchResponse); a name
+    already uninstalling is `already_running`, and a refused one does not stop
+    the rest.
+    """
+
+    started: int
+    already_running: int
+    failed: int
+    results: list[ServerRunItem]
+
+
+async def _start_uninstall(client: Client, run_input: UninstallServerInput):
+    return await client.start_workflow(
+        UninstallServerWorkflow.run,
+        UninstallServerRunArgs(input=run_input),
+        id=uninstall_server_workflow_id(run_input.server_name),
+        task_queue=UNINSTALL_SERVER_WORKFLOW_QUEUE,
+    )
+
+
+@router.post(
+    _UNINSTALL_SERVER_PATH,
+    response_model=StartWorkflowResponse | UninstallServerBatchResponse,
+    status_code=202,
+)
+async def start_uninstall_server(
+    uninstall_request: UninstallServerRequest,
+    client: Client = Depends(get_temporal_client),
+) -> StartWorkflowResponse | UninstallServerBatchResponse:
+    """Take servers all the way out of an MCE — returns immediately (202).
+
+    Whatever state each server is in. A hosted cluster's node first leaves the
+    hosted cluster — its CAPI Machine is deleted, CAPI drains the Node, the
+    Agent provider unbinds the Agent — and then, like a host that was only
+    inventory, leaves the MCE through remove-server, run as the uninstall's
+    child (`remove-server-<server>`).
+
+    **Standalone, this REPLACES the node, it does not shrink the cluster.**
+    NodePool replicas are not touched, so the MachineSet backfills a new
+    Machine from the InfraEnv's other Agents. To shrink, lower the NodePool's
+    replicas first (the future scale-down-nodepool workflow does both): the
+    Machine is then already deleting and this run only waits for it.
+
+    The reply follows what was sent: one name is `{workflow_id, run_id}` on
+    `uninstall-server-<server>` and a 409 while that server is uninstalling;
+    a list (1-20, each once) is a per-run report, even for a list of one.
+
+    Poll GET /workflows/runs/{workflow_id} (one per server) for progress and
+    result. server-scan disagreeing with the MCE, an Agent bound with no
+    AgentMachine, a lock another run holds, a drain stuck for 20 minutes or an
+    orphaned Node all surface there as a FAILED run — not as a 4xx here.
+    """
+    names = uninstall_request.server_names
+    if isinstance(names, list):
+        results = await _start_each_by_name(
+            names,
+            lambda name: _start_uninstall(client, uninstall_request.run_input(name)),
+            uninstall_server_workflow_id,
+            ServerRunItem,
+        )
+        return UninstallServerBatchResponse(**_count_statuses(results), results=results)
+    return await _start_one_by_name(
+        lambda: _start_uninstall(client, uninstall_request.run_input(names)),
+        uninstall_server_workflow_id(names),
+        f"An uninstall-server run is already in flight for server {names}",
+    )
 
 
 class PublishInfraEnvBootRequest(PublishInfraEnvBootInput):

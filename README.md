@@ -423,6 +423,77 @@ double-click installs two. That was accepted because its callers are people,
 not controllers. The options weighed and the collision cases are in
 [`docs/design/install-server-api.md`](docs/design/install-server-api.md).
 
+### `uninstall-server` — a server all the way out of an MCE, whatever its Agent's state
+
+`POST /workflows/server-lifecycle/uninstall-server` with `server_names` (one
+name, or a list of 1–20 — one run each, id `uninstall-server-<server>`),
+`mce_cluster` (with or without `ocp4-`) and `namespace` (default `inventory`).
+Nothing else: no `count`, NodePool or HostedCluster field (422) — server-scan
+and the Agent's own binding say where the server is. A string is answered
+`{workflow_id, run_id}` (409 while that server uninstalls), a list with the
+same per-run report as install-server's.
+
+The path is picked by the **binding** seen at inspection, never by the Agent's
+state string:
+
+- **A hosted cluster's node** — the Agent is bound and an AgentMachine is
+  behind it, *or* an AgentMachine's `status.agentRef` still names it. The
+  second shape is a Machine deletion already under way: the Agent provider
+  clears the Agent's binding *before* the Machine finishes (it holds the
+  Machine on its `pre-terminate.delete.hook…/agentmachine` hook until the host
+  is unbound), so a re-run must recognise it and resume. The run deletes the
+  CAPI Machine (a no-op when it is already deleting or gone — its one write on
+  the MCE), waits for CAPI to drain the Node (`draining`, 20 min) and for the
+  provider to release the Agent and the host to reboot into discovery
+  (`unbinding`, 1 h, until `known-unbound`), then checks the AgentMachine is
+  gone, the hosted cluster has no Node of that name, and the Agent is a clean
+  inventory host.
+- **An inventory host** — nothing binds it; that half is skipped.
+
+Either way it then runs **remove-server as an awaited child**
+(`remove-server-<server>`): power off, BareMetalHost, NMStateConfig, the Agent
+last, the PXE map of the MCE's own site. A server with nothing on the MCE ends
+there as a no-op (`found: false`). Every skipped step is named in `skipped`.
+
+> **Standalone this REPLACES the node; it does not shrink the cluster.**
+> NodePool replicas are not this workflow's business, so after the Machine
+> goes, the MachineSet backfills a new one from the InfraEnv's other Agents.
+> Lower the replicas first to shrink — the future `scale-down-nodepool`
+> workflow does that and then starts this run per server, which finds the
+> Machine already deleting.
+
+Before anything is written it **refuses** on a contradiction: a name
+server-scan does not know (`ServerNotInServerScanError`); server-scan saying
+another MCE, another cluster than the Agent's, `INSTALLED_TO_INVENTORY` while
+the Agent is bound, or `contested_with` (`ClusterMembershipMismatchError`);
+two bound Agents (`MultipleBoundAgentsError`); an Agent bound with no
+AgentMachine behind it — an early-bound ACM/ZTP cluster
+(`NotHostedClusterNodeError`). `AVAILABLE` is not a contradiction. Then it
+takes server-scan's **install lock** (holder `uninstall-server`): the hosted
+cluster's nodes job frees the server the moment its Node is gone while the
+MCE's agents job re-claims it only every 15 min, so in between it can read
+`AVAILABLE` while still in this InfraEnv. The lock is extended to 24 h before
+the child starts and left to its TTL on a failure. A lock another run holds —
+install-server's day-long hold after it installed the machine, typically —
+fails the run (`ServerReservedError`); release it in server-scan and re-run.
+
+After the Machine delete nothing is undone (it cannot be) and a re-run of the
+same id resumes: `MachineDrainTimeoutError` names the Machine's deletion
+conditions and pending delete hooks; `AgentUnbindTimeoutError` the Agent's
+state; `HostedNodeStillPresentError` the orphaned Node, with the
+`oc delete node` to run — this workflow never deletes a Node.
+
+The Node is read through the HostedCluster's admin kubeconfig
+(`status.kubeconfig`), with the server replaced by the control plane's
+in-cluster Service, `https://kube-apiserver.<hc-ns>-<hc>.svc:6443`, and TLS
+verified against the kubeconfig's CA; nothing from it reaches history or a
+log. An Agent's `clusterDeploymentName.namespace` is that control-plane
+namespace, not the HostedCluster's (HyperShift creates the ClusterDeployment
+there), so the HostedCluster is found by HyperShift's namespace rule. This
+needs a **ClusterRole** on the limb — Machines get/list/delete, AgentMachines
+and HostedClusters get/list, Secrets get cluster-wide — see
+[the chart README](deploy/charts/server-lifecycle-worker/README.md).
+
 ### `publish-infraenv-boot` — an InfraEnv's current iPXE script onto its PXE VM
 
 `POST /workflows/server-lifecycle/publish-infraenv-boot` with
@@ -562,6 +633,7 @@ result.
 | `POST /workflows/segment-lifecycle/release-segment` | one release (after the cluster's Application is gone) |
 | `POST /workflows/server-lifecycle/install-server` | one workflow PER server into an InfraEnv: one from its pool, `count` from its pool in parallel, or the machines in `server_names` |
 | `POST /workflows/server-lifecycle/remove-server` | one server out of an MCE's inventory |
+| `POST /workflows/server-lifecycle/uninstall-server` | one workflow PER server in `server_names`: out of its hosted cluster (if a node), then out of the MCE (remove-server, as a child) |
 | `POST /workflows/server-lifecycle/publish-infraenv-boot` | an InfraEnv's current iPXE script onto its site's PXE VM |
 | `POST /workflows/server-provisioning/provision-dell-server` | one Dell server, by iDRAC IP |
 | `POST /workflows/server-provisioning/provision-dell-server/bulk` | one workflow PER iDRAC IP |
@@ -618,7 +690,8 @@ would hide which segments actually got a workflow.
   it matches, and a run skips candidates that already have a BareMetalHost.
   Workflow ids are deterministic (`initialize-segment-<network>`,
   `allocate-segment-<TYPE>-<cluster>`, `release-segment-<TYPE>-<cluster>`,
-  `install-server-name-<server>`), so a duplicate trigger while running gets
+  `install-server-name-<server>`, `remove-server-<server>`,
+  `uninstall-server-<server>`), so a duplicate trigger while running gets
   HTTP 409. install-server's pool draws are the exception on purpose: each takes
   a free slot (`install-server-<infraEnv>_<slot>`), and the install lock keeps
   them on different machines.

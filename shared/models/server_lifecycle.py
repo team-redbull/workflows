@@ -729,3 +729,261 @@ class InstallServerResult(BaseModel):
     # site's PXE VM — True only for an IPMI (network-booted) server. Defaulted
     # for result payloads recorded before the field existed.
     pxe_registered: bool = False
+
+
+# --- uninstall-server ---------------------------------------------------------
+
+
+class ServerMembershipRequest(BaseModel):
+    """uninstall-server: which server to ask server-scan about, by exact name."""
+
+    server_name: str = Field(min_length=1)
+
+
+class ServerMembership(BaseModel):
+    """server-scan's record of WHERE one server is — the authority for it.
+
+    Read from `GET /servers/{id}` after `GET /servers?search=` and an exact,
+    case-insensitive name match — never `/servers/available`, which hides
+    exactly the claimed and reserved machines an uninstall is about.
+
+    `lifecycle_state` is server-scan's reading (`AVAILABLE`, `INSTALLED`,
+    `INSTALLED_TO_INVENTORY`), kept as a string so a state server-scan adds
+    later decodes instead of failing the run. `cluster_name` is set on
+    INSTALLED (for an MCE's Agent it is the ClusterDeployment's name, i.e. the
+    hosted cluster's); `mce_name` only when an MCE's agents job wrote it — a
+    hosted cluster's own nodes job leaves it None. `contested_with` is set when
+    two claims are flipping the server between them (server-scan ADR-0041).
+    """
+
+    found: bool = False
+    server_id: str | None = None
+    server_name: str | None = None
+    lifecycle_state: str | None = None
+    cluster_name: str | None = None
+    mce_name: str | None = None
+    contested_with: str | None = None
+    maintenance: bool = False
+    maintenance_reason: str | None = None
+
+
+class HostAgent(BaseModel):
+    """One Agent matched to the host, with everything that says whose node it is.
+
+    `agent_machine` is `<namespace>/<name>` of the AgentMachine behind it,
+    found EITHER through the `agentMachineRef` label (+ its namespace
+    annotation) the Agent provider puts on a bound Agent, OR through an
+    AgentMachine whose `status.agentRef` still names it. The second is what a
+    re-run needs: once a Machine starts deleting, the provider clears the
+    Agent's binding and label FIRST and then holds the Machine on its
+    pre-terminate hook until the host is unbound — an Agent that reads unbound
+    while its Machine is still going away.
+    """
+
+    name: str
+    namespace: str
+    # `<namespace>/<name>` of spec.clusterDeploymentName; None = unbound.
+    cluster_deployment: str | None = None
+    # status.debugInfo.state (`known-unbound`, `unbinding`, `added-to-existing-cluster`…).
+    state: str | None = None
+    approved: bool | None = None
+    agent_machine: str | None = None
+    # Whether the Agent still carries the provider's `agentMachineRef` label.
+    agent_machine_label: bool = False
+
+
+class MachineRef(BaseModel):
+    """One CAPI Machine on the MCE: in a hosted cluster's control-plane namespace.
+
+    `api_version` is the one the AgentMachine's ownerReference names
+    (`cluster.x-k8s.io/v1beta1` or `/v1beta2`), so the read uses whichever
+    version the installed CAPI serves.
+    """
+
+    namespace: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    api_version: str = "cluster.x-k8s.io/v1beta1"
+
+
+class MachineState(BaseModel):
+    """A Machine as read back: whether it is going, and what holds it.
+
+    `pending_hooks` are the `pre-drain.delete.hook.machine.cluster.x-k8s.io/*`
+    and `pre-terminate.delete.hook.machine.cluster.x-k8s.io/*` annotations
+    still on it — the Agent provider's own `…/agentmachine` among them, which
+    is how it holds the Machine until the host is unbound. `conditions` are its
+    deletion conditions that are not True yet, as `Type=Status (Reason):
+    message`, for an operator to act on.
+    """
+
+    found: bool = False
+    deleting: bool = False
+    deletion_timestamp: str | None = None
+    node_name: str | None = None
+    phase: str | None = None
+    pending_hooks: list[str] = Field(default_factory=list)
+    conditions: list[str] = Field(default_factory=list)
+
+
+class HostedClusterRef(BaseModel):
+    """The HostedCluster a Machine's control-plane namespace belongs to.
+
+    `hcp_namespace` is where its Machines, AgentMachines and API server
+    Service live — `<namespace>-<name>` by HyperShift's rule.
+    """
+
+    namespace: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    hcp_namespace: str = Field(min_length=1)
+
+
+class BoundHostState(BaseModel):
+    """inspect_bound_host: one server on its MCE, as a hosted-cluster node or not.
+
+    Reads only. `machine` and `hosted_cluster` are resolved for the ONE Agent
+    with an AgentMachine behind it; with none (an inventory host) or more than
+    one (the workflow refuses) they stay None. `machine_state` is that
+    Machine's state at inspection — None when the AgentMachine names no
+    Machine any more.
+    """
+
+    bmh_found: bool = False
+    bmh_operational_status: str | None = None
+    # The BMH's InfraEnv label, carried into the install lock's record.
+    infra_env: str | None = None
+    agents: list[HostAgent] = Field(default_factory=list)
+    machine: MachineRef | None = None
+    machine_state: MachineState | None = None
+    hosted_cluster: HostedClusterRef | None = None
+
+    @property
+    def bound_agents(self) -> list[HostAgent]:
+        return [a for a in self.agents if a.cluster_deployment]
+
+    @property
+    def hosted_agents(self) -> list[HostAgent]:
+        return [a for a in self.agents if a.agent_machine]
+
+
+class MachineDeletion(BaseModel):
+    """What ensure_machine_deleting found and did.
+
+    `already_deleting`: the Machine had a deletionTimestamp — a scale-down, an
+    operator, or an earlier run of this id — so nothing was written.
+    `found=False`: the Machine was already gone.
+    """
+
+    found: bool = False
+    already_deleting: bool = False
+    deleted: bool = False
+
+
+class AgentMachineRef(BaseModel):
+    """One AgentMachine, in a hosted cluster's control-plane namespace."""
+
+    namespace: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+
+
+class AgentMachineState(BaseModel):
+    found: bool = False
+    deleting: bool = False
+
+
+class AgentNameRef(BaseModel):
+    """One Agent by name, in the InfraEnv namespace."""
+
+    namespace: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+
+
+class AgentBindingState(BaseModel):
+    """One Agent's binding as read back now — the Machine wait's other half."""
+
+    found: bool = False
+    cluster_deployment: str | None = None
+    agent_machine_label: bool = False
+    state: str | None = None
+    approved: bool | None = None
+
+
+class HostedNodeRef(BaseModel):
+    """One Node of a hosted cluster, read through its control plane on the MCE."""
+
+    hosted_cluster: HostedClusterRef
+    node_name: str = Field(min_length=1)
+
+
+class HostedNodeState(BaseModel):
+    found: bool = False
+    node_name: str
+
+
+class UninstallServerInput(BaseModel):
+    """Input to UninstallServerWorkflow: which server to take out of which MCE.
+
+    No cluster, NodePool or HostedCluster input on purpose: server-scan and the
+    Agent's own binding say where the server is, and a caller-supplied cluster
+    could only contradict them. `namespace` is the InfraEnv namespace of its
+    BareMetalHost and Agent — required HERE; the API defaults it to
+    `inventory` on its edge model, so a recorded run always carries the
+    namespace it acted on.
+    """
+
+    server_name: str = Field(min_length=1)
+    mce_cluster: str = Field(min_length=1)
+    namespace: str = Field(min_length=1)
+
+
+class UninstallServerRunArgs(BaseModel):
+    """The workflow's single argument (see InstallServerRunArgs for why a wrapper)."""
+
+    input: UninstallServerInput
+
+
+class UninstallServerProgress(BaseModel):
+    """Returned by the `progress` query.
+
+    `sub_phase` is set while the run waits for the Machine to go:
+    `draining` (the Agent is still bound — pre-drain hooks, the drain, volume
+    detach) or `unbinding` (the provider has released the Agent; the host is
+    rebooting back into the discovery image). `agent_state` is the Agent's
+    last `status.debugInfo.state`.
+    """
+
+    phase: str
+    sub_phase: str | None = None
+    activity_queue: str | None = None
+    agent_state: str | None = None
+
+
+class UninstallServerResult(BaseModel):
+    """What the uninstall did, both halves.
+
+    `hosted` says whether the hosted-cluster half ran (the host was a hosted
+    cluster's node, or still going away as one). `skipped` names every step
+    that did not need doing and why — a Machine already deleting, a Node
+    check with no Node to check, the whole hosted-cluster half for an
+    inventory host. `remove_server` is the awaited remove-server child's own
+    result, on `remove_server_workflow_id`.
+    """
+
+    server_name: str
+    namespace: str
+    mce_cluster: str
+    server_id: str | None = None
+    lifecycle_state_at_start: str | None = None
+    hosted: bool = False
+    bound_at_start: bool = False
+    agent_state_at_start: str | None = None
+    agent_name: str | None = None
+    hosted_cluster: str | None = None
+    hcp_namespace: str | None = None
+    machine: str | None = None
+    agent_machine: str | None = None
+    node_name: str | None = None
+    machine_deleted_by_run: bool = False
+    skipped: list[str] = Field(default_factory=list)
+    reservation_expires_at: str | None = None
+    remove_server_workflow_id: str | None = None
+    remove_server: RemoveServerResult | None = None

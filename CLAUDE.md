@@ -31,7 +31,9 @@ activities/<domain>/         The execution "limbs" (one deployment per domain)
                                with no worker: values_repo.py (git), dhcp_api.py (the
                                DHCP scope API), server_scan.py (the inventory API),
                                cluster_api.py (the Kubernetes API, its idempotency
-                               rule and its error classification)
+                               rule and its error classification),
+                               hosted_cluster_api.py (a HOSTED cluster's API, read
+                               through its admin kubeconfig)
   worker_init.py             Registers activities, polls that queue
 docs/                             The static documentation site (its own image, no code)
 ```
@@ -313,6 +315,95 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   pxe-map-api ignores `?mce_cluster` and deletes unconditionally — upgrade the
   PXE VMs first. Leaves server-scan's lock alone. Needs `delete` on agents in
   the limb's RBAC.
+- **uninstall-server takes ONE server all the way out of an MCE, whatever its
+  Agent's state** (`workflow_domains/server_lifecycle/uninstall_server.py`, own
+  queue `uninstall-server-workflow`, id `uninstall-server-<server lowercased>`,
+  API `POST /workflows/server-lifecycle/uninstall-server` — `server_names` ONLY,
+  a string or a list of 1-20, each once case-insensitively, plus `mce_cluster`
+  canonicalised and `namespace` defaulting to `inventory`; NO `count`, NodePool or
+  HostedCluster field: server-scan and the Agent's binding say where it is. A
+  string is `{workflow_id, run_id}` and a 409 while it runs, a list the per-run
+  report install-server's named list uses (`ServerRunItem`); `UninstallServerRequest`
+  is its OWN model with `run_input()`, guarded by `test_every_run_field_can_be_sent`.)
+  Designed with the operator 2026-10-23. The PATH is picked by the BINDING seen
+  at inspection, never by the Agent's state string: a HOSTED NODE is an Agent
+  bound (`spec.clusterDeploymentName`) with an AgentMachine behind it, OR an
+  Agent an AgentMachine's `status.agentRef` still names — the Agent provider
+  clears the binding, the `agentMachineRef` label and its namespace annotation
+  BEFORE the Machine finishes deleting (it holds the Machine on
+  `pre-terminate.delete.hook.machine.cluster.x-k8s.io/agentmachine` until the
+  Agent is unbound), so without the agentRef match a re-run mid-unbinding would
+  skip the hosted half instead of resuming it. Anything else is an INVENTORY HOST
+  and skips that half. EVERY path ends in remove-server as an AWAITED CHILD
+  (`remove_server_workflow_id`, `REMOVE_SERVER_WORKFLOW_QUEUE`, ABANDON on parent
+  close) — the inventory half, PXE cleanup included, is never reimplemented here
+  and remove-server's own route keeps working alone; `WorkflowAlreadyStartedError`
+  on it is `RemoveServerAlreadyRunningError` naming the id, its failure
+  `RemoveServerFailedError` carrying the child's type; nothing on the MCE
+  completes through the child's `found=false`. ORDER: `checking-inventory`
+  (`lookup_server_membership`: `GET /servers?search=` + exact name on
+  `/servers/{id}`, never `/servers/available`; refused ONLY on a contradiction —
+  unknown `ServerNotInServerScanError`, `contested_with`, another MCE —
+  `ClusterMembershipMismatchError`; AVAILABLE is accepted) → `inspecting`
+  (`inspect_bound_host`: BMH, Agents by bmh label / any MAC, AgentMachines listed
+  cluster-wide, the owning Machine via ownerReferences — deletionTimestamp,
+  nodeRef, hooks, conditions — and the HostedCluster; the Node name is captured
+  HERE; refused: two bound Agents `MultipleBoundAgentsError`, bound with no
+  AgentMachine — early-bound ACM/ZTP or an orphan binding, v2 —
+  `NotHostedClusterNodeError`, server-scan INSTALLED naming another cluster or
+  INSTALLED_TO_INVENTORY while bound — an unbound Agent contradicts no
+  INSTALLED reading, a re-run's normal view) → `reserving-server` ALWAYS → the
+  hosted half: `deleting-machine` (`ensure_machine_deleting`, the ONE write on
+  the MCE, a no-op when it already has a deletionTimestamp or is gone) →
+  `awaiting-machine-deletion` (30 s polls of Machine + Agent: `draining` while the
+  Agent is bound, 20 min from the first deleting observation, then
+  `MachineDrainTimeoutError` naming conditions and pending hooks; `unbinding`
+  once released, 1 h to `known-unbound` — install-server's bare-metal reasoning —
+  then `AgentUnbindTimeoutError`, or `MachineDeletionTimeoutError` when the Agent
+  is free and the Machine still stands) → `verifying-agentmachine` (gone, 5 min,
+  `ServerStillPresentError`) → `verifying-node` (`check_hosted_node`; SKIPPED when
+  the Machine never had a nodeRef; present = `HostedNodeStillPresentError` with
+  an `oc delete node` hint — a Node is NEVER deleted) → `verifying-agent` (no
+  binding, no label, known-unbound, approved, BMH present and not in error; 5 min,
+  `AgentStillBoundError`) → `holding-server` (24 h BEFORE the child, so the hold
+  covers the inventory half) → `removing-from-inventory`. Every skip goes into
+  `result.skipped`. NOTHING IS UNDONE after the Machine delete — it cannot be —
+  and a re-run of the same id RESUMES. NODEPOOL REPLICAS ARE NOT ITS BUSINESS:
+  standalone = REPLACE (the MachineSet backfills from the InfraEnv),
+  scale-down-driven = SHRINK — a future `scale-down-nodepool` owns the
+  annotation + replicas and triggers this run per server, which then finds the
+  Machine already deleting. THE LOCK even for an uninstall (holder
+  `uninstall-server`, TTL = drain + unbind + both verifications + 10 min): the
+  hosted cluster's nodes job frees the server on its Node's absence and the MCE's
+  agents job re-claims it INSTALLED_TO_INVENTORY on its own 15-min cadence, so
+  between them it can read AVAILABLE while still in this InfraEnv and be drawn by
+  another MCE's install. Taken after the inspection, before any write; a lock
+  held elsewhere fails the run (install-server's day-long `_INSTALLED_HOLD` on a
+  freshly installed machine does — release it in server-scan); on failure left
+  to its TTL; a refused 24 h extension is logged and the child still runs.
+  HOSTED-CLUSTER ACCESS: `HostedCluster.status.kubeconfig.name` in the
+  HostedCluster's namespace, the kubeconfig parsed BY THE LIMB
+  (`activities/server_lifecycle/hosted_cluster_api.py` — the kubernetes client's
+  loader caches cert/key files for the process lifetime; here they live in a
+  per-call temp dir) with the server overridden to
+  `https://kube-apiserver.<hcp-ns>.svc:6443` (the external route may not be
+  reachable from the pod network), TLS verified against its CA, nothing from it
+  in history, logs or errors; retryable `HostedClusterUnreachableError`
+  (connection, 5xx, 401), non-retryable `HostedClusterAccessError` (no
+  kubeconfig, unusable Secret, 403, TLS verification). THE AGENT'S
+  `clusterDeploymentName.namespace` IS THE CONTROL-PLANE NAMESPACE, not the
+  HostedCluster's: HyperShift creates the AgentCluster — and with it the
+  ClusterDeployment — there, named after the HostedCluster, so the HostedCluster
+  is found by listing them and matching HyperShift's
+  `<ns>-<name, dots as dashes>` against the AgentMachine's namespace
+  (`hosted_resources.hosted_cluster_for`). Shapes are taken from
+  cluster-api-provider-agent and HyperShift's own code, cited in
+  `hosted_resources.py`. Needs, beyond the InfraEnv Roles, a ClusterRole
+  (`rbac.hostedClusters`): machines get/list/delete, agentmachines get/list,
+  hostedclusters get/list and secrets get CLUSTER-WIDE — the widest grant the
+  limb holds; the vendored chart in redbull-platform needs the same. Never: a
+  NodePool change, a Node delete, Node-side drain logic, a PXE map write
+  (remove-server's), a new deployment.
 - **Select bond members from `interfaces[]`, NEVER from `nic_macs`.**
   server-scan reduces Dell NPAR partitions to one entry per physical port in
   `interfaces` but leaves `nic_macs` whole on purpose, so a 4-port partitioned
@@ -678,7 +769,8 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   `deploy/argocd/`). On a remote MCE it renders its own Temporal endpoint, since no brain ConfigMap
   exists there; `deploy/` is in `.dockerignore` and triggers no image build. The server-lifecycle limb is the first to need real RBAC: it creates
   secrets, metal3.io/baremetalhosts and agent-install.openshift.io/nmstateconfigs in the target
-  namespace, where segment-lifecycle only makes HTTP and git calls.
+  namespace, where segment-lifecycle only makes HTTP and git calls — and, for uninstall-server,
+  a ClusterRole over CAPI Machines, AgentMachines, HostedClusters and Secrets (§4).
 - Assumed already running: a Temporal server and the Segments Manager (via OpenShift routes or
   localhost — no port assumptions in code).
 - Trigger via the unified API: `uvicorn workflow_domains.api:app --port 8080`, Swagger at `/docs`.

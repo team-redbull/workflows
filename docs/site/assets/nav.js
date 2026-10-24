@@ -52,8 +52,8 @@
         },
         {
           name: "uninstall-server",
-          href: null,
-          blurb: "take a server back out of the InfraEnv"
+          href: "/server-lifecycle/uninstall-server.html",
+          blurb: "take a server out of its hosted cluster and the MCE"
         }
       ]
     },

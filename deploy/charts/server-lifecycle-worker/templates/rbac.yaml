@@ -45,4 +45,57 @@ subjects:
     name: {{ include "slw.serviceAccountName" $root }}
     namespace: {{ $root.Release.Namespace }}
 {{- end }}
+{{- if .Values.rbac.hostedClusters }}
+---
+# uninstall-server's reads of a hosted cluster, and its ONE write. Cluster-wide
+# because what it touches lives in each hosted cluster's control-plane
+# namespace (`<hc-ns>-<hc>`) and the HostedCluster's own namespace — neither
+# is an InfraEnv namespace, and neither is named in the request:
+#   * machines            get + delete the Machine behind the Agent (the
+#                         delete is the run's only write). `list` is in the
+#                         agreed grant but no code lists Machines today
+#   * agentmachines       list to find the one whose agentRef names the Agent
+#                         — the only link left once the provider starts
+#                         unbinding — and get to confirm it went
+#   * hostedclusters      list to find the HostedCluster by its control-plane
+#                         namespace, get for its status.kubeconfig
+#   * secrets             get the HostedCluster's admin kubeconfig. This is the
+#                         widest grant in the chart: get on EVERY Secret of the
+#                         MCE. Turn `rbac.hostedClusters` off on an MCE that
+#                         runs no hosted clusters.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "slw.fullname" . }}-hosted-clusters
+  labels:
+    {{- include "slw.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [cluster.x-k8s.io]
+    resources: [machines]
+    verbs: [get, list, delete]
+  - apiGroups: [capi-provider.agent-install.openshift.io]
+    resources: [agentmachines]
+    verbs: [get, list]
+  - apiGroups: [hypershift.openshift.io]
+    resources: [hostedclusters]
+    verbs: [get, list]
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "slw.fullname" . }}-hosted-clusters
+  labels:
+    {{- include "slw.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "slw.fullname" . }}-hosted-clusters
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "slw.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
 {{- end }}

@@ -496,3 +496,126 @@ class TestPublishInfraEnvBoot:
 
     def test_unknown_fields_are_refused(self, client):
         assert client.post(self.PATH, json={**self.BODY, "ipxe_url": "http://x"}).status_code == 422
+
+
+# --- uninstall-server -----------------------------------------------------------------
+
+UNINSTALL = "/workflows/server-lifecycle/uninstall-server"
+UNINSTALL_BODY = {"mce_cluster": "mce-bat-yam-01"}
+
+
+class _FakeUninstallClient:
+    """Temporal, as the uninstall route meets it: one RUNNING workflow per id."""
+
+    def __init__(self, running: set[str] | None = None, fail_on: str | None = None) -> None:
+        self.started: list[tuple[str, str, object]] = []
+        self.running = running if running is not None else set()
+        self.fail_on = fail_on
+
+    async def start_workflow(self, _run, args, *, id: str, task_queue: str):
+        if id == self.fail_on:
+            raise RuntimeError("Temporal unavailable")
+        if id in self.running:
+            raise WorkflowAlreadyStartedError(id, "UninstallServerWorkflow")
+        self.running.add(id)
+        self.started.append((id, task_queue, args.input))
+        return _FakeHandle(id)
+
+
+def _uninstall_client(fake) -> TestClient:
+    app = FastAPI()
+    app.include_router(router_module.router)
+    app.dependency_overrides[get_temporal_client] = lambda: fake
+    return TestClient(app)
+
+
+def _uninstall_id(name: str) -> str:
+    return f"uninstall-server-{name.lower()}"
+
+
+class TestUninstallServer:
+    def test_one_name_is_one_run_on_its_own_queue_and_id(self):
+        from shared.consts import UNINSTALL_SERVER_WORKFLOW_QUEUE
+        from shared.models.server_lifecycle import UninstallServerInput
+
+        fake = _FakeUninstallClient()
+        response = _uninstall_client(fake).post(UNINSTALL, json={**UNINSTALL_BODY, "server_names": NAMES[0]})
+
+        assert response.status_code == 202
+        assert response.json() == {"workflow_id": _uninstall_id(NAMES[0]), "run_id": "run-1"}
+        [(workflow_id, queue, run_input)] = fake.started
+        assert queue == UNINSTALL_SERVER_WORKFLOW_QUEUE
+        # The run's input is exactly the history model: one server, the MCE
+        # canonical, the namespace defaulted here at the edge.
+        assert type(run_input) is UninstallServerInput
+        assert run_input == UninstallServerInput(
+            server_name=NAMES[0], mce_cluster="ocp4-mce-bat-yam-01", namespace="inventory"
+        )
+
+    def test_one_name_already_uninstalling_is_409(self):
+        fake = _FakeUninstallClient(running={_uninstall_id(NAMES[0])})
+        response = _uninstall_client(fake).post(UNINSTALL, json={**UNINSTALL_BODY, "server_names": NAMES[0]})
+        assert response.status_code == 409 and NAMES[0] in response.json()["detail"]
+
+    def test_the_same_machine_typed_in_another_case_is_the_same_run(self):
+        fake = _FakeUninstallClient(running={_uninstall_id(NAMES[0])})
+        response = _uninstall_client(fake).post(
+            UNINSTALL, json={**UNINSTALL_BODY, "server_names": NAMES[0].upper()}
+        )
+        assert response.status_code == 409
+
+    def test_a_start_temporal_refuses_is_502_with_its_reason(self):
+        fake = _FakeUninstallClient(fail_on=_uninstall_id(NAMES[0]))
+        response = _uninstall_client(fake).post(UNINSTALL, json={**UNINSTALL_BODY, "server_names": NAMES[0]})
+        assert response.status_code == 502 and "Temporal unavailable" in response.json()["detail"]
+
+    def test_a_list_is_one_run_per_name_with_a_report(self):
+        fake = _FakeUninstallClient(running={_uninstall_id(NAMES[1])})
+        response = _uninstall_client(fake).post(
+            UNINSTALL, json={**UNINSTALL_BODY, "server_names": NAMES, "namespace": "lab-kv"}
+        )
+
+        assert response.status_code == 202
+        body = response.json()
+        assert (body["started"], body["already_running"], body["failed"]) == (1, 1, 0)
+        assert [(r["server_name"], r["workflow_id"], r["status"]) for r in body["results"]] == [
+            (NAMES[0], _uninstall_id(NAMES[0]), "started"),
+            (NAMES[1], _uninstall_id(NAMES[1]), "already_running"),
+        ]
+        assert {run_input.namespace for _, _, run_input in fake.started} == {"lab-kv"}
+
+    def test_a_list_of_one_is_still_a_report(self):
+        body = _uninstall_client(_FakeUninstallClient()).post(
+            UNINSTALL, json={**UNINSTALL_BODY, "server_names": NAMES[:1]}
+        ).json()
+        assert body["started"] == 1 and len(body["results"]) == 1
+
+    @pytest.mark.parametrize(
+        ("body", "words"),
+        [
+            ({}, "server_names"),
+            ({"server_names": []}, "lists no server"),
+            ({"server_names": ""}, "cannot be empty"),
+            ({"server_names": [NAMES[0], NAMES[0].lower()]}, "more than once"),
+            ({"server_names": [f"ocp-x-{n}" for n in range(21)]}, "at most 20"),
+            ({"server_names": NAMES[0], "count": 2}, "extra"),
+            ({"server_names": NAMES[0], "node_pool": "np-1"}, "extra"),
+            ({"server_names": NAMES[0], "hosted_cluster": "hc-01"}, "extra"),
+            ({"server_name": NAMES[0]}, "`server_names`"),
+            ({"server_names": NAMES[0], "mce_cluster": ""}, "mce_cluster"),
+        ],
+    )
+    def test_anything_else_is_422_and_starts_nothing(self, body, words):
+        fake = _FakeUninstallClient()
+        response = _uninstall_client(fake).post(UNINSTALL, json={**UNINSTALL_BODY, **body})
+        assert response.status_code == 422
+        assert words in response.text
+        assert fake.started == []
+
+    def test_every_run_field_can_be_sent(self):
+        # Its own model, not a subclass of the run's input: a field added to
+        # UninstallServerInput must be added to the request too.
+        from shared.models.server_lifecycle import UninstallServerInput
+
+        run_fields = set(UninstallServerInput.model_fields) - {"server_name"}
+        assert run_fields <= set(router_module.UninstallServerRequest.model_fields)

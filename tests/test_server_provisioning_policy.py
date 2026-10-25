@@ -13,9 +13,19 @@ from shared.models.server_provisioning import (
     IdracController,
     IdracDrive,
     IdracVolume,
+    BiosComparison,
     StorageLayout,
+    TemplateAttribute,
 )
 from workflow_domains.server_provisioning.regions import resolve_region
+from workflow_domains.server_provisioning.template_policy import (
+    NETWORK,
+    STORAGE,
+    USERS,
+    audit_template,
+    describe_drift,
+    describe_hazards,
+)
 from workflow_domains.server_provisioning.server_name import (
     model_token,
     name_matches_convention,
@@ -174,3 +184,91 @@ class TestStoragePlan:
     def test_a_drive_neither_ready_nor_non_raid_is_a_problem(self, status):
         plan = plan_storage(StorageLayout(controllers=[_boss(), _perc([status])]))
         assert plan.problems
+
+
+class TestTemplateAudit:
+    """The template audit — the one guard whose failure mode is a machine that
+    can only be recovered at the rack."""
+
+    @staticmethod
+    def _attr(group: str, name: str, ignored: bool = False) -> TemplateAttribute:
+        return TemplateAttribute(attribute_id=1, name=name, group=group, is_ignored=ignored)
+
+    def test_a_bios_only_template_is_safe(self):
+        safe = [
+            self._attr("BIOS,System Profile Settings", "System Profile"),
+            self._attr("BIOS,Boot Settings", "Boot Mode"),
+            self._attr("iDRAC,Web Server", "Timeout"),
+            self._attr("System,Server Operating System", "Server Host Name"),
+        ]
+        assert audit_template(safe) == []
+
+    def test_the_idracs_own_address_is_refused(self):
+        """The worst case: deploying a reference server's address moves this
+        machine's iDRAC, and nothing remote can bring it back."""
+        hazards = audit_template([self._attr("iDRAC,IPv4 Information", "Address")])
+        assert [h.group for h in hazards] == [NETWORK]
+
+    def test_a_host_nic_is_not_an_idrac_network_setting(self):
+        """A template legitimately configures the host's NICs. Only the iDRAC's
+        own network is the hazard, so the group has to mention iDRAC."""
+        assert audit_template([self._attr("NIC,Integrated 1 Port 1", "MAC Address")]) == []
+
+    def test_a_virtual_disk_component_is_refused(self):
+        hazards = audit_template([self._attr("Storage,RAID.Integrated.1-1", "Virtual Disk 0")])
+        assert [h.group for h in hazards] == [STORAGE]
+
+    def test_a_user_account_is_refused(self):
+        hazards = audit_template([self._attr("iDRAC,Users,User 2", "Password")])
+        assert [h.group for h in hazards] == [USERS]
+
+    def test_ordinary_bios_settings_that_merely_sound_dangerous_are_allowed(self):
+        """The audit FAILS a run, so a false positive stops provisioning. The
+        BIOS is full of words that look like hazards out of context, and every
+        one of these is a normal thing for a template to carry."""
+        innocent = [
+            self._attr("BIOS,System Security", "System Password"),
+            self._attr("BIOS,System Security", "Setup Password"),
+            self._attr("BIOS,Boot Settings", "Hard-Disk Drive Sequence"),
+            self._attr("BIOS,SATA Settings", "Embedded SATA"),
+            self._attr("BIOS,Integrated Devices", "Embedded NIC1"),
+            self._attr("BIOS,Network Settings", "IPv4 Support"),
+        ]
+        assert audit_template(innocent) == []
+
+    def test_an_ignored_attribute_is_not_a_hazard(self):
+        """IsIgnored is how an operator keeps a captured attribute without
+        deploying it — refusing it would make the audit unsatisfiable from the
+        OME GUI."""
+        assert audit_template([self._attr("iDRAC,IPv4 Information", "Address", ignored=True)]) == []
+
+    def test_each_attribute_is_reported_once_even_if_it_fits_two_groups(self):
+        """'iDRAC,Users,User 2' + 'DNS RAC Name' matches both network and users;
+        one attribute must not be counted twice in the failure message."""
+        hazards = audit_template([self._attr("iDRAC,Users,User 2", "DNS RAC Name")])
+        assert len(hazards) == 1
+
+    def test_the_message_groups_by_reason_and_names_every_attribute(self):
+        hazards = audit_template([
+            self._attr("iDRAC,IPv4 Information", "Address"),
+            self._attr("iDRAC,IPv6 Information", "Gateway"),
+            self._attr("Storage,RAID.Integrated.1-1", "Virtual Disk 0"),
+        ])
+        described = describe_hazards(hazards)
+        assert "idrac-network (2)" in described and "storage (1)" in described
+        assert "iDRAC,IPv4 Information,Address" in described
+        assert "reachable only at the rack" in described
+
+
+class TestDriftReporting:
+    def test_a_long_drift_list_is_capped_so_the_failure_stays_readable(self):
+        """A template on the wrong firmware can fail dozens of attributes, and
+        the message goes verbatim into Temporal history."""
+        many = [
+            BiosComparison(display_name=f"Attr {n}", attribute_name=f"A{n}",
+                           intended="on", actual="off")
+            for n in range(25)
+        ]
+        described = describe_drift(many)
+        assert "and 15 more" in described
+        assert described.count("template says") == 10

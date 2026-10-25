@@ -80,6 +80,12 @@ class IdracProbeResult(BaseModel):
     credential: int | None = None
     rejected: int = 0
     detail: str | None = None
+    # Force Change of Password is pending: `credential` is the password root
+    # HAS, and the iDRAC will refuse everything else until it is changed.
+    # Defaults False, which is exactly how this read before the field existed —
+    # so a run replaying a payload an older limb wrote takes the path it
+    # originally took, rather than a new one (CLAUDE.md §5).
+    password_change_required: bool = False
 
 
 class IdracIdentity(BaseModel):
@@ -91,6 +97,12 @@ class IdracIdentity(BaseModel):
     idrac_firmware: str
     bios_version: str | None = None
     power_state: str | None = None
+    # The OS hostname the iDRAC reports (Redfish `HostName`, racadm
+    # `System.ServerOS.HostName`). Servers arrive carrying a factory value —
+    # `Miniwinpc` is the one the DC team keeps seeing — and while it is set, OME
+    # shows it instead of the machine's address next to the profile. A server
+    # being provisioned has no OS, so any value here is stale by definition.
+    os_hostname: str | None = None
 
 
 class IdracDrive(BaseModel):
@@ -175,6 +187,86 @@ class RebootResult(BaseModel):
 
     rebooted: bool
     reset_type: str | None = None
+
+
+class BiosComparison(BaseModel):
+    """One BIOS attribute the template meant to set, against what the machine has.
+
+    `attribute_name` is None when the machine's BIOS attribute registry has no
+    entry with that display name — reported rather than dropped, because
+    silence would read as "verified" when it means "not checked". That happens
+    when a template built for one firmware names an attribute another firmware
+    does not have, which is the exact case Dell warns about.
+    """
+
+    display_name: str
+    attribute_name: str | None = None
+    intended: str | None = None
+    actual: str | None = None
+    read_only: bool = False
+
+    @property
+    def verifiable(self) -> bool:
+        return bool(self.attribute_name) and not self.read_only and self.intended is not None
+
+    @property
+    def drifted(self) -> bool:
+        return self.verifiable and self.actual != self.intended
+
+
+class BiosVerifyRequest(BaseModel):
+    """The BIOS attributes to check, keyed by the DISPLAY name OME reports."""
+
+    idrac: IdracRef
+    intended: dict[str, str | None] = Field(default_factory=dict)
+
+
+class BiosVerification(BaseModel):
+    compared: list[BiosComparison] = Field(default_factory=list)
+
+
+class BiosStageRequest(BaseModel):
+    """Attribute NAME -> value, as Redfish accepts them in a PATCH."""
+
+    idrac: IdracRef
+    attributes: dict[str, str] = Field(default_factory=dict)
+
+
+class TemplateAttribute(BaseModel):
+    """One attribute an OME template would deploy.
+
+    As `TemplateService/Templates({id})/AttributeDetails` reports it: OME gives
+    the GUI's display names rather than the SCP attribute names, so `group` is
+    the joined path of the nested AttributeGroups ("iDRAC,IPv4 Information")
+    and `name` the leaf DisplayName ("Address"). `template_policy.py` matches
+    on both — there is no stable id to key on.
+    """
+
+    attribute_id: int | None = None
+    name: str
+    group: str = ""
+    value: str | None = None
+    # OME's own "capture it but do not deploy it" flag. An ignored attribute is
+    # not applied, so it is never a hazard.
+    is_ignored: bool = False
+
+    def describe(self) -> str:
+        return f"{self.group},{self.name}" if self.group else self.name
+
+
+class TemplateContents(BaseModel):
+    """What a template would deploy, for the audit that runs before it does."""
+
+    template_id: int
+    template_name: str
+    attributes: list[TemplateAttribute] = Field(default_factory=list)
+
+
+class OmeTemplateRef(BaseModel):
+    """Which template to read, named the way DELL_TEMPLATES names it."""
+
+    model: str
+    idrac_firmware: str
 
 
 class OmeDeviceRef(BaseModel):
@@ -301,6 +393,9 @@ class ProvisionDellServerProgress(BaseModel):
     ome_device_id: int | None = None
     template_name: str | None = None
     profile_name: str | None = None
+    os_hostname_cleared: bool | None = None
+    bios_attributes_checked: int | None = None
+    bios_attributes_drifted: int | None = None
     waiting_on: str | None = None
 
 
@@ -318,3 +413,13 @@ class ProvisionDellServerResult(BaseModel):
     profile_name: str
     boss_raid1_created: bool
     non_raid_drives_converted: int
+    # True when the machine arrived with a factory OS hostname (`Miniwinpc`)
+    # that this run blanked, so OME shows its address beside the profile.
+    os_hostname_cleared: bool = False
+    # How much of the template this run could actually verify, and how much of
+    # it the deployment silently failed to apply. `bios_attributes_unverified`
+    # is the honest coverage gap: attributes the machine's BIOS registry does
+    # not know, which is what a template/firmware mismatch looks like.
+    bios_attributes_checked: int = 0
+    bios_attributes_remediated: int = 0
+    bios_attributes_unverified: int = 0

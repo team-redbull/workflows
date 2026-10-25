@@ -38,6 +38,9 @@ BASE = f"https://{IP}"
 SYSTEM = f"{BASE}{idrac.SYSTEM}"
 MANAGER = f"{BASE}{idrac.MANAGER}"
 JOBS = f"{BASE}{idrac.JOBS}"
+SYSTEM_ATTRS = f"{BASE}{idrac.SYSTEM_ATTRIBUTES}"
+ACCOUNT = f"{BASE}{idrac.ROOT_ACCOUNT}"
+ACCOUNT_10 = f"{BASE}{idrac.ROOT_ACCOUNT_IDRAC10}"
 
 
 class TestProbe:
@@ -64,6 +67,53 @@ class TestProbe:
         result = await idrac.probe_credentials(IP, "root", ["a", "b"])
         assert not result.reachable and result.credential is None
         assert route.call_count == 1
+
+    @staticmethod
+    def _force_change(message_id: str = "Base.1.18.PasswordChangeRequired") -> httpx.Response:
+        return httpx.Response(
+            401,
+            json={
+                "error": {
+                    "@Message.ExtendedInfo": [
+                        {
+                            "MessageId": message_id,
+                            "Message": "The password provided for this account must be "
+                            "changed before access is granted.",
+                        }
+                    ]
+                }
+            },
+        )
+
+    @respx.mock
+    async def test_force_change_of_password_is_the_right_password_not_a_rejection(self):
+        """Dell's FCP refuses a CORRECT password with the same 401 a wrong one
+        gets. Counting it as wrong spends the other candidates and trips the
+        iDRAC's own block — on a machine that just told us the password."""
+        route = respx.get(SYSTEM).mock(side_effect=[httpx.Response(401), self._force_change()])
+        result = await idrac.probe_credentials(IP, "root", ["target", "calvin", "other"])
+
+        assert result.reachable and result.credential == 1
+        assert result.password_change_required
+        assert result.rejected == 1  # the genuine one before it, and no more
+        assert route.call_count == 2
+
+    @respx.mock
+    async def test_the_registry_version_in_the_message_id_is_not_matched_on(self):
+        """`Base.1.18.PasswordChangeRequired` today; a later firmware ships a
+        later registry. Matching the whole string would silently stop working."""
+        respx.get(SYSTEM).mock(return_value=self._force_change("Base.1.21.PasswordChangeRequired"))
+        result = await idrac.probe_credentials(IP, "root", ["calvin"])
+        assert result.password_change_required and result.credential == 0
+
+    @respx.mock
+    async def test_an_ordinary_401_is_still_a_rejection(self):
+        """The detection must not swallow the case it sits next to: a 401
+        carrying some other Dell message is a wrong password, as before."""
+        respx.get(SYSTEM).mock(return_value=self._force_change("Base.1.18.InsufficientPrivilege"))
+        result = await idrac.probe_credentials(IP, "root", ["a", "b"])
+        assert result.credential is None and result.rejected == 2
+        assert not result.password_change_required
 
     @respx.mock
     async def test_a_5xx_ends_the_round_without_counting_as_a_rejection(self):
@@ -99,6 +149,187 @@ class TestIdentity:
         respx.get(SYSTEM).mock(return_value=httpx.Response(500))
         with pytest.raises(IdracError):
             await idrac.read_identity(IP, "root", "pw")
+
+
+class TestRootPassword:
+    """Set over Redfish before OME ever sees the machine, so OME is only handed
+    the password root keeps."""
+
+    @respx.mock
+    async def test_the_idrac9_account_collection_is_used(self):
+        """iDRAC9 keeps accounts under the MANAGER; AccountService is iDRAC10.
+        An R660 is 16G, so the whole current fleet is on the first."""
+        respx.get(ACCOUNT).mock(return_value=httpx.Response(200, json={"UserName": "root"}))
+        patched = respx.patch(ACCOUNT).mock(return_value=httpx.Response(200))
+        assert await idrac.set_root_password(IP, "root", "old", "new") is True
+        assert json.loads(patched.calls.last.request.content) == {"Password": "new"}
+
+    @respx.mock
+    async def test_an_idrac10_machine_falls_back_to_accountservice(self):
+        respx.get(ACCOUNT).mock(return_value=httpx.Response(404))
+        respx.get(ACCOUNT_10).mock(return_value=httpx.Response(200, json={"UserName": "root"}))
+        patched = respx.patch(ACCOUNT_10).mock(return_value=httpx.Response(200))
+        assert await idrac.set_root_password(IP, "root", "old", "new") is True
+        assert patched.called
+
+    @respx.mock
+    async def test_a_retry_after_success_is_not_a_failure(self):
+        """The retry authenticates with a password the machine no longer has.
+        Rather than spending a rejected login on EVERY run to find out — iDRAC9
+        blocks an address after three — the 401 is allowed to happen and only
+        then is the target password tried."""
+        respx.get(ACCOUNT).mock(return_value=httpx.Response(401))
+        respx.get(SYSTEM).mock(return_value=httpx.Response(200, json={}))
+        assert await idrac.set_root_password(IP, "root", "old", "new") is False
+
+    @respx.mock
+    async def test_force_change_of_password_is_named_not_mistaken_for_a_lost_password(self):
+        """Reaching here under FCP means the probe let it through. The 401 on
+        the account read must not fall into the retry-after-success path: that
+        asks whether the TARGET password works, gets another 401, and reports
+        "root's password changed under this run" — wrong, and unactionable."""
+        respx.get(ACCOUNT).mock(return_value=TestProbe._force_change())
+
+        with pytest.raises(IdracRequestRejectedError) as info:
+            await idrac.set_root_password(IP, "root", "old", "new")
+
+        assert "Force Change of Password" in str(info.value)
+        # It names the fix, and it never tried the target password.
+        assert "ForceChangePassword" in str(info.value)
+
+    @respx.mock
+    async def test_a_credential_that_is_simply_wrong_still_fails(self):
+        respx.get(ACCOUNT).mock(return_value=httpx.Response(401))
+        respx.get(SYSTEM).mock(return_value=httpx.Response(401))
+        with pytest.raises(IdracAuthError):
+            await idrac.set_root_password(IP, "root", "old", "new")
+
+    @respx.mock
+    async def test_a_slot_2_that_is_not_root_is_refused(self):
+        """Changing the wrong account is how OME loses a server for good."""
+        respx.get(ACCOUNT).mock(return_value=httpx.Response(200, json={"UserName": "ome-svc"}))
+        patched = respx.patch(ACCOUNT).mock(return_value=httpx.Response(200))
+        with pytest.raises(IdracRequestRejectedError):
+            await idrac.set_root_password(IP, "root", "old", "new")
+        assert not patched.called
+
+
+class TestOsHostname:
+    """The factory hostname (`Miniwinpc`) that hides a machine's address in OME."""
+
+    @respx.mock
+    async def test_a_factory_hostname_is_blanked(self):
+        """Written as the SYSTEM ATTRIBUTE racadm sets, not the standard
+        ComputerSystem property — Dell fills that one from the OS via iSM."""
+        respx.get(SYSTEM).mock(return_value=httpx.Response(200, json={"HostName": "Miniwinpc"}))
+        patched = respx.patch(SYSTEM_ATTRS).mock(return_value=httpx.Response(200))
+        assert await idrac.clear_os_hostname(IP, "root", "pw") is True
+        assert json.loads(patched.calls.last.request.content) == {
+            "Attributes": {"ServerOS.1.HostName": ""}
+        }
+
+    @respx.mock
+    async def test_an_already_blank_machine_is_never_written_to(self):
+        """Idempotence: a re-run must not PATCH a machine that is already right."""
+        respx.get(SYSTEM).mock(return_value=httpx.Response(200, json={"HostName": ""}))
+        patched = respx.patch(SYSTEM_ATTRS).mock(return_value=httpx.Response(200))
+        assert await idrac.clear_os_hostname(IP, "root", "pw") is False
+        assert not patched.called
+
+    @respx.mock
+    async def test_whitespace_counts_as_blank(self):
+        respx.get(SYSTEM).mock(return_value=httpx.Response(200, json={"HostName": "   "}))
+        patched = respx.patch(SYSTEM_ATTRS).mock(return_value=httpx.Response(200))
+        assert await idrac.clear_os_hostname(IP, "root", "pw") is False
+        assert not patched.called
+
+
+REGISTRY = f"{BASE}{idrac.BIOS_REGISTRY}"
+BIOS = f"{BASE}{idrac.BIOS}"
+BIOS_SETTINGS = f"{BASE}{idrac.BIOS_SETTINGS}"
+
+_REGISTRY_BODY = {"RegistryEntries": {"Attributes": [
+    {"AttributeName": "SysProfile", "DisplayName": "System Profile", "ReadOnly": False,
+     "Value": [{"ValueName": "PerfOptimized", "ValueDisplayName": "Performance Optimized"}]},
+    {"AttributeName": "SysMemSize", "DisplayName": "System Memory Size", "ReadOnly": True, "Value": []},
+]}}
+
+
+class TestBiosComparison:
+    """The BIOS attribute registry is the only bridge between OME's display
+    names and the names Redfish accepts, so getting it wrong means either
+    silently skipping a setting or PATCHing one that does not exist."""
+
+    def _registry(self) -> None:
+        respx.get(REGISTRY).mock(return_value=httpx.Response(200, json=_REGISTRY_BODY))
+
+    @respx.mock
+    async def test_a_display_name_resolves_to_its_redfish_attribute(self):
+        self._registry()
+        respx.get(BIOS).mock(return_value=httpx.Response(200, json={"Attributes": {"SysProfile": "Custom"}}))
+        [compared] = await idrac.compare_bios(IP, "root", "pw", {"System Profile": "PerfOptimized"})
+        assert (compared.attribute_name, compared.actual, compared.intended) == (
+            "SysProfile", "Custom", "PerfOptimized"
+        )
+        assert compared.drifted
+
+    @respx.mock
+    async def test_a_value_given_by_its_display_name_is_translated(self):
+        """OME may report either the value name or its display name; only the
+        value NAME is what Redfish stores, so comparing the raw strings would
+        report drift on a machine that is already correct."""
+        self._registry()
+        respx.get(BIOS).mock(
+            return_value=httpx.Response(200, json={"Attributes": {"SysProfile": "PerfOptimized"}})
+        )
+        [compared] = await idrac.compare_bios(
+            IP, "root", "pw", {"System Profile": "Performance Optimized"}
+        )
+        assert compared.intended == "PerfOptimized" and not compared.drifted
+
+    @respx.mock
+    async def test_an_attribute_the_registry_does_not_know_is_reported_not_dropped(self):
+        """A template built for another firmware names attributes this machine
+        does not have. Dropping them silently would read as 'verified'."""
+        self._registry()
+        respx.get(BIOS).mock(return_value=httpx.Response(200, json={"Attributes": {}}))
+        [compared] = await idrac.compare_bios(IP, "root", "pw", {"Some New Knob": "On"})
+        assert compared.attribute_name is None and not compared.drifted and not compared.verifiable
+
+    @respx.mock
+    async def test_a_read_only_attribute_is_never_drift(self):
+        self._registry()
+        respx.get(BIOS).mock(return_value=httpx.Response(200, json={"Attributes": {"SysMemSize": "1024 GB"}}))
+        [compared] = await idrac.compare_bios(IP, "root", "pw", {"System Memory Size": "512 GB"})
+        assert compared.read_only and not compared.drifted
+
+
+class TestStageBios:
+    @respx.mock
+    async def test_one_patch_stages_the_values_and_creates_the_job(self):
+        """Dell's shape: the SettingsApplyTime is what makes the iDRAC create
+        the config job, and the job comes back in the Location header. Patching
+        attributes alone leaves pending values with nothing to apply them."""
+        respx.get(JOBS).mock(return_value=httpx.Response(200, json={"Members": []}))
+        patched = respx.patch(BIOS_SETTINGS).mock(
+            return_value=httpx.Response(202, headers={"Location": f"{idrac.JOBS}/JID_555"})
+        )
+        assert await idrac.stage_bios_attributes(IP, "root", "pw", {"SysProfile": "PerfOptimized"}) == "JID_555"
+        assert json.loads(patched.calls.last.request.content) == {
+            "@Redfish.SettingsApplyTime": {"ApplyTime": "OnReset"},
+            "Attributes": {"SysProfile": "PerfOptimized"},
+        }
+
+    @respx.mock
+    async def test_a_retry_reuses_the_pending_job_instead_of_queueing_a_second(self):
+        """An iDRAC holds one pending configuration job per controller, so a
+        second would be refused — the same rule stage_storage follows."""
+        respx.get(JOBS).mock(return_value=httpx.Response(200, json={"Members": [
+            {"Id": "JID_111", "Name": "Configure: BIOS.Setup.1-1", "JobState": "Scheduled"},
+        ]}))
+        patched = respx.patch(BIOS_SETTINGS).mock(return_value=httpx.Response(202))
+        assert await idrac.stage_bios_attributes(IP, "root", "pw", {"SysProfile": "X"}) == "JID_111"
+        assert not patched.called
 
 
 BOSS = "AHCI.SL.6-1"
@@ -449,6 +680,59 @@ def _server(server_id: str, name: str, serial: str, state: str = "AVAILABLE", cl
         "reachable": True,
         "openshift": {"lifecycle_state": state, "cluster_name": cluster},
     }
+
+
+class TestTemplateAttributes:
+    """OME reports nested AttributeGroups; the walker flattens them the way
+    Dell's own ome_template.py recurse_subattr_list does."""
+
+    @respx.mock
+    async def test_nested_groups_are_flattened_with_their_display_path(self):
+        _login()
+        respx.get(f"{API}/TemplateService/Templates(25)/AttributeDetails").mock(
+            return_value=httpx.Response(200, json={"AttributeGroups": [
+                {"DisplayName": "iDRAC", "SubAttributeGroups": [
+                    {"DisplayName": "IPv4 Information", "SubAttributeGroups": [], "Attributes": [
+                        {"AttributeId": 7, "DisplayName": "Address", "Value": "10.0.0.5", "IsIgnored": False},
+                    ]},
+                ]},
+                {"DisplayName": "BIOS", "SubAttributeGroups": [
+                    {"DisplayName": "Boot Settings", "SubAttributeGroups": [], "Attributes": [
+                        {"AttributeId": 8, "DisplayName": "Boot Mode", "Value": "Uefi", "IsIgnored": True},
+                    ]},
+                ]},
+            ]})
+        )
+        async with ome.session(OME, "u", "p") as client:
+            attributes = await ome.template_attributes(client, 25)
+        assert [(a.group, a.name, a.is_ignored) for a in attributes] == [
+            ("iDRAC,IPv4 Information", "Address", False),
+            ("BIOS,Boot Settings", "Boot Mode", True),
+        ]
+        assert attributes[0].describe() == "iDRAC,IPv4 Information,Address"
+
+    @respx.mock
+    async def test_a_group_with_no_subgroups_carries_its_attributes_directly(self):
+        _login()
+        respx.get(f"{API}/TemplateService/Templates(25)/AttributeDetails").mock(
+            return_value=httpx.Response(200, json={"AttributeGroups": [
+                {"DisplayName": "System", "SubAttributeGroups": [], "Attributes": [
+                    {"AttributeId": 1, "DisplayName": "Asset Tag", "Value": None, "IsIgnored": False},
+                ]},
+            ]})
+        )
+        async with ome.session(OME, "u", "p") as client:
+            attributes = await ome.template_attributes(client, 25)
+        assert [(a.group, a.name, a.value) for a in attributes] == [("System", "Asset Tag", None)]
+
+    @respx.mock
+    async def test_a_template_with_no_attributes_reads_as_empty(self):
+        _login()
+        respx.get(f"{API}/TemplateService/Templates(25)/AttributeDetails").mock(
+            return_value=httpx.Response(200, json={})
+        )
+        async with ome.session(OME, "u", "p") as client:
+            assert await ome.template_attributes(client, 25) == []
 
 
 class TestServerScan:

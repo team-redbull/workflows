@@ -23,6 +23,10 @@ from temporalio import activity
 from activities.server_provisioning import idrac, ome, server_namer, server_scan
 from shared.exceptions import IdracCredentialsMissingError, TemplateNotConfiguredError
 from shared.models.server_provisioning import (
+    TARGET_CREDENTIAL,
+    BiosStageRequest,
+    BiosVerification,
+    BiosVerifyRequest,
     IdracIdentity,
     IdracJobsRef,
     IdracJobsState,
@@ -35,12 +39,14 @@ from shared.models.server_provisioning import (
     OmeJobState,
     OmeProfile,
     OmeProfileRef,
+    OmeTemplateRef,
     RebootResult,
     ServerNameRequest,
     ServerScanLookup,
     ServerScanState,
     StorageConfigRequest,
     StorageLayout,
+    TemplateContents,
     TemplateDeployRequest,
     TemplateDeployResult,
 )
@@ -62,6 +68,18 @@ def _password(ref: IdracRef) -> str:
 
 def _ome_session():
     return ome.session(_settings.ome_url, _settings.ome_username, _settings.ome_password)
+
+
+def _template_name(model: str, idrac_firmware: str) -> str:
+    """The template DELL_TEMPLATES configures for this machine. No fallback."""
+    by_firmware = _settings.dell_templates.get(model) or {}
+    template_name = by_firmware.get(idrac_firmware)
+    if not template_name:
+        raise TemplateNotConfiguredError(
+            f"DELL_TEMPLATES has no template for {model!r} on iDRAC firmware "
+            f"{idrac_firmware!r} (configured for this model: {sorted(by_firmware) or 'none'})"
+        )
+    return template_name
 
 
 # --- iDRAC -------------------------------------------------------------------
@@ -102,6 +120,66 @@ async def read_idrac_identity(ref: IdracRef) -> IdracIdentity:
         identity.idrac_firmware,
     )
     return identity
+
+
+@activity.defn
+async def set_idrac_root_password(ref: IdracRef) -> bool:
+    """Set root's password to the target one, from whichever it has now."""
+    changed = await idrac.set_root_password(
+        ref.idrac_ip,
+        _settings.idrac_username,
+        _password(ref),
+        _password(IdracRef(idrac_ip=ref.idrac_ip, credential=TARGET_CREDENTIAL)),
+    )
+    activity.logger.info(
+        "iDRAC %s: root %s",
+        ref.idrac_ip,
+        "moved to the target password" if changed else "already on the target password",
+    )
+    return changed
+
+
+@activity.defn
+async def clear_idrac_os_hostname(ref: IdracRef) -> bool:
+    """Blank the machine's OS hostname so OME shows its address, not `Miniwinpc`."""
+    cleared = await idrac.clear_os_hostname(ref.idrac_ip, _settings.idrac_username, _password(ref))
+    if cleared:
+        activity.logger.info("iDRAC %s: OS hostname cleared", ref.idrac_ip)
+    return cleared
+
+
+@activity.defn
+async def verify_bios_configuration(request: BiosVerifyRequest) -> BiosVerification:
+    """What the template meant each BIOS attribute to be, against what it is."""
+    ref = request.idrac
+    compared = await idrac.compare_bios(
+        ref.idrac_ip, _settings.idrac_username, _password(ref), request.intended
+    )
+    drifted = [c.display_name for c in compared if c.drifted]
+    activity.logger.info(
+        "iDRAC %s BIOS: %d checked, %d drifted%s",
+        ref.idrac_ip,
+        len(compared),
+        len(drifted),
+        f" ({', '.join(drifted)})" if drifted else "",
+    )
+    return BiosVerification(compared=compared)
+
+
+@activity.defn
+async def stage_bios_attributes(request: BiosStageRequest) -> str:
+    """Stage BIOS values and queue the job that applies them on the next reset."""
+    ref = request.idrac
+    job_id = await idrac.stage_bios_attributes(
+        ref.idrac_ip, _settings.idrac_username, _password(ref), request.attributes
+    )
+    activity.logger.info(
+        "iDRAC %s: %d BIOS attribute(s) staged as %s",
+        ref.idrac_ip,
+        len(request.attributes),
+        job_id,
+    )
+    return job_id
 
 
 @activity.defn
@@ -186,14 +264,7 @@ async def get_ome_job(ref: OmeJobRef) -> OmeJobState:
 @activity.defn
 async def deploy_ome_template(request: TemplateDeployRequest) -> TemplateDeployResult:
     """Deploy the configured template for (model, iDRAC firmware) to the device."""
-    by_firmware = _settings.dell_templates.get(request.model) or {}
-    template_name = by_firmware.get(request.idrac_firmware)
-    if not template_name:
-        raise TemplateNotConfiguredError(
-            f"DELL_TEMPLATES has no template for {request.model!r} on iDRAC firmware "
-            f"{request.idrac_firmware!r} (configured for this model: "
-            f"{sorted(by_firmware) or 'none'})"
-        )
+    template_name = _template_name(request.model, request.idrac_firmware)
     async with _ome_session() as client:
         template_id = await ome.find_template_id(client, template_name)
         job_id = await ome.deploy_template(client, template_id, template_name, request.device_id)
@@ -205,6 +276,26 @@ async def deploy_ome_template(request: TemplateDeployRequest) -> TemplateDeployR
         f"job {job_id}" if job_id is not None else "already deployed",
     )
     return TemplateDeployResult(template_name=template_name, template_id=template_id, job_id=job_id)
+
+
+@activity.defn
+async def read_ome_template(ref: OmeTemplateRef) -> TemplateContents:
+    """Every attribute the configured template would deploy, for the audit."""
+    template_name = _template_name(ref.model, ref.idrac_firmware)
+    async with _ome_session() as client:
+        template_id = await ome.find_template_id(client, template_name)
+        attributes = await ome.template_attributes(client, template_id)
+    deployable = sum(1 for attribute in attributes if not attribute.is_ignored)
+    activity.logger.info(
+        "Template %s (id %d): %d attribute(s), %d deployed",
+        template_name,
+        template_id,
+        len(attributes),
+        deployable,
+    )
+    return TemplateContents(
+        template_id=template_id, template_name=template_name, attributes=attributes
+    )
 
 
 @activity.defn

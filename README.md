@@ -255,11 +255,16 @@ mid-create leaves the BareMetalHost on the MCE while the lock expires after
    watch — 14 hours, measured — so only the deadline itself distinguished a dead
    host from a slow one.
 
-Its id is `install-server-<infraEnv>_<slot>` — the **candidate pool** plus a
-slot, not the target pair, because the pool is `^ocp-<infraEnv>` with no MCE in
-it. Installs drawing from one pool run in parallel, one per slot (see
+Its id is `add-server-to-mce_<mce>_<infraEnv>_<slot>` — the hub, the
+**candidate pool** and a slot. The MCE is in the id so each hub finds only its own
+runs; the pool itself (`^ocp-<infraEnv>`) has no MCE in it, so two hubs filling an
+InfraEnv of the same name still draw from the same machines, and the install
+lock is what keeps them apart. Installs drawing from one pool run in parallel,
+one per slot (see
 [Several servers at once](#several-servers-at-once--count-or-a-list-of-server_names));
-a named machine's is `install-server-name-<server>`.
+a named machine's is `add-server-to-mce_<mce>_<server>`. The workflow, its queue
+and its route are still `install-server`; runs started before 2026-10-25 keep
+the old `install-server-…` ids.
 
 **The install lock is the guard across MCEs.** server-scan lists a machine
 `AVAILABLE` until a cluster reports it, and the BareMetalHost probe in step 3
@@ -324,7 +329,7 @@ several runs (next sections).
 | server-scan query | `?pattern=^ocp-<infraEnv>&count=<candidate_count>` | `?name=<server>&count=1` |
 | candidates drawn | `candidate_count` (default: runs on the pool + 2, so 3 for a lone install; 1–20) | one |
 | already has a BareMetalHost | **skipped**, next candidate tried | **converged** — that is the point |
-| workflow id | `install-server-<infraEnv>_<slot>`, the first free slot | `install-server-name-<server>` |
+| workflow id | `add-server-to-mce_<mce>_<infraEnv>_<slot>`, the first free slot | `add-server-to-mce_<mce>_<server>` |
 | use it for | routine capacity: take whatever is free and healthy | re-running a specific host, or repairing one |
 
 Both modes apply every other rule identically: `HEALTHY` only, at least two NIC
@@ -380,7 +385,7 @@ pool run or `server_name` for a named one). `count` and `candidate_count` size a
 draw from the pool, so either one with `server_names` is a 422.
 
 **From the pool: slots.** Every run the pool picks for is on a slot,
-`install-server-<infraEnv>_<slot>`. The route walks the slots from `_1` up,
+`add-server-to-mce_<mce>_<infraEnv>_<slot>`. The route walks the slots from `_1` up,
 steps over every slot whose run is still going and starts one in each free slot
 — one without `count`, N with `count: N`. So a second install while the first
 still runs takes `_2` instead of a 409, and a second batch of 5 while the first
@@ -388,7 +393,7 @@ still runs takes `_2` instead of a 409, and a second batch of 5 while the first
 closed run's id). The only 409 left from the pool is all 100 slots running.
 
 **By name: a list of `server_names`.** One run per name, on the same id a single
-named install uses (`install-server-name-<server>`), so a machine is one run
+named install uses (`add-server-to-mce_<mce>_<server>`), so a machine is one run
 however it was asked for: a name already installing reports `already_running`
 rather than being installed twice. One refused start does not stop the others.
 
@@ -726,10 +731,10 @@ would hide which segments actually got a workflow.
   it matches, and a run skips candidates that already have a BareMetalHost.
   Workflow ids are deterministic (`initialize-segment-<network>`,
   `allocate-segment-<TYPE>-<cluster>`, `release-segment-<TYPE>-<cluster>`,
-  `install-server-name-<server>`, `remove-server-<server>`,
+  `add-server-to-mce_<mce>_<server>`, `remove-server-<server>`,
   `uninstall-server-<server>`), so a duplicate trigger while running gets
   HTTP 409. install-server's pool draws are the exception on purpose: each takes
-  a free slot (`install-server-<infraEnv>_<slot>`), and the install lock keeps
+  a free slot (`add-server-to-mce_<mce>_<infraEnv>_<slot>`), and the install lock keeps
   them on different machines.
 
 ## Configuration

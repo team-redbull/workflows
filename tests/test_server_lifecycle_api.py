@@ -84,12 +84,13 @@ def test_a_vlan_is_still_refused(client):
     assert client.post(PATH, json={**BODY, "vlan_id": 24}).status_code == 422
 
 
-SLOT = "install-server-cisco-m6-bat-yam-64c-512gb_{}"
+MCE = BODY["mce_cluster"]
+SLOT = "add-server-to-mce_" + MCE + "_cisco-m6-bat-yam-64c-512gb_{}"
 NAMES = ["ocp-cisco-m6-bat-yam-64c-512gb-WZP1", "ocp-cisco-m6-bat-yam-64c-512gb-WZP2"]
 
 
 def _named_id(name: str) -> str:
-    return f"install-server-name-{name.lower()}"
+    return f"add-server-to-mce_{MCE}_{name.lower()}"
 
 
 def _with_temporal(fake, *, running: set[str], fail_on: str | None = None) -> set[str]:

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from functools import partial
 from typing import Annotated, Any, Literal, TypeVar
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -137,9 +138,9 @@ def _refuse_server_name(data: Any) -> Any:
 
 # Deterministic ids come from shared/workflow_ids.py — the ONE definition per
 # scheme, so the id this route builds and the id anything else builds for the
-# same target can never drift apart: a pool run is on a slot of its InfraEnv
-# (install_server_slot_workflow_id), a named run on its machine
-# (install_server_name_workflow_id).
+# same target can never drift apart: a pool run is on a slot of its InfraEnv on
+# its MCE (install_server_slot_workflow_id), a named run on its machine on its
+# MCE (install_server_name_workflow_id).
 
 
 async def _start(client: Client, run_input: InstallServerInput, workflow_id: str):
@@ -360,14 +361,14 @@ async def start_install_server(
     there is never one run for a batch. The body decides how many:
 
     - **Neither `count` nor `server_names`**: the pool picks ONE server, in
-      the first free slot (`install-server-<infraEnv>_<slot>`), answered with
+      the first free slot (`install-server-<mce>_<infraEnv>_<slot>`), answered with
       `{workflow_id, run_id}`. Slots still running are stepped over, so the
       same request sent again while it installs starts a SECOND install — it
       is never a 409 (only when all 100 slots are busy).
     - **`count: N`**: the pool picks N, installed IN PARALLEL, one per free
       slot, answered with a per-run report. A second request adds N more.
     - **`server_names: "<name>"`**: that one machine
-      (`install-server-name-<server>`), answered with `{workflow_id, run_id}`;
+      (`install-server-<mce>_<server>`), answered with `{workflow_id, run_id}`;
       a 409 while it is already installing.
     - **`server_names: [...]`**: each named machine in parallel, answered with
       a per-run report — always, even for a list of one — in which a machine
@@ -465,7 +466,7 @@ async def _start_named_install(
     client: Client, request: InstallServerRequest, server_name: str
 ) -> StartWorkflowResponse:
     """One named machine, answered as one run: a 409 while it is installing."""
-    workflow_id = install_server_name_workflow_id(server_name)
+    workflow_id = install_server_name_workflow_id(request.mce_cluster, server_name)
     return await _start_one_by_name(
         lambda: _start(client, request.run_input(server_name=server_name), workflow_id),
         workflow_id,
@@ -488,7 +489,7 @@ async def _start_pool_installs(
     for slot in range(1, _MAX_SLOTS + 1):
         if started == count:
             break
-        workflow_id = install_server_slot_workflow_id(request.infra_env, slot)
+        workflow_id = install_server_slot_workflow_id(request.mce_cluster, request.infra_env, slot)
         # Every run on the pool - the busy slots below this one and the ones
         # this request has started - takes one machine from the same top of
         # the list, so each new run needs that many spares, plus its own.
@@ -537,9 +538,11 @@ async def _start_named_installs(
     results = await _start_each_by_name(
         server_names,
         lambda name: _start(
-            client, request.run_input(server_name=name), install_server_name_workflow_id(name)
+            client,
+            request.run_input(server_name=name),
+            install_server_name_workflow_id(request.mce_cluster, name),
         ),
-        install_server_name_workflow_id,
+        partial(install_server_name_workflow_id, request.mce_cluster),
         InstallServerItem,
     )
     return InstallServerBatchResponse(**_count_statuses(results), results=results)

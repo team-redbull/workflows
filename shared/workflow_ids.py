@@ -50,12 +50,35 @@ def allocate_segment_workflow_id(segment_type: SegmentType, cluster: str) -> str
     return f"allocate-segment-{segment_type.value}-{cluster}"
 
 
-def install_server_name_workflow_id(server_name: str) -> str:
-    """`install-server-name-<server>`: an install of ONE NAMED machine.
+# The install run's ids carry the workflow name, then the MCE, then `_` before
+# every further part: `install-server-<mce>_<...>`. The MCE ends at the first
+# `_` because a Kubernetes name cannot contain one, so a hub's runs all sit under
+# `install-server-<mce>_` and never under another hub's, even when one MCE's name
+# extends another's (`ocp4-a`, `ocp4-a-b`). An id is not part of a run's replayed
+# history, so adding the MCE cannot break a run in flight. Runs started before it
+# keep the ids they were started with (`install-server-name-<server>`,
+# `install-server-<infraEnv>_<slot>`); anything that counts runs by id has to look
+# for both until they have closed.
+_INSTALL_SERVER = "install-server"
+
+
+def install_server_name_workflow_id(mce_cluster: str, server_name: str) -> str:
+    """`install-server-<mce>_<server>`: an install of ONE NAMED machine on one MCE.
 
     install-server builds it for every name in `server_names`, one or a list,
     so one machine is one run however it is asked for: a second request for it
-    while it installs is a dedup hit, never a second run.
+    while it installs on that MCE is a dedup hit, never a second run.
+
+    The MCE is in the id so every run on a hub is found under one prefix,
+    `install-server-<mce>_`, and a hub never sees another's runs. Two hubs
+    installing the SAME machine at once are no longer stopped by this id: the
+    server-scan install lock stops the second.
+
+    The MCE is followed by `_` because a Kubernetes name cannot contain it, so
+    where the MCE ends is unambiguous. With `-` after it, the prefix
+    `install-server-ocp4-a-` would also match the runs of an MCE `ocp4-a-b`. A
+    server name with an underscore is not a valid Kubernetes name, so a named id
+    can not equal a pool id (`..._<infraEnv>_<slot>`) either.
 
     That name is LOWERCASED, which is not cosmetic: server-scan names carry an
     uppercase vendor serial, the run lowercases it to build the resource names,
@@ -65,26 +88,30 @@ def install_server_name_workflow_id(server_name: str) -> str:
     exists to prevent. Two different servers cannot collide by lowercasing:
     server-scan names differ by more than case.
     """
-    return f"install-server-name-{server_name.lower()}"
+    return f"{_INSTALL_SERVER}-{mce_cluster}_{server_name.lower()}"
 
 
-def install_server_slot_workflow_id(infra_env: str, slot: int) -> str:
-    """`install-server-<infraEnv>_<slot>`: one of the PARALLEL draws from a pool.
+def install_server_slot_workflow_id(mce_cluster: str, infra_env: str, slot: int) -> str:
+    """`install-server-<mce>_<infraEnv>_<slot>`: one of the PARALLEL draws from a pool.
 
     Every install-server run that lets the pool pick is on a slot: `count: N`
     fills N free ones, and a request without `count` fills one. Keyed on the
-    CANDIDATE POOL plus a slot number, and on neither of the obvious things:
+    HUB, the CANDIDATE POOL and a slot number, and on none of the obvious
+    other things:
 
     Not the machine, because it is not known when the run starts: which server
     gets installed is decided inside the workflow, by asking server-scan.
     Building the id from it would mean acquiring the server in the router
     first — putting the decision the run's outcome depends on outside the run,
-    which is exactly the shape initialize-segment was changed to avoid.
+    which is exactly the shape initialize-segment was changed to avoid. (It
+    also would lose the walk to the next candidate when one is unusable.)
 
-    Not the MCE: the pool a run draws from is `^ocp-<infraEnv>`, with no MCE in
-    it, so two MCEs filling an InfraEnv of the same name share ONE set of
-    slots — which is what lets each new run count every run already drawing
-    from the pool when it sizes its spares.
+    The MCE IS in the id, since 2026-10-25. It was not before, and two MCEs
+    filling an InfraEnv of the same name then shared ONE set of slots: a caller
+    counting the open runs of its own pool counted the other hub's as well, and
+    ordered too few. The slots are still a fixed, enumerable set (`_1`..`_100`),
+    so a controller can ask Temporal about each id directly rather than search
+    for them, and a search lags behind a start.
 
     The id does not stop two runs taking one machine; the install lock does,
     for any number of runs: server-scan takes it by compare-and-set on the
@@ -93,18 +120,16 @@ def install_server_slot_workflow_id(infra_env: str, slot: int) -> str:
     machine (`reserved`) and tries its next candidate. So any number of slots
     may draw from one pool at once and still land on different machines.
 
-    Pool draws used to be serialized on ONE id per pool,
-    `install-server-<infraEnv>`, so a repeated request was a 409: first as the
-    only defence against two runs drawing one machine (before the lock), then
-    only to stop a double-click or a retried POST installing two. Dropped on
-    2026-10-24:
-    its callers are people asking for one more server, and the 409 refused
-    exactly that. Runs started on it before then keep that id.
+    Pool draws used to be serialized on ONE id per pool, so a repeated request
+    was a 409: first as the only defence against two runs drawing one machine
+    (before the lock), then only to stop a double-click or a retried POST
+    installing two. Dropped on 2026-10-24: its callers are people asking for one
+    more server, and the 409 refused exactly that.
 
-    `_` because a Kubernetes name cannot contain it: a slot id can never equal
-    the old id of an InfraEnv whose own name ends in `-<digits>`.
+    `_` follows the MCE and joins the parts after it, for the reason
+    install_server_name_workflow_id gives.
     """
-    return f"install-server-{infra_env}_{slot}"
+    return f"{_INSTALL_SERVER}-{mce_cluster}_{infra_env}_{slot}"
 
 
 def remove_server_workflow_id(server_name: str) -> str:
@@ -127,7 +152,7 @@ def uninstall_server_workflow_id(server_name: str) -> str:
     waiting on one Agent. The `uninstall-` prefix is what keeps it apart from
     the other two ids of the same machine, and both distinctions matter:
 
-      * `install-server-name-<server>` — an install and an uninstall of one
+      * `install-server-<mce>_<server>` — an install and an uninstall of one
         machine are different operations, and refusing one because the other
         once ran (or is running) would be wrong in both directions;
       * `remove-server-<server>` — uninstall-server STARTS that id as its

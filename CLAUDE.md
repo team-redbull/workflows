@@ -843,10 +843,10 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   one machine. The install lock (§4) guards the machine itself, so draws are PARALLEL: a request
   without `count` starts ONE new run and `count` (1-20, on the request ONLY — never in a run's
   input, which is decoded from history) starts `count`, one per SLOT, id
-  `add-server-to-mce_<mce>_<infraEnv>_<slot>` (`_` joins every part: it cannot occur in a Kubernetes
-  name, so MCE `ocp4-a` + InfraEnv `b-c` never equals MCE `ocp4-a-b` + InfraEnv `c`; only the id
-  prefix changed — the workflow type, queue and route are still `install-server`, so a run in flight
-  replays; runs started before keep `install-server-<infraEnv>_<slot>` and
+  `install-server-<mce>_<infraEnv>_<slot>` (`_` follows the MCE and joins the parts after it: it
+  cannot occur in a Kubernetes name, so a hub's runs are all under `install-server-<mce>_` and MCE
+  `ocp4-a` never matches MCE `ocp4-a-b`'s; the id keeps the workflow's name and only gained the MCE —
+  the workflow type, queue and route are unchanged, so a run in flight replays; runs started before keep `install-server-<infraEnv>_<slot>` and
   `install-server-name-<server>`). It walks slots `_1`..`_100`, steps over
   every slot whose run is still RUNNING (WorkflowAlreadyStartedError) and fills free ones, so a
   second request during the first batch adds installs — it used to collide on `_1`..`_N`. A
@@ -861,7 +861,7 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   ONE ROUTE, ONE RUN PER SERVER — never a batch workflow. Named machines are `server_names`: a
   string is one run (`{workflow_id, run_id}`, 409 while it installs), a list (1-20, each once,
   case-insensitively) one run per name with a per-run report, even for a list of one — the reply
-  follows the request's shape. Every named run is on `add-server-to-mce_<mce>_<server>`, so one machine
+  follows the request's shape. Every named run is on `install-server-<mce>_<server>`, so one machine
   is one run however it is asked for. `count` and `candidate_count` size a POOL draw, so either
   next to `server_names` is a 422, never silently ignored. `InstallServerRequest` is therefore its
   OWN model, not an InstallServerInput subclass: one request is many runs, each built by

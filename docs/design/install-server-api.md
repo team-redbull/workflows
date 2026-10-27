@@ -148,19 +148,20 @@ builds the pool id any more. Runs started on it before the change keep it, and
 
 Workflow ids follow two schemes that never overlap:
 
-- `add-server-to-mce_<mce>_<infraEnv>_<slot>` for every run the pool picks, one or
+- `install-server-<mce>_<infraEnv>_<slot>` for every run the pool picks, one or
   `count` of them (`install-server-<infraEnv>_<slot>` before 2026-10-25, and
   `install-server-<infraEnv>`, without a slot, before 2026-10-24);
-- `add-server-to-mce_<mce>_<server>` for a named server, lowercased
+- `install-server-<mce>_<server>` for a named server, lowercased
   (`install-server-name-<server>` before 2026-10-25).
 
-The parts are joined with `_`, which a Kubernetes name cannot contain, so no two
-different (MCE, InfraEnv, slot) triples build the same id. The MCE is in the id so
+The MCE is followed by `_`, which a Kubernetes name cannot contain, so no two
+different (MCE, InfraEnv, slot) triples build the same id and a hub's prefix
+`install-server-<mce>_` never matches the runs of an MCE whose name extends it. The MCE is in the id so
 a hub finds only its own runs; the machines a pool draws from are shared by every
 hub, so a run sizing its spare candidates no longer counts another hub's runs
 (`busy` is per hub) — the install lock, not the id, keeps two hubs off one
-machine. Only the id prefix changed: the workflow type, queue and route are still
-`install-server`, and runs started on the old ids keep them.
+machine. The id keeps the workflow's name and only gained the MCE: the workflow type, queue
+and route are unchanged, and runs started on the old ids keep them.
 
 Machines are guarded by server-scan's install lock (ADR-0035 there):
 

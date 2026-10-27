@@ -322,7 +322,7 @@ class TestWorkflowIdKeysOnTheHubAndTheCandidatePool:
 
     def test_a_pool_id_carries_hub_infraenv_and_slot(self) -> None:
         assert install_server_slot_workflow_id(self.MCE, "dell-r650-tlv-64c-1024gb", 1) == (
-            "add-server-to-mce_ocp4-mce-tlv-01_dell-r650-tlv-64c-1024gb_1"
+            "install-server-ocp4-mce-tlv-01_dell-r650-tlv-64c-1024gb_1"
         )
 
     def test_the_same_infraenv_on_two_mces_gets_different_slots(self) -> None:
@@ -339,22 +339,28 @@ class TestWorkflowIdKeysOnTheHubAndTheCandidatePool:
         )
 
     def test_hyphens_inside_names_cannot_make_two_pools_share_an_id(self) -> None:
-        """Joined with `-`, MCE `ocp4-a` + InfraEnv `b-c` equals MCE `ocp4-a-b` +
-        InfraEnv `c`. The `_` between the parts, which a Kubernetes name cannot
-        contain, is what keeps them apart."""
+        """MCE `ocp4-a` + InfraEnv `b-c` and MCE `ocp4-a-b` + InfraEnv `c` would
+        collide if `-` followed the MCE. The `_` after it, which a Kubernetes
+        name cannot contain, is what keeps them apart."""
         assert install_server_slot_workflow_id("ocp4-a", "b-c", 1) != (
             install_server_slot_workflow_id("ocp4-a-b", "c", 1)
         )
 
+    def test_a_hub_prefix_does_not_match_a_hub_whose_name_extends_it(self) -> None:
+        prefix = "install-server-ocp4-a_"
+        assert install_server_slot_workflow_id("ocp4-a", "ie", 1).startswith(prefix)
+        assert not install_server_slot_workflow_id("ocp4-a-b", "ie", 1).startswith(prefix)
+        assert not install_server_name_workflow_id("ocp4-a-b", "ocp-x").startswith(prefix)
+
     def test_every_run_of_a_hub_is_under_one_prefix(self) -> None:
-        prefix = f"add-server-to-mce_{self.MCE}_"
+        prefix = f"install-server-{self.MCE}_"
         assert install_server_slot_workflow_id(self.MCE, "ie", 3).startswith(prefix)
         assert install_server_name_workflow_id(self.MCE, "ocp-dell-x").startswith(prefix)
 
     def test_a_named_server_gets_its_own_id(self) -> None:
         # Naming a machine draws from a pool of one, so it does not take a slot.
         by_name = install_server_name_workflow_id(self.MCE, "ocp-dell-x")
-        assert by_name == "add-server-to-mce_ocp4-mce-tlv-01_ocp-dell-x"
+        assert by_name == "install-server-ocp4-mce-tlv-01_ocp-dell-x"
         assert by_name != install_server_slot_workflow_id(
             self.MCE, "dell-r650-tlv-64c-1024gb", 1
         )

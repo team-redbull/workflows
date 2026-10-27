@@ -361,14 +361,14 @@ async def start_install_server(
     there is never one run for a batch. The body decides how many:
 
     - **Neither `count` nor `server_names`**: the pool picks ONE server, in
-      the first free slot (`add-server-to-mce_<mce>_<infraEnv>_<slot>`), answered with
+      the first free slot (`install-server-<mce>_<infraEnv>_<slot>`), answered with
       `{workflow_id, run_id}`. Slots still running are stepped over, so the
       same request sent again while it installs starts a SECOND install — it
       is never a 409 (only when all 100 slots are busy).
     - **`count: N`**: the pool picks N, installed IN PARALLEL, one per free
       slot, answered with a per-run report. A second request adds N more.
     - **`server_names: "<name>"`**: that one machine
-      (`add-server-to-mce_<mce>_<server>`), answered with `{workflow_id, run_id}`;
+      (`install-server-<mce>_<server>`), answered with `{workflow_id, run_id}`;
       a 409 while it is already installing.
     - **`server_names: [...]`**: each named machine in parallel, answered with
       a per-run report — always, even for a list of one — in which a machine

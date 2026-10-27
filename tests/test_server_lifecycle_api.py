@@ -85,12 +85,12 @@ def test_a_vlan_is_still_refused(client):
 
 
 MCE = BODY["mce_cluster"]
-SLOT = "add-server-to-mce_" + MCE + "_cisco-m6-bat-yam-64c-512gb_{}"
+SLOT = "install-server-" + MCE + "_cisco-m6-bat-yam-64c-512gb_{}"
 NAMES = ["ocp-cisco-m6-bat-yam-64c-512gb-WZP1", "ocp-cisco-m6-bat-yam-64c-512gb-WZP2"]
 
 
 def _named_id(name: str) -> str:
-    return f"add-server-to-mce_{MCE}_{name.lower()}"
+    return f"install-server-{MCE}_{name.lower()}"
 
 
 def _with_temporal(fake, *, running: set[str], fail_on: str | None = None) -> set[str]:

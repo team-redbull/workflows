@@ -915,3 +915,18 @@ class StorageNotConvergedError(OrchestratorError):
 class ServerNameNotAppliedError(OrchestratorError):
     """WORKFLOW-RAISED. The OME profile never carried a name matching the
     convention for this machine (region and service tag included) in time."""
+
+
+# --- cluster-upgrade --------------------------------------------------------
+
+
+class UpgradePathRefusedError(OrchestratorError):
+    """WORKFLOW-RAISED. No upgrade path exists that the ladder rules allow.
+
+    Raised by the path resolver before anything is committed, so nothing was
+    changed. The message says which rule refused it: a downgrade, a minor with
+    no ladder rung, a NodePool already newer than its control plane or further
+    behind it than maxWorkerSkew, or a release spelled in a form the chart does
+    not render. Fix the ladder (day1 `upgrade/ladder.yaml`) or the request,
+    then start a new run.
+    """

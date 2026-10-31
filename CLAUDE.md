@@ -76,7 +76,8 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   Brain push tokens), and per MCE `cluster-upgrade` (the workflow ServiceAccount) and
   `upgrade-agent` (no Kubernetes credential at all: it POSTs to the upgrade agent service, our own
   service in its own repo, run as a kubernetes-sigs agent-sandbox `Sandbox` in the MCE; the
-  service vendors the agent contract, `tests/test_upgrade_agent_contract.py` keeps the two equal). Each limb gets its OWN interface module
+  service vendors the agent contract, `tests/test_upgrade_agent_contract.py` keeps the two equal).
+  The hub limb, `activities/upgrade_gitops/`, holds no Kubernetes credential either (§4). Each limb gets its OWN interface module
   (`shared/interfaces/{upgrade_gitops,cluster_upgrade,upgrade_agent}.py`), so the contract test
   still pairs one interface module with one `activities/<limb>/activities.py`; the domain keeps
   one models module and one `workflow_domains/cluster_upgrade/`. The MCE limb is
@@ -604,7 +605,23 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   queue and `SegmentConversionConflictError`). The per-type things that remain are all about an
   ALLOCATION: the allocate id, the SM's (cluster, site, type) idempotency, the DHCP exclusion policy.
 - **The day1 values repo is reached by git subprocess** (`DAY1_REPO_URL`), never a Python git
-  dependency — see §5.
+  dependency — see §5. ONE git client, `activities/git_repo.py`, shared by segment-lifecycle
+  (`values_repo.py` keeps its own names for it) and the cluster-upgrade hub limb.
+- **The cluster-upgrade hub limb (`upgrade-gitops-worker`) works on `main` only**: Argo CD
+  renders nothing else. It reads the rules after day1's own `scripts/validate_upgrade_rules.py`
+  passed them, and a cluster file the way the hostedclusters-setup chart renders it — the value
+  layers merged as Helm does, the HostedCluster `openshift-<clusterName>` in `hcp-<clusterName>`
+  (`clusterName` the file's own, else its name minus `ocp4-`), NodePools `.name` else
+  `<clusterName>-<infraEnv>` — every duplicate a `problems` line, never an exception. A commit edits
+  ONLY its key lines as text, re-parses, and refuses (`Day1ChangeRejectedError`) unless only those
+  keys moved and the file now renders what was asked; "already so" is checked BEFORE the blob
+  compare-and-set, or a retry would read its own landed push as someone else's edit
+  (`Day1FileChangedError`). `DAY1_VALIDATE_COMMAND` runs in the clone first; a rejected push is
+  retried from a fresh clone, never forced. Releases are pinned over the registry v2 API and
+  checked with `oc adm release info` (the image carries `oc`): a gap is reported, an outage or a
+  refused credential on the release repo is the retryable `ReleaseRegistryError`. No
+  `DAY2_REPO_URL` / `BRAIN_REPO_URL` is a `note` in the result, never an error, so a lab runs
+  without them; a Brain page its validator refuses is not pushed, and the run is told.
 - **allocate-segment writes to the BRANCH THE RUN NAMES, and ends at the push.** Until a
   create-cluster workflow exists, allocate-segment is a step INSIDE the day1 values repo's GitLab
   pipeline, which runs only on non-`main` branches: a human pushes a temp branch with the new

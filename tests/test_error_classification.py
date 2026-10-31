@@ -266,3 +266,45 @@ class TestTheClusterUpgradeMceLimbsErrors:
         listed = set(RETRY_POLICY.non_retryable_error_types or [])
         assert self._PERMANENT <= listed
         assert not self._WAITED_ON & listed
+
+
+class TestTheUpgradeHubLimbsErrors:
+    """Every shared error the hub limb raises is either permanent for cluster-upgrade or retried on purpose.
+
+    The domain's activities retry without bound (dispatch.RETRY_POLICY), so an
+    error neither listed nor meant to be retried would leave a run RUNNING on a
+    failure no retry can fix.
+    """
+
+    # Retried by design: an outage, a rejected push, a registry credential being
+    # fixed. A missing `main` (ValuesBranchNotFoundError) is retried too: failing
+    # the run would strand an upgrade mid-way over something a person repairs.
+    RETRIED = {"ValuesRepoGitError", "ValuesBranchNotFoundError", "ReleaseRegistryError"}
+
+    def _raised(self) -> set[str]:
+        root = pathlib.Path(__file__).resolve().parent.parent / "activities"
+        modules = [*sorted((root / "upgrade_gitops").glob("*.py")), root / "git_repo.py"]
+        names = set()
+        for module in modules:
+            for node in ast.walk(ast.parse(module.read_text())):
+                call = node.exc if isinstance(node, ast.Raise) else node.value if isinstance(node, ast.Return) else None
+                if isinstance(call, ast.Call) and isinstance(call.func, ast.Name):
+                    names.add(call.func.id)
+        return {name for name in names if isinstance(getattr(exceptions, name, None), type)}
+
+    def test_each_is_permanent_or_retried_on_purpose(self):
+        from workflow_domains.cluster_upgrade.dispatch import PERMANENT_ACTIVITY_ERRORS
+
+        permanent = {error.__name__ for error in PERMANENT_ACTIVITY_ERRORS}
+        raised = self._raised()
+        assert raised, "the scan found no shared error raised by the hub limb"
+        assert raised <= permanent | self.RETRIED, sorted(raised - permanent - self.RETRIED)
+        assert not self.RETRIED & permanent
+
+    def test_the_hub_limbs_permanent_errors_are_all_listed(self):
+        from workflow_domains.cluster_upgrade.dispatch import PERMANENT_ACTIVITY_ERRORS
+
+        assert {
+            "UpgradeRulesInvalidError", "ClusterFileNotFoundError", "AmbiguousClusterFileError",
+            "Day1FileChangedError", "Day1ChangeRejectedError",
+        } <= {error.__name__ for error in PERMANENT_ACTIVITY_ERRORS}

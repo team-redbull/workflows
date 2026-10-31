@@ -267,6 +267,37 @@ jobs:
           push: true
           tags: ghcr.io/${{ github.repository_owner }}/cluster-upgrade-worker:${{ steps.tag.outputs.tag }}
 
+  build-upgrade-gitops-worker:
+    # The cluster-upgrade HUB limb (activities/upgrade_gitops/: git, oc, the registry).
+    # IMAGE ONLY, NO CHART BUMP, for the reason the upgrade-agent job above gives: its
+    # chart is deploy/charts/upgrade-gitops-worker/ here, not yet vendored in
+    # redbull-platform, so the shared workflow's bump would fail. Publishes
+    # ghcr.io/<owner>/upgrade-gitops-worker:<branch-slug>-<short sha>; the tag is set by
+    # hand until the chart moves there, then this joins the reusable workflow's chain.
+    needs: changes
+    if: ${{ needs.changes.outputs.limb == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - id: tag
+        run: |
+          slug="$(echo "${GITHUB_REF_NAME}" | tr -c 'a-zA-Z0-9' '-' | tr 'A-Z' 'a-z' | sed 's/-\+/-/g; s/^-//; s/-$//')"
+          echo "tag=${slug}-$(git rev-parse --short HEAD)" >> "${GITHUB_OUTPUT}"
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: activities/upgrade_gitops/Dockerfile
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/upgrade-gitops-worker:${{ steps.tag.outputs.tag }}
+
   cleanup-workflow-brain-on-delete:
     if: github.event_name == 'delete'
     uses: team-redbull/.github/.github/workflows/ghcr-cleanup-on-delete.yml@main
@@ -300,6 +331,13 @@ jobs:
     uses: team-redbull/.github/.github/workflows/ghcr-cleanup-on-delete.yml@main
     with:
       image-name: upgrade-agent-worker
+    secrets: inherit
+
+  cleanup-upgrade-gitops-worker-on-delete:
+    if: github.event_name == 'delete'
+    uses: team-redbull/.github/.github/workflows/ghcr-cleanup-on-delete.yml@main
+    with:
+      image-name: upgrade-gitops-worker
     secrets: inherit
 
   cleanup-workflows-docs-on-delete:

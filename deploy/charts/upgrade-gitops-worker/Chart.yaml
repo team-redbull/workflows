@@ -1,0 +1,11 @@
+apiVersion: v2
+name: upgrade-gitops-worker
+description: >-
+  The cluster-upgrade HUB limb, one release on the hub. It polls
+  upgrade-gitops-activity and does the upgrade's git and registry work: reads
+  the day1 upgrade rules and cluster files, commits each step to day1 main,
+  pins releases to digests in the release registry, checks day2's version
+  layers and writes agent verdicts to Brain. It touches no Kubernetes API.
+type: application
+version: 0.1.0
+appVersion: "v1.0.0"

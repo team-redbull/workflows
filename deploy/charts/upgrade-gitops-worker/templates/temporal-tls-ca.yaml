@@ -1,0 +1,19 @@
+{{- if .Values.temporal.tls.enabled }}
+{{- if not .Values.temporal.host }}
+{{- fail "temporal.tls.enabled needs temporal.host: TLS is configured with the endpoint it is for" }}
+{{- end }}
+{{- if not .Values.temporal.tls.caCert }}
+{{- fail "temporal.tls.caCert is required when temporal.tls.enabled: the CA that signed the frontend's certificate" }}
+{{- end }}
+# The CA the worker verifies the Temporal endpoint against. Public data,
+# hence a ConfigMap; mounted as a file because the SDK reads it once at start.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "ugw.fullname" . }}-temporal-ca
+  labels:
+    {{- include "ugw.labels" . | nindent 4 }}
+data:
+  ca.crt: |
+    {{- .Values.temporal.tls.caCert | trim | nindent 4 }}
+{{- end }}

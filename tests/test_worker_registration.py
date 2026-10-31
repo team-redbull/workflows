@@ -30,6 +30,7 @@ _WORKERS = {
     "server_lifecycle_activity_queue": "activities/server_lifecycle/worker_init.py",
     "SERVER_PROVISIONING_ACTIVITY_QUEUE": "activities/server_provisioning/worker_init.py",
     "upgrade_agent_activity_queue": "activities/upgrade_agent/worker_init.py",
+    "UPGRADE_GITOPS_ACTIVITY_QUEUE": "activities/upgrade_gitops/worker_init.py",
 }
 
 # the workflow modules that dispatch activities, and the interface module each
@@ -349,3 +350,38 @@ def test_the_agent_call_lands_on_the_upgrade_agent_worker():
     ]
     assert started == [("invoke_upgrade_agent", "upgrade_agent_activity_queue")]
     assert "invoke_upgrade_agent" in _registered_activities(_WORKERS["upgrade_agent_activity_queue"])
+
+
+def _sent_to_the_hub(relative: str) -> set[str]:
+    """Activities a cluster-upgrade module hands to dispatch.on_hub, its one route to the hub limb."""
+    return {
+        node.args[0].id
+        for node in ast.walk(_tree(relative))
+        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "on_hub"
+        and node.args and isinstance(node.args[0], ast.Name)
+    }
+
+
+def test_every_activity_sent_to_the_hub_is_registered_on_the_hub_worker():
+    """cluster-upgrade reaches UPGRADE_GITOPS_ACTIVITY_QUEUE only through on_hub, which _dispatched cannot follow."""
+    dispatch = _tree("workflow_domains/cluster_upgrade/dispatch.py")
+    on_hub = next(n for n in ast.walk(dispatch) if isinstance(n, ast.AsyncFunctionDef) and n.name == "on_hub")
+    queues = {
+        keyword.value.id
+        for node in ast.walk(on_hub) if isinstance(node, ast.Call)
+        for keyword in node.keywords if keyword.arg == "task_queue"
+    }
+    assert queues == {"UPGRADE_GITOPS_ACTIVITY_QUEUE"}
+
+    modules = sorted(str(p.relative_to(REPO)) for p in (REPO / "workflow_domains/cluster_upgrade").glob("*.py"))
+    sent = set().union(*(_sent_to_the_hub(module) for module in modules))
+    registered = _registered_activities(_WORKERS["UPGRADE_GITOPS_ACTIVITY_QUEUE"])
+    assert sent, "no cluster-upgrade module sends anything to the hub"
+    assert sent <= registered, sorted(sent - registered)
+    # And the worker registers the hub's whole interface, nothing more.
+    import shared.interfaces.upgrade_gitops as hub_interface
+
+    interface = {
+        name for name, value in vars(hub_interface).items() if hasattr(value, "__temporal_activity_definition")
+    }
+    assert registered == interface

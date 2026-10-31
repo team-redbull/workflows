@@ -48,6 +48,15 @@ class TestUpgradeable:
         assert fields == {"cluster_version_upgradeable": True, "upgradeable_reason": None,
                           "upgradeable_message": None, "upgradeable_reasons": []}
 
+    def test_the_same_cluster_acked_and_installed_is_upgradeable(self):
+        # Live, after the ack and the install: the 4.19 CVO removes Upgradeable when
+        # nothing blocks, and HyperShift said ClusterVersionUpgradeable=True FromClusterVersion.
+        completed = _fixture("clusterversion-4.19.53-completed.json")
+        assert "Upgradeable" not in [c["type"] for c in completed["status"]["conditions"]]
+        assert upgrade_state.upgradeable(completed)["cluster_version_upgradeable"] is True
+        assert (completed["status"]["history"][0]["version"], completed["status"]["history"][0]["state"]) == ("4.19.53", "Completed")
+        assert upgrade_state.admin_ack_required(completed) is None
+
     def test_one_reason_sits_on_the_aggregate_alone(self):
         fields = upgrade_state.upgradeable(_cv(_cond("Upgradeable", "False", "AdminAckRequired", "ack it")))
         assert fields["upgradeable_reasons"] == ["AdminAckRequired"]

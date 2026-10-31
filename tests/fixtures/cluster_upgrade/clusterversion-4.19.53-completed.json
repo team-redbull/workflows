@@ -1,0 +1,69 @@
+{
+  "apiVersion": "config.openshift.io/v1",
+  "kind": "ClusterVersion",
+  "metadata": {
+    "name": "version"
+  },
+  "spec": {
+    "clusterID": "00000000-0000-0000-0000-000000000000"
+  },
+  "status": {
+    "conditions": [
+      {
+        "lastTransitionTime": "2026-10-31T11:18:15Z",
+        "message": "The update channel has not been configured.",
+        "reason": "NoChannel",
+        "status": "False",
+        "type": "RetrievedUpdates"
+      },
+      {
+        "lastTransitionTime": "2026-10-31T11:18:15Z",
+        "message": "Capabilities match configured spec",
+        "reason": "AsExpected",
+        "status": "False",
+        "type": "ImplicitlyEnabledCapabilities"
+      },
+      {
+        "lastTransitionTime": "2026-10-31T11:18:15Z",
+        "message": "Payload loaded version=\"4.19.53\" image=\"quay.io/openshift-release-dev/ocp-release@sha256:ceea7abb1ba4451655fafa0b68f575fe08027b9d31a2c69b2d11480252b8a2f9\" architecture=\"amd64\"",
+        "reason": "PayloadLoaded",
+        "status": "True",
+        "type": "ReleaseAccepted"
+      },
+      {
+        "lastTransitionTime": "2026-10-31T12:22:30Z",
+        "message": "Done applying 4.19.53",
+        "status": "True",
+        "type": "Available"
+      },
+      {
+        "lastTransitionTime": "2026-10-31T12:22:30Z",
+        "status": "False",
+        "type": "Failing"
+      },
+      {
+        "lastTransitionTime": "2026-10-31T12:22:30Z",
+        "message": "Cluster version is 4.19.53",
+        "status": "False",
+        "type": "Progressing"
+      }
+    ],
+    "desired": {
+      "image": "quay.io/openshift-release-dev/ocp-release@sha256:ceea7abb1ba4451655fafa0b68f575fe08027b9d31a2c69b2d11480252b8a2f9",
+      "url": "https://access.redhat.com/errata/RHSA-2026:89655",
+      "version": "4.19.53"
+    },
+    "history": [
+      {
+        "completionTime": "2026-10-31T12:22:30Z",
+        "image": "quay.io/openshift-release-dev/ocp-release@sha256:ceea7abb1ba4451655fafa0b68f575fe08027b9d31a2c69b2d11480252b8a2f9",
+        "startedTime": "2026-10-31T11:18:15Z",
+        "state": "Completed",
+        "verified": false,
+        "version": "4.19.53"
+      }
+    ],
+    "observedGeneration": 1,
+    "versionHash": "qmASEm0sKIA="
+  }
+}

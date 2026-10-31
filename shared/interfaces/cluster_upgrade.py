@@ -68,7 +68,11 @@ async def read_argo_application(request: HostedClusterRequest) -> ArgoApplicatio
 
 @activity.defn
 async def read_hosted_health(request: HostedHealthRequest) -> HostedHealth:
-    """Through the hosted cluster's admin kubeconfig (the existing workflow-path pattern)."""
+    """Through the hosted cluster's admin kubeconfig (the existing workflow-path pattern).
+
+    A hosted API it cannot read — unreachable, or an admin kubeconfig it
+    cannot use (none published, 403, TLS) — is `reachable: False`, never raised.
+    """
     ...
 
 
@@ -80,7 +84,8 @@ async def read_admin_acks(request: AdminAckRequest) -> AdminAckState:
     found, the CVO's UpgradeableAdminAckRequired message, and one ApiUsage per
     (API, user, user agent) from the APIRequestCount `status.last24h`. An API
     with no APIRequestCount was not called. Through the hosted cluster's admin
-    kubeconfig (the existing workflow-path pattern).
+    kubeconfig (the existing workflow-path pattern); a hosted API it cannot
+    read is `reachable: False`, as in read_hosted_health.
     """
     ...
 
@@ -90,8 +95,8 @@ async def give_admin_ack(request: GiveAdminAckRequest) -> AdminAckGiven:
     """Merge `data.<gate>: "true"` into the hosted cluster's openshift-config/admin-acks.
 
     Only that one key, and only for a gate the hosted admin-gates holds; reads
-    it back before returning. Idempotent: an ack already "true" is
-    `changed: False`.
+    it back before returning (AdminAckNotAppliedError, retried, when it does
+    not). Idempotent: an ack already "true" is `changed: False`.
     """
     ...
 
@@ -103,7 +108,9 @@ async def sync_argo_application(request: ArgoSyncRequest) -> ArgoSyncResult:
     A multi-source Application is synced with `revision` in its day1 values
     source (`ref: values`) and its other sources at the revisions Argo CD
     last compared. Raises ArgoSyncRefusedError (permanent) when anything
-    outside `allowed_out_of_sync` is out of sync.
+    outside `allowed_out_of_sync` is out of sync, or the Application is gone;
+    ArgoOperationInProgressError (retried) while another Argo CD operation
+    holds it — nothing is asked over one.
     """
     ...
 
@@ -148,8 +155,10 @@ async def watch_nodepool_gate(request: NodePoolGateRequest) -> GateOutcome:
 async def collect_evidence(request: EvidenceRequest) -> EvidenceBundle:
     """Read-only evidence for the agent: conditions, operators, events, Argo, data plane.
 
-    For a NodePool also its drain: cordoned nodes, the pods left on them, the
-    PDBs covering those pods, and the hosted-cluster-config-operator's drainer lines.
+    For a NodePool also its drain: cordoned nodes, the pods a drain still has
+    to move off them with their state, and the PDBs in those pods' namespaces
+    with disruptionsAllowed and healthy counts. No pod logs are read (the limb
+    has no `pods/log`), so no hosted-cluster-config-operator drainer lines.
     """
     ...
 
@@ -159,5 +168,7 @@ async def execute_proposed_action(request: ProposedActionRequest) -> ActionResul
     """Run one approved tier-2 action with the workflow's identity, through the typed catalog.
 
     Raises ProposedActionRefusedError (permanent) for a kind not in the catalog.
+    A Job it creates carries which request made it; one of that name that
+    another request made is reported (`executed: False`), never claimed.
     """
     ...

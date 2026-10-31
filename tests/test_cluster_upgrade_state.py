@@ -609,3 +609,110 @@ class TestTheNodePoolGate:
         outcome = self._run([(0, bad), (80, good), (90, good)])
         (soak,) = outcome.failing_checks
         assert (soak.name, soak.observed) == ("soak", "passing for 10 min")
+
+
+def _data_plane_pod(name, phase, ready, namespace="openshift-image-registry", **status):
+    return {"metadata": {"name": name, "namespace": namespace}, "spec": {"nodeName": "w-1"},
+            "status": {"phase": phase, "conditions": [{"type": "Ready", "status": ready}], **status}}
+
+
+class TestTheDataPlanePods:
+    def test_a_finished_pod_is_not_reported_not_ready(self):
+        """Every image-pruner run leaves a Succeeded pod, which is never Ready (reason PodCompleted)."""
+        completed = _data_plane_pod("image-pruner-29365920-abcde", "Succeeded", "False", containerStatuses=[
+            {"name": "image-pruner", "ready": False, "state": {"terminated": {"reason": "Completed", "exitCode": 0}}}])
+        assert upgrade_state.pod_state(completed) == "Succeeded"
+        assert upgrade_state.pods_not_ready([completed]) == []
+
+    def test_running_and_ready_is_skipped_and_everything_else_listed(self):
+        pods = [
+            _data_plane_pod("registry-1", "Running", "True"),
+            _data_plane_pod("registry-2", "Running", "False"),
+            _data_plane_pod("image-pruner-1", "Failed", "False"),
+            _data_plane_pod("router-1", "Running", "False", namespace="openshift-ingress", containerStatuses=[
+                {"name": "router", "state": {"waiting": {"reason": "CrashLoopBackOff"}}}]),
+        ]
+        assert upgrade_state.pods_not_ready(pods) == [
+            "openshift-image-registry/image-pruner-1 (Failed, not Ready) on w-1",
+            "openshift-image-registry/registry-2 (Running, not Ready) on w-1",
+            "openshift-ingress/router-1 (CrashLoopBackOff) on w-1",
+        ]
+
+
+class TestTheReadingsTheApiModulesUse:
+    """Field readings the fetching modules ask for, kept here with every other reading."""
+
+    def test_the_nodepools_of_a_hostedcluster_are_by_its_own_name(self):
+        nodepools = [{"metadata": {"name": "a"}, "spec": {"clusterName": "openshift-herzi"}},
+                     {"metadata": {"name": "b"}, "spec": {"clusterName": "openshift-herzi"}},
+                     {"metadata": {"name": "stray"}, "spec": {"clusterName": "herzi"}}]
+        assert [np["metadata"]["name"] for np in upgrade_state.nodepools_of(nodepools, "openshift-herzi")] == ["a", "b"]
+        assert [np["metadata"]["name"] for np in upgrade_state.nodepools_of(nodepools, "openshift-herzi", "b")] == ["b"]
+
+    def test_the_machineset_configs(self):
+        machine_set = {"metadata": {"annotations": {upgrade_state.TARGET_CONFIG_ANNOTATION: "t",
+                                                    upgrade_state.CURRENT_CONFIG_ANNOTATION: "c"}}}
+        assert upgrade_state.machine_set_configs(machine_set) == ("t", "c")
+        assert upgrade_state.machine_set_configs(None) == (None, None)
+
+    def test_a_failed_job(self):
+        assert upgrade_state.job_failed({"status": {"conditions": [_cond("Failed", "True")]}})
+        assert not upgrade_state.job_failed({"status": {"conditions": [_cond("Complete", "True")]}})
+        assert not upgrade_state.job_failed({"status": {}})
+
+    def test_pods_are_read_only_where_a_customer_pdb_is_at_zero(self):
+        pdbs = [{"metadata": {"namespace": "shop"}, "status": {"disruptionsAllowed": 0}},
+                {"metadata": {"namespace": "bank"}, "status": {"disruptionsAllowed": 1}},
+                {"metadata": {"namespace": "openshift-console"}, "status": {"disruptionsAllowed": 0}}]
+        # A platform PDB at 0 is not blocking_pdbs' to judge, so its Pods are not read.
+        assert upgrade_state.blocking_pdb_namespaces(pdbs) == ["shop"]
+
+    def test_endpoints_are_read_only_where_a_webhook_s_service_lives(self):
+        configurations = [{"webhooks": [{"clientConfig": {"service": {"namespace": "kyverno", "name": "svc"}}},
+                                        {"clientConfig": {"url": "https://x"}}]}]
+        assert upgrade_state.webhook_service_namespaces(configurations) == ["kyverno"]
+
+    def test_a_gate_held_and_acked(self):
+        assert upgrade_state.gate_held({"data": {GATE: "msg"}}, GATE) and not upgrade_state.gate_held(None, GATE)
+        assert upgrade_state.acked({"data": {GATE: "true"}}, GATE)
+        assert not upgrade_state.acked({"data": {GATE: "false"}}, GATE) and not upgrade_state.acked(None, GATE)
+
+    def test_a_job_is_annotated_with_exactly_these(self):
+        ours = {"workflows.redbull/request": "abc"}
+        assert upgrade_state.annotated_with({"metadata": {"annotations": {**ours, "other": "x"}}}, ours)
+        assert not upgrade_state.annotated_with({"metadata": {"annotations": {"workflows.redbull/request": "def"}}}, ours)
+        assert not upgrade_state.annotated_with({"metadata": {}}, ours)
+        assert not upgrade_state.annotated_with({"metadata": {"annotations": {}}}, {})
+
+
+class TestAnotherArgoOperation:
+    """Argo CD 3.1: `operation` set = asked for, not ended; the controller clears it when it ends."""
+
+    def test_none_and_our_own_are_not_another(self):
+        assert upgrade_state.other_operation({"status": {}}, "sha1") is None
+        assert upgrade_state.other_operation({"operation": {"sync": {"revision": "sha1"}}, "status": {}}, "sha1") is None
+        running_ours = {"status": {"operationState": {"phase": "Running", "operation": {"sync": {"revision": "sha1"}}}}}
+        assert upgrade_state.other_operation(running_ours, "sha1") is None
+        # A finished operation for another revision holds nothing.
+        done = {"status": {"operationState": {"phase": "Succeeded", "operation": {"sync": {"revision": "sha0"}}}}}
+        assert upgrade_state.other_operation(done, "sha1") is None
+
+    def test_one_asked_or_running_for_another_revision_is(self):
+        asked = {"operation": {"initiatedBy": {"username": "alice"}, "sync": {"revision": "sha0"}}, "status": {}}
+        assert upgrade_state.other_operation(asked, "sha1") == (
+            "an operation by alice for day1 revision sha0 is pending or running")
+        auto = {"operation": {"initiatedBy": {"automated": True}, "sync": {"revision": "sha0"}}, "status": {}}
+        assert "an auto-sync" in upgrade_state.other_operation(auto, "sha1")
+        running = {"status": {"operationState": {"phase": "Running", "operation": {"sync": {"revision": "sha0"}}}}}
+        assert upgrade_state.other_operation(running, "sha1") == "an operation for day1 revision sha0 is Running"
+
+    def test_requested_and_message(self):
+        assert upgrade_state.operation_requested({"operation": {"sync": {}}})
+        assert not upgrade_state.operation_requested({"status": {}}) and not upgrade_state.operation_requested(None)
+        assert upgrade_state.operation_message({"status": {"operationState": {"message": "boom"}}}) == "boom"
+        assert upgrade_state.operation_message(None) == ""
+
+    def test_the_ask_carries_the_resource_version_read(self):
+        app = {"metadata": {"resourceVersion": "42"}, "status": {}}
+        assert upgrade_state.sync_operation(app, "sha1", "w")["metadata"] == {"resourceVersion": "42"}
+        assert "metadata" not in upgrade_state.sync_operation({"status": {}}, "sha1", "w")

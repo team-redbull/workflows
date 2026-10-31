@@ -852,9 +852,10 @@ class EvidenceBundle(BaseModel):
 
     `sections` maps a heading ("hostedcluster", "nodepools", "clusteroperators",
     "events", "argo", "data-plane") to its rendered text. For a NodePool, also
-    "drain": its cordoned nodes, the pods still on them with their state, the
-    PodDisruptionBudgets covering those pods with disruptionsAllowed, and the
-    hosted-cluster-config-operator's last `drainer` lines (D17).
+    "drain": its cordoned nodes, the pods a drain still has to move off them
+    with their state, and the PodDisruptionBudgets in those pods' namespaces
+    with disruptionsAllowed and healthy counts (D17). No pod logs: the limb
+    reads none, so no hosted-cluster-config-operator `drainer` lines.
     """
 
     sections: dict[str, str] = Field(default_factory=dict)

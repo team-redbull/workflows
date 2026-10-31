@@ -15,7 +15,7 @@ import json
 from datetime import datetime, timedelta
 from typing import Any
 
-from activities.server_lifecycle.hosted_resources import pod_to_evict
+from activities.server_lifecycle.hosted_resources import node_ready, pod_to_evict
 from shared.models.cluster_upgrade import (
     AdminAckState,
     ApiUsage,
@@ -94,6 +94,17 @@ def nodepool_state(nodepool: dict[str, Any]) -> NodePoolState:
     )
 
 
+def nodepools_of(
+    nodepools: list[dict[str, Any]], hosted_cluster: str | None, only: str | None = None
+) -> list[dict[str, Any]]:
+    """The NodePools whose `spec.clusterName` is the HostedCluster's name (not the day1 file's); just `only` when named."""
+    return [
+        np for np in nodepools
+        if (np.get("spec") or {}).get("clusterName") == hosted_cluster
+        and (only is None or (np.get("metadata") or {}).get("name") == only)
+    ]
+
+
 def hosted_cluster_state(
     hosted_cluster: dict[str, Any] | None, nodepools: list[dict[str, Any]]
 ) -> HostedClusterState:
@@ -115,10 +126,7 @@ def hosted_cluster_state(
         progressing=None if progressing is None else progressing.get("status") == "True",
         conditions={c["type"]: str(c.get("status")) for c in _conditions(hosted_cluster) if c.get("type")},
         image_content_mirrors=mirrors,
-        nodepools=sorted(
-            (nodepool_state(np) for np in nodepools if (np.get("spec") or {}).get("clusterName") == name),
-            key=lambda state: state.name,
-        ),
+        nodepools=sorted((nodepool_state(np) for np in nodepools_of(nodepools, name)), key=lambda state: state.name),
     )
 
 
@@ -242,8 +250,18 @@ def admin_ack_state(
 
 
 def ack_patch(gate: str) -> dict[str, Any]:
-    """The merge patch that acks one gate, and nothing else."""
+    """The merge patch that acks one gate, and nothing else (also the `data` of a recreated admin-acks)."""
     return {"data": {gate: "true"}}
+
+
+def gate_held(admin_gates: dict[str, Any] | None, gate: str) -> bool:
+    """Whether openshift-config-managed/admin-gates (as read, None when absent) asks for this gate."""
+    return gate in ((admin_gates or {}).get("data") or {})
+
+
+def acked(admin_acks: dict[str, Any] | None, gate: str) -> bool:
+    """Whether openshift-config/admin-acks (as read, None when absent) holds this gate as "true"."""
+    return ((admin_acks or {}).get("data") or {}).get(gate) == "true"
 
 
 # --- the rest of hosted health (pre-flight checks 6, 8-11) -------------------------
@@ -256,13 +274,8 @@ _PLATFORM_NAMESPACE_PREFIXES = ("openshift-", "kube-")
 _PLATFORM_NAMESPACES = ("openshift", "default")
 
 
-def _ready(node: dict[str, Any]) -> bool:
-    ready = _condition(node, "Ready")
-    return ready is not None and ready.get("status") == "True"
-
-
 def nodes_not_ready(nodes: list[dict[str, Any]]) -> list[str]:
-    return sorted((n.get("metadata") or {}).get("name", "?") for n in nodes if not _ready(n))
+    return sorted((n.get("metadata") or {}).get("name", "?") for n in nodes if not node_ready(n))
 
 
 def nodes_in_scope(nodes: list[dict[str, Any]], nodepools: list[str]) -> set[str]:
@@ -324,6 +337,26 @@ def blocking_pdbs(pdbs: list[dict[str, Any]], pods: list[dict[str, Any]], scope:
         ):
             blocking.append(f"{namespace}/{metadata.get('name')}")
     return sorted(blocking)
+
+
+def blocking_pdb_namespaces(pdbs: list[dict[str, Any]]) -> list[str]:
+    """Customer namespaces holding a PDB at disruptionsAllowed 0: the only Pods blocking_pdbs
+    needs (it judges no platform PDB), so a big cluster's every Pod is not read to answer it."""
+    return sorted({
+        namespace
+        for pdb in pdbs
+        if (namespace := (pdb.get("metadata") or {}).get("namespace"))
+        and not _platform(namespace)
+        and (pdb.get("status") or {}).get("disruptionsAllowed", 1) == 0
+    })
+
+
+def webhook_service_namespaces(configurations: list[dict[str, Any]]) -> list[str]:
+    """Namespaces of the Services the webhooks call: the only Endpoints dead_webhooks needs."""
+    return sorted({
+        ((webhook.get("clientConfig") or {}).get("service") or {}).get("namespace")
+        for configuration in configurations for webhook in configuration.get("webhooks") or []
+    } - {None})
 
 
 def dead_webhooks(configurations: list[dict[str, Any]], endpoints: list[dict[str, Any]]) -> list[str]:
@@ -496,13 +529,66 @@ def synced_at(application: dict[str, Any] | None, revision: str, values_ref: str
     )
 
 
-def operation_phase(application: dict[str, Any] | None, revision: str, values_ref: str = "values") -> str | None:
-    """The phase of the operation syncing day1 `revision` (Running, Succeeded, Failed, Error), or None for none."""
-    operation = ((application or {}).get("status") or {}).get("operationState") or {}
-    target = _day1_revision(application, (operation.get("operation") or {}).get("sync") or {}, values_ref) or (
+def _operation_state(application: dict[str, Any] | None) -> dict[str, Any]:
+    return ((application or {}).get("status") or {}).get("operationState") or {}
+
+
+def _operation_state_revision(application: dict[str, Any] | None, values_ref: str) -> str | None:
+    """The day1 revision the last (or current) operation in operationState is for."""
+    operation = _operation_state(application)
+    return _day1_revision(application, (operation.get("operation") or {}).get("sync") or {}, values_ref) or (
         _day1_revision(application, operation.get("syncResult") or {}, values_ref)
     )
-    return operation.get("phase") if target == revision else None
+
+
+def operation_phase(application: dict[str, Any] | None, revision: str, values_ref: str = "values") -> str | None:
+    """The phase of the operation syncing day1 `revision` (Running, Succeeded, Failed, Error), or None for none."""
+    if _operation_state_revision(application, values_ref) != revision:
+        return None
+    return _operation_state(application).get("phase")
+
+
+def operation_message(application: dict[str, Any] | None) -> str:
+    """Argo CD's own sentence on the last operation (`operationState.message`), "" when it has none."""
+    return str(_operation_state(application).get("message") or "")
+
+
+# An operation is asked for by setting the Application's `operation`; the
+# controller clears it in the same write that records the operation's end
+# (setOperationState, controller/appcontroller.go, release-3.1). Argo CD's own
+# API refuses a second one while it is set: SetAppOperation (util/argo/argo.go)
+# returns "another operation is already in progress".
+_RUNNING_PHASES = ("Running", "Terminating")
+
+
+def operation_requested(application: dict[str, Any] | None) -> bool:
+    """Whether the Application's `operation` is set: an operation asked for and not ended.
+
+    While it is, operationState may still be the PREVIOUS operation's: a
+    Failed or Succeeded there is not this one's end.
+    """
+    return bool((application or {}).get("operation"))
+
+
+def other_operation(application: dict[str, Any] | None, revision: str, values_ref: str = "values") -> str | None:
+    """What other Argo CD operation holds the Application now, or None (none, or one for day1 `revision`).
+
+    Another one is an `operation` asked for another revision — a person's sync,
+    an auto-sync — or an operationState Running for one. Patching ours over it
+    would replace an operation in flight.
+    """
+    requested = (application or {}).get("operation")
+    if requested:
+        target = _day1_revision(application, requested.get("sync") or {}, values_ref)
+        if target != revision:
+            initiated = requested.get("initiatedBy") or {}
+            who = initiated.get("username") or ("an auto-sync" if initiated.get("automated") else "someone")
+            return f"an operation by {who} for day1 revision {target or '?'} is pending or running"
+    state = _operation_state(application)
+    target = _operation_state_revision(application, values_ref)
+    if state.get("phase") in _RUNNING_PHASES and target != revision:
+        return f"an operation for day1 revision {target or '?'} is {state.get('phase')}"
+    return None
 
 
 def sync_operation(
@@ -526,13 +612,20 @@ def sync_operation(
     sync_refusal checked, never a chart change nobody looked at; with no
     comparison yet, its targetRevision.
 
+    With the resourceVersion the Application was read at, as Argo CD's own
+    SetAppOperation updates it: a change in between (another operation asked
+    for, the spec edited) is a 409, and the activity reads again before
+    asking (precedent: hosted_resources.agent_release_patch).
+
     Raises ValueError for a multi-source Application with no values source
     (sync_refusal refuses that one first).
     """
     sources = _sources(application)
     initiated = {"username": by}
+    resource_version = ((application or {}).get("metadata") or {}).get("resourceVersion")
+    pinned = {"metadata": {"resourceVersion": resource_version}} if resource_version else {}
     if not sources:
-        return {"operation": {"initiatedBy": initiated, "sync": {"revision": revision}}}
+        return {**pinned, "operation": {"initiatedBy": initiated, "sync": {"revision": revision}}}
     index = values_source(application, values_ref)
     if index is None:
         raise ValueError(source_problem(application, values_ref))
@@ -542,7 +635,7 @@ def sync_operation(
         else (compared[i] if i < len(compared) and compared[i] else source.get("targetRevision") or "HEAD")
         for i, source in enumerate(sources)
     ]
-    return {"operation": {"initiatedBy": initiated, "sync": {"sources": sources, "revisions": revisions}}}
+    return {**pinned, "operation": {"initiatedBy": initiated, "sync": {"sources": sources, "revisions": revisions}}}
 
 
 # --- the watches: what progress looks like, and when to stop watching ----------------
@@ -640,6 +733,12 @@ _UNSCHEDULABLE_TAINT = "node.kubernetes.io/unschedulable"
 _NODEPOOL_CONDITIONS = ("UpdatingVersion", "UpdatingConfig", "AllNodesHealthy", "Ready", "SupportedVersionSkew")
 
 
+def machine_set_configs(machine_set: dict[str, Any] | None) -> tuple[str | None, str | None]:
+    """(target, current) config versions on a NodePool's CAPI MachineSet; (None, None) when it has none."""
+    annotations = ((machine_set or {}).get("metadata") or {}).get("annotations") or {}
+    return annotations.get(TARGET_CONFIG_ANNOTATION), annotations.get(CURRENT_CONFIG_ANNOTATION)
+
+
 def _parse_time(value: Any) -> datetime | None:
     if not isinstance(value, str):
         return None
@@ -659,15 +758,24 @@ def cordoned_since(node: dict[str, Any]) -> datetime | None:
     return None
 
 
+_SUCCEEDED = "Succeeded"
+
+
 def pod_state(pod: dict[str, Any]) -> str:
-    """A Pod's state in a word or two: the waiting reason of a container (CrashLoopBackOff), else its phase."""
+    """A Pod's state in a word or two: the waiting reason of a container (CrashLoopBackOff), else its phase.
+
+    A Succeeded Pod is just "Succeeded": its containers have exited, so it is
+    never Ready (Ready=False, reason PodCompleted) and that says nothing.
+    """
     status = pod.get("status") or {}
     for container in status.get("containerStatuses") or []:
         waiting = (container.get("state") or {}).get("waiting") or {}
         if waiting.get("reason"):
             return str(waiting["reason"])
-    ready = next((c for c in status.get("conditions") or [] if c.get("type") == "Ready"), {})
     phase = str(status.get("phase", "Unknown"))
+    if phase == _SUCCEEDED:
+        return phase
+    ready = next((c for c in status.get("conditions") or [] if c.get("type") == "Ready"), {})
     return phase if ready.get("status") == "True" else f"{phase}, not Ready"
 
 
@@ -774,7 +882,7 @@ def _gate_nodes(nodepool: str, nodes: list[dict[str, Any]]) -> CheckResult:
                            observed=f"no node carries {NODEPOOL_LABEL}={nodepool}", on_failure=CheckFailure.WAIT)
     bad = []
     for node in nodes:
-        why = [word for word, hit in (("NotReady", not _ready(node)),
+        why = [word for word, hit in (("NotReady", not node_ready(node)),
                                       ("cordoned", bool((node.get("spec") or {}).get("unschedulable")))) if hit]
         if why:
             bad.append(f"{(node.get('metadata') or {}).get('name', '?')} ({', '.join(why)})")
@@ -881,11 +989,14 @@ def _conditions_text(obj: dict[str, Any] | None) -> str:
 
 
 def pods_not_ready(pods: list[dict[str, Any]]) -> list[str]:
-    """"ns/name (state) on node" for every Pod that is not Running and Ready, or Succeeded."""
+    """"ns/name (state) on node" for every Pod that is neither Running and Ready nor Succeeded.
+
+    A finished Pod (every image-pruner run leaves one) is not a problem.
+    """
     lines = []
     for pod in pods:
         state = pod_state(pod)
-        if state in ("Running", "Succeeded"):
+        if state in ("Running", _SUCCEEDED):
             continue
         metadata = pod.get("metadata") or {}
         lines.append(f"{metadata.get('namespace')}/{metadata.get('name')} ({state}) "
@@ -959,3 +1070,17 @@ def evidence_sections(
             sections[key] = text.encode()[:share].decode(errors="ignore") + "\n[cut]"
             truncated = True
     return sections, truncated
+
+
+# --- the objects a tier-2 action acts on (DESIGN §8.3) ---------------------------------
+
+
+def job_failed(job: dict[str, Any]) -> bool:
+    """A Job the Job controller has marked Failed (condition Failed=True): finished, nothing left running."""
+    return any(c.get("type") == "Failed" and c.get("status") == "True" for c in _conditions(job))
+
+
+def annotated_with(obj: dict[str, Any] | None, annotations: dict[str, str]) -> bool:
+    """Whether the object carries every one of these annotations, each with exactly this value."""
+    present = ((obj or {}).get("metadata") or {}).get("annotations") or {}
+    return bool(annotations) and all(present.get(key) == value for key, value in annotations.items())

@@ -15,19 +15,20 @@ Every verb it uses is in deploy/charts/cluster-upgrade-worker/templates/rbac.yam
 from __future__ import annotations
 
 import asyncio
-import base64
-import binascii
 import time
 from datetime import UTC, datetime
 
 from temporalio import activity
 
 from activities.cluster_upgrade import action_catalog, hosted_upgrade_api, upgrade_state
-from activities.server_lifecycle import cluster_api, hosted_cluster_api
+from activities.server_lifecycle import cluster_api, hosted_cluster_api, hosted_resources
 from shared.exceptions import (
+    AmbiguousHostedClusterError,
+    ArgoOperationInProgressError,
     ArgoSyncFailedError,
     ArgoSyncRefusedError,
     HostedClusterAccessError,
+    HostedClusterNotFoundError,
     HostedClusterUnreachableError,
 )
 from shared.models.cluster_upgrade import (
@@ -72,10 +73,27 @@ _SYNC_WAIT_SECONDS = 240
 # A watch looks this often, and heartbeats each time (heartbeat_timeout 2 min,
 # dispatch.WATCH_HEARTBEAT_TIMEOUT).
 _WATCH_POLL_SECONDS = 30
-_HYPERSHIFT_GROUP = "hypershift.openshift.io"
-_HYPERSHIFT_VERSION = "v1beta1"
-# The key HyperShift stores an admin kubeconfig under in its Secret.
-_KUBECONFIG_KEY = "kubeconfig"
+
+# What the limb reads and writes on the MCE, as cluster_api takes it.
+_HOSTED_CLUSTER = {
+    "group": hosted_resources.HOSTED_CLUSTER_GROUP, "version": hosted_resources.HOSTED_CLUSTER_VERSION,
+    "plural": hosted_resources.HOSTED_CLUSTER_PLURAL, "kind": hosted_resources.HOSTED_CLUSTER_KIND,
+}
+_NODEPOOL = {
+    "group": hosted_resources.HOSTED_CLUSTER_GROUP, "version": hosted_resources.HOSTED_CLUSTER_VERSION,
+    "plural": "nodepools", "kind": "NodePool",
+}
+_MACHINE_SET = {"group": hosted_resources.MACHINE_GROUP, "version": "v1beta1", "plural": "machinesets", "kind": "MachineSet"}
+_APPLICATION = {"group": "argoproj.io", "version": "v1alpha1", "plural": "applications", "kind": "Application"}
+_IDMS = {"group": "config.openshift.io", "version": "v1", "plural": "imagedigestmirrorsets", "kind": "ImageDigestMirrorSet"}
+
+# A hosted API this attempt cannot read: down or 5xx (clears by itself), or an
+# admin kubeconfig it cannot use — none published yet, 403, TLS (a person's).
+# Reads and watches report either instead of raising: the pre-flight or the
+# watch shows it, rather than a read retried for ever.
+_HOSTED_UNREADABLE = (HostedClusterUnreachableError, HostedClusterAccessError)
+# An Argo CD operation still under way.
+_OPERATION_RUNNING = ("Running", "Terminating")
 
 
 def _target(request) -> tuple[str, str | None]:
@@ -93,50 +111,53 @@ async def _hosted_cluster(name: str, namespace: str | None = None) -> dict | Non
     """The HostedCluster `namespace/name` on the MCE; None when there is none.
 
     With no namespace it is found by listing, by name in any namespace. Two of
-    one name is then a conflict a person resolves, never a guess.
+    one name is then AmbiguousHostedClusterError, which a person resolves —
+    never a guess.
     """
     if namespace:
-        return await cluster_api.read_custom_object(
-            group=_HYPERSHIFT_GROUP, version=_HYPERSHIFT_VERSION, plural="hostedclusters", kind="HostedCluster",
-            namespace=namespace, name=name,
-        )
+        return await cluster_api.read_custom_object(**_HOSTED_CLUSTER, namespace=namespace, name=name)
     found = [
-        hc for hc in await cluster_api.list_cluster_custom_objects(
-            group=_HYPERSHIFT_GROUP, version=_HYPERSHIFT_VERSION, plural="hostedclusters", kind="HostedCluster",
-        )
+        hc for hc in await cluster_api.list_cluster_custom_objects(**_HOSTED_CLUSTER)
         if (hc.get("metadata") or {}).get("name") == name
     ]
     if len(found) > 1:
         namespaces = sorted((hc.get("metadata") or {}).get("namespace", "?") for hc in found)
-        raise HostedClusterAccessError(
+        raise AmbiguousHostedClusterError(
             f"{len(found)} HostedClusters are named {name} on this MCE, in {', '.join(namespaces)}"
         )
     return found[0] if found else None
 
 
+def _namespace(hosted_cluster: dict) -> str:
+    return (hosted_cluster.get("metadata") or {}).get("namespace", "")
+
+
 def _hcp_namespace(hosted_cluster: dict) -> str:
-    """HyperShift's control-plane namespace: `<namespace>-<name, dots as dashes>`."""
     metadata = hosted_cluster.get("metadata") or {}
-    return f"{metadata.get('namespace')}-{str(metadata.get('name')).replace('.', '-')}"
+    return hosted_resources.hosted_control_plane_namespace(metadata.get("namespace", ""), metadata.get("name", ""))
 
 
-async def _kubeconfig(hosted_cluster: dict) -> str:
-    """The hosted cluster's admin kubeconfig text, from the Secret its status names."""
-    metadata = hosted_cluster.get("metadata") or {}
-    namespace, label = metadata.get("namespace"), f"{metadata.get('namespace')}/{metadata.get('name')}"
-    secret = ((hosted_cluster.get("status") or {}).get("kubeconfig") or {}).get("name")
+async def _hosted_access(hosted_cluster: dict) -> tuple[str, str]:
+    """(admin kubeconfig text, the control plane's in-cluster API URL) of a HostedCluster.
+
+    The kubeconfig from the Secret its status names, decoded where every admin
+    kubeconfig is (hosted_cluster_api.admin_kubeconfig); HostedClusterAccessError
+    while there is none.
+    """
+    namespace = _namespace(hosted_cluster)
+    label = f"{namespace}/{(hosted_cluster.get('metadata') or {}).get('name')}"
+    secret = hosted_resources.admin_kubeconfig_secret(hosted_cluster)
     if not secret:
         raise HostedClusterAccessError(f"HostedCluster {label} publishes no status.kubeconfig yet")
-    data = await cluster_api.read_secret_data(namespace, secret)
-    encoded = (data or {}).get(_KUBECONFIG_KEY)
-    if not encoded:
-        raise HostedClusterAccessError(f"Secret {namespace}/{secret} of HostedCluster {label} holds no kubeconfig")
-    try:
-        return base64.b64decode(encoded, validate=True).decode()
-    except (binascii.Error, UnicodeDecodeError, ValueError):
-        raise HostedClusterAccessError(
-            f"Secret {namespace}/{secret} of HostedCluster {label} holds no readable kubeconfig"
-        ) from None
+    kubeconfig = hosted_cluster_api.admin_kubeconfig(
+        await cluster_api.read_secret_data(namespace, secret), f"{namespace}/{secret}", label
+    )
+    return kubeconfig, hosted_cluster_api.kas_service_url(_hcp_namespace(hosted_cluster))
+
+
+async def _nodepools(hosted_cluster: dict) -> list[dict]:
+    """Every NodePool in the HostedCluster's namespace (upgrade_state.nodepools_of says whose)."""
+    return await cluster_api.list_custom_objects(**_NODEPOOL, namespace=_namespace(hosted_cluster))
 
 
 @activity.defn
@@ -145,9 +166,7 @@ async def read_mce_state(request: MceRequest) -> MceState:
     found, versions = upgrade_state.supported_versions(
         await cluster_api.read_config_map_data("hypershift", "supported-versions")
     )
-    idms = await cluster_api.list_cluster_custom_objects(
-        group="config.openshift.io", version="v1", plural="imagedigestmirrorsets", kind="ImageDigestMirrorSet",
-    )
+    idms = await cluster_api.list_cluster_custom_objects(**_IDMS)
     return MceState(supported_versions_found=found, supported_versions=versions,
                     idms_mirrors=upgrade_state.idms_mirrors(idms))
 
@@ -160,10 +179,7 @@ async def read_argo_application(request: HostedClusterRequest) -> ArgoApplicatio
 
 async def _application(cluster: str) -> dict | None:
     """The cluster's Application: named after its day1 file, in ARGO_NAMESPACE."""
-    return await cluster_api.read_custom_object(
-        group="argoproj.io", version="v1alpha1", plural="applications", kind="Application",
-        namespace=_settings.argo_namespace, name=cluster,
-    )
+    return await cluster_api.read_custom_object(**_APPLICATION, namespace=_settings.argo_namespace, name=cluster)
 
 
 @activity.defn
@@ -171,10 +187,13 @@ async def sync_argo_application(request: ArgoSyncRequest) -> ArgoSyncResult:
     """Sync the Application to exactly `request.revision`, and wait for the operation.
 
     Raises ArgoSyncRefusedError (permanent) when anything outside
-    `allowed_out_of_sync` is out of sync, or when a multi-source Application
-    has no ARGO_VALUES_REF source to pin the day1 commit in. Idempotent:
-    already synced at the revision is success, and an operation already
-    running for it is waited for, not started twice.
+    `allowed_out_of_sync` is out of sync, when a multi-source Application
+    has no ARGO_VALUES_REF source to pin the day1 commit in, or when the
+    Application is gone; ArgoOperationInProgressError (retryable) while
+    another operation holds it — nothing is asked over one. The ask carries
+    the resourceVersion read, so a change in between is a retryable 409.
+    Idempotent: already synced at the revision is success, and an operation
+    already asked for it, or running, is waited for, not started twice.
     """
     ref = _settings.argo_values_ref
     label = f"{_settings.argo_namespace}/{request.cluster}"
@@ -184,24 +203,38 @@ async def sync_argo_application(request: ArgoSyncRequest) -> ArgoSyncResult:
     refusal = upgrade_state.sync_refusal(application, request.allowed_out_of_sync, ref)
     if refusal is not None:
         raise ArgoSyncRefusedError(f"Application {label}: {refusal}")
-    if upgrade_state.operation_phase(application, request.revision, ref) != "Running":
-        await cluster_api.patch_custom_object(
-            group="argoproj.io", version="v1alpha1", plural="applications", kind="Application",
-            namespace=_settings.argo_namespace, name=request.cluster,
+    busy = upgrade_state.other_operation(application, request.revision, ref)
+    if busy is not None:
+        raise ArgoOperationInProgressError(
+            f"Application {label}: {busy}; nothing was asked, the next attempt reads it again"
+        )
+    if not upgrade_state.operation_requested(application) and (
+        upgrade_state.operation_phase(application, request.revision, ref) not in _OPERATION_RUNNING
+    ):
+        patched = await cluster_api.patch_custom_object(
+            **_APPLICATION, namespace=_settings.argo_namespace, name=request.cluster,
             body=upgrade_state.sync_operation(application, request.revision, _SYNC_INITIATOR, ref),
         )
+        if not patched:
+            raise ArgoSyncRefusedError(f"Application {label}: the Application does not exist")
         activity.logger.info("asked Argo CD to sync %s to %s", label, request.revision)
     deadline = time.monotonic() + _SYNC_WAIT_SECONDS
     while time.monotonic() < deadline:
         await asyncio.sleep(_SYNC_POLL_SECONDS)
         activity.heartbeat()
         application = await _application(request.cluster)
+        if application is None:
+            raise ArgoSyncRefusedError(f"Application {label}: the Application does not exist")
         phase = upgrade_state.operation_phase(application, request.revision, ref)
-        if phase == "Succeeded" or upgrade_state.synced_at(application, request.revision, ref):
+        # While `operation` is set, operationState may still be the previous one's.
+        ended = not upgrade_state.operation_requested(application)
+        if upgrade_state.synced_at(application, request.revision, ref) or (phase == "Succeeded" and ended):
             return ArgoSyncResult(revision=request.revision, phase="Succeeded")
-        if phase in ("Failed", "Error"):
-            message = (((application or {}).get("status") or {}).get("operationState") or {}).get("message", "")
-            raise ArgoSyncFailedError(f"Argo CD's sync of {label} to {request.revision} ended {phase}: {message}")
+        if phase in ("Failed", "Error") and ended:
+            raise ArgoSyncFailedError(
+                f"Argo CD's sync of {label} to {request.revision} ended {phase}: "
+                f"{upgrade_state.operation_message(application)}"
+            )
     raise ArgoSyncFailedError(
         f"Argo CD's sync of {label} to {request.revision} did not finish in {_SYNC_WAIT_SECONDS}s"
     )
@@ -213,43 +246,32 @@ async def read_hosted_cluster(request: HostedClusterRequest) -> HostedClusterSta
     hosted = await _hosted_cluster(*_target(request))
     if hosted is None:
         return upgrade_state.hosted_cluster_state(None, [])
-    nodepools = await cluster_api.list_custom_objects(
-        group=_HYPERSHIFT_GROUP, version=_HYPERSHIFT_VERSION, plural="nodepools", kind="NodePool",
-        namespace=(hosted.get("metadata") or {}).get("namespace", ""),
-    )
-    return upgrade_state.hosted_cluster_state(hosted, nodepools)
+    return upgrade_state.hosted_cluster_state(hosted, await _nodepools(hosted))
 
 
 @activity.defn
 async def read_hosted_health(request: HostedHealthRequest) -> HostedHealth:
-    """Through the hosted cluster's admin kubeconfig (the existing workflow-path pattern).
+    """Through the hosted cluster's admin kubeconfig (the existing workflow-path pattern), in one session.
 
-    An API server that cannot be reached is `reachable: False`, which the
-    pre-flight shows a person, rather than a read retried for ever.
+    A hosted API that cannot be read — unreachable, or an admin kubeconfig
+    that cannot be used (none published, 403, TLS) — is `reachable: False`,
+    which the pre-flight shows a person, rather than a read retried for ever.
     """
     hosted = await _hosted_cluster(*_target(request))
     if hosted is None:
         return HostedHealth(reachable=False)
-    kubeconfig = await _kubeconfig(hosted)
-    server = hosted_cluster_api.kas_service_url(_hcp_namespace(hosted))
     try:
-        upgrade = await hosted_upgrade_api.read_upgrade_objects(kubeconfig, server, request.cluster, [])
-        health = await hosted_upgrade_api.read_health_objects(kubeconfig, server, request.cluster)
-    except HostedClusterUnreachableError as err:
-        activity.logger.warning("hosted cluster %s unreachable: %s", request.cluster, err)
+        health = await hosted_upgrade_api.read_health_objects(*await _hosted_access(hosted), request.cluster)
+    except _HOSTED_UNREADABLE as err:
+        activity.logger.warning("hosted cluster %s unreadable for its health (%s): %s",
+                                request.cluster, type(err).__name__, err)
         return HostedHealth(reachable=False)
-    nodepools = upgrade_state.hosted_cluster_state(
-        hosted,
-        await cluster_api.list_custom_objects(
-            group=_HYPERSHIFT_GROUP, version=_HYPERSHIFT_VERSION, plural="nodepools", kind="NodePool",
-            namespace=(hosted.get("metadata") or {}).get("namespace", ""),
-        ),
-    ).nodepools
+    nodepools = upgrade_state.hosted_cluster_state(hosted, await _nodepools(hosted)).nodepools
     scope = upgrade_state.nodes_in_scope(health["nodes"], request.nodepools)
     return HostedHealth(
         reachable=True,
-        operators_unhealthy=upgrade_state.operators_unhealthy(upgrade["cluster_operators"]),
-        **upgrade_state.upgradeable(upgrade["cluster_version"]),
+        operators_unhealthy=upgrade_state.operators_unhealthy(health["cluster_operators"]),
+        **upgrade_state.upgradeable(health["cluster_version"]),
         nodes_not_ready=upgrade_state.nodes_not_ready(health["nodes"]),
         nodepools_short=upgrade_state.nodepools_short(nodepools, request.nodepools),
         pending_csrs=upgrade_state.pending_csrs(health["csrs"]),
@@ -261,16 +283,21 @@ async def read_hosted_health(request: HostedHealthRequest) -> HostedHealth:
 
 @activity.defn
 async def read_admin_acks(request: AdminAckRequest) -> AdminAckState:
-    """The hosted cluster's admin gates and acks, and who called `request.apis` in the last 24 hours."""
+    """The hosted cluster's admin gates and acks, and who called `request.apis` in the last 24 hours.
+
+    A hosted API that cannot be read is `reachable: False`, as in read_hosted_health.
+    """
     hosted = await _hosted_cluster(*_target(request))
     if hosted is None:
         return AdminAckState(reachable=False)
-    objects = await hosted_upgrade_api.read_upgrade_objects(
-        await _kubeconfig(hosted),
-        hosted_cluster_api.kas_service_url(_hcp_namespace(hosted)),
-        request.cluster,
-        request.apis,
-    )
+    try:
+        objects = await hosted_upgrade_api.read_admin_ack_objects(
+            *await _hosted_access(hosted), request.cluster, request.apis
+        )
+    except _HOSTED_UNREADABLE as err:
+        activity.logger.warning("hosted cluster %s unreadable for its admin acks (%s): %s",
+                                request.cluster, type(err).__name__, err)
+        return AdminAckState(reachable=False)
     state = upgrade_state.admin_ack_state(
         admin_gates=objects["admin_gates"],
         admin_acks=objects["admin_acks"],
@@ -288,19 +315,19 @@ async def read_admin_acks(request: AdminAckRequest) -> AdminAckState:
 async def give_admin_ack(request: GiveAdminAckRequest) -> AdminAckGiven:
     """Merge `data.<gate>: "true"` into the hosted cluster's openshift-config/admin-acks.
 
-    Raises AdminGateNotFoundError (permanent) for a gate its admin-gates does not hold.
+    Raises AdminGateNotFoundError (permanent) for a gate its admin-gates does
+    not hold; HostedClusterNotFoundError (retried) when the HostedCluster is
+    not on the MCE, and AdminAckNotAppliedError (retried) for an ack that did
+    not read back — nothing is reported written that the cluster does not hold.
     """
-    hosted = await _hosted_cluster(*_target(request))
+    name, namespace = _target(request)
+    hosted = await _hosted_cluster(name, namespace)
     if hosted is None:
-        raise HostedClusterAccessError(
-            f"no HostedCluster {_target(request)[0]} on this MCE to ack {request.gate} in"
+        raise HostedClusterNotFoundError(
+            f"no HostedCluster {name}{f' in {namespace}' if namespace else ''} on this MCE "
+            f"to ack {request.gate} in; nothing was written"
         )
-    changed = await hosted_upgrade_api.give_admin_ack(
-        await _kubeconfig(hosted),
-        hosted_cluster_api.kas_service_url(_hcp_namespace(hosted)),
-        request.cluster,
-        request.gate,
-    )
+    changed = await hosted_upgrade_api.give_admin_ack(*await _hosted_access(hosted), request.cluster, request.gate)
     activity.logger.info("admin ack %s in %s: %s", request.gate, request.cluster, "written" if changed else "already true")
     return AdminAckGiven(gate=request.gate, changed=changed)
 
@@ -317,15 +344,13 @@ def _resumed_snapshot() -> ProgressSnapshot | None:
 
 
 async def _hosted_operators(hosted: dict, cluster: str) -> list[dict] | None:
-    """The hosted ClusterOperators, or None when the hosted API cannot be read this time."""
+    """The hosted ClusterOperators — the only hosted read a control-plane poll needs — or None
+    when the hosted API cannot be read this time."""
     try:
-        objects = await hosted_upgrade_api.read_upgrade_objects(
-            await _kubeconfig(hosted), hosted_cluster_api.kas_service_url(_hcp_namespace(hosted)), cluster, [],
-        )
-    except (HostedClusterUnreachableError, HostedClusterAccessError) as err:
+        return await hosted_upgrade_api.read_cluster_operators(*await _hosted_access(hosted), cluster)
+    except _HOSTED_UNREADABLE as err:
         activity.logger.info("hosted cluster %s unreadable this poll: %s", cluster, err)
         return None
-    return objects["cluster_operators"]
 
 
 @activity.defn
@@ -354,30 +379,23 @@ async def watch_control_plane(request: WatchControlPlaneRequest) -> WatchOutcome
         await asyncio.sleep(_WATCH_POLL_SECONDS)
 
 
-async def _nodepool_view(request: WatchNodePoolRequest) -> tuple[dict | None, dict, dict | None]:
-    """(NodePool, the MachineSet's annotations, the hosted objects or None when unreadable)."""
+async def _nodepool_view(request: WatchNodePoolRequest) -> tuple[dict | None, dict | None, dict | None]:
+    """(NodePool, its CAPI MachineSet, the hosted objects or None when unreadable); None where absent."""
     hosted = await _hosted_cluster(*_target(request))
     if hosted is None:
-        return None, {}, None
-    namespace = (hosted.get("metadata") or {}).get("namespace", "")
-    nodepool = await cluster_api.read_custom_object(
-        group=_HYPERSHIFT_GROUP, version=_HYPERSHIFT_VERSION, plural="nodepools", kind="NodePool",
-        namespace=namespace, name=request.nodepool,
-    )
+        return None, None, None
+    nodepool = await cluster_api.read_custom_object(**_NODEPOOL, namespace=_namespace(hosted), name=request.nodepool)
     machine_set = await cluster_api.read_custom_object(
-        group="cluster.x-k8s.io", version="v1beta1", plural="machinesets", kind="MachineSet",
-        namespace=_hcp_namespace(hosted), name=request.nodepool,
+        **_MACHINE_SET, namespace=_hcp_namespace(hosted), name=request.nodepool,
     )
-    annotations = ((machine_set or {}).get("metadata") or {}).get("annotations") or {}
     try:
         objects = await hosted_upgrade_api.read_nodepool_objects(
-            await _kubeconfig(hosted), hosted_cluster_api.kas_service_url(_hcp_namespace(hosted)),
-            request.cluster, request.nodepool, upgrade_state.NODEPOOL_LABEL,
+            *await _hosted_access(hosted), request.cluster, request.nodepool, upgrade_state.NODEPOOL_LABEL,
         )
-    except (HostedClusterUnreachableError, HostedClusterAccessError) as err:
+    except _HOSTED_UNREADABLE as err:
         activity.logger.info("hosted cluster %s unreadable this poll: %s", request.cluster, err)
         objects = None
-    return nodepool, annotations, objects
+    return nodepool, machine_set, objects
 
 
 @activity.defn
@@ -393,10 +411,10 @@ async def watch_nodepool(request: WatchNodePoolRequest) -> WatchOutcome:
     snapshot = _resumed_snapshot()
     while True:
         nodepool, machine_set, objects = await _nodepool_view(request)
+        target_config, current_config = upgrade_state.machine_set_configs(machine_set)
         done, seen = upgrade_state.nodepool_progress(
-            nodepool, None if objects is None else objects["nodes"],
-            machine_set.get(upgrade_state.TARGET_CONFIG_ANNOTATION), request.version,
-            current_config=machine_set.get(upgrade_state.CURRENT_CONFIG_ANNOTATION),
+            nodepool, None if objects is None else objects["nodes"], target_config, request.version,
+            current_config=current_config,
         )
         now = datetime.now(UTC)
         snapshot = upgrade_state.advance(snapshot, seen, now)
@@ -428,10 +446,10 @@ async def _gate_checks(request: NodePoolGateRequest) -> list[CheckResult]:
     if hosted is not None:
         try:
             objects = await hosted_upgrade_api.read_gate_objects(
-                await _kubeconfig(hosted), hosted_cluster_api.kas_service_url(_hcp_namespace(hosted)),
+                *await _hosted_access(hosted),
                 request.cluster, request.nodepool, upgrade_state.NODEPOOL_LABEL, request.workload_checks,
             )
-        except (HostedClusterUnreachableError, HostedClusterAccessError) as err:
+        except _HOSTED_UNREADABLE as err:
             activity.logger.info("hosted cluster %s unreadable this poll: %s", request.cluster, err)
             unreadable = f"the hosted API was unreadable: {err}"
     return upgrade_state.gate_checks(request.nodepool, objects, request.workload_checks, unreadable)
@@ -467,10 +485,12 @@ async def watch_nodepool_gate(request: NodePoolGateRequest) -> GateOutcome:
 async def collect_evidence(request: EvidenceRequest) -> EvidenceBundle:
     """Read-only evidence for the agent: conditions, operators, events, Argo, data plane.
 
-    For a NodePool also its drain: cordoned nodes, the pods left on them, the
-    PDBs covering those pods. (The hosted-cluster-config-operator's drainer
-    lines, DESIGN §6.3, come with the pod-log read.) Never a Secret; what cannot
-    be read says so instead of failing the bundle.
+    For a NodePool also its drain: cordoned nodes, the pods a drain still has
+    to move off them with their state, and the PDBs in those pods' namespaces
+    with disruptionsAllowed and healthy counts. No pod logs: the limb reads
+    none (no `pods/log`), so no hosted-cluster-config-operator drainer lines
+    either. Never a Secret; what cannot be read says so instead of failing
+    the bundle.
     """
     name, namespace = _target(request)
     hosted = await _hosted_cluster(name, namespace)
@@ -478,29 +498,17 @@ async def collect_evidence(request: EvidenceRequest) -> EvidenceBundle:
     operators = pods = warnings = None
     drain = None
     if hosted is not None:
-        nodepools = [
-            np for np in await cluster_api.list_custom_objects(
-                group=_HYPERSHIFT_GROUP, version=_HYPERSHIFT_VERSION, plural="nodepools", kind="NodePool",
-                namespace=(hosted.get("metadata") or {}).get("namespace", ""),
-            )
-            # A NodePool names its HostedCluster, not the day1 file.
-            if (np.get("spec") or {}).get("clusterName") == name
-            and (request.nodepool is None or (np.get("metadata") or {}).get("name") == request.nodepool)
-        ]
+        nodepools = upgrade_state.nodepools_of(await _nodepools(hosted), name, request.nodepool)
         try:
-            kubeconfig = await _kubeconfig(hosted)
-            server = hosted_cluster_api.kas_service_url(_hcp_namespace(hosted))
-            operators = (await hosted_upgrade_api.read_upgrade_objects(kubeconfig, server, request.cluster, []))[
-                "cluster_operators"
-            ]
+            kubeconfig, server = await _hosted_access(hosted)
             extra = await hosted_upgrade_api.read_evidence_objects(kubeconfig, server, request.cluster)
-            pods, warnings = extra["data_plane_pods"], extra["warning_events"]
+            operators, pods, warnings = extra["cluster_operators"], extra["data_plane_pods"], extra["warning_events"]
             if request.nodepool is not None:
                 objects = await hosted_upgrade_api.read_nodepool_objects(
                     kubeconfig, server, request.cluster, request.nodepool, upgrade_state.NODEPOOL_LABEL,
                 )
                 drain = upgrade_state.drain_text(objects["nodes"], objects["pods"], objects["pdbs"])
-        except (HostedClusterUnreachableError, HostedClusterAccessError) as err:
+        except _HOSTED_UNREADABLE as err:
             activity.logger.info("hosted cluster %s partly unreadable for evidence: %s", request.cluster, err)
     sections, truncated = upgrade_state.evidence_sections(
         hosted_cluster=hosted,
@@ -514,15 +522,18 @@ async def collect_evidence(request: EvidenceRequest) -> EvidenceBundle:
     return EvidenceBundle(sections=sections, truncated=truncated)
 
 
-_ACTION_OUTCOMES = {
-    "deleted": (True, "deleted"),
-    "gone": (False, "not executed: already gone"),
-    "replaced": (False, "not executed: replaced since the proposal (its UID differs)"),
-    "created": (True, "created Job {job}"),
-    "exists": (True, "created Job {job} (found on retry)"),
-    "missing": (False, "not executed: no such CronJob"),
-    "not-failed": (False, "not executed: the Job has not failed (it is running or Complete)"),
-}
+def _job_annotations(request: ProposedActionRequest) -> dict[str, str]:
+    """What a Job this request creates carries: the action, the cluster, the workflow, and a
+    fingerprint of the request and of this activity execution (a retry has the same)."""
+    info = activity.info()
+    return action_catalog.job_annotations(
+        action_id=request.action.action_id,
+        cluster=request.cluster,
+        workflow_id=info.workflow_id,
+        fingerprint=action_catalog.request_fingerprint(
+            request.model_dump_json(), info.workflow_id, info.workflow_run_id, info.activity_id,
+        ),
+    )
 
 
 @activity.defn
@@ -531,20 +542,20 @@ async def execute_proposed_action(request: ProposedActionRequest) -> ActionResul
 
     Raises ProposedActionRefusedError (permanent) for a kind not in the catalog,
     or a target outside its rules (DESIGN §8.3). Idempotent: a retry finds the
-    pod gone or its own Job, and says so.
+    pod gone or its own Job (by the annotations it carries), and says so; a Job
+    of that name that is not its own is reported, never claimed.
     """
     action = action_catalog.check(request.action)
     action_id = request.action.action_id
     hosted = await _hosted_cluster(*_target(request))
     if hosted is None:
         return ActionResult(action_id=action_id, executed=False,
-                            detail=f"not executed: HostedCluster {request.cluster} not found on the MCE")
+                            detail=f"not executed: HostedCluster {_target(request)[0]} not found on the MCE")
     job = None
     if action.kind == action_catalog.DELETE_HCP_POD:
         outcome = await cluster_api.delete_pod(_hcp_namespace(hosted), action.name, action.uid)
     else:
-        kubeconfig = await _kubeconfig(hosted)
-        server = hosted_cluster_api.kas_service_url(_hcp_namespace(hosted))
+        kubeconfig, server = await _hosted_access(hosted)
         if action.kind == action_catalog.DELETE_POD:
             outcome = await hosted_upgrade_api.delete_pod(
                 kubeconfig, server, request.cluster, action.namespace or "", action.name, action.uid)
@@ -552,12 +563,14 @@ async def execute_proposed_action(request: ProposedActionRequest) -> ActionResul
             outcome = await hosted_upgrade_api.delete_failed_job(
                 kubeconfig, server, request.cluster, action.namespace or "", action.name, action.uid)
         else:
-            job = action_catalog.rerun_job_name(action.name, action_id)
+            # ProposedActionRequest carries no agent invocation id yet: once it
+            # does, pass request.invocation_id here, so the "same" action of two
+            # invocations gets two names.
+            job = action_catalog.rerun_job_name(action.name, action_id, invocation_id=None)
             outcome = await hosted_upgrade_api.rerun_cronjob(
-                kubeconfig, server, request.cluster, action.namespace or "", action.name, job)
-    executed, detail = _ACTION_OUTCOMES[outcome]
-    detail = detail.format(job=job)
+                kubeconfig, server, request.cluster, action.namespace or "", action.name, job,
+                _job_annotations(request))
+    executed, detail = action_catalog.outcome(outcome, job)
     activity.logger.info("action %s (%s %s), approved by %s, on %s: %s", action_id, action.kind,
                          request.action.target, request.approved_by, request.cluster, detail)
     return ActionResult(action_id=action_id, executed=executed, detail=detail)
-

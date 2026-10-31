@@ -614,9 +614,11 @@ class HostedClusterAccessError(OrchestratorError):
     """The hosted cluster's admin kubeconfig cannot be used. Deterministic.
 
     The HostedCluster publishes no `status.kubeconfig`, its Secret lacks the
-    `kubeconfig` key or does not parse, or the hosted API server answers 403.
-    None of those changes on a retry. The message names which, and never any
-    of the kubeconfig's contents.
+    `kubeconfig` key or does not parse, TLS fails verification against its
+    CA, or the hosted API server answers 403. None of those changes on a
+    retry. The message names which, and never any of the kubeconfig's
+    contents. cluster-upgrade's reads turn it into `reachable: False`, which
+    a person sees in the pre-flight, rather than a read retried for ever.
     """
 
 
@@ -1024,6 +1026,51 @@ class ArgoSyncFailedError(OrchestratorError):
     RETRYABLE: the next attempt asks for the same revision again, so a
     transient apply failure clears by itself; one that never clears shows on
     the activity, its message naming Argo CD's own.
+    """
+
+
+class ArgoOperationInProgressError(OrchestratorError):
+    """Another Argo CD operation holds the cluster's Application, so the run asked for nothing.
+
+    The Application's `operation` is set, or its operationState is Running, for
+    a revision that is not the run's — someone's manual sync, an auto-sync.
+    Argo CD's own API refuses a second operation then ("another operation is
+    already in progress"), and a patch would replace the one in flight.
+    RETRYABLE on purpose, so not in the workflow's non-retryable list: the
+    other operation ends by itself, and the next attempt reads again.
+    """
+
+
+class AmbiguousHostedClusterError(OrchestratorError):
+    """Two HostedClusters on the MCE bear the name a cluster-upgrade request looks for.
+
+    Only a request that names no namespace (a run planned before the
+    HostedCluster's own name was carried) is found by listing, so only it can
+    meet two. Deterministic: the limb never guesses which one is meant; a
+    person removes one, or a new run names the namespace. cluster-upgrade
+    waits on it (not in its non-retryable list) rather than fail a run that
+    may already have committed; it shows on the pending activity, naming both.
+    """
+
+
+class HostedClusterNotFoundError(OrchestratorError):
+    """The HostedCluster a cluster-upgrade WRITE is for is not on the MCE; nothing was written.
+
+    Reads answer `found: False` / `reachable: False` instead; a write cannot.
+    The run read the HostedCluster moments before, so a missing one is being
+    recreated (Argo CD applies it from day1) or was removed by a person.
+    Retried, so not in the workflow's non-retryable list: the write goes ahead
+    once it is back, and until then it shows on the pending activity.
+    """
+
+
+class AdminAckNotAppliedError(OrchestratorError):
+    """An admin ack the limb wrote did not read back as "true".
+
+    The write was accepted but the ConfigMap read just after does not hold it
+    (someone or something rewrote it in between). RETRYABLE: the next attempt
+    reads the gates and the acks and writes again; it never reports an ack
+    the cluster does not hold.
     """
 
 

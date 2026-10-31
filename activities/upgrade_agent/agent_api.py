@@ -17,6 +17,9 @@ apply only where a second attempt can help:
   * it answered 2xx, but not with an AgentVerdict: RETURN needs_human saying so
     (the interface's promise: a malformed reply is never raised).
 
+A verdict comes back through action_catalog.checked: what to keep of its
+proposals is the catalog's policy, not this HTTP client's.
+
 No retries here: Temporal owns them. The client lives for one call.
 """
 
@@ -26,8 +29,8 @@ import httpx
 from pydantic import ValidationError
 
 from activities.cluster_upgrade import action_catalog
-from shared.exceptions import ProposedActionRefusedError, UpgradeAgentRefusedError, UpgradeAgentUnavailableError
-from shared.models.cluster_upgrade import AgentRequest, AgentVerdict, ProposedAction
+from shared.exceptions import UpgradeAgentRefusedError, UpgradeAgentUnavailableError
+from shared.models.cluster_upgrade import AgentRequest, AgentVerdict
 
 INVOKE_PATH = "/v1/invoke"
 _CONNECT_TIMEOUT = 10.0
@@ -36,37 +39,6 @@ _CONNECT_TIMEOUT = 10.0
 def _malformed(why: str) -> AgentVerdict:
     return AgentVerdict(diagnosis=f"the upgrade agent's reply was not a verdict: {why}",
                         confidence="hypothesis", verdict="needs_human")
-
-
-def checked(verdict: AgentVerdict) -> AgentVerdict:
-    """The verdict with only proposals the workflow's catalog can run, each with its own id.
-
-    The service checks them too; this is the workflow's side of the boundary.
-    A proposal outside the catalog is dropped and named in the diagnosis, and a
-    verdict that had one is never `retry_gate`: a person sees it.
-    """
-    kept: list[ProposedAction] = []
-    notes: list[str] = []
-    ids: set[str] = set()
-    for action in verdict.actions_proposed:
-        try:
-            action_catalog.check(action)
-        except ProposedActionRefusedError as err:
-            notes.append(f"dropped {err}")
-            continue
-        if not action.action_id or action.action_id in ids or not action.action_id.replace("-", "").isalnum():
-            action = action.model_copy(update={"action_id": f"{len(kept) + 1}"})
-            while action.action_id in ids:
-                action = action.model_copy(update={"action_id": f"{action.action_id}-x"})
-        ids.add(action.action_id)
-        kept.append(action)
-    if not notes and kept == verdict.actions_proposed:
-        return verdict
-    return verdict.model_copy(update={
-        "actions_proposed": kept,
-        "diagnosis": verdict.diagnosis + ("\n\nChecked by the upgrade-agent worker: " + "; ".join(notes) if notes else ""),
-        "verdict": "needs_human" if notes and verdict.verdict == "retry_gate" else verdict.verdict,
-    })
 
 
 async def invoke(url: str, token: str, request: AgentRequest, *, timeout: float) -> AgentVerdict:
@@ -89,4 +61,4 @@ async def invoke(url: str, token: str, request: AgentRequest, *, timeout: float)
     except ValidationError as err:
         errors = "; ".join(f"{'.'.join(map(str, e['loc'])) or 'body'}: {e['msg']}" for e in err.errors()[:3])
         return _malformed(errors)
-    return checked(verdict)
+    return action_catalog.checked(verdict)

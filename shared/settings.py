@@ -388,3 +388,53 @@ class ServerProvisioningActivitySettings(BaseSettings):
         return [self.idrac_root_password] + [
             p for p in self.idrac_factory_passwords if p != self.idrac_root_password
         ]
+
+
+# --- cluster-upgrade: three limbs (CLAUDE.md §2) -------------------------------------
+# One class per limb, each filled in by that limb's code. Field names = Helm
+# ConfigMap/Secret keys lowercased, as for the classes above.
+
+
+class UpgradeGitopsActivitySettings(BaseSettings):
+    """Config for the cluster-upgrade HUB limb (`upgrade-gitops-worker`) only.
+
+    The day1 and day2 repos, the release registry, Brain: everything the
+    upgrade reads or writes in git or a registry. The brain never reads these.
+    """
+
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+
+class ClusterUpgradeActivitySettings(BaseSettings):
+    """Config for the per-MCE cluster-upgrade limb (`cluster-upgrade-worker`) only.
+
+    Polls `cluster-upgrade-activity-<mce_cluster>`; reads and patches that MCE's
+    HostedClusters, NodePools and Argo CD Applications as its own ServiceAccount.
+    """
+
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    # Which MCE this worker serves: names its queue. Canonical, `ocp4-` prefixed.
+    mce_cluster: str
+
+    @field_validator("mce_cluster")
+    @classmethod
+    def _canonical_mce_cluster(cls, value: str) -> str:
+        return canonical_mce_cluster(value)
+
+
+class UpgradeAgentActivitySettings(BaseSettings):
+    """Config for the per-MCE upgrade-agent limb (`upgrade-agent-worker`) only.
+
+    Holds no Kubernetes credential: it calls the upgrade agent's endpoint.
+    """
+
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    # Which MCE this worker serves: names its queue. Canonical, `ocp4-` prefixed.
+    mce_cluster: str
+
+    @field_validator("mce_cluster")
+    @classmethod
+    def _canonical_mce_cluster(cls, value: str) -> str:
+        return canonical_mce_cluster(value)

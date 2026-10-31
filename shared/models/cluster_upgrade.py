@@ -77,10 +77,14 @@ class PinnedRelease(BaseModel):
     The release payload and the hypershift control-plane-operator image are
     both pinned: the chart renders both from tags (`tag`, `cpoTag`), and either
     moving under a run would deploy something nobody approved.
+
+    `control_plane_operator` is None when the release layout names no CPO repo
+    (a public source such as quay.io's ocp-release, `release.mirrored: false`):
+    HyperShift then runs the CPO the payload itself carries.
     """
 
     release: str
-    control_plane_operator: str
+    control_plane_operator: str | None = None
 
 
 class UpgradePlan(BaseModel):
@@ -143,8 +147,14 @@ class ReleaseLayout(BaseModel):
     image_path: str
     repo: str
     tag: str
-    cpo_repo: str
-    cpo_tag: str
+    # No CPO repo: the payload's own CPO is used and nothing extra is pinned.
+    cpo_repo: str | None = None
+    cpo_tag: str | None = None
+    # False when releases come straight from their public source rather than an
+    # internal mirror (a connected lab): there is then no IDMS to check
+    # (pre-flight check 11 passes, saying why). Absent = mirrored, as in
+    # production and in every run planned before the field.
+    mirrored: bool = True
 
 
 class UpgradeContext(BaseModel):
@@ -437,6 +447,12 @@ class Day1Cluster(BaseModel):
     top_level_workertag: str | None = None
     image_path: str | None = None  # effective, after the site and MCE files
     image_hc: str | None = None
+    # The HostedCluster this file renders, as the hostedclusters-setup chart
+    # names it (not the file name): metadata.name and namespace. None from a
+    # reader that predates the fields; the MCE requests then fall back to the
+    # cluster name.
+    hosted_cluster: str | None = None
+    hosted_cluster_namespace: str | None = None
     nodepools: list[Day1NodePool] = Field(default_factory=list)
     upgrade: ClusterUpgradeSettings = Field(default_factory=ClusterUpgradeSettings)
     # What the parser refused, line by line: a duplicate key, a NodePool

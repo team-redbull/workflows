@@ -207,7 +207,14 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   or a renewal EXTENDS it; renewed as the Agent wait begins; held a day after
   success; released ONLY after a teardown (a failure elsewhere leaves it to its
   TTL, since half-created resources may still name the machine). A lock held
-  elsewhere is a skip (`reserved`), like every candidate reason. Needs an ADMIN
+  elsewhere is a skip (`reserved`), like every candidate reason. A RE-RUN of the
+  same named install (same workflow id) after such a failure never reached
+  `reserve_server`: `/servers/available` hides a locked machine even from its
+  holder, so it failed for two hours on a bare "no assignable server" (the
+  2026-10-31 incident). So a named machine it refuses is read once more
+  (`lookup_install_candidate`, gated `named-install-own-lock-rerun`): the run goes
+  on when the only reason is its OWN workflow id's lock, and otherwise fails
+  saying which (another run's lock, a claim, maintenance, its health). Needs an ADMIN
   `SERVER_SCAN_API_TOKEN`. Gated by `workflow.patched("server-scan-install-lock")`
   so runs started before it replay unchanged — keep the patch until none can
   remain in history.

@@ -138,7 +138,11 @@ a run that dies costs one TTL rather than the machine. It is released only
 after a teardown has proved nothing on the cluster still points at the machine
 — a failure anywhere else leaves it held until it expires, deliberately, since
 half-created resources may still name it. Runs started before the lock existed
-replay without it (`workflow.patched`).
+replay without it (`workflow.patched`). A RE-RUN of a named install after such a
+failure meets its own lock: server-scan hides a locked machine from
+`/servers/available` whoever asks, so the machine's record is read and the run
+goes on when that lock — its own workflow id's — is the only reason
+(_named_server_refused); re-taking it is an extension.
 
 A NAMED SERVER MAY BE INSTALLED UNHEALTHY, ON REQUEST — the hidden
 `allow_unhealthy` (CLAUDE.md §4). `/servers/available` is still asked first;
@@ -371,6 +375,10 @@ _PXE_BOOT_MAC_ONLY_PATCH = "pxe-map-boot-mac-only"
 # the server refused when something does. A run recorded before it met the
 # conflict at create_nmstate_config instead (BmhConflictError).
 _NMSTATE_REPLACE_PATCH = "nmstateconfig-replace-unless-in-use"
+# Gates the second look at a NAMED server /servers/available refuses: a re-run
+# recovers its own workflow id's leftover lock, and any other refusal says why.
+# A run recorded before it failed on the refusal as server-scan gave it.
+_OWN_LOCK_RERUN_PATCH = "named-install-own-lock-rerun"
 
 # assisted-service regenerates the discovery image within seconds of an
 # NMStateConfig change; ten minutes of no new image means it is not going to
@@ -587,6 +595,7 @@ class InstallServerWorkflow:
         self._infra_env_boot = False
         self._pxe_boot_mac_only = False
         self._nmstate_replace = False
+        self._own_lock_rerun = False
         # The health refusals waived for the server being installed
         # (`allow_unhealthy`), each with what was observed.
         self._allowed_unhealthy: list[WaivedHealthCheck] = []
@@ -623,6 +632,7 @@ class InstallServerWorkflow:
         self._infra_env_boot = workflow.patched(_PXE_INFRAENV_BOOT_PATCH)
         self._pxe_boot_mac_only = workflow.patched(_PXE_BOOT_MAC_ONLY_PATCH)
         self._nmstate_replace = workflow.patched(_NMSTATE_REPLACE_PATCH)
+        self._own_lock_rerun = workflow.patched(_OWN_LOCK_RERUN_PATCH)
         workflow.logger.info(
             "Installing a server into InfraEnv=%s for MCE=%s",
             infra_env,
@@ -1038,8 +1048,9 @@ class InstallServerWorkflow:
 
         `/servers/available` is always asked first, so a machine it hands out
         comes with its live recheck. A NAMED machine it refuses is looked up
-        once more when the request asked for `allow_unhealthy`
-        (_named_server_refused); every other refusal fails the run as before.
+        once more (_named_server_refused) — to recover this workflow id's own
+        leftover lock, and, when the request asked for `allow_unhealthy`, to
+        waive its health. A pool draw's refusal fails the run as before.
         """
         try:
             candidates = await workflow.execute_activity(
@@ -1058,27 +1069,51 @@ class InstallServerWorkflow:
             cause = err.cause
             if not (
                 install_input.server_name
-                and install_input.allow_unhealthy
+                and (install_input.allow_unhealthy or self._own_lock_rerun)
                 and isinstance(cause, ApplicationError)
                 and cause.type == ServerNotAvailableError.__name__
             ):
                 raise
-            return await self._named_server_refused(install_input.server_name, cause, task_queue)
+            found = await self._named_server_refused(
+                install_input.server_name,
+                cause,
+                task_queue,
+                waive_health=install_input.allow_unhealthy,
+            )
+            if found is None:
+                raise
+            return found
         return candidates, []
 
     async def _named_server_refused(
-        self, server_name: str, refused: ApplicationError, task_queue: str
-    ) -> tuple[list[AcquiredServer], list[WaivedHealthCheck]]:
-        """A named machine `/servers/available` refused: why, and whether that may be waived.
+        self,
+        server_name: str,
+        refused: ApplicationError,
+        task_queue: str,
+        *,
+        waive_health: bool,
+    ) -> tuple[list[AcquiredServer], list[WaivedHealthCheck]] | None:
+        """A named machine `/servers/available` refused: why, and whether the run may go on.
 
         Its 404 cannot say — the detail names neither the network category nor
         the install lock — so server-scan's stored record is read
-        (lookup_install_candidate) and sorted by health_waiver: a SAFETY reason
-        (unknown, claimed, contested, maintenance, another run's lock) fails
-        the run whatever was asked; the server's own HEALTH is waived — and
-        recorded — because the request asked. A record showing nothing wrong
-        means the live recheck refused it, which is waived and recorded too;
-        the run's own leftover lock is no reason at all.
+        (lookup_install_candidate) and sorted by health_waiver:
+
+          * a SAFETY reason (unknown, claimed, contested, maintenance, ANOTHER
+            run's lock) fails the run, whatever was asked, saying which;
+          * the server's own HEALTH fails it too, saying which — unless the
+            request asked for `allow_unhealthy`: then it is waived and recorded,
+            as is a record showing nothing wrong (the live recheck refused it);
+          * THIS workflow id's own live lock is no reason at all. A run that
+            failed after its lock — mid-create — leaves it to its TTL, on
+            purpose (CLAUDE.md §4), and server-scan hides a locked machine from
+            `/servers/available` even from the run that holds it, so without
+            this a re-run of the same named install — the documented recovery —
+            failed for two hours on a bare "no assignable server". Re-taking the
+            lock is an extension (server-scan's own rule).
+
+        None: the record shows no reason at all and nothing was asked to be
+        waived, so the refusal stands as server-scan gave it.
         """
         record = await workflow.execute_activity(
             lookup_install_candidate,
@@ -1088,28 +1123,58 @@ class InstallServerWorkflow:
             schedule_to_start_timeout=_SCHEDULE_TO_START_TIMEOUT,
             retry_policy=_RETRY_POLICY,
         )
-        refusal = safety_refusal(record, workflow.info().workflow_id)
+        workflow_id = workflow.info().workflow_id
+        refusal = safety_refusal(record, workflow_id)
         if refusal is not None:
             message = (
                 f"server-scan will not hand out {server_name} ({refused.message}), and "
-                f"its record says why: {refusal.reason}. That is a safety refusal, "
-                "which allow_unhealthy never waives"
+                f"its record says why: {refusal.reason}"
             )
+            if waive_health:
+                message += ". That is a safety refusal, which allow_unhealthy never waives"
+            elif refusal.another_runs_lock:
+                message += (
+                    ". A run that failed keeps its lock until it expires; wait for that, "
+                    "or release the lock in server-scan once nothing on the MCE still "
+                    "points at the machine"
+                )
             if refusal.another_runs_lock:
                 raise ApplicationError(message, type=ServerReservedError.__name__)
             raise ApplicationError(message, type=ServerNotAvailableError.__name__)
 
-        waived = health_findings(record)
-        if not waived and not holds_own_lock(record, workflow.info().workflow_id):
-            waived = [WaivedHealthCheck(check="server-scan-recheck", observed=refused.message)]
-        workflow.logger.warning(
-            "allow_unhealthy: server-scan refused %s (%s); its record shows no safety "
-            "reason, so the install goes ahead",
-            server_name,
-            refused.message,
-        )
-        # Never None here: safety_refusal refuses a record with no server.
-        return [cast(AcquiredServer, record.server)], waived
+        findings = health_findings(record)
+        own_lock = holds_own_lock(record, workflow_id)
+        # Never None past safety_refusal, which refuses a record with no server.
+        server = cast(AcquiredServer, record.server)
+        if waive_health:
+            waived = findings
+            if not waived and not own_lock:
+                waived = [WaivedHealthCheck(check="server-scan-recheck", observed=refused.message)]
+            workflow.logger.warning(
+                "allow_unhealthy: server-scan refused %s (%s); its record shows no safety "
+                "reason, so the install goes ahead",
+                server_name,
+                refused.message,
+            )
+            return [server], waived
+        if findings:
+            raise ApplicationError(
+                f"server-scan will not hand out {server_name} ({refused.message}): it is "
+                "not healthy — "
+                + "; ".join(f"{f.check}: {f.observed}" for f in findings),
+                type=ServerNotAvailableError.__name__,
+            )
+        if own_lock:
+            workflow.logger.warning(
+                "%s is held by this workflow id's own install lock (%s, until %s), left by "
+                "an earlier run of it; re-taking it extends it, and nothing else in "
+                "server-scan's record refuses the machine",
+                server_name,
+                record.lock.holder,
+                record.lock.expires_at,
+            )
+            return [server], []
+        return None
 
     async def _reserve(
         self,

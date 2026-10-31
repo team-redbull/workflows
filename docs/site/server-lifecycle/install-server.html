@@ -196,7 +196,7 @@
           <tr><td>No Agent within 1 h</td><td class="muted">Deletes the candidate&rsquo;s resources, tries the next</td><td class="muted">released at once</td></tr>
           <tr><td>The lock lapsed mid-install and another run took the machine</td><td class="muted">Deletes <em>its own</em> resources, tries the next</td><td class="muted">the other run&rsquo;s, untouched</td></tr>
           <tr><td>Every candidate skipped or tried</td><td class="muted">Fails, reasons grouped</td><td class="muted">none left held</td></tr>
-          <tr><td>The run crashes or fails while creating resources (e.g. <code>BmhConflictError</code>)</td><td class="muted">Stops; resources are <b>left</b> on the MCE</td><td class="muted">expires after 2 h</td></tr>
+          <tr><td>The run crashes or fails while creating resources (e.g. <code>BmhConflictError</code>)</td><td class="muted">Stops; resources are <b>left</b> on the MCE</td><td class="muted">expires after 2 h; a re-run of the same named install extends it</td></tr>
           <tr><td>An operator cancels the run</td><td class="muted">Stops; resources are <b>left</b>, so you can see how far it got</td><td class="muted">expires on its own</td></tr>
           <tr><td>No worker is running in that MCE</td><td class="muted">Waits; the <code>progress</code> query names the unserved queue</td><td class="muted">&mdash;</td></tr>
           <tr><td>The server-scan token lacks the admin role</td><td class="muted">Fails at the first lock, <code>ServerScanAuthError</code></td><td class="muted">never taken</td></tr>
@@ -214,7 +214,12 @@
       <code>AVAILABLE</code> again once the 24 h &mdash; server-scan&rsquo;s ceiling &mdash; ran out.</p>
       <p><b>A crash mid-create strands resources.</b> The BareMetalHost stays on the MCE while the lock
       expires after 2 h, so after that the machine is drawable while still pointing at one cluster.
-      Clean these up by hand, or re-run with <code>server_names</code> set to that machine to converge on them.</p>
+      Clean these up by hand, or re-run the same named install (<code>server_names</code> set to that
+      machine) to converge on them. server-scan hides a locked machine from <code>/servers/available</code>
+      even from the run that holds the lock, so a named run it refuses reads the machine&rsquo;s record and
+      goes on when the only reason is its <em>own</em> workflow id&rsquo;s lock, which it then extends. Any
+      other refusal of a named server &mdash; another run&rsquo;s lock, a cluster&rsquo;s claim, maintenance,
+      its health &mdash; fails saying which.</p>
     </div>
   </section>
 

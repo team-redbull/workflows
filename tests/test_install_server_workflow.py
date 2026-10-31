@@ -29,11 +29,12 @@ from shared.consts import (
     server_lifecycle_activity_queue,
 )
 from shared.exceptions import (
+    BmhConflictError,
     InfraEnvNotFoundError,
-    ServerLooksInstalledError,
     InventorySegmentNotFoundError,
     PxeMapAuthError,
     PxeSiteNotConfiguredError,
+    ServerLooksInstalledError,
     ServerNotAvailableError,
     ServerReservedError,
     ServerScanAuthError,
@@ -209,6 +210,8 @@ def make_mock_activities(
     record: InstallCandidateRecord | None = None,
     nmstate_differs: dict[str, list[str]] | None = None,
     in_use: dict[str, str] | None = None,
+    nmstate_error_once: bool = False,
+    scan_hides_locked: bool = False,
 ):
     """Build the full mock activity set + a call recorder.
 
@@ -235,7 +238,12 @@ def make_mock_activities(
     makes the PXE VM report a newer image already published.
 
     `nmstate_error` is raised by `create_nmstate_config` — the incident in which
-    the NMStateConfig already existed with other content (BmhConflictError).
+    the NMStateConfig already existed with other content (BmhConflictError) —
+    every time, or only the first time with `nmstate_error_once`.
+
+    `scan_hides_locked` makes `acquire_servers` answer as server-scan's does
+    for a NAMED machine under a live install lock: 404, whoever holds the lock
+    — the run's own workflow id included (its `server_still_qualifies`).
 
     `record` is what `lookup_install_candidate` reads from server-scan for a
     named server `/servers/available` refused; None = server-scan does not
@@ -270,6 +278,7 @@ def make_mock_activities(
         )
     }
     configured_pxe_sites = {"bat-yam"} if pxe_sites is None else pxe_sites
+    nmstate_failed_once: list[bool] = []
     drawn = candidates if candidates is not None else [bondable_server()]
     script = list(bmh_script or [])
     installed = already_installed or set()
@@ -294,6 +303,14 @@ def make_mock_activities(
         calls["order"].append("acquire_servers")
         if acquire_error is not None:
             raise acquire_error
+        if scan_hides_locked and request.name is not None:
+            locked = [s for s in drawn if s.name == request.name and s.id in locks]
+            if locked:
+                raise ServerNotAvailableError(
+                    f"server-scan has no assignable server for this request: "
+                    f"'{request.name}' is no longer available: health=HEALTHY, "
+                    "openshift=AVAILABLE, maintenance=False, reachable=True"
+                )
         return list(drawn)
 
     @activity.defn
@@ -394,7 +411,9 @@ def make_mock_activities(
     async def create_nmstate_config(request: BmhResourceRequest) -> CreatedResource:
         calls["create_nmstate_config"].append(request)
         calls["order"].append("create_nmstate_config")
-        if nmstate_error is not None:
+        if nmstate_error is not None and not nmstate_failed_once:
+            if nmstate_error_once:
+                nmstate_failed_once.append(True)
             raise nmstate_error
         return _created("NMStateConfig", f"nmstate-config-{request.server_name}")
 
@@ -2115,3 +2134,130 @@ class TestAConflictingNmStateConfig:
         message = str(_application_error(excinfo.value))
         assert "already hold a BareMetalHost" in message
         assert _IN_USE in message
+
+
+# --- a re-run of a named install after a failure: its own leftover lock -------
+
+_RERUN_ID = f"install-server-{MCE_CLUSTER}_{SERVER_NAME.lower()}"
+_OWN_LOCK = ServerLockRecord(
+    live=True, holder="install-server", workflow_id=_RERUN_ID, mce_cluster=MCE_CLUSTER,
+    expires_at="2026-10-31T16:00:00Z",
+)
+_NAMED_RUN = INPUT.model_copy(update={"server_name": SERVER_NAME})
+
+
+class TestARerunAfterAFailure:
+    """The second half of the incident: the retry "told us it had failed".
+
+    A run that fails after its lock — the NMStateConfig conflict did, at
+    create_nmstate_config — leaves the lock to its 2 h TTL ON PURPOSE (its
+    half-created resources may still name the machine). The re-run of the
+    same named install, on the same workflow id, was meant to extend it. But
+    server-scan's `/servers/available` hides a locked machine even from the
+    run holding it, so the re-run failed at once with a bare "no assignable
+    server" for two hours. A named re-run now looks again and recovers its OWN
+    lock; anything else refused says why.
+    """
+
+    async def test_the_incident_end_to_end(self):
+        calls, segment_acts, server_acts = make_mock_activities(
+            nmstate_error=BmhConflictError(
+                "NMStateConfig nmstate-config-x already exists and does not match this "
+                "request: VLAN id: want ['24'], found ['77']"
+            ),
+            nmstate_error_once=True,
+            scan_hides_locked=True,
+            record=scan_record(bondable_server(), health=_FINE, lock=_OWN_LOCK),
+        )
+        async with _Harness(segment_acts, server_acts) as client:
+            with pytest.raises(WorkflowFailureError) as excinfo:
+                await _execute_as(client, InstallServerRunArgs(input=_NAMED_RUN), _RERUN_ID)
+            # The first run: failed mid-create, lock left to its TTL by design.
+            assert _application_error(excinfo.value).type == "BmhConflictError"
+            assert calls["release_server"] == []
+
+            # The operator deletes the NMStateConfig and runs it again.
+            result = await _execute_as(client, InstallServerRunArgs(input=_NAMED_RUN), _RERUN_ID)
+
+        assert result.server_name == SERVER_NAME
+        assert [r.server_name for r in calls["lookup_install_candidate"]] == [SERVER_NAME]
+        # Its lock, extended — never released and re-taken.
+        assert {c.workflow_id for c in calls["reserve_server"]} == {_RERUN_ID}
+        assert calls["release_server"] == []
+        assert result.allowed_unhealthy == []
+
+    async def test_another_runs_lock_fails_saying_whose_and_until_when(self):
+        theirs = ServerLockRecord(
+            live=True, holder="install-server", workflow_id="install-server-ocp4-b_pool_1",
+            mce_cluster="ocp4-b", expires_at="2026-10-31T16:00:00Z",
+        )
+        calls, segment_acts, server_acts = make_mock_activities(
+            acquire_error=_refused(), record=scan_record(bondable_server(), health=_FINE, lock=theirs)
+        )
+        async with _Harness(segment_acts, server_acts) as client:
+            with pytest.raises(WorkflowFailureError) as excinfo:
+                await _execute_as(client, InstallServerRunArgs(input=_NAMED_RUN), _RERUN_ID)
+
+        error = _application_error(excinfo.value)
+        assert error.type == "ServerReservedError"
+        message = str(error)
+        assert "install-server-ocp4-b_pool_1" in message and "2026-10-31T16:00:00Z" in message
+        assert "keeps its lock until it expires" in message
+        assert "unhealthy" not in message  # the hidden option is never named
+        assert calls["reserve_server"] == []
+
+    async def test_an_unhealthy_server_fails_saying_which_check(self):
+        _, segment_acts, server_acts = make_mock_activities(
+            acquire_error=_refused(),
+            record=scan_record(one_nic_up_server(), health={"overall": "HEALTHY", "network": "MAJOR"}),
+        )
+        async with _Harness(segment_acts, server_acts) as client:
+            with pytest.raises(WorkflowFailureError) as excinfo:
+                await _execute_as(client, InstallServerRunArgs(input=_NAMED_RUN), _RERUN_ID)
+
+        error = _application_error(excinfo.value)
+        assert error.type == "ServerNotAvailableError"
+        assert "network-health: network MAJOR" in str(error)
+        assert "allow_unhealthy" not in str(error)
+
+    async def test_its_own_lock_does_not_excuse_ill_health(self):
+        _, segment_acts, server_acts = make_mock_activities(
+            acquire_error=_refused(), record=scan_record(one_nic_up_server(), lock=_OWN_LOCK)
+        )
+        async with _Harness(segment_acts, server_acts) as client:
+            with pytest.raises(WorkflowFailureError) as excinfo:
+                await _execute_as(client, InstallServerRunArgs(input=_NAMED_RUN), _RERUN_ID)
+        assert _application_error(excinfo.value).type == "ServerNotAvailableError"
+
+    async def test_a_claimed_server_fails_saying_so(self):
+        _, segment_acts, server_acts = make_mock_activities(
+            acquire_error=_refused(),
+            record=scan_record(bondable_server(), health=_FINE, lifecycle="INSTALLED", cluster="hc-a"),
+        )
+        async with _Harness(segment_acts, server_acts) as client:
+            with pytest.raises(WorkflowFailureError) as excinfo:
+                await _execute_as(client, InstallServerRunArgs(input=_NAMED_RUN), _RERUN_ID)
+
+        error = _application_error(excinfo.value)
+        assert error.type == "ServerNotAvailableError"
+        assert "a cluster claims it" in str(error)
+
+    async def test_a_refusal_the_record_cannot_explain_stands_as_server_scan_gave_it(self):
+        refused = _refused()
+        _, segment_acts, server_acts = make_mock_activities(
+            acquire_error=refused, record=scan_record(bondable_server(), health=_FINE)
+        )
+        async with _Harness(segment_acts, server_acts) as client:
+            with pytest.raises(WorkflowFailureError) as excinfo:
+                await _execute_as(client, InstallServerRunArgs(input=_NAMED_RUN), _RERUN_ID)
+
+        error = _application_error(excinfo.value)
+        assert error.type == "ServerNotAvailableError"
+        assert error.message == str(refused)  # untouched: the activity's own failure
+
+    async def test_a_pool_draw_never_looks_again(self):
+        calls, segment_acts, server_acts = make_mock_activities(acquire_error=_refused())
+        async with _Harness(segment_acts, server_acts) as client:
+            with pytest.raises(WorkflowFailureError):
+                await _execute(client, InstallServerRunArgs(input=INPUT))
+        assert calls["lookup_install_candidate"] == []

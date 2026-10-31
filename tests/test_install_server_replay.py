@@ -46,13 +46,18 @@ from shared.exceptions import (
     ServerLooksInstalledError,
     ServerNotAvailableError,
 )
-from shared.models.server_lifecycle import InstallServerInput, InstallServerRunArgs
+from shared.models.server_lifecycle import (
+    InstallServerInput,
+    InstallServerRunArgs,
+    ServerLockRecord,
+)
 from tests.test_install_server_workflow import (
     INPUT,
     SERVER_NAME,
     _application_error,
     _Harness,
     _refused,
+    _FINE,
     _unhealthy,
     bondable_server,
     make_mock_activities,
@@ -138,6 +143,23 @@ SCENARIOS: dict[str, Callable[[], Scenario]] = {
         mocks={"in_use": {SERVER_NAME: f"BareMetalHost {SERVER_NAME.lower()} exists"}},
         input=_named(SERVER_NAME),
         fails_with=ServerLooksInstalledError.__name__,
+    ),
+    # A re-run of a named install after a failure: server-scan hides the
+    # machine behind the run's OWN leftover lock; the record shows it is ours.
+    "named-own-lock-rerun": lambda: Scenario(
+        mocks={
+            "acquire_error": _refused(),
+            "record": scan_record(
+                bondable_server(),
+                health=_FINE,
+                lock=ServerLockRecord(
+                    live=True,
+                    holder="install-server",
+                    workflow_id="install-server-replay-named-own-lock-rerun",
+                ),
+            ),
+        },
+        input=_named(SERVER_NAME),
     ),
     # Skips before the install: no bond, another run's lock, then the next.
     "skips-then-install": lambda: Scenario(

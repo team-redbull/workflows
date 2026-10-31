@@ -183,7 +183,7 @@ check before a cluster write. No NIC count is sent to server-scan
 | no Agent within 1 h | deletes the candidate's resources, tries the next | released at once |
 | the lock lapsed and another run took the machine | deletes its *own* resources, tries the next | theirs, untouched |
 | every candidate skipped or tried | fails, reasons grouped | none held |
-| crash/failure while creating resources | stops, resources **left** on the MCE | expires after 2 h |
+| crash/failure while creating resources | stops, resources **left** on the MCE | expires after 2 h; a re-run of the same named install extends it |
 | operator cancels | stops, resources **left** to show progress | expires |
 | no worker in that MCE | waits; `progress` names the queue | — |
 | server-scan token not admin | fails at the first lock (`ServerScanAuthError`) | never taken |
@@ -196,7 +196,13 @@ would read the machine `AVAILABLE` again after the 24 h (server-scan's ceiling).
 
 **Known gap.** A crash
 mid-create leaves the BareMetalHost on the MCE while the lock expires after
-2 h; clean up by hand, or re-run with `server_names` set to that machine.
+2 h; clean up by hand, or re-run the same named install (`server_names` set to
+that machine, so the same workflow id). server-scan hides a locked machine
+from `/servers/available` even from the run holding the lock, so a named run it
+refuses reads the machine's record (`lookup_install_candidate`) and goes on
+when the only reason is its OWN workflow id's lock, which it then extends. Any
+other refusal of a named server — another run's lock, a cluster's claim,
+maintenance, its health — fails saying which.
 
 #### Phase by phase
 

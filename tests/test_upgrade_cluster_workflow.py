@@ -183,6 +183,40 @@ class TestTheHappyPath:
             await h.result()
         assert [e.by for e in second.log if e.event == "day2-confirmed"] == ["day2-team"]
 
+    async def test_a_lab_cluster_with_no_day2_application_is_not_held_for_confirm_day2(self):
+        # D27: nothing to sync, so nobody to wait for — and a lab run can be hands-off.
+        fleet = Fleet(control_plane="4.19.53", upgrade=ClusterUpgradeSettings(wave=0))
+        fleet.day2_apps = []
+        async with Harness(fleet) as h:
+            await h.start(request(target_version="4.20.44", auto_approve=True, workers_to_target=False))
+            result = await h.result()
+        assert result.outcome is UpgradeOutcome.DONE
+        assert not any(e.event == "day2-confirmed" for e in result.log)
+        [skipped] = [e.detail for e in result.log if e.event == "day2-skipped"]
+        assert f"no Application labelled day2.gitops/cluster={CLUSTER}" in skipped
+        assert fleet.calls.count("list_day2_applications") == 1
+
+    async def test_a_lab_cluster_with_a_day2_application_waits_for_its_team(self):
+        fleet = Fleet(control_plane="4.19.53", upgrade=ClusterUpgradeSettings(wave=0))
+        async with Harness(fleet) as h:
+            await h.start(request(target_version="4.20.44", auto_approve=True, workers_to_target=False))
+            waiting = await h.until(UpgradePhase.AWAITING_DAY2_CONFIRM)
+            assert "day2.gitops/cluster=" + CLUSTER in waiting.waiting_for
+            await h.decide(Run.confirm_day2, DAY2)
+            result = await h.result()
+        assert [e.by for e in result.log if e.event == "day2-confirmed"] == ["day2-team"]
+        assert not any(e.event == "day2-skipped" for e in result.log)
+
+    async def test_a_canary_with_no_day2_application_still_waits_and_is_not_even_listed(self):
+        fleet = Fleet(control_plane="4.19.53", upgrade=ClusterUpgradeSettings(wave=1))
+        fleet.day2_apps = []
+        async with Harness(fleet) as h:
+            await h.start(request(target_version="4.20.44", auto_approve=True, workers_to_target=False))
+            await h.until(UpgradePhase.AWAITING_DAY2_CONFIRM)
+            await h.decide(Run.confirm_day2, DAY2)
+            await h.result()
+        assert "list_day2_applications" not in fleet.calls
+
     async def test_auto_mode_rolls_by_zone_and_soaks_in_the_gate(self):
         fleet = Fleet(
             control_plane="4.20.44",

@@ -204,6 +204,17 @@ def nodepool_roll_deadline_minutes(replicas: int | None, max_unavailable: str | 
     return batches * PER_BATCH_MINUTES
 
 
+# Lab clusters only (wave 0): with no day2 Application, nobody has a layer to
+# sync after a control-plane step, so the run does not wait for confirm-day2
+# (the owner, 2026-11-01, D27). A canary (1) and every production wave wait.
+_LAB_WAVES = (0,)
+
+
+def day2_confirm_may_be_skipped(wave: int | None) -> bool:
+    """Whether confirm-day2 may be skipped when the cluster has no day2 Application: lab clusters only (D27)."""
+    return wave in _LAB_WAVES
+
+
 def tier1_enabled(wave: int | None) -> bool:
     """Whether the agent runs tier-1 actions itself, judge-reviewed, within its budget (AGENT.md #25).
 

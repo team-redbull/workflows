@@ -75,6 +75,22 @@ def mce(monkeypatch):
     return fake
 
 
+class TestTheDay2Applications:
+    async def test_the_cluster_s_day2_applications_by_their_label(self, monkeypatch):
+        seen = {}
+
+        async def _list(**kwargs):
+            seen.update(kwargs)
+            return [{"metadata": {"name": "b-day2"}}, {"metadata": {"name": "a-day2"}}, {"metadata": {}}]
+
+        monkeypatch.setattr(cluster_api, "list_custom_objects", _list)
+        monkeypatch.setattr(limb, "_settings", limb._settings.model_copy(update={"argo_namespace": "gitops-hc"}))
+        result = await limb.list_day2_applications(HostedClusterRequest(mce_cluster="m", cluster="lab-upgrade"))
+        assert result.names == ["a-day2", "b-day2"]
+        assert (seen["plural"], seen["namespace"]) == ("applications", "gitops-hc")
+        assert seen["label_selector"] == "day2.gitops/cluster=lab-upgrade"
+
+
 class TestFindingTheHostedCluster:
     async def test_found_by_name_in_its_own_namespace_with_its_nodepools(self, mce):
         mce.nodepools = [
@@ -1159,6 +1175,22 @@ class TestTheMceCallsAreBounded:
         ]
         assert len(calls) >= 17, "the scan no longer finds the SDK calls"
         assert [c.func.attr for c in calls if "_request_timeout" not in {k.arg for k in c.keywords}] == []
+
+    async def test_a_label_selector_reaches_the_client_and_none_is_not_sent(self, monkeypatch):
+        seen = []
+
+        class _Api:
+            def list_namespaced_custom_object(self, **kwargs):
+                seen.append(kwargs)
+                return {"items": []}
+
+        monkeypatch.setattr(cluster_api, "_load_kube", lambda: None)
+        monkeypatch.setattr(cluster_api.k8s_client, "CustomObjectsApi", _Api)
+        await cluster_api.list_custom_objects(group="g", version="v", plural="p", kind="K", namespace="n",
+                                              label_selector="a=b")
+        await cluster_api.list_custom_objects(group="g", version="v", plural="p", kind="K", namespace="n")
+        assert seen[0]["label_selector"] == "a=b"
+        assert "label_selector" not in seen[1]
 
     async def test_the_timeout_reaches_the_client(self, monkeypatch):
         seen = {}

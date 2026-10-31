@@ -1012,7 +1012,8 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   and its RBAC is derived call by call from `activities/cluster_upgrade/activities.py` (its
   README's table): a ClusterRole reading HostedClusters, NodePools, MachineSets, IDMS and Secrets
   (the admin kubeconfig) and deleting pods (`delete_hcp_pod`), a Role in `ARGO_NAMESPACE`
-  (applications get/patch) and one on ConfigMap `hypershift/supported-versions`. Never a write to a
+  (applications get/list/patch — list for a lab cluster's day2 Applications, D27) and one on ConfigMap
+  `hypershift/supported-versions`. Never a write to a
   HostedCluster or NodePool (DESIGN D1). Its chart is NOT in redbull-platform yet, so CI's
   `build-cluster-upgrade-worker` builds the IMAGE ONLY (`<branch-slug>-<short sha>`, the chart's
   `image.tag` set by hand), like upgrade-agent-worker's; once the chart is vendored it moves to

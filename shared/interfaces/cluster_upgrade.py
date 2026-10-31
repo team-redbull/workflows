@@ -30,6 +30,7 @@ from shared.models.cluster_upgrade import (
     ArgoApplicationState,
     ArgoSyncRequest,
     ArgoSyncResult,
+    Day2Applications,
     EvidenceBundle,
     EvidenceRequest,
     GateOutcome,
@@ -63,6 +64,16 @@ async def read_hosted_cluster(request: HostedClusterRequest) -> HostedClusterSta
 @activity.defn
 async def read_argo_application(request: HostedClusterRequest) -> ArgoApplicationState:
     """The cluster's Application in ARGO_NAMESPACE: sync, health, what is out of sync."""
+    ...
+
+
+@activity.defn
+async def list_day2_applications(request: HostedClusterRequest) -> Day2Applications:
+    """The cluster's day2 Applications in ARGO_NAMESPACE (label `day2.gitops/cluster=<cluster>`), by name.
+
+    Read after a control-plane step of a lab cluster (wave 0): none means no
+    day2 layer to sync, so nobody has to confirm one (D27).
+    """
     ...
 
 

@@ -269,8 +269,9 @@ async def list_custom_objects(
     plural: str,
     kind: str,
     namespace: str,
+    label_selector: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Every namespaced custom resource of one kind, or [] when there are none.
+    """Every namespaced custom resource of one kind (with `label_selector`, those it matches), or [] when none.
 
     A 404 is an EMPTY LIST, not an error, for one specific reason: the Agent CRD
     is installed by the Assisted Installer, and a namespace that has never had
@@ -285,6 +286,7 @@ async def list_custom_objects(
             response = k8s_client.CustomObjectsApi().list_namespaced_custom_object(
                 group=group, version=version, namespace=namespace, plural=plural,
                 _request_timeout=_REQUEST_TIMEOUT,
+                **({"label_selector": label_selector} if label_selector else {}),
             )
         except k8s_client.ApiException as exc:
             if exc.status == _NOT_FOUND:

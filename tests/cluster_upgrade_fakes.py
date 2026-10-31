@@ -54,6 +54,7 @@ from shared.models.cluster_upgrade import (
     Day1ClusterRequest,
     Day1Commit,
     Day1NodePool,
+    Day2Applications,
     Day2Layers,
     Day2LayersRequest,
     EvidenceBundle,
@@ -72,9 +73,9 @@ from shared.models.cluster_upgrade import (
     MceState,
     NodePoolGateRequest,
     NodePoolState,
+    PinReleasesRequest,
     PinnedRelease,
     PinnedReleases,
-    PinReleasesRequest,
     ProposedActionRequest,
     ReleaseLayout,
     ReleaseTags,
@@ -211,6 +212,9 @@ class Fleet:
         self.gate_script: list[GateOutcome] = []
         self.verdicts: list[AgentVerdict] = []
         self.health_script: list[HostedHealth] = []
+        # The cluster's day2 Applications on the MCE: one by default, so a run
+        # waits for confirm-day2 in every wave unless a test empties it (D27).
+        self.day2_apps: list[str] = [f"{CLUSTER}-day2-operators"]
         # The hosted cluster's admin gates (admin-gates) and acks (admin-acks),
         # who called the gated APIs in the last 24 hours, and how many reads
         # after an ack the CVO still says AdminAckRequired.
@@ -404,6 +408,11 @@ class Fleet:
             return ArgoApplicationState(found=True, sync_status="Synced", health_status="Healthy",
                                         revision=f"rev-{fleet.revision}")
 
+        @activity.defn(name="list_day2_applications")
+        async def list_day2_applications(request: HostedClusterRequest) -> Day2Applications:
+            fleet.calls.append("list_day2_applications")
+            return Day2Applications(names=list(fleet.day2_apps))
+
         @activity.defn(name="read_hosted_health")
         async def read_hosted_health(request: HostedHealthRequest) -> HostedHealth:
             fleet.calls.append("read_hosted_health")
@@ -521,7 +530,8 @@ class Fleet:
         return {
             HUB_QUEUE: [read_upgrade_rules, read_day1_cluster, list_release_tags, pin_release_digests,
                         check_day2_layers, commit_day1_change, write_incident],
-            MCE_QUEUE: [read_mce_state, read_hosted_cluster, read_argo_application, read_hosted_health,
+            MCE_QUEUE: [read_mce_state, read_hosted_cluster, read_argo_application, list_day2_applications,
+                        read_hosted_health,
                         read_admin_acks, give_admin_ack, sync_argo_application, watch_control_plane,
                         watch_nodepool, watch_nodepool_gate, collect_evidence, execute_proposed_action],
             AGENT_QUEUE: [invoke_upgrade_agent],

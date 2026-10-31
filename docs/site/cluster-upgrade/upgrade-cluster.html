@@ -520,7 +520,8 @@
           <p>Then <b>day2</b>: the cluster&rsquo;s day2 Applications (<code>day2.gitops/cluster=&lt;cluster&gt;</code>)
           now render for the new version and are OutOfSync. The day2 team syncs them; the run waits for
           <code>confirm-day2</code>, after <b>every</b> control-plane step, intermediate ones too. It never
-          syncs day2 itself.</p>
+          syncs day2 itself. The one exception: a lab cluster (<code>upgrade.wave</code> 0) with no day2
+          Application on the MCE has no layer to sync, so the run logs <code>day2-skipped</code> and goes on.</p>
           <p class="note">The child is started with <code>ParentClosePolicy.ABANDON</code>: a parent terminated
           mid-step leaves the slot taken until the step ends. The parent drives it by signals
           (<code>stop</code>, <code>hold</code>, <code>retry</code>), never by cancellation. An early end before
@@ -680,6 +681,8 @@
           <li>The agent&rsquo;s tier 1 (<code>tier1_enabled</code>): on in waves 0&ndash;1, where the agent will run
             a known-safe fix itself once its judge and tier-1 tools exist; off elsewhere, where every fix is a
             proposal a person approves.</li>
+          <li><code>confirm-day2</code> with no day2 Application on the MCE: skipped on wave 0 only (a lab
+            cluster); a canary and every production wave still wait for it.</li>
         </ul>
         <p class="note">Today tier 1 is not built: the agent service ignores <code>tier1_enabled</code> and
         proposes every fix, in every wave. Fleet waves are not built either: running a whole wave of clusters
@@ -689,8 +692,8 @@
         <h3>Always a person, in every mode</h3>
         <ul>
           <li><code>confirm-day2</code> after <b>every</b> control-plane step, intermediate ones included: the
-            day2 team syncs their layer for the new version, and only they confirm. So even a wave-0 run with
-            both automatic options stops once per control-plane step.</li>
+            day2 team syncs their layer for the new version, and only they confirm. The one exception is a lab
+            cluster (wave 0) with no day2 Application: there is nothing to sync, so the run goes on.</li>
           <li><code>approve-admin-ack</code> when a client called a gated API in the last 24 hours. With no
             caller the run gives the ack itself, in every mode; a gate the rules do not list is
             <code>needs-human</code>.</li>
@@ -710,7 +713,7 @@
         <thead><tr><th>in practice</th><th>request</th><th>the run stops for</th></tr></thead>
         <tbody>
           <tr><td class="k">production (the default)</td><td class="muted">nothing extra</td><td class="muted"><code>approve</code> &rarr; per control-plane step <code>confirm-day2</code> &rarr; per NodePool <code>continue</code></td></tr>
-          <tr><td class="k">lab, hands-off</td><td class="muted"><code>"auto_approve": true, "nodepool_mode": "auto"</code> on wave 0 or 1</td><td class="muted">only <code>confirm-day2</code> per control-plane step, plus anything in the list above</td></tr>
+          <tr><td class="k">lab, hands-off</td><td class="muted"><code>"auto_approve": true, "nodepool_mode": "auto"</code> on wave 0 or 1</td><td class="muted">only <code>confirm-day2</code> per control-plane step &mdash; nothing at all on wave 0 with no day2 Application &mdash; plus anything in the list above</td></tr>
           <tr><td class="k">control plane now, workers later</td><td class="muted"><code>"workers_to_target": false</code></td><td class="muted"><code>approve</code> &rarr; <code>confirm-day2</code> per step; the NodePools only where the path forces it</td></tr>
           <tr><td class="k">a dry run</td><td class="muted">any; then <code>abort</code> at <code>awaiting-approval</code></td><td class="muted">the plan, pinned and pre-flighted; ends CANCELLED with nothing committed. With <code>auto_approve</code> there is no stop to abort at</td></tr>
         </tbody>

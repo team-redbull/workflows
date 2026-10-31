@@ -39,7 +39,9 @@ says what a person has to do next):
                                commits, syncs and watches;
        awaiting-day2-confirm — the day2 team syncs their layer for the new
                                version and confirms (D14). After EVERY
-                               control-plane step.
+                               control-plane step — but for a lab cluster
+                               (wave 0) with no day2 Application, which
+                               logs `day2-skipped` instead (D27).
      A WORKERS step, for each NodePool:
        awaiting-continue     — manual mode: the customer runs their own
                                readiness checks, and their `continue` is the
@@ -74,7 +76,8 @@ D20); elsewhere planning FAILS saying why, never a quiet switch to manual.
 `workers_to_target: false` ends at the control plane, the NodePools moving only
 where the path forces them. The wave also sets the agent's `tier1_enabled`
 (gates.tier1_enabled), which the agent ignores until tier 1 exists. No mode skips
-`confirm-day2`, an admin ack a client still needs, a needs-human stop or an
+`confirm-day2` (only a lab cluster, wave 0, with no day2 Application has none
+to give, D27), an admin ack a client still needs, a needs-human stop or an
 agent proposal: those always wait for a person.
 
 A failed gate goes to the agent once (dispatch.diagnose); it may clear the gate
@@ -137,6 +140,7 @@ with workflow.unsafe.imports_passed_through():
     from shared.interfaces.cluster_upgrade import (
         execute_proposed_action,
         give_admin_ack,
+        list_day2_applications,
         read_admin_acks,
         read_argo_application,
         read_hosted_cluster,
@@ -274,6 +278,9 @@ _ACTION_CHECKPOINT_PATCH = "upgrade-cluster-checkpoint-before-actions"
 # the owner whenever one is among them. Runs recorded before it skipped the
 # agent when the first-ranked failure was the PDB, and sent it the PDB otherwise.
 _OWNER_CHECKS_PATCH = "upgrade-preflight-owner-checks-apart"
+# A lab cluster (wave 0) with no day2 Application goes on after a control-plane
+# step without confirm-day2 (D27). Runs recorded before it always waited.
+_LAB_DAY2_PATCH = "upgrade-cluster-lab-skips-empty-day2"
 
 _LOG_LIMIT = 500
 _PROGRESS_LOG_TAIL = 20
@@ -598,6 +605,7 @@ class UpgradeClusterWorkflow:
             day1_path=day1.path,
             mce_cluster=self._mce,
             tier1_enabled=gates.tier1_enabled(day1.upgrade.wave),
+            wave=day1.upgrade.wave,
             admin_acks=rules.admin_acks,
             api_usage_ignored_users=rules.api_usage_ignored_users,
             hosted_cluster=self._hosted,
@@ -750,7 +758,16 @@ class UpgradeClusterWorkflow:
         self._cp_version = step.version
 
         # The day2 team's part (D14): their layer for the new version is now
-        # OutOfSync on their side, and only they sync it.
+        # OutOfSync on their side, and only they sync it. A lab cluster with no
+        # day2 Application has no layer to sync, so nobody is asked (D27).
+        if gates.day2_confirm_may_be_skipped(self._ctx.wave) and workflow.patched(_LAB_DAY2_PATCH):
+            day2 = await on_mce(self._mce, list_day2_applications, self._hc_request())
+            if not day2.names:
+                self._log(
+                    "day2-skipped",
+                    detail=f"wave {self._ctx.wave}, no Application labelled day2.gitops/cluster={self._cluster}",
+                )
+                return
         self._day2_confirmed = None
         self._phase = UpgradePhase.AWAITING_DAY2_CONFIRM
         self._waiting_for = (

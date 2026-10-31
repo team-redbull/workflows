@@ -32,6 +32,7 @@ from activities.cluster_upgrade.activities import (
     collect_evidence,
     execute_proposed_action,
     give_admin_ack,
+    list_day2_applications,
     read_admin_acks,
     read_argo_application,
     read_hosted_cluster,
@@ -71,6 +72,8 @@ async def main() -> None:
             give_admin_ack,
             # every commit's sync
             sync_argo_application,
+            # after a lab cluster's control-plane step: is there a day2 layer to confirm? (D27)
+            list_day2_applications,
             # the long watches: they poll and heartbeat inside the activity
             watch_control_plane,
             watch_nodepool,

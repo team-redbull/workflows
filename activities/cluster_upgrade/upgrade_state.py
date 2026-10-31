@@ -475,6 +475,16 @@ def source_problem(application: dict[str, Any] | None, values_ref: str) -> str |
     )
 
 
+# The label day2's ApplicationSets put on each Application of a cluster (D14):
+# the day1 file's name, as in the run's confirm-day2 message.
+DAY2_CLUSTER_LABEL = "day2.gitops/cluster"
+
+
+def names(objects: list[dict[str, Any]]) -> list[str]:
+    """The objects' metadata.name, sorted; an object with none is left out."""
+    return sorted(name for obj in objects if (name := (obj.get("metadata") or {}).get("name")))
+
+
 def argo_application_state(application: dict[str, Any] | None, values_ref: str = "values") -> ArgoApplicationState:
     """Sync and health of the cluster's Application, and which resources are out of sync ("Kind/name").
 

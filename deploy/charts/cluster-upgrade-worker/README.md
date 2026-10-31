@@ -120,7 +120,7 @@ hostedclusters-setup chart) and its control-plane namespace (`<that namespace>-<
 | cluster-wide | `config.openshift.io` imagedigestmirrorsets | list | `read_mce_state`: the MCE's mirrors (pre-flight check 11) |
 | cluster-wide | `""` secrets | get | the HostedCluster's admin kubeconfig (`status.kubeconfig`). **The widest grant: every Secret of the MCE**, as server-lifecycle-worker's `rbac.hostedClusters` |
 | cluster-wide | `""` pods | delete | `execute_proposed_action`'s `delete_hcp_pod`, a tier-2 action a person approved, in the cluster's own control-plane namespace; the catalog refuses `etcd-*` and `kube-apiserver-*` |
-| `argo.namespace` | `argoproj.io` applications | get, patch | `read_argo_application`, `collect_evidence`; `sync_argo_application` patches `operation` |
+| `argo.namespace` | `argoproj.io` applications | get, list, patch | `read_argo_application`, `collect_evidence`; `sync_argo_application` patches `operation`; `list_day2_applications` lists by the `day2.gitops/cluster` label |
 | `hypershift` | `""` configmaps, `resourceNames: [supported-versions]` | get | `read_mce_state` (D10: git is intent, the cluster is truth) |
 
 Not granted, on purpose: any write to HostedClusters, NodePools or IDMS (D1), Agents,

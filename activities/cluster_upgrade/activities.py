@@ -40,6 +40,7 @@ from shared.models.cluster_upgrade import (
     ArgoSyncRequest,
     ArgoSyncResult,
     CheckResult,
+    Day2Applications,
     EvidenceBundle,
     EvidenceRequest,
     GateOutcome,
@@ -175,6 +176,16 @@ async def read_mce_state(request: MceRequest) -> MceState:
 async def read_argo_application(request: HostedClusterRequest) -> ArgoApplicationState:
     """The cluster's Application in ARGO_NAMESPACE: sync, health, what is out of sync."""
     return upgrade_state.argo_application_state(await _application(request.cluster), _settings.argo_values_ref)
+
+
+@activity.defn
+async def list_day2_applications(request: HostedClusterRequest) -> Day2Applications:
+    """The cluster's day2 Applications in ARGO_NAMESPACE: those labelled `day2.gitops/cluster=<cluster>`."""
+    applications = await cluster_api.list_custom_objects(
+        **_APPLICATION, namespace=_settings.argo_namespace,
+        label_selector=f"{upgrade_state.DAY2_CLUSTER_LABEL}={request.cluster}",
+    )
+    return Day2Applications(names=upgrade_state.names(applications))
 
 
 async def _application(cluster: str) -> dict | None:

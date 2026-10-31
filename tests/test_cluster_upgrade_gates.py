@@ -559,3 +559,8 @@ class TestAdminAcks:
 def test_the_mce_is_the_folder_day1_keeps_the_cluster_file_in(path, mce):
     assert gates.mce_of_day1_path(path) == mce
 
+
+@pytest.mark.parametrize(("wave", "skippable"), [(0, True), (1, False), (2, False), (None, False)])
+def test_only_a_lab_cluster_may_skip_an_empty_day2_confirm(wave, skippable):
+    # D27: a canary and every production wave wait for the day2 team, Applications or not.
+    assert gates.day2_confirm_may_be_skipped(wave) is skippable

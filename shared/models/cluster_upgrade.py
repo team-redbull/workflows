@@ -198,6 +198,9 @@ class UpgradeContext(BaseModel):
     # with its `ocp4-` prefix): which MCE's queue the run's activities go to.
     mce_cluster: str | None = None
     tier1_enabled: bool = False
+    # The cluster file's `upgrade.wave` at planning: a lab cluster (0) with no
+    # day2 Application skips confirm-day2 (D27). None in runs planned before it.
+    wave: int | None = None
     # The acks the run may give by itself, and whose calls to a gated API do
     # not count (rules file, D16). Empty in runs planned before them.
     admin_acks: list[AdminAckRule] = Field(default_factory=list)
@@ -647,6 +650,12 @@ class HostedClusterState(BaseModel):
     # The mirror repositories spec.imageContentSources points at.
     image_content_mirrors: list[str] = Field(default_factory=list)
     nodepools: list[NodePoolState] = Field(default_factory=list)
+
+
+class Day2Applications(BaseModel):
+    """The cluster's day2 Applications on its MCE (label `day2.gitops/cluster=<cluster>`), by name."""
+
+    names: list[str] = Field(default_factory=list)
 
 
 class ArgoApplicationState(BaseModel):

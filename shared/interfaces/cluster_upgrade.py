@@ -136,7 +136,8 @@ async def watch_nodepool_gate(request: NodePoolGateRequest) -> GateOutcome:
 
     Platform: the NodePool's nodes Ready and schedulable. Workload (when asked):
     PDBs on its nodes back to disruptionsAllowed >= 1, StatefulSets ready.
-    Then the cluster's declared readiness checks. Heartbeats every poll.
+    Then the cluster's declared readiness checks, which fail as "not run" until
+    the limb can run them (DESIGN O22). Heartbeats every poll.
     """
     ...
 

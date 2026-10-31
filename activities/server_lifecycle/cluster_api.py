@@ -43,6 +43,7 @@ from shared.models.server_lifecycle import CreatedResource
 _NOT_FOUND = 404
 _FORBIDDEN = 403
 _ALREADY_EXISTS = 409
+_CONFLICT = 409  # also how a delete's failed UID precondition answers
 _INVALID = (400, 422)
 
 # Which fields of an object already on the cluster disagree with the one we
@@ -554,3 +555,27 @@ async def read_config_map_data(namespace: str, name: str) -> dict[str, str] | No
         return dict(config_map.data or {})
 
     return await asyncio.to_thread(_read)
+
+
+async def delete_pod(namespace: str, name: str, uid: str | None) -> str:
+    """Delete one Pod on the MCE: "deleted", "gone" (absent already) or "replaced" (its UID is not `uid`).
+
+    The cluster-upgrade limb's tier-2 `delete_hcp_pod` (DESIGN §8.3), which its
+    catalog has already checked.
+    """
+
+    def _delete() -> str:
+        _load_kube()
+        body = k8s_client.V1DeleteOptions(preconditions=k8s_client.V1Preconditions(uid=uid)) if uid else None
+        try:
+            k8s_client.CoreV1Api().delete_namespaced_pod(name=name, namespace=namespace, body=body)
+        except k8s_client.ApiException as exc:
+            if exc.status == _NOT_FOUND:
+                return "gone"
+            if exc.status == _CONFLICT and uid:
+                return "replaced"
+            raise _classify(exc, "delete", "Pod", f"{namespace}/{name}") from None
+        return "deleted"
+
+    return await asyncio.to_thread(_delete)
+

@@ -439,3 +439,74 @@ def test_the_evidence_bundle_names_the_drain_and_stays_under_its_cap():
     assert sections["clusteroperators"] == "unreadable" and "drain" in sections
     assert sum(len(t.encode()) for t in sections.values()) <= upgrade_state.EVIDENCE_LIMIT_BYTES + 100
     assert truncated is False  # the events are capped at 50 lines first
+
+
+class TestTheNodePoolGate:
+    T0 = datetime(2026, 10, 31, 6, 0, tzinfo=UTC)
+
+    def _objects(self, **override):
+        objects = {"nodes": [_node("w-1"), _node("w-2")], "pods": [_pod("db-0", "shop", "w-1", app="db")],
+                   "pdbs": [_pdb("db", "shop", 1, app="db")],
+                   "statefulsets": [{"metadata": {"name": "db", "namespace": "shop"},
+                                     "spec": {"replicas": 3}, "status": {"readyReplicas": 3}}]}
+        return {**objects, **override}
+
+    def _run(self, polls, soak=30, deadline=90):
+        """(minutes after T0, checks) per poll → the verdict at the last poll."""
+        snapshot = None
+        for minutes, checks in polls:
+            now = self.T0 + timedelta(minutes=minutes)
+            snapshot = upgrade_state.advance(snapshot, upgrade_state.gate_snapshot(checks), now)
+            verdict = upgrade_state.gate_verdict(snapshot, checks, now, soak_minutes=soak, deadline_minutes=deadline)
+        return verdict
+
+    def test_a_healthy_pool_passes_every_check(self):
+        checks = upgrade_state.gate_checks("np-a", self._objects(), workload=True)
+        assert [(c.name, c.passed) for c in checks] == [("nodepool-nodes", True), ("pdbs", True), ("statefulsets", True)]
+        assert [c.name for c in upgrade_state.gate_checks("np-a", self._objects(), workload=False)] == ["nodepool-nodes"]
+
+    def test_each_check_says_what_holds_it(self):
+        cordoned = _node("w-2", ready="False")
+        cordoned["spec"] = {"unschedulable": True}
+        checks = upgrade_state.gate_checks("np-a", self._objects(
+            nodes=[_node("w-1"), cordoned],
+            # db-1 was evicted and waits for a node: its PDB counts though it is on no node yet.
+            pods=[_pod("db-1", "shop", None, app="db"), _pod("web-0", "shop", "w-9", app="web")],
+            pdbs=[_pdb("db", "shop", 0, app="db"), _pdb("web", "shop", 0, app="web")],
+            statefulsets=[{"metadata": {"name": "db", "namespace": "shop"}, "spec": {"replicas": 3},
+                           "status": {"readyReplicas": 2}},
+                          {"metadata": {"name": "off", "namespace": "shop"}, "spec": {"replicas": 0}, "status": {}}],
+        ), workload=True)
+        failing = {c.name: c.observed for c in checks if not c.passed}
+        assert failing == {"nodepool-nodes": "w-2 (NotReady, cordoned)", "pdbs": "at 0: shop/db",
+                           "statefulsets": "shop/db (2/3 ready)"}
+
+    def test_no_nodes_or_no_read_never_passes(self):
+        (empty,) = upgrade_state.gate_checks("np-a", self._objects(nodes=[]), workload=False)
+        assert not empty.passed and "no node carries hypershift.openshift.io/nodePool=np-a" in empty.observed
+        (unread,) = upgrade_state.gate_checks("np-a", None, workload=True, unreadable="the hosted API was unreadable: 503")
+        assert not unread.passed and unread.observed.endswith("503")
+
+    def test_a_declared_check_fails_until_the_limb_can_run_it(self):
+        from shared.models.cluster_upgrade import ReadinessCheck
+
+        check = upgrade_state.readiness_not_run(ReadinessCheck(name="db-quorum", promql='min(pg_up{namespace="db"})', expect="== 1"))
+        assert (check.name, check.passed, check.expected) == ("readiness:db-quorum", False, 'min(pg_up{namespace="db"}) == 1')
+        assert "DESIGN O22" in check.observed
+
+    def test_the_soak_runs_from_when_every_check_last_started_passing(self):
+        good = upgrade_state.gate_checks("np-a", self._objects(), workload=True)
+        bad = upgrade_state.gate_checks("np-a", self._objects(nodes=[_node("w-1", ready="False")]), workload=True)
+        assert self._run([(0, bad), (5, good), (34, good)]) is None            # 29 min of 30
+        assert self._run([(0, bad), (5, good), (35, good)]).result.value == "passed"
+        assert self._run([(0, good), (20, bad), (25, good), (54, good)]) is None  # a break restarts it
+        assert self._run([(0, good)], soak=0).result.value == "passed"         # generic: no soak
+
+    def test_the_deadline_names_what_still_fails_or_the_unfinished_soak(self):
+        good = upgrade_state.gate_checks("np-a", self._objects(), workload=True)
+        bad = upgrade_state.gate_checks("np-a", self._objects(nodes=[_node("w-1", ready="False")]), workload=True)
+        outcome = self._run([(0, bad), (90, bad)])
+        assert outcome.result.value == "deadline" and [c.name for c in outcome.failing_checks] == ["nodepool-nodes"]
+        outcome = self._run([(0, bad), (80, good), (90, good)])
+        (soak,) = outcome.failing_checks
+        assert (soak.name, soak.observed) == ("soak", "passing for 10 min")

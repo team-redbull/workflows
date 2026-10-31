@@ -25,7 +25,7 @@ from datetime import UTC, datetime
 
 from temporalio import activity
 
-from activities.cluster_upgrade import hosted_upgrade_api, upgrade_state
+from activities.cluster_upgrade import action_catalog, hosted_upgrade_api, upgrade_state
 from activities.server_lifecycle import cluster_api, hosted_cluster_api
 from shared.exceptions import (
     ArgoSyncFailedError,
@@ -34,14 +34,17 @@ from shared.exceptions import (
     HostedClusterUnreachableError,
 )
 from shared.models.cluster_upgrade import (
+    ActionResult,
     AdminAckGiven,
     AdminAckRequest,
     AdminAckState,
     ArgoApplicationState,
     ArgoSyncRequest,
     ArgoSyncResult,
+    CheckResult,
     EvidenceBundle,
     EvidenceRequest,
+    GateOutcome,
     GiveAdminAckRequest,
     HostedClusterRequest,
     HostedClusterState,
@@ -49,7 +52,9 @@ from shared.models.cluster_upgrade import (
     HostedHealthRequest,
     MceRequest,
     MceState,
+    NodePoolGateRequest,
     ProgressSnapshot,
+    ProposedActionRequest,
     WatchControlPlaneRequest,
     WatchNodePoolRequest,
     WatchOutcome,
@@ -397,6 +402,49 @@ async def watch_nodepool(request: WatchNodePoolRequest) -> WatchOutcome:
         await asyncio.sleep(_WATCH_POLL_SECONDS)
 
 
+async def _gate_checks(request: NodePoolGateRequest) -> list[CheckResult]:
+    """This poll's gate checks: platform and workload from the hosted cluster, then the declared ones."""
+    hosted = await _hosted_cluster(request.cluster)
+    objects, unreadable = None, f"HostedCluster {request.cluster} not found on the MCE"
+    if hosted is not None:
+        try:
+            objects = await hosted_upgrade_api.read_gate_objects(
+                await _kubeconfig(hosted), hosted_cluster_api.kas_service_url(_hcp_namespace(hosted)),
+                request.cluster, request.nodepool, upgrade_state.NODEPOOL_LABEL, request.workload_checks,
+            )
+        except (HostedClusterUnreachableError, HostedClusterAccessError) as err:
+            activity.logger.info("hosted cluster %s unreadable this poll: %s", request.cluster, err)
+            unreadable = f"the hosted API was unreadable: {err}"
+    checks = upgrade_state.gate_checks(request.nodepool, objects, request.workload_checks, unreadable)
+    return checks + [upgrade_state.readiness_not_run(check) for check in request.readiness_checks]
+
+
+@activity.defn
+async def watch_nodepool_gate(request: NodePoolGateRequest) -> GateOutcome:
+    """Until every gate check has held for the soak window, or the deadline.
+
+    Platform: the NodePool's nodes Ready and schedulable. Workload (when asked):
+    PDBs on its nodes back to disruptionsAllowed >= 1, StatefulSets ready.
+    Then the cluster's declared readiness checks, which fail as "not run" until
+    the limb can run them (DESIGN O22). Heartbeats every poll; a retry keeps
+    the soak clock.
+    """
+    snapshot = _resumed_snapshot()
+    while True:
+        checks = await _gate_checks(request)
+        now = datetime.now(UTC)
+        snapshot = upgrade_state.advance(snapshot, upgrade_state.gate_snapshot(checks), now)
+        activity.heartbeat(snapshot.model_dump(mode="json"))
+        outcome = upgrade_state.gate_verdict(
+            snapshot, checks, now, soak_minutes=request.soak_minutes, deadline_minutes=request.deadline_minutes,
+        )
+        if outcome is not None:
+            activity.logger.info("gate after NodePool %s of %s: %s (%s)", request.nodepool, request.cluster,
+                                 outcome.result.value, snapshot.summary)
+            return outcome
+        await asyncio.sleep(_WATCH_POLL_SECONDS)
+
+
 @activity.defn
 async def collect_evidence(request: EvidenceRequest) -> EvidenceBundle:
     """Read-only evidence for the agent: conditions, operators, events, Argo, data plane.
@@ -444,3 +492,48 @@ async def collect_evidence(request: EvidenceRequest) -> EvidenceBundle:
         drain=drain,
     )
     return EvidenceBundle(sections=sections, truncated=truncated)
+
+
+_ACTION_OUTCOMES = {
+    "deleted": (True, "deleted"),
+    "gone": (False, "not executed: already gone"),
+    "replaced": (False, "not executed: replaced since the proposal (its UID differs)"),
+    "created": (True, "created Job {job}"),
+    "exists": (True, "created Job {job} (found on retry)"),
+    "missing": (False, "not executed: no such CronJob"),
+}
+
+
+@activity.defn
+async def execute_proposed_action(request: ProposedActionRequest) -> ActionResult:
+    """Run one approved tier-2 action with the workflow's identity, through the typed catalog.
+
+    Raises ProposedActionRefusedError (permanent) for a kind not in the catalog,
+    or a target outside its rules (DESIGN §8.3). Idempotent: a retry finds the
+    pod gone or its own Job, and says so.
+    """
+    action = action_catalog.check(request.action)
+    action_id = request.action.action_id
+    hosted = await _hosted_cluster(request.cluster)
+    if hosted is None:
+        return ActionResult(action_id=action_id, executed=False,
+                            detail=f"not executed: HostedCluster {request.cluster} not found on the MCE")
+    job = None
+    if action.kind == action_catalog.DELETE_HCP_POD:
+        outcome = await cluster_api.delete_pod(_hcp_namespace(hosted), action.name, action.uid)
+    else:
+        kubeconfig = await _kubeconfig(hosted)
+        server = hosted_cluster_api.kas_service_url(_hcp_namespace(hosted))
+        if action.kind == action_catalog.DELETE_POD:
+            outcome = await hosted_upgrade_api.delete_pod(
+                kubeconfig, server, request.cluster, action.namespace or "", action.name, action.uid)
+        else:
+            job = action_catalog.rerun_job_name(action.name, action_id)
+            outcome = await hosted_upgrade_api.rerun_cronjob(
+                kubeconfig, server, request.cluster, action.namespace or "", action.name, job)
+    executed, detail = _ACTION_OUTCOMES[outcome]
+    detail = detail.format(job=job)
+    activity.logger.info("action %s (%s %s), approved by %s, on %s: %s", action_id, action.kind,
+                         request.action.target, request.approved_by, request.cluster, detail)
+    return ActionResult(action_id=action_id, executed=executed, detail=detail)
+

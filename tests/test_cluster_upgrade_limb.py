@@ -1,4 +1,4 @@
-"""The cluster-upgrade limb's activities (activities/cluster_upgrade/), built so far.
+"""The cluster-upgrade limb's activities (activities/cluster_upgrade/).
 
 The MCE's API (cluster_api) and the hosted cluster's (open_hosted_api) are
 replaced by fakes holding plain dicts, as the server-lifecycle limb tests do; no
@@ -10,12 +10,10 @@ from __future__ import annotations
 
 import base64
 import contextlib
-import typing
 
 import pytest
 
 import activities.cluster_upgrade.activities as limb
-import shared.interfaces.cluster_upgrade as interface
 from activities.cluster_upgrade import hosted_upgrade_api
 from activities.server_lifecycle import cluster_api
 from shared.exceptions import AdminGateNotFoundError, HostedClusterAccessError
@@ -23,20 +21,6 @@ from shared.models.cluster_upgrade import AdminAckRequest, GiveAdminAckRequest, 
 
 GATE = "ack-4.19-admissionregistration-v1beta1-api-removals-in-4.20"
 VAP = "validatingadmissionpolicies.v1beta1.admissionregistration.k8s.io"
-
-
-def test_what_is_built_matches_the_interface():
-    """Until the whole limb exists (and joins tests/test_contract.py), its parts must not drift."""
-    def definitions(module):
-        return {
-            defn.name: fn for fn in vars(module).values()
-            if (defn := getattr(fn, "__temporal_activity_definition", None)) is not None
-        }
-
-    built, declared = definitions(limb), definitions(interface)
-    assert set(built) <= set(declared)
-    for name, fn in built.items():
-        assert typing.get_type_hints(fn) == typing.get_type_hints(declared[name]), name
 
 
 def _hc(name="lab-upgrade", namespace="hcp-lab-upgrade"):
@@ -367,3 +351,226 @@ class TestTheNodePoolWatch:
             stall_minutes=30, deadline_minutes=120, drain_blocked_minutes=10))
         assert outcome.result is WatchResult.STALLED
         assert "PDB openshift-console/downloads (disruptionsAllowed 0; downloads-a CrashLoopBackOff)" in outcome.snapshot.summary
+
+
+class TestTheNodePoolGate:
+    def _quiet(self, monkeypatch):
+        from types import SimpleNamespace
+
+        monkeypatch.setattr(limb.activity, "heartbeat", lambda *a: None)
+        monkeypatch.setattr(limb.activity, "info", lambda: SimpleNamespace(heartbeat_details=[]))
+
+    def _request(self, **fields):
+        from shared.models.cluster_upgrade import NodePoolGateRequest
+
+        return NodePoolGateRequest(**{"mce_cluster": "m", "cluster": "lab-upgrade", "nodepool": "np", "version": "4.19.53",
+                                      "workload_checks": False, "soak_minutes": 0, "deadline_minutes": 60, **fields})
+
+    async def test_a_healthy_pool_with_no_soak_passes_at_once(self, mce, monkeypatch):
+        seen = {}
+
+        async def _read(kubeconfig, server, cluster, nodepool, label, workload):
+            seen.update(server=server, nodepool=nodepool, label=label, workload=workload)
+            return {"nodes": [{"metadata": {"name": "w-1"}, "spec": {},
+                               "status": {"conditions": [{"type": "Ready", "status": "True"}]}}]}
+
+        monkeypatch.setattr(hosted_upgrade_api, "read_gate_objects", _read)
+        self._quiet(monkeypatch)
+        outcome = await limb.watch_nodepool_gate(self._request())
+        assert outcome.result.value == "passed" and outcome.failing_checks == []
+        assert seen == {"server": "https://kube-apiserver.hcp-lab-upgrade-lab-upgrade.svc:6443", "nodepool": "np",
+                        "label": "hypershift.openshift.io/nodePool", "workload": False}
+
+    async def test_a_declared_check_holds_the_gate_until_its_deadline(self, mce, monkeypatch):
+        from shared.models.cluster_upgrade import ReadinessCheck
+
+        async def _read(*args):
+            return {"nodes": [{"metadata": {"name": "w-1"}, "spec": {},
+                               "status": {"conditions": [{"type": "Ready", "status": "True"}]}}],
+                    "pods": [], "pdbs": [], "statefulsets": []}
+
+        monkeypatch.setattr(hosted_upgrade_api, "read_gate_objects", _read)
+        self._quiet(monkeypatch)
+        outcome = await limb.watch_nodepool_gate(self._request(
+            workload_checks=True, deadline_minutes=0,
+            readiness_checks=[ReadinessCheck(name="api", http="https://app.example/healthz", expect_status=200)]))
+        assert outcome.result.value == "deadline"
+        assert [c.name for c in outcome.failing_checks] == ["readiness:api"]
+
+    async def test_an_unreadable_cluster_fails_the_platform_check_saying_why(self, mce, monkeypatch):
+        from shared.exceptions import HostedClusterUnreachableError
+
+        async def _read(*args):
+            raise HostedClusterUnreachableError("hosted cluster lab-upgrade: 503 on a list of Nodes")
+
+        monkeypatch.setattr(hosted_upgrade_api, "read_gate_objects", _read)
+        self._quiet(monkeypatch)
+        outcome = await limb.watch_nodepool_gate(self._request(deadline_minutes=0))
+        (check,) = outcome.failing_checks
+        assert check.name == "nodepool-nodes" and "503 on a list of Nodes" in check.observed
+
+
+def _action(kind, target, action_id="a-1", **args):
+    from shared.models.cluster_upgrade import ProposedAction
+
+    return ProposedAction(action_id=action_id, kind=kind, target=target, args=args)
+
+
+class TestTheActionCatalog:
+    """Tier 2 holds the tier-1 kinds with their allowlists (DESIGN §8.3, AGENT.md #22, #25)."""
+
+    @pytest.mark.parametrize(("kind", "target", "where"), [
+        ("delete_pod", "openshift-console/downloads-a", ("openshift-console", "downloads-a")),
+        ("delete_hcp_pod", "cluster-version-operator-7d9f", (None, "cluster-version-operator-7d9f")),
+        ("rerun_cronjob", "openshift-operator-lifecycle-manager/collect-profiles",
+         ("openshift-operator-lifecycle-manager", "collect-profiles")),
+    ])
+    def test_in_the_catalog(self, kind, target, where):
+        from activities.cluster_upgrade import action_catalog
+
+        action = action_catalog.check(_action(kind, target, uid="u-1"))
+        assert (action.namespace, action.name) == where
+        assert action.uid == (None if kind == "rerun_cronjob" else "u-1")
+
+    @pytest.mark.parametrize(("kind", "target", "why"), [
+        ("delete_deployment", "openshift-console/console", "not in the catalog"),
+        ("delete_pod", "shop/db-0", "only namespaces openshift-*"),
+        ("delete_pod", "openshift-ovn-kubernetes/ovnkube-node-x", "never deleted"),
+        ("delete_pod", "openshift-multus/multus-x", "never deleted"),
+        ("delete_pod", "downloads-a", "<namespace>/<name>"),
+        ("delete_pod", "openshift-console/", "<namespace>/<name>"),
+        ("delete_hcp_pod", "etcd-0", "never deleted"),
+        ("delete_hcp_pod", "kube-apiserver-5f6d", "never deleted"),
+        ("delete_hcp_pod", "ns/pod", "pod in the cluster's HCP namespace"),
+        ("rerun_cronjob", "default/backup", "only namespaces openshift-*"),
+    ])
+    def test_refused_whoever_approved_it(self, kind, target, why):
+        from activities.cluster_upgrade import action_catalog
+        from shared.exceptions import ProposedActionRefusedError
+
+        with pytest.raises(ProposedActionRefusedError, match=why):
+            action_catalog.check(_action(kind, target))
+
+    def test_a_rerun_job_name_is_one_per_action_and_short(self):
+        from activities.cluster_upgrade import action_catalog
+
+        name = action_catalog.rerun_job_name("x" * 60, "a-1")
+        assert name == action_catalog.rerun_job_name("x" * 60, "a-1") != action_catalog.rerun_job_name("x" * 60, "a-2")
+        assert len(name) <= 52 and name.startswith("x" * 37 + "-rerun-")
+
+
+class _FakeActionCore:
+    """Pods and CronJobs/Jobs of a hosted cluster, enough for the tier-2 writes."""
+
+    def __init__(self, pods=None, cronjobs=None):
+        self.pods = dict(pods or {})  # (namespace, name) -> uid
+        self.cronjobs = dict(cronjobs or {})
+        self.jobs = {}
+
+    def delete_namespaced_pod(self, name, namespace, body=None, _request_timeout=None):
+        from kubernetes import client as k8s_client
+        if (namespace, name) not in self.pods:
+            raise k8s_client.ApiException(status=404)
+        if body is not None and body.preconditions.uid != self.pods[(namespace, name)]:
+            raise k8s_client.ApiException(status=409)
+        del self.pods[(namespace, name)]
+
+    def read_namespaced_cron_job(self, name, namespace, _request_timeout=None):
+        from kubernetes import client as k8s_client
+        if (namespace, name) not in self.cronjobs:
+            raise k8s_client.ApiException(status=404)
+        return self.cronjobs[(namespace, name)]
+
+    def create_namespaced_job(self, namespace, body, _request_timeout=None):
+        from kubernetes import client as k8s_client
+        if (namespace, body["metadata"]["name"]) in self.jobs:
+            raise k8s_client.ApiException(status=409)
+        self.jobs[(namespace, body["metadata"]["name"])] = body
+
+
+class TestTheActionWrites:
+    def _open(self, monkeypatch, core):
+        from kubernetes import client as k8s_client
+
+        @contextlib.contextmanager
+        def _open(kubeconfig, server, cluster):
+            yield _FakeApiClient(), core
+
+        monkeypatch.setattr(hosted_upgrade_api, "open_hosted_api", _open)
+        monkeypatch.setattr(k8s_client, "BatchV1Api", lambda api_client: core)
+
+    def test_a_pod_delete_is_idempotent_and_honours_the_uid(self, monkeypatch):
+        core = _FakeActionCore(pods={("openshift-console", "downloads-a"): "u-1", ("openshift-console", "sts-0"): "u-new"})
+        self._open(monkeypatch, core)
+        delete = hosted_upgrade_api._delete_pod
+        assert delete("k", "s", "c", "openshift-console", "downloads-a", "u-1") == "deleted"
+        assert delete("k", "s", "c", "openshift-console", "downloads-a", "u-1") == "gone"
+        # Recreated under the same name since the agent saw it: left alone.
+        assert delete("k", "s", "c", "openshift-console", "sts-0", "u-old") == "replaced"
+        assert ("openshift-console", "sts-0") in core.pods
+
+    def test_a_cronjob_rerun_makes_the_job_oc_would_and_only_once(self, monkeypatch):
+        cronjob = {"metadata": {"name": "collect-profiles", "namespace": "openshift-olm", "uid": "cj-uid"},
+                   "spec": {"jobTemplate": {"metadata": {"labels": {"app": "p"}, "annotations": {"a": "b"}},
+                                            "spec": {"template": {"spec": {"containers": [{"name": "c"}]}}}}}}
+        core = _FakeActionCore(cronjobs={("openshift-olm", "collect-profiles"): cronjob})
+        self._open(monkeypatch, core)
+        rerun = hosted_upgrade_api._rerun_cronjob
+        assert rerun("k", "s", "c", "openshift-olm", "collect-profiles", "collect-profiles-rerun-1a2b3c4d") == "created"
+        assert rerun("k", "s", "c", "openshift-olm", "collect-profiles", "collect-profiles-rerun-1a2b3c4d") == "exists"
+        assert rerun("k", "s", "c", "openshift-olm", "gone", "gone-rerun-1a2b3c4d") == "missing"
+        (job,) = core.jobs.values()
+        assert job["spec"] == cronjob["spec"]["jobTemplate"]["spec"]
+        assert job["metadata"]["labels"] == {"app": "p"}
+        assert job["metadata"]["annotations"] == {"a": "b", "cronjob.kubernetes.io/instantiate": "manual"}
+        assert job["metadata"]["ownerReferences"] == [{"apiVersion": "batch/v1", "kind": "CronJob",
+                                                       "name": "collect-profiles", "uid": "cj-uid", "controller": True}]
+
+
+class TestExecuteProposedAction:
+    def _request(self, kind, target, **args):
+        from shared.models.cluster_upgrade import ProposedActionRequest
+
+        return ProposedActionRequest(mce_cluster="m", cluster="lab-upgrade", action=_action(kind, target, **args),
+                                     approved_by="alice")
+
+    async def test_a_hosted_pod_goes_to_the_control_plane_service(self, mce, monkeypatch):
+        seen = {}
+
+        async def _delete(kubeconfig, server, cluster, namespace, name, uid):
+            seen.update(server=server, namespace=namespace, name=name, uid=uid)
+            return "deleted"
+
+        monkeypatch.setattr(hosted_upgrade_api, "delete_pod", _delete)
+        result = await limb.execute_proposed_action(self._request("delete_pod", "openshift-console/downloads-a", uid="u-1"))
+        assert (result.action_id, result.executed, result.detail) == ("a-1", True, "deleted")
+        assert seen == {"server": "https://kube-apiserver.hcp-lab-upgrade-lab-upgrade.svc:6443",
+                        "namespace": "openshift-console", "name": "downloads-a", "uid": "u-1"}
+
+    async def test_an_hcp_pod_is_deleted_in_the_hcp_namespace_on_the_mce(self, mce, monkeypatch):
+        seen = []
+
+        async def _delete(namespace, name, uid):
+            seen.append((namespace, name, uid))
+            return "gone"
+
+        monkeypatch.setattr(cluster_api, "delete_pod", _delete)
+        result = await limb.execute_proposed_action(self._request("delete_hcp_pod", "cluster-version-operator-7d9f"))
+        assert seen == [("hcp-lab-upgrade-lab-upgrade", "cluster-version-operator-7d9f", None)]
+        assert (result.executed, result.detail) == (False, "not executed: already gone")
+
+    async def test_a_rerun_names_its_job(self, mce, monkeypatch):
+        async def _rerun(kubeconfig, server, cluster, namespace, name, job):
+            return "exists"
+
+        monkeypatch.setattr(hosted_upgrade_api, "rerun_cronjob", _rerun)
+        result = await limb.execute_proposed_action(self._request("rerun_cronjob", "openshift-olm/collect-profiles"))
+        assert result.executed and result.detail.startswith("created Job collect-profiles-rerun-")
+        assert result.detail.endswith("(found on retry)")
+
+    async def test_refused_before_anything_is_read(self, mce, monkeypatch):
+        from shared.exceptions import ProposedActionRefusedError
+
+        with pytest.raises(ProposedActionRefusedError, match="only namespaces openshift-"):
+            await limb.execute_proposed_action(self._request("delete_pod", "shop/db-0"))
+        assert mce.secret_reads == []

@@ -20,9 +20,14 @@ from shared.models.cluster_upgrade import (
     AdminAckState,
     ApiUsage,
     ArgoApplicationState,
+    CheckFailure,
+    CheckResult,
+    GateOutcome,
+    GateResult,
     HostedClusterState,
     NodePoolState,
     ProgressSnapshot,
+    ReadinessCheck,
     WatchResult,
 )
 from shared.ocp_version import release_version
@@ -658,6 +663,127 @@ def nodepool_progress(
         + (f"; UpdatingVersion={conditions['UpdatingVersion']}" if "UpdatingVersion" in conditions else "")
     )
     return done, ProgressSnapshot(summary=summary, conditions=conditions, updated=updated, total=total)
+
+
+# --- the NodePool gate (DESIGN §6.3 step 3) --------------------------------------------
+
+GATE_NODES = "nodepool-nodes"
+GATE_PDBS = "pdbs"
+GATE_STATEFULSETS = "statefulsets"
+GATE_SOAK = "soak"
+
+
+def _gate_nodes(nodepool: str, nodes: list[dict[str, Any]]) -> CheckResult:
+    expected = f"every node of NodePool {nodepool} Ready and schedulable"
+    if not nodes:
+        return CheckResult(name=GATE_NODES, passed=False, expected=expected,
+                           observed=f"no node carries {NODEPOOL_LABEL}={nodepool}", on_failure=CheckFailure.WAIT)
+    bad = []
+    for node in nodes:
+        why = [word for word, hit in (("NotReady", not _ready(node)),
+                                      ("cordoned", bool((node.get("spec") or {}).get("unschedulable")))) if hit]
+        if why:
+            bad.append(f"{(node.get('metadata') or {}).get('name', '?')} ({', '.join(why)})")
+    return CheckResult(name=GATE_NODES, passed=not bad, expected=expected,
+                       observed="; ".join(sorted(bad)) or f"{len(nodes)} nodes Ready and schedulable",
+                       on_failure=CheckFailure.WAIT)
+
+
+def _gate_pdbs(nodes: list[dict[str, Any]], pods: list[dict[str, Any]], pdbs: list[dict[str, Any]]) -> CheckResult:
+    """PDBs at disruptionsAllowed 0 covering a Pod on the NodePool's nodes, or one not scheduled yet.
+
+    A Pod the roll evicted may still be Pending somewhere; its PDB counts too.
+    Platform PDBs included: the next NodePool's drain would meet them the same way.
+    """
+    scope = {(n.get("metadata") or {}).get("name") for n in nodes}
+    low = []
+    for pdb in pdbs:
+        if (pdb.get("status") or {}).get("disruptionsAllowed", 1) >= 1:
+            continue
+        metadata = pdb.get("metadata") or {}
+        namespace = metadata.get("namespace")
+        selector = (pdb.get("spec") or {}).get("selector")
+        if any(
+            (pod.get("metadata") or {}).get("namespace") == namespace
+            and (pod.get("spec") or {}).get("nodeName") in scope | {None}
+            and _selects(selector, (pod.get("metadata") or {}).get("labels") or {})
+            for pod in pods
+        ):
+            low.append(f"{namespace}/{metadata.get('name')}")
+    return CheckResult(name=GATE_PDBS, passed=not low,
+                       expected="PDBs covering this NodePool's Pods back to disruptionsAllowed >= 1",
+                       observed="at 0: " + ", ".join(sorted(low)) if low else "none at 0",
+                       on_failure=CheckFailure.WAIT)
+
+
+def _gate_statefulsets(statefulsets: list[dict[str, Any]]) -> CheckResult:
+    """Every StatefulSet in the cluster with readyReplicas == replicas (AGENT.md #17; not scoped
+    to the NodePool, so one already short before the upgrade holds the gate for a person too)."""
+    short = []
+    for sts in statefulsets:
+        want = (sts.get("spec") or {}).get("replicas", 1) or 0
+        ready = (sts.get("status") or {}).get("readyReplicas", 0) or 0
+        if want and ready < want:
+            metadata = sts.get("metadata") or {}
+            short.append(f"{metadata.get('namespace')}/{metadata.get('name')} ({ready}/{want} ready)")
+    return CheckResult(name=GATE_STATEFULSETS, passed=not short, expected="every StatefulSet readyReplicas == replicas",
+                       observed=", ".join(sorted(short)) or f"{len(statefulsets)} StatefulSets ready",
+                       on_failure=CheckFailure.WAIT)
+
+
+def gate_checks(
+    nodepool: str, objects: dict[str, Any] | None, workload: bool, unreadable: str = "the hosted API was unreadable"
+) -> list[CheckResult]:
+    """The gate's platform and workload checks on what the hosted cluster shows now.
+
+    `objects` None: nothing could be read this poll, which fails the platform
+    check (saying why) rather than passing anything.
+    """
+    if objects is None:
+        return [CheckResult(name=GATE_NODES, passed=False, expected=f"every node of NodePool {nodepool} Ready and schedulable",
+                            observed=unreadable, on_failure=CheckFailure.WAIT)]
+    checks = [_gate_nodes(nodepool, objects["nodes"])]
+    if workload:
+        checks.append(_gate_pdbs(objects["nodes"], objects["pods"], objects["pdbs"]))
+        checks.append(_gate_statefulsets(objects["statefulsets"]))
+    return checks
+
+
+def readiness_not_run(check: ReadinessCheck) -> CheckResult:
+    """A declared check the limb cannot run yet: it fails, so the gate waits for a person (DESIGN O22).
+
+    Neither kind has a decided way to run from the MCE: PromQL needs a token in the
+    hosted cluster and a path to its Thanos Querier, HTTP a path to the customer's
+    route. Passing a check nobody ran would be the one wrong answer.
+    """
+    what = f"{check.promql} {check.expect or ''}".strip() if check.promql else f"{check.http} -> {check.expect_status}"
+    return CheckResult(name=f"readiness:{check.name}", passed=False, expected=what,
+                       observed="not run: the limb cannot run declared readiness checks yet (DESIGN O22)",
+                       on_failure=CheckFailure.NEEDS_HUMAN)
+
+
+def gate_snapshot(checks: list[CheckResult]) -> ProgressSnapshot:
+    """What the gate saw, for `advance`: the summary is fixed while every check passes, so the
+    soak clock is the time since it last changed."""
+    failing = [c for c in checks if not c.passed]
+    summary = "; ".join(f"{c.name}: {c.observed}" for c in failing) or f"every check passes ({len(checks)})"
+    return ProgressSnapshot(summary=summary, updated=len(checks) - len(failing), total=len(checks))
+
+
+def gate_verdict(
+    snapshot: ProgressSnapshot, checks: list[CheckResult], now: datetime, *, soak_minutes: int, deadline_minutes: int
+) -> GateOutcome | None:
+    """PASSED once every check has held for the soak, DEADLINE on the gate's own clock, else None."""
+    failing = [c for c in checks if not c.passed]
+    held = now - snapshot.last_change_at if snapshot.last_change_at else timedelta(0)
+    if not failing and held >= timedelta(minutes=soak_minutes):
+        return GateOutcome(result=GateResult.PASSED)
+    if snapshot.started_at and now - snapshot.started_at >= timedelta(minutes=deadline_minutes):
+        return GateOutcome(result=GateResult.DEADLINE, failing_checks=failing or [CheckResult(
+            name=GATE_SOAK, passed=False, expected=f"every check passing for {soak_minutes} min",
+            observed=f"passing for {int(held.total_seconds() // 60)} min", on_failure=CheckFailure.WAIT,
+        )])
+    return None
 
 
 # --- the agent's evidence --------------------------------------------------------------

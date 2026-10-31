@@ -13,9 +13,11 @@ import typing
 
 import pytest
 
+import activities.cluster_upgrade.activities as cluster_upgrade_impl
 import activities.segment_lifecycle.activities as segment_impl
 import activities.server_lifecycle.activities as server_impl
 import activities.server_provisioning.activities as provisioning_impl
+import shared.interfaces.cluster_upgrade as cluster_upgrade_interface
 import shared.interfaces.segment_lifecycle as segment_interface
 import shared.interfaces.server_lifecycle as server_interface
 import shared.interfaces.server_provisioning as provisioning_interface
@@ -26,6 +28,7 @@ _DOMAINS = [
     pytest.param(segment_interface, segment_impl, id="segment_lifecycle"),
     pytest.param(server_interface, server_impl, id="server_lifecycle"),
     pytest.param(provisioning_interface, provisioning_impl, id="server_provisioning"),
+    pytest.param(cluster_upgrade_interface, cluster_upgrade_impl, id="cluster_upgrade"),
 ]
 
 

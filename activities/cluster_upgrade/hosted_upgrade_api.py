@@ -8,9 +8,11 @@ nothing from the kubeconfig in any error.
 
 It only fetches and writes. What the objects mean is upgrade_state.py's.
 
-The one WRITE is an admin ack (DESIGN §6.2a, D16): one key of
+Its WRITES are an admin ack (DESIGN §6.2a, D16) — one key of
 openshift-config/admin-acks, only for a gate openshift-config-managed/admin-gates
-holds, read back before returning.
+holds, read back before returning — and the tier-2 actions a person approved
+(DESIGN §8.3), which action_catalog.py checked first: a pod delete and a Job
+from a CronJob.
 """
 
 from __future__ import annotations
@@ -193,6 +195,49 @@ async def read_nodepool_objects(kubeconfig: str, server: str, cluster: str, node
     return await asyncio.to_thread(_read_nodepool_objects, kubeconfig, server, cluster, nodepool, label)
 
 
+def _read_gate_objects(kubeconfig: str, server: str, cluster: str, nodepool: str, label: str, workload: bool) -> dict[str, Any]:
+    with open_hosted_api(kubeconfig, server, cluster) as (api_client, core):
+        t = _REQUEST_TIMEOUT
+        nodes = _items(api_client, call_hosted(
+            lambda: core.list_node(label_selector=f"{label}={nodepool}", _request_timeout=t),
+            cluster, f"a list of the Nodes of NodePool {nodepool}",
+        ))
+        if not workload:
+            return {"nodes": nodes}
+        policy, apps = k8s_client.PolicyV1Api(api_client), k8s_client.AppsV1Api(api_client)
+        pods = [
+            pod
+            for node in nodes
+            for pod in _items(api_client, call_hosted(
+                lambda node=node: core.list_pod_for_all_namespaces(
+                    field_selector=f"spec.nodeName={node['metadata']['name']}", _request_timeout=t),
+                cluster, f"a list of the Pods on Node {node['metadata']['name']}",
+            ))
+        ] + _items(api_client, call_hosted(
+            lambda: core.list_pod_for_all_namespaces(field_selector="spec.nodeName=", _request_timeout=t),
+            cluster, "a list of the Pods not scheduled yet",
+        ))
+        return {
+            "nodes": nodes,
+            "pods": pods,
+            "pdbs": _items(api_client, call_hosted(
+                lambda: policy.list_pod_disruption_budget_for_all_namespaces(_request_timeout=t),
+                cluster, "a list of PodDisruptionBudgets",
+            )),
+            "statefulsets": _items(api_client, call_hosted(
+                lambda: apps.list_stateful_set_for_all_namespaces(_request_timeout=t),
+                cluster, "a list of StatefulSets",
+            )),
+        }
+
+
+async def read_gate_objects(
+    kubeconfig: str, server: str, cluster: str, nodepool: str, label: str, workload: bool
+) -> dict[str, Any]:
+    """A NodePool's Nodes; with `workload`, also the Pods on them or unscheduled, every PDB and StatefulSet."""
+    return await asyncio.to_thread(_read_gate_objects, kubeconfig, server, cluster, nodepool, label, workload)
+
+
 # The data plane a control-plane step depends on (AGENT.md #15): its operators
 # run on worker nodes.
 DATA_PLANE_NAMESPACES = ("openshift-ingress", "openshift-image-registry", "openshift-console")
@@ -270,3 +315,78 @@ async def give_admin_ack(kubeconfig: str, server: str, cluster: str, gate: str) 
     Raises AdminGateNotFoundError (permanent) for a gate admin-gates does not hold.
     """
     return await asyncio.to_thread(_give_admin_ack, kubeconfig, server, cluster, gate)
+
+
+# --- tier-2 actions a person approved (DESIGN §8.3) -------------------------------
+
+_CONFLICT = 409
+
+
+def _delete_pod(kubeconfig: str, server: str, cluster: str, namespace: str, name: str, uid: str | None) -> str:
+    with open_hosted_api(kubeconfig, server, cluster) as (_api_client, core):
+        body = k8s_client.V1DeleteOptions(preconditions=k8s_client.V1Preconditions(uid=uid)) if uid else None
+
+        def _delete() -> str:
+            try:
+                core.delete_namespaced_pod(name=name, namespace=namespace, body=body, _request_timeout=_REQUEST_TIMEOUT)
+            except k8s_client.ApiException as exc:
+                if exc.status == _CONFLICT and uid:
+                    return "replaced"  # the UID precondition failed: a new pod holds the name
+                raise
+            return "deleted"
+
+        return call_hosted(_delete, cluster, f"a delete of Pod {namespace}/{name}", absent="gone")
+
+
+async def delete_pod(kubeconfig: str, server: str, cluster: str, namespace: str, name: str, uid: str | None) -> str:
+    """Delete one Pod: "deleted", "gone" (absent already) or "replaced" (its UID is not `uid`)."""
+    return await asyncio.to_thread(_delete_pod, kubeconfig, server, cluster, namespace, name, uid)
+
+
+def _job_from_cronjob(cronjob: dict[str, Any], job_name: str) -> dict[str, Any]:
+    """The Job `oc create job --from=cronjob/<name>` makes: the jobTemplate, owned by the CronJob."""
+    metadata = cronjob.get("metadata") or {}
+    template = (cronjob.get("spec") or {}).get("jobTemplate") or {}
+    template_meta = template.get("metadata") or {}
+    return {
+        "apiVersion": "batch/v1",
+        "kind": "Job",
+        "metadata": {
+            "name": job_name,
+            "namespace": metadata.get("namespace"),
+            "labels": dict(template_meta.get("labels") or {}),
+            "annotations": {**(template_meta.get("annotations") or {}), "cronjob.kubernetes.io/instantiate": "manual"},
+            "ownerReferences": [{"apiVersion": "batch/v1", "kind": "CronJob", "name": metadata.get("name"),
+                                 "uid": metadata.get("uid"), "controller": True}],
+        },
+        "spec": template.get("spec") or {},
+    }
+
+
+def _rerun_cronjob(kubeconfig: str, server: str, cluster: str, namespace: str, name: str, job_name: str) -> str:
+    with open_hosted_api(kubeconfig, server, cluster) as (api_client, _core):
+        batch = k8s_client.BatchV1Api(api_client)
+        cronjob = call_hosted(
+            lambda: batch.read_namespaced_cron_job(name=name, namespace=namespace, _request_timeout=_REQUEST_TIMEOUT),
+            cluster, f"a read of CronJob {namespace}/{name}", absent=None,
+        )
+        if cronjob is None:
+            return "missing"
+        body = _job_from_cronjob(as_plain(api_client, cronjob), job_name)
+
+        def _create() -> str:
+            try:
+                batch.create_namespaced_job(namespace=namespace, body=body, _request_timeout=_REQUEST_TIMEOUT)
+            except k8s_client.ApiException as exc:
+                if exc.status == _CONFLICT:
+                    return "exists"  # this action's Job, made by an earlier attempt
+                raise
+            return "created"
+
+        return call_hosted(_create, cluster, f"a create of Job {namespace}/{job_name}")
+
+
+async def rerun_cronjob(kubeconfig: str, server: str, cluster: str, namespace: str, name: str, job_name: str) -> str:
+    """A Job from the CronJob, named `job_name`: "created", "exists" (a retry) or "missing" (no CronJob)."""
+    return await asyncio.to_thread(_rerun_cronjob, kubeconfig, server, cluster, namespace, name, job_name)
+

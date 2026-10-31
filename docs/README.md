@@ -25,6 +25,8 @@ docs/
       install-server.html
     server-provisioning/
       provision-dell-server.html
+    cluster-upgrade/
+      upgrade-cluster.html
     assets/
       site.css                     every page's styling
       nav.js                       THE workflow catalogue + topbar menu behaviour

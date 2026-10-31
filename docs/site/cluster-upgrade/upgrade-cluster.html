@@ -1,0 +1,994 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>upgrade-cluster — Redbull Workflows</title>
+<meta name="description" content="The upgrade-cluster workflow: take one HyperShift HostedCluster from its release to a target through day1 git and an Argo CD sync on its MCE — the control plane one minor at a time along a verified ladder, NodePools one at a time at a person's pace, and an agent only when a gate fails.">
+<link rel="icon" href="/assets/favicon.svg?v=__DOC_VERSION__" type="image/svg+xml">
+<link rel="stylesheet" href="/assets/site.css?v=__DOC_VERSION__">
+</head>
+<body data-page="/cluster-upgrade/upgrade-cluster.html">
+
+<a class="skip-link" href="#main">Skip to content</a>
+
+<!-- Topbar: identical on every page. Brand + deployed version upper-left; the
+     "Workflows" menu is built from the catalogue in assets/nav.js. -->
+<header class="topbar">
+  <a class="brand" href="/">
+    <img class="brand-mark" src="/assets/redbull-logo.png?v=__DOC_VERSION__" alt="" aria-hidden="true"
+         width="480" height="179">
+    <span class="brand-name">Redbull Workflows</span>
+    <span class="brand-ver" title="deployed image tag of this documentation site">__DOC_VERSION__</span>
+  </a>
+  <nav class="topnav" aria-label="Site">
+    <a class="topnav-link" href="/">Orchestrator guide</a>
+    <div class="wfmenu">
+      <button class="wfmenu-btn" id="wfmenu-btn" type="button"
+              aria-expanded="false" aria-haspopup="true" aria-controls="wfmenu-panel">
+        Workflows <span class="caret" aria-hidden="true">&#9662;</span>
+      </button>
+      <div class="wfmenu-panel" id="wfmenu-panel" role="menu" aria-label="Workflows by domain" hidden></div>
+    </div>
+    <noscript>
+      <a class="topnav-link" href="/cluster-upgrade/upgrade-cluster.html">upgrade-cluster</a>
+    </noscript>
+  </nav>
+</header>
+
+<main id="main">
+<header class="masthead">
+  <div class="masthead-inner">
+    <div class="eyebrow">Temporal workflow &middot; domain: cluster-upgrade</div>
+    <h1>upgrade-cluster<span class="dim"> &mdash; what actually happens</span></h1>
+    <p class="lede">
+      One request takes <b>one HyperShift HostedCluster</b> from the release it runs to a target release.
+      Every change is a <b>commit to the cluster&rsquo;s day1 file</b> followed by a <b>sync of that
+      cluster&rsquo;s one Argo CD Application</b> on its hosting MCE. The run never patches the
+      HostedCluster or a NodePool itself: Argo CD stays their only writer, so git and the cluster always
+      agree.
+    </p>
+    <p class="lede">The <b>control plane</b> moves <b>one minor at a time</b>, along a ladder of releases
+    the team verified. The <b>NodePools</b> follow <b>one at a time, at a person&rsquo;s pace</b>: between
+    two of them the run may wait days or weeks, and that wait costs nothing. One approval comes before
+    anything is committed. An upgrade that passes every gate makes <b>no LLM call</b>; the upgrade agent
+    is asked only when a gate fails or a watch stalls, and even then a person decides what happens
+    next.</p>
+    <div class="facts">
+      <div class="fact"><span class="k">Trigger</span><span class="v">POST /workflows/cluster-upgrade/upgrade-cluster &middot; not mounted yet</span></div>
+      <div class="fact"><span class="k">Workflow id</span><span class="v">one per HostedCluster: upgrade-cluster-&lt;mce&gt;_&lt;cluster&gt;</span></div>
+      <div class="fact"><span class="k">Child</span><span class="v">upgrade-control-plane-&lt;mce&gt;_&lt;slot&gt;, one per control-plane step</span></div>
+      <div class="fact"><span class="k">Workflow queues</span><span class="v">upgrade-cluster-workflow &middot; upgrade-control-plane-workflow</span></div>
+      <div class="fact"><span class="k">Activity queues</span><span class="v">upgrade-gitops-activity (hub) &middot; cluster-upgrade-activity-&lt;mce&gt; &middot; upgrade-agent-activity-&lt;mce&gt;</span></div>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <!-- ============================================================ STATUS -->
+  <section id="status">
+    <div class="sec-head">
+      <div class="eyebrow">Where it stands</div>
+      <h2>Built and tested on a fake fleet &mdash; not runnable yet</h2>
+      <p class="lede">This page describes the code on <code>main</code>. Where the design says more than the
+      code does yet, the page says so.</p>
+    </div>
+
+    <div class="grid-3">
+      <div class="panel ok">
+        <h3>Built, on main</h3>
+        <ul>
+          <li>The workflow and its control-plane child, every activity mocked against a <b>fake fleet</b>:
+            happy path with a week between NodePools, pause, abort, the agent, the slot cap, a digest that
+            moves, admin acks, continue-as-new.</li>
+          <li><b>Replay tests</b> of saved histories.</li>
+          <li>The path resolver and every check, as pure code.</li>
+          <li>The HTTP routes, with their own tests.</li>
+        </ul>
+      </div>
+      <div class="panel warn">
+        <h3>Not yet</h3>
+        <ul>
+          <li>The routes are <b>not mounted</b> in the API. They come with the first limb.</li>
+          <li>The <b>limbs</b> (the activities) are in progress. The MCE limb comes first: its pre-flight
+            reads and the admin-ack write.</li>
+          <li>Still to build: the hub limb (day1 git, the mirror, day2, Brain), the agent limb, kagent&rsquo;s
+            <code>upgrade-agent</code> and judge, the tool server, and the RBAC and admission policies.</li>
+          <li>Abort commits <code>pausedUntil</code>, which the hostedclusters-setup chart does not render
+            yet.</li>
+        </ul>
+      </div>
+      <div class="panel">
+        <h3>So, today</h3>
+        <p>A run <b>cannot be started</b>. Started by hand, it would sit in <code>planning</code>, its first
+        activity waiting for a worker that does not exist yet.</p>
+        <p class="note">Read this page as the contract the limbs are being built to. Design:
+        <code>docs/upgrade/DESIGN.md</code> in the Cluster-AutoUpgrade workspace.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ========================================================= PRINCIPLES -->
+  <section id="principles">
+    <div class="sec-head">
+      <div class="eyebrow">Five rules the whole run follows</div>
+      <h2>Git is intent, the cluster is truth</h2>
+    </div>
+
+    <div class="grid-2">
+      <div class="panel accent">
+        <h3>Every change goes through day1 git and Argo CD</h3>
+        <p>A step edits one or two lines of the cluster&rsquo;s day1 file &mdash; <code>mastertag</code> for
+        the control plane, <code>nodepool[&lt;name&gt;].workertag</code> for a NodePool &mdash; runs the day1
+        validator on the result, pushes to <code>main</code>, then syncs <code>Application/&lt;cluster&gt;</code>
+        in <code>openshift-gitops</code> on the MCE <b>to exactly that commit</b>.</p>
+        <p class="note">A file someone else edited since planning is never committed over: the run stops
+        and asks. A sync with anything out of sync besides what this step changes is refused: someone
+        else&rsquo;s change is pending.</p>
+      </div>
+      <div class="panel accent">
+        <h3>Temporal owns the upgrade; the agent only advises</h3>
+        <p>The workflow is the state machine: order, gates, timeouts, approvals and the audit log. The
+        upgrade agent is one activity, called on a failed gate. It diagnoses, may fix a known-safe thing
+        within a budget, and proposes the rest. Control always comes back to <b>the same gate</b>.</p>
+        <p class="note">&ldquo;Continue&rdquo; and &ldquo;skip&rdquo; are never agent verdicts. Only a
+        person moves a run past a gate that still fails.</p>
+      </div>
+    </div>
+    <div class="grid-3" style="margin-top:18px">
+      <div class="panel">
+        <h3>Control plane through every minor</h3>
+        <p>Never skips a minor; a <code>must</code> rung is never skipped. Workers may skip minors but never
+        fall more than <b>2</b> behind.</p>
+      </div>
+      <div class="panel">
+        <h3>Digests, pinned once</h3>
+        <p>Tags stay in git. At planning every tag is resolved to a digest; right before each commit it is
+        resolved again, and a tag that moved stops the run.</p>
+      </div>
+      <div class="panel">
+        <h3>The happy path is boring</h3>
+        <p>Every check is deterministic code. No LLM is called on an upgrade that passes every gate.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ========================================================== LIFECYCLE -->
+  <section id="lifecycle">
+    <div class="sec-head">
+      <div class="eyebrow">The lifecycle at a glance</div>
+      <h2>Plan, check, one approval, then step by step</h2>
+      <p class="lede">The run reads and checks everything before it asks for approval, and commits nothing
+      before it. After approval it walks the plan&rsquo;s steps in order. Each step is either a control-plane
+      step or a worker step, and the run continues as new after each one.</p>
+    </div>
+
+    <div class="diagram rail">
+      <svg viewBox="0 0 1060 556" role="img"
+           aria-label="Lifecycle of an upgrade-cluster run. Top row, left to right: a POST starts the run; 1 planning reads the rules, the day1 file, the MCE and the HostedCluster, resolves the path and pins digests, and fails the run if anything is wrong; 2 pre-flight runs checks 5 to 11, and a failure waits for a person; 3 a person approves once, and an abort here cancels with nothing committed. After approval the run enters 4, the steps of the plan in order. A control-plane step runs pre-flight 5 to 10, the admin acks before a minor step, then the slot child re-pins, commits, syncs and watches, then waits for a person to confirm day2. A worker step, one NodePool at a time, waits for a person's continue in manual mode, runs pre-flight 5 to 10 for that NodePool, re-checks the digest, commits and syncs, watches the roll, then runs the gate and soak. When the plan is done, 5 post-flight commits and syncs the last clean-up and checks everything is at the target. When a gate fails the agent is asked once, the same gate runs once more, else the run waits for a person to retry or abort. Pause holds the run before its next commit; abort after approval commits pausedUntil and syncs.">
+        <defs>
+          <marker id="ah-n"  viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0.5 L8,4 L0,7.5 Z"/></marker>
+          <marker id="ah-nxt" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0.5 L8,4 L0,7.5 Z"/></marker>
+        </defs>
+
+        <!-- entry -->
+        <rect class="entry-pill" x="30" y="16" width="560" height="30" rx="4"/>
+        <text class="entry-t" x="44" y="36">POST …/upgrade-cluster · cluster, target_version | target_minor</text>
+        <path class="f-arrow" d="M100,46 V70" marker-end="url(#ah-n)"/>
+
+        <!-- 1 planning -->
+        <rect class="fbox sm" x="30" y="76" width="210" height="112" rx="5"/>
+        <circle class="stepno sm" cx="52" cy="98" r="12"/>
+        <text class="stepno-t" x="52" y="102">1</text>
+        <text class="f-title" x="48" y="136">Planning</text>
+        <text class="f-sys sm" x="48" y="156">path · digests pinned</text>
+        <text class="f-det" x="48" y="174">fail → FAILED</text>
+
+        <path class="f-arrow" d="M244,132 H264" marker-end="url(#ah-n)"/>
+
+        <!-- 2 pre-flight -->
+        <rect class="fbox sm" x="270" y="76" width="210" height="112" rx="5"/>
+        <circle class="stepno sm" cx="292" cy="98" r="12"/>
+        <text class="stepno-t" x="292" y="102">2</text>
+        <text class="f-title" x="288" y="136">Pre-flight</text>
+        <text class="f-sys sm" x="288" y="156">checks 5–11</text>
+        <text class="f-det" x="288" y="174">fail → needs-human</text>
+
+        <path class="f-arrow" d="M484,132 H504" marker-end="url(#ah-n)"/>
+
+        <!-- 3 approval: a person -->
+        <rect class="box ghost" x="510" y="76" width="210" height="112" rx="5"/>
+        <circle class="stepno" cx="532" cy="98" r="12"/>
+        <text class="stepno-t" x="532" y="102">3</text>
+        <text class="f-title" x="528" y="136">Approve</text>
+        <text class="l" x="528" y="156">a person, once</text>
+        <text class="f-det" x="528" y="174">abort → CANCELLED</text>
+
+        <!-- approval down into the steps -->
+        <path class="f-arrow" d="M615,188 V230" marker-end="url(#ah-n)"/>
+        <text class="l" x="624" y="214">approve</text>
+
+        <!-- 5 post-flight -->
+        <rect class="fbox nxt" x="820" y="76" width="210" height="112" rx="5"/>
+        <circle class="stepno nxt" cx="842" cy="98" r="12"/>
+        <text class="stepno-t" x="842" y="102">5</text>
+        <text class="f-title" x="838" y="136">Post-flight</text>
+        <text class="f-sys nxt" x="838" y="156">commit + sync</text>
+        <text class="f-det" x="838" y="174">all at target → done</text>
+
+        <!-- steps up into post-flight -->
+        <path class="f-arrow" d="M925,236 V194" marker-end="url(#ah-n)"/>
+        <text class="l" x="934" y="218">plan done</text>
+
+        <!-- 4 the steps container -->
+        <rect class="box ghost" x="30" y="236" width="1000" height="236" rx="6"/>
+        <circle class="stepno" cx="52" cy="258" r="12"/>
+        <text class="stepno-t" x="52" y="262">4</text>
+        <text class="hd" x="74" y="262">EACH STEP OF THE PLAN, IN ORDER · CONTINUE-AS-NEW AFTER EACH</text>
+
+        <!-- lane A: control-plane step -->
+        <text class="mini" x="50" y="290">CONTROL-PLANE STEP · ONE MINOR AT A TIME</text>
+        <rect class="fbox sm" x="50" y="298" width="220" height="64" rx="5"/>
+        <text class="f-title" x="64" y="324">pre-flight 5–10</text>
+        <text class="f-det" x="64" y="344">health, Argo app clean</text>
+        <path class="f-arrow" d="M274,330 H288" marker-end="url(#ah-n)"/>
+        <rect class="fbox nxt" x="294" y="298" width="220" height="64" rx="5"/>
+        <text class="f-title" x="308" y="324">admin acks</text>
+        <text class="f-det" x="308" y="344">minor steps only</text>
+        <path class="f-arrow" d="M518,330 H532" marker-end="url(#ah-n)"/>
+        <rect class="fbox nxt" x="538" y="298" width="220" height="64" rx="5"/>
+        <text class="f-title" x="552" y="324">slot child</text>
+        <text class="f-det" x="552" y="344">re-pin · commit · sync · watch</text>
+        <path class="f-arrow" d="M762,330 H776" marker-end="url(#ah-n)"/>
+        <rect class="box ghost" x="782" y="298" width="220" height="64" rx="5"/>
+        <text class="f-title" x="796" y="324">day2 confirm</text>
+        <text class="f-det" x="796" y="344">a person: confirm-day2</text>
+
+        <!-- lane B: worker step -->
+        <text class="mini" x="50" y="384">WORKER STEP · ONE NODEPOOL AT A TIME</text>
+        <rect class="box ghost" x="50" y="392" width="172" height="64" rx="5"/>
+        <text class="f-title" x="64" y="418">continue</text>
+        <text class="f-det" x="64" y="438">a person (manual)</text>
+        <path class="f-arrow" d="M224,424 H236" marker-end="url(#ah-n)"/>
+        <rect class="fbox sm" x="240" y="392" width="172" height="64" rx="5"/>
+        <text class="f-title" x="254" y="418">pre-flight 5–10</text>
+        <text class="f-det" x="254" y="438">for this NodePool</text>
+        <path class="f-arrow" d="M414,424 H426" marker-end="url(#ah-n)"/>
+        <rect class="fbox nxt" x="430" y="392" width="172" height="64" rx="5"/>
+        <text class="f-title" x="444" y="418">commit + sync</text>
+        <text class="f-det" x="444" y="438">digest re-checked</text>
+        <path class="f-arrow" d="M604,424 H616" marker-end="url(#ah-n)"/>
+        <rect class="fbox sm" x="620" y="392" width="172" height="64" rx="5"/>
+        <text class="f-title" x="634" y="418">watch the roll</text>
+        <text class="f-det" x="634" y="438">stall → agent</text>
+        <path class="f-arrow" d="M794,424 H806" marker-end="url(#ah-n)"/>
+        <rect class="fbox sm" x="810" y="392" width="172" height="64" rx="5"/>
+        <text class="f-title" x="824" y="418">gate + soak</text>
+        <text class="f-det" x="824" y="438">nodes, PDBs, checks</text>
+
+        <!-- failure strip -->
+        <rect class="failstrip" x="30" y="488" width="1000" height="56" rx="4"/>
+        <text class="fail-t hd" x="46" y="510">A GATE FAILS &#8594;</text>
+        <text class="fail-t" x="196" y="510">the agent, once; the same gate once more; else needs-human, until a person retries or aborts.</text>
+        <text class="fail-t hd" x="46" y="530">PAUSE · ABORT &#8594;</text>
+        <text class="fail-t" x="196" y="530">pause holds before the next commit. Abort after approval commits pausedUntil and syncs: ABORTED.</text>
+      </svg>
+    </div>
+    <div class="diagram-caption">
+      <span class="swatch sm"><i></i>reads and checks &mdash; nothing written</span>
+      <span class="swatch nxt"><i></i>writes &mdash; a day1 commit and an Argo CD sync, or the admin ack</span>
+      <span class="swatch n"><i class="dash"></i>a person decides &mdash; no deadline</span>
+    </div>
+  </section>
+
+  <!-- =============================================================== PATH -->
+  <section id="path">
+    <div class="sec-head">
+      <div class="eyebrow">The path</div>
+      <h2>A ladder in git, one minor per control-plane step</h2>
+      <p class="lede">A disconnected fleet has no upgrade graph to ask, so the path comes from a rules file
+      in day1: <code>upgrade/ladder.yaml</code>, read at the start of every run. Each <b>rung</b> is a
+      release the team checked upgrades cleanly into the next minor; every consecutive pair is an edge in
+      Red Hat&rsquo;s public stable graphs.</p>
+    </div>
+
+    <div class="grid-2">
+      <div class="panel">
+        <h3>The ladder today</h3>
+        <p><code>4.15.41 &rarr; 4.16.55 &rarr; 4.17.58 &rarr; 4.18.56 &rarr; 4.19.53 &rarr; 4.20.44 &rarr;
+        4.21.40</code>, every rung <code>must: true</code>. Last checked against the graph on
+        <code>2026-10-31</code>; the approver is shown that date.</p>
+        <p class="note">There is <b>no 4.22 rung</b>: Red Hat publishes 4.21 &rarr; 4.22 edges only in
+        <code>candidate-4.22</code>. A cluster already on 4.22 can take a 4.22 z-stream; nothing moves
+        <em>into</em> 4.22 until a rung is added. The rungs are proposed; the team confirms them before
+        production.</p>
+      </div>
+      <div class="panel">
+        <h3>The rest of the rules file</h3>
+        <ul>
+          <li><code>maxWorkerSkew: 2</code> &mdash; the team&rsquo;s rule. HyperShift allows 3, so 2 is the
+            stricter.</li>
+          <li><code>release</code> &mdash; the one full mirror and its layout:
+            <code>{imagePath}/openshift/release-images:{version}-x86_64</code>, and the control-plane-operator
+            image next to it.</li>
+          <li><code>adminAcks</code>, <code>apiUsageIgnoredUsers</code> &mdash; <a href="#admin-acks">admin
+            acks</a>.</li>
+          <li>Per MCE, <code>upgrade/mces/&lt;mce&gt;.yaml</code>: <code>supportedHostedVersions</code> (must
+            match the MCE, check 1) and <code>maxConcurrentControlPlanes</code>.</li>
+        </ul>
+        <p class="note">A validator in day1, <code>scripts/validate_upgrade_rules.py</code>, keeps the file
+        sane: rungs ascending, no minor missing, skew 1&ndash;3.</p>
+      </div>
+    </div>
+
+    <div class="grid-2" style="margin-top:18px">
+      <div class="panel">
+        <h3>Control plane: the next step</h3>
+        <ol>
+          <li><b>Already in the target&rsquo;s minor:</b> the target, after any <code>must</code> rung between
+            the two.</li>
+          <li><b>Else, if its own minor has a rung newer than it:</b> that rung. A release is only known to
+            upgrade into the next minor from the rung the ladder verified.</li>
+          <li><b>Else:</b> the next minor&rsquo;s rung, or the target if that minor is the target&rsquo;s. A
+            minor with no rung is refused.</li>
+        </ol>
+      </div>
+      <div class="panel">
+        <h3>Workers: never more than 2 minors behind</h3>
+        <ul>
+          <li>Before a control-plane step that would leave a NodePool more than <code>maxWorkerSkew</code>
+            minors behind, every lagging NodePool moves to the control plane&rsquo;s current release.</li>
+          <li>A worker step always goes <b>to</b> the control plane&rsquo;s release, never past it.</li>
+          <li>A rung marked <code>dataPlane: required</code> rolls the workers right after the control plane
+            reaches it.</li>
+          <li><code>workers_to_target</code> (default <code>true</code>) adds a final worker step.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h3 style="margin:28px 0 10px">Worked example: 4.16.27 &rarr; 4.21.40, skew 2</h3>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>#</th><th>step</th><th>why</th></tr></thead>
+        <tbody>
+          <tr><td class="k">1</td><td class="muted">control plane &rarr; 4.16.55</td><td class="muted">the rung of its own minor</td></tr>
+          <tr><td class="k">2</td><td class="muted">control plane &rarr; 4.17.58</td><td class="muted">ladder</td></tr>
+          <tr><td class="k">3</td><td class="muted">control plane &rarr; 4.18.56</td><td class="muted">ladder; workers now 2 behind, still allowed</td></tr>
+          <tr><td class="k">4</td><td class="muted">workers &rarr; 4.18.56</td><td class="muted">skew: 4.19 would leave them 3 behind</td></tr>
+          <tr><td class="k">5</td><td class="muted">control plane &rarr; 4.19.53</td><td class="muted">ladder</td></tr>
+          <tr><td class="k">6</td><td class="muted">control plane &rarr; 4.20.44</td><td class="muted">ladder &mdash; the <a href="#admin-acks">4.19 admin ack</a> comes first</td></tr>
+          <tr><td class="k">7</td><td class="muted">workers &rarr; 4.20.44</td><td class="muted">skew</td></tr>
+          <tr><td class="k">8</td><td class="muted">control plane &rarr; 4.21.40</td><td class="muted">target</td></tr>
+          <tr><td class="k">9</td><td class="muted">workers &rarr; 4.21.40</td><td class="muted">final</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note" style="margin-top:10px">Steps 4, 7 and 9 move each NodePool <b>two minors in one
+    InPlace roll</b>. That was tried on a sandbox HostedCluster (4.17.58 &rarr; 4.19.53): each node was
+    drained and rebooted once, one node at a time. Should it ever misbehave, <code>maxWorkerSkew: 1</code>
+    rolls the workers every minor instead.</p>
+
+    <div class="grid-2" style="margin-top:18px">
+      <div class="panel">
+        <h3>Choosing the target</h3>
+        <p><code>target_version</code> names a release, which must be in the mirror; it need not be a rung,
+        but it can only be the last step. <code>target_minor</code> (<code>"4.21"</code>) lets the run pick:
+        the newest release of that minor that is <b>both in the mirror and a rung</b>.</p>
+      </div>
+      <div class="panel">
+        <h3>Refused up front, nothing changed</h3>
+        <p>A downgrade; a NodePool newer than its control plane (patch included); a NodePool already beyond
+        the skew; a version spelled other than <code>X.Y.Z</code> or <code>X.Y.Z-x86_64</code>; a repeated
+        rung. Each fails the run at planning.</p>
+      </div>
+    </div>
+
+    <div class="panel" id="digests" style="margin-top:18px">
+      <h3>Digests: pinned at planning, re-checked before every commit</h3>
+      <p>Planning resolves every release in the plan to <b>two digests</b> &mdash; the release payload and the
+      HyperShift control-plane-operator image &mdash; and checks the payload images exist. Those go into the
+      plan the approver sees. Right before each commit the step&rsquo;s tags are resolved again; anything else
+      than the approved digests stops the step before it commits: &ldquo;the mirror changed under the
+      run&rdquo;, and a person decides. Tags stay in the chart; the chart needs no change.</p>
+    </div>
+  </section>
+
+  <!-- =============================================================== FLOW -->
+  <section id="flow">
+    <div class="sec-head">
+      <div class="eyebrow">Step by step</div>
+      <h2>What the run does</h2>
+      <p class="lede" style="margin-bottom:24px">Each card carries its <code>phase</code>, read live off the
+      running workflow through its <code>progress</code> query. Whenever a person is needed,
+      <code>progress.waiting_for</code> says what to do, in words.</p>
+    </div>
+
+    <div class="flow">
+
+      <!-- 1 -->
+      <div class="step">
+        <div class="marker">1</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>planning</h3>
+            <span class="phase">phase <b>planning</b></span>
+          </div>
+          <p><b>Reads only.</b> The rules file and the cluster&rsquo;s day1 file (hub), the MCE&rsquo;s
+          <code>hypershift/supported-versions</code> and the HostedCluster with its NodePools (MCE). It
+          derives the <b>profile</b> &mdash; <code>zoned</code> when NodePools carry
+          <code>topology.kubernetes.io/zone</code>, else <code>generic</code>, unless the file&rsquo;s
+          <code>upgrade.profile</code> says otherwise &mdash; and the NodePool order.
+          Then it resolves the path, pins every release to its digests and checks day2 has a layer for every
+          version.</p>
+          <div class="calls">
+            <div class="call nxt"><span class="verb">HUB</span><span class="path">read_upgrade_rules &middot; read_day1_cluster &middot; pin_release_digests &middot; check_day2_layers <em>&middot; list_release_tags for a target_minor</em></span></div>
+            <div class="call sm"><span class="verb">MCE</span><span class="path">read_mce_state &middot; read_hosted_cluster</span></div>
+          </div>
+          <p class="note">Any failed check (1&ndash;4, git matching the cluster, auto-approve allowed)
+          <b>fails the run</b>, listing every failure at once. A cluster already at the target completes
+          here, with nothing done.</p>
+        </div>
+      </div>
+
+      <!-- 2 -->
+      <div class="step">
+        <div class="marker">2</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>pre-flight</h3>
+            <span class="phase">phase <b>preflight</b></span>
+          </div>
+          <p>Checks 5&ndash;11 of the <a href="#preflight">pre-flight table</a>, in parallel reads on the MCE.
+          A control plane still settling is re-checked every minute for up to 30 minutes first.</p>
+          <p class="note">Before approval only the IDMS check (11) fails the run. Every other failure, here and
+          after approval, <b>waits for a person</b> (<code>needs-human</code>): a PDB&rsquo;s owner can fix
+          theirs and <code>retry</code>.</p>
+        </div>
+      </div>
+
+      <!-- 3 -->
+      <div class="step wait">
+        <div class="marker">3</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>the one approval</h3>
+            <span class="phase">phase <b>awaiting-approval</b></span>
+          </div>
+          <p><code>waiting_for</code> shows the plan, step by step, the date the ladder was last checked
+          against the graph, and the admin acks the plan will meet. <code>approve</code> starts the steps.
+          <code>abort</code> here ends the run <b>CANCELLED</b>: nothing was committed.</p>
+          <p class="note">This is also the dry run: start, read the plan, abort. With
+          <code>auto_approve</code>, only allowed when the cluster file says <code>upgrade.wave</code> 0 or 1
+          (lab, canary), the run approves itself.</p>
+        </div>
+      </div>
+
+      <!-- 4 -->
+      <div class="step">
+        <div class="marker">4</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>a control-plane step</h3>
+            <span class="phase">phases <b>preflight</b> &rarr; <b>admin-acks</b> &rarr; <b>waiting-for-slot</b> &rarr; <b>control-plane-step</b> &rarr; <b>awaiting-day2-confirm</b></span>
+          </div>
+          <p>Pre-flight 5&ndash;10 again. Before a <b>minor</b> step, the <a href="#admin-acks">admin acks</a>.
+          Then a free <b>slot</b> on the MCE: the child workflow&rsquo;s id is
+          <code>upgrade-control-plane-&lt;mce&gt;_&lt;n&gt;</code>, n up to <code>maxConcurrentControlPlanes</code>,
+          so a taken id means a busy slot. All busy: look again every 2 minutes. The child then:</p>
+          <ol>
+            <li><b>checking-mirror</b> &mdash; re-resolves the tags; a changed digest ends the step before any
+              commit.</li>
+            <li><b>committing</b> &mdash; <code>mastertag: &lt;v&gt;-x86_64</code>, with every NodePool&rsquo;s
+              <code>workertag</code> pinned explicitly so no worker moves with it; compare-and-set on the
+              file&rsquo;s blob id.</li>
+            <li><b>syncing</b> &mdash; <code>Application/&lt;cluster&gt;</code> to that commit, refused if anything
+              but the HostedCluster is out of sync (5 min).</li>
+            <li><b>watching</b> &mdash; one heartbeating activity, polling every 30 s, until
+              <code>status.version.history[0]</code> is the version and Completed,
+              <code>ClusterVersionSucceeding</code> and <code>ValidReleaseInfo</code> True, not Progressing,
+              and every ClusterOperator at the version. <b>20 min</b> with no change is a stall;
+              <b>3 h</b> is the deadline. (The design proposes a 45-minute stall window plus the CVO&rsquo;s
+              own &ldquo;wait has exceeded&rdquo; signals, because the CVO itself gives slow operators 30 to 40
+              minutes; still open.)</li>
+            <li><b>diagnosing</b> &mdash; a stall or the deadline goes to <a href="#agent">the agent</a>. After a
+              stall it may clear the gate and the watch runs <b>once</b> more.</li>
+            <li><b>needs-human</b> &mdash; the child tells the parent and waits, <b>still holding its
+              slot</b>: the HostedCluster is mid-upgrade. A person&rsquo;s <code>retry</code> watches again.</li>
+          </ol>
+          <div class="calls">
+            <div class="call nxt"><span class="verb">HUB</span><span class="path">pin_release_digests &middot; commit_day1_change <em>&middot; control-plane</em></span></div>
+            <div class="call sm"><span class="verb">MCE</span><span class="path">sync_argo_application &middot; watch_control_plane</span></div>
+          </div>
+          <p>Then <b>day2</b>: the cluster&rsquo;s day2 Applications (<code>day2.gitops/cluster=&lt;cluster&gt;</code>)
+          now render for the new version and are OutOfSync. The day2 team syncs them; the run waits for
+          <code>confirm-day2</code>, after <b>every</b> control-plane step, intermediate ones too. It never
+          syncs day2 itself.</p>
+          <p class="note">The child is started with <code>ParentClosePolicy.ABANDON</code>: a parent terminated
+          mid-step leaves the slot taken until the step ends. The parent drives it by signals
+          (<code>stop</code>, <code>hold</code>, <code>retry</code>), never by cancellation. An early end before
+          the sync &mdash; the mirror changed, someone edited the file, the validator or Argo CD refused &mdash;
+          is a result, frees the slot, and becomes <code>needs-human</code> in the parent.</p>
+        </div>
+      </div>
+
+      <!-- 5 -->
+      <div class="step">
+        <div class="marker">5</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>a worker step, one NodePool at a time</h3>
+            <span class="phase">phases <b>awaiting-continue</b> &rarr; <b>preflight</b> &rarr; <b>nodepool-roll</b> &rarr; <b>nodepool-gate</b></span>
+          </div>
+          <p>The order is <code>nodepool_order</code> from the request, else the file&rsquo;s
+          <code>upgrade.nodePoolOrder</code>, else by zone (<code>a</code>, <code>b</code>, <code>c</code>)
+          when every NodePool has one, else file order. For each NodePool:</p>
+          <ol>
+            <li><b>Wait</b> (manual mode, the default) for <code>continue</code>, which may name the next
+              NodePool. This can take a week. Auto mode goes on after the previous gate&rsquo;s soak.</li>
+            <li><b>Pre-flight 5&ndash;10</b>, scoped to this NodePool, and the digest re-checked.</li>
+            <li><b>Commit</b> <code>nodepool[&lt;name&gt;].workertag</code> and <b>sync</b>, refused if anything but
+              <code>NodePool/&lt;name&gt;</code> is out of sync. A sync refused after the commit landed is retried
+              alone.</li>
+            <li><b>Watch</b> until <code>NodePool.status.version</code> is the version, <code>UpdatingVersion</code>
+              False and <code>AllNodesHealthy</code> True (and <code>SupportedVersionSkew</code> True where the
+              operator sets it). No node finishing for <b>30 min</b> is a stall; a drain the eviction API refuses
+              for <b>10 min</b> is handed over early (<a href="#drain">below</a>). Deadline:
+              <code>ceil(replicas / maxUnavailable)</code> &times; 60 min, <code>maxUnavailable</code> 0 counting
+              as 1.</li>
+            <li><b>Gate</b>: all the NodePool&rsquo;s nodes Ready and schedulable; for a <code>zoned</code> cluster,
+              or one that declares readiness checks, also PDBs back to <code>disruptionsAllowed &ge; 1</code>,
+              StatefulSets ready, and the cluster&rsquo;s own checks (PromQL or HTTP). All of it must hold for the
+              <b>soak</b> &mdash; 30 min zoned, 0 generic, or <code>upgrade.soakMinutes</code>. Deadline: the soak
+              plus 60 min.</li>
+          </ol>
+          <div class="calls">
+            <div class="call nxt"><span class="verb">HUB</span><span class="path">pin_release_digests &middot; commit_day1_change <em>&middot; nodepool</em></span></div>
+            <div class="call sm"><span class="verb">MCE</span><span class="path">sync_argo_application &middot; watch_nodepool &middot; watch_nodepool_gate</span></div>
+          </div>
+          <p class="note">A failed watch or gate goes to the agent, then the same watch or gate once more, else
+          <code>needs-human</code>. &ldquo;Skip to the next NodePool&rdquo; is never the agent&rsquo;s call.
+          Per-node preparation stays in the existing node finalizer framework (CAPI pre-drain hooks).</p>
+        </div>
+      </div>
+
+      <!-- 6 -->
+      <div class="step done">
+        <div class="marker">6</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>post-flight</h3>
+            <span class="phase">phase <b>postflight</b> &rarr; <b>done</b></span>
+          </div>
+          <p>Drops the top-level <code>workertag</code> the run may have added (per-NodePool lines stay, now
+          equal to <code>mastertag</code>), syncs with nothing allowed out of sync, and reads the HostedCluster:
+          the control plane and every NodePool at the target &mdash; or, with <code>workers_to_target:
+          false</code>, where the plan left them. Anything else is <code>needs-human</code>.</p>
+        </div>
+      </div>
+
+    </div>
+
+    <div class="grid-2" style="margin-top:8px">
+      <div class="panel">
+        <h3>Waiting is free</h3>
+        <p>Every human wait is a <code>wait_condition</code> on a flag an Update sets: no timer, no polling,
+        so a week between two NodePools adds nothing to history. The run <b>continues as new</b> after every
+        control-plane step and every NodePool, carrying the plan, pinned digests, profile, order and limits
+        it was approved with &mdash; whatever the rules file says by then.</p>
+      </div>
+      <div class="panel">
+        <h3>Abort and pause, checked before every act</h3>
+        <p>Right before each commit, sync, admin ack, child start and agent call, as well as in every wait
+        and watch. <b>Pause</b> holds the run before its next commit; what is already rolling finishes.
+        <b>Abort</b> before approval cancels. After it, the run stops a running child, commits
+        <code>pausedUntil</code> for the HostedCluster and every NodePool, syncs, and ends <b>ABORTED</b>.</p>
+        <p class="note">If the validator or Argo CD refuses the abort, a person is asked and the run retries;
+        it never ends half-aborted. <b>There is no downgrade</b>, and no commit is ever reverted.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ========================================================== PREFLIGHT -->
+  <section id="preflight">
+    <div class="sec-head">
+      <div class="eyebrow">Deterministic, no LLM</div>
+      <h2>The checks, and what each failure does</h2>
+      <p class="lede">Checks 1&ndash;4 run at planning. Checks 5&ndash;11 run before approval; 5&ndash;10 run
+      again before every control-plane step and every NodePool roll. Before approval a <code>Failed</code>
+      check fails the run; after approval no check fails it &mdash; it waits for a person.</p>
+    </div>
+
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>#</th><th>check</th><th>passes when</th><th>on failure</th></tr></thead>
+        <tbody>
+          <tr><td class="k">1</td><td class="muted"><code>rules-match-mce</code></td><td class="muted"><code>supportedHostedVersions</code> in <code>upgrade/mces/&lt;mce&gt;.yaml</code> equals the MCE&rsquo;s <code>hypershift/supported-versions</code>, and every step&rsquo;s minor is in it</td><td class="muted">Failed: fix git or the MCE</td></tr>
+          <tr><td class="k">2</td><td class="muted"><code>mirror-has-every-step</code></td><td class="muted">every step&rsquo;s release and control-plane-operator tags resolve to digests, and their payload images exist</td><td class="muted">Failed: &ldquo;mirror &lt;v&gt; first&rdquo;, with the ImageSetConfiguration snippet</td></tr>
+          <tr><td class="k">3</td><td class="muted"><code>day1-file-upgradeable</code></td><td class="muted">the file parses; its NodePools are the cluster&rsquo;s; every one <code>upgradeType: InPlace</code>; <code>imagePath</code> is the one full mirror</td><td class="muted">Failed, naming the problem</td></tr>
+          <tr><td class="k">4</td><td class="muted"><code>day2-layers-exist</code></td><td class="muted">for every step version, each pinned day2 chart has <code>ocp-versions/&lt;v&gt;/</code></td><td class="muted">Failed: create that layer first</td></tr>
+          <tr><td class="k">&mdash;</td><td class="muted"><code>git-matches-cluster</code>, <code>auto-approve-wave</code></td><td class="muted"><code>mastertag</code> and every effective <code>workertag</code> are what the cluster runs; <code>auto_approve</code> only with <code>upgrade.wave</code> 0 or 1</td><td class="muted">Failed</td></tr>
+          <tr><td class="k">5</td><td class="muted"><code>argo-app-clean</code></td><td class="muted"><code>Application/&lt;cluster&gt;</code> Synced and Healthy</td><td class="muted">needs-human: someone&rsquo;s change is pending</td></tr>
+          <tr><td class="k">6</td><td class="muted"><code>operators-healthy</code>, <code>cluster-version-upgradeable</code></td><td class="muted">every ClusterOperator Available and not Degraded; <code>ClusterVersionUpgradeable=True</code> (a CVO with no such condition counts as True, as HyperShift counts it)</td><td class="muted">needs-human. <code>UpdateInProgress</code> waits, like check 7. <code>AdminAckRequired</code> alone passes: the <a href="#admin-acks">admin-ack step</a> answers it. <code>force-upgrade-to</code> is <b>never</b> set</td></tr>
+          <tr><td class="k">7</td><td class="muted"><code>control-plane-idle</code></td><td class="muted">not Progressing, <code>history[0]</code> Completed, <code>ClusterVersionProgressing=False</code>, <code>ClusterVersionSucceeding=True</code></td><td class="muted">re-checked each minute for 30 min, then needs-human</td></tr>
+          <tr><td class="k">8</td><td class="muted"><code>nodes-healthy</code></td><td class="muted">every Node Ready, every NodePool at its desired replicas, no pending CSRs</td><td class="muted">needs-human</td></tr>
+          <tr><td class="k">9</td><td class="muted"><code>pdbs-allow-disruption</code></td><td class="muted">no PodDisruptionBudget at <code>disruptionsAllowed: 0</code> on the nodes in scope</td><td class="muted">needs-human, for the PDB&rsquo;s <b>owner</b> to act &mdash; never remediated</td></tr>
+          <tr><td class="k">10</td><td class="muted"><code>webhooks-have-endpoints</code></td><td class="muted">no <code>failurePolicy: Fail</code> webhook whose service has no endpoints</td><td class="muted">needs-human</td></tr>
+          <tr><td class="k">11</td><td class="muted"><code>idms-covers-release</code></td><td class="muted"><code>HostedCluster.spec.imageContentSources</code>, the hosted cluster&rsquo;s IDMS and the MCE&rsquo;s IDMS all cover the release repositories</td><td class="muted">Failed (checked before approval only)</td></tr>
+          <tr><td class="k">12</td><td class="muted">concurrency</td><td class="muted">no other run for this cluster; a control-plane slot free on the MCE</td><td class="muted">409 at start; waits for a slot</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note" style="margin-top:10px">There is no backup check: clusters are assumed backed up. Whether
+    the IDMS reached <code>registries.conf</code> on every node is not checked yet (it needs a way without
+    exec); check 11 reads the IDMS objects. The owner of a blocking PDB is not notified yet beyond
+    <code>waiting_for</code> and the logs.</p>
+  </section>
+
+  <!-- ========================================================= ADMIN ACKS -->
+  <section id="admin-acks">
+    <div class="sec-head">
+      <div class="eyebrow">Before a control-plane minor step</div>
+      <h2>Admin acks: given by the run, unless a client still uses the API</h2>
+      <p class="lede">Some releases make an administrator acknowledge an API removal before the control
+      plane may leave their minor. From <b>4.19.15</b>, a 4.19 cluster asks for
+      <code>ack-4.19-admissionregistration-v1beta1-api-removals-in-4.20</code>: four
+      <code>admissionregistration.k8s.io/v1beta1</code> resources &mdash; Mutating and Validating webhook
+      configurations, ValidatingAdmissionPolicies and their bindings &mdash; are gone in 4.20. Until the ack
+      is given, the hosted CVO says <code>Upgradeable=False</code>, <code>AdminAckRequired</code>, and
+      HyperShift refuses a minor change of the HostedCluster.</p>
+    </div>
+
+    <div class="grid-2">
+      <div class="panel">
+        <h3>What the run reads</h3>
+        <p>Through the hosted cluster&rsquo;s admin kubeconfig, right before the step&rsquo;s commit (and only
+        when the step changes the minor &mdash; a z-stream needs no ack):</p>
+        <ul>
+          <li><code>openshift-config-managed/admin-gates</code> and <code>openshift-config/admin-acks</code>;</li>
+          <li>the CVO&rsquo;s <code>AdminAckRequired</code> message;</li>
+          <li>for each API the rules list for the gate, its <b>APIRequestCount</b> over the last 24 hours: who
+            called it, with which user agent, which verbs, how often.</li>
+        </ul>
+        <p class="note">A gate is pending, by the CVO&rsquo;s own rule, while its <code>ack-4.&lt;minor&gt;-</code>
+        matches the control plane&rsquo;s minor and <code>admin-acks</code> does not hold exactly
+        <code>"true"</code> for it.</p>
+      </div>
+      <div class="panel">
+        <h3>What it decides, per pending gate</h3>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>the gate</th><th>the run</th></tr></thead>
+            <tbody>
+              <tr><td class="k">listed in the rules, no caller</td><td class="muted"><b>acks it itself</b>, logged as given by <code>workflow</code></td></tr>
+              <tr><td class="k">listed, with callers</td><td class="muted"><code>awaiting-admin-ack</code>, listing each caller &mdash; then <code>approve-admin-ack</code> (a reason is required) or <code>retry</code></td></tr>
+              <tr><td class="k">not listed</td><td class="muted"><code>needs-human</code>: a person checks the removal, acks by hand or adds the gate to the rules, and retries</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="note">Callers in <code>apiUsageIgnoredUsers</code> do not count: the garbage collector, the
+        namespace controller, kube-controller-manager and cluster-policy-controller walk every API.</p>
+      </div>
+    </div>
+
+    <div class="grid-2" style="margin-top:18px">
+      <div class="panel">
+        <h3>The write, and the wait after it</h3>
+        <p>One merge patch of <code>data.&lt;gate&gt;: "true"</code> into the hosted
+        <code>openshift-config/admin-acks</code>, read back. It is the run&rsquo;s <b>only write inside a
+        hosted cluster</b>, and it is never taken back: it allows a minor step, it does not start one. Then
+        the run waits for the CVO to stop saying <code>AdminAckRequired</code> &mdash; polled every minute,
+        for up to 10 minutes, then <code>needs-human</code>. A commit before that would sit refused.</p>
+      </div>
+      <div class="panel warn">
+        <h3>Strict on purpose</h3>
+        <p>One counted request is enough to ask a person, because the ack is what lets the removal go ahead.
+        The count covers 24 hours, so a client that just moved to the v1 API keeps showing for up to a day:
+        the person may approve sooner, knowing that, or <code>retry</code> later.</p>
+        <p class="note">APIRequestCount cannot see idle workloads or tools outside the cluster, so listing a
+        gate in the rules is a reviewed team decision. The approver sees, at approval, every listed ack the
+        plan will meet.</p>
+      </div>
+    </div>
+
+    <pre style="margin-top:18px"><span class="c">// progress.waiting_for while awaiting-admin-ack (one line per caller)</span>
+approve-admin-ack or retry: before 4.20.44 the hosted cluster needs admin acks, and clients called
+the APIs they remove in the last 24 hours:
+ack-4.19-admissionregistration-v1beta1-api-removals-in-4.20:
+  validatingadmissionpolicies.v1beta1.admissionregistration.k8s.io: system:serviceaccount:&lt;ns&gt;:&lt;sa&gt; (&lt;agent&gt;), 42 requests (list, watch)
+Move them to the new API version. Then approve-admin-ack with a reason (you answer for them),
+or retry to check again (the count covers 24 hours)</pre>
+  </section>
+
+  <!-- ============================================================== AGENT -->
+  <section id="agent">
+    <div class="sec-head">
+      <div class="eyebrow">Only when a gate fails</div>
+      <h2>The upgrade agent: diagnoses, proposes, never decides</h2>
+      <p class="lede">One activity, <code>invoke_upgrade_agent</code>, on <code>upgrade-agent-activity-&lt;mce&gt;</code>,
+      called only on a failed gate or a stalled watch. It runs on kagent inside the MCE (GLM 5.3 in
+      production) and holds no credentials: its tools run in a separate <code>upgrade-tools</code> server
+      under the agent&rsquo;s own identity.</p>
+    </div>
+
+    <div class="grid-2">
+      <div class="panel">
+        <h3>Typed in, typed out</h3>
+        <p><b>In</b> (<code>AgentRequest</code>): the run, the cluster and MCE, the profile, the step and
+        NodePool, which gate failed and its failing checks, an <b>evidence bundle</b> collected on the MCE
+        (HostedCluster and NodePool conditions, ClusterOperators, events, the Argo app, data-plane health;
+        capped at 512 KB, no Secrets), and a <b>budget</b>: 15 minutes, 40 tool calls, 2 tier-1 actions.</p>
+        <p><b>Out</b> (<code>AgentVerdict</code>): a diagnosis with its confidence, every tool call it made,
+        the actions it proposes, and one verdict: <code>retry_gate</code>, <code>needs_human</code> or
+        <code>abort_recommended</code>.</p>
+        <p class="note">A malformed reply is <code>needs_human</code>. An agent that cannot be reached in two
+        attempts is answered as <code>needs_human</code> too; the run never fails for it. Every answered call
+        is written to Brain as an incident.</p>
+      </div>
+      <div class="panel">
+        <h3>What happens with the verdict</h3>
+        <ul>
+          <li><code>retry_gate</code> with nothing proposed: the same stalled watch, or the same gate, runs
+            <b>once</b> more. A second failure is <code>needs-human</code>.</li>
+          <li>Anything proposed: <code>needs-human</code>, the proposals listed in
+            <code>progress.pending_actions</code>. A person approves or rejects each; an approved one runs with
+            the <b>workflow&rsquo;s</b> identity; then <code>retry</code>.</li>
+          <li><code>abort_recommended</code>: <code>needs-human</code>, with the recommendation shown. Only a
+            person aborts.</li>
+          <li>A watch that hit its deadline always ends at <code>needs-human</code>.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h3 style="margin:28px 0 10px">What the agent may do</h3>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>tier</th><th>what</th><th>who runs it</th></tr></thead>
+        <tbody>
+          <tr><td class="k">0 &mdash; read</td><td class="muted">get and list on the hosted cluster (not Secrets) and the HCP namespace on the MCE; logs; events</td><td class="muted">the agent, always</td></tr>
+          <tr><td class="k">1 &mdash; known-safe</td><td class="muted">delete a pod in <code>openshift-*</code> on the hosted cluster (never <code>openshift-ovn-kubernetes</code> or <code>openshift-multus</code>); delete a pod in the HCP namespace (never <code>etcd-*</code> or <code>kube-apiserver-*</code>); re-run a Job from a CronJob in <code>openshift-*</code></td><td class="muted">the agent itself, within budget, after a judge model approves the call &mdash; <b>only in waves 0&ndash;1</b> (lab, canary). Everywhere else, and whenever the judge rejects it, it becomes a proposal</td></tr>
+          <tr><td class="k">2 &mdash; proposal</td><td class="muted">anything novel or impactful</td><td class="muted">the workflow, with its own identity, after a person approves</td></tr>
+          <tr><td class="k">3 &mdash; forbidden</td><td class="muted">Deployments, StatefulSets, DaemonSets, PDBs, Namespaces, CRDs, webhooks, IngressControllers; any customer namespace; <code>force-upgrade-to</code>; a downgrade; <code>pods/exec</code>, impersonate, escalate, bind</td><td class="muted">no one: RBAC and an admission policy refuse it, not the prompt. A blocked attempt fails the evals</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note" style="margin-top:10px">What the agent <em>knows</em> (Brain, runbooks, incidents) and what
+    it <em>may do</em> (the tool server and the admission policy) are separate: a Brain page can never widen
+    the allowlist. Graduating a fix to tier 1 in more waves is a reviewed change to the code and the policy.</p>
+
+    <div class="panel" id="drain" style="margin-top:18px">
+      <h3>The one known remediation so far: a drain stuck on an OpenShift PDB</h3>
+      <p><b>Seen live on the sandbox</b>: a NodePool roll waited 35 minutes on
+      <code>openshift-console/downloads</code>. Both of that PDB&rsquo;s pods were crash-looping on the
+      starved node being drained, so the PDB could never allow a disruption, and the eviction API refused
+      every try: &ldquo;Cannot evict pod as it would violate the pod&rsquo;s disruption budget&rdquo;.
+      <code>nodeDrainTimeout</code> is 0 by default, so it waits for ever. Deleting the two pods unblocked
+      it.</p>
+      <ul>
+        <li><b>Handed over early.</b> The NodePool watch reports a stall once a node has waited
+          <b>10 minutes</b> on a refused eviction, instead of the 30-minute stall window. Its evidence names
+          the node, the PDB and the PDB&rsquo;s pods with their state.</li>
+        <li><b>The fix:</b> delete the not-Ready pods behind that PDB &mdash; deleting a pod bypasses the
+          eviction API, its controller recreates it elsewhere and the drain goes on &mdash; then
+          <code>retry_gate</code>. <b>Never</b> the PDB itself, never a Ready pod, never outside
+          <code>openshift-*</code>.</li>
+        <li><b>Who does it:</b> the agent itself in waves 0&ndash;1; elsewhere it proposes the deletes and a
+          person approves them, until the evals graduate it.</li>
+        <li><b>A customer&rsquo;s PDB</b> in the same spot is never touched: <code>needs_human</code>, naming
+          the PDB, for its owner.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ================================================================ API -->
+  <section id="api">
+    <div class="sec-head">
+      <div class="eyebrow">HTTP surface &middot; not mounted yet</div>
+      <h2>How you start it, steer it and watch it</h2>
+      <p class="lede">Served by <code>workflows-orchestrator-api</code> once the router is mounted. Every route
+      lives under <code>/workflows/cluster-upgrade/upgrade-cluster</code>. Decisions are <b>Temporal
+      Updates</b>, answered at once: the run itself says whether it was waiting for that decision.</p>
+    </div>
+
+    <div class="api">
+
+      <div class="endpoint">
+        <div class="endpoint-head">
+          <span class="method">POST</span>
+          <span class="path">/workflows/cluster-upgrade/upgrade-cluster</span>
+          <span class="ret">202 &middot; 409 if this cluster already has a run &middot; 422 on a bad body</span>
+        </div>
+        <div class="endpoint-body">
+          <p>Which cluster, on which MCE, to what. <b>Exactly one</b> of <code>target_version</code>
+          (<code>X.Y.Z</code> or <code>X.Y.Z-x86_64</code>) and <code>target_minor</code>.
+          <code>mce_cluster</code> is accepted with or without <code>ocp4-</code>; the run uses the prefixed
+          name, which also names the per-MCE queues. Unknown fields are refused.</p>
+          <pre><span class="c">// request</span>
+{
+  "mce_cluster":       "&lt;mce&gt;",
+  "cluster":           "&lt;cluster&gt;",          <span class="c">// the HostedCluster: its day1 file's name</span>
+  "target_minor":      "4.21",               <span class="c">// or "target_version": "4.21.40"</span>
+  "nodepool_mode":     "manual",             <span class="c">// default; "auto" rolls on after each soak</span>
+  "nodepool_order":    null,                 <span class="c">// default: upgrade.nodePoolOrder, else zone, else file order</span>
+  "workers_to_target": true,                 <span class="c">// default</span>
+  "auto_approve":      false,                <span class="c">// default; planning fails unless upgrade.wave is 0 or 1</span>
+  "requested_by":      "&lt;you&gt;"
+}
+
+<span class="c">// 202 response</span>
+{ "workflow_id": "upgrade-cluster-ocp4-&lt;mce&gt;_&lt;cluster&gt;", "run_id": "…" }</pre>
+          <p class="note">Starting is the dry run: the run plans, pins, pre-flights and waits for
+          <code>approve</code> with nothing committed. Read the plan, then <code>abort</code>: CANCELLED.</p>
+        </div>
+      </div>
+
+      <div class="endpoint">
+        <div class="endpoint-head">
+          <span class="method">POST</span>
+          <span class="path">/workflows/cluster-upgrade/upgrade-cluster/{workflow_id}/&lt;decision&gt;</span>
+          <span class="ret">200 &middot; 409 &middot; 404 &middot; 504</span>
+        </div>
+        <div class="endpoint-body">
+          <p>Every body carries <code>by</code>, recorded in the run&rsquo;s log with the time.</p>
+          <div class="table-scroll">
+            <table>
+              <thead><tr><th>decision</th><th>body</th><th>accepted while</th><th>what the run does</th></tr></thead>
+              <tbody>
+                <tr><td class="k">approve</td><td class="muted"><code>{by, reason?}</code></td><td class="muted">awaiting-approval</td><td class="muted">starts the steps</td></tr>
+                <tr><td class="k">approve-admin-ack</td><td class="muted"><code>{by, reason}</code> &mdash; reason required</td><td class="muted">awaiting-admin-ack</td><td class="muted">gives the acks although clients still call the APIs; the person answers for them</td></tr>
+                <tr><td class="k">continue</td><td class="muted"><code>{by, nodepool?}</code></td><td class="muted">awaiting-continue</td><td class="muted">rolls the next NodePool, or the one named (it must be one still waiting)</td></tr>
+                <tr><td class="k">confirm-day2</td><td class="muted"><code>{by}</code></td><td class="muted">awaiting-day2-confirm</td><td class="muted">carries on after the day2 team synced their layer</td></tr>
+                <tr><td class="k">pause</td><td class="muted"><code>{by, reason?}</code></td><td class="muted">after approval, not already paused</td><td class="muted">holds before the next commit; forwarded to a running child</td></tr>
+                <tr><td class="k">resume</td><td class="muted"><code>{by, reason?}</code></td><td class="muted">paused</td><td class="muted">carries on from where it held</td></tr>
+                <tr><td class="k">abort</td><td class="muted"><code>{by, reason}</code> &mdash; reason required</td><td class="muted">any open phase, once</td><td class="muted">before approval: CANCELLED. After: stop the child, commit <code>pausedUntil</code>, sync: ABORTED</td></tr>
+                <tr><td class="k">retry</td><td class="muted"><code>{by, reason?}</code></td><td class="muted">needs-human, awaiting-admin-ack</td><td class="muted">re-runs what failed; waiting for an admin ack, checks the API callers again</td></tr>
+                <tr><td class="k">actions/{action_id}/approve</td><td class="muted"><code>{by}</code></td><td class="muted">needs-human, the action pending</td><td class="muted">runs that agent proposal with the workflow&rsquo;s identity; then <code>retry</code></td></tr>
+                <tr><td class="k">actions/{action_id}/reject</td><td class="muted"><code>{by}</code></td><td class="muted">needs-human, the action pending</td><td class="muted">records the rejection</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="table-scroll" style="margin-top:6px">
+            <table>
+              <thead><tr><th>answer</th><th>means</th></tr></thead>
+              <tbody>
+                <tr><td class="k">200</td><td class="muted"><code>{workflow_id, decision}</code>: the run took it. What it does next shows in its progress</td></tr>
+                <tr><td class="k">409</td><td class="muted">the run is not waiting for that decision; the detail is the run&rsquo;s own reason and names what it <em>is</em> waiting for</td></tr>
+                <tr><td class="k">404</td><td class="muted">no such running run, or an id that is not <code>upgrade-cluster-&hellip;</code> &mdash; a decision route reaches nothing else</td></tr>
+                <tr><td class="k">504</td><td class="muted">no answer in 15 s: is the brain worker up?</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <div class="endpoint">
+        <div class="endpoint-head">
+          <span class="method">GET</span>
+          <span class="path">/workflows/runs/{workflow_id}</span>
+          <span class="ret">200</span>
+        </div>
+        <div class="endpoint-body">
+          <p>The domain-agnostic status route, already live for every workflow. While the run is open,
+          <code>progress</code> carries the phase, the plan with its pinned digests, the versions now, the
+          proposals waiting, the agent&rsquo;s last verdict and the last 20 log lines &mdash; and
+          <code>waiting_for</code>, which says in words what a person must do next (null when nobody is
+          needed).</p>
+          <pre><span class="c">// 200 while waiting for approval</span>
+{
+  "workflow_id":   "upgrade-cluster-ocp4-&lt;mce&gt;_&lt;cluster&gt;",
+  "workflow_type": "UpgradeClusterWorkflow",
+  "status":        "RUNNING",
+  "progress": {
+    "phase":       "awaiting-approval",
+    "waiting_for": "approve: 4.16.27 → 4.21.40 in 9 steps (control plane → 4.16.55, control plane → 4.17.58,
+                    control plane → 4.18.56, workers → 4.18.56, control plane → 4.19.53, control plane → 4.20.44,
+                    workers → 4.20.44, control plane → 4.21.40, workers → 4.21.40). Ladder last checked against
+                    the upgrade graph: 2026-10-31. Admin acks on the way, given by the run only if no client
+                    called the APIs they remove in the 24 hours before (else it asks):
+                    ack-4.19-admissionregistration-v1beta1-api-removals-in-4.20 before 4.20.44",
+    "plan": {
+      "control_plane": "4.16.27", "target": "4.21.40", "max_worker_skew": 2,
+      "nodepools": { "&lt;nodepool&gt;": "4.16.27" },
+      "steps":  [ { "kind": "control-plane", "version": "4.16.55", "reason": "ladder", "nodepools": [] }, … ],
+      "pinned": { "4.16.55": { "release": "sha256:…", "control_plane_operator": "sha256:…" }, … }
+    },
+    "profile":                   "generic",      <span class="c">// or "zoned"</span>
+    "current_step":              0,
+    "current_nodepool":          null,
+    "nodepools_done":            [],
+    "control_plane_version":     "4.16.27",
+    "nodepool_versions":         { "&lt;nodepool&gt;": "4.16.27" },
+    "paused":                    false,
+    "control_plane_workflow_id": null,           <span class="c">// upgrade-control-plane-&lt;mce&gt;_&lt;n&gt; during a step</span>
+    "pending_actions":           [],             <span class="c">// agent proposals waiting for approve / reject</span>
+    "last_verdict":              null,
+    "verified_against_graph":    "2026-10-31",
+    "log": [ { "at": "…", "event": "planned", "by": null, "detail": "…" } ]
+  }
+}</pre>
+          <p class="note">Completed, <code>result</code> carries the outcome (<code>done</code>,
+          <code>cancelled</code> or <code>aborted</code>), the plan, the steps completed, the final versions
+          and the log. A run that failed at planning reports every failed check in <code>error</code>.</p>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ========================================================= REFERENCE -->
+  <section id="reference">
+    <div class="sec-head">
+      <div class="eyebrow">Reference</div>
+      <h2>Phases, the three limbs, and what the run never does</h2>
+    </div>
+
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>phase</th><th>meaning</th><th>bound</th></tr></thead>
+        <tbody>
+          <tr><td class="k">planning</td><td class="muted">rules, day1, MCE and HostedCluster read; path resolved; digests pinned; checks 1&ndash;4</td><td class="muted">minutes</td></tr>
+          <tr><td class="k">preflight</td><td class="muted">checks 5&ndash;11, or 5&ndash;10 before a step</td><td class="muted">&le; 30 min settling</td></tr>
+          <tr><td class="k">awaiting-approval</td><td class="muted">the one approval</td><td class="muted">a person</td></tr>
+          <tr><td class="k">admin-acks</td><td class="muted">reading, giving, then waiting for the CVO to take the acks</td><td class="muted">&le; 10 min for the CVO</td></tr>
+          <tr><td class="k">awaiting-admin-ack</td><td class="muted">clients still call a gated API</td><td class="muted">a person</td></tr>
+          <tr><td class="k">waiting-for-slot</td><td class="muted">every control-plane slot on the MCE busy; polled every 2 min</td><td class="muted">the other runs&rsquo; steps</td></tr>
+          <tr><td class="k">control-plane-step</td><td class="muted">the slot child commits, syncs and watches (its own phases on its own id)</td><td class="muted">stall 20 min, deadline 3 h</td></tr>
+          <tr><td class="k">awaiting-day2-confirm</td><td class="muted">the day2 team syncs their layer for the new version</td><td class="muted">a person</td></tr>
+          <tr><td class="k">awaiting-continue</td><td class="muted">manual mode: the next NodePool waits for a person</td><td class="muted">a person</td></tr>
+          <tr><td class="k">nodepool-roll</td><td class="muted">commit, sync, watch the roll</td><td class="muted">stall 30 min (drain blocked 10 min); batches &times; 60 min</td></tr>
+          <tr><td class="k">nodepool-gate</td><td class="muted">nodes, workloads, readiness checks, held for the soak</td><td class="muted">soak + 60 min</td></tr>
+          <tr><td class="k">agent-invocation</td><td class="muted">the upgrade agent on a failed gate</td><td class="muted">15 min budget + 2 min</td></tr>
+          <tr><td class="k">needs-human</td><td class="muted"><code>retry</code>, an action decision, or <code>abort</code></td><td class="muted">a person</td></tr>
+          <tr><td class="k">paused</td><td class="muted">held before the next commit</td><td class="muted">a person</td></tr>
+          <tr><td class="k">postflight</td><td class="muted">clean-up commit, sync, everything at the target</td><td class="muted">minutes</td></tr>
+          <tr><td class="k">aborting</td><td class="muted"><code>pausedUntil</code> committed and synced</td><td class="muted">minutes</td></tr>
+          <tr><td class="k">done &middot; cancelled &middot; aborted</td><td class="muted">the outcome</td><td class="muted">&mdash;</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 style="margin:28px 0 10px">Three limbs, three credential sets</h3>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>limb</th><th>queue</th><th>holds</th><th>does</th></tr></thead>
+        <tbody>
+          <tr><td class="k">upgrade-gitops-worker</td><td class="muted">upgrade-gitops-activity (hub)</td><td class="muted">the git and registry tokens</td><td class="muted">rules, day1 read and commit (with the day1 validator), the mirror, day2 layers, Brain incidents. No Kubernetes write</td></tr>
+          <tr><td class="k">cluster-upgrade-worker</td><td class="muted">cluster-upgrade-activity-&lt;mce&gt;</td><td class="muted">the workflow identity on that MCE</td><td class="muted">reads of the HostedCluster, NodePools and hosted health; the Argo sync; the watches; the admin ack; approved proposals</td></tr>
+          <tr><td class="k">upgrade-agent-worker</td><td class="muted">upgrade-agent-activity-&lt;mce&gt;</td><td class="muted">nothing</td><td class="muted">calls kagent&rsquo;s <code>upgrade-agent</code>; the tools run under the agent&rsquo;s own identity</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 style="margin:28px 0 10px">What it never does</h3>
+    <ul>
+      <li>No patch of a HostedCluster, NodePool or IDMS &mdash; Argo CD applies what day1 says.</li>
+      <li>No commit over a person&rsquo;s edit, and no sync over someone else&rsquo;s pending change.</li>
+      <li>No skipped minor on the control plane, no skipped <code>must</code> rung, no worker more than two minors behind.</li>
+      <li>No tag after planning &mdash; every commit is checked against the approved digests.</li>
+      <li>No <code>force-upgrade-to</code>, no downgrade, no reverted commit.</li>
+      <li>No day2 sync &mdash; the day2 team does that and confirms.</li>
+      <li>No ack for a gate the rules file does not list.</li>
+      <li>No LLM call on an upgrade that passes every gate.</li>
+    </ul>
+  </section>
+
+  <footer>
+    <span>workflow_domains/cluster_upgrade/upgrade_cluster.py</span>
+    <span>workflow_domains/cluster_upgrade/upgrade_control_plane.py</span>
+    <span>workflow_domains/cluster_upgrade/upgrade_path.py</span>
+    <span>workflow_domains/cluster_upgrade/gates.py</span>
+    <span>workflow_domains/cluster_upgrade/dispatch.py</span>
+    <span>workflow_domains/cluster_upgrade/router.py</span>
+    <span>shared/models/cluster_upgrade.py</span>
+    <span>shared/interfaces/cluster_upgrade.py</span>
+    <span>shared/interfaces/upgrade_gitops.py</span>
+    <span>shared/interfaces/upgrade_agent.py</span>
+    <span>day1: upgrade/ladder.yaml</span>
+  </footer>
+
+</div>
+</main>
+
+<script src="/assets/nav.js?v=__DOC_VERSION__" defer></script>
+</body>
+</html>

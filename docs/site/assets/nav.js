@@ -70,6 +70,21 @@
           blurb: "rack-ready Dell → listed in server-scan"
         }
       ]
+    },
+    {
+      domain: "cluster-upgrade",
+      // Three limbs: the per-MCE cluster limb shown here (reads, Argo CD syncs,
+      // watches), plus upgrade-gitops-activity on the hub (day1 git, the mirror)
+      // and upgrade-agent-activity-<mce> (the agent). Built and tested on a fake
+      // fleet; its routes are not mounted yet, so no run can be started.
+      queue: "cluster-upgrade-activity-<mce>",
+      workflows: [
+        {
+          name: "upgrade-cluster",
+          href: "/cluster-upgrade/upgrade-cluster.html",
+          blurb: "a HostedCluster to a newer release, via day1 git · not runnable yet"
+        }
+      ]
     }
   ];
 

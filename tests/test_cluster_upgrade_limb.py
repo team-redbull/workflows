@@ -338,6 +338,76 @@ class TestTheArgoSync:
             ])
 
 
+class TestTheMultiSourceSync:
+    """The hcAppset's Application: the chart, then day1 as `ref: values`, in ARGO_NAMESPACE."""
+
+    OURS = "4" * 40
+
+    def _app(self) -> dict:
+        import json
+        import pathlib
+
+        fixture = pathlib.Path(__file__).parent / "fixtures" / "cluster_upgrade" / "argo-application-multi-source.json"
+        return json.loads(fixture.read_text())
+
+    async def test_it_pins_day1_in_the_values_source_in_the_configured_namespace(self, monkeypatch):
+        from shared.models.cluster_upgrade import ArgoSyncRequest
+
+        before = self._app()
+        running = self._app()
+        running["status"]["operationState"] = {"phase": "Running", "operation": {"sync": {
+            "sources": before["spec"]["sources"], "revisions": ["1" * 40, self.OURS]}}}
+        done = self._app()
+        done["status"]["sync"] = {"status": "Synced", "revisions": ["1" * 40, self.OURS]}
+        done["status"]["resources"][0]["status"] = "Synced"
+        reads, patches = [before, running, done], []
+
+        async def _read(**kwargs):
+            assert (kwargs["namespace"], kwargs["name"]) == ("gitops-hc", "ocp4-herzi")
+            return reads.pop(0) if len(reads) > 1 else reads[0]
+
+        async def _patch(**kwargs):
+            assert kwargs["namespace"] == "gitops-hc"
+            patches.append(kwargs["body"])
+            return True
+
+        monkeypatch.setattr(limb, "_settings", limb._settings.model_copy(update={"argo_namespace": "gitops-hc"}))
+        monkeypatch.setattr(cluster_api, "read_custom_object", _read)
+        monkeypatch.setattr(cluster_api, "patch_custom_object", _patch)
+        monkeypatch.setattr(limb, "_SYNC_POLL_SECONDS", 0)
+        monkeypatch.setattr(limb.activity, "heartbeat", lambda *a: None)
+        result = await limb.sync_argo_application(ArgoSyncRequest(
+            mce_cluster="m", cluster="ocp4-herzi", revision=self.OURS,
+            allowed_out_of_sync=["HostedCluster/openshift-herzi"],
+        ))
+        assert result.phase == "Succeeded"
+        (patch,) = patches
+        assert patch["operation"]["sync"] == {"sources": before["spec"]["sources"], "revisions": ["1" * 40, self.OURS]}
+
+    async def test_without_its_values_source_it_is_refused_and_nothing_is_asked(self, monkeypatch):
+        from shared.exceptions import ArgoSyncRefusedError
+        from shared.models.cluster_upgrade import ArgoSyncRequest
+
+        app = self._app()
+        app["spec"]["sources"][1]["ref"] = "day1"
+        patches = []
+
+        async def _read(**kwargs):
+            return app
+
+        async def _patch(**kwargs):
+            patches.append(kwargs)
+
+        monkeypatch.setattr(cluster_api, "read_custom_object", _read)
+        monkeypatch.setattr(cluster_api, "patch_custom_object", _patch)
+        with pytest.raises(ArgoSyncRefusedError, match="openshift-gitops/ocp4-herzi: none of its 2 sources"):
+            await limb.sync_argo_application(ArgoSyncRequest(
+                mce_cluster="m", cluster="ocp4-herzi", revision=self.OURS,
+                allowed_out_of_sync=["HostedCluster/openshift-herzi"],
+            ))
+        assert patches == []
+
+
 
 class TestTheControlPlaneWatch:
     def _wire(self, monkeypatch, polls, heartbeat_details=()):

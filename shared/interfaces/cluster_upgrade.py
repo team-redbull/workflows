@@ -62,7 +62,7 @@ async def read_hosted_cluster(request: HostedClusterRequest) -> HostedClusterSta
 
 @activity.defn
 async def read_argo_application(request: HostedClusterRequest) -> ArgoApplicationState:
-    """The cluster's Application in openshift-gitops: sync, health, what is out of sync."""
+    """The cluster's Application in ARGO_NAMESPACE: sync, health, what is out of sync."""
     ...
 
 
@@ -100,8 +100,10 @@ async def give_admin_ack(request: GiveAdminAckRequest) -> AdminAckGiven:
 async def sync_argo_application(request: ArgoSyncRequest) -> ArgoSyncResult:
     """Sync the Application to exactly `request.revision`, and wait for the operation.
 
-    Raises ArgoSyncRefusedError (permanent) when anything outside
-    `allowed_out_of_sync` is out of sync.
+    A multi-source Application is synced with `revision` in its day1 values
+    source (`ref: values`) and its other sources at the revisions Argo CD
+    last compared. Raises ArgoSyncRefusedError (permanent) when anything
+    outside `allowed_out_of_sync` is out of sync.
     """
     ...
 

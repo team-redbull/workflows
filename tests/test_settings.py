@@ -132,3 +132,33 @@ class TestDhcpApiKeys:
         monkeypatch.delenv(key)
         with pytest.raises(ValidationError, match=key.lower()):
             SegmentLifecycleActivitySettings()
+
+
+class TestClusterUpgradeActivitySettings:
+    """The per-MCE cluster-upgrade limb: its MCE, and where Argo CD keeps the hosted clusters' Applications."""
+
+    def test_the_defaults_are_the_hcappset_s(self):
+        from shared.settings import ClusterUpgradeActivitySettings
+
+        settings = ClusterUpgradeActivitySettings()
+        assert (settings.mce_cluster, settings.argo_namespace, settings.argo_values_ref) == (
+            "ocp4-mce-test", "openshift-gitops", "values")
+
+    def test_both_argo_keys_are_read_from_the_environment(self, monkeypatch):
+        from shared.settings import ClusterUpgradeActivitySettings
+
+        monkeypatch.setenv("ARGO_NAMESPACE", "gitops-hc")
+        monkeypatch.setenv("ARGO_VALUES_REF", "day1")
+        settings = ClusterUpgradeActivitySettings()
+        assert (settings.argo_namespace, settings.argo_values_ref) == ("gitops-hc", "day1")
+
+    @pytest.mark.parametrize("key, value", [
+        ("ARGO_NAMESPACE", "Openshift-GitOps"), ("ARGO_NAMESPACE", ""), ("ARGO_NAMESPACE", "a" * 64),
+        ("ARGO_VALUES_REF", "$values"), ("ARGO_VALUES_REF", ""),
+    ])
+    def test_a_value_argo_could_not_mean_is_rejected_at_startup(self, monkeypatch, key, value):
+        from shared.settings import ClusterUpgradeActivitySettings
+
+        monkeypatch.setenv(key, value)
+        with pytest.raises(ValidationError, match=key.lower()):
+            ClusterUpgradeActivitySettings()

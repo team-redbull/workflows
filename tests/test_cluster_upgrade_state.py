@@ -313,8 +313,95 @@ class TestArgoSync:
         assert upgrade_state.operation_phase(app, "sha2") is None
 
     def test_the_patch_names_the_revision(self):
-        assert upgrade_state.sync_operation("sha1", "cluster-upgrade-worker") == {
+        assert upgrade_state.sync_operation(self._app(), "sha1", "cluster-upgrade-worker") == {
             "operation": {"initiatedBy": {"username": "cluster-upgrade-worker"}, "sync": {"revision": "sha1"}}}
+
+
+CHART_SHA, SYNCED_SHA, HEAD_SHA, OURS = "1" * 40, "2" * 40, "3" * 40, "4" * 40
+
+
+class TestBothApplicationShapes:
+    """Argo CD 3.1's single- and multi-source Applications (types.go, release-3.1).
+
+    The hcAppset renders the multi-source one: the chart, then day1 as `ref:
+    values`. Its revisions are per source, by position; the day1 one is the
+    values source's.
+    """
+
+    def _multi(self, **status_changes) -> dict:
+        app = _fixture("argo-application-multi-source.json")
+        app["status"].update(status_changes)
+        return app
+
+    def test_the_day1_revision_of_a_multi_source_application_is_the_values_source_s(self):
+        state = upgrade_state.argo_application_state(self._multi())
+        assert (state.sync_status, state.health_status, state.revision) == ("OutOfSync", "Healthy", HEAD_SHA)
+        assert state.out_of_sync == ["HostedCluster/openshift-herzi"]
+
+    def test_a_single_source_application_keeps_its_one_revision(self):
+        app = _fixture("argo-application-single-source.json")
+        state = upgrade_state.argo_application_state(app)
+        assert state.revision == HEAD_SHA and state.out_of_sync == ["HostedCluster/openshift-herzi"]
+        assert upgrade_state.operation_phase(app, SYNCED_SHA) == "Succeeded"
+        assert upgrade_state.sync_operation(app, OURS, "w") == {
+            "operation": {"initiatedBy": {"username": "w"}, "sync": {"revision": OURS}}}
+
+    def test_the_sync_pins_day1_in_the_values_source_and_the_chart_where_argo_compared_it(self):
+        app = self._multi()
+        patch = upgrade_state.sync_operation(app, OURS, "cluster-upgrade-worker")
+        sync = patch["operation"]["sync"]
+        # Both are needed: without `sources` the controller reads `$values` at day1's HEAD.
+        assert sync["sources"] == app["spec"]["sources"]
+        assert sync["revisions"] == [CHART_SHA, OURS]
+        assert "revision" not in sync
+        assert patch["operation"]["initiatedBy"] == {"username": "cluster-upgrade-worker"}
+
+    def test_never_compared_the_chart_goes_at_its_target_revision(self):
+        app = self._multi(sync={"status": "Unknown"})
+        assert upgrade_state.sync_operation(app, OURS, "w")["operation"]["sync"]["revisions"] == ["main", OURS]
+
+    def test_the_values_source_is_found_by_its_ref_wherever_it_is(self):
+        app = self._multi()
+        app["spec"]["sources"].reverse()
+        app["status"]["sync"]["revisions"].reverse()
+        assert upgrade_state.argo_application_state(app).revision == HEAD_SHA
+        assert upgrade_state.sync_operation(app, OURS, "w")["operation"]["sync"]["revisions"] == [OURS, CHART_SHA]
+
+    def test_synced_at_reads_the_values_source(self):
+        synced = self._multi(sync={"status": "Synced", "revisions": [CHART_SHA, OURS]})
+        assert upgrade_state.synced_at(synced, OURS)
+        assert not upgrade_state.synced_at(synced, CHART_SHA)
+        assert not upgrade_state.synced_at(self._multi(), OURS)
+
+    def test_an_operation_counts_for_the_day1_revision_it_syncs(self):
+        app = self._multi()
+        running = {"phase": "Running", "operation": {"sync": {
+            "sources": app["spec"]["sources"], "revisions": [CHART_SHA, OURS]}}}
+        app["status"]["operationState"] = running
+        assert upgrade_state.operation_phase(app, OURS) == "Running"
+        assert upgrade_state.operation_phase(app, CHART_SHA) is None
+        # The fixture's finished operation, by its result's revisions.
+        done = self._multi()
+        del done["status"]["operationState"]["operation"]["sync"]["revisions"]
+        assert upgrade_state.operation_phase(done, SYNCED_SHA) == "Succeeded"
+
+    def test_no_values_source_is_refused_before_anything_is_asked(self):
+        app = self._multi()
+        app["spec"]["sources"][1]["ref"] = "day1"
+        refusal = upgrade_state.sync_refusal(app, ["HostedCluster/openshift-herzi"])
+        assert "none of its 2 sources is `ref: values` (it has `ref: day1`)" in refusal
+        assert upgrade_state.argo_application_state(app).revision is None
+        with pytest.raises(ValueError, match="ARGO_VALUES_REF"):
+            upgrade_state.sync_operation(app, OURS, "w")
+        # The ref is the worker's setting: configured as day1, the same Application syncs.
+        assert upgrade_state.sync_refusal(app, ["HostedCluster/openshift-herzi"], "day1") is None
+        assert upgrade_state.sync_operation(app, OURS, "w", "day1")["operation"]["sync"]["revisions"] == [
+            CHART_SHA, OURS]
+
+    def test_someone_else_s_pending_change_is_refused_in_a_multi_source_application_too(self):
+        app = self._multi()
+        app["status"]["resources"][1]["status"] = "OutOfSync"
+        assert "NodePool/herzi-np" in upgrade_state.sync_refusal(app, ["HostedCluster/openshift-herzi"])
 
 
 class TestTheControlPlaneWatch:

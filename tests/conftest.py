@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 
 from shared.settings import (
+    ClusterUpgradeActivitySettings,
     SegmentLifecycleActivitySettings,
     ServerLifecycleActivitySettings,
     ServerProvisioningActivitySettings,
@@ -24,6 +25,7 @@ from shared.settings import (
 )
 
 for _settings_class in (
+    ClusterUpgradeActivitySettings,
     SegmentLifecycleActivitySettings,
     ServerLifecycleActivitySettings,
     ServerProvisioningActivitySettings,

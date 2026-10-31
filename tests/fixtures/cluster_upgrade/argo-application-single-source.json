@@ -1,0 +1,32 @@
+{
+  "_comment": "The same hosted cluster's Application with ONE source (spec.source), as Argo CD 3.1 reports it: one revision everywhere, no `revisions` lists. Names, URLs and revisions made up.",
+  "apiVersion": "argoproj.io/v1alpha1",
+  "kind": "Application",
+  "metadata": {"name": "ocp4-herzi", "namespace": "openshift-gitops"},
+  "spec": {
+    "destination": {"name": "in-cluster", "namespace": "openshift-gitops"},
+    "project": "default",
+    "source": {
+      "repoURL": "https://git.example.internal/internal/gitops-day1/platform-config.git",
+      "targetRevision": "main",
+      "path": "rendered/ocp4-herzi"
+    }
+  },
+  "status": {
+    "health": {"status": "Healthy"},
+    "operationState": {
+      "finishedAt": "2026-10-31T14:10:24Z",
+      "message": "successfully synced (all tasks run)",
+      "operation": {"initiatedBy": {"username": "admin"}, "sync": {"revision": "2222222222222222222222222222222222222222"}},
+      "phase": "Succeeded",
+      "startedAt": "2026-10-31T14:10:21Z",
+      "syncResult": {"revision": "2222222222222222222222222222222222222222"}
+    },
+    "resources": [
+      {"group": "hypershift.openshift.io", "kind": "HostedCluster", "name": "openshift-herzi",
+       "namespace": "hcp-herzi", "status": "OutOfSync", "version": "v1beta1"}
+    ],
+    "sourceType": "Directory",
+    "sync": {"revision": "3333333333333333333333333333333333333333", "status": "OutOfSync"}
+  }
+}

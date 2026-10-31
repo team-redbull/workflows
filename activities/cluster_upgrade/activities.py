@@ -1,18 +1,15 @@
 """Cluster-upgrade activities — the per-MCE limb (DESIGN §2). Thin: each one reads, then hands to upgrade_state.
 
 Runs inside each MCE as the workflow ServiceAccount (`cluster-upgrade-worker`),
-polling cluster_upgrade_activity_queue(<mce>). The MCE's own API is read through
-activities/server_lifecycle/cluster_api.py; a hosted cluster's through its admin
-kubeconfig, by hosted_upgrade_api.py — the workflow path only, never the agent's
-(AGENT.md Part 4).
+polling cluster_upgrade_activity_queue(<mce>) (worker_init.py). The MCE's own
+API is read through activities/server_lifecycle/cluster_api.py; a hosted
+cluster's through its admin kubeconfig, by hosted_upgrade_api.py — the workflow
+path only, never the agent's (AGENT.md Part 4).
 
-BUILT SO FAR (DESIGN §11 step 4, one piece at a time): the MCE state, the Argo
-CD Application read and sync, the HostedCluster read, the hosted health read,
-the admin-ack pair (D16), the control-plane and NodePool watches, and the
-agent's evidence. The rest of shared/interfaces/cluster_upgrade.py follows;
-until it is all here the limb has no worker_init, so nothing registers a partial
-limb, and tests/test_cluster_upgrade_limb.py keeps what exists in step with the
-interface.
+Its writes on the MCE are two: the `operation` of the cluster's Argo CD
+Application (sync_argo_application), and a tier-2 `delete_hcp_pod` a person
+approved. It never writes a HostedCluster, NodePool or IDMS (DESIGN D1).
+Every verb it uses is in deploy/charts/cluster-upgrade-worker/templates/rbac.yaml.
 """
 
 from __future__ import annotations
@@ -60,10 +57,12 @@ from shared.models.cluster_upgrade import (
     WatchOutcome,
     WatchResult,
 )
+from shared.settings import ClusterUpgradeActivitySettings
 
-# Argo CD on the MCE: one Application per hosted cluster, named after it, made
-# by the <mce>-hc ApplicationSet (CONTEXT §6.1).
-_ARGO_NAMESPACE = "openshift-gitops"
+# Argo CD on the MCE: one Application per hosted cluster, named after its day1
+# file, made by the hcAppset (CONTEXT §6.1), in ARGO_NAMESPACE; the day1
+# commit is in its ARGO_VALUES_REF source when it has several.
+_settings = ClusterUpgradeActivitySettings()
 # Who Argo CD records as having started the sync.
 _SYNC_INITIATOR = "cluster-upgrade-worker"
 # Poll the operation this often, and give up this long after asking — under the
@@ -155,14 +154,15 @@ async def read_mce_state(request: MceRequest) -> MceState:
 
 @activity.defn
 async def read_argo_application(request: HostedClusterRequest) -> ArgoApplicationState:
-    """The cluster's Application in openshift-gitops: sync, health, what is out of sync."""
-    return upgrade_state.argo_application_state(await _application(request.cluster))
+    """The cluster's Application in ARGO_NAMESPACE: sync, health, what is out of sync."""
+    return upgrade_state.argo_application_state(await _application(request.cluster), _settings.argo_values_ref)
 
 
 async def _application(cluster: str) -> dict | None:
+    """The cluster's Application: named after its day1 file, in ARGO_NAMESPACE."""
     return await cluster_api.read_custom_object(
         group="argoproj.io", version="v1alpha1", plural="applications", kind="Application",
-        namespace=_ARGO_NAMESPACE, name=cluster,
+        namespace=_settings.argo_namespace, name=cluster,
     )
 
 
@@ -171,22 +171,24 @@ async def sync_argo_application(request: ArgoSyncRequest) -> ArgoSyncResult:
     """Sync the Application to exactly `request.revision`, and wait for the operation.
 
     Raises ArgoSyncRefusedError (permanent) when anything outside
-    `allowed_out_of_sync` is out of sync. Idempotent: already synced at the
-    revision is success, and an operation already running for it is waited
-    for, not started twice.
+    `allowed_out_of_sync` is out of sync, or when a multi-source Application
+    has no ARGO_VALUES_REF source to pin the day1 commit in. Idempotent:
+    already synced at the revision is success, and an operation already
+    running for it is waited for, not started twice.
     """
-    label = f"{_ARGO_NAMESPACE}/{request.cluster}"
+    ref = _settings.argo_values_ref
+    label = f"{_settings.argo_namespace}/{request.cluster}"
     application = await _application(request.cluster)
-    if upgrade_state.synced_at(application, request.revision):
+    if upgrade_state.synced_at(application, request.revision, ref):
         return ArgoSyncResult(revision=request.revision, phase="Succeeded")
-    refusal = upgrade_state.sync_refusal(application, request.allowed_out_of_sync)
+    refusal = upgrade_state.sync_refusal(application, request.allowed_out_of_sync, ref)
     if refusal is not None:
         raise ArgoSyncRefusedError(f"Application {label}: {refusal}")
-    if upgrade_state.operation_phase(application, request.revision) != "Running":
+    if upgrade_state.operation_phase(application, request.revision, ref) != "Running":
         await cluster_api.patch_custom_object(
             group="argoproj.io", version="v1alpha1", plural="applications", kind="Application",
-            namespace=_ARGO_NAMESPACE, name=request.cluster,
-            body=upgrade_state.sync_operation(request.revision, _SYNC_INITIATOR),
+            namespace=_settings.argo_namespace, name=request.cluster,
+            body=upgrade_state.sync_operation(application, request.revision, _SYNC_INITIATOR, ref),
         )
         activity.logger.info("asked Argo CD to sync %s to %s", label, request.revision)
     deadline = time.monotonic() + _SYNC_WAIT_SECONDS
@@ -194,8 +196,8 @@ async def sync_argo_application(request: ArgoSyncRequest) -> ArgoSyncResult:
         await asyncio.sleep(_SYNC_POLL_SECONDS)
         activity.heartbeat()
         application = await _application(request.cluster)
-        phase = upgrade_state.operation_phase(application, request.revision)
-        if phase == "Succeeded" or upgrade_state.synced_at(application, request.revision):
+        phase = upgrade_state.operation_phase(application, request.revision, ref)
+        if phase == "Succeeded" or upgrade_state.synced_at(application, request.revision, ref):
             return ArgoSyncResult(revision=request.revision, phase="Succeeded")
         if phase in ("Failed", "Error"):
             message = (((application or {}).get("status") or {}).get("operationState") or {}).get("message", "")
@@ -504,7 +506,7 @@ async def collect_evidence(request: EvidenceRequest) -> EvidenceBundle:
         hosted_cluster=hosted,
         nodepools=nodepools,
         cluster_operators=operators,
-        argo=upgrade_state.argo_application_state(await _application(request.cluster)),
+        argo=upgrade_state.argo_application_state(await _application(request.cluster), _settings.argo_values_ref),
         data_plane_pods=pods,
         warnings=warnings,
         drain=drain,

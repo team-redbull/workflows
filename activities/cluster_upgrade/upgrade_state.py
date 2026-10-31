@@ -387,13 +387,68 @@ def supported_versions(data: dict[str, str] | None) -> tuple[bool, list[str]]:
 
 
 # --- the MCE: the cluster's Argo CD Application ---------------------------------------
+#
+# Two shapes, both Argo CD 3.1 (OpenShift GitOps 1.18), pkg/apis/application/
+# v1alpha1/types.go at release-3.1:
+#   * SINGLE source, `spec.source`: one revision everywhere — status.sync.revision,
+#     operation.sync.revision, operationState.syncResult.revision.
+#   * MULTI-SOURCE, `spec.sources` (ANY non-empty list counts, HasMultipleSources):
+#     one revision PER SOURCE, by position in spec.sources — status.sync.revisions
+#     (SyncStatus.Revisions), operation.sync.revisions (SyncOperation.Revisions),
+#     operationState.syncResult.revisions (SyncOperationResult.Revisions); the
+#     singular fields are empty. The hcAppset renders this shape: the
+#     hostedclusters-setup chart, then the day1 repo as `ref: values` (stack-export
+#     gitops/argocd-platform/hostedClusters/templates/hcAppset.yaml), and so did
+#     every multi-source Application seen live on the sandbox.
+#
+# A day1 commit lands in the VALUES source, the one whose `ref` the limb is
+# configured with (ARGO_VALUES_REF); the chart source keeps its revision.
 
 
-def argo_application_state(application: dict[str, Any] | None) -> ArgoApplicationState:
+def _sources(application: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """spec.sources; [] for a single-source Application."""
+    return list(((application or {}).get("spec") or {}).get("sources") or [])
+
+
+def values_source(application: dict[str, Any] | None, values_ref: str) -> int | None:
+    """The position in spec.sources of the source whose `ref` is `values_ref`, or None."""
+    return next((i for i, source in enumerate(_sources(application)) if source.get("ref") == values_ref), None)
+
+
+def _day1_revision(application: dict[str, Any] | None, holder: dict[str, Any], values_ref: str) -> str | None:
+    """The day1 revision a sync status / operation / result names: its `revision`, or `revisions[values]`.
+
+    None for a multi-source Application without the values source: nothing
+    there is the day1 revision.
+    """
+    if not _sources(application):
+        return holder.get("revision") or None
+    index = values_source(application, values_ref)
+    revisions = holder.get("revisions") or []
+    if index is None or index >= len(revisions):
+        return None
+    return revisions[index] or None
+
+
+def source_problem(application: dict[str, Any] | None, values_ref: str) -> str | None:
+    """Why the run cannot tell where its day1 commit goes in this Application, or None."""
+    sources = _sources(application)
+    if not sources or values_source(application, values_ref) is not None:
+        return None
+    refs = ", ".join(f"`ref: {s['ref']}`" for s in sources if s.get("ref")) or "no ref"
+    return (
+        f"none of its {len(sources)} sources is `ref: {values_ref}` (it has {refs}), so the run cannot "
+        "tell which one holds the day1 file: fix the Application or the worker's ARGO_VALUES_REF"
+    )
+
+
+def argo_application_state(application: dict[str, Any] | None, values_ref: str = "values") -> ArgoApplicationState:
     """Sync and health of the cluster's Application, and which resources are out of sync ("Kind/name").
 
-    Pre-flight check 5 needs it Synced and Healthy; a sync is refused when
-    anything but the expected resource is out of sync (DESIGN §6.2 step 3).
+    `revision` is the day1 revision Argo CD last compared against: the
+    values source's for a multi-source Application. Pre-flight check 5 needs
+    it Synced and Healthy; a sync is refused when anything but the expected
+    resource is out of sync (DESIGN §6.2 step 3).
     """
     if application is None:
         return ArgoApplicationState(found=False)
@@ -402,7 +457,7 @@ def argo_application_state(application: dict[str, Any] | None) -> ArgoApplicatio
         found=True,
         sync_status=(status.get("sync") or {}).get("status"),
         health_status=(status.get("health") or {}).get("status"),
-        revision=(status.get("sync") or {}).get("revision"),
+        revision=_day1_revision(application, status.get("sync") or {}, values_ref),
         out_of_sync=sorted(
             f"{r.get('kind')}/{r.get('name')}"
             for r in status.get("resources") or [] if r.get("status") == "OutOfSync"
@@ -410,44 +465,84 @@ def argo_application_state(application: dict[str, Any] | None) -> ArgoApplicatio
     )
 
 
-def sync_refusal(application: dict[str, Any] | None, allowed: list[str]) -> str | None:
+def sync_refusal(application: dict[str, Any] | None, allowed: list[str], values_ref: str = "values") -> str | None:
     """Why the run must not sync this Application now, or None.
 
     Anything out of sync beyond `allowed` is someone else's pending change:
-    syncing would deploy it under the run's name (DESIGN §6.2 step 3).
+    syncing would deploy it under the run's name (DESIGN §6.2 step 3). A
+    multi-source Application with no values source is refused too: the run
+    cannot pin its commit in it.
     """
-    state = argo_application_state(application)
+    state = argo_application_state(application, values_ref)
     if not state.found:
         return "the Application does not exist"
+    problem = source_problem(application, values_ref)
+    if problem is not None:
+        return problem
     extra = [resource for resource in state.out_of_sync if resource not in allowed]
     if extra:
         return f"out of sync beyond {allowed or 'nothing'}: {', '.join(extra)}"
     return None
 
 
-def synced_at(application: dict[str, Any] | None, revision: str) -> bool:
-    """Already applied at exactly `revision`: Synced, and the last operation there Succeeded."""
+def synced_at(application: dict[str, Any] | None, revision: str, values_ref: str = "values") -> bool:
+    """Already applied at exactly `revision`: Synced, at that day1 revision, and the last operation Succeeded."""
     status = (application or {}).get("status") or {}
     operation = status.get("operationState") or {}
     return (
         (status.get("sync") or {}).get("status") == "Synced"
-        and (status.get("sync") or {}).get("revision") == revision
+        and _day1_revision(application, status.get("sync") or {}, values_ref) == revision
         and operation.get("phase") in (None, "Succeeded")
     )
 
 
-def operation_phase(application: dict[str, Any] | None, revision: str) -> str | None:
-    """The phase of the operation syncing `revision` (Running, Succeeded, Failed, Error), or None for none."""
+def operation_phase(application: dict[str, Any] | None, revision: str, values_ref: str = "values") -> str | None:
+    """The phase of the operation syncing day1 `revision` (Running, Succeeded, Failed, Error), or None for none."""
     operation = ((application or {}).get("status") or {}).get("operationState") or {}
-    target = ((operation.get("operation") or {}).get("sync") or {}).get("revision") or (
-        (operation.get("syncResult") or {}).get("revision")
+    target = _day1_revision(application, (operation.get("operation") or {}).get("sync") or {}, values_ref) or (
+        _day1_revision(application, operation.get("syncResult") or {}, values_ref)
     )
     return operation.get("phase") if target == revision else None
 
 
-def sync_operation(revision: str, by: str) -> dict[str, Any]:
-    """The merge patch that asks Argo CD to sync exactly `revision` (as `argocd app sync --revision` does)."""
-    return {"operation": {"initiatedBy": {"username": by}, "sync": {"revision": revision}}}
+def sync_operation(
+    application: dict[str, Any] | None, revision: str, by: str, values_ref: str = "values"
+) -> dict[str, Any]:
+    """The merge patch that asks Argo CD to sync day1 at exactly `revision`.
+
+    Single source: `sync.revision`, as `argocd app sync --revision` does.
+
+    Multi-source: what `argocd app sync --revisions <sha> --source-positions <n>`
+    makes the API server write (Server.Sync, server/application/application.go,
+    release-3.1): `sync.sources` = spec.sources and `sync.revisions`, one per
+    source. Both are needed. The controller uses `revisions` only when there is
+    one per source, else every source's targetRevision (CompareAppState,
+    controller/state.go); and it resolves a `ref` source — the values one the
+    chart reads `$values/...` from — at `revisions[i]` only when the operation
+    carries `sources`, else at its targetRevision, i.e. day1's HEAD
+    (GetRefSources, util/argo/argo.go). The values source gets `revision`. The
+    chart source keeps the revision Argo CD last compared it at
+    (status.sync.revisions), so the run deploys exactly the chart whose diff
+    sync_refusal checked, never a chart change nobody looked at; with no
+    comparison yet, its targetRevision.
+
+    Raises ValueError for a multi-source Application with no values source
+    (sync_refusal refuses that one first).
+    """
+    sources = _sources(application)
+    initiated = {"username": by}
+    if not sources:
+        return {"operation": {"initiatedBy": initiated, "sync": {"revision": revision}}}
+    index = values_source(application, values_ref)
+    if index is None:
+        raise ValueError(source_problem(application, values_ref))
+    compared = (((application or {}).get("status") or {}).get("sync") or {}).get("revisions") or []
+    revisions = [
+        revision if i == index
+        else (compared[i] if i < len(compared) and compared[i] else source.get("targetRevision") or "HEAD")
+        for i, source in enumerate(sources)
+    ]
+    return {"operation": {"initiatedBy": initiated, "sync": {"sources": sources, "revisions": revisions}}}
 
 
 # --- the watches: what progress looks like, and when to stop watching ----------------

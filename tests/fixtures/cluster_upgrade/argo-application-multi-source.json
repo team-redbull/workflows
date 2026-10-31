@@ -1,0 +1,78 @@
+{
+  "_comment": "A hosted cluster's Application as the hcAppset renders it: the hostedclusters-setup chart, then the day1 repo as `ref: values`. Status shaped as OpenShift GitOps 1.18.6 (Argo CD 3.1) reports a multi-source Application on the sandbox; names, URLs and revisions made up. The day1 file changed since the last sync (values 2222… -> 3333…), so the HostedCluster is OutOfSync.",
+  "apiVersion": "argoproj.io/v1alpha1",
+  "kind": "Application",
+  "metadata": {"name": "ocp4-herzi", "namespace": "openshift-gitops"},
+  "spec": {
+    "destination": {"name": "in-cluster", "namespace": "openshift-gitops"},
+    "project": "default",
+    "sources": [
+      {
+        "repoURL": "https://git.example.internal/internal/helm-charts/hostedclusters-setup.git",
+        "targetRevision": "main",
+        "path": ".",
+        "helm": {
+          "ignoreMissingValueFiles": true,
+          "parameters": [{"name": "clusterName", "value": "herzi", "forceString": true}],
+          "valueFiles": [
+            "$values/sites/configValues.yaml",
+            "$values/sites/site1/values.yaml",
+            "$values/sites/site1/mces/ocp4-mce-site1-a/values.yaml",
+            "$values/sites/site1/mces/ocp4-mce-site1-a/hostedClusters/ocp4-herzi.yaml"
+          ]
+        }
+      },
+      {
+        "repoURL": "https://git.example.internal/internal/gitops-day1/platform-config.git",
+        "targetRevision": "main",
+        "ref": "values"
+      }
+    ]
+  },
+  "status": {
+    "health": {"lastTransitionTime": "2026-10-31T14:10:24Z", "status": "Healthy"},
+    "history": [
+      {
+        "deployStartedAt": "2026-10-31T14:10:21Z",
+        "deployedAt": "2026-10-31T14:10:24Z",
+        "id": 0,
+        "initiatedBy": {"username": "admin"},
+        "revisions": ["1111111111111111111111111111111111111111", "2222222222222222222222222222222222222222"]
+      }
+    ],
+    "operationState": {
+      "finishedAt": "2026-10-31T14:10:24Z",
+      "message": "successfully synced (all tasks run)",
+      "operation": {
+        "initiatedBy": {"username": "admin"},
+        "retry": {},
+        "sync": {
+          "revisions": ["1111111111111111111111111111111111111111", "2222222222222222222222222222222222222222"]
+        }
+      },
+      "phase": "Succeeded",
+      "startedAt": "2026-10-31T14:10:21Z",
+      "syncResult": {
+        "resources": [
+          {"group": "hypershift.openshift.io", "kind": "HostedCluster", "name": "openshift-herzi",
+           "namespace": "hcp-herzi", "status": "Synced", "syncPhase": "Sync", "version": "v1beta1"}
+        ],
+        "revision": "",
+        "revisions": ["1111111111111111111111111111111111111111", "2222222222222222222222222222222222222222"]
+      }
+    },
+    "reconciledAt": "2026-10-31T17:59:51Z",
+    "resources": [
+      {"group": "hypershift.openshift.io", "kind": "HostedCluster", "name": "openshift-herzi",
+       "namespace": "hcp-herzi", "status": "OutOfSync", "health": {"status": "Healthy"}, "version": "v1beta1"},
+      {"group": "hypershift.openshift.io", "kind": "NodePool", "name": "herzi-np",
+       "namespace": "hcp-herzi", "status": "Synced", "health": {"status": "Healthy"}, "version": "v1beta1"}
+    ],
+    "sourceTypes": ["Helm", ""],
+    "sync": {
+      "comparedTo": {"destination": {"name": "in-cluster", "namespace": "openshift-gitops"}},
+      "revisions": ["1111111111111111111111111111111111111111", "3333333333333333333333333333333333333333"],
+      "status": "OutOfSync"
+    }
+  }
+}

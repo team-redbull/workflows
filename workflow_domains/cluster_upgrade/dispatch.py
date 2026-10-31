@@ -15,6 +15,7 @@ Three limbs, three routes (shared/consts.py):
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import timedelta
@@ -51,6 +52,7 @@ with workflow.unsafe.imports_passed_through():
         CheckResult,
         ClusterProfile,
         EvidenceRequest,
+        IncidentRecord,
         IncidentRequest,
         UpgradeStep,
     )
@@ -108,6 +110,11 @@ AGENT_RETRY_POLICY = RetryPolicy(
     maximum_interval=timedelta(minutes=1),
     maximum_attempts=2,
 )
+
+# Gates a stop letting go of the Brain incident write once the agent has
+# answered. Runs recorded before it waited for the write, which retries for as
+# long as Brain is away, through an abort.
+_INCIDENT_YIELDS_PATCH = "upgrade-agent-incident-yields-to-stop"
 
 
 def error_type(error: BaseException) -> str | None:
@@ -178,6 +185,19 @@ def start_watch(
     )
 
 
+async def _let_go(handle: workflow.ActivityHandle) -> None:
+    """Cancel a TRY_CANCEL activity, and take its outcome so nothing is left unawaited.
+
+    TRY_CANCEL resolves the handle at once, as cancelled — or with the result
+    or failure it reached first — and the activity is told on its next heartbeat.
+    """
+    handle.cancel()
+    try:
+        await handle
+    except (asyncio.CancelledError, ActivityError):
+        pass
+
+
 @dataclass(frozen=True)
 class Diagnosis:
     """What one agent invocation came back with, and where Brain recorded it."""
@@ -216,6 +236,9 @@ async def diagnose(
     Returns None when `stopped()` turns true first (an abort): it is checked
     before each call and raced against the agent, whose activity is then
     cancelled — cancelling the caller's task would not stop a call in flight.
+    A stop once the agent has answered is raced against the incident write
+    the same way: the verdict comes back with `incident_path` None, and the
+    caller's next act stops at its own checkpoint.
 
     `hosted_cluster(_namespace)`: the HostedCluster's own name, where the
     evidence is read (HostedClusterRequest); None is the one named `cluster`.
@@ -278,7 +301,9 @@ async def diagnose(
             ),
             incident_path=None,
         )
-    record = await on_hub(
+    # The incident is the hub's to write, retried for as long as Brain is away;
+    # a stop does not wait for it. The verdict is returned either way.
+    incident = workflow.start_activity(
         write_incident,
         IncidentRequest(
             workflow_id=workflow_id,
@@ -290,7 +315,16 @@ async def diagnose(
             nodepool=nodepool,
             verdict=verdict,
         ),
+        task_queue=UPGRADE_GITOPS_ACTIVITY_QUEUE,
+        start_to_close_timeout=GIT_TIMEOUT,
+        retry_policy=RETRY_POLICY,
+        cancellation_type=ActivityCancellationType.TRY_CANCEL,
     )
+    await workflow.wait_condition(lambda: incident.done() or stopped())
+    if not incident.done() and workflow.patched(_INCIDENT_YIELDS_PATCH):
+        await _let_go(incident)
+        return Diagnosis(invocation_id=invocation_id, verdict=verdict, incident_path=None)
+    record: IncidentRecord = await incident
     return Diagnosis(invocation_id=invocation_id, verdict=verdict, incident_path=record.path)
 
 

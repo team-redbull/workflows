@@ -96,7 +96,9 @@ with workflow.unsafe.imports_passed_through():
     from shared.consts import UPGRADE_CONTROL_PLANE_WORKFLOW_QUEUE
     from shared.exceptions import (
         AdminGateNotFoundError,
+        AmbiguousClusterFileError,
         ArgoSyncRefusedError,
+        ClusterFileNotFoundError,
         Day1ChangeRejectedError,
         Day1FileChangedError,
         ProposedActionRefusedError,
@@ -223,6 +225,19 @@ _SLOT_POLL = timedelta(minutes=2)
 # few minutes is generous before a person is asked.
 _ACK_SETTLE_POLL = timedelta(minutes=1)
 _ACK_SETTLE_DEADLINE = timedelta(minutes=10)
+
+# Gates re-reading the day1 file on the retry after the validator refused the
+# run's edit, as after someone else's edit: the person who fixed the file
+# changed its blob. Runs recorded before it committed over the old blob, met
+# the fix as someone else's edit and asked a second time.
+_REJECTED_REREAD_PATCH = "upgrade-cluster-reread-after-rejection"
+# Gates a cluster file gone or doubled after approval waiting for a person.
+# Runs recorded before it FAILED there — mid-upgrade, or mid-abort.
+_CLUSTER_FILE_PATCH = "upgrade-cluster-file-errors-wait-for-a-person"
+_CLUSTER_FILE_ERRORS = (ClusterFileNotFoundError.__name__, AmbiguousClusterFileError.__name__)
+# Gates the pause and abort checkpoint before an approved tier-2 action. Runs
+# recorded before it ran an action approved while paused at once.
+_ACTION_CHECKPOINT_PATCH = "upgrade-cluster-checkpoint-before-actions"
 
 # The waves whose agent runs tier-1 actions itself, judge-reviewed, within its
 # budget: lab and canary (AGENT.md #25). Everywhere else every action is a
@@ -677,7 +692,10 @@ class UpgradeClusterWorkflow:
                 await self._preflight(step, include_idms=False, nodepools=[], from_version=from_version)
                 if minor_of(step.version) > minor_of(from_version):
                     await self._admin_acks(step, from_version)
-            await self._take_current_day1_if_stale()
+            reason = await self._take_current_day1_if_stale()
+            if reason is not None:
+                await self._needs_human(f"control-plane step to {step.version}: {reason}")
+                continue
             child = await self._take_slot(step, from_version)
             try:
                 result = await self._drive_child(child, step)
@@ -702,6 +720,8 @@ class UpgradeClusterWorkflow:
             if result.outcome is ControlPlaneStepOutcome.DAY1_CHANGED:
                 self._day1_stale = True
                 detail = self._day1_changed(detail)
+            elif result.outcome is ControlPlaneStepOutcome.DAY1_REJECTED:
+                detail = self._day1_rejected(detail)
             await self._needs_human(f"control-plane step to {step.version}: {detail}", verdict=result.verdict)
         self._cp_version = step.version
 
@@ -1128,7 +1148,9 @@ class UpgradeClusterWorkflow:
             )
             if now.pinned.get(version) != context.plan.pinned.get(version):
                 return f"the mirror changed under the run: {release_tag(version)} no longer resolves to the approved digests"
-        await self._take_current_day1_if_stale()
+        reason = await self._take_current_day1_if_stale()
+        if reason is not None:
+            return reason
         await self._checkpoint()
         try:
             commit: Day1Commit = await on_hub(
@@ -1150,8 +1172,11 @@ class UpgradeClusterWorkflow:
                 self._day1_stale = True
                 return self._day1_changed(error_message(err))
             if kind == Day1ChangeRejectedError.__name__:
-                return f"the day1 validator refused the change: {error_message(err)}"
-            raise
+                return self._day1_rejected(error_message(err))
+            reason = self._cluster_file_problem(err)
+            if reason is None:
+                raise
+            return reason
         self._day1_blob = commit.blob
         self._log(f"commit-{change.value}", detail=f"{commit.revision} {nodepool or ''} {version or ''}".strip())
         # A NodePool commit is synced even when the file already said so: the
@@ -1189,14 +1214,49 @@ class UpgradeClusterWorkflow:
             "Retry carries on from the file as it is now; the run never commits over a person"
         )
 
-    async def _take_current_day1_if_stale(self) -> None:
-        """After a person's retry on a conflict, carry on from the file as they left it."""
+    def _day1_rejected(self, detail: str) -> str:
+        """Why a person is needed when the day1 validator refused the run's edit.
+
+        The person fixes the file, which changes its blob, so the retry re-reads
+        it first, as after someone else's edit — else the commit's compare-and-set
+        would take the fix for one and ask again.
+        """
+        refused = f"the day1 validator refused the change to {self._ctx.day1_path}: {detail}"
+        if not workflow.patched(_REJECTED_REREAD_PATCH):
+            return refused
+        self._day1_stale = True
+        return f"{refused}. Fix the file, then retry: the run carries on from the file as you leave it"
+
+    def _cluster_file_problem(self, err: ActivityError) -> str | None:
+        """Why a person is needed when day1 holds no file for the cluster, or two; None for any other error.
+
+        Only ever after approval: planning FAILS on them, with nothing committed.
+        Past that the HostedCluster may be mid-upgrade, and a run must never fail
+        on what a person can put right (CLAUDE.md §5) — whoever moved or copied
+        the file puts it back, and retries.
+        """
+        if error_type(err) not in _CLUSTER_FILE_ERRORS or not workflow.patched(_CLUSTER_FILE_PATCH):
+            return None
+        return (
+            f"day1 no longer holds exactly one file for {self._cluster}: {error_message(err)}. "
+            f"Put {self._ctx.day1_path} back, then retry"
+        )
+
+    async def _take_current_day1_if_stale(self) -> str | None:
+        """After a person's retry on a conflict, carry on from the file as they left it. Why a person is needed, or None."""
         if not self._day1_stale:
-            return
-        day1: Day1Cluster = await on_hub(read_day1_cluster, Day1ClusterRequest(cluster=self._cluster))
+            return None
+        try:
+            day1: Day1Cluster = await on_hub(read_day1_cluster, Day1ClusterRequest(cluster=self._cluster))
+        except ActivityError as err:
+            reason = self._cluster_file_problem(err)
+            if reason is None:
+                raise
+            return reason
         self._day1_blob = day1.blob
         self._day1_stale = False
         self._log("day1-reread", detail=f"{day1.path} at {day1.revision}")
+        return None
 
     async def _preflight(
         self, step: UpgradeStep, *, include_idms: bool, nodepools: list[str], from_version: str | None
@@ -1325,6 +1385,13 @@ class UpgradeClusterWorkflow:
             else:
                 await self._wait_for(ready)
             for pending in self._approved_unexecuted():
+                # An approved action is an act like a commit: a pause holds it
+                # until resume, an abort drops it. (Inside an abort nothing is
+                # proposed, so nothing reaches here.)
+                if not during_abort and workflow.patched(_ACTION_CHECKPOINT_PATCH):
+                    waiting_for = self._waiting_for
+                    await self._checkpoint()
+                    self._waiting_for = waiting_for
                 await self._execute(pending)
             if self._retry is not None:
                 self._retry = None
@@ -1382,7 +1449,8 @@ class UpgradeClusterWorkflow:
         """pausedUntil for the HostedCluster and every NodePool, committed and synced (D6).
 
         Never fails on what a person can fix: the day1 validator refusing the
-        edit, or Argo CD refusing the sync over someone else's pending change.
+        edit, the cluster file gone or doubled, or Argo CD refusing the sync
+        over someone else's pending change.
         The run waits for them and retries, because a half-done abort — paused
         in git, still rolling on the cluster — must not be left with nobody
         watching it.
@@ -1407,12 +1475,13 @@ class UpgradeClusterWorkflow:
                         ),
                     )
                 except ActivityError as err:
-                    if error_type(err) != Day1ChangeRejectedError.__name__:
-                        raise
-                    await self._needs_human(
-                        f"abort: the day1 validator refused pausedUntil: {error_message(err)}",
-                        during_abort=True,
-                    )
+                    if error_type(err) == Day1ChangeRejectedError.__name__:
+                        reason = f"the day1 validator refused pausedUntil: {error_message(err)}"
+                    else:
+                        reason = self._cluster_file_problem(err)
+                        if reason is None:
+                            raise
+                    await self._needs_human(f"abort: {reason}", during_abort=True)
                     continue
                 revision = commit.revision
                 self._log("commit-pause", detail=revision)

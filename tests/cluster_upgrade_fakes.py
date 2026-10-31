@@ -21,7 +21,7 @@ from datetime import timedelta
 from typing import Any
 
 from temporalio import activity, workflow
-from temporalio.client import Client, WorkflowHandle, WorkflowHistory
+from temporalio.client import Client, WorkflowExecutionStatus, WorkflowHandle, WorkflowHistory
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import UnsandboxedWorkflowRunner, Worker
@@ -225,6 +225,10 @@ class Fleet:
         # A step's own re-pin (one version), not planning's: holds it in flight.
         self.block_step_pin = False
         self.block_evidence = False
+        self.block_agent = False
+        self.block_incident = False
+        # Errors for the reads of the day1 file after planning's (a re-read on a retry).
+        self.day1_read_errors: list[Exception | None] = []
         # what happened
         self.calls: list[str] = []
         self.commits: list[Day1ChangeRequest] = []
@@ -290,6 +294,9 @@ class Fleet:
         @activity.defn(name="read_day1_cluster")
         async def read_day1_cluster(request: Day1ClusterRequest) -> Day1Cluster:
             fleet.calls.append("read_day1_cluster")
+            error = fleet.day1_read_errors.pop(0) if fleet.day1_read_errors else None
+            if error is not None:
+                raise error
             return Day1Cluster(
                 path=fleet.day1_path, revision=f"rev-{fleet.revision}", blob=fleet._blob(),
                 mastertag=fleet.mastertag, image_path=IMAGE_PATH,
@@ -355,6 +362,8 @@ class Fleet:
         @activity.defn(name="write_incident")
         async def write_incident(request: IncidentRequest) -> IncidentRecord:
             fleet.calls.append("write_incident")
+            while fleet.block_incident:
+                await asyncio.sleep(0.02)
             fleet.incidents.append(request)
             return IncidentRecord(path=f"incidents/2026-11-01-hypershift-stall-{len(fleet.incidents)}.md")
 
@@ -497,6 +506,9 @@ class Fleet:
         async def invoke_upgrade_agent(request: AgentRequest) -> AgentVerdict:
             fleet.calls.append(f"agent:{request.gate}")
             fleet.agent_requests.append(request)
+            while fleet.block_agent:
+                activity.heartbeat()
+                await asyncio.sleep(0.05)
             if fleet.agent_down:
                 raise RuntimeError("upgrade-agent: connection refused")
             return fleet.verdicts.pop(0) if fleet.verdicts else verdict("needs_human")
@@ -567,6 +579,8 @@ class Harness:
         self.fleet.block_control_plane_watch = False
         self.fleet.block_step_pin = False
         self.fleet.block_evidence = False
+        self.fleet.block_agent = False
+        self.fleet.block_incident = False
         for worker in reversed(self._workers):
             await worker.__aexit__(*exc_info)
         await self.env.__aexit__(*exc_info)
@@ -604,6 +618,28 @@ class Harness:
                 return last
             await asyncio.sleep(0.02)
         raise AssertionError(f"never reached {phase.value}; last progress: {last}")
+
+    async def next_stop(
+        self, *phases: UpgradePhase, workflow_id: str = WORKFLOW_ID, timeout: float = 30
+    ) -> UpgradeClusterProgress | None:
+        """Poll until the run reaches one of `phases`, or None once it has closed (a failure included).
+
+        For a driver that must work on two shapes of the code, where one shape
+        stops where the other goes on (a replay scenario recorded before a fix).
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while loop.time() < deadline:
+            if (await self.run(workflow_id).describe()).status is not WorkflowExecutionStatus.RUNNING:
+                return None
+            try:
+                last = await self.progress(workflow_id)
+            except Exception:  # noqa: BLE001 — between two runs of a continue-as-new
+                last = None
+            if last is not None and last.phase in phases:
+                return last
+            await asyncio.sleep(0.02)
+        raise AssertionError(f"never reached any of {[p.value for p in phases]}")
 
     async def called(self, name: str, times: int = 1, timeout: float = 30) -> None:
         """Wait until the fleet has seen `name` called `times` times."""

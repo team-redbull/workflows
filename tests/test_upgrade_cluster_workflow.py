@@ -21,7 +21,9 @@ from temporalio.client import WorkflowExecutionStatus, WorkflowFailureError, Wor
 from temporalio.exceptions import ApplicationError
 
 from shared.exceptions import (
+    AmbiguousClusterFileError,
     ClusterFileNotFoundError,
+    Day1ChangeRejectedError,
     UpgradePlanningFailedError,
     UpgradeUpdateRefusedError,
 )
@@ -69,6 +71,7 @@ from tests.cluster_upgrade_fakes import (
     verdict,
 )
 from shared.consts import UPGRADE_TARGETS_WORKFLOW_QUEUE
+from workflow_domains.cluster_upgrade.dispatch import error_type
 from workflow_domains.cluster_upgrade.upgrade_cluster import UpgradeClusterWorkflow as Run
 from workflow_domains.cluster_upgrade.upgrade_targets import UpgradeTargetsWorkflow
 from workflow_domains.cluster_upgrade.upgrade_control_plane import UpgradeControlPlaneWorkflow
@@ -627,6 +630,66 @@ class TestGatesAndTheAgent:
         assert executed.approved_by == "alice" and executed.action.target == "openshift-monitoring/prom-0"
         assert [c for c in fleet.calls if c.startswith("gate:")] == ["gate:np-a", "gate:np-a"]
 
+    async def _until_a_proposal_waits(self, h: Harness, fleet: Fleet) -> None:
+        failing = CheckResult(name="pdbs-back", passed=False, expected="disruptionsAllowed >= 1",
+                              observed="db/pdb at 0", on_failure=CheckFailure.NEEDS_HUMAN)
+        fleet.gate_script = [GateOutcome(result=GateResult.DEADLINE, failing_checks=[failing])]
+        fleet.verdicts = [verdict("needs_human", actions_proposed=[ProposedAction(
+            action_id="act-1", kind="delete_pod", target="openshift-monitoring/prom-0", rationale="stuck terminating",
+        )])]
+        await h.start(request(nodepool_mode=NodePoolMode.AUTO))
+        await h.until(UpgradePhase.AWAITING_APPROVAL)
+        await h.decide(Run.approve, ALICE)
+        await h.until(UpgradePhase.NEEDS_HUMAN)
+        await h.decide(Run.pause, HumanDecision(by="alice", reason="look first"))
+        await h.decide(Run.approve_action, ActionDecision(by="alice", action_id="act-1"))
+
+    async def test_an_action_approved_while_paused_runs_only_after_resume(self):
+        fleet = Fleet(control_plane="4.20.44", nodepools={"np-a": "4.19.53"})
+        async with Harness(fleet) as h:
+            await self._until_a_proposal_waits(h, fleet)
+            held = await h.until(UpgradePhase.PAUSED)
+            assert "resume: paused by alice" in held.waiting_for
+            await h.env.sleep(timedelta(hours=1))
+            assert fleet.actions == []  # a pause holds an approved action like a commit
+            await h.decide(Run.resume, ALICE)
+            await h.called("action:act-1")
+            waiting = await h.until(UpgradePhase.NEEDS_HUMAN)
+            # Back in the same wait, saying what it waits for.
+            assert waiting.waiting_for.startswith("retry or abort: the gate after NodePool np-a did not pass")
+            await h.decide(Run.retry, ALICE)
+            result = await h.result()
+        assert result.outcome is UpgradeOutcome.DONE
+        assert [(a.action.action_id, a.approved_by) for a in fleet.actions] == [("act-1", "alice")]
+
+    async def test_an_action_approved_while_paused_never_runs_once_aborted(self):
+        fleet = Fleet(control_plane="4.20.44", nodepools={"np-a": "4.19.53"})
+        async with Harness(fleet) as h:
+            await self._until_a_proposal_waits(h, fleet)
+            await h.until(UpgradePhase.PAUSED)
+            await h.decide(Run.abort, HumanDecision(by="alice", reason="change of plan"))
+            result = await h.result()
+        assert result.outcome is UpgradeOutcome.ABORTED
+        assert fleet.actions == []
+        assert fleet.commit_summary() == ["nodepool:np-a:4.20.44", "pause"]
+
+    async def test_an_abort_while_brain_records_the_incident_does_not_wait_for_brain(self):
+        fleet = Fleet(control_plane="4.20.44", nodepools={"np-a": "4.19.53"})
+        fleet.np_watch_script = [WatchResult.STALLED]
+        fleet.block_incident = True  # Brain unreachable: the hub limb retries for ever
+        async with Harness(fleet) as h:
+            await h.start(request(nodepool_mode=NodePoolMode.AUTO))
+            await h.until(UpgradePhase.AWAITING_APPROVAL)
+            await h.decide(Run.approve, ALICE)
+            await h.called("write_incident")
+            await h.decide(Run.abort, HumanDecision(by="alice", reason="change of plan"))
+            result = await h.result()  # with the write still blocked
+        assert result.outcome is UpgradeOutcome.ABORTED
+        assert fleet.commit_summary() == ["nodepool:np-a:4.20.44", "pause"]
+        # The verdict is still on record, with no incident to point to.
+        (agent,) = [e for e in result.log if e.event == "agent"]
+        assert agent.detail.startswith("needs_human: ") and "incidents/" not in agent.detail
+
     async def test_a_drain_a_pdb_blocks_goes_to_the_agent_early_and_lab_waves_let_it_act(self):
         # Seen live (CONTEXT §8.13): an OpenShift PDB whose pods crash-loop
         # blocks a node's drain for ever. The watch hands it over after
@@ -917,6 +980,107 @@ class TestTheMirrorAndGit:
         assert fleet.calls.count("read_day1_cluster") == 2
         assert fleet.commits[0].expected_blob == "blob-2"
         assert fleet.commit_summary()[0] == "control-plane::4.19.53"
+
+    async def test_a_refused_nodepool_commit_a_person_fixes_takes_one_retry(self):
+        # The fix changes the file's blob: the retry must re-read it, not take the fix for someone else's edit.
+        fleet = Fleet(control_plane="4.20.44", nodepools={"np-a": "4.19.53"})
+        fleet.commit_errors = [Day1ChangeRejectedError("workertag must be pinned")]
+        async with Harness(fleet) as h:
+            await h.start(request(nodepool_mode=NodePoolMode.AUTO))
+            await h.until(UpgradePhase.AWAITING_APPROVAL)
+            await h.decide(Run.approve, ALICE)
+            waiting = await h.until(UpgradePhase.NEEDS_HUMAN)
+            assert "the day1 validator refused the change" in waiting.waiting_for
+            assert "workertag must be pinned" in waiting.waiting_for and "Fix the file" in waiting.waiting_for
+            fleet.edit_by_hand()
+            await h.decide(Run.retry, ALICE)
+            result = await h.result()
+        assert result.outcome is UpgradeOutcome.DONE
+        assert sum(e.event == "needs-human" for e in result.log) == 1
+        assert fleet.commit_summary() == ["nodepool:np-a:4.20.44", "finish"]
+        assert fleet.commits[0].expected_blob == "blob-2"  # the person's fix, read again
+
+    async def test_a_refused_control_plane_commit_a_person_fixes_takes_one_retry(self):
+        fleet = Fleet(control_plane="4.19.53", nodepools={"np-a": "4.19.53"})
+        fleet.commit_errors = [Day1ChangeRejectedError("mastertag must be quoted")]
+        async with Harness(fleet) as h:
+            await h.start(request(workers_to_target=False))
+            await h.until(UpgradePhase.AWAITING_APPROVAL)
+            await h.decide(Run.approve, ALICE)
+            waiting = await h.until(UpgradePhase.NEEDS_HUMAN)
+            assert "the day1 validator refused the change" in waiting.waiting_for
+            assert "mastertag must be quoted" in waiting.waiting_for
+            fleet.edit_by_hand()
+            await h.decide(Run.retry, ALICE)
+            await h.until(UpgradePhase.AWAITING_DAY2_CONFIRM)
+            await h.decide(Run.confirm_day2, DAY2)
+            result = await h.result()
+        assert result.outcome is UpgradeOutcome.DONE
+        assert sum(e.event == "needs-human" for e in result.log) == 1
+        assert fleet.commit_summary() == ["control-plane::4.20.44", "finish"]
+        assert fleet.calls.count("read_day1_cluster") == 2  # planning, then the retry
+
+    async def test_a_cluster_file_gone_after_approval_waits_for_a_person_not_a_failure(self):
+        fleet = Fleet(control_plane="4.20.44", nodepools={"np-a": "4.19.53"})
+        async with Harness(fleet) as h:
+            await h.start(request(nodepool_mode=NodePoolMode.AUTO))
+            await h.until(UpgradePhase.AWAITING_APPROVAL)
+            fleet.commit_errors = [ClusterFileNotFoundError(f"no {CLUSTER}.yaml under the clusters root")]
+            await h.decide(Run.approve, ALICE)
+            waiting = await h.until(UpgradePhase.NEEDS_HUMAN)
+            assert f"no {CLUSTER}.yaml" in waiting.waiting_for and "then retry" in waiting.waiting_for
+            await h.decide(Run.retry, ALICE)
+            result = await h.result()
+        assert result.outcome is UpgradeOutcome.DONE
+        assert fleet.commit_summary() == ["nodepool:np-a:4.20.44", "finish"]
+
+    async def test_a_cluster_file_gone_when_the_run_re_reads_it_waits_for_a_person(self):
+        fleet = Fleet()
+        async with Harness(fleet) as h:
+            await h.start(request(workers_to_target=False))
+            await h.until(UpgradePhase.AWAITING_APPROVAL)
+            fleet.edit_by_hand()
+            await h.decide(Run.approve, ALICE)
+            await h.until(UpgradePhase.NEEDS_HUMAN)  # someone else's edit
+            fleet.day1_read_errors = [AmbiguousClusterFileError(f"two {CLUSTER}.yaml files")]
+            await h.decide(Run.retry, ALICE)
+            await h.called("read_day1_cluster", times=2)
+            waiting = await h.until(UpgradePhase.NEEDS_HUMAN)
+            assert f"two {CLUSTER}.yaml files" in waiting.waiting_for
+            assert fleet.commits == []
+            await h.decide(Run.retry, ALICE)
+            await h.until(UpgradePhase.AWAITING_DAY2_CONFIRM)
+            await h.decide(Run.abort, HumanDecision(by="alice", reason="end of test"))
+            result = await h.result()
+        assert result.outcome is UpgradeOutcome.ABORTED
+        assert fleet.commit_summary() == ["control-plane::4.19.53", "pause"]
+
+    async def test_an_abort_whose_cluster_file_is_doubled_waits_for_a_person_then_lands(self):
+        fleet = Fleet()
+        async with Harness(fleet) as h:
+            await h.start(request())
+            await h.until(UpgradePhase.AWAITING_APPROVAL)
+            await h.decide(Run.approve, ALICE)
+            await h.until(UpgradePhase.AWAITING_DAY2_CONFIRM)
+            fleet.commit_errors = [AmbiguousClusterFileError(f"two {CLUSTER}.yaml files")]
+            await h.decide(Run.abort, HumanDecision(by="alice", reason="escalation"))
+            waiting = await h.until(UpgradePhase.NEEDS_HUMAN)
+            assert waiting.waiting_for.startswith("retry or abort: abort: day1 no longer holds exactly one file")
+            await h.decide(Run.retry, ALICE)
+            result = await h.result()
+        assert result.outcome is UpgradeOutcome.ABORTED
+        assert fleet.commit_summary() == ["control-plane::4.19.53", "pause"] and fleet.paused_until
+
+    async def test_a_cluster_file_missing_at_planning_still_fails_the_run(self):
+        fleet = Fleet()
+        fleet.day1_read_errors = [ClusterFileNotFoundError(f"no {CLUSTER}.yaml under the clusters root")]
+        async with Harness(fleet) as h:
+            await h.start(request())
+            with pytest.raises(WorkflowFailureError) as excinfo:
+                await h.result()
+        # Before approval nothing is committed, so planning fails on it, as it always has.
+        assert error_type(excinfo.value.cause) == ClusterFileNotFoundError.__name__
+        assert fleet.commits == []
 
     async def test_a_refused_sync_after_the_commit_retries_only_the_sync(self):
         fleet = Fleet(control_plane="4.20.44", nodepools={"np-a": "4.19.53"})

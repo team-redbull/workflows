@@ -167,7 +167,9 @@ class Fleet:
     ) -> None:
         self.nodepools = dict(nodepools or {"np-a": control_plane, "np-b": control_plane})
         self.zones = zones or {}
-        self.upgrade = upgrade or ClusterUpgradeSettings()
+        # A lab cluster (wave 1) unless a test says otherwise: auto NodePool mode, which
+        # most tests use to skip the customer's continue, is for waves 0 and 1 only (D20).
+        self.upgrade = upgrade or ClusterUpgradeSettings(wave=1)
         self.mirror = mirror if mirror is not None else [r.version for r in LADDER]
         self.max_concurrent_control_planes = max_concurrent_control_planes
         # day1, as written: production files pin every NodePool's workertag.

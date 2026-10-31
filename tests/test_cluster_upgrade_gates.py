@@ -10,6 +10,7 @@ from __future__ import annotations
 import pytest
 
 from shared.models.cluster_upgrade import (
+    NodePoolMode,
     AdminAckRule,
     AdminAckState,
     ApiUsage,
@@ -164,6 +165,21 @@ class TestPlanningChecks:
         gap = Day2LayerGap(sig="sig-storage", chart="odf", version="4.19.53")
         check = _planning(day2=Day2Layers(missing=[gap]))["day2-layers"]
         assert not check.passed and "create ocp-versions/4.19.53/ for odf in sig-storage" in check.observed
+
+    @pytest.mark.parametrize(("wave", "passes"), [(0, True), (1, True), (2, False), (None, False)])
+    def test_auto_nodepool_mode_is_for_waves_zero_and_one_only(self, wave, passes):
+        check = _planning(
+            request=request(nodepool_mode=NodePoolMode.AUTO), day1=_day1(upgrade=ClusterUpgradeSettings(wave=wave))
+        )["auto-mode-wave"]
+        assert check.passed is passes
+
+    def test_manual_mode_or_no_worker_step_is_never_refused(self):
+        production = _day1(upgrade=ClusterUpgradeSettings(wave=2))
+        assert _planning(request=request(), day1=production)["auto-mode-wave"].passed
+        control_plane_only = PLAN.model_copy(update={"steps": PLAN.steps[:2]})
+        no_workers = _planning(request=request(nodepool_mode=NodePoolMode.AUTO), day1=production,
+                               plan=control_plane_only)
+        assert no_workers["auto-mode-wave"].passed
 
     @pytest.mark.parametrize(("wave", "passes"), [(0, True), (1, True), (2, False), (None, False)])
     def test_auto_approve_is_for_waves_zero_and_one_only(self, wave, passes):

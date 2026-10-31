@@ -40,6 +40,7 @@ with workflow.unsafe.imports_passed_through():
         HostedClusterState,
         HostedHealth,
         MceState,
+        NodePoolMode,
         PinnedReleases,
         ReleaseLayout,
         StepKind,
@@ -61,8 +62,9 @@ _GENERIC_SOAK_MINUTES = 0
 # bare-metal reboot. The hour install-server allows a bare-metal POST and boot.
 PER_BATCH_MINUTES = 60
 
-# The waves whose clusters may skip the human approval (AGENT.md #3, #30).
-_AUTO_APPROVE_WAVES = (0, 1)
+# The waves whose clusters may run without a person (AGENT.md #3, #30): auto-approve,
+# and auto NodePool mode, which skips the customer's sign-off between NodePools (D19, D20).
+_UNATTENDED_WAVES = (0, 1)
 
 # The CVO's Upgradeable=False reason while its own update runs (4.19 and later).
 _UPDATE_IN_PROGRESS = "UpdateInProgress"
@@ -214,6 +216,7 @@ def planning_checks(
         _git_matches_cluster(day1, hosted),
         _day2_layers_exist(day2),
         _auto_approve_allowed(request, day1),
+        _auto_nodepool_mode_allowed(request, day1, plan),
     ]
 
 
@@ -348,8 +351,23 @@ def _auto_approve_allowed(request: UpgradeClusterInput, day1: Day1Cluster) -> Ch
         return _failed_check(name, True, "", "approval by a person")
     wave = day1.upgrade.wave
     return _failed_check(
-        name, wave in _AUTO_APPROVE_WAVES,
-        f"upgrade.wave in {list(_AUTO_APPROVE_WAVES)} for auto_approve",
+        name, wave in _UNATTENDED_WAVES,
+        f"upgrade.wave in {list(_UNATTENDED_WAVES)} for auto_approve",
+        f"upgrade.wave is {wave}",
+    )
+
+
+def _auto_nodepool_mode_allowed(request: UpgradeClusterInput, day1: Day1Cluster, plan: UpgradePlan) -> CheckResult:
+    """Auto mode rolls NodePools without stopping, so the customer gets no turn to check (D19):
+    only lab and canary clusters may run it (D20). A plan that rolls no workers is not affected."""
+    name = "auto-mode-wave"
+    if request.nodepool_mode is not NodePoolMode.AUTO or not any(s.kind is StepKind.WORKERS for s in plan.steps):
+        return _failed_check(name, True, "", "the customer signs off before each NodePool")
+    wave = day1.upgrade.wave
+    return _failed_check(
+        name, wave in _UNATTENDED_WAVES,
+        f"upgrade.wave in {list(_UNATTENDED_WAVES)} for nodepool_mode auto; elsewhere the customer runs "
+        "their readiness checks and signs off with continue",
         f"upgrade.wave is {wave}",
     )
 

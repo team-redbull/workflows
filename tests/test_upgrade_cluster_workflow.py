@@ -239,6 +239,16 @@ class TestPlanningRefusals:
         assert "kind: ImageSetConfiguration" in failure.message and "minVersion: 4.19.53" in failure.message
         assert fleet.commits == []
 
+    async def test_auto_mode_on_a_production_cluster_fails_before_anything_is_committed(self):
+        # Auto mode would roll every NodePool without the customer's turn to check (D19, D20).
+        fleet = Fleet(upgrade=ClusterUpgradeSettings(wave=2))
+        async with Harness(fleet) as h:
+            await h.start(request(nodepool_mode=NodePoolMode.AUTO))
+            failure = await _fails(h)
+        assert failure.type == UpgradePlanningFailedError.__name__
+        assert "for nodepool_mode auto" in failure.message and "upgrade.wave is 2" in failure.message
+        assert fleet.commits == []
+
     async def test_auto_approve_needs_a_wave_zero_or_one_cluster(self):
         fleet = Fleet(upgrade=ClusterUpgradeSettings(wave=3))
         async with Harness(fleet) as h:
@@ -540,13 +550,16 @@ class TestPauseAndAbortReachEveryAct:
 
 class TestGatesAndTheAgent:
     async def test_a_stall_the_agent_clears_is_watched_once_more_and_passes(self):
-        fleet = Fleet(control_plane="4.20.44", nodepools={"np-a": "4.19.53"})
+        # A production cluster: manual mode, and the agent only proposes.
+        fleet = Fleet(control_plane="4.20.44", nodepools={"np-a": "4.19.53"}, upgrade=ClusterUpgradeSettings(wave=2))
         fleet.np_watch_script = [WatchResult.STALLED]
         fleet.verdicts = [verdict("retry_gate")]
         async with Harness(fleet) as h:
-            await h.start(request(nodepool_mode=NodePoolMode.AUTO))
+            await h.start(request())
             await h.until(UpgradePhase.AWAITING_APPROVAL)
             await h.decide(Run.approve, ALICE)
+            await h.until(UpgradePhase.AWAITING_CONTINUE)
+            await h.decide(Run.continue_nodepool, ContinueNodePool(by="the customer"))
             result = await h.result()
 
         assert result.outcome is UpgradeOutcome.DONE

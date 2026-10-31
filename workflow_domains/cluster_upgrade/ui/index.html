@@ -1,0 +1,617 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cluster upgrades</title>
+<!--
+  A temporary page for upgrade-cluster runs, until the ClickCluster Platform UI exists.
+  Served by the workflows API (workflow_domains/cluster_upgrade/ui.py), which it calls:
+    GET  /workflows/runs?workflow_type=UpgradeClusterWorkflow   the run list
+    GET  /workflows/runs/{workflow_id}                          one run's progress or result
+    POST /workflows/cluster-upgrade/upgrade-cluster[/{id}/...]  start, and every decision
+  Self-contained on purpose: production is air-gapped, so nothing loads from another host.
+  Demo mode reads /ui/cluster-upgrade/demo-runs.json, recorded from the workflow's tests.
+-->
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --ink: #1c2330; --muted: #5d6878; --line: #e2e6ec; --soft: #eef1f5;
+  --accent: #2f6fde; --accent-ink: #ffffff;
+  --ok: #1f8a4c; --ok-bg: #e5f5ec; --person: #a86400; --person-bg: #fdf1dc; --alert: #b3261e; --alert-bg: #fbe6e4;
+  --machine: #2f6fde; --machine-bg: #e6eefc; --mutedc: #6b7280; --muted-bg: #eceef2;
+  --shadow: 0 1px 2px rgba(16, 24, 40, .06), 0 1px 3px rgba(16, 24, 40, .08);
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f131a; --panel: #171c25; --ink: #e6e9ef; --muted: #98a2b3; --line: #273041; --soft: #1e2532;
+    --accent: #5b8ef0; --accent-ink: #0b1220;
+    --ok: #4cc488; --ok-bg: #14301f; --person: #f0b24a; --person-bg: #33270f; --alert: #ff7b72; --alert-bg: #3a1716;
+    --machine: #7aa5f5; --machine-bg: #172a4a; --mutedc: #9aa3b2; --muted-bg: #222a37;
+    --shadow: none;
+    color-scheme: dark;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
+code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; }
+button { font: inherit; cursor: pointer; border-radius: 8px; border: 1px solid var(--line); background: var(--panel);
+  color: var(--ink); padding: 7px 12px; }
+button:hover { border-color: var(--muted); }
+button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible, .run:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 2px; }
+button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 600; }
+button.danger { color: var(--alert); }
+button.link { border: none; background: none; color: var(--accent); padding: 0; }
+input, select, textarea { font: inherit; color: var(--ink); background: var(--panel); border: 1px solid var(--line);
+  border-radius: 8px; padding: 7px 9px; width: 100%; }
+label { display: block; font-weight: 600; margin: 10px 0 4px; }
+label .hint { font-weight: 400; color: var(--muted); }
+
+header { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; padding: 12px 20px;
+  background: var(--panel); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 2; }
+header h1 { font-size: 17px; margin: 0; }
+.tag { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; color: var(--muted);
+  border: 1px solid var(--line); border-radius: 999px; padding: 2px 8px; }
+.spacer { flex: 1; }
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.seg button { border: none; border-radius: 0; padding: 6px 12px; }
+.seg button[aria-pressed="true"] { background: var(--soft); font-weight: 600; }
+.who { display: flex; align-items: center; gap: 6px; }
+.who input { width: 150px; padding: 5px 8px; }
+.refreshed { color: var(--muted); font-size: 12px; min-width: 110px; text-align: right; }
+
+.banner { margin: 14px 20px 0; padding: 10px 14px; border-radius: 10px; background: var(--person-bg);
+  color: var(--ink); border: 1px solid var(--line); }
+.banner b { color: var(--person); }
+
+main { display: grid; grid-template-columns: 320px minmax(0, 1fr); gap: 16px; padding: 16px 20px 40px; }
+@media (max-width: 860px) {
+  main { grid-template-columns: minmax(0, 1fr); padding: 12px 16px 32px; }
+  header { padding: 10px 16px; }
+  .banner { margin: 12px 16px 0; }
+  .refreshed { min-width: 0; text-align: left; }
+}
+.panel { min-width: 0; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow); }
+.list-head { display: flex; align-items: center; justify-content: space-between; padding: 12px 14px 8px; }
+.list-head h2, .card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 0; }
+.runs { list-style: none; margin: 0; padding: 4px 8px 10px; }
+.run { display: block; width: 100%; text-align: left; border: 1px solid transparent; border-radius: 10px;
+  padding: 10px 10px; background: none; }
+.run:hover { background: var(--soft); }
+.run[aria-current="true"] { background: var(--soft); border-color: var(--line); }
+.run .name { font-weight: 600; display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+.run .sub { color: var(--muted); font-size: 12.5px; margin-top: 3px; overflow: hidden; text-overflow: ellipsis;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+.empty { color: var(--muted); padding: 16px 14px; }
+
+.chip { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; border-radius: 999px;
+  padding: 2px 9px; white-space: nowrap; }
+.chip::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.t-person { color: var(--person); background: var(--person-bg); }
+.t-machine { color: var(--machine); background: var(--machine-bg); }
+.t-alert, .t-bad { color: var(--alert); background: var(--alert-bg); }
+.t-ok { color: var(--ok); background: var(--ok-bg); }
+.t-muted { color: var(--mutedc); background: var(--muted-bg); }
+
+.detail { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+.card { padding: 16px 18px; }
+.card h2 { margin-bottom: 12px; }
+.title { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.title h2 { font-size: 20px; text-transform: none; letter-spacing: 0; color: var(--ink); margin: 0; }
+.facts { display: flex; flex-wrap: wrap; gap: 6px 22px; margin-top: 10px; color: var(--muted); font-size: 13px; }
+.facts b { color: var(--ink); font-weight: 600; }
+
+.waiting { border-left: 4px solid var(--person); background: var(--person-bg); border-radius: 10px; padding: 12px 14px; }
+.waiting.machine { border-left-color: var(--machine); background: var(--machine-bg); }
+.waiting.alert { border-left-color: var(--alert); background: var(--alert-bg); }
+.waiting .label { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
+.waiting p { margin: 6px 0 0; white-space: pre-line; }
+.actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+
+.track { display: flex; align-items: stretch; gap: 0; overflow-x: auto; padding: 4px 2px 8px; }
+.node { min-width: 150px; flex: 0 0 auto; }
+.node .box { border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; background: var(--panel); height: 100%; }
+.node .kind { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
+.node .ver { font-size: 16px; font-weight: 700; margin-top: 2px; }
+.node .why { font-size: 12px; color: var(--muted); }
+.node.s-done .box { border-color: var(--ok); }
+.node.s-done .ver::after { content: "  \2713"; color: var(--ok); }
+.node.s-current .box { border-color: var(--machine); box-shadow: 0 0 0 3px var(--machine-bg); }
+.node.s-alert .box { border-color: var(--alert); box-shadow: 0 0 0 3px var(--alert-bg); }
+.node.s-start .box { background: var(--soft); }
+.link-line { flex: 0 0 26px; align-self: center; height: 2px; background: var(--line); }
+.link-line.done { background: var(--ok); }
+.pools { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; }
+.pool { font-size: 12px; border-radius: 6px; padding: 2px 7px; background: var(--muted-bg); color: var(--mutedc); }
+.pool.done { background: var(--ok-bg); color: var(--ok); }
+.pool.current { background: var(--machine-bg); color: var(--machine); font-weight: 600; }
+.pool.alert { background: var(--alert-bg); color: var(--alert); font-weight: 600; }
+.pool.next { background: var(--person-bg); color: var(--person); font-weight: 600; }
+.legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--muted); margin-top: 6px; }
+
+.verdict p { margin: 4px 0 10px; }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 8px 6px; border-top: 1px solid var(--line); vertical-align: top; }
+th { font-size: 12px; color: var(--muted); font-weight: 600; border-top: none; }
+.log { list-style: none; margin: 0; padding: 0; }
+.log li { display: grid; grid-template-columns: 112px minmax(0, 1fr); gap: 10px; padding: 7px 0; border-top: 1px solid var(--line); }
+.log li:first-child { border-top: none; }
+.log time { color: var(--muted); font-size: 12px; white-space: nowrap; }
+.log .ev { font-weight: 600; }
+.log .by { color: var(--muted); }
+.log .d { color: var(--ink); overflow-wrap: anywhere; }
+details summary { cursor: pointer; color: var(--muted); }
+pre { background: var(--soft); border-radius: 8px; padding: 10px; overflow: auto; max-height: 360px; font-size: 12px; }
+
+dialog { border: 1px solid var(--line); border-radius: 14px; padding: 0; width: min(520px, calc(100vw - 32px));
+  background: var(--panel); color: var(--ink); }
+dialog::backdrop { background: rgba(10, 14, 20, .45); }
+dialog form { padding: 18px 20px; }
+dialog h3 { margin: 0 0 4px; font-size: 17px; }
+dialog .explain { color: var(--muted); margin: 0 0 6px; }
+dialog .buttons { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+.toast { position: fixed; right: 20px; bottom: 20px; max-width: min(460px, calc(100vw - 40px)); padding: 12px 14px;
+  border-radius: 10px; background: var(--ink); color: var(--bg); box-shadow: var(--shadow); white-space: pre-line;
+  opacity: 0; transform: translateY(8px); transition: .2s; pointer-events: none; }
+.toast.show { opacity: 1; transform: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Cluster upgrades</h1>
+  <span class="tag" title="Until the ClickCluster Platform UI exists">temporary</span>
+  <span class="spacer"></span>
+  <div class="who"><label for="who" style="margin:0">You</label><input id="who" placeholder="your name" autocomplete="name"></div>
+  <div class="seg" role="group" aria-label="Data source">
+    <button id="mode-live" type="button" aria-pressed="false">Live</button>
+    <button id="mode-demo" type="button" aria-pressed="false">Demo</button>
+  </div>
+  <span class="refreshed" id="refreshed" aria-live="polite"></span>
+</header>
+<div class="banner" id="banner" hidden></div>
+<main>
+  <section class="panel" aria-label="Upgrade runs">
+    <div class="list-head"><h2>Runs</h2><button type="button" class="primary" id="new-run">New upgrade</button></div>
+    <ul class="runs" id="runs"></ul>
+  </section>
+  <section class="detail" id="detail" aria-live="polite"></section>
+</main>
+
+<dialog id="dialog"><form method="dialog" id="dialog-form"></form></dialog>
+<div class="toast" id="toast" role="status"></div>
+
+<script>
+"use strict";
+const API = "/workflows/cluster-upgrade/upgrade-cluster";
+const RUNS = "/workflows/runs";
+const DEMO_URL = "/ui/cluster-upgrade/demo-runs.json";
+const POLL_MS = 10000;
+
+// Phase -> [words a person reads, tone]. Tones: person (someone must act), machine, alert, ok, muted, bad.
+const PHASES = {
+  "planning": ["Planning", "machine"], "preflight": ["Pre-flight checks", "machine"],
+  "awaiting-approval": ["Waiting for approval", "person"], "waiting-for-slot": ["Waiting for a control-plane slot", "machine"],
+  "admin-acks": ["Checking admin acks", "machine"], "awaiting-admin-ack": ["Admin ack needs a person", "person"],
+  "control-plane-step": ["Upgrading the control plane", "machine"], "awaiting-day2-confirm": ["Waiting for day2", "person"],
+  "awaiting-continue": ["Customer's turn to check", "person"], "nodepool-roll": ["Rolling a NodePool", "machine"],
+  "nodepool-gate": ["Checking the NodePool", "machine"], "agent-invocation": ["Agent diagnosing", "machine"],
+  "needs-human": ["Needs a person", "alert"], "paused": ["Paused", "muted"], "postflight": ["Finishing", "machine"],
+  "aborting": ["Aborting", "alert"], "done": ["Done", "ok"], "cancelled": ["Cancelled", "muted"], "aborted": ["Aborted", "bad"],
+};
+const STATUS = { FAILED: ["Failed", "bad"], TERMINATED: ["Terminated", "bad"], CANCELED: ["Cancelled", "muted"],
+  TIMED_OUT: ["Timed out", "bad"], CONTINUED_AS_NEW: ["Continuing", "machine"] };
+
+// What a person can decide in each phase (router.py validates again; the page only offers).
+const DECISIONS = {
+  "awaiting-approval": [{ path: "approve", label: "Approve the plan", primary: true, reason: "optional",
+    explain: "Nothing has been committed yet. Approving lets the run commit the first step to day1 and sync it." }],
+  "awaiting-day2-confirm": [{ path: "confirm-day2", label: "Day2 is ready", primary: true, reason: "optional",
+    explain: "Confirms the day2 layers for this version are applied, so the run may go on." }],
+  "awaiting-admin-ack": [
+    { path: "approve-admin-ack", label: "Approve the admin ack", primary: true, reason: "required",
+      explain: "A client still called an API this ack removes. Approving gives the ack anyway; say why." },
+    { path: "retry", label: "Check the callers again", reason: "optional",
+      explain: "Reads the API callers again; if none remain, the run gives the ack itself." }],
+  "awaiting-continue": [{ path: "continue", label: "Continue", primary: true, nodepool: true,
+    explain: "The customer's sign-off: their readiness checks passed, so the next NodePool may roll." }],
+  "needs-human": [{ path: "retry", label: "Retry", primary: true, reason: "optional",
+    explain: "Runs what failed again, after any approved proposals are executed." }],
+};
+const ACTIVE = (phase) => !["done", "cancelled", "aborted", "aborting"].includes(phase);
+
+const state = { mode: "live", list: [], runs: {}, selected: null, demo: null, liveNote: "" };
+const $ = (id) => document.getElementById(id);
+const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const cluster = (id) => id.replace(/^upgrade-cluster-/, "");
+
+function store(key, value) { try { value === undefined ? localStorage.removeItem(key) : localStorage.setItem(key, value); } catch (e) {} }
+function recall(key) { try { return localStorage.getItem(key); } catch (e) { return null; } }
+
+function ago(iso) {
+  if (!iso) return "";
+  const s = Math.round((Date.now() - new Date(iso).getTime()) / 1000);
+  if (s < 60) return "just now";
+  if (s < 3600) return `${Math.round(s / 60)} min ago`;
+  if (s < 86400) return `${Math.round(s / 3600)} h ago`;
+  return new Date(iso).toLocaleDateString(undefined, { day: "numeric", month: "short" });
+}
+function clock(iso) {
+  const d = new Date(iso);
+  return d.toLocaleDateString(undefined, { day: "numeric", month: "short" }) + " " +
+    d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+}
+
+// --- reading -------------------------------------------------------------------------------
+
+async function getJSON(url) {
+  const response = await fetch(url, { headers: { accept: "application/json" } });
+  if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+  return response.json();
+}
+
+async function loadDemo() {
+  if (!state.demo) state.demo = await getJSON(DEMO_URL);
+  state.list = state.demo.list;
+  state.runs = state.demo.runs;
+}
+
+async function loadLive() {
+  state.list = await getJSON(`${RUNS}?workflow_type=UpgradeClusterWorkflow&limit=50`);
+  const ids = state.list.slice(0, 25).map((r) => r.workflow_id);
+  const results = await Promise.allSettled(ids.map((id) => getJSON(`${RUNS}/${encodeURIComponent(id)}`)));
+  const runs = {};
+  results.forEach((r, i) => { if (r.status === "fulfilled") runs[ids[i]] = r.value; });
+  state.runs = runs;
+}
+
+async function refresh() {
+  try {
+    if (state.mode === "demo") await loadDemo(); else await loadLive();
+    if (!state.selected || !state.list.some((r) => r.workflow_id === state.selected)) {
+      state.selected = (state.list.find((r) => tone(r.workflow_id) === "person" || tone(r.workflow_id) === "alert") || state.list[0] || {}).workflow_id || null;
+    }
+    $("refreshed").textContent = state.mode === "demo" ? "demo data" : `updated ${new Date().toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" })}`;
+  } catch (err) {
+    if (state.mode === "live") {
+      state.liveNote = `The run list could not be read (${err.message}).`;
+      return setMode("demo", true);
+    }
+    toast(`Could not load: ${err.message}`);
+  }
+  render();
+}
+
+function setMode(mode, automatic) {
+  state.mode = mode;
+  if (!automatic) store("cu-mode", mode);
+  $("mode-live").setAttribute("aria-pressed", String(mode === "live"));
+  $("mode-demo").setAttribute("aria-pressed", String(mode === "demo"));
+  const banner = $("banner");
+  if (mode === "demo") {
+    banner.hidden = false;
+    banner.innerHTML = `<b>Demo data.</b> ${esc(state.liveNote)} These runs were recorded from the workflow's own test scenarios on a fake fleet. Buttons show the request they would send instead of sending it.`;
+  } else {
+    banner.hidden = true;
+  }
+  state.selected = null;
+  return refresh();
+}
+
+// --- what a run says -----------------------------------------------------------------------
+
+function view(id) {
+  const status = state.runs[id] || {};
+  const p = status.progress || null, r = status.result || null;
+  const phase = p ? p.phase : r ? r.outcome : null;
+  return { id, status, p, r, phase, plan: (p || r || {}).plan || null };
+}
+
+function phaseInfo(v) {
+  if (v.status.status && v.status.status !== "RUNNING" && v.status.status !== "COMPLETED") {
+    return STATUS[v.status.status] || [v.status.status, "muted"];
+  }
+  if (v.p && v.p.paused && v.phase !== "paused") return ["Paused", "muted"];
+  return PHASES[v.phase] || [v.phase || "Starting", "machine"];
+}
+const tone = (id) => phaseInfo(view(id))[1];
+
+function chip(v) { const [label, t] = phaseInfo(v); return `<span class="chip t-${t}">${esc(label)}</span>`; }
+
+function stepStates(v) {
+  const steps = v.plan ? v.plan.steps : [];
+  if (v.r) return steps.map((s, i) => (i < v.r.steps_completed ? "done" : "pending"));
+  if (!v.p) return steps.map(() => "pending");
+  const before = ["planning", "preflight", "awaiting-approval"].includes(v.phase);
+  const at = v.p.current_step ?? 0;
+  return steps.map((s, i) => (before ? "pending" : i < at ? "done" : i > at ? "pending" : v.phase === "needs-human" ? "alert" : "current"));
+}
+
+function remainingPools(v) {
+  const steps = v.plan ? v.plan.steps : [];
+  const step = steps[v.p ? v.p.current_step ?? 0 : 0];
+  if (!step || step.kind !== "workers") return [];
+  const done = (v.p && v.p.nodepools_done) || [];
+  return step.nodepools.filter((n) => !done.includes(n));
+}
+
+function poolState(v, stepState, name, next) {
+  if (stepState === "done") return "done";
+  if (stepState === "pending") return "";
+  if ((v.p.nodepools_done || []).includes(name)) return "done";
+  if (v.p.current_nodepool === name) return v.phase === "needs-human" ? "alert" : "current";
+  if (v.phase === "awaiting-continue" && name === next) return "next";
+  return "";
+}
+
+// --- rendering -----------------------------------------------------------------------------
+
+function render() { renderList(); renderDetail(); }
+
+function renderList() {
+  const ul = $("runs");
+  if (!state.list.length) {
+    ul.innerHTML = `<li class="empty">No upgrade runs yet.${state.mode === "live" ? " Switch to Demo to see what a run looks like." : ""}</li>`;
+    return;
+  }
+  ul.innerHTML = state.list.map((item) => {
+    const v = view(item.workflow_id);
+    const sub = v.p ? (v.p.waiting_for || PHASES[v.phase]?.[0] || "") : v.r ? `${v.r.control_plane_version || ""} reached` : item.status;
+    return `<li><button type="button" class="run" data-id="${esc(item.workflow_id)}" aria-current="${item.workflow_id === state.selected}">
+      <div class="name"><span>${esc(cluster(item.workflow_id))}</span><span class="muted" style="color:var(--muted);font-weight:400;font-size:12px">${esc(ago(item.start_time))}</span></div>
+      <div style="margin-top:5px">${chip(v)}</div>
+      <div class="sub">${esc(sub)}</div></button></li>`;
+  }).join("");
+}
+
+function renderDetail() {
+  const el = $("detail");
+  if (!state.selected) {
+    el.innerHTML = `<div class="panel card"><p class="empty">Select a run, or start a new upgrade.</p></div>`;
+    return;
+  }
+  const v = view(state.selected);
+  const data = v.p || v.r || {};
+  const plan = v.plan;
+  const [label, t] = phaseInfo(v);
+  const facts = [
+    ["MCE", data.mce_cluster || "found in day1 during planning"],
+    plan && ["Path", `${plan.control_plane} → ${plan.target}`],
+    data.profile && ["Profile", data.profile],
+    v.p && v.p.control_plane_version && ["Control plane", v.p.control_plane_version],
+    (v.p || v.r) && data.verified_against_graph && ["Ladder checked", data.verified_against_graph],
+  ].filter(Boolean);
+  el.innerHTML = [
+    `<div class="panel card">
+      <div class="title"><h2>${esc(cluster(v.id))}</h2>${chip(v)}</div>
+      <div class="facts">${facts.map(([k, val]) => `<span>${esc(k)} <b>${esc(val)}</b></span>`).join("")}
+        <span>Run <code>${esc(v.id)}</code> <button type="button" class="link" data-copy="${esc(v.id)}">copy</button></span></div>
+      ${renderWaiting(v, t, label)}
+    </div>`,
+    plan ? renderPlan(v) : "",
+    renderAgent(v),
+    renderLog(data.log || []),
+    `<div class="panel card"><details><summary>Raw response</summary><pre>${esc(JSON.stringify(v.status, null, 2))}</pre></details></div>`,
+  ].join("");
+}
+
+function renderWaiting(v, t, label) {
+  if (v.status.error) {
+    return `<div class="waiting alert" style="margin-top:14px"><div class="label">Ended</div><p>${esc(v.status.error)}</p></div>`;
+  }
+  if (v.r) {
+    const versions = Object.entries(v.r.nodepool_versions || {}).map(([n, ver]) => `${n} ${ver}`).join(", ");
+    return `<div class="waiting machine" style="margin-top:14px;border-left-color:var(--ok);background:var(--ok-bg)">
+      <div class="label">Finished: ${esc(v.r.outcome)}</div>
+      <p>Control plane ${esc(v.r.control_plane_version || "?")}${versions ? `; NodePools ${esc(versions)}` : ""}. ${esc(v.r.steps_completed)} of ${esc((v.plan?.steps || []).length)} steps ran.</p></div>`;
+  }
+  if (!v.p) return "";
+  const decisions = (DECISIONS[v.phase] || []);
+  const kind = t === "person" ? "" : t === "alert" ? "alert" : "machine";
+  const what = v.p.waiting_for || (t === "machine" ? `${label}: nothing to do, the run is working.` : label);
+  const buttons = decisions.map((d, i) => `<button type="button" class="${d.primary ? "primary" : ""}" data-decide="${i}">${esc(d.label)}</button>`);
+  if (ACTIVE(v.phase)) {
+    buttons.push(v.p.paused || v.phase === "paused"
+      ? `<button type="button" data-simple="resume">Resume</button>`
+      : `<button type="button" data-simple="pause">Pause</button>`);
+    buttons.push(`<button type="button" class="danger" data-simple="abort">Abort</button>`);
+  }
+  return `<div class="waiting ${kind}" style="margin-top:14px">
+    <div class="label">${t === "person" || t === "alert" ? "Waiting for" : "Now"}</div><p>${esc(what)}</p>
+    <div class="actions">${buttons.join("")}</div></div>`;
+}
+
+function renderPlan(v) {
+  const plan = v.plan;
+  const states = stepStates(v);
+  const next = v.p && v.phase === "awaiting-continue" ? remainingPools(v)[0] : null;
+  const poolVersions = [...new Set(Object.values(plan.nodepools))].join(", ");
+  const nodes = [`<div class="node s-start"><div class="box"><div class="kind">Now runs</div><div class="ver">${esc(plan.control_plane)}</div>
+    <div class="why">${esc(Object.keys(plan.nodepools).length)} NodePools at ${esc(poolVersions || "?")}</div></div></div>`];
+  plan.steps.forEach((step, i) => {
+    const s = states[i];
+    nodes.push(`<div class="link-line ${s === "done" ? "done" : ""}"></div>`);
+    const pools = step.kind === "workers"
+      ? `<div class="pools">${step.nodepools.map((n) => `<span class="pool ${v.p ? poolState(v, s, n, next) : s === "done" ? "done" : ""}">${esc(n)}</span>`).join("")}</div>` : "";
+    nodes.push(`<div class="node s-${s}"><div class="box">
+      <div class="kind">${step.kind === "workers" ? "Workers" : "Control plane"}</div>
+      <div class="ver">${esc(step.version)}</div><div class="why">${esc(step.reason)}</div>${pools}</div></div>`);
+  });
+  return `<div class="panel card"><h2>Plan</h2><div class="track">${nodes.join("")}</div>
+    <div class="legend"><span><span class="pool done">done</span></span><span><span class="pool current">rolling</span></span>
+    <span><span class="pool next">next, after the customer's check</span></span><span><span class="pool">waiting</span></span></div></div>`;
+}
+
+function renderAgent(v) {
+  const p = v.p;
+  if (!p || (!p.last_verdict && !(p.pending_actions || []).length)) return "";
+  const verdict = p.last_verdict;
+  const rows = (p.pending_actions || []).map((a) => {
+    const canDecide = a.decision === "pending" && v.phase === "needs-human";
+    const status = a.decision === "pending" ? "waiting for a person" : `${a.decision} by ${a.decided_by || "?"}${a.result ? `: ${a.result}` : ""}`;
+    return `<tr><td><code>${esc(a.action.kind)}</code></td><td><code>${esc(a.action.target)}</code><div style="color:var(--muted)">${esc(a.action.rationale)}</div></td>
+      <td>${esc(status)}</td><td style="white-space:nowrap">${canDecide ? `<button type="button" class="primary" data-action="approve" data-aid="${esc(a.action.action_id)}">Approve</button>
+      <button type="button" data-action="reject" data-aid="${esc(a.action.action_id)}">Reject</button>` : ""}</td></tr>`;
+  }).join("");
+  return `<div class="panel card verdict"><h2>The agent</h2>
+    ${verdict ? `<p><b>${esc(verdict.verdict.replace(/_/g, " "))}</b> <span style="color:var(--muted)">(${esc(verdict.confidence)})</span></p><p>${esc(verdict.diagnosis)}</p>` : ""}
+    ${rows ? `<table><thead><tr><th>Proposed</th><th>On</th><th>Status</th><th></th></tr></thead><tbody>${rows}</tbody></table>
+      <p style="color:var(--muted);margin-top:10px">Approved actions run with the workflow's identity, then use Retry.</p>` : ""}</div>`;
+}
+
+function renderLog(log) {
+  if (!log.length) return "";
+  const items = log.slice().reverse().map((e) => `<li><time title="${esc(e.at)}">${esc(clock(e.at))}</time>
+    <div><span class="ev">${esc(e.event.replace(/-/g, " "))}</span>${e.by ? ` <span class="by">· ${esc(e.by)}</span>` : ""}${e.detail ? `<div class="d">${esc(e.detail)}</div>` : ""}</div></li>`).join("");
+  return `<div class="panel card"><h2>Log</h2><ul class="log">${items}</ul></div>`;
+}
+
+// --- deciding ------------------------------------------------------------------------------
+
+function who() { return $("who").value.trim(); }
+
+function openDialog({ title, explain, method = "POST", path, fields = [], body }) {
+  const form = $("dialog-form");
+  form.innerHTML = `<h3>${esc(title)}</h3>${explain ? `<p class="explain">${esc(explain)}</p>` : ""}
+    <label for="f-by">Who decides</label><input id="f-by" required value="${esc(who())}" placeholder="your name">
+    ${fields.join("")}
+    <details style="margin-top:12px"><summary>The request</summary><pre id="f-preview"></pre></details>
+    <div class="buttons"><button type="button" value="cancel" id="f-cancel">Cancel</button><button type="submit" class="primary" id="f-send">${state.mode === "demo" ? "Show what it sends" : "Send"}</button></div>`;
+  const preview = () => { $("f-preview").textContent = `${method} ${path}\n${JSON.stringify(body(form), null, 2)}`; };
+  form.oninput = preview; preview();
+  $("f-cancel").onclick = () => $("dialog").close();
+  form.onsubmit = async (event) => {
+    event.preventDefault();
+    if (!form.reportValidity()) return;
+    const payload = body(form);
+    store("cu-by", payload.by || payload.requested_by || who());
+    $("who").value = recall("cu-by") || "";
+    $("dialog").close();
+    await send(method, path, payload);
+  };
+  $("dialog").showModal();
+  (who() ? form.querySelector("textarea, select, input:not(#f-by)") || $("f-send") : $("f-by")).focus();
+}
+
+async function send(method, path, payload) {
+  if (state.mode === "demo") {
+    toast(`Demo: nothing was sent. Live, this would be\n${method} ${path}\n${JSON.stringify(payload)}`, 8000);
+    return;
+  }
+  try {
+    const response = await fetch(path, { method, headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
+    const text = await response.text();
+    let detail = text;
+    try { const j = JSON.parse(text); detail = typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail ?? j); } catch (e) {}
+    if (response.ok) toast("Done: the run took it.");
+    else if (response.status === 404 && /^\{"detail":"Not Found"\}$/.test(text)) toast("The upgrade routes are not mounted on this API yet: they come with the limbs (DESIGN O18).", 8000);
+    else toast(`${response.status}: ${detail}`, 9000);
+  } catch (err) {
+    toast(`Not sent: ${err.message}`);
+  }
+  refresh();
+}
+
+function decide(v, d) {
+  const fields = [];
+  if (d.reason) {
+    fields.push(`<label for="f-reason">Reason <span class="hint">${d.reason === "required" ? "(required)" : "(optional)"}</span></label>
+      <textarea id="f-reason" rows="3" ${d.reason === "required" ? "required" : ""}></textarea>`);
+  }
+  if (d.nodepool) {
+    const pools = remainingPools(v);
+    fields.push(`<label for="f-pool">Next NodePool</label><select id="f-pool">${pools.map((n, i) => `<option value="${esc(n)}">${esc(n)}${i === 0 ? " (default)" : ""}</option>`).join("")}</select>`);
+  }
+  openDialog({
+    title: `${d.label}: ${cluster(v.id)}`, explain: d.explain, path: `${API}/${encodeURIComponent(v.id)}/${d.path}`,
+    fields,
+    body: (form) => {
+      const out = { by: form.querySelector("#f-by").value.trim() };
+      const reason = form.querySelector("#f-reason");
+      if (reason && reason.value.trim()) out.reason = reason.value.trim();
+      const pool = form.querySelector("#f-pool");
+      if (pool && pool.value && pool.selectedIndex > 0) out.nodepool = pool.value;
+      return out;
+    },
+  });
+}
+
+const SIMPLE = {
+  pause: { label: "Pause", reason: "optional", explain: "Holds the run before its next commit. Nothing in flight is stopped." },
+  resume: { label: "Resume", reason: "optional", explain: "Lets a paused run go on." },
+  abort: { label: "Abort", reason: "required", explain: "Stops the run and sets pausedUntil on the cluster. There is no downgrade: what is upgraded stays upgraded." },
+};
+
+function newRun() {
+  openDialog({
+    title: "New upgrade", explain: "Starting is the dry run: the run plans, pins every release and runs the pre-flight, then waits for approval with nothing committed. The MCE is found from the cluster's day1 file.",
+    path: API,
+    fields: [
+      `<label for="f-cluster">Cluster <span class="hint">its day1 file's name</span></label><input id="f-cluster" required placeholder="cluster name">`,
+      `<label for="f-target">Target <span class="hint">a release (4.21.40) or a minor (4.21)</span></label><input id="f-target" required pattern="\\d+\\.\\d+(\\.\\d+(-x86_64)?)?" placeholder="4.21">`,
+      `<label for="f-mode">NodePools</label><select id="f-mode"><option value="manual">Manual: the customer checks and continues before each NodePool</option><option value="auto">Auto: lab and canary clusters only (upgrade.wave 0 or 1)</option></select>`,
+      `<label style="display:flex;gap:8px;align-items:center;font-weight:400"><input type="checkbox" id="f-auto" style="width:auto"> Approve automatically (lab and canary clusters only)</label>`,
+    ],
+    body: (form) => {
+      const target = form.querySelector("#f-target").value.trim();
+      const out = { cluster: form.querySelector("#f-cluster").value.trim(), requested_by: form.querySelector("#f-by").value.trim(),
+        nodepool_mode: form.querySelector("#f-mode").value, auto_approve: form.querySelector("#f-auto").checked };
+      if (/^\d+\.\d+$/.test(target)) out.target_minor = target; else out.target_version = target;
+      return out;
+    },
+  });
+}
+
+// --- wiring --------------------------------------------------------------------------------
+
+let toastTimer;
+function toast(text, ms = 4500) {
+  const el = $("toast"); el.textContent = text; el.classList.add("show");
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => el.classList.remove("show"), ms);
+}
+
+document.addEventListener("click", (event) => {
+  const run = event.target.closest(".run");
+  if (run) {
+    state.selected = run.dataset.id; render();
+    if (window.matchMedia("(max-width: 860px)").matches) $("detail").scrollIntoView({ behavior: "smooth" });
+    return;
+  }
+  const t = event.target.closest("button");
+  if (!t || !state.selected) return;
+  const v = view(state.selected);
+  if (t.dataset.decide !== undefined) decide(v, DECISIONS[v.phase][Number(t.dataset.decide)]);
+  else if (t.dataset.simple) decide(v, { ...SIMPLE[t.dataset.simple], path: t.dataset.simple });
+  else if (t.dataset.action) {
+    const verb = t.dataset.action;
+    openDialog({ title: `${verb === "approve" ? "Approve" : "Reject"} the proposal`,
+      explain: verb === "approve" ? "The workflow runs it with its own identity, through the typed catalog." : "The proposal is dropped; the run keeps waiting for a person.",
+      path: `${API}/${encodeURIComponent(v.id)}/actions/${encodeURIComponent(t.dataset.aid)}/${verb}`,
+      body: (form) => ({ by: form.querySelector("#f-by").value.trim() }) });
+  } else if (t.dataset.copy) {
+    navigator.clipboard?.writeText(t.dataset.copy).then(() => toast("Copied."), () => toast(t.dataset.copy));
+  }
+});
+$("new-run").onclick = newRun;
+$("mode-live").onclick = () => { state.liveNote = ""; setMode("live"); };
+$("mode-demo").onclick = () => setMode("demo");
+$("who").value = recall("cu-by") || "";
+$("who").onchange = () => store("cu-by", who());
+
+(async function start() {
+  const wanted = recall("cu-mode");
+  if (wanted === "demo") return setMode("demo");
+  try {
+    const list = await getJSON(`${RUNS}?workflow_type=UpgradeClusterWorkflow&limit=1`);
+    if (!list.length) { state.liveNote = "There are no upgrade runs on this API yet."; return setMode("demo", true); }
+    await setMode("live", true);
+  } catch (err) {
+    state.liveNote = `The run list could not be read (${err.message}).`;
+    await setMode("demo", true);
+  }
+})();
+setInterval(() => { if (state.mode === "live" && !$("dialog").open) refresh(); }, POLL_MS);
+</script>
+</body>
+</html>

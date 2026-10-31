@@ -974,7 +974,7 @@ class UpgradeClusterWorkflow:
                     outcome = await self._watch_nodepool(step, nodepool)
                 if outcome.result is not WatchResult.DONE:
                     await self._needs_human(
-                        f"NodePool {nodepool} did not reach {step.version}: {outcome.snapshot.summary}",
+                        f"NodePool {nodepool} did not reach {step.version}" + (f": {outcome.snapshot.summary}" if outcome.snapshot.summary else ""),
                         verdict=diagnosis.verdict,
                     )
                     continue

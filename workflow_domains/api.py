@@ -21,6 +21,7 @@ from fastapi import FastAPI
 
 from shared.settings import TemporalSettings
 from shared.temporal_client import connect_temporal
+from workflow_domains.cluster_upgrade.ui import router as cluster_upgrade_ui_router
 from workflow_domains.routers.runs import router as runs_router
 from workflow_domains.segment_lifecycle.router import (
     router as segment_lifecycle_router,
@@ -46,3 +47,6 @@ app.include_router(segment_lifecycle_router)
 app.include_router(server_lifecycle_router)
 app.include_router(server_provisioning_router)
 app.include_router(runs_router)
+# The temporary cluster-upgrade page only; the upgrade routes themselves come
+# with the limbs (DESIGN O18), so until then the page shows its demo data.
+app.include_router(cluster_upgrade_ui_router)

@@ -1,5 +1,10 @@
 """Workflow-run status — ONE endpoint for every domain and every workflow.
 
+Plus one list, `GET /workflows/runs?workflow_type=<WorkflowClass>`: the newest
+runs of one workflow, status and times only, which is what a page listing
+runs needs (the temporary cluster-upgrade UI does). Progress stays on the
+per-run endpoint, so a list never waits on a query per run.
+
 Temporal workflow ids are globally unique, so a run's status needs neither the
 domain nor the workflow in its path: `GET /workflows/runs/{workflow_id}`
 describes any run started by any domain router.
@@ -20,10 +25,10 @@ workflow, which is exactly what this endpoint exists to avoid.
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from temporalio.client import Client, WorkflowExecutionStatus, WorkflowFailureError
 from temporalio.service import RPCError, RPCStatusCode
@@ -43,6 +48,38 @@ _TERMINAL_FAILURE_STATUSES = (
     WorkflowExecutionStatus.TERMINATED,
     WorkflowExecutionStatus.TIMED_OUT,
 )
+
+
+class WorkflowRunSummary(BaseModel):
+    workflow_id: str
+    workflow_type: str
+    status: str  # RUNNING / COMPLETED / FAILED / TERMINATED / ...
+    start_time: datetime | None = None
+    close_time: datetime | None = None
+
+
+# A workflow class name: checked so it can go into the visibility query as a literal.
+_WORKFLOW_TYPE_PATTERN = r"^[A-Za-z][A-Za-z0-9_]{0,127}$"
+
+
+@router.get("", response_model=list[WorkflowRunSummary])
+async def list_workflow_runs(
+    workflow_type: str = Query(pattern=_WORKFLOW_TYPE_PATTERN, description="e.g. UpgradeClusterWorkflow"),
+    limit: int = Query(default=50, ge=1, le=200),
+    client: Client = Depends(get_temporal_client),
+) -> list[WorkflowRunSummary]:
+    """The newest runs of one workflow type, newest first: status and times. Progress: GET /{workflow_id}."""
+    runs = [
+        WorkflowRunSummary(
+            workflow_id=execution.id,
+            workflow_type=execution.workflow_type,
+            status=execution.status.name if execution.status else "UNKNOWN",
+            start_time=execution.start_time,
+            close_time=execution.close_time,
+        )
+        async for execution in client.list_workflows(f"WorkflowType = '{workflow_type}'", limit=limit)
+    ]
+    return sorted(runs, key=lambda run: run.start_time or datetime.min.replace(tzinfo=UTC), reverse=True)
 
 
 class WorkflowRunStatusResponse(BaseModel):

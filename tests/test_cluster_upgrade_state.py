@@ -2,7 +2,7 @@
 
 Pure functions on plain dicts. Where a shape matters, the input is what a live
 cluster returned: tests/fixtures/cluster_upgrade/ holds objects captured on the
-sandbox (experiment 2, a KubeVirt HostedCluster at 4.19.53, MCE 2.17.3),
+sandbox (experiments 2 and 3, a KubeVirt HostedCluster at 4.19.53, MCE 2.17.3),
 trimmed to the fields read and with nothing that names the sandbox.
 """
 
@@ -176,6 +176,16 @@ def test_unhealthy_operators_name_what_is_wrong():
         "console (Available=False: RouteHealth_FailedGet; Degraded=True: RouteHealthDegraded)",
         "insights (Available=missing)",
     ]
+
+
+def test_a_failed_image_pruner_job_reads_as_the_live_operator_reports_it():
+    # Live (experiment 3, 2026-10-31): one image-pruner Job failed on a 4.19.53
+    # hosted cluster. The workflow tests' PRUNER_DEGRADED and the replay
+    # scenario image-pruner-degraded use exactly this string.
+    co = _fixture("clusteroperator-image-registry-pruner-degraded.json")
+    degraded = next(c for c in co["status"]["conditions"] if c["type"] == "Degraded")
+    assert degraded["message"] == "ImagePrunerDegraded: Job has reached the specified backoff limit"
+    assert upgrade_state.operators_unhealthy([co]) == ["image-registry (Degraded=True: ImagePrunerJobFailed)"]
 
 
 def _node(name, ready="True", nodepool="np-a"):

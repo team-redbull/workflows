@@ -990,8 +990,9 @@ def test_every_interface_is_mocked_on_its_own_queue():
 
 
 # Seen on real clusters (Red Hat KCS 6988893): one failed image-pruner Job leaves image-registry
-# Degraded until the next midnight run, and pre-flight refuses every step meanwhile. The fix is
-# deleting the failed Job (D21).
+# Degraded until the next midnight run, and pre-flight refuses every step meanwhile. Reproduced
+# live (experiment 3, 2026-10-31): a successful re-run from the CronJob (rerun_cronjob) clears it;
+# deleting the failed Job is the KCS's fix (D21).
 PRUNER_DEGRADED = HostedHealth(
     reachable=True, cluster_version_upgradeable=True, idms_mirrors=MIRRORS,
     operators_unhealthy=["image-registry (Degraded=True: ImagePrunerJobFailed)"],

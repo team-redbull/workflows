@@ -39,7 +39,7 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 button { font: inherit; cursor: pointer; border-radius: 8px; border: 1px solid var(--line); background: var(--panel);
   color: var(--ink); padding: 7px 12px; }
 button:hover { border-color: var(--muted); }
-button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible, .run:focus-visible {
+button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible, .run:focus-visible, a:focus-visible {
   outline: 2px solid var(--accent); outline-offset: 2px; }
 button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 600; }
 button.danger { color: var(--alert); }
@@ -54,6 +54,10 @@ header { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; padding
 header h1 { font-size: 17px; margin: 0; }
 .tag { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; color: var(--muted);
   border: 1px solid var(--line); border-radius: 999px; padding: 2px 8px; }
+.nav { display: flex; gap: 2px; }
+.nav a { color: var(--muted); text-decoration: none; font-size: 13px; font-weight: 600; padding: 5px 10px; border-radius: 8px; }
+.nav a:hover { color: var(--ink); background: var(--soft); }
+.nav a[aria-current="page"] { color: var(--ink); background: var(--soft); }
 .spacer { flex: 1; }
 .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
 .seg button { border: none; border-radius: 0; padding: 6px 12px; }
@@ -162,6 +166,7 @@ dialog .buttons { display: flex; justify-content: flex-end; gap: 8px; margin-top
 <header>
   <h1>Cluster upgrades</h1>
   <span class="tag" title="Until the ClickCluster Platform UI exists">temporary</span>
+  <nav class="nav" aria-label="Pages"><a href="/ui/cluster-upgrade" aria-current="page">Cluster upgrades</a><a href="/ui/server-lifecycle">Server lifecycle</a></nav>
   <span class="spacer"></span>
   <div class="who"><label for="who" style="margin:0">You</label><input id="who" placeholder="your name" autocomplete="name"></div>
   <div class="seg" role="group" aria-label="Data source">

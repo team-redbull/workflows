@@ -29,6 +29,7 @@ from workflow_domains.segment_lifecycle.router import (
 from workflow_domains.server_lifecycle.router import (
     router as server_lifecycle_router,
 )
+from workflow_domains.server_lifecycle.ui import router as server_lifecycle_ui_router
 from workflow_domains.server_provisioning.router import (
     router as server_provisioning_router,
 )
@@ -50,3 +51,6 @@ app.include_router(runs_router)
 # The temporary cluster-upgrade page only; the upgrade routes themselves come
 # with the limbs (DESIGN O18), so until then the page shows its demo data.
 app.include_router(cluster_upgrade_ui_router)
+# The temporary server-lifecycle page: install, remove, uninstall and
+# publish-infraenv-boot runs, on the routes above.
+app.include_router(server_lifecycle_ui_router)

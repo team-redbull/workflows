@@ -1,0 +1,1106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Server lifecycle</title>
+<!--
+  A temporary page for the server-lifecycle runs, until the ClickCluster Platform UI exists.
+  Served by the workflows API (workflow_domains/server_lifecycle/ui.py), which it calls:
+    GET  /workflows/runs?workflow_type=<class>          one workflow's run list
+    GET  /workflows/runs/{workflow_id}                  one run's progress, result or error
+    POST /workflows/server-lifecycle/install-server     start installs (a pool draw or named servers)
+    POST /workflows/server-lifecycle/remove-server      start a removal
+  Self-contained on purpose: production is air-gapped, so nothing loads from another host.
+  Demo mode reads /ui/server-lifecycle/demo-runs.json, recorded from the workflows' tests.
+  It shows what the runs report and nothing more; the page invents no field.
+-->
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --ink: #1c2330; --muted: #5d6878; --line: #e2e6ec; --soft: #eef1f5;
+  --accent: #2f6fde; --accent-ink: #ffffff;
+  --ok: #1f8a4c; --ok-bg: #e5f5ec; --person: #a86400; --person-bg: #fdf1dc; --alert: #b3261e; --alert-bg: #fbe6e4;
+  --machine: #2f6fde; --machine-bg: #e6eefc; --mutedc: #6b7280; --muted-bg: #eceef2;
+  --shadow: 0 1px 2px rgba(16, 24, 40, .06), 0 1px 3px rgba(16, 24, 40, .08);
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f131a; --panel: #171c25; --ink: #e6e9ef; --muted: #98a2b3; --line: #273041; --soft: #1e2532;
+    --accent: #5b8ef0; --accent-ink: #0b1220;
+    --ok: #4cc488; --ok-bg: #14301f; --person: #f0b24a; --person-bg: #33270f; --alert: #ff7b72; --alert-bg: #3a1716;
+    --machine: #7aa5f5; --machine-bg: #172a4a; --mutedc: #9aa3b2; --muted-bg: #222a37;
+    --shadow: none;
+    color-scheme: dark;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
+code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; }
+button { font: inherit; cursor: pointer; border-radius: 8px; border: 1px solid var(--line); background: var(--panel);
+  color: var(--ink); padding: 7px 12px; }
+button:hover { border-color: var(--muted); }
+button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible, .run:focus-visible, a:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 2px; }
+button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 600; }
+button.danger { color: var(--alert); font-weight: 600; }
+button.danger-solid { background: var(--alert); border-color: var(--alert); color: var(--panel); font-weight: 600; }
+button:disabled { opacity: .45; cursor: not-allowed; }
+button.link { border: none; background: none; color: var(--accent); padding: 0; }
+input, select, textarea { font: inherit; color: var(--ink); background: var(--panel); border: 1px solid var(--line);
+  border-radius: 8px; padding: 7px 9px; width: 100%; }
+label { display: block; font-weight: 600; margin: 10px 0 4px; }
+label .hint { font-weight: 400; color: var(--muted); }
+
+header { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; padding: 12px 20px;
+  background: var(--panel); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 2; }
+header h1 { font-size: 17px; margin: 0; }
+.tag { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; color: var(--muted);
+  border: 1px solid var(--line); border-radius: 999px; padding: 2px 8px; }
+.nav { display: flex; gap: 2px; }
+.nav a { color: var(--muted); text-decoration: none; font-size: 13px; font-weight: 600; padding: 5px 10px; border-radius: 8px; }
+.nav a:hover { color: var(--ink); background: var(--soft); }
+.nav a[aria-current="page"] { color: var(--ink); background: var(--soft); }
+.spacer { flex: 1; }
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.seg button { border: none; border-radius: 0; padding: 6px 12px; }
+.seg button[aria-pressed="true"] { background: var(--soft); font-weight: 600; }
+.refreshed { color: var(--muted); font-size: 12px; min-width: 110px; text-align: right; }
+
+.banner { margin: 14px 20px 0; padding: 10px 14px; border-radius: 10px; background: var(--person-bg);
+  color: var(--ink); border: 1px solid var(--line); }
+.banner b { color: var(--person); }
+
+.tabs { display: flex; gap: 6px; padding: 14px 20px 0; overflow-x: auto; scrollbar-width: none; }
+.tabs::-webkit-scrollbar { display: none; }
+.tabs button { white-space: nowrap; border-radius: 999px; padding: 6px 14px; background: transparent; border-color: transparent;
+  color: var(--muted); font-weight: 600; }
+.tabs button:hover { color: var(--ink); border-color: var(--line); }
+.tabs button[aria-selected="true"] { background: var(--panel); color: var(--ink); border-color: var(--line); box-shadow: var(--shadow); }
+
+main { display: grid; grid-template-columns: 320px minmax(0, 1fr); gap: 16px; padding: 14px 20px 40px; }
+@media (max-width: 860px) {
+  main { grid-template-columns: minmax(0, 1fr); padding: 12px 16px 32px; }
+  header { padding: 10px 16px; position: static; }
+  .banner { margin: 12px 16px 0; }
+  .tabs { padding: 12px 16px 0; gap: 2px; }
+  .tabs button { padding: 6px 10px; }
+  .refreshed { min-width: 0; text-align: left; }
+}
+.panel { min-width: 0; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow); }
+.list-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 12px 14px 8px; }
+.list-head button { white-space: nowrap; }
+.list-head h2, .card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 0; }
+.runs { list-style: none; margin: 0; padding: 4px 8px 10px; }
+.run { display: block; width: 100%; text-align: left; border: 1px solid transparent; border-radius: 10px;
+  padding: 10px 10px; background: none; }
+.run:hover { background: var(--soft); }
+.run[aria-current="true"] { background: var(--soft); border-color: var(--line); }
+.run .name { font-weight: 600; display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+.run .name > span:first-child { min-width: 0; overflow-wrap: anywhere; }
+.run .when { color: var(--muted); font-weight: 400; font-size: 12px; white-space: nowrap; }
+.run .sub { color: var(--muted); font-size: 12.5px; margin-top: 3px; overflow: hidden; text-overflow: ellipsis;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow-wrap: anywhere; }
+.empty { color: var(--muted); padding: 16px 14px; }
+
+.chip { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; border-radius: 999px;
+  padding: 2px 9px; white-space: nowrap; }
+.chip::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.t-person { color: var(--person); background: var(--person-bg); }
+.t-machine { color: var(--machine); background: var(--machine-bg); }
+.t-alert, .t-bad { color: var(--alert); background: var(--alert-bg); }
+.t-ok { color: var(--ok); background: var(--ok-bg); }
+.t-muted { color: var(--mutedc); background: var(--muted-bg); }
+
+.detail { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+.card { padding: 16px 18px; min-width: 0; }
+.card h2 { margin-bottom: 12px; }
+.title { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.title h2 { font-size: 20px; text-transform: none; letter-spacing: 0; color: var(--ink); margin: 0; overflow-wrap: anywhere; min-width: 0; }
+.facts { display: flex; flex-wrap: wrap; gap: 6px 22px; margin-top: 10px; color: var(--muted); font-size: 13px; }
+.facts b { color: var(--ink); font-weight: 600; overflow-wrap: anywhere; }
+
+.waiting { border-left: 4px solid var(--machine); background: var(--machine-bg); border-radius: 10px; padding: 12px 14px; margin-top: 14px; }
+.waiting.ok { border-left-color: var(--ok); background: var(--ok-bg); }
+.waiting.alert { border-left-color: var(--alert); background: var(--alert-bg); }
+.waiting.muted { border-left-color: var(--mutedc); background: var(--muted-bg); }
+.waiting .label { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; color: var(--muted);
+  display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.waiting .label code { text-transform: none; letter-spacing: 0; color: var(--alert); font-weight: 600; }
+.waiting p { margin: 6px 0 0; white-space: pre-line; overflow-wrap: anywhere; }
+.waiting.alert .headline { font-size: 15px; font-weight: 600; }
+.waiting details { margin-top: 8px; }
+
+.cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; align-items: start; }
+
+.steps { list-style: none; margin: 0; padding: 0; }
+.steps li { display: grid; grid-template-columns: 24px minmax(0, 1fr); gap: 10px; position: relative; padding: 0 0 14px; }
+.steps li:last-child { padding-bottom: 0; }
+.steps li::before { content: ""; position: absolute; left: 11px; top: 26px; bottom: 2px; width: 2px; background: var(--line); }
+.steps li:last-child::before { display: none; }
+.steps li.s-done::before { background: var(--ok); }
+.dot { width: 24px; height: 24px; border-radius: 50%; border: 2px solid var(--line); background: var(--panel);
+  display: grid; place-items: center; font-size: 11px; font-weight: 700; color: var(--muted); }
+.s-done .dot { border-color: var(--ok); background: var(--ok); color: var(--panel); }
+.s-current .dot { border-color: var(--machine); color: var(--machine); box-shadow: 0 0 0 4px var(--machine-bg); }
+.s-alert .dot { border-color: var(--alert); background: var(--alert); color: var(--panel); }
+.s-skipped .dot { border-style: dashed; }
+.step-label { font-weight: 600; padding-top: 2px; }
+.s-pending .step-label, .s-skipped .step-label { color: var(--muted); font-weight: 500; }
+.s-current .step-label { color: var(--machine); }
+.s-alert .step-label { color: var(--alert); }
+.step-note { color: var(--muted); font-size: 12.5px; overflow-wrap: anywhere; }
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+
+.kv { display: grid; grid-template-columns: minmax(96px, 34%) minmax(0, 1fr); gap: 8px 14px; margin: 0; }
+.kv dt { color: var(--muted); font-size: 13px; }
+.kv dd { margin: 0; overflow-wrap: anywhere; }
+.kv ul { margin: 0; padding-left: 18px; }
+.kv .warn { color: var(--alert); }
+.note { color: var(--muted); font-size: 12.5px; margin: 12px 0 0; }
+
+.group { border-top: 1px solid var(--line); padding: 12px 0 4px; }
+.group:first-of-type { border-top: none; padding-top: 0; }
+.group .why { color: var(--muted); font-size: 12.5px; margin: 6px 0 8px; }
+.group ul { list-style: none; margin: 0; padding: 0; }
+.group li { padding: 6px 0; display: grid; gap: 2px; }
+.group li .d { color: var(--muted); font-size: 12.5px; overflow-wrap: anywhere; }
+details summary { cursor: pointer; color: var(--muted); }
+pre { background: var(--soft); border-radius: 8px; padding: 10px; overflow: auto; max-height: 360px; font-size: 12px;
+  white-space: pre-wrap; overflow-wrap: anywhere; }
+
+dialog { border: 1px solid var(--line); border-radius: 14px; padding: 0; width: min(540px, calc(100vw - 32px));
+  background: var(--panel); color: var(--ink); }
+dialog::backdrop { background: rgba(10, 14, 20, .45); }
+dialog form { padding: 18px 20px; }
+dialog h3 { margin: 0 0 4px; font-size: 17px; }
+dialog .explain { color: var(--muted); margin: 0 0 6px; }
+dialog .buttons { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; flex-wrap: wrap; }
+fieldset.choice { border: none; padding: 0; margin: 12px 0 0; display: flex; gap: 16px; flex-wrap: wrap; }
+fieldset.choice legend { font-weight: 600; padding: 0; margin-bottom: 4px; }
+fieldset.choice label { display: flex; align-items: center; gap: 6px; font-weight: 400; margin: 0; }
+fieldset.choice input { width: auto; }
+.confirm { margin-top: 14px; border: 1px solid var(--alert); background: var(--alert-bg); border-radius: 10px; padding: 10px 12px; }
+.confirm p { margin: 0; }
+.toast { position: fixed; right: 20px; bottom: 20px; max-width: min(460px, calc(100vw - 40px)); padding: 12px 14px;
+  border-radius: 10px; background: var(--ink); color: var(--bg); box-shadow: var(--shadow); white-space: pre-line;
+  overflow-wrap: anywhere; opacity: 0; transform: translateY(8px); transition: .2s; pointer-events: none; }
+.toast.show { opacity: 1; transform: none; }
+@media (prefers-reduced-motion: reduce) { .toast { transition: none; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Server lifecycle</h1>
+  <span class="tag" title="Until the ClickCluster Platform UI exists">temporary</span>
+  <nav class="nav" aria-label="Pages"><a href="/ui/cluster-upgrade">Cluster upgrades</a><a href="/ui/server-lifecycle" aria-current="page">Server lifecycle</a></nav>
+  <span class="spacer"></span>
+  <div class="seg" role="group" aria-label="Data source">
+    <button id="mode-live" type="button" aria-pressed="false">Live</button>
+    <button id="mode-demo" type="button" aria-pressed="false">Demo</button>
+  </div>
+  <span class="refreshed" id="refreshed" aria-live="polite"></span>
+</header>
+<div class="banner" id="banner" hidden></div>
+<div class="tabs" id="tabs" role="tablist" aria-label="Workflow"></div>
+<main>
+  <section class="panel" aria-label="Runs">
+    <div class="list-head"><h2 id="list-title">Runs</h2><span id="start-slot"></span></div>
+    <ul class="runs" id="runs"></ul>
+  </section>
+  <section class="detail" id="detail" aria-live="polite"></section>
+</main>
+
+<dialog id="dialog"><form method="dialog" id="dialog-form" novalidate></form></dialog>
+<div class="toast" id="toast" role="status"></div>
+
+<!-- Why install-server skips a candidate: install_server._REJECTION_SUMMARY word for word (a test
+     keeps them equal), plus a short label. A failed run's message is "<summary>: <entries>" per reason. -->
+<script type="application/json" id="skip-reasons">
+{
+ "unnameable": {"label": "Not a usable name",
+  "summary": "cannot be a Kubernetes resource name even lowercased — rename these in server-scan"},
+ "no-bond": {"label": "No bondable NICs",
+  "summary": "offer fewer than two link-up NICs on two distinct physical ports. HPE OneView reports no link state at all and Intersight vNICs usually report none, so servers from those collectors cannot satisfy a strict link-up requirement"},
+ "already-installed": {"label": "Already installed",
+  "summary": "already hold a BareMetalHost in this namespace"},
+ "unknown-bmc-vendor": {"label": "Unknown BMC vendor",
+  "summary": "have no BMC driver vocabulary server-scan can name. A STANDALONE machine's driver is the caller's decision, and guessing IPMI would be silently wrong for a Redfish-only BMC"},
+ "no-bmc-host": {"label": "No BMC host",
+  "summary": "have no BMC host in the inventory, so Ironic would have nothing to connect to. A collector run fills this in"},
+ "bad-mac": {"label": "Malformed MAC",
+  "summary": "carry a malformed MAC. server-scan normalizes MACs on ingest, so this is a bad payload rather than a condition to wait out"},
+ "no-agent": {"label": "No Agent in time",
+  "summary": "were installed and never registered an Agent before the deadline, so each was rolled back and its machine returned to the inventory. An Agent appears once the host boots the discovery ISO and reaches assisted-service, so what failed is DOWNSTREAM of the BareMetalHost — the BMC, the bond, the VLAN, or DHCP on that inventory segment. Each entry below says which of those the host's own state points at"},
+ "reserved": {"label": "Locked by another run",
+  "summary": "are held by another install's lock in server-scan — most likely being installed into another MCE right now. Each entry names the holder and when its lock expires"},
+ "gone": {"label": "Left the inventory",
+  "summary": "left server-scan's inventory between the draw and the reservation, so there was nothing to lock"},
+ "no-pxe-site": {"label": "No PXE VM for its site",
+  "summary": "are driven over IPMI, so they boot from the network, but this MCE's server-lifecycle-worker has no PXE map host for their site — add the site to PXE_MAP_URLS. Each was released untouched"}
+}
+</script>
+<script>
+"use strict";
+const RUNS = "/workflows/runs";
+const INSTALL = "/workflows/server-lifecycle/install-server";
+const REMOVE = "/workflows/server-lifecycle/remove-server";
+const DEMO_URL = "/ui/server-lifecycle/demo-runs.json";
+const POLL_MS = 10000;
+const DETAILS_PER_REFRESH = 20;
+const QUEUE_PREFIX = "server-lifecycle-activity-";
+const SKIP = JSON.parse(document.getElementById("skip-reasons").textContent);
+
+const $ = (id) => document.getElementById(id);
+const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const code = (v) => `<code>${esc(v)}</code>`;
+function store(key, value) { try { value === undefined ? localStorage.removeItem(key) : localStorage.setItem(key, value); } catch (e) {} }
+function recall(key) { try { return localStorage.getItem(key); } catch (e) { return null; } }
+
+function ago(iso) {
+  if (!iso) return "";
+  const s = Math.round((Date.now() - new Date(iso).getTime()) / 1000);
+  if (s < 60) return "just now";
+  if (s < 3600) return `${Math.round(s / 60)} min ago`;
+  if (s < 86400) return `${Math.round(s / 3600)} h ago`;
+  return new Date(iso).toLocaleDateString(undefined, { day: "numeric", month: "short" });
+}
+function clock(iso) {
+  const d = new Date(iso);
+  if (isNaN(d)) return String(iso);
+  return d.toLocaleDateString(undefined, { day: "numeric", month: "short" }) + " " +
+    d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+}
+function span(fromIso, toIso) {
+  const s = Math.max(0, Math.round((new Date(toIso || Date.now()) - new Date(fromIso)) / 1000));
+  if (s < 90) return `${s} s`;
+  if (s < 5400) return `${Math.round(s / 60)} min`;
+  return `${Math.floor(s / 3600)} h ${Math.round((s % 3600) / 60)} min`;
+}
+
+// --- the four workflows ------------------------------------------------------------------
+// Phase words come from each workflow's `progress.phase`; steps group those phases in the
+// order the workflow runs them (workflow_domains/server_lifecycle/<workflow>.py).
+
+const FLOWS = {
+  install: {
+    type: "InstallServerWorkflow", tab: "Install", noun: "install-server",
+    phases: {
+      "pending": ["Starting", ""],
+      "resolving-vlan": ["Reading the inventory VLAN", "The VLAN is the MCE's: it comes from the MCE's inventory segment in the Segments Manager, never from the caller."],
+      "validating-infraenv": ["Checking the InfraEnv", "The InfraEnv must exist on the MCE before any server is drawn."],
+      "acquiring-server": ["Drawing candidates", "Asks server-scan for the healthy, unclaimed servers listed under the InfraEnv's name."],
+      "selecting-server": ["Checking a candidate", "A usable name, a known BMC, two link-up NICs on two physical ports, and no BareMetalHost already. Any reason it fails is a skip to the next candidate."],
+      "reserving-server": ["Locking the server", "Takes server-scan's install lock before anything is written, so no other MCE draws this machine."],
+      "registering-pxe-boot": ["Mapping it on the PXE VM", "An IPMI server boots from the network: its boot MAC is mapped on its site's PXE VM."],
+      "creating-nmstateconfig": ["Creating the NMStateConfig", "The static network config the discovery image carries."],
+      "publishing-pxe-boot": ["Publishing the boot entry", "Waits (up to 10 min) for a discovery image that includes the NMStateConfig, then publishes it as the InfraEnv's boot entry."],
+      "creating-secret": ["Creating the BMC Secret", "Each create is a no-op when the object already exists."],
+      "creating-baremetalhost": ["Creating the BareMetalHost", "Ironic registers the host through its BMC and boots it."],
+      "awaiting-agent": ["Waiting for the Agent", "The host boots the discovery image; its Agent registering is the proof the install worked. Each candidate gets up to 60 min, then it is rolled back and the next one tried."],
+      "rolling-back": ["Rolling the candidate back", "It produced no Agent in time: what was created for it is removed and the machine goes back to the inventory before the next candidate."],
+      "unregistering-pxe-boot": ["Unmapping it from the PXE VM", "The rolled-back candidate's MAC is taken off its site's PXE VM."],
+      "releasing-server": ["Releasing the lock", "The candidate's install lock goes back to server-scan."],
+      "holding-server": ["Holding the lock a day", "So no other MCE draws the machine before a cluster reports it."],
+      "completed": ["Installed", ""],
+    },
+    steps: [
+      ["Inventory VLAN", ["resolving-vlan"]],
+      ["InfraEnv on the MCE", ["validating-infraenv"]],
+      ["Draw candidates", ["acquiring-server"]],
+      ["Choose a server", ["selecting-server", "rolling-back", "unregistering-pxe-boot", "releasing-server"]],
+      ["Lock it in server-scan", ["reserving-server"]],
+      ["PXE boot entry (IPMI only)", ["registering-pxe-boot", "publishing-pxe-boot"]],
+      ["Secret, BareMetalHost, NMStateConfig", ["creating-secret", "creating-baremetalhost", "creating-nmstateconfig"]],
+      ["Agent registers", ["awaiting-agent"]],
+      ["Hold the lock a day", ["holding-server"]],
+    ],
+  },
+  remove: {
+    type: "RemoveServerWorkflow", tab: "Remove", noun: "remove-server",
+    phases: {
+      "pending": ["Starting", ""],
+      "inspecting": ["Inspecting the MCE", "Finds the server's BareMetalHost, NMStateConfig and Agents. An Agent bound to a cluster stops the run with nothing changed."],
+      "powering-off": ["Powering the host off", "Sets online: false and waits for the host to report powered off, so it cannot re-register its Agent."],
+      "removing-host": ["Deleting the BareMetalHost", "The BareMetalHost (its Secret goes with it) and the NMStateConfig."],
+      "removing-agent": ["Deleting the Agent", "Last, once nothing can bring it back."],
+      "removing-pxe-boot": ["Clearing the PXE map", "Every MAC the host is known by comes off its site's PXE VM. Best effort: a failure here is reported, not fatal."],
+      "verifying": ["Verifying it is gone", "Re-inspects (up to 5 min) until nothing of the server is left on the MCE."],
+      "completed": ["Removed", ""],
+    },
+    steps: [
+      ["Inspect the MCE", ["inspecting"]],
+      ["Power off", ["powering-off"]],
+      ["Delete BareMetalHost and NMStateConfig", ["removing-host"]],
+      ["Delete the Agent", ["removing-agent"]],
+      ["Clear the PXE map", ["removing-pxe-boot"]],
+      ["Verify nothing is left", ["verifying"]],
+    ],
+  },
+  uninstall: {
+    type: "UninstallServerWorkflow", tab: "Uninstall", noun: "uninstall-server",
+    phases: {
+      "pending": ["Starting", ""],
+      "checking-inventory": ["Asking server-scan", "Where server-scan says the server is. Only a contradiction stops the run."],
+      "inspecting": ["Inspecting the MCE", "The BareMetalHost, Agents, AgentMachines, Machine and HostedCluster: a hosted cluster's node, or an inventory host."],
+      "checking-hosted-node": ["Looking for its Node", "The Node that is this server, in its hosted cluster."],
+      "reserving-server": ["Locking the server", "server-scan's lock, before anything is written."],
+      "draining-node": ["Draining a lost Node", "A Node no Machine stands behind is cordoned and drained by the run (up to 20 min)."],
+      "deleting-machine": ["Deleting the Machine", "The node's CAPI Machine. NodePool replicas are not touched, so the NodePool backfills a replacement."],
+      "awaiting-machine-deletion": ["Waiting for the Machine to go", "CAPI drains the Node and the Agent provider unbinds the Agent; the host reboots into discovery."],
+      "verifying-agentmachine": ["Verifying the AgentMachine is gone", ""],
+      "verifying-node": ["Verifying no Node is the server", ""],
+      "verifying-agent": ["Verifying the Agent is free", ""],
+      "holding-server": ["Holding the lock a day", "So no other MCE draws the machine meanwhile."],
+      "removing-from-inventory": ["Removing it from the inventory", "remove-server runs as an awaited child."],
+      "completed": ["Uninstalled", ""],
+    },
+    sub: { draining: "Draining: the Agent is still bound", releasing: "Releasing: the run unbinds the Agent itself",
+      unbinding: "Unbinding: the host is rebooting into discovery" },
+    steps: [
+      ["Ask server-scan where it is", ["checking-inventory"]],
+      ["Inspect the MCE", ["inspecting", "checking-hosted-node"]],
+      ["Lock it in server-scan", ["reserving-server"]],
+      ["Leave the hosted cluster", ["draining-node", "deleting-machine", "awaiting-machine-deletion"]],
+      ["Verify AgentMachine, Node, Agent", ["verifying-agentmachine", "verifying-node", "verifying-agent"]],
+      ["Hold the lock a day", ["holding-server"]],
+      ["Remove from the inventory (remove-server)", ["removing-from-inventory"]],
+    ],
+  },
+  publish: {
+    type: "PublishInfraEnvBootWorkflow", tab: "Boot entry", noun: "publish-infraenv-boot",
+    phases: {
+      "pending": ["Starting", ""],
+      "resolving-site": ["Finding the site", "The MCE's inventory segment names the site, and so the PXE VM to write to."],
+      "validating-infraenv": ["Checking the InfraEnv", "The InfraEnv must exist on the MCE."],
+      "publishing": ["Publishing the boot entry", "Waits (up to 10 min) for a ready discovery image, then writes the InfraEnv's boot entry on the PXE VM."],
+      "completed": ["Published", ""],
+    },
+    steps: [
+      ["Find the site", ["resolving-site"]],
+      ["InfraEnv on the MCE", ["validating-infraenv"]],
+      ["Publish the boot entry", ["publishing"]],
+    ],
+  },
+};
+const TAB_KEYS = Object.keys(FLOWS);
+const STATUS = { FAILED: ["Failed", "bad"], TERMINATED: ["Terminated", "bad"], CANCELED: ["Cancelled", "muted"],
+  TIMED_OUT: ["Timed out", "bad"], CONTINUED_AS_NEW: ["Continued", "muted"], UNKNOWN: ["Unknown", "muted"] };
+
+const state = { mode: "live", tab: "install", lists: {}, runs: {}, selected: null, demo: null, liveNote: "" };
+
+// --- reading -------------------------------------------------------------------------------
+
+async function getJSON(url) {
+  const response = await fetch(url, { headers: { accept: "application/json" } });
+  if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+  return response.json();
+}
+
+async function loadDemo() {
+  if (!state.demo) state.demo = await getJSON(DEMO_URL);
+  state.lists = state.demo.lists;
+  state.runs = state.demo.runs;
+}
+
+async function fetchRun(id) {
+  state.runs[id] = await getJSON(`${RUNS}/${encodeURIComponent(id)}`);
+}
+
+async function loadLive() {
+  const type = FLOWS[state.tab].type;
+  const list = await getJSON(`${RUNS}?workflow_type=${type}&limit=50`);
+  state.lists[type] = list;
+  const wanted = list.slice(0, DETAILS_PER_REFRESH).map((r) => r.workflow_id);
+  if (state.selected && !wanted.includes(state.selected) && list.some((r) => r.workflow_id === state.selected)) wanted.push(state.selected);
+  // A closed run's status never changes again: fetch it once.
+  const stale = wanted.filter((id) => {
+    const known = state.runs[id];
+    const listed = list.find((r) => r.workflow_id === id);
+    return !known || known.status === "RUNNING" || (listed && listed.status !== known.status);
+  });
+  await Promise.allSettled(stale.map(fetchRun));
+}
+
+async function refresh() {
+  try {
+    if (state.mode === "demo") await loadDemo(); else await loadLive();
+    const list = currentList();
+    if (!state.selected || !list.some((r) => r.workflow_id === state.selected)) {
+      state.selected = (list[0] || {}).workflow_id || null;
+    }
+    $("refreshed").textContent = state.mode === "demo" ? "demo data" : `updated ${new Date().toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" })}`;
+  } catch (err) {
+    if (state.mode === "live") {
+      state.liveNote = `The run list could not be read (${err.message}).`;
+      return setMode("demo", true);
+    }
+    toast(`Could not load: ${err.message}`);
+  }
+  render();
+}
+
+function setMode(mode, automatic) {
+  state.mode = mode;
+  if (!automatic) store("sl-mode", mode);
+  $("mode-live").setAttribute("aria-pressed", String(mode === "live"));
+  $("mode-demo").setAttribute("aria-pressed", String(mode === "demo"));
+  const banner = $("banner");
+  if (mode === "demo") {
+    banner.hidden = false;
+    banner.innerHTML = `<b>Demo data.</b> ${esc(state.liveNote)} These runs were recorded from the workflows' own test harnesses on fake MCEs, with demo names. The start buttons show the request they would send instead of sending it.`;
+  } else {
+    banner.hidden = true;
+  }
+  state.lists = {}; state.runs = {};
+  return refresh();
+}
+
+function setTab(tab, selected) {
+  if (!FLOWS[tab]) tab = "install";
+  state.tab = tab;
+  state.selected = selected || null;
+  renderTabs();
+  return refresh();
+}
+
+// --- what a run says -----------------------------------------------------------------------
+
+function currentList() { return state.lists[FLOWS[state.tab].type] || []; }
+
+function view(id) {
+  const flow = FLOWS[state.tab];
+  const status = state.runs[id] || {};
+  const listed = currentList().find((r) => r.workflow_id === id) || {};
+  const run = status.status || listed.status || "UNKNOWN";
+  return { id, flow, status, listed, run, p: status.progress || null, r: status.result || null,
+    error: status.error || null, ids: parseId(flow, id) };
+}
+
+// What a workflow id says, by the builders in shared/workflow_ids.py (old shapes included).
+function parseId(flow, id) {
+  const rest = id.startsWith(`${flow.noun}-`) ? id.slice(flow.noun.length + 1) : id;
+  if (flow === FLOWS.install) {
+    if (rest.startsWith("name-")) return { server: rest.slice(5) };
+    const parts = rest.split("_");
+    if (parts.length === 3) return { mce: parts[0], infraEnv: parts[1], slot: parts[2] };
+    if (parts.length === 2) return /^\d+$/.test(parts[1]) ? { infraEnv: parts[0], slot: parts[1] } : { mce: parts[0], server: parts[1] };
+    return { infraEnv: rest };
+  }
+  if (flow === FLOWS.publish) return { entry: rest };
+  return { server: rest };
+}
+
+function mceOf(v) {
+  const q = v.p && v.p.activity_queue;
+  return (v.r && v.r.mce_cluster) || v.ids.mce || (q && q.startsWith(QUEUE_PREFIX) ? q.slice(QUEUE_PREFIX.length) : null);
+}
+
+// install-server's `progress.server_name` is the candidate of the latest ATTEMPT: set once a
+// candidate is locked and about to be created, and kept while the run rolls it back and
+// checks the next one. What it means therefore depends on the phase.
+const INSTALLING = ["creating-nmstateconfig", "publishing-pxe-boot", "creating-secret", "creating-baremetalhost", "awaiting-agent", "holding-server", "completed"];
+const ROLLING_BACK = ["rolling-back", "unregistering-pxe-boot", "releasing-server"];
+function serverRole(v) {
+  const phase = v.p && v.p.phase;
+  if (!isFailed(v) && INSTALLING.includes(phase)) return "Installing";
+  if (!isFailed(v) && ROLLING_BACK.includes(phase)) return "Rolling back";
+  return "Last tried";
+}
+const arr = (x) => (Array.isArray(x) ? x : []);
+const rolledBack = (n) => (n === 1 ? "1 never registered an Agent and was rolled back" : `${n} never registered an Agent and were rolled back`);
+
+function titleOf(v) {
+  const r = v.r || {}, p = v.p || {};
+  if (v.flow === FLOWS.install) {
+    const pool = `${v.ids.infraEnv || "InfraEnv"} pool`;
+    return r.server_name || v.ids.server || (p.server_name && serverRole(v) === "Installing" ? p.server_name : pool);
+  }
+  if (v.flow === FLOWS.publish) return r.infra_env || v.ids.entry;
+  return r.server_name || v.ids.server;
+}
+
+function isOpen(v) { return v.run === "RUNNING"; }
+function isFailed(v) { return !["RUNNING", "COMPLETED"].includes(v.run); }
+
+function phaseWords(v, phase) { return (v.flow.phases[phase] || [phase || "Starting"])[0]; }
+
+function statusInfo(v) {
+  if (v.run === "RUNNING") return [v.p ? phaseWords(v, v.p.phase) : "Running", "machine"];
+  if (v.run === "COMPLETED") {
+    const r = v.r || {};
+    if (v.flow === FLOWS.remove && r.found === false) return ["Nothing to remove", "muted"];
+    if (v.flow === FLOWS.uninstall && r.kept_in_inventory) return ["Out of its cluster, kept", "ok"];
+    if (v.flow === FLOWS.publish && r.superseded) return ["Newer image kept", "ok"];
+    return [v.flow.phases.completed[0], "ok"];
+  }
+  return STATUS[v.run] || [v.run, "muted"];
+}
+const chip = (v) => { const [label, t] = statusInfo(v); return `<span class="chip t-${t}">${esc(label)}</span>`; };
+
+// "SomeError: message" as the runs endpoint reports a failure, split into its type and message.
+function splitError(text) {
+  const m = /^([A-Z][A-Za-z0-9]*(?:Error|Exception)): ([\s\S]*)$/.exec(text || "");
+  return m ? { type: m[1], message: m[2] } : { type: null, message: text || "" };
+}
+
+// install-server names its candidates only in the failure it ends with when none could be
+// installed: "Checked N candidate(s) — <summary>: <entry>; <entry>. <summary>: …".
+function parseCandidates(message) {
+  const m = /^([\s\S]*?Checked (\d+) candidate\(s\)) — ([\s\S]*)$/.exec(message || "");
+  if (!m) return null;
+  const body = m[3];
+  const found = [];
+  for (const [key, reason] of Object.entries(SKIP)) {
+    const at = body.indexOf(`${reason.summary}: `);
+    if (at >= 0) found.push({ key, at, reason });
+  }
+  if (!found.length || found.sort((a, b) => a.at - b.at)[0].at !== 0) return null;
+  const groups = found.map((g, i) => {
+    const from = g.at + g.reason.summary.length + 2;
+    let text = i + 1 < found.length ? body.slice(from, found[i + 1].at) : body.slice(from);
+    text = text.replace(/\.\s*$/, "");
+    return { key: g.key, label: g.reason.label, summary: g.reason.summary, entries: splitTop(text, "; ").map(entry) };
+  });
+  return { headline: `${m[1]}.`, checked: Number(m[2]), groups };
+}
+// Split on a separator outside (), [] — an entry's own detail may contain it.
+function splitTop(text, sep) {
+  const out = []; let depth = 0, from = 0;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (c === "(" || c === "[") depth++;
+    else if ((c === ")" || c === "]") && depth) depth--;
+    else if (!depth && text.startsWith(sep, i)) { out.push(text.slice(from, i)); from = i + sep.length; i += sep.length - 1; }
+  }
+  out.push(text.slice(from));
+  return out.map((s) => s.trim()).filter(Boolean);
+}
+function entry(text) {
+  const m = /^(\S+)\s*([\s\S]*)$/.exec(text);
+  let detail = m ? m[2] : "";
+  if (/^\(([\s\S]*)\)$/.test(detail)) detail = detail.slice(1, -1);
+  return { name: m ? m[1] : text, detail };
+}
+
+// --- steps ---------------------------------------------------------------------------------
+
+function phaseStates(v) {
+  const phase = v.p && v.p.phase;
+  const at = v.flow.steps.findIndex(([, phases]) => phases.includes(phase));
+  return v.flow.steps.map(([label], i) => ({
+    label, note: "",
+    state: at < 0 ? "pending" : i < at ? "done" : i > at ? "pending" : isFailed(v) ? "alert" : "current",
+  }));
+}
+
+function steps(v) {
+  const s = phaseStates(v);
+  const note = (i, text) => { if (text) s[i].note = text; };
+  const skip = (i, text) => { s[i].state = "skipped"; s[i].note = text; };
+  const r = v.r, p = v.p || {};
+  const at = s.findIndex((x) => x.state === "current" || x.state === "alert");
+  if (at >= 0 && p.phase && v.flow.steps[at][1].length > 1) note(at, phaseWords(v, p.phase));
+
+  if (v.flow === FLOWS.install) {
+    if (r) {
+      s.forEach((x) => (x.state = "done"));
+      note(0, `VLAN ${r.vlan_id}`);
+      note(1, `${r.namespace}/${r.infra_env}`);
+      note(3, r.attempts > 1 ? `${r.server_name}, attempt ${r.attempts}: ${rolledBack(r.attempts - 1)} before it` : r.server_name);
+      if (r.pxe_registered) note(5, "An IPMI server: its boot MAC chains to the InfraEnv's boot entry");
+      else skip(5, "Not needed: it boots from virtual media");
+      note(6, r.resources_changed ? "Created by this run" : "All three already existed: nothing written");
+      note(7, r.agent_name ? `Agent ${r.agent_name}` : "");
+      if (r.reservation_expires_at) note(8, `Until ${clock(r.reservation_expires_at)}`); else skip(8, "No hold recorded");
+    } else {
+      if (s[5].state === "done") { s[5].state = "skipped"; s[5].note = "Only for an IPMI server; the result says whether it ran"; }
+      if (p.server_name && at > 3) note(3, p.server_name);
+      if (p.server_name && at === 3) note(3, `${phaseWords(v, p.phase)} · ${serverRole(v).toLowerCase()} ${p.server_name}`);
+      if (p.phase === "awaiting-agent" && !isFailed(v)) note(7, "Up to 60 min per candidate");
+    }
+  } else if (v.flow === FLOWS.remove) {
+    if (r) {
+      s.forEach((x) => (x.state = "done"));
+      if (!r.found) {
+        note(0, "Nothing of the server was on the MCE");
+        for (let i = 1; i < s.length; i++) skip(i, "Nothing to do");
+        return s;
+      }
+      if (r.powered_off) note(1, "Reported powered off"); else skip(1, "No BareMetalHost to power it off through");
+      if (arr(r.resources_removed).length) note(2, r.resources_removed.join(", ")); else skip(2, "Neither was there");
+      if (arr(r.agents_removed).length) note(3, r.agents_removed.join(", ")); else skip(3, "No Agent");
+      const [cleared, kept, failed] = [arr(r.pxe_cleared), arr(r.pxe_kept), arr(r.pxe_failed)];
+      if (!cleared.length && !kept.length && !failed.length) skip(4, "Nothing cleared: no MAC known, or a run from before the PXE cleanup");
+      else note(4, [cleared.length && `${cleared.length} cleared`, kept.length && `${kept.length} kept (another MCE's)`,
+        failed.length && `${failed.length} failed`].filter(Boolean).join(", "));
+      note(5, "Nothing left on the MCE");
+    }
+  } else if (v.flow === FLOWS.uninstall) {
+    if (r) {
+      s.forEach((x) => (x.state = "done"));
+      const nothing = r.kept_in_inventory && !r.hosted && !r.reservation_expires_at;
+      note(0, r.lifecycle_state_at_start || "");
+      note(1, r.hosted ? `A node of ${r.hosted_cluster || "a hosted cluster"}` : "An inventory host");
+      if (nothing) skip(2, "Nothing to write, so no lock");
+      if (r.hosted || arr(r.cleaned_up).length) note(3, r.machine_deleted_by_run ? `Deleted Machine ${r.machine}` : r.machine ? `Machine ${r.machine} was already going` : "");
+      else skip(3, "Not a hosted cluster's node");
+      if (nothing) skip(4, "Nothing to verify");
+      if (r.reservation_expires_at) note(5, `Until ${clock(r.reservation_expires_at)}`);
+      else if (nothing) skip(5, "No lock taken"); else note(5, "Not extended: the run's log says why");
+      if (r.kept_in_inventory) skip(6, "keep_inventory: left in the MCE's inventory");
+      else if (r.remove_server) note(6, r.remove_server.found ? `Removed by ${r.remove_server_workflow_id}` : "Nothing of it was left on the MCE");
+    } else if (p.phase === "awaiting-machine-deletion") {
+      note(3, [v.flow.sub[p.sub_phase] || p.sub_phase, p.agent_state && `Agent ${p.agent_state}`].filter(Boolean).join(" · "));
+    }
+  } else if (v.flow === FLOWS.publish && r) {
+    s.forEach((x) => (x.state = "done"));
+    note(0, r.site);
+    note(1, `${r.namespace}/${r.infra_env}`);
+    note(2, r.superseded ? "The PXE VM already held a newer image and kept it" : `Image of ${clock(r.image_created_at)}`);
+  }
+  return s;
+}
+
+// --- rendering -----------------------------------------------------------------------------
+
+function render() {
+  // A poll re-renders the list: keep the keyboard focus on the run it was on.
+  const focused = document.activeElement && document.activeElement.classList.contains("run") ? document.activeElement.dataset.id : null;
+  renderTabs(); renderList(); renderDetail(); writeHash();
+  if (focused) { const again = [...document.querySelectorAll(".run")].find((b) => b.dataset.id === focused); if (again) again.focus(); }
+}
+
+let renderedTab = null;
+function renderTabs() {
+  if (!$("tabs").children.length) {
+    $("tabs").innerHTML = TAB_KEYS.map((key) => `<button type="button" role="tab" data-tab="${key}">${esc(FLOWS[key].tab)}</button>`).join("");
+  }
+  $("tabs").querySelectorAll("[data-tab]").forEach((b) => {
+    b.setAttribute("aria-selected", String(b.dataset.tab === state.tab));
+    b.tabIndex = b.dataset.tab === state.tab ? 0 : -1;
+  });
+  if (renderedTab === state.tab) return;
+  renderedTab = state.tab;
+  $("list-title").textContent = "Runs";
+  $("list-title").title = `${FLOWS[state.tab].noun} runs`;
+  $("start-slot").innerHTML = state.tab === "install" ? `<button type="button" class="primary" id="new-install">Install servers</button>`
+    : state.tab === "remove" ? `<button type="button" class="danger" id="new-remove">Remove a server</button>` : "";
+}
+
+// Under the chip: where the run is, and for a failed one why it ended.
+function listSub(v) {
+  const r = v.r || {};
+  const where = v.flow === FLOWS.install ? [v.ids.infraEnv || r.infra_env, v.ids.slot ? `slot ${v.ids.slot}` : "named"].filter(Boolean).join(" · ")
+    : v.flow === FLOWS.publish ? [r.mce_cluster || mceOf(v), r.site].filter(Boolean).join(" · ") : mceOf(v) || "";
+  if (isFailed(v)) return [v.flow === FLOWS.install && where, v.error ? splitError(v.error).message : v.run.toLowerCase()].filter(Boolean).join(" · ");
+  if (v.flow === FLOWS.install && r.agent_name) return `${where} · Agent ${r.agent_name}`;
+  return where;
+}
+
+function renderList() {
+  const ul = $("runs");
+  const list = currentList();
+  if (!list.length) {
+    ul.innerHTML = `<li class="empty">No ${esc(FLOWS[state.tab].noun)} runs yet.${state.mode === "live" ? " Switch to Demo to see what a run looks like." : ""}</li>`;
+    return;
+  }
+  ul.innerHTML = list.map((item) => {
+    const v = view(item.workflow_id);
+    return `<li><button type="button" class="run" data-id="${esc(item.workflow_id)}" aria-current="${item.workflow_id === state.selected}">
+      <div class="name"><span>${esc(titleOf(v))}</span><span class="when">${esc(ago(item.start_time))}</span></div>
+      <div style="margin-top:5px">${chip(v)}</div>
+      <div class="sub">${esc(listSub(v))}</div></button></li>`;
+  }).join("");
+}
+
+function renderDetail() {
+  const el = $("detail");
+  if (!state.selected) {
+    el.innerHTML = `<div class="panel card"><p class="empty">Select a run${state.tab === "install" || state.tab === "remove" ? ", or start one" : ""}.</p></div>`;
+    return;
+  }
+  const v = view(state.selected);
+  if (!v.status.status) {
+    el.innerHTML = `<div class="panel card"><div class="title"><h2>${esc(titleOf(v))}</h2>${chip(v)}</div><p class="note">Reading this run…</p></div>`;
+    return;
+  }
+  const facts = [
+    ["MCE", mceOf(v)],
+    v.flow === FLOWS.install && ["InfraEnv", (v.r && v.r.infra_env) || v.ids.infraEnv],
+    v.flow === FLOWS.install && ["Drawn", v.ids.slot ? `from the pool, slot ${v.ids.slot}` : "by name"],
+    v.listed.start_time && ["Started", clock(v.listed.start_time)],
+    // A demo run was recorded long ago: how long it has been running says nothing.
+    v.listed.start_time && !(isOpen(v) && state.mode === "demo") && [isOpen(v) ? "Running for" : "Took", span(v.listed.start_time, v.listed.close_time)],
+  ].filter((f) => f && f[1]);
+  const candidates = v.flow === FLOWS.install ? renderCandidates(v) : "";
+  el.innerHTML = [
+    `<div class="panel card">
+      <div class="title"><h2>${esc(titleOf(v))}</h2>${chip(v)}</div>
+      <div class="facts">${facts.map(([k, val]) => `<span>${esc(k)} <b>${esc(val)}</b></span>`).join("")}
+        <span>Run <code>${esc(v.id)}</code> <button type="button" class="link" data-copy="${esc(v.id)}">copy</button></span></div>
+      ${renderNow(v)}
+    </div>`,
+    `<div class="cols">
+      <div class="panel card"><h2>Steps</h2><ol class="steps">${steps(v).map(renderStep).join("")}</ol></div>
+      <div class="panel card"><h2>${v.flow === FLOWS.publish ? "Boot entry" : v.flow !== FLOWS.install && v.r ? "What it did" : "Server"}</h2>${renderFacts(v)}</div>
+    </div>`,
+    candidates,
+    `<div class="panel card"><details><summary>Raw response</summary><pre>${esc(JSON.stringify(v.status, null, 2))}</pre></details></div>`,
+  ].join("");
+}
+
+function renderStep(step, i) {
+  const mark = { done: "&#10003;", alert: "!", skipped: "&ndash;", current: "&#9679;" }[step.state] || String(i + 1);
+  const words = { done: "done", alert: "stopped here", skipped: "skipped", current: "now", pending: "not yet" }[step.state];
+  return `<li class="s-${step.state}"><span class="dot" aria-hidden="true">${mark}</span>
+    <div><div class="step-label">${esc(step.label)} <span class="sr">(${words})</span></div>${step.note ? `<div class="step-note">${esc(step.note)}</div>` : ""}</div></li>`;
+}
+
+function renderNow(v) {
+  if (isFailed(v)) {
+    const { type, message } = splitError(v.error || "");
+    const parsed = v.flow === FLOWS.install ? parseCandidates(message) : null;
+    const where = v.p && v.p.phase ? ` · last step: ${phaseWords(v, v.p.phase)}` : "";
+    const label = `${esc(statusInfo(v)[0])}${esc(where)}${type ? ` ${code(type)}` : ""}`;
+    if (!message) return `<div class="waiting alert"><div class="label">${label}</div><p>The run reported no error message.</p></div>`;
+    if (parsed) {
+      return `<div class="waiting alert"><div class="label">${label}</div><p class="headline">${esc(parsed.headline)}</p>
+        <p>Why each was skipped is below.</p><details><summary>Full message</summary><p>${esc(message)}</p></details></div>`;
+    }
+    return `<div class="waiting alert"><div class="label">${label}</div><p class="headline">${esc(message)}</p></div>`;
+  }
+  if (v.run === "COMPLETED") return `<div class="waiting ok"><div class="label">Finished</div><p>${esc(summary(v))}</p></div>`;
+  const phase = v.p && v.p.phase;
+  const [words, help] = v.flow.phases[phase] || [phase || "Running", ""];
+  const extra = v.flow === FLOWS.uninstall && v.p && v.p.sub_phase ? `\n${v.flow.sub[v.p.sub_phase] || v.p.sub_phase}${v.p.agent_state ? ` (Agent ${v.p.agent_state})` : ""}` : "";
+  const server = v.flow === FLOWS.install && v.p && v.p.server_name ? ` ${v.p.server_name}` : "";
+  return `<div class="waiting"><div class="label">Now</div><p><b>${esc(words)}</b>${esc(server ? ":" + server : "")}${help ? `\n${esc(help)}` : ""}${esc(extra)}</p>
+    ${v.p ? "" : `<p class="note">The run did not answer its progress query: no brain worker, or it is busy.</p>`}</div>`;
+}
+
+function summary(v) {
+  const r = v.r || {};
+  if (v.flow === FLOWS.install) return `${r.server_name} is installable in InfraEnv ${r.namespace}/${r.infra_env}: its Agent ${r.agent_name || "(not named)"} registered${r.attempts > 1 ? ` on attempt ${r.attempts}` : ""}.`;
+  if (v.flow === FLOWS.remove) return r.found ? `${r.server_name} is out of the inventory of ${r.mce_cluster}.` : `Nothing of ${r.server_name} was on ${r.mce_cluster}: nothing to remove.`;
+  if (v.flow === FLOWS.uninstall) {
+    const where = r.hosted ? `left ${r.hosted_cluster || "its hosted cluster"}` : "was only inventory";
+    return r.kept_in_inventory ? `${r.server_name} ${where} and stays in the inventory of ${r.mce_cluster} as a free Agent.`
+      : `${r.server_name} ${where} and is out of ${r.mce_cluster}.`;
+  }
+  return r.superseded ? `The ${r.site} PXE VM already held a newer image of ${r.infra_env}, and kept it: the entry is current.`
+    : `The ${r.site} PXE VM serves the image of ${r.infra_env} created ${clock(r.image_created_at)}.`;
+}
+
+function kv(rows, note) {
+  const body = rows.filter((row) => row && row[1] !== undefined && row[1] !== null && row[1] !== "")
+    .map(([k, val, raw]) => `<dt>${esc(k)}</dt><dd>${raw ? val : esc(val)}</dd>`).join("");
+  return `<dl class="kv">${body}</dl>${note ? `<p class="note">${esc(note)}</p>` : ""}`;
+}
+const codeList = (items, cls) => arr(items).length ? `<ul${cls ? ` class="${cls}"` : ""}>${items.map((i) => `<li>${code(i)}</li>`).join("")}</ul>` : null;
+const yes = (b) => (b ? "yes" : "no");
+
+function renderFacts(v) {
+  const r = v.r, p = v.p || {};
+  if (v.flow === FLOWS.install) {
+    if (r) {
+      return kv([
+        ["Server", `${code(r.server_name)} <span style="color:var(--muted)">${esc(r.server_id)}</span>`, true],
+        ["BMC", `${esc(r.bmc_vendor)} ${code(r.bmc_address)}`, true],
+        ["Boots from", r.pxe_registered ? "the network: its site's PXE VM" : "virtual media"],
+        ["Boot MAC", code(r.boot_mac), true],
+        ["Bond", codeList(r.bond_macs), true],
+        ["VLAN", r.vlan_id],
+        ["BareMetalHost", r.bmh_registered ? "registered (its Agent proves it)" : "not registered"],
+        ["Resources", r.resources_changed ? "created by this run" : "already there; nothing written"],
+        ["Agent", r.agent_name ? code(r.agent_name) : "not named", true],
+        ["Lock", r.reservation_expires_at ? `held until ${clock(r.reservation_expires_at)}` : "no expiry recorded"],
+        ["Attempts", r.attempts],
+      ]);
+    }
+    return kv([
+      [p.server_name ? serverRole(v) : "Server", p.server_name ? code(p.server_name) : isFailed(v) ? "none attempted" : "none attempted yet", true],
+      ["InfraEnv", v.ids.infraEnv],
+      ["Worker queue", p.activity_queue ? code(p.activity_queue) : null, true],
+    ], "The BMC, bond, VLAN, Agent and lock are reported in the result, when the run succeeds.");
+  }
+  if (v.flow === FLOWS.remove) {
+    if (r) {
+      return kv([
+        ["Server", code(r.server_name), true],
+        ["Namespace", r.namespace],
+        ["Found on the MCE", yes(r.found)],
+        r.found && ["Powered off", yes(r.powered_off)],
+        ["Removed", codeList(r.resources_removed), true],
+        ["Agents removed", codeList(r.agents_removed), true],
+        ["PXE cleared", codeList(r.pxe_cleared), true],
+        ["PXE kept", codeList(r.pxe_kept), true],
+        ["PXE failed", codeList(r.pxe_failed, "warn"), true],
+      ]);
+    }
+    return kv([
+      ["Server", code(titleOf(v)), true],
+      ["Worker queue", p.activity_queue ? code(p.activity_queue) : null, true],
+    ], "What was powered off and removed is reported in the result, when the run succeeds.");
+  }
+  if (v.flow === FLOWS.uninstall) {
+    if (r) {
+      const child = r.remove_server;
+      return kv([
+        ["Server", `${code(r.server_name)}${r.server_id ? ` <span style="color:var(--muted)">${esc(r.server_id)}</span>` : ""}`, true],
+        ["server-scan said", r.lifecycle_state_at_start],
+        ["Agent", r.agent_name ? `${code(r.agent_name)} ${esc(r.agent_state_at_start || "")}${r.bound_at_start ? " · bound" : ""}` : null, true],
+        ["Hosted cluster", r.hosted_cluster ? `${code(r.hosted_cluster)}${r.hcp_namespace ? ` in ${code(r.hcp_namespace)}` : ""}` : null, true],
+        ["Machine", r.machine ? `${code(r.machine)}${r.machine_deleted_by_run ? " · deleted by this run" : ""}` : null, true],
+        ["AgentMachine", r.agent_machine ? code(r.agent_machine) : null, true],
+        ["Node", r.node_name ? code(r.node_name) : null, true],
+        ["Lock", r.reservation_expires_at ? `held until ${clock(r.reservation_expires_at)}` : null],
+        ["Kept in inventory", r.kept_in_inventory ? "yes: a free Agent of the InfraEnv" : null],
+        ["Leftovers found", codeList(r.leftovers_at_start), true],
+        ["Cleaned up", codeList(r.cleaned_up), true],
+        ["Skipped", codeList(r.skipped), true],
+        ["remove-server", r.remove_server_workflow_id ? `${code(r.remove_server_workflow_id)}${child ? `<div class="step-note">${esc(child.found
+          ? [child.powered_off && "powered off", arr(child.resources_removed).length && `removed ${child.resources_removed.join(", ")}`,
+            arr(child.agents_removed).length && `Agents ${child.agents_removed.join(", ")}`, arr(child.pxe_cleared).length && `${child.pxe_cleared.length} PXE entries cleared`,
+            arr(child.pxe_failed).length && `PXE failed: ${child.pxe_failed.join("; ")}`].filter(Boolean).join(" · ")
+          : "found nothing left on the MCE")}</div>` : ""}` : null, true],
+      ]);
+    }
+    return kv([
+      ["Server", code(titleOf(v)), true],
+      ["Waiting on", p.sub_phase ? (v.flow.sub[p.sub_phase] || p.sub_phase) : null],
+      ["Agent state", p.agent_state ? code(p.agent_state) : null, true],
+      ["Worker queue", p.activity_queue ? code(p.activity_queue) : null, true],
+    ], "The hosted cluster, Machine, Node and what was cleaned up are reported in the result, when the run succeeds.");
+  }
+  if (r) {
+    return kv([
+      ["InfraEnv", `${r.namespace}/${r.infra_env}`],
+      ["MCE", r.mce_cluster],
+      ["Site", r.site],
+      ["Entry", code(`${r.mce_cluster}/${r.infra_env}.ipxe`), true],
+      ["Image created", r.image_created_at ? clock(r.image_created_at) : null],
+      ["Superseded", r.superseded ? "yes: the PXE VM already held a newer image" : "no"],
+    ]);
+  }
+  return kv([["Worker queue", p.activity_queue ? code(p.activity_queue) : null, true]],
+    "The site and the image published are reported in the result, when the run succeeds.");
+}
+
+function renderCandidates(v) {
+  if (isFailed(v)) {
+    const parsed = parseCandidates(splitError(v.error || "").message);
+    if (!parsed) return "";
+    const groups = parsed.groups.map((g) => `<div class="group">
+      <span class="chip t-bad">${esc(g.label)}</span> <span style="color:var(--muted)">${esc(g.entries.length)} of ${esc(parsed.checked)}</span>
+      <p class="why">They ${esc(g.summary)}.</p>
+      <ul>${g.entries.map((e) => `<li>${code(e.name)}${e.detail ? `<span class="d">${esc(e.detail)}</span>` : ""}</li>`).join("")}</ul></div>`).join("");
+    return `<div class="panel card"><h2>Candidates: ${esc(parsed.checked)} checked, none installed</h2>${groups}</div>`;
+  }
+  let text;
+  if (v.r) {
+    text = v.r.attempts > 1
+      ? `${v.r.attempts} candidates were installed: ${rolledBack(v.r.attempts - 1)}, then ${v.r.server_name} registered its Agent.`
+      : `${v.r.server_name} was the first candidate installed.`;
+  } else {
+    text = v.p && v.p.server_name ? `Now on ${v.p.server_name}.` : "No candidate chosen yet.";
+  }
+  return `<div class="panel card"><h2>Candidates</h2><p style="margin:0">${esc(text)}</p>
+    <p class="note">A run names the candidates it skipped, and why, only when none could be installed: they are in its failure.</p></div>`;
+}
+
+// --- starting ------------------------------------------------------------------------------
+
+// The body a form sends: only elements marked data-send="<route>:<field>", each a field of
+// that route's request model (tests/test_server_lifecycle_ui.py pins the set).
+function collect(form, route) {
+  const out = {};
+  form.querySelectorAll(`[data-send^="${route}:"]`).forEach((el) => {
+    if (el.disabled || el.closest("[hidden]")) return;
+    const field = el.dataset.send.slice(route.length + 1);
+    const raw = el.value.trim();
+    if (!raw) return;
+    if (field === "count") out[field] = Number(raw);
+    else if (field === "server_names") {
+      const names = raw.split(/[\s,]+/).filter(Boolean);
+      out[field] = names.length === 1 ? names[0] : names;
+    } else out[field] = raw;
+  });
+  return out;
+}
+
+function openDialog({ title, explain, path, route, fields, ready = () => true, danger = false, sent }) {
+  const form = $("dialog-form");
+  const label = state.mode === "demo" ? "Show what it sends" : danger ? "Remove it" : "Start";
+  form.innerHTML = `<h3>${esc(title)}</h3>${explain ? `<p class="explain">${esc(explain)}</p>` : ""}
+    ${fields}
+    <details style="margin-top:12px"><summary>The request</summary><pre id="f-preview"></pre></details>
+    <div class="buttons"><button type="button" id="f-cancel">Cancel</button>
+      <button type="submit" class="${danger ? "danger-solid" : "primary"}" id="f-send">${esc(label)}</button></div>`;
+  const update = () => {
+    $("f-preview").textContent = `POST ${path}\n${JSON.stringify(collect(form, route), null, 2)}`;
+    $("f-send").disabled = !ready(form);
+  };
+  form.oninput = update; form.onchange = update; update();
+  $("f-cancel").onclick = () => $("dialog").close();
+  form.onsubmit = async (event) => {
+    event.preventDefault();
+    if (!form.reportValidity() || !ready(form)) return;
+    const payload = collect(form, route);
+    $("dialog").close();
+    await send(path, payload, sent);
+  };
+  $("dialog").showModal();
+  form.querySelector("input, textarea").focus();
+}
+
+async function send(path, payload, sent) {
+  if (state.mode === "demo") {
+    toast(`Demo: nothing was sent. Live, this would be\nPOST ${path}\n${JSON.stringify(payload)}`, 9000);
+    return;
+  }
+  try {
+    const response = await fetch(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
+    const text = await response.text();
+    let body = null;
+    try { body = JSON.parse(text); } catch (e) {}
+    if (response.ok && body) {
+      const started = sent(body);
+      if (started) state.selected = started;
+    } else if (response.status === 404 && /^\{"detail":"Not Found"\}$/.test(text)) {
+      toast("The server-lifecycle routes are not on this API.", 8000);
+    } else {
+      const detail = body && body.detail;
+      const words = Array.isArray(detail) ? detail.map((d) => `${(d.loc || []).slice(1).join(".")}: ${d.msg}`).join("\n")
+        : typeof detail === "string" ? detail : text;
+      toast(`${response.status}: ${words}`, 10000);
+    }
+  } catch (err) {
+    toast(`Not sent: ${err.message}`);
+  }
+  refresh();
+}
+
+function installDialog() {
+  openDialog({
+    title: "Install servers", path: INSTALL, route: "install-server",
+    explain: "Every server is its own run. The InfraEnv's name states the hardware, so it is also the pool: the healthy, unclaimed servers server-scan lists under that name.",
+    fields: `
+      <label for="f-infra">InfraEnv <span class="hint">the one to fill</span></label>
+      <input id="f-infra" data-send="install-server:infra_env" required autocomplete="off" spellcheck="false" placeholder="cisco-m6-site1-64c-512gb">
+      <label for="f-mce">MCE <span class="hint">with or without its ocp4- prefix</span></label>
+      <input id="f-mce" data-send="install-server:mce_cluster" required autocomplete="off" spellcheck="false" placeholder="ocp4-mce-site1-a">
+      <fieldset class="choice"><legend>Which servers</legend>
+        <label><input type="radio" name="f-which" value="pool" checked> The pool picks</label>
+        <label><input type="radio" name="f-which" value="named"> Named servers</label></fieldset>
+      <div data-which="pool"><label for="f-count">How many <span class="hint">1 to 20, in parallel; empty is one</span></label>
+        <input id="f-count" type="number" min="1" max="20" step="1" inputmode="numeric" data-send="install-server:count" placeholder="1"></div>
+      <div data-which="named" hidden><label for="f-names">Server names <span class="hint">server-scan's names, one per line, up to 20</span></label>
+        <textarea id="f-names" rows="4" spellcheck="false" data-send="install-server:server_names"></textarea></div>`,
+    ready: (form) => {
+      const named = form.querySelector('input[name="f-which"]:checked').value === "named";
+      form.querySelectorAll("[data-which]").forEach((el) => {
+        const on = el.dataset.which === (named ? "named" : "pool");
+        el.hidden = !on;
+        el.querySelectorAll("input, textarea").forEach((i) => { i.disabled = !on; });
+      });
+      $("f-names").required = named;
+      return true;
+    },
+    sent: (body) => {
+      if (body.workflow_id) { toast(`Started ${body.workflow_id}`); return body.workflow_id; }
+      const failed = (body.results || []).filter((i) => i.status === "failed");
+      toast([`Started ${body.started}, already running ${body.already_running}, failed ${body.failed}.`,
+        ...failed.map((i) => `${i.server_name || `slot ${i.slot}`}: ${i.error}`)].join("\n"), failed.length ? 12000 : 6000);
+      return ((body.results || []).find((i) => i.status === "started") || {}).workflow_id || null;
+    },
+  });
+}
+
+function removeDialog() {
+  openDialog({
+    title: "Remove a server from an MCE's inventory", path: REMOVE, route: "remove-server", danger: true,
+    explain: "For a server that is only inventory: if its Agent is bound to a cluster, the run fails having changed nothing. A server that has nothing on the MCE completes as a no-op.",
+    fields: `
+      <label for="f-server">Server <span class="hint">its server-scan name</span></label>
+      <input id="f-server" data-send="remove-server:server_name" required autocomplete="off" spellcheck="false">
+      <label for="f-mce">MCE <span class="hint">with or without its ocp4- prefix</span></label>
+      <input id="f-mce" data-send="remove-server:mce_cluster" required autocomplete="off" spellcheck="false">
+      <div class="confirm"><p><b>This cannot be undone.</b> The host is powered off, then its BareMetalHost, NMStateConfig and Agent are deleted and its MACs cleared from the site's PXE VM.</p>
+        <label for="f-confirm">Type the server name again to confirm</label>
+        <input id="f-confirm" autocomplete="off" spellcheck="false"></div>`,
+    ready: (form) => {
+      const name = form.querySelector("#f-server").value.trim();
+      return Boolean(name) && form.querySelector("#f-confirm").value.trim() === name;
+    },
+    sent: (body) => { toast(`Started ${body.workflow_id}`); return body.workflow_id; },
+  });
+}
+
+// --- wiring --------------------------------------------------------------------------------
+
+let toastTimer;
+function toast(text, ms = 4500) {
+  const el = $("toast"); el.textContent = text; el.classList.add("show");
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => el.classList.remove("show"), ms);
+}
+
+function writeHash() {
+  const hash = `#${state.tab}${state.selected ? `/${encodeURIComponent(state.selected)}` : ""}`;
+  if (location.hash !== hash) history.replaceState(null, "", hash);
+}
+function readHash() {
+  const [tab, id] = location.hash.slice(1).split("/");
+  return { tab: FLOWS[tab] ? tab : "install", id: id ? decodeURIComponent(id) : null };
+}
+document.addEventListener("click", async (event) => {
+  const tab = event.target.closest("[data-tab]");
+  if (tab) { setTab(tab.dataset.tab); return; }
+  const run = event.target.closest(".run");
+  if (run) {
+    state.selected = run.dataset.id; render();
+    if (window.matchMedia("(max-width: 860px)").matches) $("detail").scrollIntoView({ behavior: "smooth" });
+    if (state.mode === "live" && !(state.runs[state.selected] || {}).status) {
+      try { await fetchRun(state.selected); } catch (err) { toast(`Could not read the run: ${err.message}`); }
+      render();
+    }
+    return;
+  }
+  const t = event.target.closest("button");
+  if (!t) return;
+  if (t.id === "new-install") installDialog();
+  else if (t.id === "new-remove") removeDialog();
+  else if (t.dataset.copy) navigator.clipboard?.writeText(t.dataset.copy).then(() => toast("Copied."), () => toast(t.dataset.copy));
+});
+$("tabs").addEventListener("keydown", (event) => {
+  if (event.key !== "ArrowRight" && event.key !== "ArrowLeft") return;
+  const next = TAB_KEYS[(TAB_KEYS.indexOf(state.tab) + (event.key === "ArrowRight" ? 1 : TAB_KEYS.length - 1)) % TAB_KEYS.length];
+  setTab(next).then(() => document.querySelector(`[data-tab="${next}"]`).focus());
+});
+$("mode-live").onclick = () => { state.liveNote = ""; setMode("live"); };
+$("mode-demo").onclick = () => setMode("demo");
+window.addEventListener("hashchange", () => {
+  const { tab, id } = readHash();
+  if (tab !== state.tab) setTab(tab, id);
+  else if (id && id !== state.selected) { state.selected = id; render(); }
+});
+
+(async function start() {
+  const { tab, id } = readHash();
+  state.tab = tab; state.selected = id;
+  renderTabs();
+  if (recall("sl-mode") === "demo") return setMode("demo");
+  try {
+    const lists = await Promise.all(TAB_KEYS.map((key) => getJSON(`${RUNS}?workflow_type=${FLOWS[key].type}&limit=1`)));
+    if (lists.every((l) => !l.length)) { state.liveNote = "There are no server-lifecycle runs on this API yet."; return setMode("demo", true); }
+    await setMode("live", true);
+  } catch (err) {
+    state.liveNote = `The run list could not be read (${err.message}).`;
+    await setMode("demo", true);
+  }
+})();
+setInterval(() => { if (state.mode === "live" && !$("dialog").open && document.visibilityState === "visible") refresh(); }, POLL_MS);
+</script>
+</body>
+</html>

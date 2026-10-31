@@ -120,12 +120,14 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   doesn't degrades to status-only. `GET /workflows/runs?workflow_type=<WorkflowClass>` lists one
   workflow's newest runs (status and times only; the type is pattern-checked because it goes into
   the visibility query).
-- **A temporary page may live at `/ui/<domain>`, served by the API it calls** (cluster-upgrade's,
-  `workflow_domains/cluster_upgrade/ui.py`, until the ClickCluster Platform UI exists). ONE
-  self-contained HTML file in the domain folder, nothing from another host (production is
-  air-gapped; `tests/test_cluster_upgrade_ui.py` checks it), same origin so no CORS. Its demo data
-  is recorded from the workflow's own test scenarios (`UPDATE_UI_DEMO=1`) and checked against the
-  models, so the page cannot drift from the API. It adds no auth: the API has none (§9).
+- **A temporary page may live at `/ui/<domain>`, served by the API it calls** (cluster-upgrade's
+  and server-lifecycle's, `workflow_domains/<domain>/ui.py`, until the ClickCluster Platform UI
+  exists; each links to the other). ONE self-contained HTML file in the domain folder, nothing from
+  another host (production is air-gapped; `tests/test_<domain>_ui.py` checks it), same origin so no
+  CORS. Its demo data is recorded from the workflow's own test scenarios (`UPDATE_UI_DEMO=1`) and
+  checked against the models, so the page cannot drift from the API. It shows only what a run
+  reports, and a start form offers only the request fields its test pins. It adds no auth: the API
+  has none (§9).
 
 ## 3. Deployment-target agnostic
 

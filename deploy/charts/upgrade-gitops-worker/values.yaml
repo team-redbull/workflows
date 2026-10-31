@@ -72,11 +72,6 @@ registry:
   # false only for a registry whose CA cannot be mounted (the internal mirror).
   tlsVerify: true
 
-# Who the upgrade's commits are by, in day1 and Brain.
-commitAuthor:
-  name: cluster-upgrade-workflow
-  email: cluster-upgrade-workflow@redbull.local
-
 serviceAccount:
   create: true
   name: ""           # defaults to the release's full name

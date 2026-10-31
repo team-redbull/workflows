@@ -445,10 +445,9 @@ class UpgradeGitopsActivitySettings(BaseSettings):
     # Off only for a registry whose CA cannot be mounted (the internal mirror).
     registry_tls_verify: bool = True
 
-    # --- who the upgrade's commits are by ---------------------------------------
-    # Not GIT_AUTHOR_NAME/EMAIL: git itself reads those, from every process in the pod.
-    commit_author_name: str = "cluster-upgrade-workflow"
-    commit_author_email: str = "cluster-upgrade-workflow@redbull.local"
+    # Who the upgrade's commits are by is NOT config: activities/git_repo.py's
+    # UPGRADE_AUTHOR, hard-coded like segment-lifecycle's — it identifies the
+    # writer, so it must not vary per environment.
 
     @field_validator("day1_repo_url", "day2_repo_url", "brain_repo_url")
     @classmethod

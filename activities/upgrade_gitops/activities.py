@@ -16,7 +16,10 @@ to one module per dependency:
 Two dependencies are optional, so a lab runs without them: no DAY2_REPO_URL
 means check 4 is skipped, saying so; no BRAIN_REPO_URL means an agent verdict
 stays in the run's history only. Either is logged and noted in the result,
-never an error.
+never an error. Brain is optional at run time too: write_incident ALWAYS
+returns, because the gate's diagnosis waits on it — Brain down, its `main`
+gone, a push rejected on every try or its validator refusing all end in a
+note, never in an error retried forever.
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ from __future__ import annotations
 from temporalio import activity
 
 from activities.upgrade_gitops import brain_repo, day1_repo, day2_repo, registry
+from shared.exceptions import ValuesBranchNotFoundError, ValuesRepoGitError
 from shared.models.cluster_upgrade import (
     Day1ChangeRequest,
     Day1Cluster,
@@ -44,9 +48,10 @@ from shared.settings import UpgradeGitopsActivitySettings
 
 _settings = UpgradeGitopsActivitySettings()
 
-
-def _author() -> day1_repo.GitIdentity:
-    return day1_repo.GitIdentity(name=_settings.commit_author_name, email=_settings.commit_author_email)
+# How many attempts Brain is worth — each one fresh clone, Temporal's retry
+# between them (dispatch.RETRY_POLICY: about 3 s in all) — before a git
+# failure there becomes a note and the verdict stays in the run's history.
+BRAIN_ATTEMPTS = 3
 
 
 @activity.defn
@@ -78,7 +83,7 @@ async def read_day1_cluster(request: Day1ClusterRequest) -> Day1Cluster:
 async def list_release_tags(request: ReleaseTagsRequest) -> ReleaseTags:
     tags = await registry.list_tags(
         layout=request.release,
-        credentials=registry.load_auth_file(_settings.registry_auth_file),
+        auth_file=_settings.registry_auth_file,
         verify=_settings.registry_tls_verify,
     )
     activity.logger.info("%d tags in %s", len(tags.tags), registry.release_repository(request.release))
@@ -123,7 +128,6 @@ async def commit_day1_change(request: Day1ChangeRequest) -> Day1Commit:
         token=_settings.day1_git_token,
         request=request,
         validate_command=_settings.day1_validate_command,
-        author=_author(),
     )
     activity.logger.info(
         "day1 %s %s for %s: %s at %s",
@@ -139,9 +143,24 @@ async def write_incident(request: IncidentRequest) -> IncidentRecord:
         note = "BRAIN_REPO_URL is not set: the agent's verdict is in this run's history only, not in Brain"
         activity.logger.warning("%s (invocation %s)", note, request.invocation_id)
         return IncidentRecord(path="", note=note)
-    record = await brain_repo.write_incident(
-        repo_url=_settings.brain_repo_url, token=_settings.brain_git_token, request=request, author=_author()
-    )
+    try:
+        record = await brain_repo.write_incident(
+            repo_url=_settings.brain_repo_url, token=_settings.brain_git_token, request=request
+        )
+    except ValuesBranchNotFoundError as err:
+        # Deterministic: no retry brings a `main` back.
+        record = IncidentRecord(path="", note=f"Brain was not written: {err}")
+    except ValuesRepoGitError as err:
+        # Unreachable, or a push rejected because main moved: worth a fresh
+        # clone or two (Temporal's retry), not an upgrade's wait. The message
+        # is scrubbed of the token already (git_repo).
+        attempt = activity.info().attempt
+        if attempt < BRAIN_ATTEMPTS:
+            raise
+        record = IncidentRecord(path="", note=f"Brain was not written after {attempt} attempts: {err}")
+    except Exception as err:  # noqa: BLE001 — a bug here must not hold the gate's diagnosis
+        activity.logger.exception("writing the incident for %s failed", request.invocation_id)
+        record = IncidentRecord(path="", note=f"Brain was not written: {type(err).__name__}: {err}")
     if record.note:
         activity.logger.warning("incident not written for %s: %s", request.invocation_id, record.note)
     else:

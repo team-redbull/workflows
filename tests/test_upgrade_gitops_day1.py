@@ -23,6 +23,7 @@ from shared.exceptions import (
     Day1ChangeRejectedError,
     Day1FileChangedError,
     UpgradeRulesInvalidError,
+    ValuesRepoGitError,
 )
 from shared.models.cluster_upgrade import ClusterProfile, Day1ChangeKind, Day1ChangeRequest
 from tests.test_git_repo import SECRET, files_holding, serve_over_https
@@ -33,7 +34,6 @@ PROD = "ocp4-prod-alpha-site1"
 SLIM = "ocp4-lab-beta-site1"
 PROD_PATH = f"sites/{SITE}/mces/{MCE}/hostedClusters/{PROD}.yaml"
 SLIM_PATH = f"sites/{SITE}/mces/{MCE}/hostedClusters/{SLIM}.yaml"
-AUTHOR = day1_repo.GitIdentity(name="cluster-upgrade-workflow", email="cluster-upgrade-workflow@test")
 
 # A production file as stack-export writes them: its own clusterName, zoned
 # NodePools named explicitly, each pinned with its own workertag.
@@ -234,7 +234,7 @@ async def _commit(origin: Path, request: Day1ChangeRequest, *, validate: str = "
     if request.expected_blob == "":
         request = request.model_copy(update={"expected_blob": blob or _blob(origin, request.path)})
     return await day1_repo.commit_change(
-        repo_url=str(origin), token="", request=request, validate_command=validate, author=AUTHOR,
+        repo_url=str(origin), token="", request=request, validate_command=validate,
     )
 
 
@@ -432,7 +432,7 @@ class TestControlPlaneCommits:
         assert _changed_lines(before, after) == (["mastertag: 4.18.56-x86_64"], ["mastertag: 4.19.53-x86_64"])
         message = _git("log", "-1", "--format=%an <%ae>|%s", "main", cwd=origin).strip()
         assert message == (
-            "cluster-upgrade-workflow <cluster-upgrade-workflow@test>|"
+            "cluster-upgrade-workflow <cluster-upgrade-workflow@redbull.local>|"
             f"upgrade({PROD}): control plane 4.18.56 → 4.19.53 [upgrade-cluster-{PROD}]"
         )
 
@@ -491,22 +491,53 @@ class TestControlPlaneCommits:
             await _commit(origin, _request(Day1ChangeKind.CONTROL_PLANE, version="4.19.53",
                                            nodepool_versions={"ghost": "4.18.56"}))
 
-    async def test_a_rejected_push_is_retried_from_a_fresh_clone(self, origin, tmp_path, monkeypatch):
-        """Someone pushes elsewhere in day1 between our clone and our push: the retry lands on top."""
+    async def test_a_rejected_push_fails_the_attempt_and_temporals_retry_lands_on_top(
+        self, origin, tmp_path, monkeypatch
+    ):
+        """Someone pushes elsewhere in day1 between our clone and our push.
+
+        ONE clone per attempt: the rejection is the retryable ValuesRepoGitError,
+        and the retry — a fresh call with the same request — re-clones and lands.
+        """
         real_exec = day1_repo.git_repo.exec_git
+        clones: list[str] = []
         raced: list[bool] = []
 
         async def racing_exec(args, **kwargs):
+            if args[0] == "clone":
+                clones.append(args[-1])
             if args[0] == "push" and not raced:
                 raced.append(True)
                 _edit_by_hand(origin, tmp_path, SLIM_PATH, lambda text: text + "# concurrent\n", name="racer")
             return await real_exec(args, **kwargs)
 
         monkeypatch.setattr(day1_repo.git_repo, "exec_git", racing_exec)
-        commit = await _commit(origin, _request(Day1ChangeKind.CONTROL_PLANE, version="4.19.53"))
-        assert raced and commit.changed
+        request = _request(Day1ChangeKind.CONTROL_PLANE, version="4.19.53", expected_blob=_blob(origin, PROD_PATH))
+        with pytest.raises(ValuesRepoGitError, match="push"):
+            await _commit(origin, request)
+        assert len(clones) == 1
+        assert _git("log", "-1", "--format=%s", "main", cwd=origin).strip() == "a person's edit"
+        commit = await _commit(origin, request)
+        assert commit.changed and len(clones) == 2
         log = _git("log", "--format=%s", "-2", "main", cwd=origin).splitlines()
         assert log[0].startswith(f"upgrade({PROD})") and log[1] == "a person's edit"
+
+    async def test_a_retry_after_a_push_that_landed_is_already_so(self, origin, monkeypatch):
+        """The push landed, the attempt still failed after it (a timeout): the retry pushes nothing."""
+        real_push = day1_repo.git_repo.commit_and_push
+
+        async def push_then_fail(*args, **kwargs):
+            await real_push(*args, **kwargs)
+            raise ValuesRepoGitError("the worker died after the push")
+
+        request = _request(Day1ChangeKind.CONTROL_PLANE, version="4.19.53", expected_blob=_blob(origin, PROD_PATH))
+        monkeypatch.setattr(day1_repo.git_repo, "commit_and_push", push_then_fail)
+        with pytest.raises(ValuesRepoGitError):
+            await _commit(origin, request)
+        landed = _git("rev-parse", "main", cwd=origin).strip()
+        monkeypatch.setattr(day1_repo.git_repo, "commit_and_push", real_push)
+        again = await _commit(origin, request)
+        assert not again.changed and again.revision == landed
 
 
     async def test_day1_code_run_in_the_clone_finds_no_token_and_the_push_still_lands(
@@ -519,7 +550,7 @@ class TestControlPlaneCommits:
         request = _request(Day1ChangeKind.CONTROL_PLANE, version="4.19.53", expected_blob=_blob(origin, PROD_PATH))
         commit = await day1_repo.commit_change(
             repo_url="https://git.test/day1.git", token=SECRET, request=request,
-            validate_command=f"{shlex.quote(sys.executable)} {shlex.quote(str(hunter))} {SECRET}", author=AUTHOR,
+            validate_command=f"{shlex.quote(sys.executable)} {shlex.quote(str(hunter))} {SECRET}",
         )
         assert commit.changed and commit.revision == _git("rev-parse", "main", cwd=origin).strip()
         assert files_holding(origin, SECRET) == []

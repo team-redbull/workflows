@@ -56,8 +56,15 @@ Brain, when wanted: `--set brain.repoUrl=https://github.com/team-redbull/redbull
   that name (`ClusterFileNotFoundError`, `AmbiguousClusterFileError`).
 - A step waits for a person: someone else changed the cluster file (`Day1FileChangedError`), or
   the day1 validator or the line editor refused the change (`Day1ChangeRejectedError`).
-- Retried until it clears, visible on the pending activity: git unreachable or a push rejected
-  three times (`ValuesRepoGitError`), the registry unreachable, a 5xx, or credentials refused on
-  the release repository itself (`ReleaseRegistryError`).
+- Retried until it clears, visible on the pending activity: git unreachable, or a push rejected
+  because `main` moved (`ValuesRepoGitError`; each attempt is one fresh clone, and the retry
+  finds an earlier push that landed already so); the registry unreachable, a 5xx, credentials
+  refused on the release repository itself, or `oc adm release info` failing for any reason but
+  an image the registry says is absent — a timeout, no answer, output that is not JSON
+  (`ReleaseRegistryError`).
 - Reported, never raised: a release tag the registry lacks, a payload image missing or not
-  readable with the auth file (planning's check 2 lists them).
+  readable with the auth file, an image `oc` is told is absent (planning's check 2 lists them).
+- Never holds an upgrade: Brain. `write_incident` always returns; Brain unreachable or a push
+  rejected on 3 attempts, no `main`, its validator refusing the page, timing out, crashing or
+  answering anything but its own exit 0/1 and summary line, or `brain.py index` failing — each
+  ends with nothing pushed and a `note` in the run's result.

@@ -22,9 +22,6 @@ from pathlib import Path
 from activities import git_repo
 from shared.models.cluster_upgrade import Day2LayerGap, Day2Layers
 
-BRANCH = "main"
-_MISSING_MAIN = "the day2 repo has no `main` branch"
-
 
 def cluster_charts(root: Path, cluster: str) -> list[tuple[str, str]]:
     """(sig, chart) for every chart the cluster's day2 Applications render, sorted."""
@@ -61,5 +58,5 @@ def layer_gaps(root: Path, cluster: str, versions: list[str]) -> list[Day2LayerG
 async def check_layers(*, repo_url: str, token: str, cluster: str, versions: list[str]) -> Day2Layers:
     with tempfile.TemporaryDirectory(prefix="day2-layers-") as tmp:
         clone = Path(tmp) / "repo"
-        await git_repo.clone(repo_url=repo_url, branch=BRANCH, token=token, dest=clone, missing_message=_MISSING_MAIN)
+        await git_repo.clone_main(repo_url=repo_url, token=token, dest=clone, repo="day2")
         return Day2Layers(missing=layer_gaps(clone, cluster, versions))

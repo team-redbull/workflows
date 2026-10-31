@@ -18,20 +18,26 @@ Rules this module enforces (CLAUDE.md §5, "Git-subprocess activities"):
     and every error message passes through redact() BEFORE an exception is
     constructed — a git error lands verbatim in Temporal history and the UI.
   * No file of a clone holds the token: clone() points `origin` back at the
-    plain URL the moment the clone exists, and a push goes to the token URL
-    built in memory again (authenticated_url), never to `origin`. The hub
-    limb runs day1's and Brain's own scripts inside their clones, and those
-    scripts must not find a credential in `.git/config`.
+    plain URL the moment the clone exists, and commit_and_push() pushes to the
+    token URL it builds in memory. The hub limb runs day1's and Brain's own
+    scripts inside their clones (run_command), and those scripts must not find
+    a credential in `.git/config`.
   * Every command runs under GIT_COMMAND_TIMEOUT_SECONDS, below the git
-    activities' 180s start_to_close_timeout.
+    activities' 180s start_to_close_timeout, and no child process outlives its
+    call: a timeout or a cancellation kills and reaps it first.
   * A clone first checks its branch with `git ls-remote --exit-code --heads`
     on the FULL ref: exit 2 is the deterministic ValuesBranchNotFoundError,
     anything else the retryable ValuesRepoGitError (unreachable is not missing).
+  * ONE clone per activity attempt: a rejected push raises the retryable
+    ValuesRepoGitError and Temporal's retry re-clones (values_repo.py's rule).
+    No retry loop runs inside an attempt — it could not fit the 180s.
 """
 
 from __future__ import annotations
 
 import asyncio
+import os
+from dataclasses import dataclass
 from pathlib import Path
 
 from shared.exceptions import ValuesBranchNotFoundError, ValuesRepoGitError
@@ -47,6 +53,26 @@ GIT_COMMAND_TIMEOUT_SECONDS = 150.0
 # matching ref — the one answer that means "this branch does not exist".
 _LS_REMOTE_NO_MATCHING_REF = 2
 
+# The cluster-upgrade hub limb's repos (day1, day2, Brain) are read and written
+# at `main` only: Argo CD renders day1's main and nothing else.
+MAIN = "main"
+
+# What a repo's script prints is cut to its last characters in a MESSAGE (it
+# lands in history) — never before the caller has read all of it.
+OUTPUT_TAIL = 2000
+
+
+@dataclass(frozen=True)
+class GitIdentity:
+    name: str
+    email: str
+
+
+# Who the cluster-upgrade hub limb's commits are by, in day1 and Brain.
+# Hard-coded, not configured, like values_repo.GIT_USER_NAME: it identifies the
+# writer, so it must not vary per environment.
+UPGRADE_AUTHOR = GitIdentity(name="cluster-upgrade-workflow", email="cluster-upgrade-workflow@redbull.local")
+
 
 def redact(text: str, secrets: list[str]) -> str:
     for secret in secrets:
@@ -55,12 +81,44 @@ def redact(text: str, secrets: list[str]) -> str:
     return text
 
 
+def tail(text: str) -> str:
+    """The last OUTPUT_TAIL characters of a script's output, for a message."""
+    return text[-OUTPUT_TAIL:]
+
+
 def authenticated_url(repo_url: str, token: str) -> str:
     """Inject the token into an https clone URL; anything else (a local path
     in tests, ssh) passes through untouched."""
     if token and repo_url.startswith("https://"):
         return "https://x-access-token:" + token + "@" + repo_url.removeprefix("https://")
     return repo_url
+
+
+async def _stop(process: asyncio.subprocess.Process) -> None:
+    """Kill the child if it still runs, and reap it."""
+    if process.returncode is None:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+    await process.wait()
+
+
+async def _communicate(process: asyncio.subprocess.Process, timeout: float) -> tuple[bytes, bytes] | None:
+    """(stdout, stderr), or None when `timeout` passed first.
+
+    The child never outlives the call: on a timeout, or on a cancellation
+    (a worker shutting down, a sibling task failing), it is killed and reaped
+    before this returns or re-raises.
+    """
+    try:
+        return await asyncio.wait_for(process.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        await _stop(process)
+        return None
+    except asyncio.CancelledError:
+        await _stop(process)
+        raise
 
 
 async def exec_git(
@@ -85,17 +143,13 @@ async def exec_git(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    try:
-        stdout, stderr = await asyncio.wait_for(
-            process.communicate(), timeout=GIT_COMMAND_TIMEOUT_SECONDS
-        )
-    except asyncio.TimeoutError:
-        process.kill()
-        await process.wait()
+    output = await _communicate(process, GIT_COMMAND_TIMEOUT_SECONDS)
+    if output is None:
         raise ValuesRepoGitError(
             f"git {redact(' '.join(args), secrets)} timed out after "
             f"{GIT_COMMAND_TIMEOUT_SECONDS:.0f}s"
-        ) from None
+        )
+    stdout, stderr = output
     return (
         process.returncode,
         stdout.decode(errors="replace"),
@@ -158,7 +212,8 @@ async def clone(
     ValuesBranchNotFoundError and the clone never sees an unchecked branch.
     Then `origin` is set back to the plain URL: git stores the URL a clone was
     given in `.git/config`, and a repo's own script run in the clone afterwards
-    must not read the token there. A push names authenticated_url() itself."""
+    must not read the token there. Pushes go through commit_and_push(), which
+    builds the token URL in memory again."""
     await require_branch(
         repo_url=repo_url, branch=branch, token=token, missing_message=missing_message
     )
@@ -177,3 +232,73 @@ async def clone(
         secrets=[token],
     )
     await run_git(["remote", "set-url", "origin", repo_url], cwd=dest, secrets=[token])
+
+
+async def clone_main(*, repo_url: str, token: str, dest: Path, repo: str) -> None:
+    """clone() of `main`, the one branch the hub limb's repos are worked on; `repo` names the repo in its error."""
+    await clone(
+        repo_url=repo_url, branch=MAIN, token=token, dest=dest,
+        missing_message=f"the {repo} repo has no `{MAIN}` branch",
+    )
+
+
+async def commit_and_push(
+    clone_dir: Path,
+    *,
+    repo_url: str,
+    token: str,
+    branch: str,
+    paths: list[str],
+    message: str,
+    author: GitIdentity,
+) -> str:
+    """Add `paths`, commit them as `author`, push HEAD to `branch`; the new commit's sha.
+
+    Pushed to the token URL built here, in memory — never to `origin`, whose
+    URL clone() left without the token — and never forced. A rejected push
+    (the branch moved since the clone) raises the retryable ValuesRepoGitError,
+    its message scrubbed like every other: Temporal's retry re-clones, and the
+    caller's "already so" check, made before anything else, lets it converge.
+    """
+    secrets = [token]
+    await run_git(["add", "--", *paths], cwd=clone_dir, secrets=secrets)
+    await run_git(
+        ["-c", f"user.name={author.name}", "-c", f"user.email={author.email}", "commit", "-m", message],
+        cwd=clone_dir,
+        secrets=secrets,
+    )
+    await run_git(
+        ["push", authenticated_url(repo_url, token), f"HEAD:refs/heads/{branch}"],
+        cwd=clone_dir,
+        secrets=secrets,
+    )
+    return (await run_git(["rev-parse", "HEAD"], cwd=clone_dir, secrets=secrets)).strip()
+
+
+async def run_command(argv: list[str], *, cwd: Path, secrets: list[str], timeout: float) -> tuple[int, str]:
+    """Run a repo's own script in its clone: (exit code, ALL its output, scrubbed).
+
+    No shell. 124 is a timeout and 127 a script that could not start, each
+    with a line saying so. The whole output comes back, so a caller judging
+    it reads every line; cut it with tail() only to put it in a message.
+
+    The child gets no `*_TOKEN` variable from this worker's environment, and
+    no file of the clone holds a token (clone()). What this does NOT close:
+    the script runs as this pod's UID, so it can still read /proc/1/environ —
+    the worker's own environment, every token in it — and the mounted
+    registry auth file. That cannot be fixed inside this pod: day1's and
+    Brain's validator scripts run with this pod's credentials, and moving them
+    to a separate Job (no Secret mounted, the clone handed over as data) is
+    the fix.
+    """
+    env = {key: value for key, value in os.environ.items() if not key.upper().endswith("_TOKEN")}
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *argv, cwd=cwd, env=env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+        )
+    except OSError as err:
+        return 127, redact(f"{argv[0]}: {err}", secrets)
+    output = await _communicate(process, timeout)
+    if output is None:
+        return 124, redact(f"{' '.join(argv)} timed out after {timeout:.0f}s", secrets)
+    return process.returncode or 0, redact(output[0].decode(errors="replace").strip(), secrets)

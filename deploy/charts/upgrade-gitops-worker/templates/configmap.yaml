@@ -25,5 +25,3 @@ data:
   REGISTRY_AUTH_FILE: /etc/registry-auth/auth.json
   {{- end }}
   REGISTRY_TLS_VERIFY: {{ .Values.registry.tlsVerify | quote }}
-  COMMIT_AUTHOR_NAME: {{ .Values.commitAuthor.name | quote }}
-  COMMIT_AUTHOR_EMAIL: {{ .Values.commitAuthor.email | quote }}

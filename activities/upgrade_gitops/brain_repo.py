@@ -11,8 +11,15 @@ before the page exists, and the page links nowhere and leaves no placeholder.
 One page per invocation: its file name ends in a hash of the invocation id,
 so a retry after a push that landed finds the page and writes nothing.
 `scripts/brain.py validate` judges the page and `brain.py index` regenerates
-INDEX.md (never edited by hand). A page Brain's validator refuses is not
-pushed: the run gets a note instead, because an upgrade never waits on Brain.
+INDEX.md (never edited by hand). FAIL-CLOSED: the page is pushed only when
+the validator answered (exit 0 or 1, with its summary line) and no line of
+that answer names the page, and the index was regenerated. Anything else —
+refused, a timeout, a crash, a failed index, no brain.py — is not pushed, and
+the run gets a note instead, because an upgrade never waits on Brain.
+
+ONE clone per call: a rejected push raises the retryable ValuesRepoGitError
+(git_repo.commit_and_push); the activity decides how often Brain is worth a
+fresh clone before the verdict stays in the run's history only.
 
 Plain parameters, no settings and no Temporal (CLAUDE.md §1).
 """
@@ -27,15 +34,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from activities import git_repo
-from activities.upgrade_gitops.day1_repo import GitIdentity, run_command
-from shared.exceptions import ValuesRepoGitError
 from shared.models.cluster_upgrade import IncidentRecord, IncidentRequest
 
-BRANCH = "main"
-_MISSING_MAIN = "the Brain repo has no `main` branch"
-PUSH_ATTEMPTS = 3
 VALIDATE_TIMEOUT_SECONDS = 60.0
 _BRAIN = "scripts/brain.py"
+# brain.py validate's last line, printed whenever it ran to the end:
+# "<n> pages checked — <e> errors, <w> warnings" (exit 1 if errors, else 0).
+_VALIDATE_SUMMARY = re.compile(r"\d+ pages checked\b")
 _AREA = "hypershift"
 
 # Brain CI's leak rules (scripts/ci_checks.py), applied before Brain sees the text.
@@ -190,57 +195,70 @@ def _existing(clone: Path, request: IncidentRequest) -> str | None:
     return str(matches[0].relative_to(clone)) if matches else None
 
 
-async def _validator_refuses(clone: Path, relative: str, token: str) -> str | None:
-    """What brain.py validate says about OUR page, or None; problems elsewhere are not ours to fix."""
+async def _why_not_pushed(clone: Path, relative: str, token: str) -> str | None:
+    """Why the page must not be pushed, or None when brain.py validate passed it.
+
+    Fail-closed: only the validator's own answer — exit 0 or 1, ending in its
+    summary line — can let the page through, and every line of it is read
+    (run_command returns the whole output). An error or warning line naming
+    OUR page refuses it; problems on other pages are not ours to fix. A
+    timeout (124), a script that cannot start (127), a crash or any other exit
+    is no answer, and no answer is not a pass.
+    """
     if not (clone / _BRAIN).is_file():
-        return None
-    _, output = await run_command(
+        return f"Brain main has no {_BRAIN} to validate the incident page with, not pushed"
+    code, output = await git_repo.run_command(
         [sys.executable, _BRAIN, "validate"], cwd=clone, secrets=[token], timeout=VALIDATE_TIMEOUT_SECONDS
     )
+    if code not in (0, 1) or not _VALIDATE_SUMMARY.search(output):
+        return f"Brain's validator did not answer (exit {code}), the incident page was not pushed: {git_repo.tail(output)}"
     ours = [line for line in output.splitlines() if relative in line and line.lstrip().lower().startswith(("error", "warning"))]
-    return "; ".join(ours) or None
+    if ours:
+        return f"Brain's validator refused the incident page, not pushed: {git_repo.tail('; '.join(ours))}"
+    return None
 
 
 async def write_incident(
-    *, repo_url: str, token: str, request: IncidentRequest, author: GitIdentity, now: datetime | None = None
+    *, repo_url: str, token: str, request: IncidentRequest, now: datetime | None = None
 ) -> IncidentRecord:
-    """Commit the page to Brain main and push, retried from a fresh clone; never forced."""
+    """Commit the page to Brain main and push, from ONE fresh clone, as git_repo.UPGRADE_AUTHOR; never forced.
+
+    A rejected push raises the retryable ValuesRepoGitError: the retry
+    re-clones and finds the page if that push landed after all.
+    """
     when = now or datetime.now(UTC)
     page = render(request, when)
-    for attempt in range(1, PUSH_ATTEMPTS + 1):
-        with tempfile.TemporaryDirectory(prefix="brain-incident-") as tmp:
-            clone = Path(tmp) / "repo"
-            await git_repo.clone(repo_url=repo_url, branch=BRANCH, token=token, dest=clone, missing_message=_MISSING_MAIN)
-            existing = _existing(clone, request)
-            if existing is not None:
-                return IncidentRecord(path=existing)
-            relative = incident_path(request, when)
-            target = clone / relative
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(page, encoding="utf-8")
-            refused = await _validator_refuses(clone, relative, token)
-            if refused is not None:
-                return IncidentRecord(path="", note=f"Brain's validator refused the incident page, not pushed: {refused}")
-            paths = [relative]
-            if (clone / _BRAIN).is_file():
-                code, output = await run_command(
-                    [sys.executable, _BRAIN, "index"], cwd=clone, secrets=[token], timeout=VALIDATE_TIMEOUT_SECONDS
-                )
-                if code == 0:
-                    paths.append("INDEX.md")
-            secrets = [token]
-            await git_repo.run_git(["add", *paths], cwd=clone, secrets=secrets)
-            subject = _one_line(scrub(f"incident({_AREA}): upgrade agent {request.verdict.verdict} at {request.phase}", request))
-            await git_repo.run_git(
-                ["-c", f"user.name={author.name}", "-c", f"user.email={author.email}", "commit", "-m", subject],
-                cwd=clone, secrets=secrets,
+    with tempfile.TemporaryDirectory(prefix="brain-incident-") as tmp:
+        clone = Path(tmp) / "repo"
+        await git_repo.clone_main(repo_url=repo_url, token=token, dest=clone, repo="Brain")
+        existing = _existing(clone, request)
+        if existing is not None:
+            return IncidentRecord(path=existing)
+        relative = incident_path(request, when)
+        target = clone / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(page, encoding="utf-8")
+        refused = await _why_not_pushed(clone, relative, token)
+        if refused is not None:
+            return IncidentRecord(path="", note=refused)
+        code, output = await git_repo.run_command(
+            [sys.executable, _BRAIN, "index"], cwd=clone, secrets=[token], timeout=VALIDATE_TIMEOUT_SECONDS
+        )
+        if code != 0:
+            # INDEX.md is generated, never hand-edited: a page pushed without
+            # it would leave Brain's own CI failing on a stale index.
+            return IncidentRecord(
+                path="",
+                note=f"{_BRAIN} index failed (exit {code}), the incident page was not pushed: {git_repo.tail(output)}",
             )
-            # To the token URL, never `origin`: the clone's config holds no token.
-            code, _, stderr = await git_repo.exec_git(
-                ["push", git_repo.authenticated_url(repo_url, token), f"HEAD:{BRANCH}"], cwd=clone, secrets=secrets
-            )
-            if code == 0:
-                return IncidentRecord(path=relative)
-            if attempt == PUSH_ATTEMPTS:
-                raise ValuesRepoGitError(f"git push to Brain main was rejected {PUSH_ATTEMPTS} times (exit {code}): {stderr}")
-    raise AssertionError("unreachable")  # pragma: no cover
+        subject = _one_line(scrub(f"incident({_AREA}): upgrade agent {request.verdict.verdict} at {request.phase}", request))
+        await git_repo.commit_and_push(
+            clone,
+            repo_url=repo_url,
+            token=token,
+            branch=git_repo.MAIN,
+            paths=[relative, "INDEX.md"],
+            message=subject,
+            author=git_repo.UPGRADE_AUTHOR,
+        )
+        return IncidentRecord(path=relative)

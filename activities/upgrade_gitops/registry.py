@@ -24,10 +24,12 @@ outlive the call that fetched them (CLAUDE.md §5).
     names it, which an air gap cannot reach.
 
 Absent is reported, never raised (PinnedReleases.missing / .problems). What
-cannot be read at all — the registry unreachable, a 5xx, a 429, or credentials
-refused on the release repository itself — raises the retryable
-ReleaseRegistryError, so a run waits out an outage or a credential fix
-instead of reading it as "not mirrored".
+cannot be read at all — the registry unreachable, a 5xx, a 429, credentials
+refused on the release repository itself, or `oc` failing for any reason but
+an absent image (oc_release.py) — raises the retryable ReleaseRegistryError,
+so a run waits out an outage or a credential fix instead of reading it as
+"not mirrored". The first such failure cancels the plan's other work in
+flight (asyncio.TaskGroup, never gather), so no oc process outlives it.
 """
 
 from __future__ import annotations
@@ -37,6 +39,7 @@ import base64
 import binascii
 import hashlib
 import json
+import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -64,6 +67,12 @@ _PAGE_SIZE = 100
 # How many releases are pinned at once, and how many payload HEADs fly at once.
 _RELEASES_AT_ONCE = 3
 _HEADS_AT_ONCE = 16
+# The whole plan's budget: the registry activities' start_to_close_timeout,
+# dispatch.REGISTRY_TIMEOUT (a test keeps the two equal).
+REGISTRY_BUDGET_SECONDS = 600.0
+# oc may use at most this share of it, over the rounds of oc that run one
+# after another (_RELEASES_AT_ONCE at a time); the HEADs keep the rest.
+_OC_SHARE = 0.5
 # How many digests a problem line names before "…".
 _EXAMPLES = 3
 _CHALLENGE_PARAM = re.compile(r'(\w+)="([^"]*)"')
@@ -250,9 +259,9 @@ def cpo_repository(layout: ReleaseLayout) -> Repository | None:
     return None if name is None else Repository.parse(name)
 
 
-async def list_tags(*, layout: ReleaseLayout, credentials: dict[str, tuple[str, str]], verify: bool) -> ReleaseTags:
+async def list_tags(*, layout: ReleaseLayout, auth_file: str, verify: bool) -> ReleaseTags:
     repository = release_repository(layout)
-    async with RegistryClient(credentials=credentials, verify=verify) as client:
+    async with RegistryClient(credentials=load_auth_file(auth_file), verify=verify) as client:
         try:
             return ReleaseTags(tags=await client.tags(repository))
         except RegistryDeniedError:
@@ -264,6 +273,35 @@ def _denied(repository: Repository) -> ReleaseRegistryError:
         f"{repository} refused the configured credentials: check the repository name and that "
         "REGISTRY_AUTH_FILE holds a credential for it"
     )
+
+
+def oc_timeout(versions: int) -> float:
+    """How long each `oc adm release info` of a plan pinning `versions` releases may take.
+
+    ceil(versions / _RELEASES_AT_ONCE) rounds of oc run one after another, so
+    oc can never take more than _OC_SHARE of REGISTRY_BUDGET_SECONDS, however
+    long the plan.
+    """
+    rounds = max(1, math.ceil(versions / _RELEASES_AT_ONCE))
+    return min(oc_release.OC_TIMEOUT_SECONDS, REGISTRY_BUDGET_SECONDS * _OC_SHARE / rounds)
+
+
+async def _each(coroutines) -> list:
+    """Await every coroutine, results in order; the first failure CANCELS the rest.
+
+    asyncio.gather would leave the others running — an oc process each — past
+    the failure. The failure is raised as itself, not as the TaskGroup's
+    ExceptionGroup, so Temporal records its type (ReleaseRegistryError).
+    """
+    try:
+        async with asyncio.TaskGroup() as group:
+            tasks = [group.create_task(coroutine) for coroutine in coroutines]
+    except BaseExceptionGroup as failed:
+        error: BaseException = failed
+        while isinstance(error, BaseExceptionGroup):
+            error = error.exceptions[0]
+        raise error from None
+    return [task.result() for task in tasks]
 
 
 async def pin_releases(
@@ -279,15 +317,17 @@ async def pin_releases(
     result = PinnedReleases()
     heads = asyncio.Semaphore(_HEADS_AT_ONCE)
     releases = asyncio.Semaphore(_RELEASES_AT_ONCE)
+    timeout = oc_timeout(len(versions))
     async with RegistryClient(credentials=credentials, verify=verify) as client:
 
         async def pin(version: str) -> tuple[PinnedRelease | None, list[str], bool]:
             async with releases:
                 return await _pin_one(
-                    client, version, layout, heads=heads, auth_file=auth_file, verify=verify, release_info=release_info
+                    client, version, layout, heads=heads, auth_file=auth_file, verify=verify,
+                    release_info=release_info, oc_seconds=timeout,
                 )
 
-        outcomes = await asyncio.gather(*(pin(version) for version in versions))
+        outcomes = await _each(pin(version) for version in versions)
     for version, (pinned, problems, missing) in zip(versions, outcomes):
         if pinned is not None:
             result.pinned[version] = pinned
@@ -306,6 +346,7 @@ async def _pin_one(
     auth_file: str,
     verify: bool,
     release_info,
+    oc_seconds: float,
 ) -> tuple[PinnedRelease | None, list[str], bool]:
     """(the pin or None, problem lines, whether a tag is missing) for one release."""
     repository = release_repository(layout)
@@ -328,7 +369,7 @@ async def _pin_one(
             return None, [f"{version}: the control-plane-operator image {operator}:{operator_tag} is missing"], True
     problems = await _payload_problems(
         client, version, f"{repository}@{release_digest}", layout,
-        heads=heads, auth_file=auth_file, verify=verify, release_info=release_info,
+        heads=heads, auth_file=auth_file, verify=verify, release_info=release_info, oc_seconds=oc_seconds,
     )
     return PinnedRelease(release=release_digest, control_plane_operator=operator_digest), problems, False
 
@@ -343,10 +384,13 @@ async def _payload_problems(
     auth_file: str,
     verify: bool,
     release_info,
+    oc_seconds: float,
 ) -> list[str]:
     try:
-        references = await release_info(pullspec, auth_file=auth_file, verify=verify)
+        references = await release_info(pullspec, auth_file=auth_file, verify=verify, timeout=oc_seconds)
     except oc_release.ReleaseInfoError as err:
+        # Only an image the registry says is absent; any other oc failure is
+        # the ReleaseRegistryError that propagates, retried.
         return [f"{version}: oc adm release info {pullspec} failed: {err}"]
     mirrors = [repo for repo in (release_repository(layout), cpo_repository(layout)) if repo is not None]
 
@@ -365,7 +409,7 @@ async def _payload_problems(
         return "denied" if denied else "missing"
 
     unique = sorted(set(references))
-    states = await asyncio.gather(*(check(reference) for reference in unique))
+    states = await _each(check(reference) for reference in unique)
     by_state: dict[str, list[str]] = {}
     for reference, state in zip(unique, states):
         by_state.setdefault(state, []).append(reference)

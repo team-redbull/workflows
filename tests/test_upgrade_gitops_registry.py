@@ -11,8 +11,10 @@ No network.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
+import math
 import os
 import stat
 import sys
@@ -123,11 +125,13 @@ def _auth_file(tmp_path: Path, host: str = QUAY) -> str:
 
 
 def _payload(*digests: str):
-    async def release_info(pullspec: str, *, auth_file: str, verify: bool) -> list[str]:
+    async def release_info(pullspec: str, *, auth_file: str, verify: bool, timeout: float) -> list[str]:
         release_info.calls.append(pullspec)
+        release_info.timeouts.append(timeout)
         return [f"{QUAY}/{PAYLOAD_REPO}@{digest}" for digest in digests]
 
     release_info.calls = []
+    release_info.timeouts = []
     return release_info
 
 
@@ -135,29 +139,29 @@ class TestTags:
     async def test_every_page_is_followed(self, quay):
         for minor in range(150):
             quay.add(RELEASE_REPO, f"4.{minor // 10}.{minor}-x86_64", _digest(f"r{minor}"))
-        tags = await registry.list_tags(layout=PUBLIC, credentials={}, verify=True)
+        tags = await registry.list_tags(layout=PUBLIC, auth_file="", verify=True)
         assert len(tags.tags) == 150 and len(quay.requests) == 2
         assert "last=" in str(quay.requests[1].url)
 
     async def test_a_repository_that_does_not_exist_has_no_tags(self, quay):
-        assert (await registry.list_tags(layout=PUBLIC, credentials={}, verify=True)).tags == []
+        assert (await registry.list_tags(layout=PUBLIC, auth_file="", verify=True)).tags == []
 
     async def test_an_outage_is_retryable_not_an_empty_mirror(self, quay):
         quay.down.add(RELEASE_REPO)
         with pytest.raises(ReleaseRegistryError, match="503"):
-            await registry.list_tags(layout=PUBLIC, credentials={}, verify=True)
+            await registry.list_tags(layout=PUBLIC, auth_file="", verify=True)
 
     async def test_refused_credentials_on_the_release_repository_are_retryable(self, quay):
         quay.private.add(RELEASE_REPO)
         quay.add(RELEASE_REPO, "4.20.35-x86_64", _digest("r"))
         with pytest.raises(ReleaseRegistryError, match="REGISTRY_AUTH_FILE"):
-            await registry.list_tags(layout=PUBLIC, credentials={}, verify=True)
+            await registry.list_tags(layout=PUBLIC, auth_file="", verify=True)
 
     async def test_a_private_repository_is_read_with_the_auth_files_credential(self, quay, tmp_path):
         quay.private.add(RELEASE_REPO)
         quay.add(RELEASE_REPO, "4.20.35-x86_64", _digest("r"))
         tags = await registry.list_tags(
-            layout=PUBLIC, credentials=registry.load_auth_file(_auth_file(tmp_path)), verify=True
+            layout=PUBLIC, auth_file=_auth_file(tmp_path), verify=True
         )
         assert tags.tags == ["4.20.35-x86_64"]
         assert quay.token_requests[0].url.params["service"] == QUAY
@@ -223,7 +227,7 @@ class TestPinning:
     async def test_oc_failing_is_reported_as_the_releases_problem(self, quay):
         quay.add(RELEASE_REPO, "4.20.35-x86_64", _digest("r"))
 
-        async def broken(pullspec: str, *, auth_file: str, verify: bool) -> list[str]:
+        async def broken(pullspec: str, *, auth_file: str, verify: bool, timeout: float) -> list[str]:
             raise oc_release.ReleaseInfoError("error: unable to read image: manifest unknown")
 
         pinned = await registry.pin_releases(versions=["4.20.35"], layout=PUBLIC, auth_file="", verify=True,
@@ -259,6 +263,59 @@ class TestPinning:
         with pytest.raises(ReleaseRegistryError, match="503"):
             await registry.pin_releases(versions=["4.20.35"], layout=PUBLIC, auth_file="", verify=True,
                                         release_info=_payload(_digest("p1")))
+
+    async def test_oc_failing_for_want_of_an_answer_is_retried_not_a_payload_problem(self, quay):
+        quay.add(RELEASE_REPO, "4.20.35-x86_64", _digest("r"))
+
+        async def unreachable(pullspec: str, *, auth_file: str, verify: bool, timeout: float) -> list[str]:
+            raise ReleaseRegistryError("oc adm release info failed: dial tcp: connection refused")
+
+        with pytest.raises(ReleaseRegistryError, match="connection refused"):
+            await registry.pin_releases(versions=["4.20.35"], layout=PUBLIC, auth_file="", verify=True,
+                                        release_info=unreachable)
+
+    async def test_the_first_failure_cancels_the_other_releases_in_flight(self, quay):
+        """gather would leave the second oc running past the failure; the TaskGroup cancels it."""
+        for version in ("4.20.35", "4.21.40"):
+            quay.add(RELEASE_REPO, f"{version}-x86_64", _digest(f"r{version}"))
+        cancelled: list[str] = []
+
+        async def one_fails_one_hangs(pullspec: str, *, auth_file: str, verify: bool, timeout: float) -> list[str]:
+            if _digest("r4.20.35") in pullspec:
+                await asyncio.sleep(0.05)
+                raise ReleaseRegistryError("the registry answered 503")
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.append(pullspec)
+                raise
+            return []
+
+        with pytest.raises(ReleaseRegistryError, match="503"):
+            await registry.pin_releases(versions=["4.20.35", "4.21.40"], layout=PUBLIC, auth_file="", verify=True,
+                                        release_info=one_fails_one_hangs)
+        assert cancelled == [f"{QUAY}/{RELEASE_REPO}@{_digest('r4.21.40')}"]
+
+    async def test_each_oc_call_gets_the_budgets_share(self, quay):
+        versions = [f"4.{minor}.1" for minor in range(14, 24)]  # ten releases: four rounds of oc
+        for version in versions:
+            quay.add(RELEASE_REPO, f"{version}-x86_64", _digest(f"r{version}"))
+        info = _payload()
+        await registry.pin_releases(versions=versions, layout=PUBLIC, auth_file="", verify=True, release_info=info)
+        assert info.timeouts == [registry.oc_timeout(10)] * 10 and registry.oc_timeout(10) == 75.0
+
+
+class TestTheOcBudget:
+    def test_oc_never_takes_more_than_half_the_plans_budget(self):
+        for versions in range(1, 40):
+            rounds = math.ceil(versions / registry._RELEASES_AT_ONCE)
+            assert registry.oc_timeout(versions) * rounds <= registry.REGISTRY_BUDGET_SECONDS / 2
+        assert registry.oc_timeout(1) == registry.oc_timeout(6) == oc_release.OC_TIMEOUT_SECONDS
+
+    def test_the_budget_is_the_activities_timeout(self):
+        from workflow_domains.cluster_upgrade import dispatch
+
+        assert registry.REGISTRY_BUDGET_SECONDS == dispatch.REGISTRY_TIMEOUT.total_seconds()
 
 
 class TestPlumbing:
@@ -333,9 +390,70 @@ class TestOc:
             "--registry-config", "/etc/registry-auth/auth.json", "--insecure=true",
         ]
 
-    async def test_oc_is_retried_then_its_error_reported(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(oc_release, "_BACKOFF_SECONDS", 0.0)
-        log = self._fake_oc(tmp_path, monkeypatch, "sys.stderr.write('error: manifest unknown\\n'); sys.exit(1)\n")
-        with pytest.raises(oc_release.ReleaseInfoError, match="manifest unknown"):
+    @pytest.mark.parametrize("stderr", [
+        "error: unable to read image quay.io/x/y@sha256:aa: manifest unknown: manifest unknown",
+        "error: image does not exist or you don't have permission: name unknown: repository not found",
+    ])
+    async def test_an_image_the_registry_says_is_absent_is_reported_after_one_call(self, tmp_path, monkeypatch, stderr):
+        log = self._fake_oc(tmp_path, monkeypatch, f"sys.stderr.write({stderr!r}); sys.exit(1)\n")
+        with pytest.raises(oc_release.ReleaseInfoError, match="unknown"):
             await oc_release.release_references("quay.io/x/y@sha256:aa", auth_file="", verify=True)
-        assert len(log.read_text().splitlines()) == oc_release.ATTEMPTS
+        assert len(log.read_text().splitlines()) == 1
+
+    @pytest.mark.parametrize("stderr", [
+        'error: unable to read image: Get "https://mirror.test/v2/": dial tcp 10.0.0.1:443: connect: connection refused',
+        "error: unable to read image: received unexpected HTTP status: 503 Service Unavailable",
+        "error: unable to read image: unauthorized: access to the requested resource is not authorized",
+        "error: unable to read image: unauthorized: authentication required; repository not found",
+        'error: unable to read image: Get "https://mirror.test/v2/": net/http: TLS handshake timeout',
+        "error: unable to read image: x509: certificate signed by unknown authority",
+        "panic: something no one has seen before",
+    ])
+    async def test_oc_failing_without_an_answer_is_the_retryable_registry_error(self, tmp_path, monkeypatch, stderr):
+        log = self._fake_oc(tmp_path, monkeypatch, f"sys.stderr.write({stderr!r}); sys.exit(1)\n")
+        with pytest.raises(ReleaseRegistryError):
+            await oc_release.release_references("quay.io/x/y@sha256:aa", auth_file="", verify=True)
+        assert len(log.read_text().splitlines()) == 1
+
+    async def test_output_that_is_not_json_is_retryable(self, tmp_path, monkeypatch):
+        self._fake_oc(tmp_path, monkeypatch, "print('Warning: something odd'); print('[]')\n")
+        with pytest.raises(ReleaseRegistryError, match="not its JSON"):
+            await oc_release.release_references("quay.io/x/y@sha256:aa", auth_file="", verify=True)
+
+    async def test_no_oc_in_the_image_is_retryable(self, tmp_path, monkeypatch):
+        (tmp_path / "empty").mkdir()
+        monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+        with pytest.raises(ReleaseRegistryError, match="cannot run oc"):
+            await oc_release.release_references("quay.io/x/y@sha256:aa", auth_file="", verify=True)
+
+    async def test_a_timeout_is_retryable_and_kills_oc(self, tmp_path, monkeypatch):
+        pid_file = tmp_path / "oc.pid"
+        self._fake_oc(tmp_path, monkeypatch, _PID_AND_SLEEP.format(pid_file=str(pid_file)))
+        with pytest.raises(ReleaseRegistryError, match="timed out after 1s"):
+            await oc_release.release_references("quay.io/x/y@sha256:aa", auth_file="", verify=True, timeout=1.0)
+        assert not _alive(int(pid_file.read_text()))
+
+    async def test_a_cancelled_call_kills_oc(self, tmp_path, monkeypatch):
+        """A sibling's failure or a worker shutdown cancels the call: oc must not live on as an orphan."""
+        pid_file = tmp_path / "oc.pid"
+        self._fake_oc(tmp_path, monkeypatch, _PID_AND_SLEEP.format(pid_file=str(pid_file)))
+        task = asyncio.create_task(oc_release.release_references("quay.io/x/y@sha256:aa", auth_file="", verify=True))
+        for _ in range(200):
+            if pid_file.exists() and pid_file.read_text():
+                break
+            await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert not _alive(int(pid_file.read_text()))
+
+
+_PID_AND_SLEEP = "import time\nopen({pid_file!r}, 'w').write(str(os.getpid()))\ntime.sleep(60)\n"
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True

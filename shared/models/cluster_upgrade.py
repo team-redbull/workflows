@@ -271,6 +271,10 @@ class PendingAction(BaseModel):
     decided_by: str | None = None
     executed: bool = False
     result: str | None = None
+    # The agent invocation that proposed it: action ids repeat across
+    # invocations ("1", "act-pruner"), so it is what makes a re-run's Job name
+    # this approval's own. None in runs recorded before it.
+    invocation_id: str | None = None
 
 
 class UpgradeClusterResumeState(BaseModel):
@@ -869,6 +873,9 @@ class ProposedActionRequest(BaseModel):
     approved_by: str
     hosted_cluster: str | None = None  # as on HostedClusterRequest
     hosted_cluster_namespace: str | None = None
+    # PendingAction.invocation_id: goes into a re-run Job's name. None from a
+    # brain that predates it, and the limb then names the Job as before.
+    invocation_id: str | None = None
 
 
 class ActionResult(BaseModel):
@@ -993,6 +1000,7 @@ class UpgradeControlPlaneResult(BaseModel):
     verdict: AgentVerdict | None = None
     incident_path: str | None = None
     failing_checks: list[CheckResult] = Field(default_factory=list)
+    invocation_id: str | None = None  # the agent invocation behind `verdict`; None before it
 
 
 class UpgradeControlPlaneProgress(BaseModel):
@@ -1007,20 +1015,3 @@ class UpgradeControlPlaneProgress(BaseModel):
 # now, at import, rather than on first use inside a workflow task.
 for _model in (PendingAction, UpgradeClusterProgress, IncidentRequest, ProposedActionRequest):
     _model.model_rebuild()
-
-
-def __getattr__(name: str) -> object:
-    """TEMPORARY: `AdminGateReview` moved to workflow_domains/cluster_upgrade/gates.py.
-
-    It is brain-only — never an activity's argument or result, nor a query's
-    payload — so it is not part of this contract. This keeps the old
-    `from shared.models.cluster_upgrade import AdminGateReview` in
-    upgrade_cluster.py working until that file imports it from gates; delete it
-    then. Resolved lazily, on that one name only, so shared/ imports no workflow
-    code at import time (gates imports this module).
-    """
-    if name == "AdminGateReview":
-        from workflow_domains.cluster_upgrade.gates import AdminGateReview
-
-        return AdminGateReview
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

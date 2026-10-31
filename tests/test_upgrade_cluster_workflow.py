@@ -643,6 +643,9 @@ class TestGatesAndTheAgent:
         assert result.outcome is UpgradeOutcome.DONE
         (executed,) = fleet.actions
         assert executed.approved_by == "alice" and executed.action.target == "openshift-monitoring/prom-0"
+        # The invocation that proposed it travels with it: a re-run Job's name is this approval's own.
+        assert executed.invocation_id is not None
+        assert executed.invocation_id == fleet.agent_requests[0].invocation_id
         assert [c for c in fleet.calls if c.startswith("gate:")] == ["gate:np-a", "gate:np-a"]
 
     async def _until_a_proposal_waits(self, h: Harness, fleet: Fleet) -> None:
@@ -757,10 +760,11 @@ class TestGatesAndTheAgent:
         assert fleet.commit_summary() == ["control-plane::4.19.53", "pause"]
         assert [c for c in fleet.calls if c.startswith("watch-cp")] == ["watch-cp:4.19.53"] * 2
         assert len(fleet.agent_requests) == 1
-        # The child's verdict and its incident reach the parent's log; its commit, once.
-        assert [e.detail for e in result.log if e.event == "agent"] == [
-            "retry_gate: a pruner pod was stuck (incidents/2026-11-01-hypershift-stall-1.md)"
-        ]
+        # The child's verdict, its incident and its invocation reach the parent's log; its commit, once.
+        [agent_line] = [e.detail for e in result.log if e.event == "agent"]
+        assert agent_line.startswith(
+            "retry_gate: a pruner pod was stuck (incidents/2026-11-01-hypershift-stall-1.md) [invocation "
+        )
         assert [e.detail for e in result.log if e.event == "commit-control-plane"] == ["rev-2 4.19.53"]
 
     async def test_an_agent_that_cannot_be_reached_is_a_person_s_call_not_a_failure(self):
@@ -1269,6 +1273,24 @@ class TestAFailedPreflightGoesToTheAgentFirst:
             await h.decide(Run.abort, HumanDecision(by="alice", reason="end of test"))
             await h.result()
         assert fleet.agent_requests == []
+
+    async def test_a_customer_pdb_never_keeps_a_platform_fault_from_the_agent(self):
+        # The PDB check comes before the webhook check, and the two used to rank
+        # the same: the run skipped the agent for the platform fault.
+        fleet = Fleet(upgrade=ClusterUpgradeSettings(wave=2))
+        fleet.health_script = [HostedHealth(reachable=True, cluster_version_upgradeable=True, idms_mirrors=MIRRORS,
+                                            blocking_pdbs=["shop/db"], dead_webhooks=["vwc/policy: no endpoints"])]
+        async with Harness(fleet) as h:
+            await h.start(request(workers_to_target=False))
+            waiting = await h.until(UpgradePhase.NEEDS_HUMAN)
+            # The person sees both, and is told the PDB is its owner's.
+            assert "its owner must act first" in waiting.waiting_for
+            assert "shop/db" in waiting.waiting_for and "vwc/policy" in waiting.waiting_for
+            await h.decide(Run.abort, HumanDecision(by="alice", reason="end of test"))
+            await h.result()
+        # The agent got the platform fault only, never the customer's PDB.
+        (asked,) = fleet.agent_requests
+        assert [c.name for c in asked.failing_checks] == ["webhooks-have-endpoints"]
 
 
 class TestUpgradeTargets:

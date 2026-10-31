@@ -108,11 +108,12 @@
       </div>
       <div class="panel">
         <h3>So, today</h3>
-        <p><b>On the sandbox (2026-10-31):</b> a KubeVirt HostedCluster created by Argo CD from a day1 file
-        through the hostedclusters-setup chart, being upgraded 4.19.53 &rarr; 4.20.44 by this workflow. So far a
-        failed pre-flight went to the agent (the lab model did not answer, so a person retried), the run gave
-        the 4.19 admin ack itself, and the control plane moved by a day1 commit and an Argo CD sync, nobody
-        touching the HostedCluster.</p>
+        <p><b>Run end to end on the sandbox (2026-10-31):</b> a KubeVirt HostedCluster created by Argo CD from a
+        day1 file through the hostedclusters-setup chart went 4.19.53 &rarr; 4.20.44 under this workflow, in
+        2.5 hours: control plane 74 minutes, two in-place nodes 64. Two failed pre-flights went to the agent
+        (the lab model did not answer, so a person retried); the run gave the 4.19 admin ack itself; the control
+        plane and then the NodePool moved by a day1 commit and an Argo CD sync each, nobody touching the
+        HostedCluster or the NodePool.</p>
         <p><b>To see it:</b> the workflows API serves a temporary page at <code>/ui/cluster-upgrade</code>, until the
         ClickCluster Platform UI exists. It starts a run, lists the runs, draws each plan, says what a run waits
         for and offers its decisions.</p>
@@ -457,7 +458,9 @@
           A control plane still settling is re-checked every minute for up to 30 minutes first.</p>
           <p class="note">Before approval only the IDMS check (11) fails the run. Every other failure, here and
           after approval, <b>waits for a person</b> (<code>needs-human</code>): a PDB&rsquo;s owner can fix
-          theirs and <code>retry</code>.</p>
+          theirs and <code>retry</code>. A customer&rsquo;s PDB goes to its owner and never to the agent; anything
+          else failing with it still goes to the agent. A hosted API the limb cannot read fails every check built
+          from it as <code>needs-human</code> &mdash; nothing passes on data nobody read.</p>
         </div>
       </div>
 
@@ -692,7 +695,9 @@
             caller the run gives the ack itself, in every mode; a gate the rules do not list is
             <code>needs-human</code>.</li>
           <li><code>needs-human</code>: a check or gate that failed again after the agent&rsquo;s one retry, a
-            watch past its deadline, a commit or sync refused. Then <code>retry</code> or <code>abort</code>.</li>
+            watch past its deadline, a commit or sync refused, the day1 file moved or doubled after approval.
+            Then <code>retry</code> or <code>abort</code>. An approved agent action waits out a
+            <code>pause</code> and never runs once an <code>abort</code> is asked.</li>
           <li>Every agent proposal (tier 2): <code>actions/{id}/approve</code> or <code>reject</code>.</li>
           <li><code>pause</code>, <code>resume</code> and <code>abort</code>: only a person, never the run or
             the agent.</li>
@@ -713,8 +718,8 @@
     </div>
     <p class="note" style="margin-top:14px">The temporary page at <code>/ui/cluster-upgrade</code> offers <code>nodepool_mode</code> and
     <code>auto_approve</code> on its start form. <code>workers_to_target</code> is API only. The rules are in
-    <code>workflow_domains/cluster_upgrade/gates.py</code> (<code>_UNATTENDED_WAVES</code>) and
-    <code>upgrade_cluster.py</code> (<code>_TIER1_WAVES</code>).</p>
+    <code>workflow_domains/cluster_upgrade/gates.py</code> (<code>_UNATTENDED_WAVES</code>,
+    <code>tier1_enabled</code>): one rule for all three.</p>
   </section>
 
   <!-- ========================================================== PREFLIGHT -->
@@ -851,7 +856,8 @@ or retry to check again (the count covers 24 hours)</pre>
         <code>abort_recommended</code>.</p>
         <p class="note">A malformed reply is <code>needs_human</code>. An agent that cannot be reached in two
         attempts is answered as <code>needs_human</code> too; the run never fails for it. Every answered call
-        is written to Brain as an incident.</p>
+        is written to Brain as an incident, but Brain never holds the run: when Brain is missing, unreachable or
+        refuses the page, the run gets a note instead, and an abort does not wait for the write.</p>
       </div>
       <div class="panel">
         <h3>What happens with the verdict</h3>

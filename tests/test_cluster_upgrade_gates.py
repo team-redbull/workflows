@@ -513,13 +513,6 @@ class TestAdminAcks:
         [review] = gates.review_admin_gates({GATE: "m"}, [RULE], [], [WALKER])
         assert review == gates.AdminGateReview(gate=GATE, message="m", listed=True, in_use=[])
 
-    def test_the_old_import_of_a_review_still_works(self):
-        # TEMPORARY, with the shim in shared/models/cluster_upgrade.py: delete
-        # both once upgrade_cluster.py imports AdminGateReview from gates.
-        from shared.models.cluster_upgrade import AdminGateReview
-
-        assert AdminGateReview is gates.AdminGateReview
-
     def test_only_callers_that_are_not_ignored_count(self):
         usage = [
             ApiUsage(api=VWC, username=WALKER, verbs=["list", "watch"], requests=40),

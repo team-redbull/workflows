@@ -73,7 +73,7 @@ cluster file with `upgrade.wave` 0 or 1, lab and canary (gates._UNATTENDED_WAVES
 D20); elsewhere planning FAILS saying why, never a quiet switch to manual.
 `workers_to_target: false` ends at the control plane, the NodePools moving only
 where the path forces them. The wave also sets the agent's `tier1_enabled`
-(_TIER1_WAVES), which the agent ignores until tier 1 exists. No mode skips
+(gates.tier1_enabled), which the agent ignores until tier 1 exists. No mode skips
 `confirm-day2`, an admin ack a client still needs, a needs-human stop or an
 agent proposal: those always wait for a person.
 
@@ -159,7 +159,6 @@ with workflow.unsafe.imports_passed_through():
         AdminAckGiven,
         AdminAckRequest,
         AdminAckState,
-        AdminGateReview,
         AgentVerdict,
         ArgoSyncRequest,
         CheckFailure,
@@ -271,13 +270,10 @@ _CLUSTER_FILE_ERRORS = (ClusterFileNotFoundError.__name__, AmbiguousClusterFileE
 # Gates the pause and abort checkpoint before an approved tier-2 action. Runs
 # recorded before it ran an action approved while paused at once.
 _ACTION_CHECKPOINT_PATCH = "upgrade-cluster-checkpoint-before-actions"
-
-# The waves whose agent runs tier-1 actions itself, judge-reviewed, within its
-# budget: lab and canary (AGENT.md #25). Everywhere else every action is a
-# proposal a person approves, until the fault-injection evals are green and the
-# same fix has been approved repeatedly — graduating a wave is a reviewed change
-# here. Settled at planning, from the cluster file's `upgrade.wave`.
-_TIER1_WAVES = (0, 1)
+# Pre-flight sends the agent every failed check but a customer's PDB, and names
+# the owner whenever one is among them. Runs recorded before it skipped the
+# agent when the first-ranked failure was the PDB, and sent it the PDB otherwise.
+_OWNER_CHECKS_PATCH = "upgrade-preflight-owner-checks-apart"
 
 _LOG_LIMIT = 500
 _PROGRESS_LOG_TAIL = 20
@@ -601,7 +597,7 @@ class UpgradeClusterWorkflow:
             verified_against_graph=rules.verified_against_graph,
             day1_path=day1.path,
             mce_cluster=self._mce,
-            tier1_enabled=day1.upgrade.wave in _TIER1_WAVES,
+            tier1_enabled=gates.tier1_enabled(day1.upgrade.wave),
             admin_acks=rules.admin_acks,
             api_usage_ignored_users=rules.api_usage_ignored_users,
             hosted_cluster=self._hosted,
@@ -747,7 +743,10 @@ class UpgradeClusterWorkflow:
                 detail = self._day1_changed(detail)
             elif result.outcome is ControlPlaneStepOutcome.DAY1_REJECTED:
                 detail = self._day1_rejected(detail)
-            await self._needs_human(f"control-plane step to {step.version}: {detail}", verdict=result.verdict)
+            await self._needs_human(
+                f"control-plane step to {step.version}: {detail}",
+                verdict=result.verdict, invocation_id=result.invocation_id,
+            )
         self._cp_version = step.version
 
         # The day2 team's part (D14): their layer for the new version is now
@@ -854,7 +853,7 @@ class UpgradeClusterWorkflow:
                 )
 
     async def _await_admin_ack_approval(
-        self, step: UpgradeStep, in_use: list[AdminGateReview]
+        self, step: UpgradeStep, in_use: list[gates.AdminGateReview]
     ) -> HumanDecision | None:
         """awaiting-admin-ack, with the callers listed. The approval, or None for a retry."""
         self._admin_ack_approval = None
@@ -903,7 +902,10 @@ class UpgradeClusterWorkflow:
             self._absorb(report)
             self._log("control-plane-needs-human", detail=report.detail)
             # The child waits meanwhile, its slot still taken: the HostedCluster is mid-upgrade.
-            await self._needs_human(f"control-plane step to {step.version}: {report.detail}", verdict=report.verdict)
+            await self._needs_human(
+                f"control-plane step to {step.version}: {report.detail}",
+                verdict=report.verdict, invocation_id=report.invocation_id,
+            )
             await self._signal_child(child, UpgradeControlPlaneWorkflow.retry)
             self._phase = UpgradePhase.CONTROL_PLANE_STEP
 
@@ -948,7 +950,7 @@ class UpgradeClusterWorkflow:
             self._day1_blob = result.day1_blob
         if result.verdict is not None:
             self._last_verdict = result.verdict
-            self._log_agent(result.verdict, result.incident_path)
+            self._log_agent(result.verdict, result.incident_path, result.invocation_id)
 
     async def _take_slot(self, step: UpgradeStep, from_version: str) -> workflow.ChildWorkflowHandle:
         """Start the step's child on the first free slot of the MCE; wait while all are taken."""
@@ -1058,7 +1060,7 @@ class UpgradeClusterWorkflow:
                 if outcome.result is not WatchResult.DONE:
                     await self._needs_human(
                         f"NodePool {nodepool} did not reach {step.version}" + (f": {outcome.snapshot.summary}" if outcome.snapshot.summary else ""),
-                        verdict=diagnosis.verdict,
+                        verdict=diagnosis.verdict, invocation_id=diagnosis.invocation_id,
                     )
                     continue
 
@@ -1072,7 +1074,7 @@ class UpgradeClusterWorkflow:
                 if gate.result is not GateResult.PASSED:
                     await self._needs_human(
                         f"the gate after NodePool {nodepool} did not pass:\n{gates.describe(gate.failing_checks)}",
-                        verdict=diagnosis.verdict,
+                        verdict=diagnosis.verdict, invocation_id=diagnosis.invocation_id,
                     )
                     continue
             self._log("nodepool-rolled", detail=f"{nodepool} → {step.version}")
@@ -1301,6 +1303,7 @@ class UpgradeClusterWorkflow:
         """
         settling = timedelta(0)
         verdict: AgentVerdict | None = None
+        invocation_id: str | None = None
         while True:
             self._phase = UpgradePhase.PREFLIGHT
             self._waiting_for = None
@@ -1315,18 +1318,26 @@ class UpgradeClusterWorkflow:
                 continue
             if worst is CheckFailure.FAILED and self._approved_by is None:
                 self._fail_planning(gates.describe(checks))
-            owner = "its owner must act first, then retry. " if worst is CheckFailure.NOTIFY_OWNER else ""
-            if worst is not CheckFailure.NOTIFY_OWNER and verdict is None:
+            if workflow.patched(_OWNER_CHECKS_PATCH):
+                # A customer's PDB goes to its owner, never to the agent
+                # (AGENT.md #12), and never keeps a platform fault from it.
+                for_agent = gates.agent_checks(checks)
+                owner = "its owner must act first, then retry. " if gates.owner_checks(checks) else ""
+            else:
+                for_agent = [] if worst is CheckFailure.NOTIFY_OWNER else gates.failed(checks)
+                owner = "its owner must act first, then retry. " if worst is CheckFailure.NOTIFY_OWNER else ""
+            if for_agent and verdict is None:
                 diagnosis = await self._diagnose(
-                    step, from_version, nodepools[0] if nodepools else None, "preflight",
-                    [check for check in checks if not check.passed],
+                    step, from_version, nodepools[0] if nodepools else None, "preflight", for_agent,
                 )
-                verdict = diagnosis.verdict
+                verdict, invocation_id = diagnosis.verdict, diagnosis.invocation_id
                 if clears_gate(diagnosis):
                     continue
-            await self._needs_human(f"pre-flight failed: {owner}\n{gates.describe(checks)}", verdict=verdict)
+            await self._needs_human(
+                f"pre-flight failed: {owner}\n{gates.describe(checks)}", verdict=verdict, invocation_id=invocation_id,
+            )
             settling = timedelta(0)
-            verdict = None
+            verdict, invocation_id = None, None
 
     async def _preflight_checks(self, *, include_idms: bool, nodepools: list[str]) -> list[CheckResult]:
         cluster = self._hc_request()
@@ -1386,8 +1397,8 @@ class UpgradeClusterWorkflow:
         """One agent answer in the run's log: the verdict, where Brain recorded it, the invocation.
 
         The invocation id is what the agent service keys its run, its tool
-        calls and its verdict on. A control-plane child's answer reaches the
-        parent without it (UpgradeControlPlaneResult has no field for it).
+        calls and its verdict on; a control-plane child's answer carries it
+        too (None from a child recorded before the field).
         """
         self._log(
             "agent",
@@ -1397,7 +1408,12 @@ class UpgradeClusterWorkflow:
         )
 
     async def _needs_human(
-        self, reason: str, *, verdict: AgentVerdict | None = None, during_abort: bool = False
+        self,
+        reason: str,
+        *,
+        verdict: AgentVerdict | None = None,
+        invocation_id: str | None = None,
+        during_abort: bool = False,
     ) -> None:
         """Wait for a person: `retry` re-runs what failed; `abort` stops. Approved actions run meanwhile.
 
@@ -1411,7 +1427,9 @@ class UpgradeClusterWorkflow:
         self._waiting_for = f"retry or abort: {reason}"
         if verdict is not None:
             self._last_verdict = verdict
-            self._pending_actions = [PendingAction(action=action) for action in verdict.actions_proposed]
+            self._pending_actions = [
+                PendingAction(action=action, invocation_id=invocation_id) for action in verdict.actions_proposed
+            ]
         self._log("needs-human", detail=reason)
         while True:
             ready = lambda: self._retry is not None or bool(self._approved_unexecuted())  # noqa: E731
@@ -1446,7 +1464,8 @@ class UpgradeClusterWorkflow:
                 execute_proposed_action,
                 ProposedActionRequest(
                     mce_cluster=self._mce, cluster=self._cluster,
-                    action=pending.action, approved_by=pending.decided_by or "", **self._on_hc(),
+                    action=pending.action, approved_by=pending.decided_by or "",
+                    invocation_id=pending.invocation_id, **self._on_hc(),
                 ),
             )
         except ActivityError as err:

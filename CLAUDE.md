@@ -849,6 +849,9 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   three-hour control-plane upgrade is then a handful of history events. Retries stay unbounded per
   the rule above. Started with `workflow.start_activity` (`TRY_CANCEL`) so an abort can cancel it;
   commits and syncs are `WAIT_CANCELLATION_COMPLETED`, so a cancel never abandons a push half-way.
+  The one write that is `TRY_CANCEL` is the Brain incident after an agent answer
+  (`dispatch.until_done`, gated `upgrade-agent-incident-yields-to-stop`): it is append-only and
+  nothing about the upgrade depends on it, so an abort never waits on Brain.
 - **Cancellation does not stop work in flight — so a stop is a FLAG checked before every act.**
   Cancelling a task or a child that is awaiting a non-heartbeating `WAIT_CANCELLATION_COMPLETED`
   call is swallowed: the call finishes, its result comes back as if nothing happened, and the code

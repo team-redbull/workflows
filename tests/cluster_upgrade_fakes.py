@@ -92,7 +92,8 @@ from shared.models.cluster_upgrade import (
 )
 from shared.ocp_version import minor_of
 from shared.workflow_ids import upgrade_cluster_workflow_id
-from workflow_domains.cluster_upgrade.gates import admin_gate_minor, release_repositories
+from shared.upgrade_layout import release_repositories
+from workflow_domains.cluster_upgrade.gates import admin_gate_minor
 from workflow_domains.cluster_upgrade.upgrade_cluster import UpgradeClusterWorkflow
 from workflow_domains.cluster_upgrade.upgrade_control_plane import UpgradeControlPlaneWorkflow
 from workflow_domains.cluster_upgrade.upgrade_targets import UpgradeTargetsWorkflow

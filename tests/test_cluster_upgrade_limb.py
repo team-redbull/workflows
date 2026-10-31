@@ -950,6 +950,24 @@ class TestExecuteProposedAction:
         assert first["annotations"] == retry["annotations"]
         assert later["annotations"]["workflows.redbull/request"] != first["annotations"]["workflows.redbull/request"]
 
+    async def test_the_invocation_that_proposed_it_names_the_job(self, mce, monkeypatch):
+        from activities.cluster_upgrade import action_catalog
+
+        seen = {}
+
+        async def _rerun(kubeconfig, server, cluster, namespace, name, job, annotations):
+            seen["job"] = job
+            return "created"
+
+        monkeypatch.setattr(hosted_upgrade_api, "rerun_cronjob", _rerun)
+        self._in_activity(monkeypatch)
+        request = self._request("rerun_cronjob", "openshift-olm/collect-profiles").model_copy(
+            update={"invocation_id": "upgrade-cluster-lab-upgrade/inv-7"})
+        await limb.execute_proposed_action(request)
+        assert seen["job"] == action_catalog.rerun_job_name(
+            "collect-profiles", "a-1", invocation_id="upgrade-cluster-lab-upgrade/inv-7")
+        assert seen["job"] != action_catalog.rerun_job_name("collect-profiles", "a-1")
+
     async def test_a_job_another_request_made_is_not_executed(self, mce, monkeypatch):
         result, _ = await self._rerun(monkeypatch, "conflict")
         assert result.executed is False

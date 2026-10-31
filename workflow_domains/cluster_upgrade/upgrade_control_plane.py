@@ -256,7 +256,8 @@ class UpgradeControlPlaneWorkflow:
                 outcome = await self._watch(request)
                 if outcome.result is WatchResult.DONE:
                     return self._result(
-                        ControlPlaneStepOutcome.DONE, verdict=diagnosis.verdict, incident_path=diagnosis.incident_path
+                        ControlPlaneStepOutcome.DONE, verdict=diagnosis.verdict, incident_path=diagnosis.incident_path,
+                        invocation_id=diagnosis.invocation_id,
                     )
                 failing = failing.model_copy(
                     update={"observed": f"{outcome.result.value} again: {outcome.snapshot.summary}"}
@@ -271,6 +272,7 @@ class UpgradeControlPlaneWorkflow:
                 verdict=diagnosis.verdict,
                 incident_path=diagnosis.incident_path,
                 failing_checks=[failing],
+                invocation_id=diagnosis.invocation_id,
             )
             await workflow.get_external_workflow_handle(request.parent_workflow_id).signal(
                 NEEDS_HUMAN_SIGNAL, report
@@ -316,6 +318,7 @@ class UpgradeControlPlaneWorkflow:
         verdict: AgentVerdict | None = None,
         incident_path: str | None = None,
         failing_checks: list[CheckResult] | None = None,
+        invocation_id: str | None = None,
     ) -> UpgradeControlPlaneResult:
         """The step's result, with what it committed — or, NEEDS_HUMAN, its report to the parent.
 
@@ -337,4 +340,5 @@ class UpgradeControlPlaneWorkflow:
             verdict=verdict,
             incident_path=incident_path,
             failing_checks=failing_checks or [],
+            invocation_id=invocation_id,
         )

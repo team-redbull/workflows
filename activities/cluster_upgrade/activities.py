@@ -563,10 +563,9 @@ async def execute_proposed_action(request: ProposedActionRequest) -> ActionResul
             outcome = await hosted_upgrade_api.delete_failed_job(
                 kubeconfig, server, request.cluster, action.namespace or "", action.name, action.uid)
         else:
-            # ProposedActionRequest carries no agent invocation id yet: once it
-            # does, pass request.invocation_id here, so the "same" action of two
-            # invocations gets two names.
-            job = action_catalog.rerun_job_name(action.name, action_id, invocation_id=None)
+            # The invocation that proposed it, so the "same" action id of two
+            # invocations gets two names (None from an older brain: the old name).
+            job = action_catalog.rerun_job_name(action.name, action_id, invocation_id=request.invocation_id)
             outcome = await hosted_upgrade_api.rerun_cronjob(
                 kubeconfig, server, request.cluster, action.namespace or "", action.name, job,
                 _job_annotations(request))

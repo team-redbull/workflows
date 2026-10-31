@@ -91,8 +91,9 @@
         <h3>Not yet</h3>
         <ul>
           <li>The routes are <b>not mounted</b> in the API. They come with the first limb.</li>
-          <li>The <b>limbs</b> (the activities) are in progress. The MCE limb comes first: its pre-flight
-            reads and the admin-ack write.</li>
+          <li>The <b>MCE limb</b>&rsquo;s activities are written and tested: the reads, the admin-ack write, the
+            Argo CD sync, the watches, the NodePool gate and the tier-2 actions. Several were run against a live
+            hosted cluster. It has no worker, image or chart yet.</li>
           <li>Still to build: the hub limb (day1 git, the mirror, day2, Brain), the agent limb, kagent&rsquo;s
             <code>upgrade-agent</code> and judge, the tool server, and the RBAC and admission policies.</li>
           <li>Abort commits <code>pausedUntil</code>, which the hostedclusters-setup chart does not render
@@ -540,7 +541,9 @@
               or one that declares readiness checks, also PDBs back to <code>disruptionsAllowed &ge; 1</code>,
               StatefulSets ready, and the cluster&rsquo;s own checks (PromQL or HTTP). All of it must hold for the
               <b>soak</b> &mdash; 30 min zoned, 0 generic, or <code>upgrade.soakMinutes</code>. Deadline: the soak
-              plus 60 min.</li>
+              plus 60 min. <b>For now a declared check fails as &ldquo;not run&rdquo;</b>, so a cluster that
+              declares one waits for a person at every gate: how the limb reaches the hosted Prometheus (it needs a
+              token there) and a customer&rsquo;s route from the MCE is still open (design O22).</li>
           </ol>
           <div class="calls">
             <div class="call nxt"><span class="verb">HUB</span><span class="path">pin_release_digests &middot; commit_day1_change <em>&middot; nodepool</em></span></div>

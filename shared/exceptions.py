@@ -999,6 +999,17 @@ class Day1ChangeRejectedError(OrchestratorError):
     """
 
 
+class ReleaseRegistryError(OrchestratorError):
+    """The release registry could not be read: unreachable, a 5xx, or refused credentials.
+
+    RETRYABLE on purpose, and so not in the workflow's non-retryable list: an
+    outage clears by itself, and a refused credential (401/403 on the release
+    repository itself) clears once the registry auth file is fixed, without a
+    new run. What the registry answers as absent (404) is never this error: it
+    is reported in the result, as a missing release or an incomplete payload.
+    """
+
+
 class ArgoSyncRefusedError(OrchestratorError):
     """The cluster's Application has changes pending that this run did not make.
 

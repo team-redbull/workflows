@@ -27,7 +27,9 @@ from shared.models.cluster_upgrade import (
     HostedHealth,
     MceState,
     NodePoolState,
+    PinnedRelease,
     PinnedReleases,
+    ReleaseLayout,
     StepKind,
     StepReason,
     UpgradePlan,
@@ -82,6 +84,11 @@ PLAN = UpgradePlan(
     ],
 )
 ALL_PINNED = PinnedReleases(pinned={"4.19.53": digest("4.19.53"), "4.20.44": digest("4.20.44")})
+# A connected lab's layout (D25): the public source, no mirror, no CPO repo.
+PUBLIC_RELEASE = ReleaseLayout(
+    image_path="quay.io/openshift-release-dev", repo="{imagePath}/ocp-release", tag="{version}-x86_64",
+    mirrored=False,
+)
 
 
 def _planning(**overrides) -> dict[str, CheckResult]:
@@ -136,6 +143,40 @@ class TestPlanningChecks:
         check = _planning(pinned=PinnedReleases(pinned={"4.20.44": digest("4.20.44")}))["mirror-has-every-step"]
         assert not check.passed and "4.19.53" in check.observed
 
+    def test_a_mirrored_layout_needs_the_operator_digest_too(self):
+        no_operator = {v: PinnedRelease(release=f"sha256:release-{v}") for v in ("4.19.53", "4.20.44")}
+        check = _planning(pinned=PinnedReleases(pinned=no_operator))["mirror-has-every-step"]
+        assert not check.passed and "no control-plane-operator digest pinned" in check.observed
+
+    @pytest.mark.parametrize(
+        ("release", "repos", "needle"),
+        [
+            # production: the chart's defaults are the full mirror's layout
+            (RELEASE, ("openshift/release-images", "openshift/release"), None),
+            (RELEASE, ("ocp-release", "openshift/release"), "releaseRepo ocp-release renders"),
+            (RELEASE, ("openshift/release-images", ""), "cpoRepo renders no CPO image"),
+            # the demo: the public source and no CPO annotation
+            (PUBLIC_RELEASE, ("ocp-release", ""), None),
+            (PUBLIC_RELEASE, ("openshift/release-images", ""), "set the cluster's releaseRepo"),
+            (PUBLIC_RELEASE, ("ocp-release", "openshift/release"), 'set the cluster\'s cpoRepo to ""'),
+            # a reader that reports neither: nothing to compare
+            (PUBLIC_RELEASE, (None, None), None),
+        ],
+    )
+    def test_the_chart_and_the_rules_build_the_same_images(self, release, repos, needle):
+        day1 = _day1(image_path=release.image_path, release_repo=repos[0], cpo_repo=repos[1])
+        check = _planning(rules=_rules(release=release), day1=day1)["day1-file-upgradeable"]
+        assert check.passed is (needle is None), check.observed
+        if needle:
+            assert needle in check.observed
+
+    def test_a_layout_with_no_cpo_repo_needs_no_operator_digest(self):
+        no_operator = {v: PinnedRelease(release=f"sha256:release-{v}") for v in ("4.19.53", "4.20.44")}
+        check = _planning(rules=_rules(release=PUBLIC_RELEASE), pinned=PinnedReleases(pinned=no_operator))[
+            "mirror-has-every-step"
+        ]
+        assert check.passed, check.observed
+
     @pytest.mark.parametrize(
         ("overrides", "needle"),
         [
@@ -189,13 +230,15 @@ class TestPlanningChecks:
         assert check.passed is passes
 
 
-def _preflight(*, argo=None, hosted=None, health=None, mce=None, include_idms=True) -> dict[str, CheckResult]:
+def _preflight(
+    *, argo=None, hosted=None, health=None, mce=None, include_idms=True, release=RELEASE
+) -> dict[str, CheckResult]:
     checks = gates.preflight_checks(
         argo=argo or ArgoApplicationState(found=True, sync_status="Synced", health_status="Healthy"),
         hosted=hosted or _hosted(),
         health=health or HostedHealth(reachable=True, cluster_version_upgradeable=True, idms_mirrors=MIRRORS),
         mce=mce or MceState(supported_versions_found=True, idms_mirrors=MIRRORS),
-        release=RELEASE,
+        release=release,
         include_idms=include_idms,
     )
     return {check.name: check for check in checks}
@@ -302,6 +345,21 @@ class TestPreflightChecks:
 
     def test_the_idms_check_runs_only_when_asked(self):
         assert "idms-covers-release" not in _preflight(include_idms=False)
+
+    def test_a_release_from_its_public_source_needs_no_mirror_and_says_so(self):
+        """D25: a connected lab has no IDMS anywhere, and nothing for one to cover."""
+        check = _preflight(
+            release=PUBLIC_RELEASE,
+            hosted=_hosted(image_content_mirrors=[]),
+            health=HostedHealth(reachable=True, cluster_version_upgradeable=True),
+            mce=MceState(supported_versions_found=True),
+        )["idms-covers-release"]
+        assert check.passed
+        assert "release.mirrored: false" in check.observed and "quay.io/openshift-release-dev/ocp-release" in check.observed
+
+    def test_the_repositories_of_a_layout_without_a_cpo_repo_are_the_payloads_alone(self):
+        assert gates.release_repositories(PUBLIC_RELEASE) == ["quay.io/openshift-release-dev/ocp-release"]
+        assert len(gates.release_repositories(RELEASE)) == 2
 
     def test_the_worst_failure_decides(self):
         checks = list(_preflight(

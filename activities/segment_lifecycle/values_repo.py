@@ -5,6 +5,11 @@ settings), so the offline tests drive it against a local bare repo with no
 network and no Temporal. The @activity.defn wrappers in activities.py pass
 the real configuration in.
 
+The generic git client — command timeout, token injection and scrubbing, the
+ls-remote branch check, the shallow clone — lives in activities/git_repo.py,
+shared with the cluster-upgrade hub limb; this module keeps its own names for
+it, so nothing that calls or tests it changed.
+
 Rules this module enforces:
   * git runs via asyncio.create_subprocess_exec — no new Python dependency,
     but the limb image must install the git binary (see the Dockerfile). Every command
@@ -35,30 +40,33 @@ unchanged.
 
 from __future__ import annotations
 
-import asyncio
 import re
 import tempfile
 from pathlib import Path
 
+from activities import git_repo
 from shared.exceptions import (
     AmbiguousClusterFileError,
     ClusterFileNotFoundError,
     ClusterValuesConflictError,
-    ValuesBranchNotFoundError,
-    ValuesRepoGitError,
 )
 from shared.models.segment_lifecycle import ClusterFileLocation, DhcpValues
 
-# Kept below the git activities' 180s start_to_close_timeout so a hung remote
-# fails the command and frees the worker before Temporal reaps the activity
-# (same budget rule as the HTTP clients'). The clone is the only long command;
-# the ls-remote branch check that precedes it, the local add/commit/rev-parse
-# and the push share the remainder comfortably.
-_GIT_COMMAND_TIMEOUT_SECONDS = 150.0
+# The shared git client (activities/git_repo.py), under the names this module
+# has always used. GIT_COMMAND_TIMEOUT_SECONDS stays below the git activities'
+# 180s start_to_close_timeout.
+_GIT_COMMAND_TIMEOUT_SECONDS = git_repo.GIT_COMMAND_TIMEOUT_SECONDS
+_redact = git_repo.redact
+authenticated_url = git_repo.authenticated_url
+_exec_git = git_repo.exec_git
+_run_git = git_repo.run_git
 
-# `git ls-remote --exit-code` exits 2 when the remote answered and holds no
-# matching ref — the one answer that means "this branch does not exist".
-_LS_REMOTE_NO_MATCHING_REF = 2
+# What a branch the remote lacks means HERE: the run named the wrong one.
+_MISSING_BRANCH = (
+    "Branch {branch!r} does not exist in the values repo — the caller "
+    "must pass the branch its cluster file lives on (the day1 "
+    "pipeline's own branch)"
+)
 
 MARKER = "# === Added By Segment-Allocation Workflow ==="
 
@@ -169,106 +177,18 @@ def append_block(content: str, block: str) -> str:
     return content.rstrip("\n") + "\n\n" + block + "\n"
 
 
-def _redact(text: str, secrets: list[str]) -> str:
-    for secret in secrets:
-        if secret:
-            text = text.replace(secret, "***")
-    return text
-
-
-def authenticated_url(repo_url: str, token: str) -> str:
-    """Inject the token into an https clone URL; anything else (a local path
-    in tests, ssh) passes through untouched."""
-    if token and repo_url.startswith("https://"):
-        return "https://x-access-token:" + token + "@" + repo_url.removeprefix("https://")
-    return repo_url
-
-
-async def _exec_git(
-    args: list[str], *, cwd: Path | None, secrets: list[str]
-) -> tuple[int, str, str]:
-    """Run one git command and return (returncode, stdout, stderr), stderr
-    already scrubbed of every secret. A timeout raises the retryable
-    ValuesRepoGitError, its message scrubbed BEFORE the exception exists (it
-    will be recorded in Temporal history). Callers that need to tell one exit
-    code from another (ls-remote) use this; everything else uses _run_git."""
-    process = await asyncio.create_subprocess_exec(
-        "git",
-        # TLS verification off, matching the httpx clients (activities._TLS_VERIFY):
-        # git keeps its OWN trust store, so the airgapped environment's
-        # un-injectable internal CA has to be waived here separately. Passed on the
-        # exec line rather than inside `args` so it never appears in the redacted
-        # command echo recorded in Temporal history.
-        "-c",
-        "http.sslVerify=false",
-        *args,
-        cwd=cwd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    try:
-        stdout, stderr = await asyncio.wait_for(
-            process.communicate(), timeout=_GIT_COMMAND_TIMEOUT_SECONDS
-        )
-    except asyncio.TimeoutError:
-        process.kill()
-        await process.wait()
-        raise ValuesRepoGitError(
-            f"git {_redact(' '.join(args), secrets)} timed out after "
-            f"{_GIT_COMMAND_TIMEOUT_SECONDS:.0f}s"
-        ) from None
-    return (
-        process.returncode,
-        stdout.decode(errors="replace"),
-        _redact(stderr.decode(errors="replace").strip(), secrets),
-    )
-
-
-async def _run_git(args: list[str], *, cwd: Path | None, secrets: list[str]) -> str:
-    """Run one git command; raise the retryable ValuesRepoGitError on any
-    failure, with every secret scrubbed from the message BEFORE the exception
-    exists (it will be recorded in Temporal history)."""
-    returncode, stdout, stderr = await _exec_git(args, cwd=cwd, secrets=secrets)
-    if returncode != 0:
-        raise ValuesRepoGitError(
-            f"git {_redact(' '.join(args), secrets)} failed "
-            f"(exit {returncode}): {stderr}"
-        )
-    return stdout
-
-
 async def _require_branch(*, repo_url: str, branch: str, token: str) -> None:
-    """Fail deterministically when the remote has no such branch.
+    """Fail deterministically when the remote has no such branch (git_repo.require_branch).
 
     Without this, `git clone --branch <missing>` exits non-zero like any other
     git failure and raises the RETRYABLE ValuesRepoGitError, so a mistyped or
-    deleted branch would retry every minute forever. ls-remote's --exit-code
-    separates the two: exit 2 means the remote answered and holds no such ref
-    (ValuesBranchNotFoundError, non-retryable); anything else — auth, DNS, a
-    missing repo, a timeout — is an unreachable remote and stays retryable.
-
-    The branch is matched as the FULL ref refs/heads/<branch>: a bare pattern
-    would tail-match, so `x` would be "found" as `feature/x`.
+    deleted branch would retry every minute forever: ls-remote exit 2 is the
+    non-retryable ValuesBranchNotFoundError, anything else stays retryable.
     """
-    args = [
-        "ls-remote",
-        "--exit-code",
-        "--heads",
-        authenticated_url(repo_url, token),
-        f"refs/heads/{branch}",
-    ]
-    returncode, _, stderr = await _exec_git(args, cwd=None, secrets=[token])
-    if returncode == _LS_REMOTE_NO_MATCHING_REF:
-        raise ValuesBranchNotFoundError(
-            f"Branch {branch!r} does not exist in the values repo — the caller "
-            "must pass the branch its cluster file lives on (the day1 "
-            "pipeline's own branch)"
-        )
-    if returncode != 0:
-        raise ValuesRepoGitError(
-            f"git ls-remote for branch {branch!r} failed (exit {returncode}): "
-            f"{stderr}"
-        )
+    await git_repo.require_branch(
+        repo_url=repo_url, branch=branch, token=token,
+        missing_message=_MISSING_BRANCH.format(branch=branch),
+    )
 
 
 async def _clone(

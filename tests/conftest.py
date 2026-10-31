@@ -23,6 +23,7 @@ from shared.settings import (
     ServerProvisioningActivitySettings,
     TemporalSettings,
     UpgradeAgentActivitySettings,
+    UpgradeGitopsActivitySettings,
 )
 
 for _settings_class in (
@@ -32,6 +33,7 @@ for _settings_class in (
     ServerProvisioningActivitySettings,
     TemporalSettings,
     UpgradeAgentActivitySettings,
+    UpgradeGitopsActivitySettings,
 ):
     _settings_class.model_config["env_file"] = None
 

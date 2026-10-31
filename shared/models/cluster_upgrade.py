@@ -458,6 +458,13 @@ class Day1Cluster(BaseModel):
     # cluster name.
     hosted_cluster: str | None = None
     hosted_cluster_namespace: str | None = None
+    # The repositories under imagePath the chart builds the release and the
+    # CPO image from (`releaseRepo`, default "openshift/release-images";
+    # `cpoRepo`, default "openshift/release", "" for none): planning checks them
+    # against the rules' release layout. The hub limb always reports both;
+    # None (a reader that predates them) skips the check.
+    release_repo: str | None = None
+    cpo_repo: str | None = None
     nodepools: list[Day1NodePool] = Field(default_factory=list)
     upgrade: ClusterUpgradeSettings = Field(default_factory=ClusterUpgradeSettings)
     # What the parser refused, line by line: a duplicate key, a NodePool
@@ -509,6 +516,8 @@ class Day2Layers(BaseModel):
     """Every pinned day2 chart missing an `ocp-versions/<v>/` layer for a step's version."""
 
     missing: list[Day2LayerGap] = Field(default_factory=list)
+    # Why nothing was checked, when nothing was (no day2 repo configured).
+    note: str = ""
 
 
 class Day1ChangeKind(str, Enum):
@@ -560,7 +569,11 @@ class IncidentRequest(BaseModel):
 
 
 class IncidentRecord(BaseModel):
-    path: str  # in Brain, e.g. incidents/2026-11-02-hypershift-<slug>.md
+    # In Brain, e.g. incidents/2026/2026-11-02-hypershift-upgrade-<gate>-<id>.md;
+    # "" when nothing was written, and `note` then says why (Brain not
+    # configured, or its validator refused the page).
+    path: str
+    note: str = ""
 
 
 # --- the per-MCE limb: cluster reads, Argo CD syncs, watches -------------------

@@ -97,11 +97,11 @@ def expand(template: str, *, image_path: str, version: str | None = None) -> str
 
 
 def release_repositories(release: ReleaseLayout) -> list[str]:
-    """The two mirror repositories a release is pulled from: payload, then operator."""
-    return [
-        expand(release.repo, image_path=release.image_path),
-        expand(release.cpo_repo, image_path=release.image_path),
-    ]
+    """The repositories a release is pulled from: payload, then operator when the layout names one."""
+    repositories = [expand(release.repo, image_path=release.image_path)]
+    if release.cpo_repo is not None:
+        repositories.append(expand(release.cpo_repo, image_path=release.image_path))
+    return repositories
 
 
 # --- profile and order ---------------------------------------------------------
@@ -275,13 +275,24 @@ def _mirror_has_every_step(
     unpinned = [v for v in versions if v not in pinned.pinned and v not in pinned.missing]
     missing = [*pinned.missing, *unpinned]
     expected = f"every step in {expand(release.repo, image_path=release.image_path)}, payload complete"
-    if not missing and not pinned.problems:
+    # A layout with a CPO repo pins the operator image too; one without (a public
+    # source, D25) runs the payload's own CPO, so no operator digest is expected.
+    no_operator = [
+        v for v in versions
+        if release.cpo_repo is not None and v in pinned.pinned and pinned.pinned[v].control_plane_operator is None
+    ]
+    problems = [
+        *pinned.problems,
+        *(f"{v}: no control-plane-operator digest pinned, though the layout names {release.cpo_repo}"
+          for v in no_operator),
+    ]
+    if not missing and not problems:
         return _failed_check(name, True, expected, "all pinned")
     observed = []
     if missing:
         tags = ", ".join(release_tag(v) for v in missing)
         observed.append(f"mirror {tags} first:\n{image_set_snippet(missing)}")
-    observed.extend(pinned.problems)
+    observed.extend(problems)
     return _failed_check(name, False, expected, "\n".join(observed))
 
 
@@ -304,10 +315,44 @@ def _day1_file_upgradeable(
         )
     if day1.image_hc is not None and day1.image_hc != rules.release.image_path:
         problems.append(f"imageHc is {day1.image_hc}, not {rules.release.image_path}")
+    problems += _release_layout_problems(rules.release, day1)
     return _failed_check(
         name, not problems, f"{day1.path} parses, InPlace NodePools, the full mirror",
         "; ".join(problems) or "ok",
     )
+
+
+def _release_layout_problems(release: ReleaseLayout, day1: Day1Cluster) -> list[str]:
+    """The chart and the rules must build the same image references (check 3).
+
+    The chart renders `<imagePath>/<releaseRepo>:<tag>` and, unless `cpoRepo`
+    is "", a CPO annotation on `<imagePath>/<cpoRepo>`; the run pins what the
+    rules' `repo`/`cpoRepo` say. Disagreeing, the cluster would run images
+    nobody pinned. Only for a reader that reports the two: the hub limb always
+    does, never as None; an older one's payloads (in history too) lack the
+    keys and decode to None, and the check then stays as it was.
+    """
+    if day1.release_repo is None or day1.cpo_repo is None:
+        return []
+    problems = []
+    rendered = f"{release.image_path}/{day1.release_repo}"
+    pinned = expand(release.repo, image_path=release.image_path)
+    if rendered != pinned:
+        problems.append(
+            f"releaseRepo {day1.release_repo} renders {rendered}, but the rules pin {pinned}: "
+            "set the cluster's releaseRepo to match upgrade/ladder.yaml's release.repo"
+        )
+    if release.cpo_repo is None and day1.cpo_repo:
+        problems.append(
+            f"cpoRepo {day1.cpo_repo} renders a control-plane-operator image the rules do not pin "
+            '(release has no cpoRepo): set the cluster\'s cpoRepo to ""'
+        )
+    elif release.cpo_repo is not None:
+        rendered_cpo = f"{release.image_path}/{day1.cpo_repo}" if day1.cpo_repo else "no CPO image"
+        pinned_cpo = expand(release.cpo_repo, image_path=release.image_path)
+        if rendered_cpo != pinned_cpo:
+            problems.append(f"cpoRepo renders {rendered_cpo}, but the rules pin {pinned_cpo}")
+    return problems
 
 
 def effective_workertag(day1: Day1Cluster, nodepool: str) -> str | None:
@@ -522,7 +567,20 @@ def _idms_covers_release(
     inside the hosted cluster (its nodes, from the day2 chart), and the MCE's
     own IDMS (its HyperShift operator reading the payload). Whether nodes'
     registries.conf really carries it needs a read without exec (O10).
+
+    A layout that is not mirrored (`release.mirrored: false`, a connected lab
+    pulling from the public source, D25) has nothing to cover: it passes,
+    saying why, so the reason is in the run's record and not a silent skip.
     """
+    if not release.mirrored:
+        source = expand(release.repo, image_path=release.image_path)
+        return CheckResult(
+            name="idms-covers-release",
+            passed=True,
+            expected="the release's repositories mirrored for the control plane, the nodes and the MCE",
+            observed=f"not applicable: releases come straight from {source} (release.mirrored: false), no mirror to cover",
+            on_failure=CheckFailure.FAILED,
+        )
     needed = release_repositories(release)
     gaps = [
         f"{where} lacks {repo}"

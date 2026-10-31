@@ -242,7 +242,13 @@ class TestTheClusterUpgradeMceLimbsErrors:
     """
 
     _PERMANENT = {"ArgoSyncRefusedError", "ProposedActionRefusedError", "AdminGateNotFoundError"}
-    _WAITED_ON = {"ArgoSyncFailedError", "HostedClusterAccessError", "HostedClusterUnreachableError"}
+    # Waited on: a run that may already have committed must never fail on them;
+    # the hosted reads turn access errors into `reachable: False` for a person.
+    _WAITED_ON = {
+        "ArgoSyncFailedError", "HostedClusterAccessError", "HostedClusterUnreachableError",
+        "ArgoOperationInProgressError", "AmbiguousHostedClusterError", "HostedClusterNotFoundError",
+        "AdminAckNotAppliedError",
+    }
 
     def _named_in_the_limb(self) -> set[str]:
         limb = pathlib.Path(__file__).resolve().parent.parent / "activities" / "cluster_upgrade"

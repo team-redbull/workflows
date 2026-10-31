@@ -27,6 +27,7 @@ import json
 import os
 import pathlib
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 import pytest
 from temporalio.client import WorkflowHistory
@@ -212,11 +213,27 @@ async def test_every_run_a_scenario_records_replays(scenario):
         for name, history in named:
             (folder / f"{name}.json").write_text(
                 json.dumps(
-                    {"workflow_id": history.workflow_id, "history": json.loads(history.to_json())},
+                    {"workflow_id": history.workflow_id, "history": _scrubbed(json.loads(history.to_json()))},
                     separators=(",", ":"), sort_keys=True,
                 )
                 + "\n"
             )
+
+
+_SCRUBBED = {"identity": "upgrade-cluster-replay", "stackTrace": ""}
+
+
+def _scrubbed(node: Any) -> Any:
+    """The history with every worker `identity` and failure `stackTrace` neutralised.
+
+    An identity is `<pid>@<hostname>` of whoever recorded it and a stack trace
+    carries local paths; this repo is public. The replayer reads neither.
+    """
+    if isinstance(node, dict):
+        return {key: (_SCRUBBED[key] if key in _SCRUBBED else _scrubbed(value)) for key, value in node.items()}
+    if isinstance(node, list):
+        return [_scrubbed(item) for item in node]
+    return node
 
 
 def _golden_files() -> list[pathlib.Path]:
@@ -233,3 +250,23 @@ async def test_golden_histories_replay_on_the_current_code(path):
     recorded = json.loads(path.read_text())
     history = WorkflowHistory.from_json(recorded["workflow_id"], recorded["history"])
     await _replayer().replay_workflow(history)
+
+
+def test_no_golden_history_names_the_machine_that_recorded_it():
+    """This repo is public: a worker identity is `<pid>@<hostname>`."""
+    for path in _golden_files():
+        for value in _identities(json.loads(path.read_text())):
+            assert value == _SCRUBBED["identity"], f"{path}: identity {value!r}"
+
+
+def _identities(node: Any):
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "identity":
+                yield value
+            else:
+                yield from _identities(value)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _identities(item)
+

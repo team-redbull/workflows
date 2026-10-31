@@ -4,7 +4,8 @@ GET /ui/cluster-upgrade serves one self-contained HTML file (ui/index.html): no
 build step and nothing from a CDN, because production is air-gapped. The page
 calls the API it is served by, so it needs no CORS: `GET /workflows/runs` to
 list upgrade-cluster runs, `GET /workflows/runs/{id}` for each one's progress,
-and the decision routes of router.py for approve, continue and the rest.
+`GET /workflows/cluster-upgrade/upgrade-targets` for the "New upgrade" form's
+choices, and the decision routes of router.py for approve, continue and the rest.
 
 It shows only the runs this API reports, on the upgrade routes api.py mounts
 beside it (DESIGN O18).

@@ -12,6 +12,11 @@ Settings groups, matching the deployment boundary:
     business holding these.
   - ServerLifecycleActivitySettings / ServerProvisioningActivitySettings: the
     same, for those domains' activity workers.
+  - UpgradeGitopsActivitySettings, ClusterUpgradeActivitySettings and
+    UpgradeAgentActivitySettings: the cluster-upgrade domain's three limbs,
+    one class per credential set (CLAUDE.md §2) — the hub's day1/day2/Brain
+    repos and release registry, the per-MCE cluster limb's Argo CD location,
+    the per-MCE agent limb's upgrade agent endpoint. Each read by that limb only.
 
 Field names deliberately equal the Helm ConfigMap/Secret keys (lowercased) —
 pydantic-settings matches env vars case-insensitively, so SEGMENTS_MANAGER_URL

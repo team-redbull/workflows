@@ -65,18 +65,23 @@ PROVISION_DELL_SERVER_WORKFLOW_QUEUE = "provision-dell-server-workflow"
 SERVER_PROVISIONING_ACTIVITY_QUEUE = "server-provisioning-activity"
 
 # -- Cluster-upgrade domain --
-# Two workflows, each on its own queue as everywhere above: the per-cluster run,
-# and the control-plane step it starts as a child on a per-MCE SLOT id (the
-# slot is the concurrency cap, see shared/workflow_ids.py).
+# Three workflows, each on its own queue as everywhere above: upgrade-cluster,
+# the per-cluster run; upgrade-control-plane, the control-plane step it starts
+# as a child on a per-MCE SLOT id (the slot is the concurrency cap, see
+# shared/workflow_ids.py); and upgrade-targets, the short read behind the
+# "New upgrade" form (D22).
 #
 # THREE activity queues for one domain, because the domain's work needs three
 # different credential sets (CLAUDE.md §2: the deployment follows the
 # dependency + credential set):
-#   * the HUB limb holds the day1 git push token, the mirror registry pull
-#     credential and the Brain push token — one queue, like segment-lifecycle;
+#   * the HUB limb holds the day1 git push token, the day2 read token, the
+#     mirror registry pull credential and the Brain push token — one queue,
+#     like segment-lifecycle;
 #   * the per-MCE cluster limb runs as the workflow ServiceAccount inside that
-#     MCE (reads, and the Argo CD sync that is the run's only cluster write) —
-#     a queue per MCE, routed exactly like server-lifecycle above;
+#     MCE — reads, and the run's few cluster writes: the Argo CD sync, an
+#     admin ack inside a hosted cluster, a tier-2 action a person approved;
+#     never a HostedCluster or NodePool (DESIGN D1) — a queue per MCE, routed
+#     exactly like server-lifecycle above;
 #   * the per-MCE agent limb holds no Kubernetes credential at all: it calls
 #     the upgrade agent service inside that MCE (an agent-sandbox Sandbox),
 #     whose tools run under their own identity — a queue per MCE as well.

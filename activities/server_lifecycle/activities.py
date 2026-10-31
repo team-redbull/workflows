@@ -30,8 +30,6 @@ as the operator's did.
 from __future__ import annotations
 
 import asyncio
-import base64
-import binascii
 
 from temporalio import activity
 
@@ -977,8 +975,6 @@ async def teardown_bmh_resources(ref: BmhRef) -> TeardownResult:
 
 # --- uninstall-server ---------------------------------------------------------
 
-# The key HyperShift stores an admin kubeconfig under in its Secret.
-_KUBECONFIG_KEY = "kubeconfig"
 _INFRAENV_LABEL = "infraenvs.agent-install.openshift.io"
 
 
@@ -1276,25 +1272,14 @@ async def _hosted_kubeconfig(cluster: HostedClusterRef) -> str | None:
     )
     if hosted is None:
         return None
-    secret_name = ((hosted.get("status") or {}).get("kubeconfig") or {}).get("name")
+    secret_name = hosted_resources.admin_kubeconfig_secret(hosted)
     if not secret_name:
         raise HostedClusterAccessError(
             f"HostedCluster {label} publishes no status.kubeconfig, so its Nodes cannot be read"
         )
     data = await cluster_api.read_secret_data(cluster.namespace, secret_name)
-    encoded = (data or {}).get(_KUBECONFIG_KEY)
-    if not encoded:
-        raise HostedClusterAccessError(
-            f"Secret {cluster.namespace}/{secret_name} of HostedCluster {label} "
-            f"{'does not exist' if data is None else f'has no {_KUBECONFIG_KEY!r} key'}"
-        )
-    try:
-        return base64.b64decode(encoded, validate=True).decode()
-    except (binascii.Error, UnicodeDecodeError, ValueError):
-        raise HostedClusterAccessError(
-            f"Secret {cluster.namespace}/{secret_name} of HostedCluster {label} holds "
-            "no readable kubeconfig"
-        ) from None
+    # The one decode of an admin kubeconfig, shared with the cluster-upgrade limb.
+    return hosted_cluster_api.admin_kubeconfig(data, f"{cluster.namespace}/{secret_name}", label)
 
 
 @activity.defn

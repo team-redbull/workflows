@@ -10,6 +10,9 @@ from __future__ import annotations
 import pytest
 
 from shared.models.cluster_upgrade import (
+    AdminAckRule,
+    AdminAckState,
+    ApiUsage,
     ArgoApplicationState,
     CheckFailure,
     CheckResult,
@@ -194,7 +197,8 @@ class TestPreflightChecks:
             ({"health": HostedHealth(reachable=True, cluster_version_upgradeable=True, idms_mirrors=MIRRORS,
                                      operators_unhealthy=["ingress"])}, "operators-healthy", CheckFailure.NEEDS_HUMAN),
             ({"health": HostedHealth(reachable=True, cluster_version_upgradeable=False, idms_mirrors=MIRRORS,
-                                     upgradeable_message="AdminAckRequired")},
+                                     upgradeable_reason="ClusterOperatorsNotUpgradeable",
+                                     upgradeable_message="Cluster operator storage should not be upgraded")},
              "cluster-version-upgradeable", CheckFailure.NEEDS_HUMAN),
             ({"hosted": _hosted(progressing=True)}, "control-plane-idle", CheckFailure.WAIT),
             ({"health": HostedHealth(reachable=True, cluster_version_upgradeable=True, idms_mirrors=MIRRORS,
@@ -235,6 +239,35 @@ class TestPreflightChecks:
         assert not check.passed and check.on_failure is CheckFailure.WAIT
         assert check.observed.startswith("UpdateInProgress: ")
         assert gates.worst(list(checks.values())) is CheckFailure.WAIT
+
+    def test_a_missing_admin_ack_alone_stops_no_preflight(self):
+        # What the 4.19.53 lab cluster said (CONTEXT §8.11). The admin-ack step
+        # answers it before the next control-plane minor step, and HyperShift
+        # rolls NodePools regardless (§8.13), so neither waits on a person here.
+        check = _preflight(health=HostedHealth(
+            reachable=True, cluster_version_upgradeable=False, idms_mirrors=MIRRORS,
+            upgradeable_reason="AdminAckRequired",
+            upgradeable_message="The admissionregistration.k8s.io/v1beta1 group version is deprecated in 4.19",
+        ))["cluster-version-upgradeable"]
+        assert check.passed
+        assert check.observed.startswith("AdminAckRequired: ") and "before the next control-plane minor step" in check.observed
+
+    def test_an_admin_ack_during_a_running_update_waits(self):
+        # Two checks failing: the CVO says MultipleReasons on Upgradeable and
+        # keeps one condition per reason, which the reader lists.
+        check = _preflight(health=HostedHealth(
+            reachable=True, cluster_version_upgradeable=False, idms_mirrors=MIRRORS,
+            upgradeable_reason="MultipleReasons", upgradeable_reasons=["AdminAckRequired", "UpdateInProgress"],
+        ))["cluster-version-upgradeable"]
+        assert not check.passed and check.on_failure is CheckFailure.WAIT
+
+    def test_an_admin_ack_beside_another_reason_asks_a_person(self):
+        check = _preflight(health=HostedHealth(
+            reachable=True, cluster_version_upgradeable=False, idms_mirrors=MIRRORS,
+            upgradeable_reason="MultipleReasons",
+            upgradeable_reasons=["AdminAckRequired", "ClusterOperatorsNotUpgradeable"],
+        ))["cluster-version-upgradeable"]
+        assert not check.passed and check.on_failure is CheckFailure.NEEDS_HUMAN
 
     def test_missing_cvo_conditions_are_not_idle(self):
         check = _preflight(hosted=_hosted(conditions={}))["control-plane-idle"]
@@ -321,3 +354,69 @@ def test_release_templates_expand_to_the_full_mirror():
 
 def test_step_versions_are_each_release_once_in_plan_order():
     assert gates.step_versions(PLAN) == ["4.19.53", "4.20.44"]
+
+
+GATE = "ack-4.19-admissionregistration-v1beta1-api-removals-in-4.20"
+VWC = "validatingwebhookconfigurations.v1beta1.admissionregistration.k8s.io"
+VAP = "validatingadmissionpolicies.v1beta1.admissionregistration.k8s.io"
+RULE = AdminAckRule(gate=GATE, apis=[VWC, VAP], source="KCS 7130599")
+WALKER = "system:serviceaccount:kube-system:generic-garbage-collector"
+
+
+class TestAdminAcks:
+    """D16: which gates the CVO enforces now, and whether the run may ack them itself."""
+
+    @pytest.mark.parametrize(
+        ("gates_found", "acks", "pending"),
+        [
+            ({GATE: "removed in 4.20"}, {}, [GATE]),
+            ({GATE: "removed in 4.20"}, {GATE: "true"}, []),
+            # Only the exact string "true" acks a gate, as the CVO reads it.
+            ({GATE: "removed in 4.20"}, {GATE: "True"}, [GATE]),
+            # A gate of another minor does not apply to a 4.19 cluster.
+            ({"ack-4.18-kube-1.32-api-removals-in-4.19": "x", GATE: "y"}, {}, [GATE]),
+            # A name the CVO cannot parse is its error to report, a person's to read.
+            ({"ack-v1beta1-removals": "x"}, {}, ["ack-v1beta1-removals"]),
+        ],
+    )
+    def test_pending_gates_follow_the_cvo(self, gates_found, acks, pending):
+        state = AdminAckState(reachable=True, gates=gates_found, acks=acks)
+        assert list(gates.pending_admin_gates(state, "4.19.53")) == pending
+
+    def test_an_unused_listed_gate_is_the_run_s_to_ack(self):
+        [review] = gates.review_admin_gates({GATE: "m"}, [RULE], [], [WALKER])
+        assert review.listed and review.in_use == []
+
+    def test_only_callers_that_are_not_ignored_count(self):
+        usage = [
+            ApiUsage(api=VWC, username=WALKER, verbs=["list", "watch"], requests=40),
+            ApiUsage(api=VAP, username="system:serviceaccount:policy:kyverno", user_agent="kyverno/1.11",
+                     verbs=["get"], requests=3),
+            ApiUsage(api="ingresses.v1beta1.networking.k8s.io", username="bob", requests=9),  # another API
+            ApiUsage(api=VWC, username="alice", requests=0),
+        ]
+        [review] = gates.review_admin_gates({GATE: "m"}, [RULE], usage, [WALKER])
+        assert [use.username for use in review.in_use] == ["system:serviceaccount:policy:kyverno"]
+        assert "kyverno/1.11" in gates.describe_api_usage(review.in_use)
+
+    def test_a_gate_the_rules_do_not_list_is_a_person_s(self):
+        [review] = gates.review_admin_gates({"ack-4.19-something-else": "m"}, [RULE], [], [])
+        assert not review.listed
+
+    def test_every_api_is_asked_about_once(self):
+        other = AdminAckRule(gate="ack-4.21-x", apis=[VAP, "flowschemas.v1beta3.flowcontrol.apiserver.k8s.io"])
+        assert gates.admin_ack_apis([RULE, other]) == [VWC, VAP, "flowschemas.v1beta3.flowcontrol.apiserver.k8s.io"]
+
+    def test_the_approver_sees_the_acks_on_the_way(self):
+        assert gates.admin_acks_on_path(PLAN, [RULE]) == [f"{GATE} before 4.20.44"]
+        before_419 = AdminAckRule(gate="ack-4.18-kube-1.32-api-removals-in-4.19", apis=[VAP])
+        assert gates.admin_acks_on_path(PLAN, [before_419]) == [
+            "ack-4.18-kube-1.32-api-removals-in-4.19 before 4.19.53"
+        ]
+
+    def test_a_z_stream_step_needs_no_ack(self):
+        z_stream = PLAN.model_copy(update={
+            "control_plane": "4.19.20", "target": "4.19.53",
+            "steps": [UpgradeStep(kind=StepKind.CONTROL_PLANE, version="4.19.53", reason=StepReason.TARGET)],
+        })
+        assert gates.admin_acks_on_path(z_stream, [RULE]) == []

@@ -177,6 +177,10 @@ class UpgradeContext(BaseModel):
     verified_against_graph: str | None = None
     day1_path: str
     tier1_enabled: bool = False
+    # The acks the run may give by itself, and whose calls to a gated API do
+    # not count (rules file, D16). Empty in runs planned before them.
+    admin_acks: list[AdminAckRule] = Field(default_factory=list)
+    api_usage_ignored_users: list[str] = Field(default_factory=list)
 
 
 class UpgradePhase(str, Enum):
@@ -186,6 +190,8 @@ class UpgradePhase(str, Enum):
     PREFLIGHT = "preflight"
     AWAITING_APPROVAL = "awaiting-approval"
     WAITING_FOR_SLOT = "waiting-for-slot"
+    ADMIN_ACKS = "admin-acks"
+    AWAITING_ADMIN_ACK = "awaiting-admin-ack"
     CONTROL_PLANE_STEP = "control-plane-step"
     AWAITING_DAY2_CONFIRM = "awaiting-day2-confirm"
     AWAITING_CONTINUE = "awaiting-continue"
@@ -202,7 +208,7 @@ class UpgradePhase(str, Enum):
 
 
 class HumanDecision(BaseModel):
-    """The argument of approve, confirm-day2, pause, resume, abort and retry: who, and why."""
+    """The argument of approve, approve-admin-ack, confirm-day2, pause, resume, abort and retry: who, and why."""
 
     by: str
     reason: str | None = None
@@ -334,6 +340,20 @@ class UpgradeRulesRequest(BaseModel):
     mce_cluster: str
 
 
+class AdminAckRule(BaseModel):
+    """One `adminAcks[]` entry of day1 `upgrade/ladder.yaml`: an ack the run may give by itself (D16).
+
+    `gate` is the key in the hosted cluster's openshift-config-managed/admin-gates;
+    `apis` are the APIRequestCount names (`<resource>.<version>.<group>`) of the
+    APIs it covers. The run gives the ack only when nobody outside
+    `api_usage_ignored_users` called one of them in the last 24 hours.
+    """
+
+    gate: str
+    apis: list[str]
+    source: str = ""
+
+
 class UpgradeRules(BaseModel):
     """day1 `upgrade/ladder.yaml` plus `upgrade/mces/<mce>.yaml`, as read at `revision`."""
 
@@ -345,6 +365,8 @@ class UpgradeRules(BaseModel):
     mce_version: str
     supported_hosted_versions: list[str]
     max_concurrent_control_planes: int
+    admin_acks: list[AdminAckRule] = Field(default_factory=list)
+    api_usage_ignored_users: list[str] = Field(default_factory=list)
 
 
 class Day1ClusterRequest(BaseModel):
@@ -572,6 +594,12 @@ class HostedHealth(BaseModel):
     # (upgradeInProgressUpgradeable, pkg/cvo/upgradeable.go, release-4.19).
     upgradeable_reason: str | None = None
     upgradeable_message: str | None = None
+    # Every reason the CVO says no for. With one reason the CVO writes only the
+    # aggregate Upgradeable condition; with several it says MultipleReasons
+    # there and keeps one Upgradeable<Check> condition per reason, e.g.
+    # UpgradeableAdminAckRequired (setUpgradeableConditions, pkg/cvo/upgradeable.go,
+    # release-4.19). The reader lists those reasons; empty when upgradeable.
+    upgradeable_reasons: list[str] = Field(default_factory=list)
     nodes_not_ready: list[str] = Field(default_factory=list)
     nodepools_short: list[str] = Field(default_factory=list)  # below desired replicas
     pending_csrs: int = 0
@@ -579,6 +607,63 @@ class HostedHealth(BaseModel):
     dead_webhooks: list[str] = Field(default_factory=list)  # failurePolicy Fail, no endpoints
     # The mirror repositories of the hosted cluster's ImageDigestMirrorSets (day2 chart).
     idms_mirrors: list[str] = Field(default_factory=list)
+
+
+class AdminAckRequest(BaseModel):
+    mce_cluster: str
+    cluster: str
+    # The APIRequestCount names whose callers to report: every rule's `apis`.
+    apis: list[str] = Field(default_factory=list)
+
+
+class ApiUsage(BaseModel):
+    """One caller of one API in the last 24 hours, from the hosted cluster's APIRequestCount."""
+
+    api: str  # the APIRequestCount name
+    username: str
+    user_agent: str = ""
+    verbs: list[str] = Field(default_factory=list)
+    requests: int = 0
+
+
+class AdminAckState(BaseModel):
+    """The hosted cluster's admin gates, its acks, and who called the gated APIs (D16).
+
+    Read through the hosted cluster's admin kubeconfig, like HostedHealth. The
+    gates and acks are copied as found; deciding which gates apply is policy
+    (gates.pending_admin_gates), done the CVO's way.
+    """
+
+    reachable: bool
+    gates: dict[str, str] = Field(default_factory=dict)  # openshift-config-managed/admin-gates data
+    acks: dict[str, str] = Field(default_factory=dict)  # openshift-config/admin-acks data
+    usage: list[ApiUsage] = Field(default_factory=list)
+    # The CVO's UpgradeableAdminAckRequired message while that check fails
+    # (it is the aggregate Upgradeable condition's when it is the only reason),
+    # else None: how the run sees an ack take effect.
+    admin_ack_required: str | None = None
+
+
+class GiveAdminAckRequest(BaseModel):
+    """Set `gate` to "true" in the hosted cluster's openshift-config/admin-acks, and read it back."""
+
+    mce_cluster: str
+    cluster: str
+    gate: str
+
+
+class AdminAckGiven(BaseModel):
+    gate: str
+    changed: bool  # False when it was already "true"
+
+
+class AdminGateReview(BaseModel):
+    """What the run makes of one pending admin gate (gates.review_admin_gates)."""
+
+    gate: str
+    message: str  # what the gate says, as admin-gates holds it
+    listed: bool  # in the rules file's adminAcks
+    in_use: list[ApiUsage] = Field(default_factory=list)  # callers that count
 
 
 class ArgoSyncRequest(BaseModel):
@@ -632,6 +717,12 @@ class WatchNodePoolRequest(BaseModel):
     version: str
     stall_minutes: int
     deadline_minutes: int
+    # Report `stalled` early once a node of the NodePool has waited this long
+    # on a drain that the eviction API refuses (a PodDisruptionBudget at
+    # disruptionsAllowed 0). nodeDrainTimeout 0 waits for ever, so it never
+    # clears by itself (CONTEXT §8.13). The snapshot names the node, the PDB
+    # and its pods with their state, for the agent (D17). None: off.
+    drain_blocked_minutes: int | None = None
 
 
 class WatchOutcome(BaseModel):
@@ -672,7 +763,10 @@ class EvidenceBundle(BaseModel):
     """Read-only evidence for the agent, size-capped, never a Secret.
 
     `sections` maps a heading ("hostedcluster", "nodepools", "clusteroperators",
-    "events", "argo", "data-plane") to its rendered text.
+    "events", "argo", "data-plane") to its rendered text. For a NodePool, also
+    "drain": its cordoned nodes, the pods still on them with their state, the
+    PodDisruptionBudgets covering those pods with disruptionsAllowed, and the
+    hosted-cluster-config-operator's last `drainer` lines (D17).
     """
 
     sections: dict[str, str] = Field(default_factory=dict)

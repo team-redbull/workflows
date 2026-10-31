@@ -21,9 +21,12 @@ An OpenShift cluster lifecycle orchestrator built on Temporal. Four domains toda
 - **cluster-upgrade** (in progress) upgrades a HyperShift HostedCluster through
   day1 git and Argo CD, never by patching it: the control plane one minor at a
   time along a verified ladder, then the NodePools one at a time, at a person's
-  pace. **upgrade-cluster** and its control-plane step child are built and
-  tested on a fake fleet; their three limbs, and the routes that start a run,
-  come next — until then nothing can start one.
+  pace. Before a minor step it gives the admin ack the release asks for (4.19's
+  before 4.20) only when no client called the removed APIs in the last 24 hours;
+  otherwise it lists the callers and waits for a person. **upgrade-cluster**
+  and its control-plane step child are built and tested on a fake fleet; their
+  three limbs, and the routes that start a run, come next — until then nothing
+  can start one.
 
 **One entry point, one Temporal run.** The Segments Manager used to own creation and
 then fire a best-effort HTTP trigger at this service — which put creation outside

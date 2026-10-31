@@ -11,6 +11,8 @@ on every replay: no clock, no I/O, no set-iteration order in anything returned.
     every control-plane step and NodePool roll.
   * cluster_profile, nodepool_order, soak_minutes — how the workers roll (D7).
   * nodepool_roll_deadline_minutes — the machine deadline of one NodePool roll.
+  * pending_admin_gates, review_admin_gates — the admin acks a control-plane
+    minor step needs, and whether the run may give them itself (D16).
 
 Design: docs/upgrade/DESIGN.md §6–§7 in the Cluster-AutoUpgrade workspace.
 """
@@ -18,11 +20,16 @@ Design: docs/upgrade/DESIGN.md §6–§7 in the Cluster-AutoUpgrade workspace.
 from __future__ import annotations
 
 import math
+import re
 
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
     from shared.models.cluster_upgrade import (
+        AdminAckRule,
+        AdminAckState,
+        AdminGateReview,
+        ApiUsage,
         ArgoApplicationState,
         CheckFailure,
         CheckResult,
@@ -34,6 +41,7 @@ with workflow.unsafe.imports_passed_through():
         MceState,
         PinnedReleases,
         ReleaseLayout,
+        StepKind,
         UpgradeClusterInput,
         UpgradePlan,
         UpgradeRules,
@@ -57,6 +65,17 @@ _AUTO_APPROVE_WAVES = (0, 1)
 
 # The CVO's Upgradeable=False reason while its own update runs (4.19 and later).
 _UPDATE_IN_PROGRESS = "UpdateInProgress"
+# Its reason while an admin gate of the current minor has no ack. The run gives
+# or asks for the ack itself, right before a control-plane minor step (D16), and
+# HyperShift never gates a NodePool on Upgradeable — a NodePool rolled 4.17 ->
+# 4.19 under it on the sandbox (CONTEXT §8.13) — so it stops no pre-flight.
+ADMIN_ACK_REQUIRED = "AdminAckRequired"
+
+# How the CVO recognises an admin gate and the minor it belongs to
+# (adminAckGateFmt, gateApplicableToCurrentVersion, pkg/cvo/upgradeable.go,
+# cluster-version-operator release-4.19). A gate applies while the cluster's
+# current version has that minor.
+_ADMIN_GATE = re.compile(r"^ack-[4-5][.]([0-9]{1,})-[^-]")
 
 _SEVERITY = {
     CheckFailure.WAIT: 0,
@@ -364,23 +383,7 @@ def preflight_checks(
             ),
             on_failure=CheckFailure.NEEDS_HUMAN,
         ),
-        CheckResult(
-            name="cluster-version-upgradeable",
-            passed=health.cluster_version_upgradeable is True,
-            # Never answered by setting hypershift.openshift.io/force-upgrade-to
-            # (AGENT.md #13): a person decides why the cluster says no. The one
-            # exception is the CVO's own "an update is still running", which
-            # clears by itself, so it waits like control-plane-idle does.
-            expected="ClusterVersion Upgradeable=True",
-            observed=(
-                (f"{health.upgradeable_reason}: " if health.upgradeable_reason else "")
-                + (health.upgradeable_message or str(health.cluster_version_upgradeable))
-            ),
-            on_failure=(
-                CheckFailure.WAIT if health.upgradeable_reason == _UPDATE_IN_PROGRESS
-                else CheckFailure.NEEDS_HUMAN
-            ),
-        ),
+        _cluster_version_upgradeable(health),
         CheckResult(
             name="control-plane-idle",
             # Progressing alone is not enough: HyperShift drops it to False as soon
@@ -439,6 +442,44 @@ def preflight_checks(
     return checks
 
 
+def upgradeable_reasons(health: HostedHealth) -> list[str]:
+    """Every reason the CVO gives for Upgradeable=False; empty when it is True."""
+    if health.cluster_version_upgradeable is True:
+        return []
+    if health.upgradeable_reasons:
+        return list(health.upgradeable_reasons)
+    return [health.upgradeable_reason] if health.upgradeable_reason else []
+
+
+def _cluster_version_upgradeable(health: HostedHealth) -> CheckResult:
+    """Check 6's Upgradeable half. A person decides why the cluster says no — except for two reasons.
+
+    Never answered by setting hypershift.openshift.io/force-upgrade-to
+    (AGENT.md #13). UpdateInProgress, the CVO's own "an update is still
+    running", clears by itself, so it waits like control-plane-idle does.
+    AdminAckRequired is the admin-ack step's to answer (D16), right before the
+    next control-plane minor step.
+    """
+    reasons = upgradeable_reasons(health)
+    blocking = [reason for reason in reasons if reason != ADMIN_ACK_REQUIRED]
+    observed = (
+        (f"{', '.join(reasons)}: " if reasons else "")
+        + (health.upgradeable_message or str(health.cluster_version_upgradeable))
+    )
+    if reasons and not blocking:
+        observed += " (the run gives or asks for the ack before the next control-plane minor step)"
+    return CheckResult(
+        name="cluster-version-upgradeable",
+        passed=health.cluster_version_upgradeable is True or (bool(reasons) and not blocking),
+        expected="ClusterVersion Upgradeable=True, or only an admin ack missing",
+        observed=observed,
+        on_failure=(
+            CheckFailure.WAIT if blocking and all(reason == _UPDATE_IN_PROGRESS for reason in blocking)
+            else CheckFailure.NEEDS_HUMAN
+        ),
+    )
+
+
 def _idms_covers_release(
     hosted: HostedClusterState, health: HostedHealth, mce: MceState, release: ReleaseLayout
 ) -> CheckResult:
@@ -466,6 +507,99 @@ def _idms_covers_release(
         expected=f"{', '.join(needed)} mirrored for the control plane, the nodes and the MCE",
         observed="; ".join(gaps) or "covered",
         on_failure=CheckFailure.FAILED,
+    )
+
+
+# --- admin acks (D16) -------------------------------------------------------------
+
+
+def admin_gate_minor(gate: str) -> int | None:
+    """The minor an admin gate belongs to (19 for `ack-4.19-...`), or None when the CVO would not read it."""
+    match = _ADMIN_GATE.match(gate)
+    return int(match.group(1)) if match else None
+
+
+def pending_admin_gates(state: AdminAckState, control_plane_version: str) -> dict[str, str]:
+    """The admin gates the CVO enforces now and nobody has acked: gate -> its message.
+
+    The CVO's own rule (checkAdminGate, pkg/cvo/upgradeable.go, release-4.19):
+    a gate applies while its `ack-4.<minor>-` matches the minor of the cluster's
+    current version, and is acked only by the exact string "true" in admin-acks.
+    A gate name the CVO cannot parse is pending too: the CVO reports it as an
+    error, which a person has to look at.
+    """
+    minor = minor_of(control_plane_version)
+    pending = {}
+    for gate, message in sorted(state.gates.items()):
+        gate_minor = admin_gate_minor(gate)
+        if gate_minor is not None and gate_minor != minor:
+            continue
+        if state.acks.get(gate) == "true":
+            continue
+        pending[gate] = message
+    return pending
+
+
+def admin_ack_apis(rules: list[AdminAckRule]) -> list[str]:
+    """Every API the listed gates cover, once each, in rule order: what the reader reports callers of."""
+    apis: list[str] = []
+    for rule in rules:
+        apis.extend(api for api in rule.apis if api not in apis)
+    return apis
+
+
+def review_admin_gates(
+    pending: dict[str, str],
+    rules: list[AdminAckRule],
+    usage: list[ApiUsage],
+    ignored_users: list[str],
+) -> list[AdminGateReview]:
+    """For each pending gate: is it in the rules file, and who still calls its APIs.
+
+    A caller counts unless its user is in `ignored_users` (they walk every
+    registered API, Red Hat KCS 6955985). Strict on purpose: one request from
+    anyone else is enough to ask a person, because the ack is what lets the
+    removal happen.
+    """
+    by_gate = {rule.gate: rule for rule in rules}
+    reviews = []
+    for gate, message in pending.items():
+        rule = by_gate.get(gate)
+        in_use = [] if rule is None else [
+            use for use in usage
+            if use.api in rule.apis and use.username not in ignored_users and use.requests > 0
+        ]
+        reviews.append(AdminGateReview(gate=gate, message=message, listed=rule is not None, in_use=in_use))
+    return reviews
+
+
+def admin_acks_on_path(plan: UpgradePlan, rules: list[AdminAckRule]) -> list[str]:
+    """The listed admin acks the plan's control-plane minor steps will meet, for the approver.
+
+    Only what the rules file knows: a gate it does not list shows up at the
+    step itself, and waits for a person there.
+    """
+    found = []
+    version = plan.control_plane
+    for step in plan.steps:
+        if step.kind is not StepKind.CONTROL_PLANE:
+            continue
+        if minor_of(step.version) > minor_of(version):
+            found += [
+                f"{rule.gate} before {step.version}"
+                for rule in rules if admin_gate_minor(rule.gate) == minor_of(version)
+            ]
+        version = step.version
+    return found
+
+
+def describe_api_usage(usage: list[ApiUsage]) -> str:
+    """One line per caller: the API, who, with what, how often."""
+    return "\n".join(
+        f"  {use.api}: {use.username}"
+        + (f" ({use.user_agent})" if use.user_agent else "")
+        + f", {use.requests} requests" + (f" ({', '.join(use.verbs)})" if use.verbs else "")
+        for use in usage
     )
 
 

@@ -30,6 +30,7 @@ from shared.interfaces import upgrade_agent as agent_interface
 from shared.interfaces import upgrade_gitops as gitops_interface
 from shared.models.cluster_upgrade import (
     ActionDecision,
+    ApiUsage,
     CheckFailure,
     CheckResult,
     ClusterUpgradeSettings,
@@ -42,12 +43,14 @@ from shared.models.cluster_upgrade import (
     HumanDecision,
     NodePoolMode,
     ProposedAction,
+    ToolCallRecord,
     UpgradeOutcome,
     UpgradePhase,
     WatchResult,
 )
 from shared.workflow_ids import upgrade_control_plane_workflow_id
 from tests.cluster_upgrade_fakes import (
+    ADMIN_GATE,
     AGENT_QUEUE,
     CLUSTER,
     HUB_QUEUE,
@@ -67,6 +70,11 @@ from workflow_domains.cluster_upgrade.upgrade_control_plane import UpgradeContro
 
 ALICE = HumanDecision(by="alice")
 DAY2 = HumanDecision(by="day2-team")
+KYVERNO = ApiUsage(
+    api="validatingwebhookconfigurations.v1beta1.admissionregistration.k8s.io",
+    username="system:serviceaccount:kyverno:kyverno-admission-controller", user_agent="kyverno/v1.10.0",
+    verbs=["get", "update"], requests=12,
+)
 
 
 async def _approve_through_control_plane(h: Harness, steps: int = 2) -> None:
@@ -579,6 +587,35 @@ class TestGatesAndTheAgent:
         assert executed.approved_by == "alice" and executed.action.target == "openshift-monitoring/prom-0"
         assert [c for c in fleet.calls if c.startswith("gate:")] == ["gate:np-a", "gate:np-a"]
 
+    async def test_a_drain_a_pdb_blocks_goes_to_the_agent_early_and_lab_waves_let_it_act(self):
+        # Seen live (CONTEXT §8.13): an OpenShift PDB whose pods crash-loop
+        # blocks a node's drain for ever. The watch hands it over after
+        # DRAIN_BLOCKED_MINUTES; in a lab wave the agent deletes those pods
+        # itself (tier 1, AGENT.md #25) and the run watches once more (D17).
+        fleet = Fleet(control_plane="4.20.44", nodepools={"np-a": "4.19.53"},
+                      upgrade=ClusterUpgradeSettings(wave=0))
+        fleet.np_watch_script = [WatchResult.STALLED]
+        fleet.verdicts = [verdict(
+            "retry_gate",
+            diagnosis="the drain of w-2 waits on PDB openshift-console/downloads: both its pods are in CrashLoopBackOff",
+            actions_taken=[ToolCallRecord(tool="delete_pod", tier=1, judged="approved",
+                                          args={"namespace": "openshift-console", "name": "downloads-7f9c"},
+                                          result="deleted", at="2026-10-31T06:06:16Z")],
+        )]
+        async with Harness(fleet) as h:
+            await h.start(request(nodepool_mode=NodePoolMode.AUTO))
+            await h.until(UpgradePhase.AWAITING_APPROVAL)
+            await h.decide(Run.approve, ALICE)
+            result = await h.result()
+
+        assert result.outcome is UpgradeOutcome.DONE
+        assert {r.drain_blocked_minutes for r in fleet.np_watch_requests} == {10}
+        (asked,) = fleet.agent_requests
+        assert asked.tier1_enabled is True
+        # What the agent did is in the incident, and nobody was asked.
+        assert fleet.incidents[0].verdict.actions_taken[0].tool == "delete_pod"
+        assert not any(e.event == "needs-human" for e in result.log)
+
     async def test_a_control_plane_deadline_is_never_retried_by_the_run_itself(self):
         fleet = Fleet()
         fleet.cp_watch_script = [WatchResult.DEADLINE]
@@ -621,6 +658,170 @@ class TestGatesAndTheAgent:
         assert waiting.last_verdict.verdict == "needs_human"
         assert "could not be reached" in waiting.last_verdict.diagnosis
         assert fleet.incidents == []
+
+
+class TestAdminAcks:
+    """D16: before a control-plane minor step, the admin acks the hosted cluster asks for.
+
+    The default fleet's 4.19 control plane holds ack-4.19-admissionregistration-
+    v1beta1-api-removals-in-4.20, which the rules file lists, so every run in
+    this file that goes 4.19 -> 4.20 passes through this step.
+    """
+
+    async def test_with_no_caller_of_the_removed_apis_the_run_gives_the_ack_itself(self):
+        fleet = Fleet()
+        async with Harness(fleet) as h:
+            await h.start(request(nodepool_mode=NodePoolMode.AUTO))
+            approval = await h.until(UpgradePhase.AWAITING_APPROVAL)
+            assert f"{ADMIN_GATE} before 4.20.44" in approval.waiting_for
+            await _approve_through_control_plane(h)
+            result = await h.result()
+
+        assert result.outcome is UpgradeOutcome.DONE
+        assert fleet.acks_given == [ADMIN_GATE]
+        # Given at 4.19, after the step's pre-flight, before its commit.
+        assert fleet.calls.index(f"ack:{ADMIN_GATE}") < fleet.calls.index("commit:control-plane::4.20.44")
+        assert fleet.calls.index(f"ack:{ADMIN_GATE}") > fleet.calls.index("commit:control-plane::4.19.53")
+        (logged,) = [e for e in result.log if e.event == "admin-ack"]
+        assert logged.by == "workflow" and "no client called its APIs" in logged.detail
+
+    async def test_a_client_still_calling_a_removed_api_waits_for_a_person(self):
+        fleet = Fleet()
+        fleet.api_usage = [KYVERNO]
+        async with Harness(fleet) as h:
+            await h.start(request(nodepool_mode=NodePoolMode.AUTO))
+            await h.until(UpgradePhase.AWAITING_APPROVAL)
+            await h.decide(Run.approve, ALICE)
+            await h.until(UpgradePhase.AWAITING_DAY2_CONFIRM)
+            await h.decide(Run.confirm_day2, DAY2)
+            waiting = await h.until(UpgradePhase.AWAITING_ADMIN_ACK)
+            assert "kyverno-admission-controller (kyverno/v1.10.0), 12 requests (get, update)" in waiting.waiting_for
+            assert fleet.acks_given == [] and "control-plane::4.20.44" not in fleet.commit_summary()
+            # An approval answers for those callers, so it carries a reason.
+            refusal = await _refused(h, Run.approve_admin_ack, HumanDecision(by="carol"))
+            assert "needs a reason" in refusal
+            await h.decide(Run.approve_admin_ack, HumanDecision(by="carol", reason="kyverno 1.10 is gone next week"))
+            await h.until(UpgradePhase.AWAITING_DAY2_CONFIRM)
+            await h.decide(Run.confirm_day2, DAY2)
+            result = await h.result()
+
+        assert result.outcome is UpgradeOutcome.DONE
+        assert fleet.acks_given == [ADMIN_GATE]
+        (logged,) = [e for e in result.log if e.event == "admin-ack"]
+        assert logged.by == "carol" and "approved with 1 callers" in logged.detail
+
+    async def test_retry_checks_the_callers_again(self):
+        fleet = Fleet()
+        fleet.api_usage = [KYVERNO]
+        async with Harness(fleet) as h:
+            await h.start(request(nodepool_mode=NodePoolMode.AUTO))
+            await h.until(UpgradePhase.AWAITING_APPROVAL)
+            await h.decide(Run.approve, ALICE)
+            await h.until(UpgradePhase.AWAITING_DAY2_CONFIRM)
+            await h.decide(Run.confirm_day2, DAY2)
+            await h.until(UpgradePhase.AWAITING_ADMIN_ACK)
+            fleet.api_usage = []  # the client moved to admissionregistration.k8s.io/v1
+            await h.decide(Run.retry, ALICE)
+            await h.until(UpgradePhase.AWAITING_DAY2_CONFIRM)
+            await h.decide(Run.confirm_day2, DAY2)
+            result = await h.result()
+        (logged,) = [e for e in result.log if e.event == "admin-ack"]
+        assert logged.by == "workflow"
+
+    async def test_callers_that_walk_every_api_do_not_count(self):
+        fleet = Fleet()
+        fleet.api_usage = [ApiUsage(api=KYVERNO.api, username="system:kube-controller-manager",
+                                    verbs=["list", "watch"], requests=300)]
+        async with Harness(fleet) as h:
+            await h.start(request(nodepool_mode=NodePoolMode.AUTO))
+            await _approve_through_control_plane(h)
+            result = await h.result()
+        assert result.outcome is UpgradeOutcome.DONE and fleet.acks_given == [ADMIN_GATE]
+
+    async def test_a_gate_the_rules_do_not_list_is_acked_by_a_person_never_by_the_run(self):
+        fleet = Fleet()
+        fleet.admin_gates["ack-4.19-kube-1.33-api-removals-in-4.20"] = "Kubernetes 1.33 removes an API."
+        async with Harness(fleet) as h:
+            await h.start(request(nodepool_mode=NodePoolMode.AUTO))
+            await h.until(UpgradePhase.AWAITING_APPROVAL)
+            await h.decide(Run.approve, ALICE)
+            await h.until(UpgradePhase.AWAITING_DAY2_CONFIRM)
+            await h.decide(Run.confirm_day2, DAY2)
+            waiting = await h.until(UpgradePhase.NEEDS_HUMAN)
+            assert "ack-4.19-kube-1.33-api-removals-in-4.20: Kubernetes 1.33 removes an API." in waiting.waiting_for
+            assert fleet.acks_given == []
+            fleet.admin_acks["ack-4.19-kube-1.33-api-removals-in-4.20"] = "true"  # a person, by hand
+            await h.decide(Run.retry, ALICE)
+            await h.until(UpgradePhase.AWAITING_DAY2_CONFIRM)
+            await h.decide(Run.confirm_day2, DAY2)
+            result = await h.result()
+        assert result.outcome is UpgradeOutcome.DONE
+        assert fleet.acks_given == [ADMIN_GATE]
+
+    async def _until_the_cvo_lags(self, h: Harness) -> None:
+        await h.until(UpgradePhase.AWAITING_APPROVAL)
+        await h.decide(Run.approve, ALICE)
+        await h.until(UpgradePhase.AWAITING_DAY2_CONFIRM)
+        await h.decide(Run.confirm_day2, DAY2)
+        while not ((await h.progress()).waiting_for or "").startswith("the CVO to take the admin acks"):
+            await asyncio.sleep(0.02)
+
+    async def test_the_commit_waits_for_the_cvo_to_take_the_ack(self):
+        fleet = Fleet()
+        fleet.cvo_ack_lag = 3
+        async with Harness(fleet) as h:
+            await h.start(request(nodepool_mode=NodePoolMode.AUTO))
+            await self._until_the_cvo_lags(h)
+            assert "control-plane::4.20.44" not in fleet.commit_summary()
+            await h.env.sleep(timedelta(minutes=5))
+            await h.until(UpgradePhase.AWAITING_DAY2_CONFIRM)
+            await h.decide(Run.confirm_day2, DAY2)
+            result = await h.result()
+        assert result.outcome is UpgradeOutcome.DONE
+        # Before 4.19: one read, nothing pending. Before 4.20: pending, then
+        # three reads where the CVO still says AdminAckRequired, then clear.
+        assert fleet.calls.count("read_admin_acks") == 1 + 5
+
+    async def test_a_cvo_that_never_takes_the_ack_is_a_person_s_call(self):
+        fleet = Fleet()
+        fleet.cvo_ack_lag = 100
+        async with Harness(fleet) as h:
+            await h.start(request(nodepool_mode=NodePoolMode.AUTO))
+            await self._until_the_cvo_lags(h)
+            await h.env.sleep(timedelta(minutes=15))
+            waiting = await h.until(UpgradePhase.NEEDS_HUMAN)
+            assert "yet the CVO still says AdminAckRequired" in waiting.waiting_for
+            assert "control-plane::4.20.44" not in fleet.commit_summary()
+            await h.decide(Run.abort, HumanDecision(by="alice", reason="end of test"))
+            await h.result()
+
+    async def test_a_nodepool_roll_is_not_held_by_a_missing_ack(self):
+        # Workers two minors behind a 4.19 control plane roll before it may go
+        # to 4.20 (D4) — with the gate still un-acked, as HyperShift allows
+        # (CONTEXT §8.13). The ack comes after, right before the 4.20 commit.
+        fleet = Fleet(control_plane="4.19.53", nodepools={"np-a": "4.17.58"})
+        async with Harness(fleet) as h:
+            await h.start(request(nodepool_mode=NodePoolMode.AUTO))
+            await h.until(UpgradePhase.AWAITING_APPROVAL)
+            await h.decide(Run.approve, ALICE)
+            await h.until(UpgradePhase.AWAITING_DAY2_CONFIRM)
+            await h.decide(Run.confirm_day2, DAY2)
+            result = await h.result()
+        assert result.outcome is UpgradeOutcome.DONE
+        assert not any(e.event == "needs-human" for e in result.log)
+        roll = next(c for c in fleet.calls if c.startswith("commit:nodepool:np-a:"))
+        assert fleet.calls.index(roll) < fleet.calls.index(f"ack:{ADMIN_GATE}")
+        assert fleet.calls.index(f"ack:{ADMIN_GATE}") < fleet.calls.index("commit:control-plane::4.20.44")
+
+    async def test_approve_admin_ack_is_refused_unless_the_run_waits_for_it(self):
+        fleet = Fleet()
+        async with Harness(fleet) as h:
+            await h.start(request())
+            await h.until(UpgradePhase.AWAITING_APPROVAL)
+            refusal = await _refused(h, Run.approve_admin_ack, HumanDecision(by="carol", reason="r"))
+            assert "approve-admin-ack is not waited for" in refusal
+            await h.decide(Run.abort, HumanDecision(by="alice", reason="end of test"))
+            await h.result()
 
 
 class TestTheMirrorAndGit:

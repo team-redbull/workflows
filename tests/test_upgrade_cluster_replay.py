@@ -34,6 +34,7 @@ from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.worker import Replayer
 
 from shared.models.cluster_upgrade import (
+    ApiUsage,
     ContinueNodePool,
     HumanDecision,
     NodePoolMode,
@@ -107,10 +108,32 @@ async def _control_plane_stall(h: Harness) -> None:
     await h.result()
 
 
+async def _admin_ack_in_use(h: Harness) -> None:
+    # A client still calls a removed API: the run waits for a person, who
+    # retries once, then approves (D16).
+    h.fleet.api_usage = [ApiUsage(
+        api="validatingwebhookconfigurations.v1beta1.admissionregistration.k8s.io",
+        username="system:serviceaccount:kyverno:kyverno", verbs=["get"], requests=4,
+    )]
+    await h.start(request(nodepool_mode=NodePoolMode.AUTO, workers_to_target=False))
+    await h.until(UpgradePhase.AWAITING_APPROVAL)
+    await h.decide(Run.approve, ALICE)
+    await h.until(UpgradePhase.AWAITING_DAY2_CONFIRM)
+    await h.decide(Run.confirm_day2, HumanDecision(by="day2-team"))
+    await h.until(UpgradePhase.AWAITING_ADMIN_ACK)
+    await h.decide(Run.retry, ALICE)
+    await h.until(UpgradePhase.AWAITING_ADMIN_ACK)
+    await h.decide(Run.approve_admin_ack, HumanDecision(by="alice", reason="kyverno is being replaced"))
+    await h.until(UpgradePhase.AWAITING_DAY2_CONFIRM)
+    await h.decide(Run.confirm_day2, HumanDecision(by="day2-team"))
+    await h.result()
+
+
 SCENARIOS: dict[str, tuple[Callable[[], Fleet], Callable[[Harness], Awaitable[None]]]] = {
     "happy-path": (Fleet, _happy_path),
     "abort-mid-roll": (Fleet, _abort_mid_roll),
     "control-plane-stall": (Fleet, _control_plane_stall),
+    "admin-ack-in-use": (Fleet, _admin_ack_in_use),
     "agent-then-person": (
         lambda: Fleet(control_plane="4.20.44", nodepools={"np-a": "4.19.53"}),
         _agent_then_person,

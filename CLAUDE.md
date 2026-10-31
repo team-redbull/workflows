@@ -710,8 +710,8 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   shape would let the old limb act on the wrong input and FAIL them (`locate_cluster_file(cluster:
   str)` would have searched `main` and raised `ClusterFileNotFoundError`).
 - **A person's decision on a running workflow is a Temporal UPDATE with a validator, never a
-  signal** (upgrade-cluster: approve, continue, confirm-day2, pause, resume, abort, retry, tier-2
-  actions). The caller must learn AT ONCE whether the run took it: a `continue` while no NodePool
+  signal** (upgrade-cluster: approve, approve-admin-ack, continue, confirm-day2, pause, resume,
+  abort, retry, tier-2 actions). The caller must learn AT ONCE whether the run took it: a `continue` while no NodePool
   waits is a 409 naming what the run does wait for, where a signal would vanish into a run that
   ignores it. The VALIDATOR only reads state and refuses by raising
   `ApplicationError(type=UpgradeUpdateRefusedError.__name__)`; the HANDLER is a plain `def` that

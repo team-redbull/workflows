@@ -135,6 +135,16 @@ class AbortRequest(DecisionRequest):
     reason: str = Field(min_length=1, description="Why; an abort is never anonymous or unexplained.")
 
 
+class AdminAckApprovalRequest(DecisionRequest):
+    reason: str = Field(
+        min_length=1,
+        description=(
+            "Why the clients the run listed may lose the API this ack lets the upgrade remove "
+            "(they moved off it, or they may break). Recorded in the run's log."
+        ),
+    )
+
+
 class ContinueRequest(ContinueNodePool):
     model_config = ConfigDict(extra="forbid")
 
@@ -222,6 +232,19 @@ async def approve(
     return await _decide(client, workflow_id, UpgradeClusterWorkflow.approve, HumanDecision(**decision.model_dump()), "approve")
 
 
+@router.post(f"{_UPGRADE_CLUSTER_PATH}/{{workflow_id}}/approve-admin-ack", response_model=DecisionResponse)
+async def approve_admin_ack(
+    workflow_id: str, decision: AdminAckApprovalRequest, client: Client = Depends(get_temporal_client)
+) -> DecisionResponse:
+    """Give the admin acks a control-plane minor step needs although clients still call the APIs
+    they remove (listed in the run's `waiting_for`). Only while the run waits for it; `retry`
+    instead checks the callers again."""
+    return await _decide(
+        client, workflow_id, UpgradeClusterWorkflow.approve_admin_ack,
+        HumanDecision(**decision.model_dump()), "approve-admin-ack",
+    )
+
+
 @router.post(f"{_UPGRADE_CLUSTER_PATH}/{{workflow_id}}/continue", response_model=DecisionResponse)
 async def continue_nodepool(
     workflow_id: str, decision: ContinueRequest, client: Client = Depends(get_temporal_client)
@@ -272,7 +295,8 @@ async def abort(
 async def retry(
     workflow_id: str, decision: DecisionRequest, client: Client = Depends(get_temporal_client)
 ) -> DecisionResponse:
-    """Re-run what failed. Only while the run waits for a person (needs-human)."""
+    """Re-run what failed. Only while the run waits for a person (needs-human), or for an
+    admin-ack approval, where it checks the API callers again."""
     return await _decide(client, workflow_id, UpgradeClusterWorkflow.retry, HumanDecision(**decision.model_dump()), "retry")
 
 

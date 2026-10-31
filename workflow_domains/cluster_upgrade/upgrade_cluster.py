@@ -19,11 +19,15 @@ what a person has to do next):
   3. awaiting-approval  — the one approval, before anything is committed
                           (AGENT.md #3). `abort` here CANCELS: nothing changed.
   4. the steps, in plan order:
-       control plane     — pre-flight 5–10, a free slot on the MCE, then the
-                           child workflow (upgrade_control_plane.py) commits,
-                           syncs and watches. Then awaiting-day2-confirm: the
-                           day2 team syncs their layer for the new version and
-                           confirms (D14). After EVERY control-plane step.
+       control plane     — pre-flight 5–10; before a MINOR step, the admin
+                           acks the hosted cluster asks for (D16: given by the
+                           run when no client used the APIs they remove in the
+                           last 24 hours, else awaiting-admin-ack); a free slot
+                           on the MCE; then the child workflow
+                           (upgrade_control_plane.py) commits, syncs and
+                           watches. Then awaiting-day2-confirm: the day2 team
+                           syncs their layer for the new version and confirms
+                           (D14). After EVERY control-plane step.
        workers           — for each NodePool: awaiting-continue (manual mode;
                            auto mode goes on after the soak), pre-flight 5–10,
                            the digest re-checked, the commit and the sync, the
@@ -36,11 +40,11 @@ A failed gate goes to the agent once (dispatch.diagnose); it may clear the gate
 for ONE more try. Anything else is needs-human: `retry` re-runs the same gate,
 and a tier-2 action the agent proposed runs only after a person approves it.
 
-PEOPLE DRIVE IT THROUGH UPDATES, never signals: approve, continue_nodepool,
-confirm_day2, pause, resume, abort, retry, approve_action, reject_action. Each
-has a validator that only reads state and refuses a decision the run is not
-waiting for, so the API can answer 409 at once instead of a signal vanishing
-into a run that ignores it. Handlers only record the decision; this `run`
+PEOPLE DRIVE IT THROUGH UPDATES, never signals: approve, approve_admin_ack,
+continue_nodepool, confirm_day2, pause, resume, abort, retry, approve_action,
+reject_action. Each has a validator that only reads state and refuses a
+decision the run is not waiting for, so the API can answer 409 at once instead
+of a signal vanishing into a run that ignores it. Handlers only record the decision; this `run`
 loop does all the work, in one ordered place.
 
 WAITING IS FREE. Every human wait is a `wait_condition` on a flag a handler
@@ -50,8 +54,8 @@ NodePool, which keeps each run short however long the upgrade, and lets new
 code take over between units.
 
 ABORT AND PAUSE ARE CHECKED RIGHT BEFORE EVERY ACT: every commit, every sync,
-every child start and every agent call (`_checkpoint`), besides every wait and
-every watch. An abort stops the control-plane child by signal and waits for it,
+every admin ack, every child start and every agent call (`_checkpoint`), besides
+every wait and every watch. An abort stops the control-plane child by signal and waits for it,
 then commits `pausedUntil` for the HostedCluster and its NodePools and syncs
 (ABORTED); if Argo CD refuses that sync, a person is asked, never the run
 failed. Before approval an abort CANCELS, with nothing committed. There is no
@@ -87,6 +91,8 @@ with workflow.unsafe.imports_passed_through():
     )
     from shared.interfaces.cluster_upgrade import (
         execute_proposed_action,
+        give_admin_ack,
+        read_admin_acks,
         read_argo_application,
         read_hosted_cluster,
         read_hosted_health,
@@ -105,6 +111,10 @@ with workflow.unsafe.imports_passed_through():
     )
     from shared.models.cluster_upgrade import (
         ActionDecision,
+        AdminAckGiven,
+        AdminAckRequest,
+        AdminAckState,
+        AdminGateReview,
         AgentVerdict,
         ArgoSyncRequest,
         CheckFailure,
@@ -120,6 +130,7 @@ with workflow.unsafe.imports_passed_through():
         Day2LayersRequest,
         GateOutcome,
         GateResult,
+        GiveAdminAckRequest,
         HostedClusterRequest,
         HostedClusterState,
         HostedHealthRequest,
@@ -152,7 +163,7 @@ with workflow.unsafe.imports_passed_through():
         WatchOutcome,
         WatchResult,
     )
-    from shared.ocp_version import minor_name, parse_minor, release_tag
+    from shared.ocp_version import minor_name, minor_of, parse_minor, release_tag
     from shared.workflow_ids import upgrade_control_plane_workflow_id
 
 from workflow_domains.cluster_upgrade import gates
@@ -180,6 +191,10 @@ from workflow_domains.cluster_upgrade.upgrade_path import recommended_target, re
 # A NodePool roll with no node finishing in this long is a stall worth a
 # diagnosis; its deadline is per batch of nodes (gates.nodepool_roll_deadline_minutes).
 NODEPOOL_STALL_MINUTES = 30
+# A drain the eviction API refuses (a PDB at disruptionsAllowed 0) never clears
+# by itself — nodeDrainTimeout 0 waits for ever — so the watch hands it to the
+# agent after this long instead of the full stall window (D17; CONTEXT §8.13).
+DRAIN_BLOCKED_MINUTES = 10
 # The gate's own deadline, on top of the soak it has to hold for.
 GATE_DEADLINE_MINUTES = 60
 # A control plane still settling (pre-flight check 7) is re-checked this
@@ -189,11 +204,18 @@ _SETTLE_DEADLINE = timedelta(minutes=30)
 # Every control-plane slot of the MCE busy: look again this often. The other
 # runs' steps are bounded by their own deadlines, so this wait is too.
 _SLOT_POLL = timedelta(minutes=2)
+# An ack given, the CVO not yet past AdminAckRequired: it re-checks as soon as
+# admin-acks changes (its ConfigMap informer, pkg/cvo/upgradeable.go), so a
+# few minutes is generous before a person is asked.
+_ACK_SETTLE_POLL = timedelta(minutes=1)
+_ACK_SETTLE_DEADLINE = timedelta(minutes=10)
 
-# Tier-1 actions stay off until the fault-injection evals are green and the
-# same fix has been approved repeatedly (AGENT.md #25): everything the agent
-# wants to do is a proposal a person approves.
-_TIER1_ENABLED = False
+# The waves whose agent runs tier-1 actions itself, judge-reviewed, within its
+# budget: lab and canary (AGENT.md #25). Everywhere else every action is a
+# proposal a person approves, until the fault-injection evals are green and the
+# same fix has been approved repeatedly — graduating a wave is a reviewed change
+# here. Settled at planning, from the cluster file's `upgrade.wave`.
+_TIER1_WAVES = (0, 1)
 
 _LOG_LIMIT = 500
 _PROGRESS_LOG_TAIL = 20
@@ -244,6 +266,7 @@ class UpgradeClusterWorkflow:
         self._log_entries: list[UpgradeLogEntry] = []
         # Decisions recorded by the Update handlers, consumed by run().
         self._approval: HumanDecision | None = None
+        self._admin_ack_approval: HumanDecision | None = None
         self._continue: ContinueNodePool | None = None
         self._continue_choices: list[str] = []
         self._day2_confirmed: HumanDecision | None = None
@@ -307,6 +330,20 @@ class UpgradeClusterWorkflow:
     @approve.validator
     def _validate_approve(self, decision: HumanDecision) -> None:
         self._require_phase(UpgradePhase.AWAITING_APPROVAL, "approve")
+
+    @workflow.update
+    def approve_admin_ack(self, decision: HumanDecision) -> None:
+        self._admin_ack_approval = decision
+        self._log("admin-ack-approved", decision.by, decision.reason or "")
+
+    @approve_admin_ack.validator
+    def _validate_approve_admin_ack(self, decision: HumanDecision) -> None:
+        self._require_phase(UpgradePhase.AWAITING_ADMIN_ACK, "approve-admin-ack")
+        if not (decision.reason or "").strip():
+            self._refuse(
+                "approve-admin-ack needs a reason: clients still call the APIs this ack lets the "
+                "upgrade remove, and the reason records why that is acceptable"
+            )
 
     @workflow.update
     def continue_nodepool(self, decision: ContinueNodePool) -> None:
@@ -373,7 +410,9 @@ class UpgradeClusterWorkflow:
 
     @retry.validator
     def _validate_retry(self, decision: HumanDecision) -> None:
-        self._require_phase(UpgradePhase.NEEDS_HUMAN, "retry")
+        # Waiting for an admin ack, retry checks the API callers again.
+        if self._phase is not UpgradePhase.AWAITING_ADMIN_ACK:
+            self._require_phase(UpgradePhase.NEEDS_HUMAN, "retry")
 
     @workflow.update
     def approve_action(self, decision: ActionDecision) -> None:
@@ -493,7 +532,9 @@ class UpgradeClusterWorkflow:
             release=rules.release,
             verified_against_graph=rules.verified_against_graph,
             day1_path=day1.path,
-            tier1_enabled=_TIER1_ENABLED,
+            tier1_enabled=day1.upgrade.wave in _TIER1_WAVES,
+            admin_acks=rules.admin_acks,
+            api_usage_ignored_users=rules.api_usage_ignored_users,
         )
         if not plan.steps:
             self._context = context
@@ -529,8 +570,14 @@ class UpgradeClusterWorkflow:
             return False
         self._phase = UpgradePhase.AWAITING_APPROVAL
         verified = context.verified_against_graph or "never"
+        acks = gates.admin_acks_on_path(context.plan, context.admin_acks)
         self._waiting_for = (
             f"approve: {self._plan_summary()}. Ladder last checked against the upgrade graph: {verified}"
+            + (
+                ". Admin acks on the way, given by the run only if no client called the APIs they "
+                f"remove in the 24 hours before (else it asks): {'; '.join(acks)}"
+                if acks else ""
+            )
         )
         await self._wait_for(lambda: self._approval is not None)
         self._approved_by = self._approval.by if self._approval else None
@@ -595,6 +642,8 @@ class UpgradeClusterWorkflow:
             await self._checkpoint()
             if not self._step_committed:
                 await self._preflight(include_idms=False, nodepools=[])
+                if minor_of(step.version) > minor_of(from_version):
+                    await self._admin_acks(step, from_version)
             await self._take_current_day1_if_stale()
             child = await self._take_slot(step, from_version)
             try:
@@ -636,6 +685,106 @@ class UpgradeClusterWorkflow:
         self._day2_confirmed = None
         self._phase = UpgradePhase.CONTROL_PLANE_STEP
         self._waiting_for = None
+
+    async def _admin_acks(self, step: UpgradeStep, from_version: str) -> None:
+        """Right before a control-plane minor step: the admin acks the hosted cluster asks for (D16).
+
+        Some releases make an administrator acknowledge an API removal before
+        the control plane may leave their minor (4.19 before 4.20): until then
+        its CVO says Upgradeable=False, AdminAckRequired, and HyperShift refuses
+        a minor change of the HostedCluster (isUpgrading). Each pending gate is:
+          * listed in the rules file, its APIs unused in the last 24 hours —
+            acked by the run, with the workflow identity;
+          * listed, its APIs still called — awaiting-admin-ack: a person
+            approves (answering for the callers shown) or retries (check
+            again, once the callers moved off the API);
+          * not listed — needs-human: a person acks it by hand, then retries.
+        Done once nothing is pending AND the CVO no longer says
+        AdminAckRequired: a commit before that would be refused. An ack given
+        is never taken back; it allows a minor step, it does not start one.
+        """
+        context = self._ctx
+        request = AdminAckRequest(
+            mce_cluster=self._mce, cluster=self._cluster, apis=gates.admin_ack_apis(context.admin_acks)
+        )
+        approved_by: dict[str, str] = {}
+        settling = timedelta(0)
+        while True:
+            await self._checkpoint()
+            self._phase = UpgradePhase.ADMIN_ACKS
+            self._waiting_for = None
+            state: AdminAckState = await on_mce(self._mce, read_admin_acks, request)
+            if not state.reachable:
+                await self._needs_human(f"admin acks before {step.version}: the hosted cluster's API is unreachable")
+                continue
+            pending = gates.pending_admin_gates(state, from_version)
+            if not pending:
+                if state.admin_ack_required is None:
+                    return
+                if settling < _ACK_SETTLE_DEADLINE:
+                    self._waiting_for = f"the CVO to take the admin acks: it still says {state.admin_ack_required}"
+                    await self._sleep_or_abort(_ACK_SETTLE_POLL)
+                    settling += _ACK_SETTLE_POLL
+                    continue
+                await self._needs_human(
+                    f"admin acks before {step.version}: every gate is acked, yet the CVO still says "
+                    f"AdminAckRequired: {state.admin_ack_required}"
+                )
+                settling = timedelta(0)
+                continue
+            reviews = gates.review_admin_gates(
+                pending, context.admin_acks, state.usage, context.api_usage_ignored_users
+            )
+            unlisted = [review for review in reviews if not review.listed]
+            if unlisted:
+                await self._needs_human(
+                    f"before {step.version} the hosted cluster asks for admin acks the rules file does not list:\n"
+                    + "\n".join(f"  {review.gate}: {review.message}" for review in unlisted)
+                    + "\nCheck the removal it names, then set the ack by hand in the hosted cluster's "
+                    "openshift-config/admin-acks, or list it in upgrade/ladder.yaml adminAcks, and retry"
+                )
+                continue
+            in_use = [review for review in reviews if review.in_use and review.gate not in approved_by]
+            if in_use:
+                decision = await self._await_admin_ack_approval(step, in_use)
+                if decision is None:
+                    continue
+                approved_by.update({review.gate: decision.by for review in in_use})
+            for review in reviews:
+                await self._checkpoint()
+                given: AdminAckGiven = await on_mce(
+                    self._mce, give_admin_ack,
+                    GiveAdminAckRequest(mce_cluster=self._mce, cluster=self._cluster, gate=review.gate),
+                )
+                self._log(
+                    "admin-ack",
+                    approved_by.get(review.gate, "workflow"),
+                    review.gate + (
+                        f": approved with {len(review.in_use)} callers in the last 24 hours" if review.in_use
+                        else ": no client called its APIs in the last 24 hours"
+                    ) + ("" if given.changed else " (already acked)"),
+                )
+
+    async def _await_admin_ack_approval(
+        self, step: UpgradeStep, in_use: list[AdminGateReview]
+    ) -> HumanDecision | None:
+        """awaiting-admin-ack, with the callers listed. The approval, or None for a retry."""
+        self._admin_ack_approval = None
+        self._retry = None
+        self._phase = UpgradePhase.AWAITING_ADMIN_ACK
+        callers = "\n".join(f"{review.gate}:\n{gates.describe_api_usage(review.in_use)}" for review in in_use)
+        self._waiting_for = (
+            f"approve-admin-ack or retry: before {step.version} the hosted cluster needs admin acks, "
+            f"and clients called the APIs they remove in the last 24 hours:\n{callers}\n"
+            "Move them to the new API version. Then approve-admin-ack with a reason (you answer for "
+            "them), or retry to check again (the count covers 24 hours)"
+        )
+        self._log("admin-ack-in-use", detail=callers)
+        await self._wait_for(lambda: self._admin_ack_approval is not None or self._retry is not None)
+        decision, self._admin_ack_approval, self._retry = self._admin_ack_approval, None, None
+        self._phase = UpgradePhase.ADMIN_ACKS
+        self._waiting_for = None
+        return decision
 
     async def _drive_child(self, child: workflow.ChildWorkflowHandle, step: UpgradeStep) -> UpgradeControlPlaneResult:
         """Await the step's child: pass it a pause, and a person's retry whenever it reports needing one.
@@ -847,6 +996,7 @@ class UpgradeClusterWorkflow:
                     version=step.version,
                     stall_minutes=NODEPOOL_STALL_MINUTES,
                     deadline_minutes=deadline,
+                    drain_blocked_minutes=DRAIN_BLOCKED_MINUTES,
                 ),
                 deadline_minutes=deadline,
             )
@@ -1154,7 +1304,7 @@ class UpgradeClusterWorkflow:
         self._waiting_for = None
 
     async def _checkpoint(self) -> None:
-        """Right before every act — a commit, a sync, a child start, an agent call.
+        """Right before every act — a commit, a sync, an admin ack, a child start, an agent call.
 
         An abort stops the run here; a pause holds it here until resume.
         """

@@ -36,8 +36,13 @@ from shared.consts import (
 from shared.exceptions import ArgoSyncRefusedError, Day1FileChangedError
 from shared.models.cluster_upgrade import (
     ActionResult,
+    AdminAckGiven,
+    AdminAckRequest,
+    AdminAckRule,
+    AdminAckState,
     AgentRequest,
     AgentVerdict,
+    ApiUsage,
     ArgoApplicationState,
     ArgoSyncRequest,
     ArgoSyncResult,
@@ -54,6 +59,7 @@ from shared.models.cluster_upgrade import (
     EvidenceRequest,
     GateOutcome,
     GateResult,
+    GiveAdminAckRequest,
     HostedClusterRequest,
     HostedClusterState,
     HostedHealth,
@@ -83,8 +89,9 @@ from shared.models.cluster_upgrade import (
     WatchOutcome,
     WatchResult,
 )
+from shared.ocp_version import minor_of
 from shared.workflow_ids import upgrade_cluster_workflow_id
-from workflow_domains.cluster_upgrade.gates import release_repositories
+from workflow_domains.cluster_upgrade.gates import admin_gate_minor, release_repositories
 from workflow_domains.cluster_upgrade.upgrade_cluster import UpgradeClusterWorkflow
 from workflow_domains.cluster_upgrade.upgrade_control_plane import UpgradeControlPlaneWorkflow
 
@@ -110,6 +117,24 @@ LADDER = [
 ]
 SUPPORTED = ["4.22", "4.21", "4.20", "4.19", "4.18"]
 DAY1_PATH = f"sites/site1/mces/{MCE}/hostedClusters/{CLUSTER}.yaml"
+
+# The admin gate a 4.19 cluster holds (CONTEXT §8.11), as the rules file lists it.
+ADMIN_GATE = "ack-4.19-admissionregistration-v1beta1-api-removals-in-4.20"
+ADMIN_GATE_MESSAGE = (
+    "The admissionregistration.k8s.io/v1beta1 group version is deprecated in 4.19 and will be removed in 4.20."
+)
+GATED_APIS = [
+    f"{resource}.v1beta1.admissionregistration.k8s.io"
+    for resource in ("mutatingwebhookconfigurations", "validatingwebhookconfigurations",
+                     "validatingadmissionpolicies", "validatingadmissionpolicybindings")
+]
+ADMIN_ACKS = [AdminAckRule(gate=ADMIN_GATE, apis=GATED_APIS, source="Red Hat KCS 7130599")]
+IGNORED_USERS = [
+    "system:serviceaccount:kube-system:generic-garbage-collector",
+    "system:serviceaccount:kube-system:namespace-controller",
+    "system:kube-controller-manager",
+    "system:cluster-policy-controller",
+]
 
 
 def digest(version: str, salt: str = "") -> PinnedRelease:
@@ -163,6 +188,14 @@ class Fleet:
         self.gate_script: list[GateOutcome] = []
         self.verdicts: list[AgentVerdict] = []
         self.health_script: list[HostedHealth] = []
+        # The hosted cluster's admin gates (admin-gates) and acks (admin-acks),
+        # who called the gated APIs in the last 24 hours, and how many reads
+        # after an ack the CVO still says AdminAckRequired.
+        self.admin_gates: dict[str, str] = {ADMIN_GATE: ADMIN_GATE_MESSAGE}
+        self.admin_acks: dict[str, str] = {}
+        self.api_usage: list[ApiUsage] = []
+        self.cvo_ack_lag = 0
+        self._cvo_lagging = 0
         # How many more HostedCluster reads report the control plane Progressing.
         self.settling = 0
         self.agent_down = False
@@ -180,6 +213,17 @@ class Fleet:
         self.gate_requests: list[NodePoolGateRequest] = []
         self.actions: list[ProposedActionRequest] = []
         self.incidents: list[IncidentRequest] = []
+        self.acks_given: list[str] = []
+        self.np_watch_requests: list[WatchNodePoolRequest] = []
+
+    def admin_ack_pending(self) -> str | None:
+        """What the hosted CVO says while a gate of its current minor has no ack, else None."""
+        minor = minor_of(self.cluster_cp)
+        missing = [
+            message for gate, message in self.admin_gates.items()
+            if admin_gate_minor(gate) in (minor, None) and self.admin_acks.get(gate) != "true"
+        ]
+        return " ".join(sorted(missing)) or None
 
     # --- day1 and Argo CD ----------------------------------------------------
 
@@ -208,6 +252,7 @@ class Fleet:
                 verified_against_graph="2026-10-31", release=RELEASE, mce_version="2.17.3",
                 supported_hosted_versions=SUPPORTED,
                 max_concurrent_control_planes=fleet.max_concurrent_control_planes,
+                admin_acks=ADMIN_ACKS, api_usage_ignored_users=IGNORED_USERS,
             )
 
         @activity.defn(name="read_day1_cluster")
@@ -315,7 +360,36 @@ class Fleet:
             fleet.calls.append("read_hosted_health")
             if fleet.health_script:
                 return fleet.health_script.pop(0)
+            missing_ack = fleet.admin_ack_pending()
+            if missing_ack:
+                return HostedHealth(
+                    reachable=True, cluster_version_upgradeable=False, upgradeable_reason="AdminAckRequired",
+                    upgradeable_message=missing_ack, idms_mirrors=MIRRORS,
+                )
             return HostedHealth(reachable=True, cluster_version_upgradeable=True, idms_mirrors=MIRRORS)
+
+        @activity.defn(name="read_admin_acks")
+        async def read_admin_acks(request: AdminAckRequest) -> AdminAckState:
+            fleet.calls.append("read_admin_acks")
+            required = fleet.admin_ack_pending()
+            if required is None and fleet._cvo_lagging > 0:
+                fleet._cvo_lagging -= 1
+                required = ADMIN_GATE_MESSAGE
+            return AdminAckState(
+                reachable=True, gates=dict(fleet.admin_gates), acks=dict(fleet.admin_acks),
+                usage=[use for use in fleet.api_usage if use.api in request.apis],
+                admin_ack_required=required,
+            )
+
+        @activity.defn(name="give_admin_ack")
+        async def give_admin_ack(request: GiveAdminAckRequest) -> AdminAckGiven:
+            fleet.calls.append(f"ack:{request.gate}")
+            assert request.gate in fleet.admin_gates, "acked a gate the cluster does not hold"
+            changed = fleet.admin_acks.get(request.gate) != "true"
+            fleet.admin_acks[request.gate] = "true"
+            fleet.acks_given.append(request.gate)
+            fleet._cvo_lagging = fleet.cvo_ack_lag
+            return AdminAckGiven(gate=request.gate, changed=changed)
 
         @activity.defn(name="sync_argo_application")
         async def sync_argo_application(request: ArgoSyncRequest) -> ArgoSyncResult:
@@ -341,6 +415,7 @@ class Fleet:
         @activity.defn(name="watch_nodepool")
         async def watch_nodepool(request: WatchNodePoolRequest) -> WatchOutcome:
             fleet.calls.append(f"watch-np:{request.nodepool}:{request.version}")
+            fleet.np_watch_requests.append(request)
             while fleet.block_nodepool_watch:
                 activity.heartbeat()
                 await asyncio.sleep(0.05)
@@ -380,8 +455,8 @@ class Fleet:
             HUB_QUEUE: [read_upgrade_rules, read_day1_cluster, list_release_tags, pin_release_digests,
                         check_day2_layers, commit_day1_change, write_incident],
             MCE_QUEUE: [read_mce_state, read_hosted_cluster, read_argo_application, read_hosted_health,
-                        sync_argo_application, watch_control_plane, watch_nodepool, watch_nodepool_gate,
-                        collect_evidence, execute_proposed_action],
+                        read_admin_acks, give_admin_ack, sync_argo_application, watch_control_plane,
+                        watch_nodepool, watch_nodepool_gate, collect_evidence, execute_proposed_action],
             AGENT_QUEUE: [invoke_upgrade_agent],
         }
 

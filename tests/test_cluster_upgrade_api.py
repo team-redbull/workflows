@@ -138,6 +138,8 @@ class TestDecisions:
         ("route", "body", "update", "arg"),
         [
             ("approve", {"by": "alice"}, UpgradeClusterWorkflow.approve, HumanDecision(by="alice")),
+            ("approve-admin-ack", {"by": "carol", "reason": "kyverno moved to v1"},
+             UpgradeClusterWorkflow.approve_admin_ack, HumanDecision(by="carol", reason="kyverno moved to v1")),
             ("continue", {"by": "alice", "nodepool": "np-b"}, UpgradeClusterWorkflow.continue_nodepool,
              ContinueNodePool(by="alice", nodepool="np-b")),
             ("confirm-day2", {"by": "day2"}, UpgradeClusterWorkflow.confirm_day2, HumanDecision(by="day2")),
@@ -187,6 +189,11 @@ class TestDecisions:
     @pytest.mark.parametrize("body", [{"by": "alice"}, {"by": "alice", "reason": ""}, {"by": ""}])
     def test_an_abort_names_who_and_why(self, client, fake, body):
         assert client.post(f"{PATH}/{RUN}/abort", json=body).status_code == 422
+        assert fake.updates == []
+
+    @pytest.mark.parametrize("body", [{"by": "carol"}, {"by": "carol", "reason": ""}])
+    def test_an_admin_ack_approval_says_why(self, client, fake, body):
+        assert client.post(f"{PATH}/{RUN}/approve-admin-ack", json=body).status_code == 422
         assert fake.updates == []
 
     def test_a_decision_with_unknown_fields_is_refused(self, client, fake):

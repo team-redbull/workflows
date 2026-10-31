@@ -30,6 +30,8 @@ from shared.models.cluster_upgrade import (
     WatchResult,
 )
 from shared.ocp_version import release_version
+from shared.upgrade_layout import ADMIN_ACK_REQUIRED as _ADMIN_ACK_REQUIRED
+from shared.upgrade_layout import ZONE_LABEL as _ZONE_LABEL
 
 # The hosted CVO's admin-ack check writes this condition when it fails and
 # other checks fail too; alone, its reason sits on the aggregate Upgradeable
@@ -37,9 +39,7 @@ from shared.ocp_version import release_version
 # cluster-version-operator release-4.19).
 _UPGRADEABLE = "Upgradeable"
 _ADMIN_ACK_CONDITION = "UpgradeableAdminAckRequired"
-_ADMIN_ACK_REQUIRED = "AdminAckRequired"
 _MULTIPLE_REASONS = "MultipleReasons"
-_ZONE_LABEL = "topology.kubernetes.io/zone"
 
 
 def _conditions(obj: dict[str, Any] | None) -> list[dict[str, Any]]:

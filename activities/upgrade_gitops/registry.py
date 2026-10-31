@@ -45,8 +45,10 @@ from urllib.parse import urljoin
 import httpx
 
 from activities.upgrade_gitops import oc_release
+from shared import upgrade_layout
 from shared.exceptions import ReleaseRegistryError
 from shared.models.cluster_upgrade import PinnedRelease, PinnedReleases, ReleaseLayout, ReleaseTags
+from shared.upgrade_layout import expand
 
 # Below the registry activities' timeouts (dispatch.REGISTRY_TIMEOUT is 10 min,
 # for a whole plan): one request never holds the worker longer than this.
@@ -66,12 +68,6 @@ _HEADS_AT_ONCE = 16
 _EXAMPLES = 3
 _CHALLENGE_PARAM = re.compile(r'(\w+)="([^"]*)"')
 _NEXT_LINK = re.compile(r'<([^>]+)>\s*;\s*rel="?next"?')
-
-
-def expand(template: str, *, image_path: str, version: str | None = None) -> str:
-    """A ladder.yaml `release` template filled in (the same rule as gates.expand)."""
-    text = template.replace("{imagePath}", image_path)
-    return text if version is None else text.replace("{version}", version)
 
 
 @dataclass(frozen=True)
@@ -246,11 +242,12 @@ class RegistryClient:
 
 
 def release_repository(layout: ReleaseLayout) -> Repository:
-    return Repository.parse(expand(layout.repo, image_path=layout.image_path))
+    return Repository.parse(upgrade_layout.release_repository(layout))
 
 
 def cpo_repository(layout: ReleaseLayout) -> Repository | None:
-    return Repository.parse(expand(layout.cpo_repo, image_path=layout.image_path)) if layout.cpo_repo else None
+    name = upgrade_layout.cpo_repository(layout)
+    return None if name is None else Repository.parse(name)
 
 
 async def list_tags(*, layout: ReleaseLayout, credentials: dict[str, tuple[str, str]], verify: bool) -> ReleaseTags:

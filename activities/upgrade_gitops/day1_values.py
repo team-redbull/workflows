@@ -51,9 +51,10 @@ from shared.models.cluster_upgrade import (
     Day1NodePool,
 )
 from shared.ocp_version import release_tag, release_version
+from shared.upgrade_layout import DAY1_CLUSTER_FILE as CLUSTER_FILE
+from shared.upgrade_layout import IN_PLACE as _IN_PLACE
+from shared.upgrade_layout import ZONE_LABEL as _ZONE_LABEL
 
-# Where day1 keeps a hosted cluster's file; the folders name its site and MCE.
-CLUSTER_FILE = re.compile(r"sites/(?P<site>[^/]+)/mces/(?P<mce>[^/]+)/hostedClusters/(?P<name>[^/]+)\.yaml")
 CONFIG_VALUES = "sites/configValues.yaml"
 # argocd-platform hostedClusters/values.yaml `clusterFilePrefix` (stack-export).
 DEFAULT_CLUSTER_FILE_PREFIX = "ocp4-"
@@ -61,8 +62,6 @@ DEFAULT_CLUSTER_FILE_PREFIX = "ocp4-"
 # one full mirror (stack-export hc.yaml:30,46; the port's hc.releaseRepo, hc.yaml:37).
 DEFAULT_RELEASE_REPO = "openshift/release-images"
 DEFAULT_CPO_REPO = "openshift/release"
-_ZONE_LABEL = "topology.kubernetes.io/zone"
-_IN_PLACE = "InPlace"
 _PAUSED = "true"
 
 

@@ -138,13 +138,13 @@ def recommended_target(
     release of that minor qualifies, which the caller reports as "mirror a rung
     of 4.<minor> first".
     """
-    rung_versions = set()
+    rung_versions: set[str] = set()
     for rung in ladder:
         try:
             rung_versions.add(release_version(rung.version))
         except ValueError:
             continue
-    candidates = []
+    candidates: list[str] = []
     for tag in available:
         try:
             version = release_version(tag)
@@ -171,7 +171,7 @@ def target_options(
     whatever the registry holds. Empty when the cluster is at the newest rung.
     """
     current = release_version(control_plane)
-    supported = set()
+    supported: set[int] = set()
     for minor in supported_minors:
         try:
             supported.add(parse_minor(minor))
@@ -179,10 +179,10 @@ def target_options(
             continue
     rungs = [rung for rung in _ordered_rungs(ladder)
              if _key(rung.version) > _key(current) and _minor(rung.version) in supported]
-    newest = {}
+    newest: dict[int, str] = {}  # minor -> its newest rung
     for rung in rungs:
         newest[_minor(rung.version)] = rung.version
-    options = []
+    options: list[UpgradeTarget] = []
     for rung in reversed(rungs):
         try:
             plan = resolve_upgrade_path(

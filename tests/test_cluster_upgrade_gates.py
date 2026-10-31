@@ -332,12 +332,31 @@ class TestPreflightChecks:
         check = _preflight(hosted=_hosted(conditions={}))["control-plane-idle"]
         assert not check.passed
 
+    # What read_hosted_health returns when the hosted API does not answer: the
+    # flag and nothing else, every list empty.
+    UNREACHABLE = HostedHealth(reachable=False)
+    FROM_THE_HOSTED_API = [
+        "operators-healthy", "cluster-version-upgradeable", "nodes-healthy", "pdbs-allow-disruption",
+        "webhooks-have-endpoints", "idms-covers-release",
+    ]
+
     def test_an_unreachable_hosted_api_passes_nothing_it_cannot_read(self):
-        checks = _preflight(health=HostedHealth(reachable=False, idms_mirrors=MIRRORS))
-        assert {c.name for c in gates.failed(list(checks.values()))} == {
-            "operators-healthy", "cluster-version-upgradeable",
-        }
-        assert "unreachable" in checks["operators-healthy"].observed
+        checks = _preflight(health=self.UNREACHABLE)
+        assert [c.name for c in gates.failed(list(checks.values()))] == self.FROM_THE_HOSTED_API
+        for name in self.FROM_THE_HOSTED_API:
+            # A person's, whatever the check would otherwise be: not a customer's
+            # PDB to clear, not an IDMS gap that fails the run.
+            assert checks[name].on_failure is CheckFailure.NEEDS_HUMAN, name
+            assert "the hosted cluster's API is unreachable" in checks[name].observed, name
+        assert "lacks" not in checks["idms-covers-release"].observed
+        assert gates.worst(list(checks.values())) is CheckFailure.NEEDS_HUMAN
+
+    def test_an_unreachable_hosted_api_does_not_hide_a_gap_read_off_the_mce(self):
+        checks = _preflight(health=self.UNREACHABLE, mce=MceState(supported_versions_found=True))
+        check = checks["idms-covers-release"]
+        assert check.on_failure is CheckFailure.FAILED
+        assert "the MCE's IDMS lacks" in check.observed and "the hosted cluster's IDMS not read" in check.observed
+        assert "the hosted cluster's IDMS lacks" not in check.observed
 
     def test_the_idms_check_names_every_gap(self):
         check = _preflight(hosted=_hosted(image_content_mirrors=[]))["idms-covers-release"]
@@ -357,10 +376,6 @@ class TestPreflightChecks:
         assert check.passed
         assert "release.mirrored: false" in check.observed and "quay.io/openshift-release-dev/ocp-release" in check.observed
 
-    def test_the_repositories_of_a_layout_without_a_cpo_repo_are_the_payloads_alone(self):
-        assert gates.release_repositories(PUBLIC_RELEASE) == ["quay.io/openshift-release-dev/ocp-release"]
-        assert len(gates.release_repositories(RELEASE)) == 2
-
     def test_the_worst_failure_decides(self):
         checks = list(_preflight(
             hosted=_hosted(progressing=True),
@@ -370,6 +385,37 @@ class TestPreflightChecks:
         ).values())
         assert gates.worst(checks) is CheckFailure.FAILED
         assert "idms-covers-release" in gates.describe(checks)
+
+
+def _health(**kwargs) -> HostedHealth:
+    return HostedHealth(reachable=True, cluster_version_upgradeable=True, idms_mirrors=MIRRORS, **kwargs)
+
+
+class TestWhoseTurnItIs:
+    """A customer's PDB is its owner's alone; any platform fault beside it is the agent's, then a person's."""
+
+    def test_a_customer_pdb_alone_is_the_owner_s(self):
+        checks = list(_preflight(health=_health(blocking_pdbs=["db/pg"])).values())
+        assert gates.worst(checks) is CheckFailure.NOTIFY_OWNER
+        assert [c.name for c in gates.owner_checks(checks)] == ["pdbs-allow-disruption"]
+        assert gates.agent_checks(checks) == []
+
+    @pytest.mark.parametrize("platform", [
+        {"dead_webhooks": ["kyverno"]},  # listed after the PDB check
+        {"operators_unhealthy": ["ingress"]},  # listed before it
+    ])
+    def test_a_platform_fault_beside_it_still_reaches_the_agent(self, platform):
+        checks = list(_preflight(health=_health(blocking_pdbs=["db/pg"], **platform)).values())
+        assert gates.worst(checks) is CheckFailure.NEEDS_HUMAN  # whichever is listed first
+        assert "pdbs-allow-disruption" not in [c.name for c in gates.agent_checks(checks)]
+        assert len(gates.agent_checks(checks)) == 1
+        # The PDB still reaches the person's message, for its owner.
+        assert [c.name for c in gates.owner_checks(checks)] == ["pdbs-allow-disruption"]
+        assert "their owners must allow a disruption: db/pg" in gates.describe(checks)
+
+    def test_the_answer_does_not_depend_on_the_order_of_the_checks(self):
+        checks = list(_preflight(health=_health(blocking_pdbs=["db/pg"], dead_webhooks=["kyverno"])).values())
+        assert gates.worst(checks) is gates.worst(list(reversed(checks))) is CheckFailure.NEEDS_HUMAN
 
 
 class TestProfileAndOrder:
@@ -418,12 +464,18 @@ class TestRollDeadline:
     def test_one_budget_per_batch_hypershift_takes_down(self, replicas, max_unavailable, batches):
         assert gates.nodepool_roll_deadline_minutes(replicas, max_unavailable) == batches * gates.PER_BATCH_MINUTES
 
+    @pytest.mark.parametrize("max_unavailable", ["33.5%", "", "%", "a", "1.5", "two"])
+    def test_a_value_it_cannot_read_is_one_at_a_time_never_an_exception(self, max_unavailable):
+        # Raised in workflow code, it would fail the workflow task and hang the run.
+        assert gates.nodepool_roll_deadline_minutes(3, max_unavailable) == 3 * gates.PER_BATCH_MINUTES
 
-def test_release_templates_expand_to_the_full_mirror():
-    assert gates.release_repositories(RELEASE) == [
-        f"{IMAGE_PATH}/openshift/release-images", f"{IMAGE_PATH}/openshift/release",
-    ]
-    assert gates.expand(RELEASE.tag, image_path=IMAGE_PATH, version="4.20.44") == "4.20.44-x86_64"
+
+@pytest.mark.parametrize(("wave", "enabled"), [(0, True), (1, True), (2, False), (3, False), (None, False)])
+def test_tier1_is_for_the_unattended_waves_only(wave, enabled):
+    assert gates.tier1_enabled(wave) is enabled
+    # One rule with auto-approve: the waves where the run may act with no person looking first.
+    checks = _planning(request=request(auto_approve=True), day1=_day1(upgrade=ClusterUpgradeSettings(wave=wave)))
+    assert checks["auto-approve-wave"].passed is enabled
 
 
 def test_step_versions_are_each_release_once_in_plan_order():
@@ -459,7 +511,14 @@ class TestAdminAcks:
 
     def test_an_unused_listed_gate_is_the_run_s_to_ack(self):
         [review] = gates.review_admin_gates({GATE: "m"}, [RULE], [], [WALKER])
-        assert review.listed and review.in_use == []
+        assert review == gates.AdminGateReview(gate=GATE, message="m", listed=True, in_use=[])
+
+    def test_the_old_import_of_a_review_still_works(self):
+        # TEMPORARY, with the shim in shared/models/cluster_upgrade.py: delete
+        # both once upgrade_cluster.py imports AdminGateReview from gates.
+        from shared.models.cluster_upgrade import AdminGateReview
+
+        assert AdminGateReview is gates.AdminGateReview
 
     def test_only_callers_that_are_not_ignored_count(self):
         usage = [
@@ -498,7 +557,8 @@ class TestAdminAcks:
 
 @pytest.mark.parametrize(("path", "mce"), [
     ("sites/site1/mces/ocp4-prod-mce-site1-a/hostedClusters/ocp4-prod-herzi-site1.yaml", "ocp4-prod-mce-site1-a"),
-    ("sites/s/mces/m/hostedClusters/c.yml", "m"),
+    # `.yaml` only, as the hub limb finds the file (shared/upgrade_layout.py).
+    ("sites/s/mces/m/hostedClusters/c.yml", None),
     ("clusters/c.yaml", None),
     ("sites/s/mces/m/version.yaml", None),
     ("sites/s/mces/m/hostedClusters/sub/c.yaml", None),

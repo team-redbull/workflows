@@ -12,8 +12,15 @@ on every replay: no clock, no I/O, no set-iteration order in anything returned.
     every control-plane step and NodePool roll.
   * cluster_profile, nodepool_order, soak_minutes — how the workers roll (D7).
   * nodepool_roll_deadline_minutes — the machine deadline of one NodePool roll.
+  * tier1_enabled — whether the agent may run tier-1 actions itself (AGENT.md #25).
   * pending_admin_gates, review_admin_gates — the admin acks a control-plane
     minor step needs, and whether the run may give them itself (D16).
+  * worst, agent_checks, owner_checks — what a set of failed checks asks of
+    the run: whose turn it is, and what the agent may look at.
+
+What a limb reads and this module also matches — the day1 path, a release's
+repositories, HyperShift's and the CVO's strings — is in shared/upgrade_layout.py,
+so the two sides cannot drift apart.
 
 Design: docs/upgrade/DESIGN.md §6–§7 in the Cluster-AutoUpgrade workspace.
 """
@@ -22,6 +29,7 @@ from __future__ import annotations
 
 import math
 import re
+from dataclasses import dataclass, field
 
 from temporalio import workflow
 
@@ -29,7 +37,6 @@ with workflow.unsafe.imports_passed_through():
     from shared.models.cluster_upgrade import (
         AdminAckRule,
         AdminAckState,
-        AdminGateReview,
         ApiUsage,
         ArgoApplicationState,
         CheckFailure,
@@ -49,10 +56,14 @@ with workflow.unsafe.imports_passed_through():
         UpgradeRules,
     )
     from shared.ocp_version import minor_name, minor_of, release_tag
-
-# The upgrade type every NodePool must have: a Replace roll would reprovision
-# bare-metal hosts, which this workflow is not built to watch.
-_IN_PLACE = "InPlace"
+    from shared.upgrade_layout import (
+        ADMIN_ACK_REQUIRED,
+        DAY1_CLUSTER_FILE,
+        IN_PLACE,
+        cpo_repository,
+        release_repositories,
+        release_repository,
+    )
 
 # Soak after each NodePool gate passes, unless the cluster file sets one.
 _ZONED_SOAK_MINUTES = 30
@@ -62,17 +73,22 @@ _GENERIC_SOAK_MINUTES = 0
 # bare-metal reboot. The hour install-server allows a bare-metal POST and boot.
 PER_BATCH_MINUTES = 60
 
-# The waves whose clusters may run without a person (AGENT.md #3, #30): auto-approve,
-# and auto NodePool mode, which skips the customer's sign-off between NodePools (D19, D20).
+# The waves whose clusters may run without a person: lab and canary. Three
+# things are allowed there and nowhere else — auto-approve (AGENT.md #3, #30),
+# auto NodePool mode, which skips the customer's sign-off between NodePools
+# (D19, D20), and the agent's tier-1 actions (AGENT.md #25, tier1_enabled).
+# ONE set on purpose: each is the run acting where no person looks first, and
+# lab and canary are the clusters where that may cost something. Graduating a
+# wave is one reviewed change here, for all three.
 _UNATTENDED_WAVES = (0, 1)
 
 # The CVO's Upgradeable=False reason while its own update runs (4.19 and later).
 _UPDATE_IN_PROGRESS = "UpdateInProgress"
-# Its reason while an admin gate of the current minor has no ack. The run gives
-# or asks for the ack itself, right before a control-plane minor step (D16), and
+# ADMIN_ACK_REQUIRED (shared/upgrade_layout.py), its reason while an admin gate
+# of the current minor has no ack, stops no pre-flight: the run gives or asks
+# for the ack itself, right before a control-plane minor step (D16), and
 # HyperShift never gates a NodePool on Upgradeable — a NodePool rolled 4.17 ->
-# 4.19 under it on the sandbox (CONTEXT §8.13) — so it stops no pre-flight.
-ADMIN_ACK_REQUIRED = "AdminAckRequired"
+# 4.19 under it on the sandbox (CONTEXT §8.13).
 
 # How the CVO recognises an admin gate and the minor it belongs to
 # (adminAckGateFmt, gateApplicableToCurrentVersion, pkg/cvo/upgradeable.go,
@@ -80,45 +96,34 @@ ADMIN_ACK_REQUIRED = "AdminAckRequired"
 # current version has that minor.
 _ADMIN_GATE = re.compile(r"^ack-[4-5][.]([0-9]{1,})-[^-]")
 
+# Which consequence of a failed check wins (worst). Every rank distinct, so the
+# answer never depends on the order the checks were listed in. NEEDS_HUMAN
+# outranks NOTIFY_OWNER: a platform fault next to a customer's PDB is still a
+# platform fault, which the agent diagnoses before a person is asked; only a
+# run whose sole problem is the owner's goes straight to the owner.
 _SEVERITY = {
     CheckFailure.WAIT: 0,
-    CheckFailure.NEEDS_HUMAN: 1,
     CheckFailure.NOTIFY_OWNER: 1,
-    CheckFailure.FAILED: 2,
+    CheckFailure.NEEDS_HUMAN: 2,
+    CheckFailure.FAILED: 3,
 }
 
-
-def expand(template: str, *, image_path: str, version: str | None = None) -> str:
-    """A ladder.yaml `release` template with `{imagePath}` (and `{version}`) filled in."""
-    text = template.replace("{imagePath}", image_path)
-    if version is not None:
-        text = text.replace("{version}", version)
-    return text
-
-
-def release_repositories(release: ReleaseLayout) -> list[str]:
-    """The repositories a release is pulled from: payload, then operator when the layout names one."""
-    repositories = [expand(release.repo, image_path=release.image_path)]
-    if release.cpo_repo is not None:
-        repositories.append(expand(release.cpo_repo, image_path=release.image_path))
-    return repositories
+# What a check built from the hosted cluster's API says when that API did not answer.
+_HOSTED_UNREACHABLE = "the hosted cluster's API is unreachable"
 
 
 # --- profile and order ---------------------------------------------------------
 
 
-# Where day1 keeps a hosted cluster's file (CONTEXT §6): the folder names its MCE.
-_DAY1_CLUSTER_PATH = re.compile(r"sites/[^/]+/mces/([^/]+)/hostedClusters/[^/]+\.ya?ml")
-
-
 def mce_of_day1_path(path: str) -> str | None:
     """The MCE whose folder holds this cluster file, or None for a path outside that layout.
 
-    The folder name is the canonical MCE name (with its `ocp4-` prefix), the
-    one every MCE limb's queue carries.
+    The layout is shared/upgrade_layout.DAY1_CLUSTER_FILE, the one the hub limb
+    finds the file by. The folder name is the canonical MCE name (with its
+    `ocp4-` prefix), the one every MCE limb's queue carries.
     """
-    match = _DAY1_CLUSTER_PATH.fullmatch(path)
-    return match.group(1) if match else None
+    match = DAY1_CLUSTER_FILE.fullmatch(path)
+    return match.group("mce") if match else None
 
 
 def cluster_profile(day1: Day1Cluster) -> ClusterProfile:
@@ -174,24 +179,40 @@ def _batch_size(replicas: int, max_unavailable: str | None) -> int:
     release-4.20 `hypershift-operator/controllers/nodepool/capi.go:1034`):
     unset means 1; a percentage is scaled to the replicas rounding DOWN; and 0
     is raised to 1.
+
+    TOTAL — it never raises. It runs in workflow code, where an exception fails
+    the workflow TASK and the run hangs (CLAUDE.md §5), and the value is the
+    NodePool's, read off the MCE: nothing the run can refuse. Anything it cannot
+    read as a whole number or a whole percentage ("33.5%", "", "a") counts as
+    1 at a time, the slowest roll, which gives the longest deadline: a deadline
+    too long only waits, one too short would hand a healthy roll to the agent.
     """
     if max_unavailable is None:
         return 1
     text = max_unavailable.strip()
-    if text.endswith("%"):
-        count = math.floor(replicas * int(text[:-1]) / 100)
-    else:
-        count = int(text)
+    try:
+        count = math.floor(replicas * int(text[:-1]) / 100) if text.endswith("%") else int(text)
+    except ValueError:
+        return 1
     return max(1, count)
 
 
-def nodepool_roll_deadline_minutes(
-    replicas: int | None, max_unavailable: str | None, *, per_batch_minutes: int = PER_BATCH_MINUTES
-) -> int:
-    """The whole budget of one NodePool roll: one `per_batch_minutes` per batch of nodes."""
+def nodepool_roll_deadline_minutes(replicas: int | None, max_unavailable: str | None) -> int:
+    """The whole budget of one NodePool roll: PER_BATCH_MINUTES per batch of nodes."""
     nodes = replicas or 1
     batches = math.ceil(nodes / _batch_size(nodes, max_unavailable))
-    return batches * per_batch_minutes
+    return batches * PER_BATCH_MINUTES
+
+
+def tier1_enabled(wave: int | None) -> bool:
+    """Whether the agent runs tier-1 actions itself, judge-reviewed, within its budget (AGENT.md #25).
+
+    Lab and canary only, the unattended waves. Everywhere else every action is
+    a proposal a person approves, until the fault-injection evals are green and
+    the same fix has been approved repeatedly. Settled at planning from the
+    cluster file's `upgrade.wave`; a file with no wave is production.
+    """
+    return wave in _UNATTENDED_WAVES
 
 
 # --- planning: checks 1-4, before approval ------------------------------------
@@ -220,7 +241,8 @@ def planning_checks(
     ]
 
 
-def _failed_check(name: str, passed: bool, expected: str, observed: str) -> CheckResult:
+def _planning_check(name: str, passed: bool, expected: str, observed: str) -> CheckResult:
+    """One planning check's result, passed or not: a planning failure always fails the run."""
     return CheckResult(
         name=name, passed=passed, expected=expected, observed=observed,
         on_failure=CheckFailure.FAILED,
@@ -231,9 +253,9 @@ def _rules_match_mce(rules: UpgradeRules, mce: MceState, plan: UpgradePlan) -> C
     name = "rules-match-mce"
     expected = f"supported-versions = {sorted(rules.supported_hosted_versions)}"
     if not mce.supported_versions_found:
-        return _failed_check(name, False, expected, "ConfigMap hypershift/supported-versions not found")
+        return _planning_check(name, False, expected, "ConfigMap hypershift/supported-versions not found")
     if sorted(set(mce.supported_versions)) != sorted(set(rules.supported_hosted_versions)):
-        return _failed_check(
+        return _planning_check(
             name, False, expected,
             f"the MCE reports {sorted(mce.supported_versions)}: fix upgrade/mces/<mce>.yaml or the MCE",
         )
@@ -242,11 +264,11 @@ def _rules_match_mce(rules: UpgradeRules, mce: MceState, plan: UpgradePlan) -> C
         if minor_name(minor_of(step.version)) not in mce.supported_versions
     ]
     if outside:
-        return _failed_check(
+        return _planning_check(
             name, False, "every step's minor supported by this MCE",
             f"not supported here: {', '.join(outside)}",
         )
-    return _failed_check(name, True, expected, "matches")
+    return _planning_check(name, True, expected, "matches")
 
 
 def image_set_snippet(versions: list[str]) -> str:
@@ -274,12 +296,13 @@ def _mirror_has_every_step(
     versions = step_versions(plan)
     unpinned = [v for v in versions if v not in pinned.pinned and v not in pinned.missing]
     missing = [*pinned.missing, *unpinned]
-    expected = f"every step in {expand(release.repo, image_path=release.image_path)}, payload complete"
+    expected = f"every step in {release_repository(release)}, payload complete"
     # A layout with a CPO repo pins the operator image too; one without (a public
     # source, D25) runs the payload's own CPO, so no operator digest is expected.
+    operator = cpo_repository(release)
     no_operator = [
         v for v in versions
-        if release.cpo_repo is not None and v in pinned.pinned and pinned.pinned[v].control_plane_operator is None
+        if operator is not None and v in pinned.pinned and pinned.pinned[v].control_plane_operator is None
     ]
     problems = [
         *pinned.problems,
@@ -287,13 +310,13 @@ def _mirror_has_every_step(
           for v in no_operator),
     ]
     if not missing and not problems:
-        return _failed_check(name, True, expected, "all pinned")
+        return _planning_check(name, True, expected, "all pinned")
     observed = []
     if missing:
         tags = ", ".join(release_tag(v) for v in missing)
         observed.append(f"mirror {tags} first:\n{image_set_snippet(missing)}")
     observed.extend(problems)
-    return _failed_check(name, False, expected, "\n".join(observed))
+    return _planning_check(name, False, expected, "\n".join(observed))
 
 
 def _day1_file_upgradeable(
@@ -306,8 +329,8 @@ def _day1_file_upgradeable(
     if day1_names != hosted_names:
         problems.append(f"the file lists NodePools {day1_names}, the cluster has {hosted_names}")
     for nodepool in hosted.nodepools:
-        if nodepool.upgrade_type != _IN_PLACE:
-            problems.append(f"NodePool {nodepool.name} upgradeType is {nodepool.upgrade_type}, not {_IN_PLACE}")
+        if nodepool.upgrade_type != IN_PLACE:
+            problems.append(f"NodePool {nodepool.name} upgradeType is {nodepool.upgrade_type}, not {IN_PLACE}")
     if day1.image_path != rules.release.image_path:
         problems.append(
             f"imagePath is {day1.image_path}: move {day1.path} to the full mirror "
@@ -316,7 +339,7 @@ def _day1_file_upgradeable(
     if day1.image_hc is not None and day1.image_hc != rules.release.image_path:
         problems.append(f"imageHc is {day1.image_hc}, not {rules.release.image_path}")
     problems += _release_layout_problems(rules.release, day1)
-    return _failed_check(
+    return _planning_check(
         name, not problems, f"{day1.path} parses, InPlace NodePools, the full mirror",
         "; ".join(problems) or "ok",
     )
@@ -336,20 +359,20 @@ def _release_layout_problems(release: ReleaseLayout, day1: Day1Cluster) -> list[
         return []
     problems = []
     rendered = f"{release.image_path}/{day1.release_repo}"
-    pinned = expand(release.repo, image_path=release.image_path)
+    pinned = release_repository(release)
     if rendered != pinned:
         problems.append(
             f"releaseRepo {day1.release_repo} renders {rendered}, but the rules pin {pinned}: "
             "set the cluster's releaseRepo to match upgrade/ladder.yaml's release.repo"
         )
-    if release.cpo_repo is None and day1.cpo_repo:
+    pinned_cpo = cpo_repository(release)
+    if pinned_cpo is None and day1.cpo_repo:
         problems.append(
             f"cpoRepo {day1.cpo_repo} renders a control-plane-operator image the rules do not pin "
             '(release has no cpoRepo): set the cluster\'s cpoRepo to ""'
         )
-    elif release.cpo_repo is not None:
+    elif pinned_cpo is not None:
         rendered_cpo = f"{release.image_path}/{day1.cpo_repo}" if day1.cpo_repo else "no CPO image"
-        pinned_cpo = expand(release.cpo_repo, image_path=release.image_path)
         if rendered_cpo != pinned_cpo:
             problems.append(f"cpoRepo renders {rendered_cpo}, but the rules pin {pinned_cpo}")
     return problems
@@ -375,7 +398,7 @@ def _git_matches_cluster(day1: Day1Cluster, hosted: HostedClusterState) -> Check
         written = effective_workertag(day1, nodepool.name)
         if written != nodepool.version:
             problems.append(f"NodePool {nodepool.name}: the file says {written}, it runs {nodepool.version}")
-    return _failed_check(
+    return _planning_check(
         name, not problems, "the cluster runs what its day1 file says", "; ".join(problems) or "agree"
     )
 
@@ -384,7 +407,7 @@ def _day2_layers_exist(day2: Day2Layers) -> CheckResult:
     observed = "; ".join(
         f"create ocp-versions/{gap.version}/ for {gap.chart} in {gap.sig} first" for gap in day2.missing
     )
-    return _failed_check(
+    return _planning_check(
         "day2-layers", not day2.missing, "every pinned day2 chart has a layer for every step",
         observed or "all present",
     )
@@ -393,9 +416,9 @@ def _day2_layers_exist(day2: Day2Layers) -> CheckResult:
 def _auto_approve_allowed(request: UpgradeClusterInput, day1: Day1Cluster) -> CheckResult:
     name = "auto-approve-wave"
     if not request.auto_approve:
-        return _failed_check(name, True, "", "approval by a person")
+        return _planning_check(name, True, "", "approval by a person")
     wave = day1.upgrade.wave
-    return _failed_check(
+    return _planning_check(
         name, wave in _UNATTENDED_WAVES,
         f"upgrade.wave in {list(_UNATTENDED_WAVES)} for auto_approve",
         f"upgrade.wave is {wave}",
@@ -407,9 +430,9 @@ def _auto_nodepool_mode_allowed(request: UpgradeClusterInput, day1: Day1Cluster,
     only lab and canary clusters may run it (D20). A plan that rolls no workers is not affected."""
     name = "auto-mode-wave"
     if request.nodepool_mode is not NodePoolMode.AUTO or not any(s.kind is StepKind.WORKERS for s in plan.steps):
-        return _failed_check(name, True, "", "the customer signs off before each NodePool")
+        return _planning_check(name, True, "", "the customer signs off before each NodePool")
     wave = day1.upgrade.wave
-    return _failed_check(
+    return _planning_check(
         name, wave in _UNATTENDED_WAVES,
         f"upgrade.wave in {list(_UNATTENDED_WAVES)} for nodepool_mode auto; elsewhere the customer runs "
         "their readiness checks and signs off with continue",
@@ -438,7 +461,13 @@ def preflight_checks(
     release: ReleaseLayout,
     include_idms: bool,
 ) -> list[CheckResult]:
-    """Checks 5–10 (and 11 when `include_idms`), passed or not, in DESIGN §7 order."""
+    """Checks 5–10 (and 11 when `include_idms`), passed or not, in DESIGN §7 order.
+
+    `health` is read through the hosted cluster's own API. When that API did not
+    answer (`reachable` False, every list empty), nothing built from it passes:
+    each such check fails NEEDS_HUMAN saying so — an unread PDB list is not a
+    customer's to clear, and an empty node list is not a healthy one.
+    """
     checks = [
         CheckResult(
             name="argo-app-clean",
@@ -451,17 +480,14 @@ def preflight_checks(
             ),
             on_failure=CheckFailure.NEEDS_HUMAN,
         ),
-        CheckResult(
+        _read_from_hosted(health, CheckResult(
             name="operators-healthy",
-            passed=health.reachable and not health.operators_unhealthy,
+            passed=not health.operators_unhealthy,
             expected="every ClusterOperator Available and not Degraded",
-            observed=(
-                ", ".join(health.operators_unhealthy) or "all healthy"
-                if health.reachable else "the hosted cluster's API is unreachable"
-            ),
+            observed=", ".join(health.operators_unhealthy) or "all healthy",
             on_failure=CheckFailure.NEEDS_HUMAN,
-        ),
-        _cluster_version_upgradeable(health),
+        )),
+        _read_from_hosted(health, _cluster_version_upgradeable(health)),
         CheckResult(
             name="control-plane-idle",
             # Progressing alone is not enough: HyperShift drops it to False as soon
@@ -484,7 +510,7 @@ def preflight_checks(
             ),
             on_failure=CheckFailure.WAIT,
         ),
-        CheckResult(
+        _read_from_hosted(health, CheckResult(
             name="nodes-healthy",
             passed=not health.nodes_not_ready and not health.nodepools_short and health.pending_csrs == 0,
             expected="all Nodes Ready, NodePools at desired replicas, no pending CSRs",
@@ -496,8 +522,8 @@ def preflight_checks(
                 ) if part
             ) or "healthy",
             on_failure=CheckFailure.NEEDS_HUMAN,
-        ),
-        CheckResult(
+        )),
+        _read_from_hosted(health, CheckResult(
             name="pdbs-allow-disruption",
             passed=not health.blocking_pdbs,
             expected="no PodDisruptionBudget at disruptionsAllowed 0 on the nodes in scope",
@@ -506,18 +532,31 @@ def preflight_checks(
                 if health.blocking_pdbs else "none blocking"
             ),
             on_failure=CheckFailure.NOTIFY_OWNER,
-        ),
-        CheckResult(
+        )),
+        _read_from_hosted(health, CheckResult(
             name="webhooks-have-endpoints",
             passed=not health.dead_webhooks,
             expected="no failurePolicy Fail webhook without endpoints",
             observed=", ".join(health.dead_webhooks) or "none",
             on_failure=CheckFailure.NEEDS_HUMAN,
-        ),
+        )),
     ]
     if include_idms:
         checks.append(_idms_covers_release(hosted, health, mce, release))
     return checks
+
+
+def _read_from_hosted(health: HostedHealth, check: CheckResult) -> CheckResult:
+    """`check` as built from `health` — or, when the hosted API did not answer, failed for that.
+
+    Its name and what it expects stay, so a person reads which checks went
+    unread; it is NEEDS_HUMAN whatever it would otherwise be.
+    """
+    if health.reachable:
+        return check
+    return check.model_copy(update={
+        "passed": False, "observed": _HOSTED_UNREACHABLE, "on_failure": CheckFailure.NEEDS_HUMAN,
+    })
 
 
 def upgradeable_reasons(health: HostedHealth) -> list[str]:
@@ -573,35 +612,53 @@ def _idms_covers_release(
     saying why, so the reason is in the run's record and not a silent skip.
     """
     if not release.mirrored:
-        source = expand(release.repo, image_path=release.image_path)
         return CheckResult(
             name="idms-covers-release",
             passed=True,
             expected="the release's repositories mirrored for the control plane, the nodes and the MCE",
-            observed=f"not applicable: releases come straight from {source} (release.mirrored: false), no mirror to cover",
+            observed=(
+                f"not applicable: releases come straight from {release_repository(release)} "
+                "(release.mirrored: false), no mirror to cover"
+            ),
             on_failure=CheckFailure.FAILED,
         )
     needed = release_repositories(release)
-    gaps = [
-        f"{where} lacks {repo}"
-        for where, mirrors in (
-            ("HostedCluster imageContentSources", hosted.image_content_mirrors),
-            ("the hosted cluster's IDMS", health.idms_mirrors),
-            ("the MCE's IDMS", mce.idms_mirrors),
-        )
-        for repo in needed
-        if repo not in mirrors
+    # The hosted cluster's own IDMS is judged only when its API answered: an
+    # unread one is neither a gap to fail the run on nor coverage to pass it on.
+    paths = [
+        ("HostedCluster imageContentSources", hosted.image_content_mirrors),
+        *([("the hosted cluster's IDMS", health.idms_mirrors)] if health.reachable else []),
+        ("the MCE's IDMS", mce.idms_mirrors),
     ]
+    gaps = [f"{where} lacks {repo}" for where, mirrors in paths for repo in needed if repo not in mirrors]
+    unread = [] if health.reachable else [f"the hosted cluster's IDMS not read: {_HOSTED_UNREACHABLE}"]
     return CheckResult(
         name="idms-covers-release",
-        passed=not gaps,
+        passed=not gaps and not unread,
         expected=f"{', '.join(needed)} mirrored for the control plane, the nodes and the MCE",
-        observed="; ".join(gaps) or "covered",
-        on_failure=CheckFailure.FAILED,
+        observed="; ".join([*gaps, *unread]) or "covered",
+        # A gap read off the HostedCluster or the MCE is real, and fails a run
+        # not yet approved. With none, an unread hosted cluster is a person's
+        # to look at, like every other check built from it.
+        on_failure=CheckFailure.NEEDS_HUMAN if unread and not gaps else CheckFailure.FAILED,
     )
 
 
 # --- admin acks (D16) -------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class AdminGateReview:
+    """What the run makes of one pending admin gate (review_admin_gates).
+
+    Brain-only: decided and used within one workflow task, never an activity's
+    argument or result, a query's payload or history, so not a shared model.
+    """
+
+    gate: str
+    message: str  # what the gate says, as admin-gates holds it
+    listed: bool  # in the rules file's adminAcks
+    in_use: list[ApiUsage] = field(default_factory=list)  # callers that count
 
 
 def admin_gate_minor(gate: str) -> int | None:
@@ -702,11 +759,25 @@ def failed(checks: list[CheckResult]) -> list[CheckResult]:
 
 
 def worst(checks: list[CheckResult]) -> CheckFailure | None:
-    """The most severe consequence among the failed checks, or None when all passed."""
+    """The most severe consequence among the failed checks, or None when all passed.
+
+    NOTIFY_OWNER only when nothing but owners' checks (and waits) failed: next
+    to any platform failure it is NEEDS_HUMAN (_SEVERITY).
+    """
     failures = failed(checks)
     if not failures:
         return None
     return max((check.on_failure for check in failures), key=_SEVERITY.__getitem__)
+
+
+def owner_checks(checks: list[CheckResult]) -> list[CheckResult]:
+    """The failed checks only their owner can clear (a customer's PDB, AGENT.md #12): for the owner's message."""
+    return [check for check in failed(checks) if check.on_failure is CheckFailure.NOTIFY_OWNER]
+
+
+def agent_checks(checks: list[CheckResult]) -> list[CheckResult]:
+    """The failed checks the agent may diagnose: every one but an owner's, which never goes to the agent."""
+    return [check for check in failed(checks) if check.on_failure is not CheckFailure.NOTIFY_OWNER]
 
 
 def describe(checks: list[CheckResult]) -> str:

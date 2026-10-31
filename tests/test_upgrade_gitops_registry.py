@@ -25,7 +25,6 @@ import respx
 from activities.upgrade_gitops import oc_release, registry
 from shared.exceptions import ReleaseRegistryError
 from shared.models.cluster_upgrade import ReleaseLayout
-from workflow_domains.cluster_upgrade import gates
 
 QUAY = "quay.io"
 RELEASE_REPO = "openshift-release-dev/ocp-release"
@@ -268,12 +267,6 @@ class TestPlumbing:
         assert registry.Repository.parse("mirror.test:5000/a/b:4.20.35-x86_64") == registry.Repository(
             "mirror.test:5000", "a/b"
         )
-
-    def test_the_template_rule_is_the_gates_rule(self):
-        for template in (MIRRORED.repo, MIRRORED.cpo_tag or "", PUBLIC.tag):
-            assert registry.expand(template, image_path="x/y", version="4.20.1") == gates.expand(
-                template, image_path="x/y", version="4.20.1"
-            )
 
     def test_the_auth_file_gives_the_longest_matching_credential(self, tmp_path):
         path = tmp_path / "auth.json"

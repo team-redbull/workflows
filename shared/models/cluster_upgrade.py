@@ -161,6 +161,23 @@ class ReleaseLayout(BaseModel):
     mirrored: bool = True
 
 
+class AdminAckRule(BaseModel):
+    """One `adminAcks[]` entry of day1 `upgrade/ladder.yaml`: an ack the run may give by itself (D16).
+
+    `gate` is the key in the hosted cluster's openshift-config-managed/admin-gates;
+    `apis` are the APIRequestCount names (`<resource>.<version>.<group>`) of the
+    APIs it covers. The run gives the ack only when nobody outside
+    `api_usage_ignored_users` called one of them in the last 24 hours.
+
+    Defined here, before UpgradeContext which carries it, so that every model
+    naming it is complete at import (the agent's models are resolved below).
+    """
+
+    gate: str
+    apis: list[str]
+    source: str = ""
+
+
 class UpgradeContext(BaseModel):
     """Everything the steps need that planning settled. It never changes after approval.
 
@@ -389,20 +406,6 @@ class CheckResult(BaseModel):
 
 class UpgradeRulesRequest(BaseModel):
     mce_cluster: str
-
-
-class AdminAckRule(BaseModel):
-    """One `adminAcks[]` entry of day1 `upgrade/ladder.yaml`: an ack the run may give by itself (D16).
-
-    `gate` is the key in the hosted cluster's openshift-config-managed/admin-gates;
-    `apis` are the APIRequestCount names (`<resource>.<version>.<group>`) of the
-    APIs it covers. The run gives the ack only when nobody outside
-    `api_usage_ignored_users` called one of them in the last 24 hours.
-    """
-
-    gate: str
-    apis: list[str]
-    source: str = ""
 
 
 class UpgradeRules(BaseModel):
@@ -744,15 +747,6 @@ class AdminAckGiven(BaseModel):
     changed: bool  # False when it was already "true"
 
 
-class AdminGateReview(BaseModel):
-    """What the run makes of one pending admin gate (gates.review_admin_gates)."""
-
-    gate: str
-    message: str  # what the gate says, as admin-gates holds it
-    listed: bool  # in the rules file's adminAcks
-    in_use: list[ApiUsage] = Field(default_factory=list)  # callers that count
-
-
 class ArgoSyncRequest(BaseModel):
     """Sync the cluster's Application to exactly `revision`.
 
@@ -1012,3 +1006,20 @@ class UpgradeControlPlaneProgress(BaseModel):
 # now, at import, rather than on first use inside a workflow task.
 for _model in (PendingAction, UpgradeClusterProgress, IncidentRequest, ProposedActionRequest):
     _model.model_rebuild()
+
+
+def __getattr__(name: str) -> object:
+    """TEMPORARY: `AdminGateReview` moved to workflow_domains/cluster_upgrade/gates.py.
+
+    It is brain-only — never an activity's argument or result, nor a query's
+    payload — so it is not part of this contract. This keeps the old
+    `from shared.models.cluster_upgrade import AdminGateReview` in
+    upgrade_cluster.py working until that file imports it from gates; delete it
+    then. Resolved lazily, on that one name only, so shared/ imports no workflow
+    code at import time (gates imports this module).
+    """
+    if name == "AdminGateReview":
+        from workflow_domains.cluster_upgrade.gates import AdminGateReview
+
+        return AdminGateReview
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

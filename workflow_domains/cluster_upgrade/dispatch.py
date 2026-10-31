@@ -201,6 +201,8 @@ async def diagnose(
     failing_checks: list[CheckResult],
     tier1_enabled: bool,
     stopped: Callable[[], bool] = lambda: False,
+    hosted_cluster: str | None = None,
+    hosted_cluster_namespace: str | None = None,
 ) -> Diagnosis | None:
     """Ask the upgrade agent about one failed gate; record the answer in Brain.
 
@@ -214,13 +216,19 @@ async def diagnose(
     Returns None when `stopped()` turns true first (an abort): it is checked
     before each call and raced against the agent, whose activity is then
     cancelled — cancelling the caller's task would not stop a call in flight.
+
+    `hosted_cluster(_namespace)`: the HostedCluster's own name, where the
+    evidence is read (HostedClusterRequest); None is the one named `cluster`.
     """
     invocation_id = f"{workflow_id}/{workflow.uuid4()}"
     if stopped():
         return None
     evidence = await on_mce(
         mce_cluster, collect_evidence,
-        EvidenceRequest(mce_cluster=mce_cluster, cluster=cluster, nodepool=nodepool),
+        EvidenceRequest(
+            mce_cluster=mce_cluster, cluster=cluster, nodepool=nodepool,
+            hosted_cluster=hosted_cluster, hosted_cluster_namespace=hosted_cluster_namespace,
+        ),
     )
     if stopped():
         return None

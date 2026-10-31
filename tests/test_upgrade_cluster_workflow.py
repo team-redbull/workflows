@@ -1106,3 +1106,72 @@ class TestUpgradeTargets:
             with pytest.raises(WorkflowFailureError) as failure:
                 await self._targets(h)
         assert "no MCE" in str(failure.value.cause)
+
+
+# What the hostedclusters-setup chart renders for the day1 file `<CLUSTER>.yaml`.
+OWN_NAME, OWN_NAMESPACE = "openshift-herzi-site1", "hcp-herzi-site1"
+
+
+class TestTheHostedClusterIsNotNamedAfterItsFile:
+    """The chart names the HostedCluster `openshift-<clusterName>` in `hcp-<clusterName>`.
+
+    The day1 file and the Argo CD Application keep the cluster's name; every
+    request that reaches the HostedCluster on the MCE carries its own, read
+    from day1 at planning (Day1Cluster.hosted_cluster). The fleet finds the
+    HostedCluster only by the name it really has.
+    """
+
+    async def test_planning_the_control_plane_and_a_nodepool_all_reach_it_by_its_own_name(self):
+        fleet = Fleet(control_plane="4.19.53", nodepools={"np-a": "4.19.53"},
+                      hosted_cluster=OWN_NAME, hosted_cluster_namespace=OWN_NAMESPACE)
+        # A stall in each step, so the agent's evidence is read in both, and a
+        # proposal a person approves, so an action runs too.
+        fleet.cp_watch_script = [WatchResult.STALLED]
+        fleet.np_watch_script = [WatchResult.STALLED]
+        action = ProposedAction(action_id="act-1", kind="delete_pod", target="openshift-console/downloads-0")
+        fleet.verdicts = [verdict("retry_gate"), verdict("needs_human", actions_proposed=[action])]
+        async with Harness(fleet) as h:
+            await h.start(request(nodepool_mode=NodePoolMode.AUTO))
+            await _approve_through_control_plane(h, steps=1)
+            await h.until(UpgradePhase.NEEDS_HUMAN)
+            await h.decide(Run.approve_action, ActionDecision(by="alice", action_id="act-1"))
+            await h.decide(Run.retry, ALICE)
+            result = await h.result()
+
+        assert result.outcome is UpgradeOutcome.DONE
+        assert result.nodepool_versions == {"np-a": "4.20.44"}
+        # Every request to the MCE named the HostedCluster by its own name and namespace…
+        assert {(name, namespace) for _, name, namespace in fleet.hc_requests} == {(OWN_NAME, OWN_NAMESPACE)}
+        # …in planning, the pre-flights, the admin ack, both watches, the gate, the evidence and the action.
+        assert {activity for activity, _, _ in fleet.hc_requests} == {
+            "read_hosted_cluster", "read_hosted_health", "read_admin_acks", "give_admin_ack",
+            "watch_control_plane", "watch_nodepool", "watch_nodepool_gate", "collect_evidence",
+            "execute_proposed_action",
+        }
+        # Argo CD lists the HostedCluster by its own name; the Application keeps the file's.
+        control_plane_sync = fleet.syncs[0]
+        assert control_plane_sync.cluster == CLUSTER
+        assert control_plane_sync.allowed_out_of_sync == [f"HostedCluster/{OWN_NAME}"]
+
+    async def test_an_abort_lets_the_hostedcluster_go_out_of_sync_by_its_own_name(self):
+        fleet = Fleet(hosted_cluster=OWN_NAME, hosted_cluster_namespace=OWN_NAMESPACE)
+        async with Harness(fleet) as h:
+            await h.start(request())
+            await h.until(UpgradePhase.AWAITING_APPROVAL)
+            await h.decide(Run.approve, ALICE)
+            await h.until(UpgradePhase.AWAITING_DAY2_CONFIRM)
+            await h.decide(Run.abort, HumanDecision(by="alice", reason="end of test"))
+            result = await h.result()
+
+        assert result.outcome is UpgradeOutcome.ABORTED
+        assert fleet.syncs[-1].allowed_out_of_sync == [f"HostedCluster/{OWN_NAME}", "NodePool/np-a", "NodePool/np-b"]
+        assert fleet.hc_misses() == []
+
+    async def test_a_hostedcluster_missing_under_its_own_name_fails_planning_naming_it(self):
+        fleet = Fleet(hosted_cluster=OWN_NAME, hosted_cluster_namespace=OWN_NAMESPACE)
+        fleet.hc_name = "someone-else"
+        async with Harness(fleet) as h:
+            await h.start(request())
+            failure = await _fails(h)
+        assert failure.type == UpgradePlanningFailedError.__name__
+        assert f"HostedCluster {OWN_NAMESPACE}/{OWN_NAME} not found on {MCE}" in failure.message

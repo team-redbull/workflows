@@ -181,6 +181,11 @@ class UpgradeContext(BaseModel):
     # not count (rules file, D16). Empty in runs planned before them.
     admin_acks: list[AdminAckRule] = Field(default_factory=list)
     api_usage_ignored_users: list[str] = Field(default_factory=list)
+    # The HostedCluster the day1 file renders (Day1Cluster.hosted_cluster):
+    # what every request to the MCE limb names. None in runs planned before
+    # it: the limb then finds the HostedCluster named after the cluster file.
+    hosted_cluster: str | None = None
+    hosted_cluster_namespace: str | None = None
 
 
 class UpgradePhase(str, Enum):
@@ -579,7 +584,16 @@ class MceState(BaseModel):
 
 class HostedClusterRequest(BaseModel):
     mce_cluster: str
+    # The day1 file's name, which also names the cluster's Argo CD Application.
     cluster: str
+    # The HostedCluster's own name and namespace: the hostedclusters-setup chart
+    # renders `openshift-<clusterName>` in `hcp-<clusterName>`, not the file's
+    # name (Day1Cluster.hosted_cluster). None, as in every request of a run
+    # planned before the fields: the HostedCluster named `cluster`, in whatever
+    # namespace. The same two fields mean the same on every request below that
+    # reaches a HostedCluster.
+    hosted_cluster: str | None = None
+    hosted_cluster_namespace: str | None = None
 
 
 class NodePoolState(BaseModel):
@@ -626,6 +640,8 @@ class HostedHealthRequest(BaseModel):
     cluster: str
     # Only these NodePools' nodes are in scope for the PDB check; all when empty.
     nodepools: list[str] = Field(default_factory=list)
+    hosted_cluster: str | None = None  # as on HostedClusterRequest
+    hosted_cluster_namespace: str | None = None
 
 
 class HostedHealth(BaseModel):
@@ -664,6 +680,8 @@ class AdminAckRequest(BaseModel):
     cluster: str
     # The APIRequestCount names whose callers to report: every rule's `apis`.
     apis: list[str] = Field(default_factory=list)
+    hosted_cluster: str | None = None  # as on HostedClusterRequest
+    hosted_cluster_namespace: str | None = None
 
 
 class ApiUsage(BaseModel):
@@ -700,6 +718,8 @@ class GiveAdminAckRequest(BaseModel):
     mce_cluster: str
     cluster: str
     gate: str
+    hosted_cluster: str | None = None  # as on HostedClusterRequest
+    hosted_cluster_namespace: str | None = None
 
 
 class AdminAckGiven(BaseModel):
@@ -758,6 +778,8 @@ class WatchControlPlaneRequest(BaseModel):
     version: str
     stall_minutes: int
     deadline_minutes: int
+    hosted_cluster: str | None = None  # as on HostedClusterRequest
+    hosted_cluster_namespace: str | None = None
 
 
 class WatchNodePoolRequest(BaseModel):
@@ -773,6 +795,8 @@ class WatchNodePoolRequest(BaseModel):
     # clears by itself (CONTEXT §8.13). The snapshot names the node, the PDB
     # and its pods with their state, for the agent (D17). None: off.
     drain_blocked_minutes: int | None = None
+    hosted_cluster: str | None = None  # as on HostedClusterRequest
+    hosted_cluster_namespace: str | None = None
 
 
 class WatchOutcome(BaseModel):
@@ -790,6 +814,8 @@ class NodePoolGateRequest(BaseModel):
     workload_checks: bool  # PDBs and StatefulSets; the zoned profile
     soak_minutes: int
     deadline_minutes: int
+    hosted_cluster: str | None = None  # as on HostedClusterRequest
+    hosted_cluster_namespace: str | None = None
 
 
 class GateResult(str, Enum):
@@ -806,6 +832,8 @@ class EvidenceRequest(BaseModel):
     mce_cluster: str
     cluster: str
     nodepool: str | None = None
+    hosted_cluster: str | None = None  # as on HostedClusterRequest
+    hosted_cluster_namespace: str | None = None
 
 
 class EvidenceBundle(BaseModel):
@@ -827,6 +855,8 @@ class ProposedActionRequest(BaseModel):
     cluster: str
     action: ProposedAction
     approved_by: str
+    hosted_cluster: str | None = None  # as on HostedClusterRequest
+    hosted_cluster_namespace: str | None = None
 
 
 class ActionResult(BaseModel):
@@ -916,6 +946,10 @@ class UpgradeControlPlaneInput(BaseModel):
     day1_blob: str
     profile: ClusterProfile
     tier1_enabled: bool = False
+    # The HostedCluster's own name and namespace (UpgradeContext); None in a
+    # step started before them.
+    hosted_cluster: str | None = None
+    hosted_cluster_namespace: str | None = None
 
 
 class UpgradeControlPlaneRunArgs(BaseModel):

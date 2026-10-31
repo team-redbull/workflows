@@ -244,6 +244,10 @@ class UpgradeClusterWorkflow:
         # Found in day1 during planning; restored from the context on a continued run.
         self._mce = ""
         self._cluster = run_args.input.cluster
+        # The HostedCluster the day1 file renders, as day1 names it (planning
+        # reads it; a continued run restores it). None: named after the file.
+        self._hosted: str | None = None
+        self._hosted_ns: str | None = None
         self._context: UpgradeContext | None = None
         self._phase = UpgradePhase.PLANNING
         self._waiting_for: str | None = None
@@ -281,6 +285,8 @@ class UpgradeClusterWorkflow:
         if resume is not None:
             self._context = resume.context
             self._mce = resume.context.mce_cluster or ""
+            self._hosted = resume.context.hosted_cluster
+            self._hosted_ns = resume.context.hosted_cluster_namespace
             self._approved_by = resume.approved_by
             self._next_step = resume.next_step
             self._nodepools_done = list(resume.nodepools_done)
@@ -498,15 +504,17 @@ class UpgradeClusterWorkflow:
                 f"day1 file {day1.path} is not under sites/<site>/mces/<mce>/hostedClusters/: no MCE to run on"
             )
         self._mce = mce_cluster
+        self._hosted, self._hosted_ns = day1.hosted_cluster, day1.hosted_cluster_namespace
         rules: UpgradeRules = await on_hub(read_upgrade_rules, UpgradeRulesRequest(mce_cluster=self._mce))
         mce: MceState = await on_mce(self._mce, read_mce_state, MceRequest(mce_cluster=self._mce))
         hosted: HostedClusterState = await on_mce(
-            self._mce, read_hosted_cluster, HostedClusterRequest(mce_cluster=self._mce, cluster=self._cluster)
+            self._mce, read_hosted_cluster,
+            HostedClusterRequest(mce_cluster=self._mce, cluster=self._cluster, **self._on_hc()),
         )
         if not hosted.found:
-            self._fail_planning(f"HostedCluster {self._cluster} not found on {self._mce}")
+            self._fail_planning(f"HostedCluster {self._hc_label} not found on {self._mce}")
         if hosted.control_plane_version is None:
-            self._fail_planning(f"HostedCluster {self._cluster} is mid-upgrade: no Completed version to plan from")
+            self._fail_planning(f"HostedCluster {self._hc_label} is mid-upgrade: no Completed version to plan from")
         unreported = [nodepool.name for nodepool in hosted.nodepools if nodepool.version is None]
         if unreported:
             self._fail_planning(f"NodePools report no version: {', '.join(unreported)}")
@@ -544,6 +552,8 @@ class UpgradeClusterWorkflow:
             tier1_enabled=day1.upgrade.wave in _TIER1_WAVES,
             admin_acks=rules.admin_acks,
             api_usage_ignored_users=rules.api_usage_ignored_users,
+            hosted_cluster=self._hosted,
+            hosted_cluster_namespace=self._hosted_ns,
         )
         if not plan.steps:
             self._context = context
@@ -716,7 +726,8 @@ class UpgradeClusterWorkflow:
         """
         context = self._ctx
         request = AdminAckRequest(
-            mce_cluster=self._mce, cluster=self._cluster, apis=gates.admin_ack_apis(context.admin_acks)
+            mce_cluster=self._mce, cluster=self._cluster, apis=gates.admin_ack_apis(context.admin_acks),
+            **self._on_hc(),
         )
         approved_by: dict[str, str] = {}
         settling = timedelta(0)
@@ -766,7 +777,9 @@ class UpgradeClusterWorkflow:
                 try:
                     given: AdminAckGiven = await on_mce(
                         self._mce, give_admin_ack,
-                        GiveAdminAckRequest(mce_cluster=self._mce, cluster=self._cluster, gate=review.gate),
+                        GiveAdminAckRequest(
+                            mce_cluster=self._mce, cluster=self._cluster, gate=review.gate, **self._on_hc()
+                        ),
                     )
                 except ActivityError as err:
                     if error_type(err) != AdminGateNotFoundError.__name__:
@@ -887,6 +900,7 @@ class UpgradeClusterWorkflow:
             day1_blob=self._day1_blob or "",
             profile=context.profile,
             tier1_enabled=context.tier1_enabled,
+            **self._on_hc(),
         )
         while True:
             # Starting the child starts the commit: a pause or an abort that
@@ -999,7 +1013,8 @@ class UpgradeClusterWorkflow:
 
     async def _watch_nodepool(self, step: UpgradeStep, nodepool: str) -> WatchOutcome:
         hosted: HostedClusterState = await on_mce(
-            self._mce, read_hosted_cluster, HostedClusterRequest(mce_cluster=self._mce, cluster=self._cluster)
+            self._mce, read_hosted_cluster,
+            HostedClusterRequest(mce_cluster=self._mce, cluster=self._cluster, **self._on_hc()),
         )
         state = next((np for np in hosted.nodepools if np.name == nodepool), None)
         deadline = gates.nodepool_roll_deadline_minutes(
@@ -1017,6 +1032,7 @@ class UpgradeClusterWorkflow:
                     stall_minutes=NODEPOOL_STALL_MINUTES,
                     deadline_minutes=deadline,
                     drain_blocked_minutes=DRAIN_BLOCKED_MINUTES,
+                    **self._on_hc(),
                 ),
                 deadline_minutes=deadline,
             )
@@ -1037,6 +1053,7 @@ class UpgradeClusterWorkflow:
                     workload_checks=context.profile is ClusterProfile.ZONED,
                     soak_minutes=context.soak_minutes,
                     deadline_minutes=deadline,
+                    **self._on_hc(),
                 ),
                 deadline_minutes=deadline,
             )
@@ -1060,7 +1077,7 @@ class UpgradeClusterWorkflow:
             if reason is None:
                 hosted: HostedClusterState = await on_mce(
                     self._mce, read_hosted_cluster,
-                    HostedClusterRequest(mce_cluster=self._mce, cluster=self._cluster),
+                    HostedClusterRequest(mce_cluster=self._mce, cluster=self._cluster, **self._on_hc()),
                 )
                 reason = self._not_at_target(hosted, context)
             if reason is None:
@@ -1215,13 +1232,15 @@ class UpgradeClusterWorkflow:
             verdict = None
 
     async def _preflight_checks(self, *, include_idms: bool, nodepools: list[str]) -> list[CheckResult]:
-        cluster = HostedClusterRequest(mce_cluster=self._mce, cluster=self._cluster)
+        cluster = HostedClusterRequest(mce_cluster=self._mce, cluster=self._cluster, **self._on_hc())
         argo, hosted, health = await asyncio.gather(
             on_mce(self._mce, read_argo_application, cluster),
             on_mce(self._mce, read_hosted_cluster, cluster),
             on_mce(
                 self._mce, read_hosted_health,
-                HostedHealthRequest(mce_cluster=self._mce, cluster=self._cluster, nodepools=nodepools),
+                HostedHealthRequest(
+                    mce_cluster=self._mce, cluster=self._cluster, nodepools=nodepools, **self._on_hc()
+                ),
             ),
         )
         mce = (
@@ -1258,6 +1277,7 @@ class UpgradeClusterWorkflow:
             failing_checks=failing_checks,
             tier1_enabled=context.tier1_enabled,
             stopped=lambda: self._abort is not None,
+            **self._on_hc(),
         )
         if diagnosis is None:
             raise _AbortRequested()
@@ -1312,7 +1332,7 @@ class UpgradeClusterWorkflow:
                 execute_proposed_action,
                 ProposedActionRequest(
                     mce_cluster=self._mce, cluster=self._cluster,
-                    action=pending.action, approved_by=pending.decided_by or "",
+                    action=pending.action, approved_by=pending.decided_by or "", **self._on_hc(),
                 ),
             )
         except ActivityError as err:
@@ -1393,7 +1413,7 @@ class UpgradeClusterWorkflow:
                         cluster=self._cluster,
                         revision=revision,
                         allowed_out_of_sync=[
-                            f"HostedCluster/{self._cluster}",
+                            f"HostedCluster/{self._hc_name}",
                             *(f"NodePool/{name}" for name in context.nodepool_order),
                         ],
                     ),
@@ -1492,6 +1512,25 @@ class UpgradeClusterWorkflow:
     def _ctx(self) -> UpgradeContext:
         assert self._context is not None, "planning sets the context before any step"
         return self._context
+
+    def _on_hc(self) -> dict[str, str | None]:
+        """The HostedCluster's own name and namespace, for every request to the MCE limb.
+
+        `cluster` keeps naming the day1 file (and the Argo CD Application); the
+        HostedCluster the chart renders from it is named differently, and runs
+        planned before day1 told its name send None, which the limb reads as
+        "named after the file".
+        """
+        return {"hosted_cluster": self._hosted, "hosted_cluster_namespace": self._hosted_ns}
+
+    @property
+    def _hc_name(self) -> str:
+        """The HostedCluster's metadata.name, as Argo CD lists it among the Application's resources."""
+        return self._hosted or self._cluster
+
+    @property
+    def _hc_label(self) -> str:
+        return f"{self._hosted_ns}/{self._hc_name}" if self._hosted_ns else self._hc_name
 
     def _plan_summary(self) -> str:
         plan = self._ctx.plan if self._context else None

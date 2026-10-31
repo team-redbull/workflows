@@ -79,23 +79,38 @@ _HYPERSHIFT_VERSION = "v1beta1"
 _KUBECONFIG_KEY = "kubeconfig"
 
 
-async def _hosted_cluster(cluster: str) -> dict | None:
-    """The HostedCluster of this name on the MCE, in whatever namespace; None when there is none.
+def _target(request) -> tuple[str, str | None]:
+    """(name, namespace) of the HostedCluster a request is about.
 
-    Found by listing: day1 renders each into its own `hcp-<cluster>` namespace,
-    and a request names only the cluster. Two of one name is a conflict a
-    person resolves, never a guess.
+    The hostedclusters-setup chart names it `openshift-<clusterName>` in
+    `hcp-<clusterName>`, not after the day1 file, so the run sends its real
+    name (`hosted_cluster`, from day1). A request of a run planned before
+    that sends None: the HostedCluster named after the file, in any namespace.
     """
+    return request.hosted_cluster or request.cluster, request.hosted_cluster_namespace
+
+
+async def _hosted_cluster(name: str, namespace: str | None = None) -> dict | None:
+    """The HostedCluster `namespace/name` on the MCE; None when there is none.
+
+    With no namespace it is found by listing, by name in any namespace. Two of
+    one name is then a conflict a person resolves, never a guess.
+    """
+    if namespace:
+        return await cluster_api.read_custom_object(
+            group=_HYPERSHIFT_GROUP, version=_HYPERSHIFT_VERSION, plural="hostedclusters", kind="HostedCluster",
+            namespace=namespace, name=name,
+        )
     found = [
         hc for hc in await cluster_api.list_cluster_custom_objects(
             group=_HYPERSHIFT_GROUP, version=_HYPERSHIFT_VERSION, plural="hostedclusters", kind="HostedCluster",
         )
-        if (hc.get("metadata") or {}).get("name") == cluster
+        if (hc.get("metadata") or {}).get("name") == name
     ]
     if len(found) > 1:
         namespaces = sorted((hc.get("metadata") or {}).get("namespace", "?") for hc in found)
         raise HostedClusterAccessError(
-            f"{len(found)} HostedClusters are named {cluster} on this MCE, in {', '.join(namespaces)}"
+            f"{len(found)} HostedClusters are named {name} on this MCE, in {', '.join(namespaces)}"
         )
     return found[0] if found else None
 
@@ -193,7 +208,7 @@ async def sync_argo_application(request: ArgoSyncRequest) -> ArgoSyncResult:
 @activity.defn
 async def read_hosted_cluster(request: HostedClusterRequest) -> HostedClusterState:
     """The HostedCluster and its NodePools: versions, conditions, rollout settings."""
-    hosted = await _hosted_cluster(request.cluster)
+    hosted = await _hosted_cluster(*_target(request))
     if hosted is None:
         return upgrade_state.hosted_cluster_state(None, [])
     nodepools = await cluster_api.list_custom_objects(
@@ -210,7 +225,7 @@ async def read_hosted_health(request: HostedHealthRequest) -> HostedHealth:
     An API server that cannot be reached is `reachable: False`, which the
     pre-flight shows a person, rather than a read retried for ever.
     """
-    hosted = await _hosted_cluster(request.cluster)
+    hosted = await _hosted_cluster(*_target(request))
     if hosted is None:
         return HostedHealth(reachable=False)
     kubeconfig = await _kubeconfig(hosted)
@@ -245,7 +260,7 @@ async def read_hosted_health(request: HostedHealthRequest) -> HostedHealth:
 @activity.defn
 async def read_admin_acks(request: AdminAckRequest) -> AdminAckState:
     """The hosted cluster's admin gates and acks, and who called `request.apis` in the last 24 hours."""
-    hosted = await _hosted_cluster(request.cluster)
+    hosted = await _hosted_cluster(*_target(request))
     if hosted is None:
         return AdminAckState(reachable=False)
     objects = await hosted_upgrade_api.read_upgrade_objects(
@@ -273,9 +288,11 @@ async def give_admin_ack(request: GiveAdminAckRequest) -> AdminAckGiven:
 
     Raises AdminGateNotFoundError (permanent) for a gate its admin-gates does not hold.
     """
-    hosted = await _hosted_cluster(request.cluster)
+    hosted = await _hosted_cluster(*_target(request))
     if hosted is None:
-        raise HostedClusterAccessError(f"no HostedCluster {request.cluster} on this MCE to ack {request.gate} in")
+        raise HostedClusterAccessError(
+            f"no HostedCluster {_target(request)[0]} on this MCE to ack {request.gate} in"
+        )
     changed = await hosted_upgrade_api.give_admin_ack(
         await _kubeconfig(hosted),
         hosted_cluster_api.kas_service_url(_hcp_namespace(hosted)),
@@ -319,7 +336,7 @@ async def watch_control_plane(request: WatchControlPlaneRequest) -> WatchOutcome
     """
     snapshot = _resumed_snapshot()
     while True:
-        hosted = await _hosted_cluster(request.cluster)
+        hosted = await _hosted_cluster(*_target(request))
         operators = None if hosted is None else await _hosted_operators(hosted, request.cluster)
         done, seen = upgrade_state.control_plane_progress(hosted, operators, request.version)
         now = datetime.now(UTC)
@@ -337,7 +354,7 @@ async def watch_control_plane(request: WatchControlPlaneRequest) -> WatchOutcome
 
 async def _nodepool_view(request: WatchNodePoolRequest) -> tuple[dict | None, dict, dict | None]:
     """(NodePool, the MachineSet's annotations, the hosted objects or None when unreadable)."""
-    hosted = await _hosted_cluster(request.cluster)
+    hosted = await _hosted_cluster(*_target(request))
     if hosted is None:
         return None, {}, None
     namespace = (hosted.get("metadata") or {}).get("namespace", "")
@@ -404,8 +421,8 @@ async def watch_nodepool(request: WatchNodePoolRequest) -> WatchOutcome:
 
 async def _gate_checks(request: NodePoolGateRequest) -> list[CheckResult]:
     """This poll's gate checks: platform and, when asked, workload, from the hosted cluster."""
-    hosted = await _hosted_cluster(request.cluster)
-    objects, unreadable = None, f"HostedCluster {request.cluster} not found on the MCE"
+    hosted = await _hosted_cluster(*_target(request))
+    objects, unreadable = None, f"HostedCluster {_target(request)[0]} not found on the MCE"
     if hosted is not None:
         try:
             objects = await hosted_upgrade_api.read_gate_objects(
@@ -453,7 +470,8 @@ async def collect_evidence(request: EvidenceRequest) -> EvidenceBundle:
     lines, DESIGN §6.3, come with the pod-log read.) Never a Secret; what cannot
     be read says so instead of failing the bundle.
     """
-    hosted = await _hosted_cluster(request.cluster)
+    name, namespace = _target(request)
+    hosted = await _hosted_cluster(name, namespace)
     nodepools: list[dict] = []
     operators = pods = warnings = None
     drain = None
@@ -463,7 +481,8 @@ async def collect_evidence(request: EvidenceRequest) -> EvidenceBundle:
                 group=_HYPERSHIFT_GROUP, version=_HYPERSHIFT_VERSION, plural="nodepools", kind="NodePool",
                 namespace=(hosted.get("metadata") or {}).get("namespace", ""),
             )
-            if (np.get("spec") or {}).get("clusterName") == request.cluster
+            # A NodePool names its HostedCluster, not the day1 file.
+            if (np.get("spec") or {}).get("clusterName") == name
             and (request.nodepool is None or (np.get("metadata") or {}).get("name") == request.nodepool)
         ]
         try:
@@ -514,7 +533,7 @@ async def execute_proposed_action(request: ProposedActionRequest) -> ActionResul
     """
     action = action_catalog.check(request.action)
     action_id = request.action.action_id
-    hosted = await _hosted_cluster(request.cluster)
+    hosted = await _hosted_cluster(*_target(request))
     if hosted is None:
         return ActionResult(action_id=action_id, executed=False,
                             detail=f"not executed: HostedCluster {request.cluster} not found on the MCE")

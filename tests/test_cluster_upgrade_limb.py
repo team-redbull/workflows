@@ -36,10 +36,20 @@ class _FakeMce:
         self.hosted_clusters = list(hosted_clusters)
         self.nodepools = list(nodepools)
         self.secret_reads = []
+        self.lists = 0
+        self.gets = []
 
     async def list_cluster_custom_objects(self, *, group, version, plural, kind):
         assert plural == "hostedclusters"
+        self.lists += 1
         return self.hosted_clusters
+
+    async def read_custom_object(self, *, group, version, plural, kind, namespace, name):
+        self.gets.append((plural, namespace, name))
+        if plural != "hostedclusters":
+            return None  # no Application in these tests
+        return next((hc for hc in self.hosted_clusters
+                     if hc["metadata"]["name"] == name and hc["metadata"]["namespace"] == namespace), None)
 
     async def list_custom_objects(self, *, group, version, plural, kind, namespace):
         assert plural == "nodepools"
@@ -53,7 +63,7 @@ class _FakeMce:
 @pytest.fixture
 def mce(monkeypatch):
     fake = _FakeMce([_hc()])
-    for fn in ("list_cluster_custom_objects", "list_custom_objects", "read_secret_data"):
+    for fn in ("list_cluster_custom_objects", "list_custom_objects", "read_secret_data", "read_custom_object"):
         monkeypatch.setattr(cluster_api, fn, getattr(fake, fn))
     return fake
 
@@ -77,6 +87,71 @@ class TestFindingTheHostedCluster:
         mce.hosted_clusters = [_hc(), _hc(namespace="clusters")]
         with pytest.raises(HostedClusterAccessError, match="2 HostedClusters are named lab-upgrade"):
             await limb.read_hosted_cluster(HostedClusterRequest(mce_cluster="m", cluster="lab-upgrade"))
+
+
+# The hostedclusters-setup chart's names for the day1 file `herzi.yaml`.
+OWN = {"hosted_cluster": "openshift-herzi", "hosted_cluster_namespace": "hcp-herzi"}
+
+
+class TestTheHostedClusterByItsOwnName:
+    """A run sends the HostedCluster's own name and namespace from day1; the file's name stays `cluster`."""
+
+    async def test_read_by_name_in_its_namespace_with_the_nodepools_naming_it(self, mce):
+        mce.hosted_clusters = [_hc("openshift-herzi", "hcp-herzi"), _hc("herzi", "hcp-herzi")]
+        mce.nodepools = [
+            {"metadata": {"name": "herzi-np", "namespace": "hcp-herzi"}, "spec": {"clusterName": "openshift-herzi"},
+             "status": {"version": "4.19.53"}},
+            {"metadata": {"name": "stray", "namespace": "hcp-herzi"}, "spec": {"clusterName": "herzi"}},
+        ]
+        state = await limb.read_hosted_cluster(HostedClusterRequest(mce_cluster="m", cluster="herzi", **OWN))
+        assert state.found and state.namespace == "hcp-herzi"
+        assert [np.name for np in state.nodepools] == ["herzi-np"]
+        # A get in the namespace day1 names: no listing across the MCE.
+        assert mce.gets == [("hostedclusters", "hcp-herzi", "openshift-herzi")] and mce.lists == 0
+
+    async def test_absent_under_its_own_name_is_not_found_even_if_one_bears_the_file_s(self, mce):
+        mce.hosted_clusters = [_hc("herzi", "hcp-herzi")]
+        state = await limb.read_hosted_cluster(HostedClusterRequest(mce_cluster="m", cluster="herzi", **OWN))
+        assert state.found is False
+
+    async def test_the_admin_kubeconfig_and_the_control_plane_follow_the_hostedcluster(self, mce, monkeypatch):
+        mce.hosted_clusters = [_hc("openshift-herzi", "hcp-herzi")]
+        seen = {}
+
+        async def _read(kubeconfig, server, cluster, apis):
+            seen.update(server=server)
+            return {"cluster_version": {}, "cluster_operators": [], "admin_gates": {"data": {}},
+                    "admin_acks": {"data": None}, "api_request_counts": {}}
+
+        monkeypatch.setattr(hosted_upgrade_api, "read_upgrade_objects", _read)
+        await limb.read_admin_acks(AdminAckRequest(mce_cluster="m", cluster="herzi", **OWN))
+        assert seen["server"] == "https://kube-apiserver.hcp-herzi-openshift-herzi.svc:6443"
+        assert mce.secret_reads == [("hcp-herzi", "openshift-herzi-admin-kubeconfig")]
+
+    async def test_the_evidence_shows_the_nodepools_of_the_hostedcluster_not_of_the_file_name(self, mce, monkeypatch):
+        from shared.models.cluster_upgrade import EvidenceRequest
+
+        mce.hosted_clusters = [_hc("openshift-herzi", "hcp-herzi")]
+        mce.nodepools = [
+            {"metadata": {"name": "herzi-np", "namespace": "hcp-herzi"}, "spec": {"clusterName": "openshift-herzi"},
+             "status": {"version": "4.19.53"}},
+            {"metadata": {"name": "stray", "namespace": "hcp-herzi"}, "spec": {"clusterName": "herzi"},
+             "status": {"version": "4.18.56"}},
+        ]
+
+        async def _upgrade(kubeconfig, server, cluster, apis):
+            return {"cluster_operators": []}
+
+        async def _evidence(kubeconfig, server, cluster):
+            return {"data_plane_pods": [], "warning_events": []}
+
+        monkeypatch.setattr(hosted_upgrade_api, "read_upgrade_objects", _upgrade)
+        monkeypatch.setattr(hosted_upgrade_api, "read_evidence_objects", _evidence)
+        bundle = await limb.collect_evidence(EvidenceRequest(mce_cluster="m", cluster="herzi", **OWN))
+        assert "herzi-np at 4.19.53" in bundle.sections["nodepools"]
+        assert "stray" not in bundle.sections["nodepools"]
+        # The Application keeps the file's name.
+        assert ("applications", "openshift-gitops", "herzi") in mce.gets
 
 
 class TestAdminAckActivities:
@@ -271,7 +346,7 @@ class TestTheControlPlaneWatch:
 
         polls, beats = list(polls), []
 
-        async def _hosted(cluster):
+        async def _hosted(name, namespace=None):
             return polls[0][0]
 
         async def _operators(hosted, cluster):

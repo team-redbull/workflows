@@ -166,7 +166,18 @@ class Fleet:
         upgrade: ClusterUpgradeSettings | None = None,
         mirror: list[str] | None = None,
         max_concurrent_control_planes: int = 2,
+        hosted_cluster: str | None = None,
+        hosted_cluster_namespace: str | None = None,
     ) -> None:
+        # What day1 says the HostedCluster is (the chart's `openshift-<clusterName>`
+        # in `hcp-<clusterName>`); None, like a reader predating the fields: named
+        # after the file. The MCE mocks find it only by the name it really has.
+        self.hosted_cluster = hosted_cluster
+        self.hosted_cluster_namespace = hosted_cluster_namespace
+        self.hc_name = hosted_cluster or CLUSTER
+        self.hc_namespace = hosted_cluster_namespace or "clusters"
+        # Every MCE request that named a HostedCluster: (activity, name, namespace).
+        self.hc_requests: list[tuple[str, str, str | None]] = []
         self.nodepools = dict(nodepools or {"np-a": control_plane, "np-b": control_plane})
         self.zones = zones or {}
         # A lab cluster (wave 1) unless a test says otherwise: auto NodePool mode, which
@@ -251,6 +262,17 @@ class Fleet:
         self.blob += 1
         self.revision += 1
 
+    def _reaches(self, activity_name: str, request: Any) -> bool:
+        """Record which HostedCluster a request names, as the limb reads it: is it this one?"""
+        name = request.hosted_cluster or request.cluster
+        namespace = request.hosted_cluster_namespace
+        self.hc_requests.append((activity_name, name, namespace))
+        return name == self.hc_name and namespace in (None, self.hc_namespace)
+
+    def hc_misses(self) -> list[tuple[str, str, str | None]]:
+        """The requests that named a HostedCluster other than this one."""
+        return [r for r in self.hc_requests if r[1] != self.hc_name or r[2] not in (None, self.hc_namespace)]
+
     def mocks(self) -> dict[str, list[Any]]:
         fleet = self
 
@@ -271,6 +293,7 @@ class Fleet:
             return Day1Cluster(
                 path=fleet.day1_path, revision=f"rev-{fleet.revision}", blob=fleet._blob(),
                 mastertag=fleet.mastertag, image_path=IMAGE_PATH,
+                hosted_cluster=fleet.hosted_cluster, hosted_cluster_namespace=fleet.hosted_cluster_namespace,
                 nodepools=[
                     Day1NodePool(name=name, workertag=fleet.workertags.get(name), upgrade_type="InPlace",
                                  zone=fleet.zones.get(name), replicas=2, max_unavailable="1")
@@ -343,10 +366,12 @@ class Fleet:
         @activity.defn(name="read_hosted_cluster")
         async def read_hosted_cluster(request: HostedClusterRequest) -> HostedClusterState:
             fleet.calls.append("read_hosted_cluster")
+            if not fleet._reaches("read_hosted_cluster", request):
+                return HostedClusterState(found=False)
             settling = fleet.settling > 0
             fleet.settling = max(0, fleet.settling - 1)
             return HostedClusterState(
-                found=True, namespace="clusters", control_plane_version=fleet.cluster_cp,
+                found=True, namespace=fleet.hc_namespace, control_plane_version=fleet.cluster_cp,
                 progressing=settling,
                 conditions={
                     "ClusterVersionProgressing": str(settling), "ClusterVersionSucceeding": "True",
@@ -368,6 +393,7 @@ class Fleet:
         @activity.defn(name="read_hosted_health")
         async def read_hosted_health(request: HostedHealthRequest) -> HostedHealth:
             fleet.calls.append("read_hosted_health")
+            fleet._reaches("read_hosted_health", request)
             if fleet.health_script:
                 return fleet.health_script.pop(0)
             missing_ack = fleet.admin_ack_pending()
@@ -381,6 +407,7 @@ class Fleet:
         @activity.defn(name="read_admin_acks")
         async def read_admin_acks(request: AdminAckRequest) -> AdminAckState:
             fleet.calls.append("read_admin_acks")
+            fleet._reaches("read_admin_acks", request)
             required = fleet.admin_ack_pending()
             if required is None and fleet._cvo_lagging > 0:
                 fleet._cvo_lagging -= 1
@@ -394,6 +421,7 @@ class Fleet:
         @activity.defn(name="give_admin_ack")
         async def give_admin_ack(request: GiveAdminAckRequest) -> AdminAckGiven:
             fleet.calls.append(f"ack:{request.gate}")
+            fleet._reaches("give_admin_ack", request)
             if fleet.ack_gate_vanishes:
                 fleet.ack_gate_vanishes = False
                 fleet.admin_gates.pop(request.gate, None)
@@ -421,6 +449,7 @@ class Fleet:
         @activity.defn(name="watch_control_plane")
         async def watch_control_plane(request: WatchControlPlaneRequest) -> WatchOutcome:
             fleet.calls.append(f"watch-cp:{request.version}")
+            fleet._reaches("watch_control_plane", request)
             while fleet.block_control_plane_watch:
                 activity.heartbeat()
                 await asyncio.sleep(0.05)
@@ -432,6 +461,7 @@ class Fleet:
         @activity.defn(name="watch_nodepool")
         async def watch_nodepool(request: WatchNodePoolRequest) -> WatchOutcome:
             fleet.calls.append(f"watch-np:{request.nodepool}:{request.version}")
+            fleet._reaches("watch_nodepool", request)
             fleet.np_watch_requests.append(request)
             while fleet.block_nodepool_watch:
                 activity.heartbeat()
@@ -444,12 +474,14 @@ class Fleet:
         @activity.defn(name="watch_nodepool_gate")
         async def watch_nodepool_gate(request: NodePoolGateRequest) -> GateOutcome:
             fleet.calls.append(f"gate:{request.nodepool}")
+            fleet._reaches("watch_nodepool_gate", request)
             fleet.gate_requests.append(request)
             return fleet.gate_script.pop(0) if fleet.gate_script else GateOutcome(result=GateResult.PASSED)
 
         @activity.defn(name="collect_evidence")
         async def collect_evidence(request: EvidenceRequest) -> EvidenceBundle:
             fleet.calls.append("collect_evidence")
+            fleet._reaches("collect_evidence", request)
             while fleet.block_evidence:
                 await asyncio.sleep(0.02)
             return EvidenceBundle(sections={"hostedcluster": "Progressing=True for 25m"})
@@ -457,6 +489,7 @@ class Fleet:
         @activity.defn(name="execute_proposed_action")
         async def execute_proposed_action(request: ProposedActionRequest) -> ActionResult:
             fleet.calls.append(f"action:{request.action.action_id}")
+            fleet._reaches("execute_proposed_action", request)
             fleet.actions.append(request)
             return ActionResult(action_id=request.action.action_id, executed=True, detail="pod deleted")
 

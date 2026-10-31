@@ -217,7 +217,8 @@ class UpgradeControlPlaneWorkflow:
                     mce_cluster=request.mce_cluster,
                     cluster=request.cluster,
                     revision=commit.revision,
-                    allowed_out_of_sync=[f"HostedCluster/{request.cluster}"],
+                    # Argo CD lists the HostedCluster by its own name, not the file's.
+                    allowed_out_of_sync=[f"HostedCluster/{request.hosted_cluster or request.cluster}"],
                 ),
                 timeout=SYNC_TIMEOUT,
             )
@@ -261,6 +262,8 @@ class UpgradeControlPlaneWorkflow:
                 failing_checks=[failing],
                 tier1_enabled=request.tier1_enabled,
                 stopped=lambda: self._stop,
+                hosted_cluster=request.hosted_cluster,
+                hosted_cluster_namespace=request.hosted_cluster_namespace,
             )
             if diagnosis is None:
                 raise _Stopped()
@@ -316,6 +319,8 @@ class UpgradeControlPlaneWorkflow:
                 version=request.step.version,
                 stall_minutes=CONTROL_PLANE_STALL_MINUTES,
                 deadline_minutes=CONTROL_PLANE_DEADLINE_MINUTES,
+                hosted_cluster=request.hosted_cluster,
+                hosted_cluster_namespace=request.hosted_cluster_namespace,
             ),
             deadline_minutes=CONTROL_PLANE_DEADLINE_MINUTES,
         )

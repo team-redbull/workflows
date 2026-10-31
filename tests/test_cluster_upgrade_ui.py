@@ -17,6 +17,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from shared.consts import UPGRADE_TARGETS_WORKFLOW_QUEUE
 from shared.models.cluster_upgrade import (
     ClusterUpgradeSettings,
     ContinueNodePool,
@@ -26,11 +27,15 @@ from shared.models.cluster_upgrade import (
     UpgradeClusterProgress,
     UpgradeClusterResult,
     UpgradePhase,
+    UpgradeTargets,
+    UpgradeTargetsInput,
+    UpgradeTargetsRunArgs,
     WatchResult,
 )
 from tests.cluster_upgrade_fakes import CLUSTER, MCE, WORKFLOW_ID, Fleet, Harness, request, verdict
 from tests.test_upgrade_cluster_workflow import ALICE, DAY2, KYVERNO, Run, _approve_through_control_plane
 from workflow_domains.cluster_upgrade import ui
+from workflow_domains.cluster_upgrade.upgrade_targets import UpgradeTargetsWorkflow
 from workflow_domains.routers import runs as runs_router
 
 DEMO = ui.UI_DIR / "demo-runs.json"
@@ -53,7 +58,8 @@ def test_the_page_is_served_whole_with_nothing_from_outside(client):
     # Air-gapped: no script, stylesheet or font from another host.
     assert "http://" not in page and "https://" not in page
     # It calls the API it is served by, on the routes the routers really have.
-    for path in ("/workflows/runs", "/workflows/cluster-upgrade/upgrade-cluster", "/ui/cluster-upgrade/demo-runs.json"):
+    for path in ("/workflows/runs", "/workflows/cluster-upgrade/upgrade-cluster", "/workflows/cluster-upgrade/upgrade-targets",
+                 "/ui/cluster-upgrade/demo-runs.json"):
         assert path in page
 
 
@@ -71,6 +77,10 @@ def test_the_demo_data_is_served_and_decodes_as_the_api_returns_it(client):
             assert UpgradeClusterResult.model_validate(status["result"]).outcome.value == "done"
     assert phases == {UpgradePhase.AWAITING_APPROVAL, UpgradePhase.CONTROL_PLANE_STEP, UpgradePhase.AWAITING_CONTINUE,
                       UpgradePhase.NEEDS_HUMAN, UpgradePhase.AWAITING_ADMIN_ACK}
+    # The "New upgrade" form's choices, as GET /upgrade-targets returns them (D22).
+    targets = {cluster: UpgradeTargets.model_validate(t) for cluster, t in demo["targets"].items()}
+    assert targets["demo-media-site2"].supported_minors == ["4.20", "4.19", "4.18"]
+    assert [t.version for t in targets["demo-media-site2"].targets] == ["4.20.44"]
     # Demo names only: nothing of the fakes' production-looking names is left.
     text = DEMO.read_text()
     assert CLUSTER not in text and MCE not in text
@@ -196,6 +206,25 @@ _SCENARIOS = [
 ]
 
 
+def _media_fleet() -> Fleet:
+    """A cluster with no run yet, on an MCE that supports up to 4.20 only."""
+    fleet = Fleet(control_plane="4.19.53", upgrade=PRODUCTION)
+    fleet.supported = ["4.20", "4.19", "4.18"]
+    return fleet
+
+
+# Clusters the demo's "New upgrade" form knows: every run's, plus ones with no run.
+_TARGET_ONLY = [("demo-media-site2", _media_fleet), ("demo-maps-site2", lambda: Fleet(control_plane="4.20.44"))]
+
+
+async def _targets(h: Harness) -> dict[str, Any]:
+    targets = await h.client.execute_workflow(
+        UpgradeTargetsWorkflow.run, UpgradeTargetsRunArgs(input=UpgradeTargetsInput(cluster=CLUSTER)),
+        id=f"upgrade-targets-{CLUSTER}", task_queue=UPGRADE_TARGETS_WORKFLOW_QUEUE,
+    )
+    return targets.model_dump(mode="json")
+
+
 def _renamed(value: Any, cluster: str) -> Any:
     text = json.dumps(value)
     for old, new in ((WORKFLOW_ID, f"upgrade-cluster-{cluster}"), (CLUSTER, cluster), (MCE, DEMO_MCE)):
@@ -204,9 +233,13 @@ def _renamed(value: Any, cluster: str) -> Any:
 
 
 async def _record_demo() -> dict[str, Any]:
-    listing, statuses = [], {}
+    listing, statuses, targets = [], {}, {}
+    for cluster, make_fleet in _TARGET_ONLY:
+        async with Harness(make_fleet()) as h:
+            targets[cluster] = _renamed(await _targets(h), cluster)
     for cluster, make_fleet, drive in _SCENARIOS:
         async with Harness(make_fleet()) as h:
+            targets[cluster] = _renamed(await _targets(h), cluster)
             await drive(h)
             description = await h.run().describe()
             status = description.status.name if description.status else "UNKNOWN"
@@ -223,7 +256,7 @@ async def _record_demo() -> dict[str, Any]:
             }, cluster))
             statuses[f"upgrade-cluster-{cluster}"] = _renamed(run, cluster)
     return {"generated_by": "UPDATE_UI_DEMO=1 pytest tests/test_cluster_upgrade_ui.py", "list": listing,
-            "runs": statuses}
+            "runs": statuses, "targets": targets}
 
 
 @pytest.mark.skipif(not os.environ.get("UPDATE_UI_DEMO"), reason="set UPDATE_UI_DEMO=1 to regenerate demo-runs.json")

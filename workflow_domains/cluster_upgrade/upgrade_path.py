@@ -49,8 +49,9 @@ with workflow.unsafe.imports_passed_through():
         StepReason,
         UpgradePlan,
         UpgradeStep,
+        UpgradeTarget,
     )
-    from shared.ocp_version import minor_name, parse_release, release_version
+    from shared.ocp_version import minor_name, parse_minor, parse_release, release_version
 
 
 def resolve_upgrade_path(
@@ -152,6 +153,53 @@ def recommended_target(
         if _minor(version) == minor and version in rung_versions:
             candidates.append(version)
     return max(candidates, key=_key) if candidates else None
+
+
+def target_options(
+    *,
+    control_plane: str,
+    nodepools: dict[str, str],
+    ladder: list[LadderRung],
+    supported_minors: list[str],
+    max_worker_skew: int,
+) -> list[UpgradeTarget]:
+    """Every release a person may pick as a target, newest first (D22).
+
+    A ladder rung newer than the control plane, of a minor the MCE supports,
+    to which resolve_upgrade_path finds a path. The ladder is the list of
+    releases the team mirrored and verified, so nothing outside it is offered,
+    whatever the registry holds. Empty when the cluster is at the newest rung.
+    """
+    current = release_version(control_plane)
+    supported = set()
+    for minor in supported_minors:
+        try:
+            supported.add(parse_minor(minor))
+        except ValueError:
+            continue
+    rungs = [rung for rung in _ordered_rungs(ladder)
+             if _key(rung.version) > _key(current) and _minor(rung.version) in supported]
+    newest = {}
+    for rung in rungs:
+        newest[_minor(rung.version)] = rung.version
+    options = []
+    for rung in reversed(rungs):
+        try:
+            plan = resolve_upgrade_path(
+                control_plane=current, nodepools=nodepools, target=rung.version,
+                ladder=ladder, max_worker_skew=max_worker_skew,
+            )
+        except ApplicationError:
+            continue
+        options.append(UpgradeTarget(
+            version=rung.version,
+            minor=minor_name(_minor(rung.version)),
+            steps=len(plan.steps),
+            control_plane_steps=sum(1 for step in plan.steps if step.kind is StepKind.CONTROL_PLANE),
+            newest_in_minor=newest[_minor(rung.version)] == rung.version,
+            must=rung.must,
+        ))
+    return options
 
 
 def _next_control_plane_step(

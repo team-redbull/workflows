@@ -15,7 +15,7 @@ The run's validator is the only judge of that — this router never reads the
 run's state to second-guess it, so the two can never disagree.
 
 PATHS ARE `/workflows/cluster-upgrade/upgrade-cluster[/{workflow_id}/<decision>]`.
-The workflow id is the one the start answered with, `upgrade-cluster-<mce>_<cluster>`;
+The workflow id is the one the start answered with, `upgrade-cluster-<cluster>`;
 a decision route refuses any other id, so it can only ever reach an upgrade run.
 """
 
@@ -24,23 +24,34 @@ from __future__ import annotations
 from datetime import timedelta
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-from temporalio.client import Client, WorkflowUpdateFailedError, WorkflowUpdateRPCTimeoutOrCancelledError
-from temporalio.exceptions import ApplicationError, WorkflowAlreadyStartedError
+from temporalio.client import (
+    Client,
+    WorkflowFailureError,
+    WorkflowUpdateFailedError,
+    WorkflowUpdateRPCTimeoutOrCancelledError,
+)
+from temporalio.common import WorkflowIDConflictPolicy
+from temporalio.exceptions import ApplicationError, TimeoutError as TemporalTimeoutError, WorkflowAlreadyStartedError
 from temporalio.service import RPCError, RPCStatusCode
 
-from shared.consts import UPGRADE_CLUSTER_WORKFLOW_QUEUE
+from shared.consts import UPGRADE_CLUSTER_WORKFLOW_QUEUE, UPGRADE_TARGETS_WORKFLOW_QUEUE
+from shared.exceptions import ClusterFileNotFoundError
 from shared.models.cluster_upgrade import (
     ActionDecision,
     ContinueNodePool,
     HumanDecision,
     UpgradeClusterInput,
     UpgradeClusterRunArgs,
+    UpgradeTargets,
+    UpgradeTargetsInput,
+    UpgradeTargetsRunArgs,
 )
 from shared.ocp_version import parse_minor, release_version
-from shared.workflow_ids import upgrade_cluster_workflow_id
+from shared.workflow_ids import upgrade_cluster_workflow_id, upgrade_targets_workflow_id
 from workflow_domains.cluster_upgrade.upgrade_cluster import UpgradeClusterWorkflow
+from workflow_domains.cluster_upgrade.upgrade_targets import UpgradeTargetsWorkflow
 from workflow_domains.routers.deps import get_temporal_client
 from workflow_domains.routers.models import StartWorkflowResponse
 
@@ -196,6 +207,47 @@ async def start_upgrade_cluster(
             detail=f"{request.cluster} already has an upgrade run: {workflow_id}",
         )
     return StartWorkflowResponse(workflow_id=handle.id, run_id=handle.result_run_id or "")
+
+
+# The targets read is two git reads on the hub limb; longer means no worker answered.
+_TARGETS_TIMEOUT = timedelta(seconds=60)
+_CLUSTER_NAME = r"^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$"
+
+
+@router.get("/upgrade-targets", response_model=UpgradeTargets)
+async def upgrade_targets(
+    cluster: str = Query(pattern=_CLUSTER_NAME, description="The HostedCluster: its day1 file's name."),
+    client: Client = Depends(get_temporal_client),
+) -> UpgradeTargets:
+    """What one cluster can be upgraded to: the "New upgrade" form's choices (D22).
+
+    Every ladder rung newer than the cluster's mastertag, of a minor its MCE
+    supports, to which a path resolves, newest first. Read from day1 git by a
+    short upgrade-targets run, waited for up to 60 s: 404 when day1 has no
+    such cluster, 409 when its file or rules cannot be used, 504 when nothing
+    answered.
+    """
+    try:
+        return await client.execute_workflow(
+            UpgradeTargetsWorkflow.run,
+            UpgradeTargetsRunArgs(input=UpgradeTargetsInput(cluster=cluster)),
+            id=upgrade_targets_workflow_id(cluster),
+            task_queue=UPGRADE_TARGETS_WORKFLOW_QUEUE,
+            execution_timeout=_TARGETS_TIMEOUT,
+            id_conflict_policy=WorkflowIDConflictPolicy.USE_EXISTING,
+        )
+    except WorkflowFailureError as exc:
+        root: BaseException = exc
+        while getattr(root, "cause", None) is not None:
+            root = root.cause  # type: ignore[assignment]
+        if isinstance(root, TemporalTimeoutError):
+            raise HTTPException(
+                status_code=504,
+                detail=f"no answer in {_TARGETS_TIMEOUT.seconds}s: is the upgrade-gitops limb running?",
+            )
+        message = root.message if isinstance(root, ApplicationError) else str(root)
+        kind = root.type if isinstance(root, ApplicationError) else None
+        raise HTTPException(status_code=404 if kind == ClusterFileNotFoundError.__name__ else 409, detail=message)
 
 
 async def _decide(client: Client, workflow_id: str, update: Any, decision: BaseModel, name: str) -> DecisionResponse:

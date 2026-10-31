@@ -82,6 +82,8 @@ SERVER_PROVISIONING_ACTIVITY_QUEUE = "server-provisioning-activity"
 #     identity — a queue per MCE as well.
 UPGRADE_CLUSTER_WORKFLOW_QUEUE = "upgrade-cluster-workflow"
 UPGRADE_CONTROL_PLANE_WORKFLOW_QUEUE = "upgrade-control-plane-workflow"
+# The "New upgrade" form's short read of what a cluster can be upgraded to (D22).
+UPGRADE_TARGETS_WORKFLOW_QUEUE = "upgrade-targets-workflow"
 UPGRADE_GITOPS_ACTIVITY_QUEUE = "upgrade-gitops-activity"
 CLUSTER_UPGRADE_ACTIVITY_QUEUE = "cluster-upgrade-activity"
 UPGRADE_AGENT_ACTIVITY_QUEUE = "upgrade-agent-activity"

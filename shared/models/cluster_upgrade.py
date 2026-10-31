@@ -259,6 +259,47 @@ class UpgradeClusterResumeState(BaseModel):
     log: list[UpgradeLogEntry] = Field(default_factory=list)
 
 
+class UpgradeTarget(BaseModel):
+    """One release a person may pick as an upgrade target (the "New upgrade" form's dropdown)."""
+
+    version: str
+    minor: str  # "4.21"
+    steps: int  # how many steps the plan to it has, control plane and workers
+    control_plane_steps: int
+    newest_in_minor: bool  # the newest rung of its minor: the recommended pick for that minor
+    must: bool = False
+
+
+class UpgradeTargetsInput(BaseModel):
+    cluster: str
+
+
+class UpgradeTargetsRunArgs(BaseModel):
+    """run()'s single argument (CLAUDE.md §5: one Pydantic argument)."""
+
+    input: UpgradeTargetsInput
+
+
+class UpgradeTargets(BaseModel):
+    """What a cluster can be upgraded to, read from day1 git (DESIGN §4, D22).
+
+    Every ladder rung newer than the control plane whose minor the hosting
+    MCE supports and to which a path resolves, newest first. The ladder is what
+    the team mirrored and verified, so a minor missing from the internal
+    registry is never offered. From git, so it is intent: planning still checks
+    git against the cluster and pins every release in the mirror.
+    """
+
+    cluster: str
+    mce_cluster: str
+    mce_version: str
+    control_plane_version: str | None  # day1 mastertag
+    supported_minors: list[str]
+    ladder_revision: str
+    verified_against_graph: str | None = None
+    targets: list[UpgradeTarget] = Field(default_factory=list)
+
+
 class UpgradeClusterRunArgs(BaseModel):
     """run()'s single argument: the request, plus state when continuing as new."""
 

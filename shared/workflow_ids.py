@@ -210,6 +210,11 @@ def upgrade_cluster_workflow_id(cluster: str) -> str:
     return f"upgrade-cluster-{cluster}"
 
 
+def upgrade_targets_workflow_id(cluster: str) -> str:
+    """`upgrade-targets-<cluster>`: one read at a time per cluster; a second ask joins it (USE_EXISTING)."""
+    return f"upgrade-targets-{cluster}"
+
+
 def upgrade_control_plane_workflow_id(mce_cluster: str, slot: int) -> str:
     """`upgrade-control-plane-<mce>_<slot>`: one of an MCE's control-plane upgrade SLOTS.
 

@@ -56,6 +56,9 @@ class _FakeClient:
         self.updates: list[tuple[str, object, object]] = []
         self.start_error: Exception | None = None
         self.update_error: Exception | None = None
+        self.target_reads: list[tuple[str, str]] = []
+        self.targets = None
+        self.targets_error: Exception | None = None
 
     async def start_workflow(self, run, args, *, id: str, task_queue: str):
         assert run == UpgradeClusterWorkflow.run
@@ -67,6 +70,19 @@ class _FakeClient:
 
     def get_workflow_handle(self, workflow_id: str) -> _FakeHandle:
         return _FakeHandle(self, workflow_id)
+
+    async def execute_workflow(self, run, args, *, id: str, task_queue: str, execution_timeout, id_conflict_policy):
+        from shared.consts import UPGRADE_TARGETS_WORKFLOW_QUEUE
+        from temporalio.common import WorkflowIDConflictPolicy
+        from workflow_domains.cluster_upgrade.upgrade_targets import UpgradeTargetsWorkflow
+
+        assert run == UpgradeTargetsWorkflow.run and task_queue == UPGRADE_TARGETS_WORKFLOW_QUEUE
+        # Two asks for one cluster share one read; a stuck read ends on its own.
+        assert id_conflict_policy is WorkflowIDConflictPolicy.USE_EXISTING and execution_timeout.total_seconds() == 60
+        self.target_reads.append((id, args.input.cluster))
+        if self.targets_error is not None:
+            raise self.targets_error
+        return self.targets
 
 
 @pytest.fixture
@@ -202,3 +218,46 @@ class TestDecisions:
 
     def test_a_decision_with_unknown_fields_is_refused(self, client, fake):
         assert client.post(f"{PATH}/{RUN}/approve", json={"by": "alice", "force": True}).status_code == 422
+
+
+class TestUpgradeTargets:
+    """GET /upgrade-targets: the "New upgrade" form's dropdown (D22)."""
+
+    PATH = "/workflows/cluster-upgrade/upgrade-targets"
+
+    def test_the_targets_the_read_returned(self, client, fake):
+        from shared.models.cluster_upgrade import UpgradeTarget, UpgradeTargets
+
+        fake.targets = UpgradeTargets(
+            cluster="c1", mce_cluster="ocp4-m", mce_version="2.17.3", control_plane_version="4.19.53",
+            supported_minors=["4.20", "4.19"], ladder_revision="rev-1",
+            targets=[UpgradeTarget(version="4.20.44", minor="4.20", steps=2, control_plane_steps=1, newest_in_minor=True)],
+        )
+        response = client.get(self.PATH, params={"cluster": "c1"})
+        assert response.status_code == 200
+        assert [t["version"] for t in response.json()["targets"]] == ["4.20.44"]
+        assert fake.target_reads == [("upgrade-targets-c1", "c1")]
+
+    @pytest.mark.parametrize(("cause", "status", "needle"), [
+        (ApplicationError("no c1.yaml in day1", type="ClusterFileNotFoundError"), 404, "no c1.yaml"),
+        (ApplicationError("upgrade/mces/ocp4-m.yaml is missing", type="UpgradeRulesInvalidError"), 409, "is missing"),
+    ])
+    def test_what_day1_refuses_is_named(self, client, fake, cause, status, needle):
+        from temporalio.client import WorkflowFailureError
+
+        fake.targets_error = WorkflowFailureError(cause=cause)
+        response = client.get(self.PATH, params={"cluster": "c1"})
+        assert response.status_code == status and needle in response.json()["detail"]
+
+    def test_no_answer_in_a_minute_is_a_504(self, client, fake):
+        from temporalio.client import WorkflowFailureError
+        from temporalio.exceptions import TimeoutError as TemporalTimeoutError
+
+        fake.targets_error = WorkflowFailureError(cause=TemporalTimeoutError("timed out", type=None, last_heartbeat_details=[]))
+        response = client.get(self.PATH, params={"cluster": "c1"})
+        assert response.status_code == 504 and "upgrade-gitops limb" in response.json()["detail"]
+
+    def test_a_cluster_name_is_checked_before_anything_runs(self, client, fake):
+        assert client.get(self.PATH, params={"cluster": "C1; drop"}).status_code == 422
+        assert fake.target_reads == []
+

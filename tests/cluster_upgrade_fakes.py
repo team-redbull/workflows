@@ -30,6 +30,7 @@ from shared.consts import (
     UPGRADE_CLUSTER_WORKFLOW_QUEUE,
     UPGRADE_CONTROL_PLANE_WORKFLOW_QUEUE,
     UPGRADE_GITOPS_ACTIVITY_QUEUE,
+    UPGRADE_TARGETS_WORKFLOW_QUEUE,
     cluster_upgrade_activity_queue,
     upgrade_agent_activity_queue,
 )
@@ -94,6 +95,7 @@ from shared.workflow_ids import upgrade_cluster_workflow_id
 from workflow_domains.cluster_upgrade.gates import admin_gate_minor, release_repositories
 from workflow_domains.cluster_upgrade.upgrade_cluster import UpgradeClusterWorkflow
 from workflow_domains.cluster_upgrade.upgrade_control_plane import UpgradeControlPlaneWorkflow
+from workflow_domains.cluster_upgrade.upgrade_targets import UpgradeTargetsWorkflow
 
 MCE = "ocp4-prod-mce-site1-a"
 CLUSTER = "ocp4-prod-herzi-site1"
@@ -172,6 +174,8 @@ class Fleet:
         self.upgrade = upgrade or ClusterUpgradeSettings(wave=1)
         self.mirror = mirror if mirror is not None else [r.version for r in LADDER]
         self.max_concurrent_control_planes = max_concurrent_control_planes
+        # The minors the hosting MCE supports (rules file `upgrade/mces/<mce>.yaml`).
+        self.supported = list(SUPPORTED)
         # day1, as written: production files pin every NodePool's workertag.
         # Its folder names the MCE the run then works on.
         self.day1_path = DAY1_PATH
@@ -256,7 +260,7 @@ class Fleet:
             return UpgradeRules(
                 revision=f"rev-{fleet.revision}", ladder=LADDER, max_worker_skew=2,
                 verified_against_graph="2026-10-31", release=RELEASE, mce_version="2.17.3",
-                supported_hosted_versions=SUPPORTED,
+                supported_hosted_versions=fleet.supported,
                 max_concurrent_control_planes=fleet.max_concurrent_control_planes,
                 admin_acks=ADMIN_ACKS, api_usage_ignored_users=IGNORED_USERS,
             )
@@ -334,7 +338,7 @@ class Fleet:
         @activity.defn(name="read_mce_state")
         async def read_mce_state(request: MceRequest) -> MceState:
             fleet.calls.append("read_mce_state")
-            return MceState(supported_versions_found=True, supported_versions=SUPPORTED, idms_mirrors=MIRRORS)
+            return MceState(supported_versions_found=True, supported_versions=fleet.supported, idms_mirrors=MIRRORS)
 
         @activity.defn(name="read_hosted_cluster")
         async def read_hosted_cluster(request: HostedClusterRequest) -> HostedClusterState:
@@ -513,6 +517,7 @@ class Harness:
             Worker(self.client, task_queue=UPGRADE_CLUSTER_WORKFLOW_QUEUE, workflows=[UpgradeClusterWorkflow]),
             Worker(self.client, task_queue=UPGRADE_CONTROL_PLANE_WORKFLOW_QUEUE,
                    workflows=[UpgradeControlPlaneWorkflow]),
+            Worker(self.client, task_queue=UPGRADE_TARGETS_WORKFLOW_QUEUE, workflows=[UpgradeTargetsWorkflow]),
             Worker(self.client, task_queue=BLOCKER_QUEUE, workflows=[SlotBlocker],
                    workflow_runner=UnsandboxedWorkflowRunner()),
             *(

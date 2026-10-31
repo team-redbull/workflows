@@ -185,6 +185,7 @@ dialog .buttons { display: flex; justify-content: flex-end; gap: 8px; margin-top
 <script>
 "use strict";
 const API = "/workflows/cluster-upgrade/upgrade-cluster";
+const TARGETS = "/workflows/cluster-upgrade/upgrade-targets";
 const RUNS = "/workflows/runs";
 const DEMO_URL = "/ui/cluster-upgrade/demo-runs.json";
 const POLL_MS = 10000;
@@ -471,7 +472,7 @@ function renderLog(log) {
 
 function who() { return $("who").value.trim(); }
 
-function openDialog({ title, explain, method = "POST", path, fields = [], body }) {
+function openDialog({ title, explain, method = "POST", path, fields = [], body, onOpen }) {
   const form = $("dialog-form");
   form.innerHTML = `<h3>${esc(title)}</h3>${explain ? `<p class="explain">${esc(explain)}</p>` : ""}
     <label for="f-by">Who decides</label><input id="f-by" required value="${esc(who())}" placeholder="your name">
@@ -480,6 +481,7 @@ function openDialog({ title, explain, method = "POST", path, fields = [], body }
     <div class="buttons"><button type="button" value="cancel" id="f-cancel">Cancel</button><button type="submit" class="primary" id="f-send">${state.mode === "demo" ? "Show what it sends" : "Send"}</button></div>`;
   const preview = () => { $("f-preview").textContent = `${method} ${path}\n${JSON.stringify(body(form), null, 2)}`; };
   form.oninput = preview; preview();
+  if (onOpen) onOpen(form, preview);
   $("f-cancel").onclick = () => $("dialog").close();
   form.onsubmit = async (event) => {
     event.preventDefault();
@@ -543,18 +545,82 @@ const SIMPLE = {
   abort: { label: "Abort", reason: "required", explain: "Stops the run and sets pausedUntil on the cluster. There is no downgrade: what is upgraded stays upgraded." },
 };
 
+// The "New upgrade" form's choices for one cluster (GET upgrade-targets, D22): ladder rungs
+// newer than it, of minors its MCE supports. The demo has them for its own clusters.
+async function loadTargets(cluster) {
+  if (state.mode === "demo") {
+    const known = (state.demo && state.demo.targets) || {};
+    if (!known[cluster]) throw new Error(`the demo has no cluster ${cluster}; try ${Object.keys(known).join(", ")}`);
+    return known[cluster];
+  }
+  const response = await fetch(`${TARGETS}?cluster=${encodeURIComponent(cluster)}`, { headers: { accept: "application/json" } });
+  const text = await response.text();
+  let detail = text;
+  try { const j = JSON.parse(text); if (response.ok) return j; detail = typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail); } catch (e) {}
+  if (response.status === 404 && /^\{"detail":"Not Found"\}$/.test(text)) detail = "the upgrade routes are not mounted on this API yet (DESIGN O18)";
+  throw new Error(`${response.status}: ${detail}`);
+}
+
+function knownClusters() {
+  const names = new Set(state.list.map((r) => cluster(r.workflow_id)));
+  if (state.mode === "demo" && state.demo) Object.keys(state.demo.targets || {}).forEach((n) => names.add(n));
+  return [...names].sort();
+}
+
+function wireTargets(form, preview) {
+  const input = form.querySelector("#f-cluster"), select = form.querySelector("#f-target"),
+    text = form.querySelector("#f-target-text"), note = form.querySelector("#f-target-note");
+  let asked = "";
+  const typed = (on, why) => {
+    select.hidden = on; select.disabled = on; text.hidden = !on; text.disabled = !on; text.required = on;
+    note.textContent = why || "";
+  };
+  const load = async () => {
+    const name = input.value.trim();
+    if (!name || name === asked) return;
+    asked = name;
+    select.disabled = true;
+    select.innerHTML = `<option value="">reading day1 for ${esc(name)}…</option>`;
+    try {
+      const t = await loadTargets(name);
+      if (asked !== name) return;
+      typed(false);
+      const pick = t.targets.map((o, i) => `<option value="${esc(o.version)}"${i === 0 ? " selected" : ""}>${esc(o.version)} · ${
+        o.control_plane_steps} control-plane step${o.control_plane_steps === 1 ? "" : "s"}, ${o.steps} in all${o.newest_in_minor ? ` · newest ${esc(o.minor)} rung` : ""}</option>`);
+      select.innerHTML = pick.join("") || `<option value="">nothing newer to offer</option>`;
+      select.disabled = !pick.length;
+      note.textContent = `Runs ${t.control_plane_version || "?"} (day1). Its MCE ${t.mce_cluster} (${t.mce_version}) supports ${
+        t.supported_minors.join(", ")}. Only ladder rungs are offered: the releases mirrored and verified.`
+        + (pick.length ? "" : " It is already at the newest one its MCE supports.");
+    } catch (err) {
+      if (asked !== name) return;
+      typed(true, `Could not read the choices (${err.message}). Type the target instead.`);
+    }
+    preview();
+  };
+  let pause;
+  input.addEventListener("input", () => { clearTimeout(pause); pause = setTimeout(load, 500); });
+  input.addEventListener("change", load);
+  input.addEventListener("blur", load);
+}
+
 function newRun() {
   openDialog({
     title: "New upgrade", explain: "Starting is the dry run: the run plans, pins every release and runs the pre-flight, then waits for approval with nothing committed. The MCE is found from the cluster's day1 file.",
     path: API,
+    onOpen: wireTargets,
     fields: [
-      `<label for="f-cluster">Cluster <span class="hint">its day1 file's name</span></label><input id="f-cluster" required placeholder="cluster name">`,
-      `<label for="f-target">Target <span class="hint">a release (4.21.40) or a minor (4.21)</span></label><input id="f-target" required pattern="\\d+\\.\\d+(\\.\\d+(-x86_64)?)?" placeholder="4.21">`,
+      `<label for="f-cluster">Cluster <span class="hint">its day1 file's name</span></label><input id="f-cluster" required placeholder="cluster name" list="f-clusters" autocomplete="off">
+       <datalist id="f-clusters">${knownClusters().map((n) => `<option value="${esc(n)}">`).join("")}</datalist>`,
+      `<label for="f-target">Target</label><select id="f-target" required disabled><option value="">pick a cluster first</option></select>
+       <input id="f-target-text" hidden disabled pattern="\\d+\\.\\d+(\\.\\d+(-x86_64)?)?" placeholder="a release (4.21.40) or a minor (4.21)">
+       <p id="f-target-note" class="explain" style="margin:6px 0 0;font-size:12.5px"></p>`,
       `<label for="f-mode">NodePools</label><select id="f-mode"><option value="manual">Manual: the customer checks and continues before each NodePool</option><option value="auto">Auto: lab and canary clusters only (upgrade.wave 0 or 1)</option></select>`,
       `<label style="display:flex;gap:8px;align-items:center;font-weight:400"><input type="checkbox" id="f-auto" style="width:auto"> Approve automatically (lab and canary clusters only)</label>`,
     ],
     body: (form) => {
-      const target = form.querySelector("#f-target").value.trim();
+      const select = form.querySelector("#f-target"), text = form.querySelector("#f-target-text");
+      const target = (text.disabled ? select.value : text.value).trim();
       const out = { cluster: form.querySelector("#f-cluster").value.trim(), requested_by: form.querySelector("#f-by").value.trim(),
         nodepool_mode: form.querySelector("#f-mode").value, auto_approve: form.querySelector("#f-auto").checked };
       if (/^\d+\.\d+$/.test(target)) out.target_minor = target; else out.target_version = target;

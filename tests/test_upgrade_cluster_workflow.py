@@ -29,6 +29,9 @@ from shared.interfaces import cluster_upgrade as cluster_interface
 from shared.interfaces import upgrade_agent as agent_interface
 from shared.interfaces import upgrade_gitops as gitops_interface
 from shared.models.cluster_upgrade import (
+    UpgradeTargets,
+    UpgradeTargetsInput,
+    UpgradeTargetsRunArgs,
     ActionDecision,
     ApiUsage,
     CheckFailure,
@@ -65,7 +68,9 @@ from tests.cluster_upgrade_fakes import (
     request,
     verdict,
 )
+from shared.consts import UPGRADE_TARGETS_WORKFLOW_QUEUE
 from workflow_domains.cluster_upgrade.upgrade_cluster import UpgradeClusterWorkflow as Run
+from workflow_domains.cluster_upgrade.upgrade_targets import UpgradeTargetsWorkflow
 from workflow_domains.cluster_upgrade.upgrade_control_plane import UpgradeControlPlaneWorkflow
 
 ALICE = HumanDecision(by="alice")
@@ -1073,3 +1078,30 @@ class TestAFailedPreflightGoesToTheAgentFirst:
             await h.decide(Run.abort, HumanDecision(by="alice", reason="end of test"))
             await h.result()
         assert fleet.agent_requests == []
+
+
+class TestUpgradeTargets:
+    """The "New upgrade" form's choices, read from day1 git on the hub limb (D22)."""
+
+    async def _targets(self, h: Harness) -> UpgradeTargets:
+        return await h.client.execute_workflow(
+            UpgradeTargetsWorkflow.run, UpgradeTargetsRunArgs(input=UpgradeTargetsInput(cluster=CLUSTER)),
+            id=f"upgrade-targets-{CLUSTER}", task_queue=UPGRADE_TARGETS_WORKFLOW_QUEUE,
+        )
+
+    async def test_the_rungs_above_mastertag_of_minors_the_mce_supports(self):
+        fleet = Fleet()
+        async with Harness(fleet) as h:
+            targets = await self._targets(h)
+        assert (targets.mce_cluster, targets.control_plane_version) == (MCE, "4.18.56")
+        assert [t.version for t in targets.targets] == ["4.21.40", "4.20.44", "4.19.53"]
+        # Two git reads on the hub; nothing on the MCE or the cluster.
+        assert fleet.calls == ["read_day1_cluster", "read_upgrade_rules"]
+
+    async def test_a_cluster_file_outside_the_layout_fails_naming_it(self):
+        fleet = Fleet()
+        fleet.day1_path = f"clusters/{CLUSTER}.yaml"
+        async with Harness(fleet) as h:
+            with pytest.raises(WorkflowFailureError) as failure:
+                await self._targets(h)
+        assert "no MCE" in str(failure.value.cause)

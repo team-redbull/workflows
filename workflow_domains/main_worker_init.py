@@ -32,6 +32,7 @@ from shared.consts import (
     REMOVE_SERVER_WORKFLOW_QUEUE,
     UNINSTALL_SERVER_WORKFLOW_QUEUE,
     UPGRADE_CLUSTER_WORKFLOW_QUEUE,
+    UPGRADE_TARGETS_WORKFLOW_QUEUE,
     UPGRADE_CONTROL_PLANE_WORKFLOW_QUEUE,
 )
 from shared.logging_config import configure_logging
@@ -39,6 +40,7 @@ from shared.settings import TemporalSettings
 from shared.shutdown import install_shutdown_handler
 from shared.temporal_client import connect_temporal
 from workflow_domains.cluster_upgrade.upgrade_cluster import UpgradeClusterWorkflow
+from workflow_domains.cluster_upgrade.upgrade_targets import UpgradeTargetsWorkflow
 from workflow_domains.cluster_upgrade.upgrade_control_plane import (
     UpgradeControlPlaneWorkflow,
 )
@@ -77,6 +79,7 @@ _WORKER_SPECS: list[tuple[str, list[type]]] = [
     (UNINSTALL_SERVER_WORKFLOW_QUEUE, [UninstallServerWorkflow]),
     (UPGRADE_CLUSTER_WORKFLOW_QUEUE, [UpgradeClusterWorkflow]),
     (UPGRADE_CONTROL_PLANE_WORKFLOW_QUEUE, [UpgradeControlPlaneWorkflow]),
+    (UPGRADE_TARGETS_WORKFLOW_QUEUE, [UpgradeTargetsWorkflow]),
 ]
 
 

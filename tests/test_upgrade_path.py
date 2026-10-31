@@ -27,6 +27,7 @@ from shared.ocp_version import (
 from workflow_domains.cluster_upgrade.upgrade_path import (
     recommended_target,
     resolve_upgrade_path,
+    target_options,
 )
 
 # The day1 dev ladder (upgrade/ladder.yaml): every consecutive pair is an edge
@@ -300,3 +301,38 @@ class TestRecommendedTarget:
 
     def test_none_when_no_rung_of_that_minor_is_mirrored(self) -> None:
         assert recommended_target(21, LADDER, ["4.21.39-x86_64"]) is None
+
+
+class TestTargetOptions:
+    """The "New upgrade" form's dropdown (D22): ladder rungs only, of minors the MCE supports."""
+
+    def _options(self, control_plane="4.18.56", ladder=None, supported=("4.22", "4.21", "4.20", "4.19", "4.18"), **kw):
+        return target_options(
+            control_plane=control_plane, nodepools=kw.pop("pools", {"pool-a": control_plane}),
+            ladder=ladder if ladder is not None else LADDER, supported_minors=list(supported),
+            max_worker_skew=kw.pop("skew", 2),
+        )
+
+    def test_every_newer_rung_newest_first_with_its_step_count(self):
+        options = self._options()
+        assert [(o.version, o.minor, o.control_plane_steps, o.steps) for o in options] == [
+            ("4.21.40", "4.21", 3, 5), ("4.20.44", "4.20", 2, 3), ("4.19.53", "4.19", 1, 2),
+        ]
+        assert all(o.newest_in_minor for o in options)
+
+    def test_a_minor_the_mce_does_not_support_is_never_offered(self):
+        assert [o.version for o in self._options(supported=("4.20", "4.19", "4.18"))] == ["4.20.44", "4.19.53"]
+
+    def test_only_ladder_rungs_are_offered_so_an_unmirrored_minor_never_is(self):
+        # 4.20 has no rung: nothing is mirrored for it, so nothing at or past it is reachable.
+        ladder = [rung for rung in LADDER if not rung.version.startswith("4.20.")]
+        assert [o.version for o in self._options(ladder=ladder)] == ["4.19.53"]
+
+    def test_two_rungs_of_one_minor_mark_the_newest(self):
+        ladder = [*LADDER, LadderRung(version="4.19.60")]
+        by_version = {o.version: o for o in self._options(ladder=ladder)}
+        assert by_version["4.19.60"].newest_in_minor and not by_version["4.19.53"].newest_in_minor
+
+    def test_at_the_newest_rung_there_is_nothing_to_offer(self):
+        assert self._options(control_plane="4.21.40") == []
+

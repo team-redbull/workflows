@@ -140,6 +140,12 @@ class TestStart:
             {"nodepool_order": []},
             {"requested_by": ""},
             {"server_names": ["x"]},  # unknown fields are refused, not ignored
+            # The day1 file's name, held to the same rule as upgrade-targets'.
+            {"cluster": ""},
+            {"cluster": "C1; drop"},
+            {"cluster": "Ocp4-prod"},
+            {"cluster": "-ocp4"},
+            {"cluster": "ocp4/../x"},
         ],
     )
     def test_a_request_the_run_could_not_act_on_is_refused_at_the_edge(self, client, fake, change):
@@ -192,6 +198,20 @@ class TestDecisions:
         response = client.post(f"{PATH}/{RUN}/continue", json={"by": "alice"})
         assert response.status_code == 409
         assert response.json()["detail"] == reason
+
+    @pytest.mark.parametrize("cause", [
+        ApplicationError("cannot decode the argument", type="PayloadConversionError"),
+        ApplicationError("handler crashed"),  # no type at all
+        RuntimeError("something else"),
+    ])
+    def test_an_update_that_failed_any_other_way_is_a_500_naming_the_cause(self, client, fake, cause):
+        # Only the validator's refusal means "not waiting for that"; anything else
+        # is a fault, and a 409 would tell the caller to try again later.
+        fake.update_error = WorkflowUpdateFailedError(cause)
+        response = client.post(f"{PATH}/{RUN}/approve", json={"by": "alice"})
+        assert response.status_code == 500
+        detail = response.json()["detail"]
+        assert RUN in detail and "approve" in detail and str(getattr(cause, "message", cause)) in detail
 
     def test_a_run_that_is_not_running_is_a_404(self, client, fake):
         fake.update_error = RPCError("workflow not found", RPCStatusCode.NOT_FOUND, b"")
@@ -260,6 +280,15 @@ class TestUpgradeTargets:
     def test_a_cluster_name_is_checked_before_anything_runs(self, client, fake):
         assert client.get(self.PATH, params={"cluster": "C1; drop"}).status_code == 422
         assert fake.target_reads == []
+
+    def test_both_routes_hold_the_cluster_to_one_rule(self, client):
+        schema = client.app.openapi()
+        start = schema["components"]["schemas"]["UpgradeClusterRequest"]["properties"]["cluster"]
+        [query] = schema["paths"][self.PATH]["get"]["parameters"]
+        assert start["pattern"] == query["schema"]["pattern"]
+        # The file's name, never the HostedCluster's (CLAUDE.md §4).
+        for description in (start["description"], query["description"]):
+            assert description.startswith("The day1 cluster file's name (also its Argo CD Application)")
 
 
 class TestMountedOnTheApi:

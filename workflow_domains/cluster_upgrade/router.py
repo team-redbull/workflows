@@ -9,14 +9,24 @@ There is no dry-run route: a started run plans, pre-flights and then WAITS for
 plan and then aborting ends the run CANCELLED, having changed nothing.
 
 DECISIONS ARE TEMPORAL UPDATES, answered at once: 200 when the run took it,
-409 with the reason when it is not waiting for it (a `continue` while no
-NodePool waits, an `approve` after approval), 404 for no such running run.
-The run's validator is the only judge of that — this router never reads the
-run's state to second-guess it, so the two can never disagree.
+409 with the reason when its validator refused it (UpgradeUpdateRefusedError:
+a `continue` while no NodePool waits, an `approve` after approval), 404 for no
+such running run, 500 for an update that failed any other way. The run's
+validator is the only judge of a refusal — this router never reads the run's
+state to second-guess it, so the two can never disagree.
 
-PATHS ARE `/workflows/cluster-upgrade/upgrade-cluster[/{workflow_id}/<decision>]`.
-The workflow id is the one the start answered with, `upgrade-cluster-<cluster>`;
-a decision route refuses any other id, so it can only ever reach an upgrade run.
+ONE ROUTE IS SYNCHRONOUS, ON PURPOSE (DESIGN D22): GET upgrade-targets, the
+"New upgrade" form's choices. It starts a short upgrade-targets run (two day1
+git reads on the hub limb) and WAITS for its answer — `execute_workflow`, up to
+60 s — because the form needs the list to draw itself, and a read that changes
+nothing has no run worth handing back to poll. Its id is per cluster with
+USE_EXISTING, so two asks at once share one read. 404 for no such cluster in
+day1, 409 for a file or rules it cannot use, 504 when no limb answered.
+
+PATHS ARE `/workflows/cluster-upgrade/upgrade-cluster[/{workflow_id}/<decision>]`
+and `/workflows/cluster-upgrade/upgrade-targets`. The workflow id is the one
+the start answered with, `upgrade-cluster-<cluster>`; a decision route refuses
+any other id, so it can only ever reach an upgrade run.
 """
 
 from __future__ import annotations
@@ -37,7 +47,7 @@ from temporalio.exceptions import ApplicationError, TimeoutError as TemporalTime
 from temporalio.service import RPCError, RPCStatusCode
 
 from shared.consts import UPGRADE_CLUSTER_WORKFLOW_QUEUE, UPGRADE_TARGETS_WORKFLOW_QUEUE
-from shared.exceptions import ClusterFileNotFoundError
+from shared.exceptions import ClusterFileNotFoundError, UpgradeUpdateRefusedError
 from shared.models.cluster_upgrade import (
     ActionDecision,
     ContinueNodePool,
@@ -59,11 +69,22 @@ from workflow_domains.routers.models import StartWorkflowResponse
 router = APIRouter(prefix="/workflows/cluster-upgrade", tags=["cluster-upgrade"])
 
 _UPGRADE_CLUSTER_PATH = "/upgrade-cluster"
+_UPGRADE_TARGETS_PATH = "/upgrade-targets"
 # `upgrade-cluster-`: every id upgrade_cluster_workflow_id builds starts with it.
 _RUN_ID_PREFIX = upgrade_cluster_workflow_id("")
 # Updates are answered by the run's validator and a handler that only records
 # the decision: seconds at most. Longer means no brain worker is polling.
 _UPDATE_TIMEOUT = timedelta(seconds=15)
+# The targets read is two git reads on the hub limb; longer means no worker answered.
+_TARGETS_TIMEOUT = timedelta(seconds=60)
+# A day1 cluster file's name, which is also its Argo CD Application's: a DNS
+# subdomain. Checked on every route that takes one, before anything runs.
+_CLUSTER_NAME = r"^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$"
+_CLUSTER_DESCRIPTION = (
+    "The day1 cluster file's name (also its Argo CD Application), without `.yaml`. "
+    "Not the HostedCluster's name, which the chart derives from the file."
+)
+
 
 class UpgradeClusterRequest(UpgradeClusterInput):
     """The upgrade-cluster request body: strict at the edge, normalised before the run sees it."""
@@ -71,10 +92,10 @@ class UpgradeClusterRequest(UpgradeClusterInput):
     model_config = ConfigDict(extra="forbid")
 
     cluster: str = Field(
-        min_length=1,
+        pattern=_CLUSTER_NAME,
         description=(
-            "The HostedCluster: its day1 file's name. The run finds the hosting MCE from "
-            "where that file is, `sites/<site>/mces/<mce>/hostedClusters/<cluster>.yaml`."
+            f"{_CLUSTER_DESCRIPTION} The run finds the hosting MCE from where that file is, "
+            "`sites/<site>/mces/<mce>/hostedClusters/<cluster>.yaml`."
         ),
     )
     target_version: str | None = Field(
@@ -170,9 +191,12 @@ class UpgradeClusterRequest(UpgradeClusterInput):
 
 
 class DecisionRequest(HumanDecision):
+    """The body of approve, confirm-day2, pause, resume and retry: who decides, and optionally why."""
+
     model_config = ConfigDict(extra="forbid")
 
     by: str = Field(min_length=1, description="Who decides; recorded in the run's log.")
+    reason: str | None = Field(default=None, description="Why, optionally; recorded in the run's log.")
 
 
 class AbortRequest(DecisionRequest):
@@ -190,18 +214,22 @@ class AdminAckApprovalRequest(DecisionRequest):
 
 
 class ContinueRequest(ContinueNodePool):
+    """The body of continue: the customer's sign-off that their readiness checks passed."""
+
     model_config = ConfigDict(extra="forbid")
 
-    by: str = Field(min_length=1)
+    by: str = Field(min_length=1, description="Who signs off; recorded in the run's log.")
     nodepool: str | None = Field(
         default=None, description="Which NodePool rolls next. Default: the next in the run's order."
     )
 
 
 class ActionDecisionRequest(BaseModel):
+    """The body of an agent proposal's approve or reject; the action is named in the path."""
+
     model_config = ConfigDict(extra="forbid")
 
-    by: str = Field(min_length=1)
+    by: str = Field(min_length=1, description="Who decides on the action; recorded in the run's log.")
 
 
 class DecisionResponse(BaseModel):
@@ -239,23 +267,26 @@ async def start_upgrade_cluster(
     return StartWorkflowResponse(workflow_id=handle.id, run_id=handle.result_run_id or "")
 
 
-# The targets read is two git reads on the hub limb; longer means no worker answered.
-_TARGETS_TIMEOUT = timedelta(seconds=60)
-_CLUSTER_NAME = r"^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$"
+def _root_cause(exc: BaseException) -> BaseException:
+    """The end of a Temporal error's `cause` chain: what the run, or its validator, raised."""
+    root = exc
+    while getattr(root, "cause", None) is not None:
+        root = root.cause  # type: ignore[assignment]
+    return root
 
 
-@router.get("/upgrade-targets", response_model=UpgradeTargets)
+@router.get(_UPGRADE_TARGETS_PATH, response_model=UpgradeTargets)
 async def upgrade_targets(
-    cluster: str = Query(pattern=_CLUSTER_NAME, description="The HostedCluster: its day1 file's name."),
+    cluster: str = Query(pattern=_CLUSTER_NAME, description=_CLUSTER_DESCRIPTION),
     client: Client = Depends(get_temporal_client),
 ) -> UpgradeTargets:
     """What one cluster can be upgraded to: the "New upgrade" form's choices (D22).
 
     Every ladder rung newer than the cluster's mastertag, of a minor its MCE
-    supports, to which a path resolves, newest first. Read from day1 git by a
-    short upgrade-targets run, waited for up to 60 s: 404 when day1 has no
-    such cluster, 409 when its file or rules cannot be used, 504 when nothing
-    answered.
+    supports, to which a path resolves, newest first. SYNCHRONOUS, unlike every
+    other route here: read from day1 git by a short upgrade-targets run, waited
+    for up to 60 s. 404 when day1 has no such cluster, 409 when its file or
+    rules cannot be used, 504 when nothing answered.
     """
     try:
         return await client.execute_workflow(
@@ -267,9 +298,7 @@ async def upgrade_targets(
             id_conflict_policy=WorkflowIDConflictPolicy.USE_EXISTING,
         )
     except WorkflowFailureError as exc:
-        root: BaseException = exc
-        while getattr(root, "cause", None) is not None:
-            root = root.cause  # type: ignore[assignment]
+        root = _root_cause(exc)
         if isinstance(root, TemporalTimeoutError):
             raise HTTPException(
                 status_code=504,
@@ -288,14 +317,15 @@ async def _decide(client: Client, workflow_id: str, update: Any, decision: BaseM
     try:
         await handle.execute_update(update, decision, rpc_timeout=_UPDATE_TIMEOUT)
     except WorkflowUpdateFailedError as exc:
-        # The validator refused it (UpgradeUpdateRefusedError): the reason is
-        # the root cause's message, which names what the run IS waiting for.
-        root: BaseException = exc
-        while getattr(root, "cause", None) is not None:
-            root = root.cause  # type: ignore[assignment]
-        raise HTTPException(
-            status_code=409, detail=root.message if isinstance(root, ApplicationError) else str(root)
-        )
+        root = _root_cause(exc)
+        message = root.message if isinstance(root, ApplicationError) else str(root)
+        if isinstance(root, ApplicationError) and root.type == UpgradeUpdateRefusedError.__name__:
+            # The validator refused it: its message names what the run IS waiting for.
+            raise HTTPException(status_code=409, detail=message)
+        # Anything else is not "the run is not waiting for that": a handler or
+        # a decode that failed is a fault, never a refusal to retry later.
+        kind = f"{root.type}: " if isinstance(root, ApplicationError) and root.type else ""
+        raise HTTPException(status_code=500, detail=f"{workflow_id}: the {name} update failed: {kind}{message}")
     except WorkflowUpdateRPCTimeoutOrCancelledError:
         # What the SDK raises when `rpc_timeout` passes — not an RPCError.
         raise HTTPException(
@@ -363,6 +393,7 @@ async def pause(
 async def resume(
     workflow_id: str, decision: DecisionRequest, client: Client = Depends(get_temporal_client)
 ) -> DecisionResponse:
+    """Carry on from where a `pause` held the run. Only while it is paused."""
     return await _decide(client, workflow_id, UpgradeClusterWorkflow.resume, HumanDecision(**decision.model_dump()), "resume")
 
 
@@ -406,6 +437,7 @@ async def reject_action(
     workflow_id: str, action_id: str, decision: ActionDecisionRequest,
     client: Client = Depends(get_temporal_client),
 ) -> DecisionResponse:
+    """Refuse one action the agent proposed: it is recorded and never run. Then `retry` or `abort`."""
     return await _decide(
         client, workflow_id, UpgradeClusterWorkflow.reject_action,
         ActionDecision(by=decision.by, action_id=action_id), "reject-action",

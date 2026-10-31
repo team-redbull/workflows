@@ -913,9 +913,11 @@ or retry to check again (the count covers 24 hours)</pre>
     <div class="sec-head">
       <div class="eyebrow">HTTP surface</div>
       <h2>How you start it, steer it and watch it</h2>
-      <p class="lede">Served by <code>workflows-orchestrator-api</code>. Every route
-      lives under <code>/workflows/cluster-upgrade/upgrade-cluster</code>. Decisions are <b>Temporal
-      Updates</b>, answered at once: the run itself says whether it was waiting for that decision.</p>
+      <p class="lede">Served by <code>workflows-orchestrator-api</code>. A run and every decision on it
+      live under <code>/workflows/cluster-upgrade/upgrade-cluster</code>; beside them,
+      <code>/workflows/cluster-upgrade/upgrade-targets</code> says what a cluster can be upgraded to. Decisions
+      are <b>Temporal Updates</b>, answered at once: the run itself says whether it was waiting for that
+      decision.</p>
     </div>
 
     <div class="api">
@@ -935,7 +937,7 @@ or retry to check again (the count covers 24 hours)</pre>
           so. Unknown fields are refused.</p>
           <pre><span class="c">// request</span>
 {
-  "cluster":           "&lt;cluster&gt;",          <span class="c">// the HostedCluster: its day1 file's name</span>
+  "cluster":           "&lt;cluster&gt;",          <span class="c">// the day1 cluster file's name (also its Argo CD Application)</span>
   "target_minor":      "4.21",               <span class="c">// or "target_version": "4.21.40"</span>
   "nodepool_mode":     "manual",             <span class="c">// default; "auto" rolls on after each soak, upgrade.wave 0 or 1 only</span>
   "nodepool_order":    null,                 <span class="c">// default: upgrade.nodePoolOrder, else zone, else file order</span>
@@ -954,9 +956,38 @@ or retry to check again (the count covers 24 hours)</pre>
 
       <div class="endpoint">
         <div class="endpoint-head">
+          <span class="method">GET</span>
+          <span class="path">/workflows/cluster-upgrade/upgrade-targets?cluster=&lt;cluster&gt;</span>
+          <span class="ret">200 &middot; 404 no such cluster &middot; 409 &middot; 422 &middot; 504</span>
+        </div>
+        <div class="endpoint-body">
+          <p>What one cluster can be upgraded to: the &ldquo;New upgrade&rdquo; form&rsquo;s choices. Every ladder
+          rung newer than the cluster&rsquo;s <code>mastertag</code>, of a minor its MCE supports, to which a path
+          resolves, newest first. <b>Synchronous, unlike every other route here:</b> it runs a short
+          <code>upgrade-targets</code> workflow (two day1 git reads on the hub limb) and answers with its result,
+          waiting up to 60 s &mdash; the form needs the list to draw itself, and a read that changes nothing has
+          no run to poll. Two asks for one cluster at once share one read. <code>cluster</code> is the day1
+          cluster file&rsquo;s name, checked before anything runs (422).</p>
+          <pre><span class="c">// 200</span>
+{
+  "cluster": "&lt;cluster&gt;", "mce_cluster": "&lt;mce&gt;", "mce_version": "2.17.3",
+  "control_plane_version": "4.19.53",           <span class="c">// day1 mastertag: intent, checked against the cluster at planning</span>
+  "supported_minors": ["4.21", "4.20", "4.19"], "ladder_revision": "…", "verified_against_graph": "2026-10-31",
+  "targets": [
+    { "version": "4.21.40", "minor": "4.21", "steps": 4, "control_plane_steps": 2, "newest_in_minor": true, "must": false },
+    …
+  ]
+}</pre>
+          <p class="note">404: day1 has no such cluster file. 409: its file or the rules cannot be used, the
+          detail says why. 504: no answer in 60 s &mdash; is the upgrade-gitops limb running?</p>
+        </div>
+      </div>
+
+      <div class="endpoint">
+        <div class="endpoint-head">
           <span class="method">POST</span>
           <span class="path">/workflows/cluster-upgrade/upgrade-cluster/{workflow_id}/&lt;decision&gt;</span>
-          <span class="ret">200 &middot; 409 &middot; 404 &middot; 504</span>
+          <span class="ret">200 &middot; 409 &middot; 404 &middot; 504 &middot; 500</span>
         </div>
         <div class="endpoint-body">
           <p>Every body carries <code>by</code>, recorded in the run&rsquo;s log with the time.</p>
@@ -985,6 +1016,7 @@ or retry to check again (the count covers 24 hours)</pre>
                 <tr><td class="k">409</td><td class="muted">the run is not waiting for that decision; the detail is the run&rsquo;s own reason and names what it <em>is</em> waiting for</td></tr>
                 <tr><td class="k">404</td><td class="muted">no such running run, or an id that is not <code>upgrade-cluster-&hellip;</code> &mdash; a decision route reaches nothing else</td></tr>
                 <tr><td class="k">504</td><td class="muted">no answer in 15 s: is the brain worker up?</td></tr>
+                <tr><td class="k">500</td><td class="muted">the update failed some other way than a refusal; the detail names the cause. Not a reason to retry the decision</td></tr>
               </tbody>
             </table>
           </div>

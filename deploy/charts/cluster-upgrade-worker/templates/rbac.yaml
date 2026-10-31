@@ -1,0 +1,134 @@
+{{- if .Values.rbac.create }}
+# Exactly the verbs activities/cluster_upgrade/activities.py uses on THIS MCE,
+# each from a call in the code (README "RBAC"). Nothing here writes a
+# HostedCluster, NodePool or ImageDigestMirrorSet: an upgrade changes them only
+# through a day1 commit that Argo CD applies (DESIGN D1). Inside a hosted
+# cluster the worker acts with that cluster's admin kubeconfig, which no MCE
+# RBAC governs: there it writes only an admin ack (D16) and the tier-2 actions
+# a person approved.
+#
+# Cluster-wide because HyperShift puts each hosted cluster in namespaces no
+# request names and no chart can list ahead of time: the HostedCluster and its
+# NodePools and admin kubeconfig in the HostedCluster's namespace
+# (`hcp-<clusterName>` from the hostedclusters-setup chart), its MachineSets and
+# control-plane pods in the control-plane namespace `<that namespace>-<name>`.
+#   * hostedclusters        get it by name in its namespace; list to find it by
+#                           name alone (a run planned before it knew the namespace)
+#   * nodepools             list a HostedCluster's, get the one a watch follows
+#   * machinesets           get the NodePool's CAPI MachineSet: its target and
+#                           current config annotations say where a roll is
+#   * imagedigestmirrorsets list the MCE's mirrors (pre-flight check 11)
+#   * secrets               get the HostedCluster's admin kubeconfig
+#                           (status.kubeconfig). The widest grant: get on EVERY
+#                           Secret of the MCE, as server-lifecycle-worker's
+#   * pods                  delete one control-plane pod, the tier-2
+#                           `delete_hcp_pod` a person approved. A proposal
+#                           names only the pod: the namespace is the cluster's
+#                           own control-plane one, and the action catalog
+#                           refuses etcd-* and kube-apiserver-* before the call.
+#                           A ValidatingAdmissionPolicy narrowing this grant to
+#                           control-plane namespaces is deliverable 7's
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "cuw.fullname" . }}
+  labels:
+    {{- include "cuw.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [hypershift.openshift.io]
+    resources: [hostedclusters]
+    verbs: [get, list]
+  - apiGroups: [hypershift.openshift.io]
+    resources: [nodepools]
+    verbs: [get, list]
+  - apiGroups: [cluster.x-k8s.io]
+    resources: [machinesets]
+    verbs: [get]
+  - apiGroups: [config.openshift.io]
+    resources: [imagedigestmirrorsets]
+    verbs: [list]
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "cuw.fullname" . }}
+  labels:
+    {{- include "cuw.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "cuw.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "cuw.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+---
+# The hosted cluster's Argo CD Application: read it (pre-flight check 5, the
+# evidence) and sync it by patching its `operation` — the one routine write
+# on the MCE. Only in Argo CD's namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "cuw.fullname" . }}-argo
+  namespace: {{ .Values.argo.namespace }}
+  labels:
+    {{- include "cuw.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [argoproj.io]
+    resources: [applications]
+    verbs: [get, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "cuw.fullname" . }}-argo
+  namespace: {{ .Values.argo.namespace }}
+  labels:
+    {{- include "cuw.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "cuw.fullname" . }}-argo
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "cuw.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+---
+# The minors this MCE's HyperShift operator can host: ConfigMap
+# hypershift/supported-versions (pre-flight check 1, D10: git is intent, the
+# cluster is truth). That one ConfigMap, in the operator's namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "cuw.fullname" . }}-supported-versions
+  namespace: hypershift
+  labels:
+    {{- include "cuw.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: [configmaps]
+    resourceNames: [supported-versions]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "cuw.fullname" . }}-supported-versions
+  namespace: hypershift
+  labels:
+    {{- include "cuw.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "cuw.fullname" . }}-supported-versions
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "cuw.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

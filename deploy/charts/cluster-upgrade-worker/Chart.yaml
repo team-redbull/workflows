@@ -1,0 +1,12 @@
+apiVersion: v2
+name: cluster-upgrade-worker
+description: >-
+  The cluster-upgrade domain's per-MCE activity worker ("limb"), one release PER
+  MCE CLUSTER, installed INSIDE that MCE. It dials out to the hub's Temporal
+  frontend, polls cluster-upgrade-activity-<mceCluster>, reads the MCE's
+  HostedClusters and NodePools and syncs their Argo CD Applications as its own
+  ServiceAccount (the workflow identity) — so no kubeconfig of any cluster is
+  stored anywhere. It never writes a HostedCluster or NodePool.
+type: application
+version: 0.1.0
+appVersion: "v1.0.0"

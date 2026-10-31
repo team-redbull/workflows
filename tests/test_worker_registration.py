@@ -266,6 +266,65 @@ def test_every_workflow_is_registered_in_the_brain():
             assert name in registered, f"{module}: {name} is not in _WORKER_SPECS"
 
 
+# cluster-upgrade dispatches through workflow_domains/cluster_upgrade/dispatch.py:
+# each helper is bound to ONE limb's queue and takes the activity as an
+# argument, `on_mce(mce, activity, request)`. Helper -> (the queue builder its
+# body must use, the worker module polling that queue).
+_CLUSTER_UPGRADE_DISPATCH = "workflow_domains/cluster_upgrade/dispatch.py"
+_CLUSTER_UPGRADE_ROUTES = {
+    "on_mce": ("cluster_upgrade_activity_queue", "activities/cluster_upgrade/worker_init.py"),
+    "start_watch": ("cluster_upgrade_activity_queue", "activities/cluster_upgrade/worker_init.py"),
+}
+
+
+def _cluster_upgrade_dispatches(helper: str) -> set[str]:
+    """Every activity a cluster-upgrade workflow module hands to a dispatch helper."""
+    names: set[str] = set()
+    for path in sorted((REPO / "workflow_domains" / "cluster_upgrade").glob("*.py")):
+        tree = ast.parse(path.read_text())
+        activities = _interface_activities(tree)
+        for node in ast.walk(tree):
+            called = getattr(node, "func", None)
+            if not isinstance(node, ast.Call) or getattr(called, "id", getattr(called, "attr", None)) != helper:
+                continue
+            if len(node.args) >= 2 and isinstance(node.args[1], ast.Name) and node.args[1].id in activities:
+                names.add(node.args[1].id)
+    return names
+
+
+@pytest.mark.parametrize("helper", sorted(_CLUSTER_UPGRADE_ROUTES))
+def test_every_cluster_upgrade_dispatch_lands_on_a_worker_registering_it(helper):
+    queue_builder, worker_module = _CLUSTER_UPGRADE_ROUTES[helper]
+    # The premise: the helper really routes to that limb's queue.
+    function = next(
+        node for node in ast.walk(_tree(_CLUSTER_UPGRADE_DISPATCH))
+        if isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef) and node.name == helper
+    )
+    queues = {
+        keyword.value.func.id
+        for call in ast.walk(function) if isinstance(call, ast.Call)
+        for keyword in call.keywords
+        if keyword.arg == "task_queue" and isinstance(keyword.value, ast.Call)
+    }
+    assert queues == {queue_builder}, f"dispatch.{helper} routes to {queues}, not {queue_builder}"
+    dispatched = _cluster_upgrade_dispatches(helper)
+    assert dispatched, f"no cluster-upgrade workflow calls {helper}: the scan is broken"
+    missing = dispatched - _registered_activities(worker_module)
+    assert not missing, (
+        f"cluster-upgrade sends {sorted(missing)} through {helper} to {queue_builder}(<mce>), but "
+        f"{worker_module} does not register them: the run would sit RUNNING on them"
+    )
+
+
+def test_the_cluster_upgrade_mce_worker_registers_its_whole_interface():
+    """Nothing in shared/interfaces/cluster_upgrade.py is left unpolled, used today or not."""
+    interface = {
+        node.name for node in ast.walk(_tree("shared/interfaces/cluster_upgrade.py"))
+        if isinstance(node, ast.AsyncFunctionDef)
+    }
+    assert _registered_activities("activities/cluster_upgrade/worker_init.py") == interface
+
+
 def test_uninstall_server_dispatches_everything_to_the_mces_own_worker():
     """No Segments Manager read of its own: the site lookup is remove-server's, in the child."""
     dispatched = _dispatched("workflow_domains/server_lifecycle/uninstall_server.py")

@@ -1,0 +1,9 @@
+temporalio>=1.28,<2
+pydantic>=2,<3
+pydantic-settings>=2,<3
+# The MCE's API (through activities/server_lifecycle/cluster_api.py) and each
+# hosted cluster's (hosted_upgrade_api.py, via server_lifecycle's
+# hosted_cluster_api.py and its kubeconfig handling). Synchronous SDK — every
+# call is wrapped in asyncio.to_thread so it never blocks this worker's event
+# loop. It brings PyYAML and urllib3, which hosted_cluster_api.py imports.
+kubernetes>=29,<32

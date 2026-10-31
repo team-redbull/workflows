@@ -79,7 +79,12 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   service vendors the agent contract, `tests/test_upgrade_agent_contract.py` keeps the two equal). Each limb gets its OWN interface module
   (`shared/interfaces/{upgrade_gitops,cluster_upgrade,upgrade_agent}.py`), so the contract test
   still pairs one interface module with one `activities/<limb>/activities.py`; the domain keeps
-  one models module and one `workflow_domains/cluster_upgrade/`.
+  one models module and one `workflow_domains/cluster_upgrade/`. The MCE limb is
+  `cluster-upgrade-worker` (`activities/cluster_upgrade/worker_init.py`, chart
+  `deploy/charts/cluster-upgrade-worker/`), on `cluster-upgrade-activity-<MCE_CLUSTER>` like
+  server-lifecycle, with `ARGO_NAMESPACE` / `ARGO_VALUES_REF` as its only other config; the
+  workflows reach it through `dispatch.on_mce` / `start_watch`, and
+  `tests/test_worker_registration.py` checks every activity sent that way is registered there.
 - **Brain is ONE deployment for every domain**, not one per workflow — the `workflows-orchestrator`
   chart is standalone, deployed once. Each new domain adds `activities/<domain>/` + a
   `gitops/charts/<domain>-worker/` chart folder (plus its `gitops/services/` app.yaml) and registers
@@ -665,6 +670,22 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   `SITE_NETWORKS`/`SITES_WITH_OPEN_CONNECTIVITY` config, the `next-api-credentials` Secret and the
   test-only mock service. A segment is born Available. If firewalls ever return, the shape above is
   the precedent — but it is history, not current design.
+- **cluster-upgrade's MCE limb names the HostedCluster by ITS name, not the day1 file's.** The
+  hostedclusters-setup chart renders `<cluster>.yaml` as `openshift-<clusterName>` in
+  `hcp-<clusterName>`; the file's name names only the Argo CD Application. Planning takes the real
+  name from `Day1Cluster.hosted_cluster(_namespace)` into `UpgradeContext`, and every MCE request
+  carries it as optional `hosted_cluster` / `hosted_cluster_namespace` (`cluster` keeps meaning the
+  file): the limb GETs the HostedCluster there, the evidence takes NodePools by that
+  `spec.clusterName`, a sync allows `HostedCluster/<its name>` out of sync. None (a run planned
+  before) = the HostedCluster named after the file, found by listing.
+- **The hcAppset's Applications are MULTI-SOURCE: the chart, then day1 as `ref: values`.** Argo CD
+  3.1 keeps one revision PER SOURCE there (`status.sync.revisions`, `operation.sync.revisions`,
+  `syncResult.revisions`; the singular fields are empty). The limb pins the day1 commit in the
+  source whose `ref` is `ARGO_VALUES_REF` and keeps the chart at the revision Argo CD last
+  compared; its sync patch carries `sync.sources` (= spec.sources) AND one revision per source, as
+  `argocd app sync --revisions <sha> --source-positions <n>` does — without `sources` the controller
+  reads `$values` at day1's HEAD, not at the commit (`GetRefSources`, util/argo/argo.go,
+  release-3.1). An Application with sources but no such ref is refused, never guessed.
 
 ## 5. Temporal SDK rules (gotchas — must follow)
 
@@ -947,13 +968,24 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   `gitops/charts/segment-lifecycle-worker/`, `gitops/charts/server-lifecycle-worker/` and the
   still-to-be-written `gitops/charts/server-provisioning-worker/` (each: ConfigMap + Secrets + limb +
   SA; the provisioning one needs no RBAC, only egress to the iDRACs, OME, the naming service and
-  server-scan). This repo ships ONE chart, `deploy/charts/server-lifecycle-worker/` — the
-  per-MCE limb, written to be copied into redbull-platform for Argo CD (example ApplicationSet in
-  `deploy/argocd/`). On a remote MCE it renders its own Temporal endpoint, since no brain ConfigMap
-  exists there; `deploy/` is in `.dockerignore` and triggers no image build. The server-lifecycle limb is the first to need real RBAC: it creates
+  server-scan). This repo ships the PER-MCE limbs' charts, written to be copied into
+  redbull-platform for Argo CD (example ApplicationSet in `deploy/argocd/`):
+  `deploy/charts/server-lifecycle-worker/`, `deploy/charts/cluster-upgrade-worker/` and
+  `deploy/charts/upgrade-agent-worker/`. On a
+  remote MCE each renders its own Temporal endpoint, since no brain ConfigMap exists there;
+  `deploy/` is in `.dockerignore` and triggers no image build. The server-lifecycle limb is the first to need real RBAC: it creates
   secrets, metal3.io/baremetalhosts and agent-install.openshift.io/nmstateconfigs in the target
   namespace, where segment-lifecycle only makes HTTP and git calls — and, for uninstall-server,
   a ClusterRole over CAPI Machines, AgentMachines, HostedClusters and Secrets (§4).
+  cluster-upgrade-worker holds NO credential Secret — its ServiceAccount is the whole identity —
+  and its RBAC is derived call by call from `activities/cluster_upgrade/activities.py` (its
+  README's table): a ClusterRole reading HostedClusters, NodePools, MachineSets, IDMS and Secrets
+  (the admin kubeconfig) and deleting pods (`delete_hcp_pod`), a Role in `ARGO_NAMESPACE`
+  (applications get/patch) and one on ConfigMap `hypershift/supported-versions`. Never a write to a
+  HostedCluster or NodePool (DESIGN D1). Its chart is NOT in redbull-platform yet, so CI's
+  `build-cluster-upgrade-worker` builds the IMAGE ONLY (`<branch-slug>-<short sha>`, the chart's
+  `image.tag` set by hand), like upgrade-agent-worker's; once the chart is vendored it moves to
+  the reusable workflow with its cross-repo bump.
 - Assumed already running: a Temporal server and the Segments Manager (via OpenShift routes or
   localhost — no port assumptions in code).
 - Trigger via the unified API: `uvicorn workflow_domains.api:app --port 8080`, Swagger at `/docs`.

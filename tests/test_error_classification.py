@@ -228,3 +228,41 @@ class TestTheResourceNamePredicate:
     def test_a_long_name_is_rejected_by_length_not_by_characters(self):
         assert is_k8s_resource_name("x" * 253)
         assert not is_k8s_resource_name("x" * 254)
+
+
+class TestTheClusterUpgradeMceLimbsErrors:
+    """Every error the per-MCE cluster-upgrade limb raises is classified on purpose.
+
+    The upgrade's activities retry without bound (dispatch.RETRY_POLICY), so an
+    error left out of PERMANENT_ACTIVITY_ERRORS is waited on, the run RUNNING
+    with it on the activity. For a weeks-long upgrade that is the point for the
+    ones below: a hosted API that is down or a kubeconfig not published yet
+    clears, and a run must not fail mid-upgrade on it. A new error raised in
+    activities/cluster_upgrade/ must be put in one set or the other.
+    """
+
+    _PERMANENT = {"ArgoSyncRefusedError", "ProposedActionRefusedError", "AdminGateNotFoundError"}
+    _WAITED_ON = {"ArgoSyncFailedError", "HostedClusterAccessError", "HostedClusterUnreachableError"}
+
+    def _named_in_the_limb(self) -> set[str]:
+        limb = pathlib.Path(__file__).resolve().parent.parent / "activities" / "cluster_upgrade"
+        names = {
+            node.id
+            for module in limb.glob("*.py")
+            for node in ast.walk(ast.parse(module.read_text()))
+            if isinstance(node, ast.Name)
+        }
+        return {
+            name for name in names
+            if isinstance(getattr(exceptions, name, None), type) and issubclass(getattr(exceptions, name), Exception)
+        }
+
+    def test_every_error_the_limb_names_is_classified(self):
+        assert self._named_in_the_limb() <= self._PERMANENT | self._WAITED_ON
+
+    def test_the_permanent_ones_stop_the_retries_and_the_others_do_not(self):
+        from workflow_domains.cluster_upgrade.dispatch import RETRY_POLICY
+
+        listed = set(RETRY_POLICY.non_retryable_error_types or [])
+        assert self._PERMANENT <= listed
+        assert not self._WAITED_ON & listed

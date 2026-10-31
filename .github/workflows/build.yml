@@ -1,8 +1,9 @@
 name: Build and Push
 
-# Five images from this one repo: the workflow "brain" (workflow_domains/Dockerfile),
-# three activity worker "limbs" — segment-lifecycle, server-lifecycle and
-# server-provisioning, one per domain (activities/<domain>/Dockerfile) — and the documentation site
+# Images from this one repo: the workflow "brain" (workflow_domains/Dockerfile),
+# the activity worker "limbs" — segment-lifecycle, server-lifecycle and
+# server-provisioning, one per domain, and cluster-upgrade's per-MCE limb
+# (activities/<limb>/Dockerfile) — and the documentation site
 # (docs/Dockerfile), which carries no code at all.
 
 # A commit message containing "[skip ci]" (or "[ci skip]", "[no ci]", "[skip actions]")
@@ -234,6 +235,38 @@ jobs:
           push: true
           tags: ghcr.io/${{ github.repository_owner }}/upgrade-agent-worker:${{ steps.tag.outputs.tag }}
 
+  build-cluster-upgrade-worker:
+    # The cluster-upgrade per-MCE limb (activities/cluster_upgrade/). IMAGE ONLY, NO CHART BUMP,
+    # like build-upgrade-agent-worker above and for the same reason: its chart is
+    # deploy/charts/cluster-upgrade-worker/ here and not yet in redbull-platform, so the shared
+    # workflow's bump on main would fail. Publishes
+    # ghcr.io/<owner>/cluster-upgrade-worker:<branch-slug>-<short sha>; the chart's image.tag is
+    # set by hand. Once the chart is vendored as gitops/charts/cluster-upgrade-worker/, switch it
+    # to the reusable workflow, last in the sequential chain, with helm-image-path: image.
+    needs: changes
+    if: ${{ needs.changes.outputs.limb == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - id: tag
+        run: |
+          slug="$(echo "${GITHUB_REF_NAME}" | tr -c 'a-zA-Z0-9' '-' | tr 'A-Z' 'a-z' | sed 's/-\+/-/g; s/^-//; s/-$//')"
+          echo "tag=${slug}-$(git rev-parse --short HEAD)" >> "${GITHUB_OUTPUT}"
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: activities/cluster_upgrade/Dockerfile
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/cluster-upgrade-worker:${{ steps.tag.outputs.tag }}
+
   cleanup-workflow-brain-on-delete:
     if: github.event_name == 'delete'
     uses: team-redbull/.github/.github/workflows/ghcr-cleanup-on-delete.yml@main
@@ -274,4 +307,11 @@ jobs:
     uses: team-redbull/.github/.github/workflows/ghcr-cleanup-on-delete.yml@main
     with:
       image-name: workflows-docs
+    secrets: inherit
+
+  cleanup-cluster-upgrade-worker-on-delete:
+    if: github.event_name == 'delete'
+    uses: team-redbull/.github/.github/workflows/ghcr-cleanup-on-delete.yml@main
+    with:
+      image-name: cluster-upgrade-worker
     secrets: inherit

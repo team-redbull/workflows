@@ -1,0 +1,81 @@
+# cluster-upgrade-worker — one release per MCE cluster, installed in that MCE.
+#
+# Argo CD: point one Application per MCE at this chart with that MCE as the
+# destination and its own values file. The chart creates no Namespace, runs no
+# hooks and renders deterministically, so Argo can sync and diff it as plain
+# manifests. It needs no credential Secret: the worker's ServiceAccount is its
+# whole identity, and it reads each hosted cluster with that HostedCluster's
+# own admin kubeconfig Secret (rbac.yaml).
+
+# REQUIRED. The MCE this worker serves. It names the queue the worker polls
+# (cluster-upgrade-activity-<mceCluster>) and MUST equal the MCE folder of the
+# clusters' day1 files, `sites/<site>/mces/<mceCluster>/hostedClusters/` —
+# which is how an upgrade run finds its MCE (D18). Given with or without the
+# `ocp4-` prefix; the worker always uses it with. A wrong value is silent: the
+# worker would serve upgrades meant for another MCE and find no such clusters.
+mceCluster: ""
+
+replicaCount: 2
+
+image:
+  # Disconnected production: the mirror of ghcr.io/team-redbull/cluster-upgrade-worker.
+  repository: ghcr.io/team-redbull/cluster-upgrade-worker
+  tag: ""            # defaults to the chart's appVersion
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+# The hub's Temporal frontend, as reachable FROM THIS MCE. On the hub itself
+# (the sandbox: local-cluster hosts the hosted clusters) that is the in-cluster
+# Service, plain gRPC; on any other MCE whatever exposes the frontend across
+# clusters, usually the TLS Route of server-lifecycle-worker's README. The
+# worker dials OUT, so the hub needs no access to the MCE.
+temporal:
+  host: ""           # REQUIRED, host:port, e.g. temporal-frontend.temporal.svc.cluster.local:7233
+  namespace: default # the TEMPORAL namespace (not the OpenShift project); must match the hub
+  # TLS to the frontend. Required when `host` is a Route (it carries TLS only);
+  # off for a plain in-cluster host. The CA is PUBLIC, so it lives here.
+  tls:
+    enabled: false
+    serverName: ""   # defaults to the host part of `host`
+    caCert: ""
+    #  -----BEGIN CERTIFICATE-----
+    #  ...
+    #  -----END CERTIFICATE-----
+
+# Argo CD on THIS MCE: the instance whose hcAppset renders one Application per
+# hosted cluster, named after its day1 file.
+argo:
+  # Its namespace (ARGO_NAMESPACE). The worker reads and syncs Applications
+  # there, and the Role in rbac.yaml is rendered there.
+  namespace: openshift-gitops
+  # The `ref` of the day1 values source of a multi-source Application
+  # (ARGO_VALUES_REF): the hcAppset's `ref: values`. A day1 commit is synced in
+  # that source; the chart source keeps its revision.
+  valuesRef: values
+
+# rbac.yaml: exactly the verbs the activities use, derived from the code
+# (README "RBAC"). `create: false` leaves it to whoever manages RBAC; the
+# ServiceAccount then needs the same grants.
+rbac:
+  create: true
+
+serviceAccount:
+  create: true
+  name: ""           # defaults to the release's full name
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    memory: 512Mi
+
+# In-flight activities get 20s to finish after SIGTERM (worker_init.py); keep
+# the pod's grace period above it. A long watch cut short is retried on another
+# pod and resumes from its last heartbeat.
+terminationGracePeriodSeconds: 30
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}

@@ -1,0 +1,21 @@
+{{- include "cuw.validate" . -}}
+# Everything this worker reads (shared/settings.py ClusterUpgradeActivitySettings
+# and TemporalSettings). An MCE has no brain, so the Temporal endpoint is
+# rendered here and this one ConfigMap is self-sufficient on any cluster. No
+# credential: the worker's ServiceAccount is its identity.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "cuw.fullname" . }}-config
+  labels:
+    {{- include "cuw.labels" . | nindent 4 }}
+data:
+  TEMPORAL_HOST: {{ .Values.temporal.host | quote }}
+  TEMPORAL_NAMESPACE: {{ .Values.temporal.namespace | quote }}
+  MCE_CLUSTER: {{ .Values.mceCluster | quote }}
+  ARGO_NAMESPACE: {{ .Values.argo.namespace | quote }}
+  ARGO_VALUES_REF: {{ .Values.argo.valuesRef | quote }}
+  {{- if .Values.temporal.tls.enabled }}
+  TEMPORAL_TLS_CA: /etc/temporal-tls/ca.crt
+  TEMPORAL_TLS_SERVER_NAME: {{ .Values.temporal.tls.serverName | default (first (splitList ":" .Values.temporal.host)) | quote }}
+  {{- end }}

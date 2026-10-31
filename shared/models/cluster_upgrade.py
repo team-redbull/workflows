@@ -530,7 +530,11 @@ class HostedClusterState(BaseModel):
     namespace: str | None = None
     # status.version.history[0] when its state is Completed; None mid-upgrade.
     control_plane_version: str | None = None
+    # The HostedCluster's own Progressing: True only until the CVO takes
+    # spec.release.image, then False for the rest of the rollout. It is not
+    # "an upgrade is running"; control_plane_version and the CVO conditions are.
     progressing: bool | None = None
+    # Every condition type -> status, including the CVO's (ClusterVersion*).
     conditions: dict[str, str] = Field(default_factory=dict)
     # The mirror repositories spec.imageContentSources points at.
     image_content_mirrors: list[str] = Field(default_factory=list)
@@ -559,7 +563,14 @@ class HostedHealth(BaseModel):
 
     reachable: bool
     operators_unhealthy: list[str] = Field(default_factory=list)
+    # A CVO with no Upgradeable condition means upgradeable: HyperShift reports
+    # True then ("Condition not found in the CVO.", hcpstatus.go, release-4.17
+    # and release-4.20). The reader must do the same, never map it to None.
     cluster_version_upgradeable: bool | None = None
+    # From 4.19 the CVO also says False, reason UpdateInProgress, for as long as
+    # its own Progressing is True, and re-checks at most every 2 minutes
+    # (upgradeInProgressUpgradeable, pkg/cvo/upgradeable.go, release-4.19).
+    upgradeable_reason: str | None = None
     upgradeable_message: str | None = None
     nodes_not_ready: list[str] = Field(default_factory=list)
     nodepools_short: list[str] = Field(default_factory=list)  # below desired replicas

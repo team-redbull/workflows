@@ -292,7 +292,10 @@ class Fleet:
             fleet.settling = max(0, fleet.settling - 1)
             return HostedClusterState(
                 found=True, namespace="clusters", control_plane_version=fleet.cluster_cp,
-                progressing=settling, conditions={"ClusterVersionSucceeding": "True"},
+                progressing=settling,
+                conditions={
+                    "ClusterVersionProgressing": str(settling), "ClusterVersionSucceeding": "True",
+                },
                 image_content_mirrors=MIRRORS,
                 nodepools=[
                     NodePoolState(name=name, version=version, replicas=2, ready_replicas=2,

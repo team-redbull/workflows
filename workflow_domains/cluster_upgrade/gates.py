@@ -55,6 +55,9 @@ PER_BATCH_MINUTES = 60
 # The waves whose clusters may skip the human approval (AGENT.md #3, #30).
 _AUTO_APPROVE_WAVES = (0, 1)
 
+# The CVO's Upgradeable=False reason while its own update runs (4.19 and later).
+_UPDATE_IN_PROGRESS = "UpdateInProgress"
+
 _SEVERITY = {
     CheckFailure.WAIT: 0,
     CheckFailure.NEEDS_HUMAN: 1,
@@ -365,17 +368,37 @@ def preflight_checks(
             name="cluster-version-upgradeable",
             passed=health.cluster_version_upgradeable is True,
             # Never answered by setting hypershift.openshift.io/force-upgrade-to
-            # (AGENT.md #13): a person decides why the cluster says no.
+            # (AGENT.md #13): a person decides why the cluster says no. The one
+            # exception is the CVO's own "an update is still running", which
+            # clears by itself, so it waits like control-plane-idle does.
             expected="ClusterVersion Upgradeable=True",
-            observed=health.upgradeable_message or str(health.cluster_version_upgradeable),
-            on_failure=CheckFailure.NEEDS_HUMAN,
+            observed=(
+                (f"{health.upgradeable_reason}: " if health.upgradeable_reason else "")
+                + (health.upgradeable_message or str(health.cluster_version_upgradeable))
+            ),
+            on_failure=(
+                CheckFailure.WAIT if health.upgradeable_reason == _UPDATE_IN_PROGRESS
+                else CheckFailure.NEEDS_HUMAN
+            ),
         ),
         CheckResult(
             name="control-plane-idle",
-            passed=hosted.progressing is False and hosted.conditions.get("ClusterVersionSucceeding") == "True",
-            expected="not Progressing, ClusterVersionSucceeding=True",
+            # Progressing alone is not enough: HyperShift drops it to False as soon
+            # as the CVO takes the new release, long before the rollout ends
+            # (isProgressing, hostedcluster_controller.go, release-4.20; seen live
+            # on a 4.17 -> 4.18 upgrade). The CVO's own conditions and a Completed
+            # history entry say the rollout is over.
+            passed=(
+                hosted.progressing is False
+                and hosted.control_plane_version is not None
+                and hosted.conditions.get("ClusterVersionProgressing") == "False"
+                and hosted.conditions.get("ClusterVersionSucceeding") == "True"
+            ),
+            expected="not Progressing, version Completed, ClusterVersionProgressing=False, ClusterVersionSucceeding=True",
             observed=(
                 f"Progressing={hosted.progressing}, "
+                f"version={hosted.control_plane_version or 'not Completed'}, "
+                f"ClusterVersionProgressing={hosted.conditions.get('ClusterVersionProgressing')}, "
                 f"ClusterVersionSucceeding={hosted.conditions.get('ClusterVersionSucceeding')}"
             ),
             on_failure=CheckFailure.WAIT,

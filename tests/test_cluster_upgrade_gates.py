@@ -51,7 +51,8 @@ def _hosted(*, versions=None, upgrade_type="InPlace", **kwargs) -> HostedCluster
     versions = versions or {"np-a": "4.18.56", "np-b": "4.18.56"}
     fields = {
         "found": True, "control_plane_version": "4.18.56", "progressing": False,
-        "conditions": {"ClusterVersionSucceeding": "True"}, "image_content_mirrors": MIRRORS,
+        "conditions": {"ClusterVersionProgressing": "False", "ClusterVersionSucceeding": "True"},
+        "image_content_mirrors": MIRRORS,
         "nodepools": [NodePoolState(name=n, version=v, upgrade_type=upgrade_type) for n, v in versions.items()],
     }
     fields.update(kwargs)
@@ -210,6 +211,34 @@ class TestPreflightChecks:
         checks = _preflight(**kwargs)
         assert [check.name for check in gates.failed(list(checks.values()))] == [name]
         assert checks[name].on_failure is consequence
+
+    def test_a_rollout_the_cvo_has_taken_is_not_idle(self):
+        # What a 4.17 -> 4.18 upgrade looked like on a live HostedCluster ten
+        # minutes in: Progressing already False, the CVO still rolling.
+        mid_rollout = _hosted(
+            progressing=False, control_plane_version=None,
+            conditions={"ClusterVersionProgressing": "True", "ClusterVersionSucceeding": "True"},
+        )
+        check = _preflight(hosted=mid_rollout)["control-plane-idle"]
+        assert not check.passed and check.on_failure is CheckFailure.WAIT
+        assert "not Completed" in check.observed and "ClusterVersionProgressing=True" in check.observed
+
+    def test_an_update_still_running_waits_instead_of_asking_a_person(self):
+        # A 4.19 CVO says Upgradeable=False, UpdateInProgress, for its whole
+        # rollout and up to two minutes after it.
+        checks = _preflight(health=HostedHealth(
+            reachable=True, cluster_version_upgradeable=False, idms_mirrors=MIRRORS,
+            upgradeable_reason="UpdateInProgress",
+            upgradeable_message="An update is already in progress and the details are in the Progressing condition",
+        ))
+        check = checks["cluster-version-upgradeable"]
+        assert not check.passed and check.on_failure is CheckFailure.WAIT
+        assert check.observed.startswith("UpdateInProgress: ")
+        assert gates.worst(list(checks.values())) is CheckFailure.WAIT
+
+    def test_missing_cvo_conditions_are_not_idle(self):
+        check = _preflight(hosted=_hosted(conditions={}))["control-plane-idle"]
+        assert not check.passed
 
     def test_an_unreachable_hosted_api_passes_nothing_it_cannot_read(self):
         checks = _preflight(health=HostedHealth(reachable=False, idms_mirrors=MIRRORS))

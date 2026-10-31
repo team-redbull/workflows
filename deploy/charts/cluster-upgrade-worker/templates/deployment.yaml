@@ -42,25 +42,33 @@ spec:
           # Temporal, and a worker that cannot reach it exits and restarts.
           envFrom:
             - configMapRef:
-                name: {{ include "cuw.fullname" . }}-config
+                name: {{ include "cuw.configName" . }}
           securityContext:
             allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
             capabilities:
               drop: [ALL]
-          {{- if .Values.temporal.tls.enabled }}
           volumeMounts:
+            # The one thing it writes: each hosted cluster's admin CA, cert and
+            # key, in a per-call temp dir deleted when the call ends
+            # (server_lifecycle/hosted_cluster_api.py).
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.temporal.tls.enabled }}
             - name: temporal-ca
               mountPath: /etc/temporal-tls
               readOnly: true
-          {{- end }}
+            {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
-      {{- if .Values.temporal.tls.enabled }}
       volumes:
+        - name: tmp
+          emptyDir: {}
+        {{- if .Values.temporal.tls.enabled }}
         - name: temporal-ca
           configMap:
             name: {{ include "cuw.fullname" . }}-temporal-ca
-      {{- end }}
+        {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

@@ -24,7 +24,7 @@ spec:
         {{- toYaml . | nindent 8 }}
         {{- end }}
     spec:
-      serviceAccountName: {{ include "uaw.fullname" . }}
+      serviceAccountName: {{ include "uaw.serviceAccountName" . }}
       # No Kubernetes API access at all: the limb's only peer is the agent service.
       automountServiceAccountToken: false
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
@@ -44,7 +44,7 @@ spec:
           # Temporal, and a worker that cannot reach it exits and restarts.
           envFrom:
             - configMapRef:
-                name: {{ include "uaw.fullname" . }}-config
+                name: {{ include "uaw.configName" . }}
           {{- with .Values.upgradeAgent.tokenSecret.name }}
           env:
             - name: UPGRADE_AGENT_TOKEN
@@ -58,20 +58,26 @@ spec:
             readOnlyRootFilesystem: true
             capabilities:
               drop: [ALL]
-          {{- if .Values.temporal.tls.enabled }}
           volumeMounts:
+            # The only writable path, as in the domain's other limbs: Python's
+            # temp files have somewhere to go on a read-only root.
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.temporal.tls.enabled }}
             - name: temporal-ca
               mountPath: /etc/temporal-tls
               readOnly: true
-          {{- end }}
+            {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
-      {{- if .Values.temporal.tls.enabled }}
       volumes:
+        - name: tmp
+          emptyDir: {}
+        {{- if .Values.temporal.tls.enabled }}
         - name: temporal-ca
           configMap:
             name: {{ include "uaw.fullname" . }}-temporal-ca
-      {{- end }}
+        {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

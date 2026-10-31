@@ -82,6 +82,16 @@ shape, with this chart's name.
 The worker fails to start on a missing `MCE_CLUSTER` or `TEMPORAL_HOST`, a namespace
 that is not a Kubernetes name, or a ref Argo CD would refuse.
 
+Every key above is in the ConfigMap `cluster-upgrade-config` (`<domain>-config`, CLAUDE.md
+§8). Before this chart named it `cluster-upgrade-worker-config`; an upgrade of the release
+creates the new one, rolls the pods onto it and deletes the old one, with nothing to do by
+hand unless something outside the chart mounted the old name.
+
+The pod runs as a non-root UID (`USER 1001` in the image; any UID OpenShift assigns works)
+with a read-only root filesystem, no privilege escalation and no capabilities. The one path
+it writes is the `/tmp` emptyDir: each hosted cluster's admin CA, certificate and key, in a
+temporary directory deleted when the call ends.
+
 ### Multi-source Applications
 
 The production hcAppset renders each hosted cluster's Application with two sources: the

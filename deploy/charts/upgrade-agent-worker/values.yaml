@@ -8,7 +8,11 @@
 # (upgrade-agent-activity-<mceCluster>). The `ocp4-` prefix is added when left out.
 mceCluster: ""
 
-replicaCount: 1
+# Two, as the domain's other limbs: the agent call is the one activity with a
+# schedule-to-start timeout (5 min, dispatch.SCHEDULE_TO_START_TIMEOUT), so a
+# lone pod being restarted turns a gate's diagnosis into needs_human. The
+# invocation id makes a retry on the other pod join the first attempt's run.
+replicaCount: 2
 
 image:
   # Disconnected production: the mirror of ghcr.io/team-redbull/upgrade-agent-worker.
@@ -36,6 +40,10 @@ upgradeAgent:
   tokenSecret:
     name: ""
     key: token
+
+serviceAccount:
+  create: true
+  name: ""           # defaults to the release's full name
 
 resources:
   requests:

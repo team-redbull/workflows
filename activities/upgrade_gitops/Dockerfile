@@ -28,7 +28,8 @@ RUN pip install --no-cache-dir -r /app/activities/upgrade_gitops/requirements.tx
 COPY shared/ /app/shared/
 COPY activities/ /app/activities/
 
-ENV PYTHONPATH=/app
+# No .pyc writes: the chart runs the root filesystem read-only.
+ENV PYTHONPATH=/app PYTHONDONTWRITEBYTECODE=1
 # Any non-root UID works (OpenShift assigns its own): every clone, and oc's
 # HOME, is a fresh temporary directory.
 USER 1001

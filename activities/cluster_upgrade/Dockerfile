@@ -16,5 +16,8 @@ RUN pip install --no-cache-dir -r /app/activities/cluster_upgrade/requirements.t
 COPY shared/ /app/shared/
 COPY activities/ /app/activities/
 
-ENV PYTHONPATH=/app
+# No .pyc writes: the chart runs the root filesystem read-only.
+ENV PYTHONPATH=/app PYTHONDONTWRITEBYTECODE=1
+# Numeric, so runAsNonRoot holds on plain Kubernetes too; OpenShift assigns its own UID.
+USER 1001
 CMD ["python", "-m", "activities.cluster_upgrade.worker_init"]

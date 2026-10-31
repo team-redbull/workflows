@@ -13,6 +13,12 @@ rest of the stack expects (CLAUDE.md §2: `-worker` names the pod). */}}
 {{- default (include "cuw.fullname" .) .Values.serviceAccount.name -}}
 {{- end -}}
 
+{{/* The limb's own ConfigMap, named after the DOMAIN (CLAUDE.md §2/§8, `<domain>-config`):
+cluster-upgrade-config, as upgrade-gitops-worker's is upgrade-gitops-config. */}}
+{{- define "cuw.configName" -}}
+{{- printf "%s-config" (include "cuw.fullname" . | trimSuffix "-worker") -}}
+{{- end -}}
+
 {{- define "cuw.selectorLabels" -}}
 app: {{ include "cuw.fullname" . }}
 app.kubernetes.io/name: {{ .Chart.Name }}

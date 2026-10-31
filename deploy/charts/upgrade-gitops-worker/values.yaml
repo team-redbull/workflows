@@ -5,7 +5,11 @@
 # no RBAC (its ServiceAccount mounts no API token), only egress to the git
 # hosts and the release registry.
 
-replicaCount: 1
+# Two, as the domain's other limbs: every upgrade in the fleet commits through
+# this queue, so one pod restarting should not pause them all. Safe to share:
+# each activity is one fresh clone, day1 commits compare-and-set on the blob
+# and Brain pages are keyed on the invocation, so two pods race like two runs.
+replicaCount: 2
 
 image:
   # Disconnected production: the mirror of ghcr.io/team-redbull/upgrade-gitops-worker.

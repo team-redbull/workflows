@@ -19,7 +19,11 @@ incidents. It calls no Kubernetes API: no RBAC, and its ServiceAccount mounts no
 | Brain repo + push token | `brain.repoUrl`, `brain.tokenSecret` | no (verdicts then stay in the run's history) |
 
 The image carries git and `oc` (from `quay.io/openshift/origin-cli:4.20`); it runs as any
-non-root UID with a read-only root filesystem, everything it writes on the `/tmp` emptyDir.
+non-root UID with a read-only root filesystem, everything it writes on the `/tmp` emptyDir. Two
+replicas share the queue (`replicaCount`), as in the domain's other limbs. Its non-secret keys
+are in the ConfigMap `upgrade-gitops-config`. Every repo URL that is set must be `https://`
+(the token is injected into https URLs only): the chart refuses to render anything else, as the
+worker would refuse to start.
 
 ## Repo code runs with this pod's credentials
 

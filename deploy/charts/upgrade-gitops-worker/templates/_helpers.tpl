@@ -37,6 +37,8 @@ where a missing value is one edit away, instead of a crash-looping worker. */}}
 {{- define "ugw.validate" -}}
 {{- if not (hasPrefix "https://" .Values.day1.repoUrl) -}}{{- fail "day1.repoUrl is required, and https:// (the token is injected into https URLs only)" -}}{{- end -}}
 {{- if not .Values.day1.tokenSecret.name -}}{{- fail "day1.tokenSecret.name is required: an existing Secret with a token that may push to day1 main" -}}{{- end -}}
+{{- if and .Values.day2.repoUrl (not (hasPrefix "https://" .Values.day2.repoUrl)) -}}{{- fail "day2.repoUrl must be https:// when set (the token is injected into https URLs only; the worker refuses anything else at start)" -}}{{- end -}}
+{{- if and .Values.brain.repoUrl (not (hasPrefix "https://" .Values.brain.repoUrl)) -}}{{- fail "brain.repoUrl must be https:// when set (the token is injected into https URLs only; the worker refuses anything else at start)" -}}{{- end -}}
 {{- if and .Values.brain.repoUrl (not .Values.brain.tokenSecret.name) -}}{{- fail "brain.tokenSecret.name is required once brain.repoUrl is set: incidents are pushed to Brain main" -}}{{- end -}}
 {{- if and (not .Values.globalConfigMap) (not .Values.temporal.host) -}}{{- fail "set temporal.host, or globalConfigMap to the brain's ConfigMap holding TEMPORAL_HOST" -}}{{- end -}}
 {{- end -}}

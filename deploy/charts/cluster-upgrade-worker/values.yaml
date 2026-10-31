@@ -15,6 +15,10 @@
 # worker would serve upgrades meant for another MCE and find no such clusters.
 mceCluster: ""
 
+# Two pods share the queue, so one dying (a node drain, an upgrade of this
+# chart) never leaves the MCE without a worker: every activity is idempotent
+# and a watch resumes from its last heartbeat on the other pod. The same in
+# the domain's other two limbs' charts.
 replicaCount: 2
 
 image:

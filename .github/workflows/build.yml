@@ -1,17 +1,17 @@
 name: Build and Push
 
-# Images from this one repo: the workflow "brain" (workflow_domains/Dockerfile),
-# the activity worker "limbs" — segment-lifecycle, server-lifecycle and
-# server-provisioning, one per domain, and cluster-upgrade's per-MCE limb
-# (activities/<limb>/Dockerfile) — and the documentation site
-# (docs/Dockerfile), which carries no code at all.
+# Eight images from this one repo: the workflow "brain" (workflow_domains/Dockerfile),
+# six activity worker "limbs" (activities/<limb>/Dockerfile) — segment-lifecycle,
+# server-lifecycle and server-provisioning, one per domain, and cluster-upgrade's
+# three: cluster-upgrade and upgrade-agent per MCE, upgrade-gitops on the hub —
+# and the documentation site (docs/Dockerfile), which carries no code at all.
 
 # A commit message containing "[skip ci]" (or "[ci skip]", "[no ci]", "[skip actions]")
 # makes GitHub skip this WHOLE workflow, the `changes` job included, and the next push
 # builds only what ITS OWN range touched. So a skipped push leaves its images unbuilt
 # until a later push touches their paths, which can ship a new brain against an old
 # limb. Never quote the marker in a commit message; if it happens anyway, re-trigger by
-# pushing a change to this file, which rebuilds all three images.
+# pushing a change to this file, which rebuilds every image.
 
 on:
   push:
@@ -60,7 +60,7 @@ jobs:
           # precision. The fallbacks matter: the obvious "no base → build
           # everything" rule sounds safe but fires on the FIRST push of every
           # new branch (github.event.before is all-zeros there), which turns
-          # an ordinary "branch, tweak docs, push" into all three images.
+          # an ordinary "branch, tweak docs, push" into every image.
           all=false
           if [ -n "${BEFORE}" ] \
              && [ "${BEFORE}" != "0000000000000000000000000000000000000000" ] \
@@ -76,7 +76,7 @@ jobs:
             echo "base: branch point off ${DEFAULT_BRANCH} (${base})"
           else
             # Only reachable when the default branch itself has no usable
-            # base — i.e. it was force-pushed. Rare, and rebuilding all three
+            # base — i.e. it was force-pushed. Rare, and rebuilding everything
             # is the right answer there: a skipped build that was needed
             # ships a stale image to PROD and is invisible, whereas a
             # redundant build only costs minutes.
@@ -100,7 +100,7 @@ jobs:
           # happens to share the image's name:
           #   · every Python image bakes in shared/, so it triggers them all;
           #   · EACH limb copies the WHOLE activities/ tree, not just its own
-          #     domain — which is why one `limb` flag drives both limb jobs;
+          #     domain — which is why one `limb` flag drives all six limb jobs;
           #   · this file changes what gets built, so it triggers everything.
           SELF='\.github/workflows/build\.yml$'
           {
@@ -154,9 +154,9 @@ jobs:
     # the same reason that one is behind the brain: both push to the same
     # redbull-platform branch, so running them together makes them race.
     #
-    # Shares the `limb` flag with the other worker deliberately — both
-    # Dockerfiles COPY the whole activities/ tree, so a change under either
-    # domain really does land in both images.
+    # Shares the `limb` flag with every other limb deliberately — each limb
+    # Dockerfile COPYs the whole activities/ tree, so a change under any
+    # domain really does land in every limb image.
     needs: [changes, build-segment-lifecycle-worker]
     if: ${{ !cancelled() && !failure() && needs.changes.outputs.limb == 'true' }}
     uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main

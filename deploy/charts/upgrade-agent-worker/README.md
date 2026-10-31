@@ -20,6 +20,12 @@ For TLS to the hub's Temporal (a passthrough Route), set `temporal.tls.*` as in
 `deploy/charts/server-lifecycle-worker/README.md`.
 
 What it holds: no Kubernetes credential and no RBAC (its ServiceAccount mounts no token), only the
-agent service's URL and, optionally, its bearer token. Failures: an agent that cannot answer
+agent service's URL and, optionally, its bearer token. The URL and the Temporal endpoint are in
+the ConfigMap `upgrade-agent-config` (`<domain>-config`, CLAUDE.md §8; before, this chart named it
+`upgrade-agent-worker-config` — an upgrade of the release replaces it and rolls the pods, nothing
+to do by hand). `serviceAccount.create: false` with `serviceAccount.name` uses an existing
+ServiceAccount instead. Two replicas by default: the agent call is the one activity with a
+schedule-to-start timeout, so a lone pod restarting would send a gate to needs-human. The pod runs
+as a non-root UID with a read-only root filesystem, `/tmp` its only writable path. Failures: an agent that cannot answer
 (unreachable, timeout, 429, 5xx) is retried once by Temporal with the same invocation id; a refusal
 (another 4xx) is non-retryable; a reply that is not an `AgentVerdict` comes back as `needs_human`.

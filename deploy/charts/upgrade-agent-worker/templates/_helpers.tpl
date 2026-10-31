@@ -7,6 +7,16 @@
 {{- end -}}
 {{- end -}}
 
+{{- define "uaw.serviceAccountName" -}}
+{{- default (include "uaw.fullname" .) .Values.serviceAccount.name -}}
+{{- end -}}
+
+{{/* The limb's own ConfigMap, named after the DOMAIN (CLAUDE.md §2/§8, `<domain>-config`):
+upgrade-agent-config, as upgrade-gitops-worker's is upgrade-gitops-config. */}}
+{{- define "uaw.configName" -}}
+{{- printf "%s-config" (include "uaw.fullname" . | trimSuffix "-worker") -}}
+{{- end -}}
+
 {{- define "uaw.selectorLabels" -}}
 app: {{ include "uaw.fullname" . }}
 app.kubernetes.io/name: {{ .Chart.Name }}

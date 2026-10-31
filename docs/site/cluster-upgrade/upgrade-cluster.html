@@ -56,7 +56,7 @@
     next.</p>
     <div class="facts">
       <div class="fact"><span class="k">Trigger</span><span class="v">POST /workflows/cluster-upgrade/upgrade-cluster &middot; not mounted yet</span></div>
-      <div class="fact"><span class="k">Workflow id</span><span class="v">one per HostedCluster: upgrade-cluster-&lt;mce&gt;_&lt;cluster&gt;</span></div>
+      <div class="fact"><span class="k">Workflow id</span><span class="v">one per HostedCluster: upgrade-cluster-&lt;cluster&gt;</span></div>
       <div class="fact"><span class="k">Child</span><span class="v">upgrade-control-plane-&lt;mce&gt;_&lt;slot&gt;, one per control-plane step</span></div>
       <div class="fact"><span class="k">Workflow queues</span><span class="v">upgrade-cluster-workflow &middot; upgrade-control-plane-workflow</span></div>
       <div class="fact"><span class="k">Activity queues</span><span class="v">upgrade-gitops-activity (hub) &middot; cluster-upgrade-activity-&lt;mce&gt; &middot; upgrade-agent-activity-&lt;mce&gt;</span></div>
@@ -415,7 +415,9 @@
             <h3>planning</h3>
             <span class="phase">phase <b>planning</b></span>
           </div>
-          <p><b>Reads only.</b> The rules file and the cluster&rsquo;s day1 file (hub), the MCE&rsquo;s
+          <p><b>Reads only.</b> First the cluster&rsquo;s day1 file (hub): the folder it sits in,
+          <code>sites/&lt;site&gt;/mces/&lt;mce&gt;/</code>, is the MCE the run works on from then on. Then the
+          rules file (hub), the MCE&rsquo;s
           <code>hypershift/supported-versions</code> and the HostedCluster with its NodePools (MCE). It
           derives the <b>profile</b> &mdash; <code>zoned</code> when NodePools carry
           <code>topology.kubernetes.io/zone</code>, else <code>generic</code>, unless the file&rsquo;s
@@ -423,7 +425,7 @@
           Then it resolves the path, pins every release to its digests and checks day2 has a layer for every
           version.</p>
           <div class="calls">
-            <div class="call nxt"><span class="verb">HUB</span><span class="path">read_upgrade_rules &middot; read_day1_cluster &middot; pin_release_digests &middot; check_day2_layers <em>&middot; list_release_tags for a target_minor</em></span></div>
+            <div class="call nxt"><span class="verb">HUB</span><span class="path">read_day1_cluster &middot; read_upgrade_rules &middot; pin_release_digests &middot; check_day2_layers <em>&middot; list_release_tags for a target_minor</em></span></div>
             <div class="call sm"><span class="verb">MCE</span><span class="path">read_mce_state &middot; read_hosted_cluster</span></div>
           </div>
           <p class="note">Any failed check (1&ndash;4, git matching the cluster, auto-approve allowed)
@@ -802,13 +804,14 @@ or retry to check again (the count covers 24 hours)</pre>
           <span class="ret">202 &middot; 409 if this cluster already has a run &middot; 422 on a bad body</span>
         </div>
         <div class="endpoint-body">
-          <p>Which cluster, on which MCE, to what. <b>Exactly one</b> of <code>target_version</code>
+          <p>Which cluster, to what. <b>Exactly one</b> of <code>target_version</code>
           (<code>X.Y.Z</code> or <code>X.Y.Z-x86_64</code>) and <code>target_minor</code>.
-          <code>mce_cluster</code> is accepted with or without <code>ocp4-</code>; the run uses the prefixed
-          name, which also names the per-MCE queues. Unknown fields are refused.</p>
+          <b>No MCE:</b> the run reads it from where day1 keeps the cluster file,
+          <code>sites/&lt;site&gt;/mces/&lt;mce&gt;/hostedClusters/&lt;cluster&gt;.yaml</code>, and shows it as
+          <code>progress.mce_cluster</code>; a body that still sends <code>mce_cluster</code> gets a 422 saying
+          so. Unknown fields are refused.</p>
           <pre><span class="c">// request</span>
 {
-  "mce_cluster":       "&lt;mce&gt;",
   "cluster":           "&lt;cluster&gt;",          <span class="c">// the HostedCluster: its day1 file's name</span>
   "target_minor":      "4.21",               <span class="c">// or "target_version": "4.21.40"</span>
   "nodepool_mode":     "manual",             <span class="c">// default; "auto" rolls on after each soak</span>
@@ -819,7 +822,7 @@ or retry to check again (the count covers 24 hours)</pre>
 }
 
 <span class="c">// 202 response</span>
-{ "workflow_id": "upgrade-cluster-ocp4-&lt;mce&gt;_&lt;cluster&gt;", "run_id": "…" }</pre>
+{ "workflow_id": "upgrade-cluster-&lt;cluster&gt;", "run_id": "…" }</pre>
           <p class="note">Starting is the dry run: the run plans, pins, pre-flights and waits for
           <code>approve</code> with nothing committed. Read the plan, then <code>abort</code>: CANCELLED.</p>
         </div>
@@ -878,11 +881,12 @@ or retry to check again (the count covers 24 hours)</pre>
           needed).</p>
           <pre><span class="c">// 200 while waiting for approval</span>
 {
-  "workflow_id":   "upgrade-cluster-ocp4-&lt;mce&gt;_&lt;cluster&gt;",
+  "workflow_id":   "upgrade-cluster-&lt;cluster&gt;",
   "workflow_type": "UpgradeClusterWorkflow",
   "status":        "RUNNING",
   "progress": {
     "phase":       "awaiting-approval",
+    "mce_cluster": "&lt;mce&gt;",                 <span class="c">// found in day1</span>
     "waiting_for": "approve: 4.16.27 → 4.21.40 in 9 steps (control plane → 4.16.55, control plane → 4.17.58,
                     control plane → 4.18.56, workers → 4.18.56, control plane → 4.19.53, control plane → 4.20.44,
                     workers → 4.20.44, control plane → 4.21.40, workers → 4.21.40). Ladder last checked against

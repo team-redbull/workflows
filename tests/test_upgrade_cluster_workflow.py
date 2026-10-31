@@ -24,6 +24,7 @@ from shared.exceptions import (
     AmbiguousClusterFileError,
     ClusterFileNotFoundError,
     Day1ChangeRejectedError,
+    UpgradePathRefusedError,
     UpgradePlanningFailedError,
     UpgradeUpdateRefusedError,
 )
@@ -1295,6 +1296,39 @@ class TestUpgradeTargets:
             with pytest.raises(WorkflowFailureError) as failure:
                 await self._targets(h)
         assert "no MCE" in str(failure.value.cause)
+
+    async def _refused(self, h: Harness) -> ApplicationError:
+        # No execution timeout here: a bare exception in the workflow would hang this test.
+        with pytest.raises(WorkflowFailureError) as failure:
+            await asyncio.wait_for(self._targets(h), timeout=30)
+        cause = failure.value.cause
+        assert isinstance(cause, ApplicationError)
+        return cause
+
+    async def test_a_ladder_listing_a_rung_twice_fails_the_run_not_its_task(self):
+        fleet = Fleet()
+        fleet.ladder = [*fleet.ladder, fleet.ladder[-1]]
+        async with Harness(fleet) as h:
+            cause = await self._refused(h)
+        assert cause.type == UpgradePathRefusedError.__name__
+        assert "the ladder lists 4.21.40 twice" in cause.message
+
+    async def test_a_mastertag_that_is_no_release_fails_the_run_not_its_task(self):
+        fleet = Fleet()
+        fleet.mastertag = "latest"
+        async with Harness(fleet) as h:
+            cause = await self._refused(h)
+        assert cause.type == UpgradePathRefusedError.__name__
+        assert "latest" in cause.message
+
+    async def test_a_file_the_parser_refused_fails_naming_what_it_refused(self):
+        fleet = Fleet()
+        fleet.day1_problems = ["line 12: duplicate key mastertag"]
+        async with Harness(fleet) as h:
+            cause = await self._refused(h)
+        assert cause.type == UpgradePlanningFailedError.__name__
+        assert "line 12: duplicate key mastertag" in cause.message
+        assert fleet.calls == ["read_day1_cluster"]
 
 
 # What the hostedclusters-setup chart renders for the day1 file `<CLUSTER>.yaml`.

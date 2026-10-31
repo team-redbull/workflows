@@ -187,6 +187,9 @@ class Fleet:
         self.max_concurrent_control_planes = max_concurrent_control_planes
         # The minors the hosting MCE supports (rules file `upgrade/mces/<mce>.yaml`).
         self.supported = list(SUPPORTED)
+        # The rules file's ladder, and what the day1 parser refused in the file.
+        self.ladder = list(LADDER)
+        self.day1_problems: list[str] = []
         # day1, as written: production files pin every NodePool's workertag.
         # Its folder names the MCE the run then works on.
         self.day1_path = DAY1_PATH
@@ -284,7 +287,7 @@ class Fleet:
         async def read_upgrade_rules(request: UpgradeRulesRequest) -> UpgradeRules:
             fleet.calls.append("read_upgrade_rules")
             return UpgradeRules(
-                revision=f"rev-{fleet.revision}", ladder=LADDER, max_worker_skew=2,
+                revision=f"rev-{fleet.revision}", ladder=fleet.ladder, max_worker_skew=2,
                 verified_against_graph="2026-10-31", release=RELEASE, mce_version="2.17.3",
                 supported_hosted_versions=fleet.supported,
                 max_concurrent_control_planes=fleet.max_concurrent_control_planes,
@@ -307,6 +310,7 @@ class Fleet:
                     for name in fleet.nodepools
                 ],
                 upgrade=fleet.upgrade,
+                problems=list(fleet.day1_problems),
             )
 
         @activity.defn(name="list_release_tags")

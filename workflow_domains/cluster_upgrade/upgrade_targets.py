@@ -10,7 +10,10 @@ a path resolves. The ladder is what the team mirrored and verified, so a minor
 missing from the internal registry is never offered.
 
 Nothing is written, and no cluster is read: planning still checks git against
-the cluster and pins every release in the mirror.
+the cluster and pins every release in the mirror. A file the parser refused
+(`problems`), a mastertag or a ladder that is no version FAILS the run with
+the reason — the route's 409 — never a workflow task retried until the API's
+timeout.
 """
 
 from __future__ import annotations
@@ -19,7 +22,7 @@ from temporalio import workflow
 from temporalio.exceptions import ApplicationError
 
 with workflow.unsafe.imports_passed_through():
-    from shared.exceptions import UpgradePlanningFailedError
+    from shared.exceptions import UpgradePathRefusedError, UpgradePlanningFailedError
     from shared.interfaces.upgrade_gitops import read_day1_cluster, read_upgrade_rules
     from shared.models.cluster_upgrade import (
         Day1Cluster,
@@ -30,7 +33,7 @@ with workflow.unsafe.imports_passed_through():
         UpgradeTargetsRunArgs,
     )
     from workflow_domains.cluster_upgrade import gates, upgrade_path
-    from workflow_domains.cluster_upgrade.dispatch import on_hub
+    from workflow_domains.cluster_upgrade.dispatch import hosting_mce, on_hub
 
 
 @workflow.defn
@@ -38,23 +41,41 @@ class UpgradeTargetsWorkflow:
     @workflow.run
     async def run(self, run_args: UpgradeTargetsRunArgs) -> UpgradeTargets:
         cluster = run_args.input.cluster
+        workflow.logger.info("Listing the upgrade targets of cluster=%s", cluster)
         day1: Day1Cluster = await on_hub(read_day1_cluster, Day1ClusterRequest(cluster=cluster))
-        mce_cluster = gates.mce_of_day1_path(day1.path)
-        if mce_cluster is None:
+        mce_cluster = hosting_mce(day1)
+        if day1.problems:
+            # Planning's check 3: a file read wrongly would offer wrong targets.
             raise ApplicationError(
-                f"day1 file {day1.path} is not under sites/<site>/mces/<mce>/hostedClusters/: no MCE",
+                f"day1 file {day1.path} cannot be read as the chart renders it:\n" + "\n".join(day1.problems),
                 type=UpgradePlanningFailedError.__name__,
             )
         rules: UpgradeRules = await on_hub(read_upgrade_rules, UpgradeRulesRequest(mce_cluster=mce_cluster))
         targets = []
         if day1.mastertag:
-            targets = upgrade_path.target_options(
-                control_plane=day1.mastertag,
-                nodepools={np.name: gates.effective_workertag(day1, np.name) or day1.mastertag for np in day1.nodepools},
-                ladder=rules.ladder,
-                supported_minors=rules.supported_hosted_versions,
-                max_worker_skew=rules.max_worker_skew,
-            )
+            try:
+                targets = upgrade_path.target_options(
+                    control_plane=day1.mastertag,
+                    nodepools={np.name: gates.effective_workertag(day1, np.name) for np in day1.nodepools},
+                    ladder=rules.ladder,
+                    supported_minors=rules.supported_hosted_versions,
+                    max_worker_skew=rules.max_worker_skew,
+                )
+            except ValueError as err:
+                # A mastertag or a ladder rung that is no release, or a rung
+                # listed twice: raised from workflow code, a bare ValueError
+                # would fail the workflow TASK and retry it until the timeout.
+                raise ApplicationError(
+                    f"no upgrade targets for {cluster}: {err}", type=UpgradePathRefusedError.__name__
+                ) from None
+        workflow.logger.info(
+            "cluster=%s on %s at %s: %d upgrade targets (%s)",
+            cluster,
+            mce_cluster,
+            day1.mastertag or "no mastertag",
+            len(targets),
+            ", ".join(target.version for target in targets) or "none",
+        )
         return UpgradeTargets(
             cluster=cluster,
             mce_cluster=mce_cluster,

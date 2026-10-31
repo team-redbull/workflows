@@ -531,8 +531,8 @@
               NodePool. <b>This is the customer&rsquo;s turn:</b> they run their own readiness checks on their
               workloads &mdash; after the control plane, then after each NodePool &mdash; and
               <code>continue</code> is their sign-off. The workflow runs no customer checks itself. This can take a
-              week. Auto mode goes on after the previous gate&rsquo;s soak without asking anyone, so it suits only a
-              customer who agreed not to check between NodePools.</li>
+              week. Auto mode goes on after the previous gate&rsquo;s soak without asking anyone, so it is <b>for lab and
+              canary clusters only</b> (<code>upgrade.wave</code> 0 or 1): elsewhere planning fails, saying why.</li>
             <li><b>Pre-flight 5&ndash;10</b>, scoped to this NodePool, and the digest re-checked.</li>
             <li><b>Commit</b> <code>nodepool[&lt;name&gt;].workertag</code> and <b>sync</b>, refused if anything but
               <code>NodePool/&lt;name&gt;</code> is out of sync. A sync refused after the commit landed is retried
@@ -816,7 +816,7 @@ or retry to check again (the count covers 24 hours)</pre>
 {
   "cluster":           "&lt;cluster&gt;",          <span class="c">// the HostedCluster: its day1 file's name</span>
   "target_minor":      "4.21",               <span class="c">// or "target_version": "4.21.40"</span>
-  "nodepool_mode":     "manual",             <span class="c">// default; "auto" rolls on after each soak</span>
+  "nodepool_mode":     "manual",             <span class="c">// default; "auto" rolls on after each soak, upgrade.wave 0 or 1 only</span>
   "nodepool_order":    null,                 <span class="c">// default: upgrade.nodePoolOrder, else zone, else file order</span>
   "workers_to_target": true,                 <span class="c">// default</span>
   "auto_approve":      false,                <span class="c">// default; planning fails unless upgrade.wave is 0 or 1</span>

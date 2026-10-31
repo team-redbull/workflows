@@ -12,9 +12,13 @@ The only cure is `workflow.patched()`. Two sources of histories catch it:
   2. GOLDEN histories in tests/histories/install_server/, recorded by earlier
      code and committed: they catch a change that would break a run in flight.
      When this fails, the change needs `workflow.patched()` — do NOT re-record.
-     Re-record only once no run of the old shape can still exist:
+     Recording writes ONLY the scenarios that have no golden file yet, so a new
+     scenario gets one and an old shape is never overwritten by accident:
 
          UPDATE_REPLAY_HISTORIES=1 .venv/bin/pytest tests/test_install_server_replay.py
+
+     Re-record an existing one (delete its file first) only once no run of
+     that shape can still exist.
 
 The golden set was first recorded on the workflow as it stood before
 `allow_unhealthy`, the NMStateConfig replacement and the own-lock re-run, so
@@ -44,9 +48,13 @@ from tests.test_install_server_workflow import (
     SERVER_NAME,
     _application_error,
     _Harness,
+    _refused,
+    _unhealthy,
     bondable_server,
     make_mock_activities,
+    one_nic_up_server,
     oneview_server,
+    scan_record,
     ucs_server,
 )
 from workflow_domains.server_lifecycle.install_server import InstallServerWorkflow
@@ -107,6 +115,12 @@ SCENARIOS: dict[str, Callable[[], Scenario]] = {
         },
         input=_named(SERVER_NAME),
         fails_with=ServerNotAvailableError.__name__,
+    ),
+    # allow_unhealthy: /servers/available refuses the named one-NIC server,
+    # its stored record is read, the health refusals waived.
+    "allow-unhealthy-one-nic": lambda: Scenario(
+        mocks={"acquire_error": _refused(), "record": scan_record(one_nic_up_server())},
+        input=_unhealthy(),
     ),
     # Skips before the install: no bond, another run's lock, then the next.
     "skips-then-install": lambda: Scenario(
@@ -169,9 +183,10 @@ async def _record(name: str) -> WorkflowHistory:
 async def test_every_run_a_scenario_records_replays(scenario):
     history = await _record(scenario)
     await _replayer().replay_workflow(history)
-    if _RECORD:
+    golden = GOLDEN / f"{scenario}.json"
+    if _RECORD and not golden.exists():
         GOLDEN.mkdir(parents=True, exist_ok=True)
-        (GOLDEN / f"{scenario}.json").write_text(
+        golden.write_text(
             json.dumps(
                 {
                     "workflow_id": history.workflow_id,

@@ -15,6 +15,7 @@ symptom, which is why it is tested directly rather than through the workflow.
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 
 import httpx
 import pytest
@@ -24,6 +25,7 @@ from kubernetes import client as k8s_client
 from activities.server_lifecycle import cluster_api
 from activities.server_lifecycle.server_scan import (
     fetch_available_servers,
+    install_candidate_by_name,
     release_server,
     reserve_server,
 )
@@ -441,3 +443,125 @@ class TestCreateIsIdempotent:
 def _never_load_a_real_kubeconfig(monkeypatch):
     """cluster_api loads kube config per operation; these tests make no calls."""
     monkeypatch.setattr(cluster_api, "_load_kube", lambda: None)
+
+
+# --- the stored record of a named server /servers/available refused -----------
+
+_NAMED = "ocp-dell-r650-tlv-64c-1024gb-DEL0000485"
+
+
+def _detail(**overrides: object) -> dict:
+    """A `GET /servers/{id}` ServerDetail, trimmed to what the read uses (server-scan's schema)."""
+    detail: dict = {
+        "id": "srv_1",
+        "name": _NAMED,
+        "identity": {"vendor": "dell", "serial": "DEL0000485", "nic_macs": ["aa:bb:cc:dd:ee:01"] * 8},
+        "source_provider": "OPENMANAGE",
+        "site_id": "tlv",
+        "network": {
+            "bmc": {"host": "10.11.1.229", "host_is_ip": True, "scheme": "redfish", "mac": "x"},
+            "interfaces": [
+                {"name": "NIC.Integrated.1-1-1", "mac": "aa:bb:cc:dd:ee:01", "location": "1/1/1",
+                 "link_state": "UP", "speed_mbps": 25000},
+                {"name": "NIC.Integrated.1-2-1", "mac": "aa:bb:cc:dd:ee:02", "location": "1/2/1",
+                 "link_state": "DOWN", "speed_mbps": 25000},
+            ],
+        },
+        "health": {"overall": "MAJOR", "network": "MAJOR", "storage": "MAJOR", "cpu": "HEALTHY",
+                   "evaluated_at": "2026-10-31T08:00:00Z", "active_policy_keys": ["raid"]},
+        "reachable": True,
+        "maintenance": {"enabled": False, "reason": None},
+        "reservation": {"holder": None},
+        "openshift": {"lifecycle_state": "AVAILABLE", "cluster_name": None},
+    }
+    detail.update(overrides)
+    return detail
+
+
+def _scan_serves(*details: dict) -> None:
+    respx.get(f"{SS}/servers").mock(
+        return_value=httpx.Response(200, json={"items": [{"id": d["id"], "name": d["name"]} for d in details]})
+    )
+    for d in details:
+        respx.get(f"{SS}/servers/{d['id']}").mock(return_value=httpx.Response(200, json=d))
+
+
+class TestTheStoredRecordOfANamedServer:
+    """install_candidate_by_name: why /servers/available refused a named machine."""
+
+    @respx.mock
+    async def test_it_projects_the_detail_as_servers_available_would(self):
+        _scan_serves(_detail())
+        record = await install_candidate_by_name(SS, "t", _NAMED.lower())
+
+        server = record.server
+        assert server is not None
+        assert (server.id, server.name, server.vendor, server.bmc_vendor) == (
+            "srv_1", _NAMED, "dell", "DELL",
+        )
+        assert server.bmc.host == "10.11.1.229" and server.bmc.host_is_ip is True
+        # interfaces[], never nic_macs — with their link state.
+        assert [(i.mac, i.link_state) for i in server.interfaces] == [
+            ("aa:bb:cc:dd:ee:01", LinkState.UP),
+            ("aa:bb:cc:dd:ee:02", LinkState.DOWN),
+        ]
+        assert server.live_recheck_performed is False
+        assert server.health_overall == "MAJOR"
+        assert record.health == {"overall": "MAJOR", "cpu": "HEALTHY", "storage": "MAJOR", "network": "MAJOR"}
+        assert record.reachable is True
+        assert record.membership.found and record.membership.lifecycle_state == "AVAILABLE"
+        assert record.lock.live is False
+
+    @pytest.mark.parametrize(
+        ("vendor", "provider", "bmc_vendor"),
+        [
+            ("cisco", "UCS_CENTRAL", "CISCO"),
+            ("cisco", "INTERSIGHT", "INTERSIGHT"),
+            ("hp", "ONEVIEW", "HP"),
+            ("dell", "OPENMANAGE", "DELL"),
+            ("standalone", "REDFISH_STANDALONE", None),
+        ],
+    )
+    @respx.mock
+    async def test_the_driver_vocabulary_is_server_scans_own(self, vendor, provider, bmc_vendor):
+        _scan_serves(_detail(identity={"vendor": vendor}, source_provider=provider))
+        record = await install_candidate_by_name(SS, "t", _NAMED)
+        assert record.server is not None and record.server.bmc_vendor == bmc_vendor
+
+    @respx.mock
+    async def test_a_lock_still_ahead_is_live_and_one_past_is_not(self):
+        held = {"holder": "install-server", "workflow_id": "run-a", "mce_cluster": "ocp4-a",
+                "expires_at": "2026-10-31T12:00:00Z"}
+        _scan_serves(_detail(reservation=held))
+        before = datetime(2026, 10, 31, 11, 0, tzinfo=UTC)
+        after = datetime(2026, 10, 31, 13, 0, tzinfo=UTC)
+
+        live = await install_candidate_by_name(SS, "t", _NAMED, now=before)
+        assert live.lock.live is True
+        assert (live.lock.holder, live.lock.workflow_id, live.lock.mce_cluster) == (
+            "install-server", "run-a", "ocp4-a",
+        )
+        assert (await install_candidate_by_name(SS, "t", _NAMED, now=after)).lock.live is False
+
+    @respx.mock
+    async def test_a_held_lock_with_no_expiry_is_live(self):
+        # `reserve` never writes one, so it is a hand-edit; server-scan honours it.
+        _scan_serves(_detail(reservation={"holder": "operator", "expires_at": None}))
+        assert (await install_candidate_by_name(SS, "t", _NAMED)).lock.live is True
+
+    @respx.mock
+    async def test_a_name_server_scan_does_not_know(self):
+        respx.get(f"{SS}/servers").mock(return_value=httpx.Response(200, json={"items": []}))
+        record = await install_candidate_by_name(SS, "t", _NAMED)
+        assert record.membership.found is False and record.server is None
+
+    @respx.mock
+    async def test_two_documents_of_one_name_are_ambiguous(self):
+        _scan_serves(_detail(), _detail(id="srv_9"))
+        with pytest.raises(AmbiguousServerNameError, match="which machine to install"):
+            await install_candidate_by_name(SS, "t", _NAMED)
+
+    @respx.mock
+    async def test_a_search_hit_with_another_name_is_not_this_server(self):
+        _scan_serves(_detail(name=f"{_NAMED}-2"))
+        assert (await install_candidate_by_name(SS, "t", _NAMED)).membership.found is False

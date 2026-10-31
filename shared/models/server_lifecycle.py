@@ -14,8 +14,9 @@ from __future__ import annotations
 
 import re
 from enum import Enum
+from typing import Any, ClassVar
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, SerializerFunctionWrapHandler, model_serializer
 
 _MAC_RE = re.compile(r"(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}")
 
@@ -28,6 +29,45 @@ def mac_is_valid(mac: str) -> bool:
     the check as a last guard on their own inputs.
     """
     return bool(_MAC_RE.fullmatch(mac))
+
+
+class _QuietDefaults(BaseModel):
+    """Leaves the fields named in `_quiet_defaults` OUT of a payload while they hold their default.
+
+    For install-server's hidden `allow_unhealthy` (CLAUDE.md §4): a field
+    serialized as `false` / `[]` into EVERY run's input, progress, result and
+    create would show the knob to anyone browsing a run in the Temporal UI, which
+    is exactly what hiding it from the OpenAPI schema is for. Absent on the wire
+    decodes back to the same default, so nothing reading a payload changes — and
+    a run that does not use it records byte-for-byte what it recorded before.
+    """
+
+    _quiet_defaults: ClassVar[tuple[str, ...]] = ()
+
+    @model_serializer(mode="wrap")
+    def _leave_quiet_defaults_out(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        data = handler(self)
+        for name in self._quiet_defaults:
+            default = type(self).model_fields[name].get_default(call_default_factory=True)
+            if name in data and getattr(self, name) == default:
+                del data[name]
+        return data
+
+
+class WaivedHealthCheck(BaseModel):
+    """One health refusal install-server did NOT apply, because the request asked (`allow_unhealthy`).
+
+    `check` names the rule — `server-scan-health` (its health tier, every
+    category worse than HEALTHY listed), `network-health` (its network
+    category: two link-up NICs actually read), `bmc-reachable`,
+    `server-scan-recheck` (its live recheck refused a server whose stored
+    record shows nothing wrong), `bond-link-up` (a bond member whose link is not
+    UP) — and `observed` what was actually seen, so the run's history says what
+    was waived and why it would otherwise have been refused.
+    """
+
+    check: str
+    observed: str
 
 
 class LinkState(str, Enum):
@@ -206,13 +246,19 @@ class BondMember(BaseModel):
     port_key: str
 
 
-class BmhResourceRequest(BaseModel):
+class BmhResourceRequest(_QuietDefaults):
     """Everything the three Kubernetes resources are built from.
 
     One request model for all three creates: they share every field, and
     splitting it would let a BareMetalHost and its NMStateConfig disagree about
     the server they describe.
+
+    `allowed_unhealthy` builds nothing: it is carried so each create's input in
+    history — and the limb's log — says which health refusals this install
+    waived. Left out of the payload when empty (_QuietDefaults).
     """
+
+    _quiet_defaults: ClassVar[tuple[str, ...]] = ("allowed_unhealthy",)
 
     server_name: str
     namespace: str
@@ -224,6 +270,7 @@ class BmhResourceRequest(BaseModel):
     bond_name: str = "bond0"
     bond_mode: str = "802.3ad"
     labels: dict[str, str] = Field(default_factory=dict)
+    allowed_unhealthy: list[WaivedHealthCheck] = Field(default_factory=list)
 
 
 class PxeBootRequest(BaseModel):
@@ -641,7 +688,7 @@ class PublishInfraEnvBootResult(BaseModel):
     superseded: bool = False
 
 
-class InstallServerInput(BaseModel):
+class InstallServerInput(_QuietDefaults):
     """Input to InstallServerWorkflow: which InfraEnv to fill, and from where.
 
     `infra_env` does double duty by design. It labels the BareMetalHost and the
@@ -655,7 +702,15 @@ class InstallServerInput(BaseModel):
     Segments Manager rather than supplied here. There is deliberately no
     `vlan_id` field — a caller-supplied VLAN could contradict the segment the
     MCE actually owns.
+
+    `allow_unhealthy` is the HIDDEN option (CLAUDE.md §4): install the named
+    server although its own condition fails a health check — fewer than two
+    link-up NICs, a RAID or storage fault, any health tier server-scan reports —
+    never past a safety refusal. Only with `server_name`. False for every run
+    recorded before it, and left out of the payload while false.
     """
+
+    _quiet_defaults: ClassVar[tuple[str, ...]] = ("allow_unhealthy",)
 
     infra_env: str = Field(min_length=1)
     mce_cluster: str = Field(min_length=1)
@@ -663,6 +718,7 @@ class InstallServerInput(BaseModel):
     server_name: str | None = None
     candidate_count: int = Field(default=3, ge=1, le=20)
     labels: dict[str, str] = Field(default_factory=dict)
+    allow_unhealthy: bool = False
 
 
 class InstallServerRunArgs(BaseModel):
@@ -678,27 +734,36 @@ class InstallServerRunArgs(BaseModel):
     input: InstallServerInput
 
 
-class InstallServerProgress(BaseModel):
+class InstallServerProgress(_QuietDefaults):
     """Returned by the workflow's `progress` query (surfaced by the status API).
 
     `activity_queue` names the MCE-scoped queue this run's cluster writes go
     to. It is what turns "the run is stuck" into "no server-lifecycle-worker is
     polling this queue, so that MCE has none deployed or it cannot reach
     Temporal".
+
+    `allowed_unhealthy` lists the health refusals waived for the server being
+    installed (`allow_unhealthy`) — here as well as on the result, because a
+    run that FAILS has no result to say it. Left out while empty.
     """
+
+    _quiet_defaults: ClassVar[tuple[str, ...]] = ("allowed_unhealthy",)
 
     phase: str
     server_name: str | None = None
     activity_queue: str | None = None
+    allowed_unhealthy: list[WaivedHealthCheck] = Field(default_factory=list)
 
 
-class InstallServerResult(BaseModel):
+class InstallServerResult(_QuietDefaults):
     """The run's outcome: the server that is now installable in the InfraEnv.
 
     `resources_changed` is False for a re-run that found all three resources
     already present — the run still succeeds, and the flag says nothing was
     written this time.
     """
+
+    _quiet_defaults: ClassVar[tuple[str, ...]] = ("allowed_unhealthy",)
 
     server_id: str
     server_name: str
@@ -729,6 +794,9 @@ class InstallServerResult(BaseModel):
     # site's PXE VM — True only for an IPMI (network-booted) server. Defaulted
     # for result payloads recorded before the field existed.
     pxe_registered: bool = False
+    # Every health refusal waived for this server, with what was observed —
+    # only ever non-empty when the request asked (`allow_unhealthy`).
+    allowed_unhealthy: list[WaivedHealthCheck] = Field(default_factory=list)
 
 
 # --- uninstall-server ---------------------------------------------------------
@@ -765,6 +833,42 @@ class ServerMembership(BaseModel):
     contested_with: str | None = None
     maintenance: bool = False
     maintenance_reason: str | None = None
+
+
+class ServerLockRecord(BaseModel):
+    """server-scan's install lock on one server, as its document stores it (ADR-0035).
+
+    `live` is judged by the limb at read time — held, and either no expiry or
+    one still ahead — the same test server-scan applies. server-scan keys "the
+    same claim" on `workflow_id`, so that is what says the lock is a run's own.
+    """
+
+    live: bool = False
+    holder: str | None = None
+    workflow_id: str | None = None
+    mce_cluster: str | None = None
+    expires_at: str | None = None
+
+
+class InstallCandidateRecord(BaseModel):
+    """lookup_install_candidate: a NAMED server as server-scan STORES it — every fact,
+    including the ones that make `/servers/available` refuse it.
+
+    Read only once `/servers/available` has refused a named machine, so the
+    workflow can see WHY (its 404 detail names neither the network category nor
+    the install lock): `membership` is uninstall-server's reading (found,
+    lifecycle state, contest, maintenance), `server` the same projection
+    `/servers/available` would have handed out (no live recheck behind it),
+    `health` every category server-scan rolls up (`overall`, `network`,
+    `storage`, …), `reachable` whether it can reach the BMC, and `lock` the
+    install lock. The limb never decides anything from it.
+    """
+
+    membership: ServerMembership = Field(default_factory=ServerMembership)
+    server: AcquiredServer | None = None
+    health: dict[str, str] = Field(default_factory=dict)
+    reachable: bool | None = None
+    lock: ServerLockRecord = Field(default_factory=ServerLockRecord)
 
 
 class HostAgent(BaseModel):

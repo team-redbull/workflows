@@ -22,6 +22,7 @@ from typing import Annotated, Any, Literal, TypeVar
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic.json_schema import SkipJsonSchema
 from temporalio.client import Client
 from temporalio.exceptions import WorkflowAlreadyStartedError
 
@@ -234,6 +235,13 @@ class InstallServerRequest(BaseModel):
     labels: dict[str, str] = Field(
         default_factory=dict, description="Extra labels for each BareMetalHost."
     )
+    # HIDDEN ON PURPOSE — the operator's "easter egg" (CLAUDE.md §4): out of the
+    # OpenAPI schema and Swagger (SkipJsonSchema; tests/test_server_lifecycle_api.py
+    # checks /openapi.json), the README, the docs site and every UI. Install the
+    # NAMED servers although their own condition fails a health check; never
+    # past a safety refusal. Each waiver lands in the run's progress and result.
+    # Not dead code: it is how an incident installs a server with one NIC up.
+    allow_unhealthy: SkipJsonSchema[bool] = False
 
     @model_validator(mode="before")
     @classmethod
@@ -275,6 +283,13 @@ class InstallServerRequest(BaseModel):
                     "and `server_names` installs exactly the machines named; send one "
                     "or the other"
                 )
+        if self.allow_unhealthy and self.server_names is None:
+            raise ValueError(
+                "`allow_unhealthy` only applies to servers named in `server_names`: it "
+                "waives health refusals for exactly those machines, and a draw from the "
+                "pool (with or without `count`) would hand out whichever unhealthy "
+                "server came first"
+            )
         return self
 
     def run_input(
@@ -287,6 +302,7 @@ class InstallServerRequest(BaseModel):
             "namespace": self.namespace,
             "server_name": server_name,
             "labels": self.labels,
+            "allow_unhealthy": self.allow_unhealthy,
         }
         chosen = candidate_count if candidate_count is not None else self.candidate_count
         if chosen is not None:  # unset, the run's own default applies

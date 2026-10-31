@@ -297,6 +297,17 @@ class NoBondableInterfacesError(OrchestratorError):
     """
 
 
+class AllowUnhealthyNeedsServerNameError(OrchestratorError):
+    """WORKFLOW-RAISED. install-server was asked to waive health checks on a pool draw.
+
+    `allow_unhealthy` (hidden, CLAUDE.md §4) waives health refusals for the ONE
+    machine a request names — a person's decision about that server. On a pool
+    draw it would hand out whichever unhealthy machine came first. The API
+    refuses the combination (422); this is the same refusal for a run started
+    some other way, before anything is read or written.
+    """
+
+
 class UnknownBmcVendorError(OrchestratorError):
     """WORKFLOW-RAISED. server-scan reported no BMC driver vocabulary for this server.
 

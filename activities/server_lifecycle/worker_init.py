@@ -54,6 +54,7 @@ from activities.server_lifecycle.activities import (
     get_machine_state,
     inspect_bound_host,
     inspect_inventory_host,
+    lookup_install_candidate,
     lookup_server_membership,
     publish_infra_env_boot,
     register_pxe_boot,
@@ -88,6 +89,7 @@ async def main() -> None:
             # install-server
             check_infra_env,
             acquire_servers,
+            lookup_install_candidate,
             register_pxe_boot,
             publish_infra_env_boot,
             unregister_pxe_boot,

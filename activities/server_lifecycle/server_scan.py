@@ -6,15 +6,18 @@ token as PARAMETERS rather than reading settings, so the offline tests drive it
 with respx against any base URL and no environment at all. The @activity.defn
 wrapper in activities.py owns the settings and the logging.
 
-Three calls are the whole surface. GET /servers/available returns servers that
-are unclaimed, healthy, reachable, unreserved and not in maintenance,
-live-rechecking each one it hands back. POST and DELETE
+Three calls are the whole surface for an install. GET /servers/available
+returns servers that are unclaimed, healthy, reachable, unreserved and not in
+maintenance, live-rechecking each one it hands back. POST and DELETE
 /servers/{id}/reservation take and release the install lock on the one a run
 chose (ADR-0035) — mutations, so the token needs server-scan's ADMIN role.
+When /servers/available refuses a NAMED server, the exact-name detail read
+(install_candidate_by_name) says why.
 """
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Any, NoReturn
 
 import httpx
@@ -31,9 +34,11 @@ from shared.models.server_lifecycle import (
     AcquiredServer,
     AcquireServerRequest,
     BmcEndpoint,
+    InstallCandidateRecord,
     ReleaseServerRequest,
     ReserveServerRequest,
     ServerInterface,
+    ServerLockRecord,
     ServerMembership,
     ServerReservation,
 )
@@ -250,15 +255,16 @@ async def server_macs_by_name(base_url: str, token: str, server_name: str) -> li
     return sorted(macs)
 
 
-async def server_membership_by_name(
-    base_url: str, token: str, server_name: str
-) -> ServerMembership:
-    """server-scan's record of where the server of this exact name is.
+async def _detail_by_exact_name(
+    base_url: str, token: str, server_name: str, purpose: str
+) -> dict[str, Any] | None:
+    """The ONE server-scan document of this exact name (with its `id`), or None.
 
-    The same two steps as server_macs_by_name — search narrows, the detail
-    confirms the name exactly — but here two documents of one name are an
-    ERROR, not a union: the answer is one machine's membership and its
-    `srv_…` id, which the install lock is then taken on.
+    `GET /servers?search=<name>` narrows, `GET /servers/{id}` confirms the name
+    EXACTLY (case-insensitive — a search hit alone could be another machine).
+    Two documents of one name are an ERROR, not a union: the answer is one
+    machine and its `srv_…` id, which the install lock is then taken on.
+    `purpose` finishes the ambiguity message ("to uninstall", "to install").
     """
     wanted = server_name.lower()
     async with httpx.AsyncClient(
@@ -274,14 +280,17 @@ async def server_membership_by_name(
                 matches.append({"id": item["id"], **detail})
 
     if not matches:
-        return ServerMembership(found=False)
+        return None
     if len(matches) > 1:
         raise AmbiguousServerNameError(
             f"server name {server_name!r} matches {len(matches)} server-scan documents "
             f"({', '.join(sorted(str(m.get('id')) for m in matches))}): which machine "
-            "to uninstall is ambiguous"
+            f"{purpose} is ambiguous"
         )
-    detail = matches[0]
+    return matches[0]
+
+
+def _membership(detail: dict[str, Any]) -> ServerMembership:
     openshift = detail.get("openshift") or {}
     maintenance = detail.get("maintenance") or {}
     return ServerMembership(
@@ -294,6 +303,125 @@ async def server_membership_by_name(
         contested_with=openshift.get("contested_with") or None,
         maintenance=bool(maintenance.get("enabled", False)),
         maintenance_reason=maintenance.get("reason") or None,
+    )
+
+
+async def server_membership_by_name(
+    base_url: str, token: str, server_name: str
+) -> ServerMembership:
+    """server-scan's record of where the server of this exact name is.
+
+    The same two steps as server_macs_by_name — search narrows, the detail
+    confirms the name exactly — but here two documents of one name are an
+    ERROR, not a union: the answer is one machine's membership and its
+    `srv_…` id, which the install lock is then taken on.
+    """
+    detail = await _detail_by_exact_name(base_url, token, server_name, "to uninstall")
+    if detail is None:
+        return ServerMembership(found=False)
+    return _membership(detail)
+
+
+def bmc_vendor_for(vendor: str | None, source_provider: str | None) -> str | None:
+    """The BMC-driver vocabulary `/servers/available` puts in `bmc_vendor`.
+
+    server-scan's own rule (`bmc_vendor_for` in its api/v1/schemas.py), because
+    a server's DETAIL document carries only `identity.vendor` and the collector:
+    a Cisco is CISCO (UCS, driven over IPMI) unless Intersight collected it, a
+    Dell DELL, an HP HP, and a STANDALONE machine None — its driver is the
+    caller's decision, which install-server refuses to guess.
+    """
+    normalized = (vendor or "").lower()
+    if normalized == "cisco":
+        return "INTERSIGHT" if source_provider == "INTERSIGHT" else "CISCO"
+    if normalized == "dell":
+        return "DELL"
+    if normalized == "hp":
+        return "HP"
+    return None
+
+
+def _lock_is_live(reservation: dict[str, Any], now: datetime) -> bool:
+    """server-scan's `Reservation.is_live`: held, and no expiry or one still ahead."""
+    if reservation.get("holder") is None:
+        return False
+    expires_at = reservation.get("expires_at")
+    if not expires_at:
+        # A hand-edited document — `reserve` never writes this; server-scan
+        # honours it, so it is live here too.
+        return True
+    try:
+        expiry = datetime.fromisoformat(str(expires_at))
+    except ValueError:
+        return True  # unreadable: assume held, the safe reading
+    if expiry.tzinfo is None:
+        expiry = expiry.replace(tzinfo=UTC)
+    return now < expiry
+
+
+def _acquired_from_detail(detail: dict[str, Any]) -> AcquiredServer:
+    """The DETAIL document as the `AvailableServerItem` `/servers/available` would build.
+
+    Same projection server-scan makes (`AvailableServerItem.from_server`):
+    vendor from `identity`, the BMC and the interfaces from `network`, the
+    driver vocabulary by bmc_vendor_for. `nic_macs` stays out for the reason
+    `_to_acquired_server` gives.
+    """
+    identity = detail.get("identity") or {}
+    network = detail.get("network") or {}
+    vendor = str(identity.get("vendor") or "")
+    source_provider = detail.get("source_provider")
+    return _to_acquired_server(
+        {
+            "id": detail["id"],
+            "name": detail["name"],
+            "vendor": vendor,
+            "source_provider": source_provider,
+            "bmc_vendor": bmc_vendor_for(vendor, source_provider),
+            "bmc": network.get("bmc") or {},
+            "interfaces": network.get("interfaces") or [],
+            "site_id": detail.get("site_id"),
+            "health_overall": (detail.get("health") or {}).get("overall", "UNKNOWN"),
+            "live_recheck_performed": False,
+        }
+    )
+
+
+# The categories server-scan rolls a health verdict up from (its Health model).
+_HEALTH_KEYS = ("overall", "cpu", "memory", "storage", "network", "connectivity", "power", "gpu")
+
+
+async def install_candidate_by_name(
+    base_url: str, token: str, server_name: str, *, now: datetime | None = None
+) -> InstallCandidateRecord:
+    """Everything server-scan STORES about one named server — what install-server
+    reads once `/servers/available` has refused it, to learn why.
+
+    The same exact-name read as uninstall-server's, never `/servers/available`,
+    which is the thing that refused. Nothing is decided here: the workflow
+    tells a safety refusal (a cluster's claim, maintenance, another run's lock)
+    from the server's own health, which a request may waive.
+    """
+    detail = await _detail_by_exact_name(base_url, token, server_name, "to install")
+    if detail is None:
+        return InstallCandidateRecord()
+    health = detail.get("health") or {}
+    reservation = detail.get("reservation") or {}
+    reachable = detail.get("reachable")
+    return InstallCandidateRecord(
+        membership=_membership(detail),
+        server=_acquired_from_detail(detail),
+        health={key: str(health[key]) for key in _HEALTH_KEYS if health.get(key) is not None},
+        reachable=None if reachable is None else bool(reachable),
+        lock=ServerLockRecord(
+            live=_lock_is_live(reservation, now or datetime.now(UTC)),
+            holder=reservation.get("holder"),
+            workflow_id=reservation.get("workflow_id"),
+            mce_cluster=reservation.get("mce_cluster"),
+            expires_at=(
+                None if reservation.get("expires_at") is None else str(reservation["expires_at"])
+            ),
+        ),
     )
 
 

@@ -47,6 +47,7 @@ from shared.models.server_lifecycle import (
     InfraEnvBootState,
     InfraEnvRef,
     InfraEnvState,
+    InstallCandidateRecord,
     InventoryHostState,
     MachineDeletion,
     MachineHookRelease,
@@ -110,6 +111,28 @@ async def reserve_server(request: ReserveServerRequest) -> ServerReservation:
     the inventory), ServerScanAuthError (401/403 — the token lacks the ADMIN
     role) or ServerScanRequestInvalidError (400/422); all non-retryable. A 409
     for a lost revision race, and anything else, is transient ServerScanError.
+    """
+    ...
+
+
+@activity.defn
+async def lookup_install_candidate(request: ServerMembershipRequest) -> InstallCandidateRecord:
+    """install-server: why `/servers/available` refused a NAMED server — server-scan's stored record.
+
+    `GET /servers?search=<name>` + `GET /servers/{id}` with an exact,
+    case-insensitive name match (uninstall-server's read), never
+    `/servers/available` — that is what refused it, and its 404 detail names
+    neither the network category nor the install lock. Returns the membership
+    (lifecycle state, contest, maintenance), the server projected exactly as
+    `/servers/available` would hand it out (no live recheck), every health
+    category, BMC reachability and the install lock, judged live or not at read
+    time. found=False for a name server-scan does not know.
+
+    Decides nothing: the workflow refuses on a claim, maintenance, a contest or
+    another run's lock, and waives the server's own health only when the request
+    asked (`allow_unhealthy`). Raises AmbiguousServerNameError (two documents
+    carry the name) and ServerScanAuthError, both non-retryable; server-scan
+    unreachable is transient ServerScanError.
     """
     ...
 

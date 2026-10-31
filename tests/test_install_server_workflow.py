@@ -52,6 +52,7 @@ from shared.models.server_lifecycle import (
     InfraEnvBootState,
     InfraEnvRef,
     InfraEnvState,
+    InstallCandidateRecord,
     InstallServerInput,
     InstallServerRunArgs,
     LinkState,
@@ -62,6 +63,9 @@ from shared.models.server_lifecycle import (
     ReleaseServerRequest,
     ReserveServerRequest,
     ServerInterface,
+    ServerLockRecord,
+    ServerMembership,
+    ServerMembershipRequest,
     ServerReservation,
     TeardownResult,
 )
@@ -199,6 +203,7 @@ def make_mock_activities(
     image_never_updates: bool = False,
     boot_superseded: bool = False,
     nmstate_error: Exception | None = None,
+    record: InstallCandidateRecord | None = None,
 ):
     """Build the full mock activity set + a call recorder.
 
@@ -226,6 +231,10 @@ def make_mock_activities(
 
     `nmstate_error` is raised by `create_nmstate_config` — the incident in which
     the NMStateConfig already existed with other content (BmhConflictError).
+
+    `record` is what `lookup_install_candidate` reads from server-scan for a
+    named server `/servers/available` refused; None = server-scan does not
+    know the name.
     """
     calls: dict[str, list] = {
         name: []
@@ -244,6 +253,7 @@ def make_mock_activities(
             "unregister_pxe_boot",
             "publish_infra_env_boot",
             "check_infra_env",
+            "lookup_install_candidate",
             # Activity names in call order, for the ones whose ORDER matters.
             "order",
         )
@@ -274,6 +284,14 @@ def make_mock_activities(
         if acquire_error is not None:
             raise acquire_error
         return list(drawn)
+
+    @activity.defn
+    async def lookup_install_candidate(
+        request: ServerMembershipRequest,
+    ) -> InstallCandidateRecord:
+        calls["lookup_install_candidate"].append(request)
+        calls["order"].append("lookup_install_candidate")
+        return record if record is not None else InstallCandidateRecord()
 
     def _created(kind: str, name: str) -> CreatedResource:
         return CreatedResource(kind=kind, name=name, changed=not resources_exist)
@@ -461,6 +479,7 @@ def make_mock_activities(
     segment_activities = [get_inventory_segment]
     server_activities = [
         acquire_servers,
+        lookup_install_candidate,
         create_bmc_secret,
         create_baremetal_host,
         create_nmstate_config,
@@ -1616,3 +1635,339 @@ class TestThePxeMapIsCleanedOnRollback:
 
         assert result.pxe_registered is True
         assert calls["unregister_pxe_boot"] == []
+
+
+# --- allow_unhealthy (hidden; CLAUDE.md §4) ------------------------------------
+
+
+def one_nic_up_server(
+    server_id: str = "srv_001", name: str = SERVER_NAME, mac_prefix: str = "aa:bb:cc:dd:ee"
+) -> AcquiredServer:
+    """The incident's machine: two ports, only the SECOND one link-up.
+
+    Listed DOWN first on purpose, so a test proves nic1 — the boot MAC — is
+    the live NIC, not merely the first one server-scan lists.
+    """
+    return bondable_server(server_id, name=name, mac_prefix=mac_prefix).model_copy(
+        update={
+            "interfaces": [
+                _nic("NIC.Integrated.1-1-1", f"{mac_prefix}:01", "1/1/1", LinkState.DOWN),
+                _nic("NIC.Integrated.1-2-1", f"{mac_prefix}:02", "1/2/1", LinkState.UP),
+            ],
+            "health_overall": "MAJOR",
+            "live_recheck_performed": False,
+        }
+    )
+
+
+_SICK = {"overall": "MAJOR", "network": "MAJOR", "storage": "MAJOR", "cpu": "HEALTHY"}
+_FINE = {"overall": "HEALTHY", "network": "HEALTHY", "storage": "HEALTHY"}
+
+
+def scan_record(
+    server: AcquiredServer,
+    *,
+    health: dict[str, str] | None = None,
+    reachable: bool = True,
+    lifecycle: str = "AVAILABLE",
+    cluster: str | None = None,
+    maintenance: bool = False,
+    contested: str | None = None,
+    lock: ServerLockRecord | None = None,
+) -> InstallCandidateRecord:
+    """server-scan's STORED record of a named server, as lookup_install_candidate reads it."""
+    return InstallCandidateRecord(
+        membership=ServerMembership(
+            found=True,
+            server_id=server.id,
+            server_name=server.name,
+            lifecycle_state=lifecycle,
+            cluster_name=cluster,
+            contested_with=contested,
+            maintenance=maintenance,
+            maintenance_reason="RMA" if maintenance else None,
+        ),
+        server=server,
+        health=dict(_SICK if health is None else health),
+        reachable=reachable,
+        lock=lock or ServerLockRecord(),
+    )
+
+
+def _refused(name: str = SERVER_NAME) -> ServerNotAvailableError:
+    """What /servers/available answers for a named machine it will not hand out."""
+    return ServerNotAvailableError(
+        f"server-scan has no assignable server for this request: '{name}' is no longer "
+        "available: health=MAJOR, openshift=AVAILABLE, maintenance=False, reachable=True"
+    )
+
+
+def _unhealthy(name: str = SERVER_NAME) -> InstallServerInput:
+    return INPUT.model_copy(update={"server_name": name, "allow_unhealthy": True})
+
+
+async def _execute_as(client: Client, args: InstallServerRunArgs, workflow_id: str):
+    return await asyncio.wait_for(
+        client.execute_workflow(
+            InstallServerWorkflow.run,
+            args,
+            id=workflow_id,
+            task_queue=INSTALL_SERVER_WORKFLOW_QUEUE,
+        ),
+        timeout=60,
+    )
+
+
+class TestAllowUnhealthy:
+    """The hidden option: a NAMED server installed although its own health fails.
+
+    The incident it exists for: a server with one NIC up and no RAID had to be
+    installed. Without it the run refuses, as it should; with it, the health
+    refusals are waived and RECORDED, and every safety refusal still stands.
+    """
+
+    async def test_a_one_nic_server_is_installed_with_every_waiver_recorded(self):
+        calls, segment_acts, server_acts = make_mock_activities(
+            acquire_error=_refused(), record=scan_record(one_nic_up_server())
+        )
+        async with _Harness(segment_acts, server_acts) as client:
+            handle = await client.start_workflow(
+                InstallServerWorkflow.run,
+                InstallServerRunArgs(input=_unhealthy()),
+                id=f"test-{uuid.uuid4()}",
+                task_queue=INSTALL_SERVER_WORKFLOW_QUEUE,
+            )
+            result = await asyncio.wait_for(handle.result(), timeout=60)
+            progress = await handle.query(InstallServerWorkflow.progress)
+
+        assert result.server_name == SERVER_NAME
+        # The usual choice: nic1, the boot MAC, is the live NIC; nic2 the one down.
+        assert result.boot_mac == "aa:bb:cc:dd:ee:02"
+        assert result.bond_macs == ["aa:bb:cc:dd:ee:02", "aa:bb:cc:dd:ee:01"]
+        waived = {w.check: w.observed for w in result.allowed_unhealthy}
+        assert list(waived) == ["server-scan-health", "network-health", "bond-link-up"]
+        assert "overall MAJOR" in waived["server-scan-health"]
+        assert "storage=MAJOR" in waived["server-scan-health"]
+        assert "cpu" not in waived["server-scan-health"]
+        assert waived["network-health"].startswith("network MAJOR")
+        assert waived["bond-link-up"].startswith("1 of 2 bond members link-UP")
+        assert "nic2 aa:bb:cc:dd:ee:01 [1/1] DOWN" in waived["bond-link-up"]
+        # A failed run has no result, so the progress says it too.
+        assert progress.allowed_unhealthy == result.allowed_unhealthy
+        # Every create's input carries it, so history and the limb log say it.
+        for kind in ("create_bmc_secret", "create_baremetal_host", "create_nmstate_config"):
+            assert calls[kind][0].allowed_unhealthy == result.allowed_unhealthy
+        assert [r.server_name for r in calls["lookup_install_candidate"]] == [SERVER_NAME]
+        assert calls["reserve_server"], "the lock is taken as for any install"
+
+    async def test_without_it_the_same_server_is_still_refused(self):
+        calls, segment_acts, server_acts = make_mock_activities(
+            acquire_error=_refused(), record=scan_record(one_nic_up_server())
+        )
+        named = INPUT.model_copy(update={"server_name": SERVER_NAME})
+        async with _Harness(segment_acts, server_acts) as client:
+            with pytest.raises(WorkflowFailureError) as excinfo:
+                await _execute(client, InstallServerRunArgs(input=named))
+
+        assert _application_error(excinfo.value).type == "ServerNotAvailableError"
+        assert calls["reserve_server"] == []
+        assert calls["create_bmc_secret"] == []
+
+    async def test_a_healthy_server_takes_the_normal_path_and_waives_nothing(self):
+        calls, segment_acts, server_acts = make_mock_activities()
+        async with _Harness(segment_acts, server_acts) as client:
+            result = await _execute(client, InstallServerRunArgs(input=_unhealthy()))
+
+        assert result.allowed_unhealthy == []
+        assert calls["lookup_install_candidate"] == []
+        assert calls["create_baremetal_host"][0].allowed_unhealthy == []
+
+    async def test_links_server_scan_cannot_report_are_waived_and_recorded(self):
+        """An HPE server: OneView reports no link state, so no member reads UP."""
+        hpe = oneview_server()
+        _, segment_acts, server_acts = make_mock_activities(candidates=[hpe])
+        async with _Harness(segment_acts, server_acts) as client:
+            result = await _execute(client, InstallServerRunArgs(input=_unhealthy(hpe.name)))
+
+        assert result.boot_mac == "aa:bb:cc:dd:ee:11"
+        [waiver] = result.allowed_unhealthy
+        assert waiver.check == "bond-link-up"
+        assert waiver.observed.startswith("0 of 2 bond members link-UP")
+        assert "UNKNOWN" in waiver.observed
+
+    @pytest.mark.parametrize(
+        ("record", "error_type", "says"),
+        [
+            pytest.param(
+                scan_record(one_nic_up_server(), lifecycle="INSTALLED", cluster="hc-a"),
+                "ServerNotAvailableError",
+                "a cluster claims it: server-scan reads it INSTALLED (cluster hc-a)",
+                id="claimed-by-a-cluster",
+            ),
+            pytest.param(
+                scan_record(one_nic_up_server(), lifecycle="INSTALLED_TO_INVENTORY"),
+                "ServerNotAvailableError",
+                "a cluster claims it",
+                id="in-an-mce-inventory",
+            ),
+            pytest.param(
+                scan_record(one_nic_up_server(), contested="ocp4-other-mce"),
+                "ServerNotAvailableError",
+                "two claims contest it",
+                id="contested",
+            ),
+            pytest.param(
+                scan_record(one_nic_up_server(), maintenance=True),
+                "ServerNotAvailableError",
+                "in maintenance in server-scan: RMA",
+                id="maintenance",
+            ),
+            pytest.param(
+                None,
+                "ServerNotAvailableError",
+                "server-scan has no server of that exact name",
+                id="unknown-to-server-scan",
+            ),
+            pytest.param(
+                scan_record(
+                    one_nic_up_server(),
+                    lock=ServerLockRecord(
+                        live=True,
+                        holder="install-server",
+                        workflow_id="install-server-ocp4-other_x",
+                        mce_cluster="ocp4-other",
+                        expires_at="2026-10-31T12:00:00Z",
+                    ),
+                ),
+                "ServerReservedError",
+                "another run holds its install lock",
+                id="another-runs-lock",
+            ),
+        ],
+    )
+    async def test_a_safety_refusal_is_never_waived(self, record, error_type, says):
+        calls, segment_acts, server_acts = make_mock_activities(
+            acquire_error=_refused(), record=record
+        )
+        async with _Harness(segment_acts, server_acts) as client:
+            with pytest.raises(WorkflowFailureError) as excinfo:
+                await _execute(client, InstallServerRunArgs(input=_unhealthy()))
+
+        error = _application_error(excinfo.value)
+        assert error.type == error_type
+        assert says in str(error)
+        assert "allow_unhealthy never waives" in str(error)
+        assert calls["reserve_server"] == []
+        assert calls["create_bmc_secret"] == []
+
+    async def test_an_expired_lock_of_another_run_is_no_refusal(self):
+        stale = ServerLockRecord(live=False, holder="install-server", workflow_id="old-run")
+        _, segment_acts, server_acts = make_mock_activities(
+            acquire_error=_refused(), record=scan_record(one_nic_up_server(), lock=stale)
+        )
+        async with _Harness(segment_acts, server_acts) as client:
+            result = await _execute(client, InstallServerRunArgs(input=_unhealthy()))
+        assert result.server_name == SERVER_NAME
+
+    async def test_its_own_leftover_lock_is_no_reason_to_refuse(self):
+        """An earlier run on the SAME id failed and left its lock: re-taking it extends it."""
+        workflow_id = f"install-server-{MCE_CLUSTER}_{SERVER_NAME.lower()}"
+        own = ServerLockRecord(live=True, holder="install-server", workflow_id=workflow_id)
+        calls, segment_acts, server_acts = make_mock_activities(
+            acquire_error=_refused(),
+            record=scan_record(bondable_server(), health=_FINE, lock=own),
+        )
+        async with _Harness(segment_acts, server_acts) as client:
+            result = await _execute_as(
+                client, InstallServerRunArgs(input=_unhealthy()), workflow_id
+            )
+
+        assert result.allowed_unhealthy == []  # nothing unhealthy was waived
+        assert {c.workflow_id for c in calls["reserve_server"]} == {workflow_id}
+
+    async def test_a_record_showing_nothing_wrong_waives_the_live_recheck(self):
+        _, segment_acts, server_acts = make_mock_activities(
+            acquire_error=_refused(), record=scan_record(bondable_server(), health=_FINE)
+        )
+        async with _Harness(segment_acts, server_acts) as client:
+            result = await _execute(client, InstallServerRunArgs(input=_unhealthy()))
+
+        [waiver] = result.allowed_unhealthy
+        assert waiver.check == "server-scan-recheck"
+        assert "is no longer available" in waiver.observed
+
+    async def test_an_unreachable_bmc_is_waived_and_recorded(self):
+        _, segment_acts, server_acts = make_mock_activities(
+            acquire_error=_refused(),
+            record=scan_record(bondable_server(), health=_FINE, reachable=False),
+        )
+        async with _Harness(segment_acts, server_acts) as client:
+            result = await _execute(client, InstallServerRunArgs(input=_unhealthy()))
+        assert [w.check for w in result.allowed_unhealthy] == ["bmc-reachable"]
+
+    async def test_a_server_with_one_port_is_still_refused(self):
+        """Link state is waived; the second port a bond needs is not."""
+        single = bondable_server().model_copy(
+            update={
+                "interfaces": [
+                    _nic("NIC.Integrated.1-1-1", "aa:bb:cc:dd:ee:01", "1/1/1", LinkState.UP)
+                ]
+            }
+        )
+        calls, segment_acts, server_acts = make_mock_activities(candidates=[single])
+        async with _Harness(segment_acts, server_acts) as client:
+            with pytest.raises(WorkflowFailureError) as excinfo:
+                await _execute(client, InstallServerRunArgs(input=_unhealthy()))
+
+        error = _application_error(excinfo.value)
+        assert error.type == "NoBondableInterfacesError"
+        assert "two distinct physical ports" in str(error)
+        assert "NIC.Integrated.1-1-1[1/1]=UP" in str(error)
+        assert calls["reserve_server"] == []
+
+    async def test_a_pool_draw_asking_for_it_fails_before_anything_is_read(self):
+        calls, segment_acts, server_acts = make_mock_activities()
+        pool = INPUT.model_copy(update={"allow_unhealthy": True})
+        async with _Harness(segment_acts, server_acts) as client:
+            with pytest.raises(WorkflowFailureError) as excinfo:
+                await _execute(client, InstallServerRunArgs(input=pool))
+
+        assert _application_error(excinfo.value).type == "AllowUnhealthyNeedsServerNameError"
+        assert calls["get_inventory_segment"] == []
+        assert calls["acquire_servers"] == []
+
+    async def test_an_ipmi_blade_with_one_nic_up_boots_from_its_live_nic(self):
+        blade = ucs_server().model_copy(
+            update={
+                "interfaces": [
+                    _nic("eth0", "00:25:b5:00:00:01", None, LinkState.DOWN),
+                    _nic("eth1", "00:25:b5:00:00:02", None, LinkState.UP),
+                ]
+            }
+        )
+        calls, segment_acts, server_acts = make_mock_activities(
+            acquire_error=_refused(blade.name), record=scan_record(blade)
+        )
+        async with _Harness(segment_acts, server_acts) as client:
+            result = await _execute(client, InstallServerRunArgs(input=_unhealthy(blade.name)))
+
+        # The PXE VM maps the BMH's boot MAC only — the live NIC.
+        assert calls["register_pxe_boot"][0].macs == ["00:25:b5:00:00:02"]
+        assert result.boot_mac == "00:25:b5:00:00:02"
+
+    async def test_a_waived_install_that_never_boots_says_what_was_waived(self):
+        calls, segment_acts, server_acts = make_mock_activities(
+            acquire_error=_refused(),
+            record=scan_record(one_nic_up_server()),
+            agent_never_for={SERVER_NAME},
+        )
+        async with _Harness(segment_acts, server_acts) as client:
+            with pytest.raises(WorkflowFailureError) as excinfo:
+                await _execute(client, InstallServerRunArgs(input=_unhealthy()))
+
+        error = _application_error(excinfo.value)
+        assert error.type == "AgentNeverAppearedError"
+        assert "health checks waived on request: server-scan-health" in str(error)
+        # Rolled back and released like any other candidate.
+        assert len(calls["teardown_bmh_resources"]) == 1
+        assert len(calls["release_server"]) == 1

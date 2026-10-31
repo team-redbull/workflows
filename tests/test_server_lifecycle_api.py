@@ -6,9 +6,12 @@ would connect to Temporal, never runs.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from pydantic_core import to_json
 from temporalio.exceptions import WorkflowAlreadyStartedError
 
 from shared.consts import INSTALL_SERVER_WORKFLOW_QUEUE
@@ -639,3 +642,58 @@ class TestUninstallServer:
 
         run_fields = set(UninstallServerInput.model_fields) - {"server_name"}
         assert run_fields <= set(router_module.UninstallServerRequest.model_fields)
+
+
+class TestTheHiddenAllowUnhealthy:
+    """`allow_unhealthy`: an option on purpose absent from every public surface (CLAUDE.md §4).
+
+    The operator's "easter egg": a person in an incident who knows it can install
+    a NAMED server whose own health fails a check. Nobody browsing Swagger, the
+    docs site or a UI should find it — but it must keep working, so it is
+    pinned here rather than looking like dead code.
+    """
+
+    def test_it_is_not_in_the_openapi_schema(self, client):
+        spec = client.get("/openapi.json")
+
+        assert spec.status_code == 200
+        assert "unhealthy" not in spec.text.lower()
+        schema = spec.json()["components"]["schemas"]["InstallServerRequest"]
+        assert "allow_unhealthy" not in schema["properties"]
+
+    def test_it_is_not_in_the_whole_apis_openapi_either(self):
+        # The real entrypoint, every domain mounted. openapi() builds the
+        # document without running the lifespan, so no Temporal is needed.
+        from workflow_domains.api import app
+
+        assert "unhealthy" not in json.dumps(app.openapi()).lower()
+
+    @pytest.mark.parametrize("names", [NAMES[0], NAMES])
+    def test_a_named_install_carries_it_into_each_run(self, client, fake, names):
+        response = client.post(PATH, json={**BODY, "server_names": names, "allow_unhealthy": True})
+
+        assert response.status_code == 202
+        assert fake.args and all(a.input.allow_unhealthy is True for a in fake.args)
+
+    def test_unsent_it_is_false_and_not_even_in_the_runs_payload(self, client, fake):
+        # Serialized as `false` into every run's input it would show the knob to
+        # anyone browsing a run in the Temporal UI.
+        assert client.post(PATH, json={**BODY, "server_names": NAMES[0]}).status_code == 202
+        run_input = fake.args[0].input
+        assert run_input.allow_unhealthy is False
+        assert b"allow_unhealthy" not in to_json(run_input)
+
+    @pytest.mark.parametrize(
+        "extra",
+        [{}, {"count": 2}, {"candidate_count": 4}],
+        ids=["pool", "count", "candidate-count"],
+    )
+    def test_a_pool_draw_cannot_ask_for_it(self, client, fake, extra):
+        response = client.post(PATH, json={**BODY, **extra, "allow_unhealthy": True})
+
+        assert response.status_code == 422
+        assert "only applies to servers named in `server_names`" in response.text
+        assert not fake.args
+
+    def test_false_on_a_pool_draw_is_harmless(self, client, fake):
+        assert client.post(PATH, json={**BODY, "allow_unhealthy": False}).status_code == 202

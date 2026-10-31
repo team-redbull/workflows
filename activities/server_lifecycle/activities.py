@@ -119,6 +119,7 @@ from shared.models.server_lifecycle import (
     InfraEnvBootState,
     InfraEnvRef,
     InfraEnvState,
+    InstallCandidateRecord,
     InventoryHostState,
     MachineDeletion,
     MachineHookRelease,
@@ -175,6 +176,16 @@ def _bmc_credentials(bmc_vendor: str) -> tuple[str, str]:
     return username, password
 
 
+def _log_waived(request: BmhResourceRequest) -> None:
+    """Say, on every create of such an install, which health refusals the request waived."""
+    if request.allowed_unhealthy:
+        activity.logger.warning(
+            "%s is installed with health checks WAIVED on request (allow_unhealthy): %s",
+            request.server_name,
+            "; ".join(f"{w.check}: {w.observed}" for w in request.allowed_unhealthy),
+        )
+
+
 def _log_outcome(resource: CreatedResource) -> CreatedResource:
     """Say whether this run wrote the resource or converged on an existing one."""
     if resource.changed:
@@ -215,6 +226,32 @@ async def reserve_server(request: ReserveServerRequest) -> ServerReservation:
         reservation.expires_at,
     )
     return reservation
+
+
+@activity.defn
+async def lookup_install_candidate(request: ServerMembershipRequest) -> InstallCandidateRecord:
+    """server-scan's stored record of a named server /servers/available refused."""
+    record = await server_scan.install_candidate_by_name(
+        _settings.server_scan_url, _settings.server_scan_api_token, request.server_name
+    )
+    membership = record.membership
+    activity.logger.info(
+        "server-scan's stored record of %s (refused by /servers/available): found=%s id=%s "
+        "state=%s cluster=%s mce=%s contested=%s maintenance=%s reachable=%s health=%s "
+        "lock=%s",
+        request.server_name,
+        membership.found,
+        membership.server_id,
+        membership.lifecycle_state,
+        membership.cluster_name,
+        membership.mce_name,
+        membership.contested_with,
+        membership.maintenance,
+        record.reachable,
+        record.health,
+        record.lock.model_dump() if record.lock.live else "none live",
+    )
+    return record
 
 
 @activity.defn
@@ -621,6 +658,7 @@ async def publish_infra_env_boot(request: InfraEnvBootRequest) -> InfraEnvBootSt
 @activity.defn
 async def create_bmc_secret(request: BmhResourceRequest) -> CreatedResource:
     """Create the BMC credentials Secret (`{vendor}-cred-{server}`)."""
+    _log_waived(request)
     username, password = _bmc_credentials(request.bmc_vendor)
     return _log_outcome(
         await cluster_api.create_secret_if_absent(
@@ -632,6 +670,7 @@ async def create_bmc_secret(request: BmhResourceRequest) -> CreatedResource:
 @activity.defn
 async def create_baremetal_host(request: BmhResourceRequest) -> CreatedResource:
     """Create the BareMetalHost (metal3.io/v1alpha1)."""
+    _log_waived(request)
     bmh = build_baremetal_host(request)
     activity.logger.info(
         "BareMetalHost %s: bmc=%s boot_mac=%s",
@@ -655,6 +694,7 @@ async def create_baremetal_host(request: BmhResourceRequest) -> CreatedResource:
 @activity.defn
 async def create_nmstate_config(request: BmhResourceRequest) -> CreatedResource:
     """Create the NMStateConfig (`nmstate-config-{server}`)."""
+    _log_waived(request)
     return _log_outcome(
         await cluster_api.create_custom_object_if_absent(
             group=NMSTATE_GROUP,

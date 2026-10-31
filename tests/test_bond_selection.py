@@ -23,7 +23,11 @@ from shared.workflow_ids import (
     install_server_name_workflow_id,
     install_server_slot_workflow_id,
 )
-from workflow_domains.server_lifecycle.bond_selection import select_bond_members
+from workflow_domains.server_lifecycle.bond_selection import (
+    link_states,
+    members_not_up,
+    select_bond_members,
+)
 
 IP_BMC = BmcEndpoint(host="10.11.1.229", host_is_ip=True, scheme="redfish")
 
@@ -383,3 +387,76 @@ class TestWorkflowIdKeysOnTheHubAndTheCandidatePool:
         assert install_server_name_workflow_id(self.MCE, "ocp-a-HP0001592") != (
             install_server_name_workflow_id(self.MCE, "ocp-a-HP0001593")
         )
+
+
+class TestWaivedLinkState:
+    """`allow_link_down` — a named install's hidden `allow_unhealthy` (CLAUDE.md §4).
+
+    It relaxes the link-UP rule and NOTHING else: still two members, still on
+    two distinct physical ports, still from `interfaces[]`, and nic1 is still
+    the first link-UP NIC whenever the server has one.
+    """
+
+    def test_with_two_up_ports_it_changes_nothing(self) -> None:
+        server = _server(
+            [
+                _nic("NIC.Integrated.1-1-1", "aa:bb:cc:dd:ee:01", "1/1/1", LinkState.DOWN),
+                _nic("NIC.Integrated.1-2-1", "aa:bb:cc:dd:ee:02", "1/2/1", LinkState.UP),
+                _nic("NIC.Slot.3-1-1", "aa:bb:cc:dd:ee:03", "3/1/1", LinkState.UP),
+            ]
+        )
+        assert select_bond_members(server, allow_link_down=True) == select_bond_members(server)
+
+    def test_one_up_port_bonds_with_the_next_port_whose_link_is_down(self) -> None:
+        server = _server(
+            [
+                _nic("NIC.Integrated.1-1-1", "aa:bb:cc:dd:ee:01", "1/1/1", LinkState.DOWN),
+                _nic("NIC.Integrated.1-2-1", "aa:bb:cc:dd:ee:02", "1/2/1", LinkState.UP),
+            ]
+        )
+        assert select_bond_members(server) is None
+        members = select_bond_members(server, allow_link_down=True)
+        assert members is not None
+        # nic1 — the boot MAC — is the live NIC, though listed second.
+        assert [m.mac for m in members] == ["aa:bb:cc:dd:ee:02", "aa:bb:cc:dd:ee:01"]
+        assert members_not_up(server, members) == 1
+        assert link_states(server, members) == [
+            "nic1 aa:bb:cc:dd:ee:02 [1/2] UP",
+            "nic2 aa:bb:cc:dd:ee:01 [1/1] DOWN",
+        ]
+
+    def test_a_link_not_reported_is_preferred_to_one_reported_down(self) -> None:
+        server = _server(
+            [
+                _nic("NIC.Integrated.1-1-1", "aa:bb:cc:dd:ee:01", "1/1/1", LinkState.UP),
+                _nic("NIC.Integrated.1-2-1", "aa:bb:cc:dd:ee:02", "1/2/1", LinkState.DISABLED),
+                _nic("NIC.Slot.3-1-1", "aa:bb:cc:dd:ee:03", "3/1/1", LinkState.DOWN),
+                _nic("NIC.Slot.3-2-1", "aa:bb:cc:dd:ee:04", "3/2/1", LinkState.UNKNOWN),
+            ]
+        )
+        members = select_bond_members(server, allow_link_down=True)
+        assert [m.mac for m in members or []] == ["aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:04"]
+
+    def test_partitions_of_one_port_are_still_never_bonded(self) -> None:
+        server = _server(
+            [
+                _nic("NIC.Integrated.1-1-1", "aa:bb:cc:dd:ee:01", "1/1/1", LinkState.UP),
+                _nic("NIC.Integrated.1-1-2", "aa:bb:cc:dd:ee:02", "1/1/2", LinkState.DOWN),
+            ]
+        )
+        assert select_bond_members(server, allow_link_down=True) is None
+
+    def test_one_port_is_still_not_a_bond(self) -> None:
+        server = _server(
+            [_nic("NIC.Integrated.1-1-1", "aa:bb:cc:dd:ee:01", "1/1/1", LinkState.UP)]
+        )
+        assert select_bond_members(server, allow_link_down=True) is None
+
+    def test_an_interface_with_no_mac_is_still_skipped(self) -> None:
+        server = _server(
+            [
+                _nic("NIC.Integrated.1-1-1", "aa:bb:cc:dd:ee:01", "1/1/1", LinkState.UP),
+                ServerInterface(name="NIC.Integrated.1-2-1", mac=None, location="1/2/1"),
+            ]
+        )
+        assert select_bond_members(server, allow_link_down=True) is None

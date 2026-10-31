@@ -134,6 +134,14 @@ after a teardown has proved nothing on the cluster still points at the machine
 half-created resources may still name it. Runs started before the lock existed
 replay without it (`workflow.patched`).
 
+A NAMED SERVER MAY BE INSTALLED UNHEALTHY, ON REQUEST — the hidden
+`allow_unhealthy` (CLAUDE.md §4). `/servers/available` is still asked first;
+a named machine it refuses is read once more from server-scan's stored record
+(`lookup_install_candidate`) and health_waiver.py splits the reasons: the
+server's own health is waived and recorded (`allowed_unhealthy` on the progress,
+the result and every create), a safety reason fails the run as before. The bond
+then accepts a member whose link is not UP — never one port alone.
+
 The teardown order is load-bearing and was established against a live cluster:
 metal3 must be told to detach the host BEFORE the delete, or its
 `baremetalhost.metal3.io` finalizer blocks forever trying to deprovision
@@ -145,6 +153,7 @@ from __future__ import annotations
 import re
 from collections.abc import Awaitable, Callable
 from datetime import timedelta
+from typing import cast
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
@@ -162,6 +171,7 @@ with workflow.unsafe.imports_passed_through():
         server_lifecycle_activity_queue,
     )
     from shared.exceptions import (
+        AllowUnhealthyNeedsServerNameError,
         AmbiguousInventorySegmentError,
         AmbiguousServerNameError,
         BmcCredentialsMissingError,
@@ -197,6 +207,7 @@ with workflow.unsafe.imports_passed_through():
         create_nmstate_config,
         find_agent_for_host,
         get_baremetal_host,
+        lookup_install_candidate,
         publish_infra_env_boot,
         register_pxe_boot,
         release_server,
@@ -225,13 +236,21 @@ with workflow.unsafe.imports_passed_through():
         PxeMapRef,
         ReleaseServerRequest,
         ReserveServerRequest,
+        ServerMembershipRequest,
         ServerReservation,
         TeardownResult,
+        WaivedHealthCheck,
         mac_is_valid,
     )
     from workflow_domains.server_lifecycle.bond_selection import (
         describe_candidate,
         select_bond_members,
+    )
+    from workflow_domains.server_lifecycle.health_waiver import (
+        bond_link_waiver,
+        health_findings,
+        holds_own_lock,
+        safety_refusal,
     )
 
 # Same budget rules as the segment-lifecycle workflows: a bounded per-attempt
@@ -530,6 +549,15 @@ def _describe_no_agent(
     )
 
 
+def _describe_waived(waived: list[WaivedHealthCheck]) -> str:
+    """The health checks a failed candidate was installed past, for its rejection."""
+    if not waived:
+        return ""
+    return " [installed with health checks waived on request: " + "; ".join(
+        f"{w.check}: {w.observed}" for w in waived
+    ) + "]"
+
+
 @workflow.defn
 class InstallServerWorkflow:
     def __init__(self) -> None:
@@ -542,6 +570,9 @@ class InstallServerWorkflow:
         self._pxe_cleanup = False
         self._infra_env_boot = False
         self._pxe_boot_mac_only = False
+        # The health refusals waived for the server being installed
+        # (`allow_unhealthy`), each with what was observed.
+        self._allowed_unhealthy: list[WaivedHealthCheck] = []
 
     @workflow.query
     def progress(self) -> InstallServerProgress:
@@ -555,6 +586,7 @@ class InstallServerWorkflow:
             phase=self._phase,
             server_name=self._server_name,
             activity_queue=self._activity_queue,
+            allowed_unhealthy=self._allowed_unhealthy,
         )
 
     @workflow.run
@@ -578,6 +610,16 @@ class InstallServerWorkflow:
             infra_env,
             install_input.mce_cluster,
         )
+        # allow_unhealthy is a person's decision about ONE named machine. The
+        # API refuses it on a pool draw; so does the run, for one started some
+        # other way — before anything is read or written. (No patch gate: no
+        # recorded run carries the field, so none can take this branch.)
+        if install_input.allow_unhealthy and not install_input.server_name:
+            raise ApplicationError(
+                "allow_unhealthy waives health refusals only for a server named in "
+                "the request; it is never applied to a draw from the pool",
+                type=AllowUnhealthyNeedsServerNameError.__name__,
+            )
 
         # Step 1 — the VLAN is the MCE's, so it is read from the Segments
         # Manager rather than taken from the caller: a supplied VLAN could
@@ -615,16 +657,7 @@ class InstallServerWorkflow:
         # model, site and spec, and server names carry the same tokens behind
         # an `ocp-` prefix, so no part of either is parsed apart.
         self._phase = "acquiring-server"
-        candidates = await workflow.execute_activity(
-            acquire_servers,
-            _acquire_request(
-                install_input.server_name, infra_env, install_input.candidate_count
-            ),
-            task_queue=activity_queue,
-            start_to_close_timeout=_ACTIVITY_TIMEOUT,
-            schedule_to_start_timeout=_SCHEDULE_TO_START_TIMEOUT,
-            retry_policy=_RETRY_POLICY,
-        )
+        candidates, record_waivers = await self._acquire(install_input, activity_queue)
 
         # Step 3 — INSTALL ONE CANDIDATE AT A TIME, all the way to an Agent,
         # and roll it back if it never produces one.
@@ -649,9 +682,21 @@ class InstallServerWorkflow:
                 namespace,
                 activity_queue,
                 rejections,
+                allow_link_down=install_input.allow_unhealthy,
             )
             if bond_members is None:
                 continue
+            # Only ever non-empty for a named install that asked for it: the
+            # record's waivers come from the one machine named, and a bond
+            # member can be down only when the link-up rule was waived.
+            bond_waiver = bond_link_waiver(candidate, bond_members)
+            self._allowed_unhealthy = [*record_waivers, *([bond_waiver] if bond_waiver else [])]
+            if self._allowed_unhealthy:
+                workflow.logger.warning(
+                    "allow_unhealthy: installing %s with health checks waived: %s",
+                    candidate.name,
+                    "; ".join(f"{w.check}: {w.observed}" for w in self._allowed_unhealthy),
+                )
 
             # Locked only now, once THIS machine is the one being installed:
             # server-scan's draw cannot know which candidate a run will choose.
@@ -702,6 +747,7 @@ class InstallServerWorkflow:
                 bond_members=bond_members,
                 vlan_id=segment.vlan_id,
                 labels=install_input.labels,
+                allowed_unhealthy=self._allowed_unhealthy,
             )
             bmh_ref = BmhRef(server_name=candidate.name, namespace=namespace)
 
@@ -839,6 +885,7 @@ class InstallServerWorkflow:
                     attempts=attempts,
                     reservation_expires_at=reservation_expires_at,
                     pxe_registered=pxe_registered,
+                    allowed_unhealthy=self._allowed_unhealthy,
                 )
 
             # No Agent. Take the machine back out of this MCE before trying
@@ -869,7 +916,8 @@ class InstallServerWorkflow:
             rejections.append(
                 (
                     "no-agent",
-                    _describe_no_agent(candidate.name, last_state, pxe_registered),
+                    _describe_no_agent(candidate.name, last_state, pxe_registered)
+                    + _describe_waived(self._allowed_unhealthy),
                 )
             )
 
@@ -882,8 +930,14 @@ class InstallServerWorkflow:
         namespace: str,
         task_queue: str,
         rejections: list[tuple[str, str]],
+        *,
+        allow_link_down: bool = False,
     ) -> list[BondMember] | None:
         """One candidate's bond members, or None with a reason recorded.
+
+        `allow_link_down` (a named install's `allow_unhealthy`) relaxes the
+        bond's link-up rule and nothing else: every other reason below is still
+        a refusal.
 
         EVERY reason a candidate cannot be installed is a skip, not a failure.
         The draw exists so one unusable server is a retry rather than a failed
@@ -916,7 +970,11 @@ class InstallServerWorkflow:
             rejections.append(("no-bmc-host", candidate.name))
             return None
 
-        members = select_bond_members(candidate)
+        # With the link-up rule waived, None means fewer than two physical
+        # ports with a MAC at all — still "no-bond", whose summary holds for it.
+        # (No reason of its own: the server-lifecycle page copies these tables,
+        # and the hidden option's name must not reach a UI.)
+        members = select_bond_members(candidate, allow_link_down=allow_link_down)
         if members is None:
             rejections.append(("no-bond", described))
             return None
@@ -937,6 +995,86 @@ class InstallServerWorkflow:
                 return None
 
         return members
+
+    async def _acquire(
+        self, install_input: InstallServerInput, task_queue: str
+    ) -> tuple[list[AcquiredServer], list[WaivedHealthCheck]]:
+        """The candidates to try, and the health refusals waived to get them.
+
+        `/servers/available` is always asked first, so a machine it hands out
+        comes with its live recheck. A NAMED machine it refuses is looked up
+        once more when the request asked for `allow_unhealthy`
+        (_named_server_refused); every other refusal fails the run as before.
+        """
+        try:
+            candidates = await workflow.execute_activity(
+                acquire_servers,
+                _acquire_request(
+                    install_input.server_name,
+                    install_input.infra_env,
+                    install_input.candidate_count,
+                ),
+                task_queue=task_queue,
+                start_to_close_timeout=_ACTIVITY_TIMEOUT,
+                schedule_to_start_timeout=_SCHEDULE_TO_START_TIMEOUT,
+                retry_policy=_RETRY_POLICY,
+            )
+        except ActivityError as err:
+            cause = err.cause
+            if not (
+                install_input.server_name
+                and install_input.allow_unhealthy
+                and isinstance(cause, ApplicationError)
+                and cause.type == ServerNotAvailableError.__name__
+            ):
+                raise
+            return await self._named_server_refused(install_input.server_name, cause, task_queue)
+        return candidates, []
+
+    async def _named_server_refused(
+        self, server_name: str, refused: ApplicationError, task_queue: str
+    ) -> tuple[list[AcquiredServer], list[WaivedHealthCheck]]:
+        """A named machine `/servers/available` refused: why, and whether that may be waived.
+
+        Its 404 cannot say — the detail names neither the network category nor
+        the install lock — so server-scan's stored record is read
+        (lookup_install_candidate) and sorted by health_waiver: a SAFETY reason
+        (unknown, claimed, contested, maintenance, another run's lock) fails
+        the run whatever was asked; the server's own HEALTH is waived — and
+        recorded — because the request asked. A record showing nothing wrong
+        means the live recheck refused it, which is waived and recorded too;
+        the run's own leftover lock is no reason at all.
+        """
+        record = await workflow.execute_activity(
+            lookup_install_candidate,
+            ServerMembershipRequest(server_name=server_name),
+            task_queue=task_queue,
+            start_to_close_timeout=_ACTIVITY_TIMEOUT,
+            schedule_to_start_timeout=_SCHEDULE_TO_START_TIMEOUT,
+            retry_policy=_RETRY_POLICY,
+        )
+        refusal = safety_refusal(record, workflow.info().workflow_id)
+        if refusal is not None:
+            message = (
+                f"server-scan will not hand out {server_name} ({refused.message}), and "
+                f"its record says why: {refusal.reason}. That is a safety refusal, "
+                "which allow_unhealthy never waives"
+            )
+            if refusal.another_runs_lock:
+                raise ApplicationError(message, type=ServerReservedError.__name__)
+            raise ApplicationError(message, type=ServerNotAvailableError.__name__)
+
+        waived = health_findings(record)
+        if not waived and not holds_own_lock(record, workflow.info().workflow_id):
+            waived = [WaivedHealthCheck(check="server-scan-recheck", observed=refused.message)]
+        workflow.logger.warning(
+            "allow_unhealthy: server-scan refused %s (%s); its record shows no safety "
+            "reason, so the install goes ahead",
+            server_name,
+            refused.message,
+        )
+        # Never None here: safety_refusal refuses a record with no server.
+        return [cast(AcquiredServer, record.server)], waived
 
     async def _reserve(
         self,

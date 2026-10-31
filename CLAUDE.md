@@ -493,6 +493,19 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   `NoBondableInterfacesError` naming the provider and the states observed —
   deliberately loud, so the gap is visible rather than looking like an empty
   inventory. Decided with the operator, 2026-09-25.
+- **install-server's `allow_unhealthy` is HIDDEN ON PURPOSE — not dead code.** The operator's
+  "easter egg" (2026-10-31), after an incident that had to install servers with one NIC up
+  and no RAID. Out of OpenAPI/Swagger (`SkipJsonSchema`, pinned by `TestTheHiddenAllowUnhealthy`),
+  the README, the docs site and every UI; left out of payloads while unused (`_QuietDefaults`),
+  so the Temporal UI does not show it either. Only with `server_names` (422 on a pool draw).
+  It waives HEALTH — the server's own condition: server-scan's health tier, network category,
+  BMC reachability, live recheck, and a bond member whose link is not UP (still two members on
+  distinct ports from `interfaces[]`, nic1 the first link-UP NIC) — NEVER safety: unknown to
+  server-scan, claimed, contested, maintenance, another run's lock, InfraEnv, BMC credentials,
+  a BMH/Agent present. A named machine `/servers/available` refuses is read once more
+  (`lookup_install_candidate`) and sorted by `health_waiver.py`; every waiver lands in
+  `allowed_unhealthy` (progress, result, each create's input). No patch gate: no recorded run
+  carries the field.
 - **The inventory VLAN belongs to the MCE, and is resolved once per run** —
   `get_inventory_segment` on the SEGMENT-LIFECYCLE queue, not a second copy of
   that token on the server-lifecycle limb. There is deliberately no `vlan_id`

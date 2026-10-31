@@ -204,12 +204,38 @@ class TestTheInstallLock:
         }
 
     @respx.mock
-    @pytest.mark.parametrize("status", [404, 409])
-    async def test_nothing_of_ours_to_release_is_success(self, status):
-        respx.delete(RESERVATION).mock(return_value=_problem(status, "not yours"))
+    async def test_a_server_gone_from_the_inventory_is_released(self):
+        respx.delete(RESERVATION).mock(return_value=_problem(404, "No server"))
         released = await release_server(SS, "", RELEASE)
         assert released.held is False
         assert released.detail
+
+    @respx.mock
+    async def test_another_holders_lock_is_left_alone(self):
+        # server-scan's ConflictError for a lock that is not ours carries held_by.
+        respx.delete(RESERVATION).mock(
+            return_value=_problem(
+                409, "reserved by 'install-server' for MCE 'ocp4-mce-other', not by 'install-server'",
+                server_id="srv_1", held_by="install-server", held_for_mce="ocp4-mce-other",
+            )
+        )
+        released = await release_server(SS, "", RELEASE)
+        assert released.held is False
+        assert "left alone" in released.detail
+
+    @respx.mock
+    async def test_a_lost_revision_race_on_release_is_retried_not_taken_as_released(self):
+        # server-scan's "modified by another caller while being released": a
+        # collector or membership write won, and the lock is still ours and live.
+        respx.delete(RESERVATION).mock(
+            return_value=_problem(
+                409, "Server 'srv_1' was modified by another caller while being released.",
+                server_id="srv_1",
+            )
+        )
+        with pytest.raises(ServerScanError) as excinfo:
+            await release_server(SS, "", RELEASE)
+        assert not isinstance(excinfo.value, (ServerScanAuthError, ServerScanRequestInvalidError))
 
     @respx.mock
     async def test_a_release_without_admin_is_permanent(self):

@@ -523,7 +523,7 @@ async def release_server(
             held=False,
             detail="the server is no longer in server-scan's inventory",
         )
-    if resp.status_code == 409:
+    if resp.status_code == 409 and _details(resp).get("held_by"):
         # Our lock lapsed and another run has since taken the machine. Clearing
         # it would hand that run's server back to the pool mid-install.
         return ServerReservation(
@@ -531,4 +531,8 @@ async def release_server(
             held=False,
             detail=f"left alone, it is not ours: {_detail(resp)}",
         )
+    # A 409 WITHOUT `held_by` is a lost revision race: a collector, membership
+    # or maintenance write changed the document between server-scan's read and
+    # its write, and nothing was released. Retried like any transient failure —
+    # taking it as "not ours" left our lock held until its TTL.
     _raise_for_lock_status(resp, "release")

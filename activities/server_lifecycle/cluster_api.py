@@ -52,6 +52,13 @@ Differences = Callable[[dict[str, Any], dict[str, Any]], list[str]]
 
 _MAX_BODY_CHARS = 500
 
+# (connect, read) seconds on EVERY call: the SDK's own default is no timeout at
+# all, and a hung read would hold its activity — a heartbeating watch included
+# — until Temporal reaps it. Generous, since every call here is one object or
+# one list; a hung one raises urllib3's timeout error, which the activity's
+# retry treats like a connection failure.
+_REQUEST_TIMEOUT = (10, 60)
+
 
 def _load_kube() -> None:
     """Load in-cluster config, falling back to a kubeconfig for local runs.
@@ -180,7 +187,9 @@ async def create_secret_if_absent(
     name = body["metadata"]["name"]
 
     def _create() -> None:
-        k8s_client.CoreV1Api().create_namespaced_secret(namespace=namespace, body=body)
+        k8s_client.CoreV1Api().create_namespaced_secret(
+            namespace=namespace, body=body, _request_timeout=_REQUEST_TIMEOUT
+        )
 
     return await asyncio.to_thread(_create_if_absent, _create, "Secret", name)
 
@@ -200,12 +209,14 @@ async def create_custom_object_if_absent(
 
     def _create() -> None:
         k8s_client.CustomObjectsApi().create_namespaced_custom_object(
-            group=group, version=version, namespace=namespace, plural=plural, body=body
+            group=group, version=version, namespace=namespace, plural=plural, body=body,
+            _request_timeout=_REQUEST_TIMEOUT,
         )
 
     def _on_exists() -> list[str]:
         existing = k8s_client.CustomObjectsApi().get_namespaced_custom_object(
-            group=group, version=version, namespace=namespace, plural=plural, name=name
+            group=group, version=version, namespace=namespace, plural=plural, name=name,
+            _request_timeout=_REQUEST_TIMEOUT,
         )
         return differences(body, existing)
 
@@ -241,6 +252,7 @@ async def read_custom_object(
                 namespace=namespace,
                 plural=plural,
                 name=name,
+                _request_timeout=_REQUEST_TIMEOUT,
             )
         except k8s_client.ApiException as exc:
             if exc.status == _NOT_FOUND:
@@ -271,7 +283,8 @@ async def list_custom_objects(
         _load_kube()
         try:
             response = k8s_client.CustomObjectsApi().list_namespaced_custom_object(
-                group=group, version=version, namespace=namespace, plural=plural
+                group=group, version=version, namespace=namespace, plural=plural,
+                _request_timeout=_REQUEST_TIMEOUT,
             )
         except k8s_client.ApiException as exc:
             if exc.status == _NOT_FOUND:
@@ -309,6 +322,7 @@ async def annotate_custom_object(
                 plural=plural,
                 name=name,
                 body={"metadata": {"annotations": annotations}},
+                _request_timeout=_REQUEST_TIMEOUT,
             )
         except k8s_client.ApiException as exc:
             if exc.status == _NOT_FOUND:
@@ -345,6 +359,7 @@ async def patch_custom_object(
                 plural=plural,
                 name=name,
                 body=body,
+                _request_timeout=_REQUEST_TIMEOUT,
             )
         except k8s_client.ApiException as exc:
             if exc.status == _NOT_FOUND:
@@ -377,7 +392,8 @@ async def delete_custom_object(
         _load_kube()
         try:
             k8s_client.CustomObjectsApi().delete_namespaced_custom_object(
-                group=group, version=version, namespace=namespace, plural=plural, name=name
+                group=group, version=version, namespace=namespace, plural=plural, name=name,
+                _request_timeout=_REQUEST_TIMEOUT,
             )
         except k8s_client.ApiException as exc:
             if exc.status == _NOT_FOUND:
@@ -417,6 +433,7 @@ async def delete_custom_object_exactly(
             k8s_client.CustomObjectsApi().delete_namespaced_custom_object(
                 group=group, version=version, namespace=namespace, plural=plural, name=name,
                 body=options,
+                _request_timeout=_REQUEST_TIMEOUT,
             )
         except k8s_client.ApiException as exc:
             if exc.status == _NOT_FOUND:
@@ -460,7 +477,8 @@ async def clear_custom_object_finalizers(
         api = k8s_client.CustomObjectsApi()
         try:
             existing = api.get_namespaced_custom_object(
-                group=group, version=version, namespace=namespace, plural=plural, name=name
+                group=group, version=version, namespace=namespace, plural=plural, name=name,
+                _request_timeout=_REQUEST_TIMEOUT,
             )
         except k8s_client.ApiException as exc:
             if exc.status == _NOT_FOUND:
@@ -480,6 +498,7 @@ async def clear_custom_object_finalizers(
                 plural=plural,
                 name=name,
                 body={"metadata": {"finalizers": remaining}},
+                _request_timeout=_REQUEST_TIMEOUT,
             )
         except k8s_client.ApiException as exc:
             if exc.status == _NOT_FOUND:
@@ -496,7 +515,9 @@ async def secret_exists(namespace: str, name: str) -> bool:
     def _read() -> bool:
         _load_kube()
         try:
-            k8s_client.CoreV1Api().read_namespaced_secret(name=name, namespace=namespace)
+            k8s_client.CoreV1Api().read_namespaced_secret(
+                name=name, namespace=namespace, _request_timeout=_REQUEST_TIMEOUT
+            )
         except k8s_client.ApiException as exc:
             if exc.status == _NOT_FOUND:
                 return False
@@ -518,7 +539,9 @@ async def delete_secret_if_present(namespace: str, name: str) -> bool:
     def _delete() -> bool:
         _load_kube()
         try:
-            k8s_client.CoreV1Api().delete_namespaced_secret(name=name, namespace=namespace)
+            k8s_client.CoreV1Api().delete_namespaced_secret(
+                name=name, namespace=namespace, _request_timeout=_REQUEST_TIMEOUT
+            )
         except k8s_client.ApiException as exc:
             if exc.status == _NOT_FOUND:
                 return False
@@ -549,7 +572,8 @@ async def list_cluster_custom_objects(
         _load_kube()
         try:
             response = k8s_client.CustomObjectsApi().list_cluster_custom_object(
-                group=group, version=version, plural=plural
+                group=group, version=version, plural=plural,
+                _request_timeout=_REQUEST_TIMEOUT,
             )
         except k8s_client.ApiException as exc:
             if exc.status == _NOT_FOUND:
@@ -571,7 +595,9 @@ async def read_secret_data(namespace: str, name: str) -> dict[str, str] | None:
     def _read() -> dict[str, str] | None:
         _load_kube()
         try:
-            secret = k8s_client.CoreV1Api().read_namespaced_secret(name=name, namespace=namespace)
+            secret = k8s_client.CoreV1Api().read_namespaced_secret(
+                name=name, namespace=namespace, _request_timeout=_REQUEST_TIMEOUT
+            )
         except k8s_client.ApiException as exc:
             if exc.status == _NOT_FOUND:
                 return None
@@ -591,7 +617,9 @@ async def read_config_map_data(namespace: str, name: str) -> dict[str, str] | No
     def _read() -> dict[str, str] | None:
         _load_kube()
         try:
-            config_map = k8s_client.CoreV1Api().read_namespaced_config_map(name=name, namespace=namespace)
+            config_map = k8s_client.CoreV1Api().read_namespaced_config_map(
+                name=name, namespace=namespace, _request_timeout=_REQUEST_TIMEOUT
+            )
         except k8s_client.ApiException as exc:
             if exc.status == _NOT_FOUND:
                 return None
@@ -612,7 +640,9 @@ async def delete_pod(namespace: str, name: str, uid: str | None) -> str:
         _load_kube()
         body = k8s_client.V1DeleteOptions(preconditions=k8s_client.V1Preconditions(uid=uid)) if uid else None
         try:
-            k8s_client.CoreV1Api().delete_namespaced_pod(name=name, namespace=namespace, body=body)
+            k8s_client.CoreV1Api().delete_namespaced_pod(
+                name=name, namespace=namespace, body=body, _request_timeout=_REQUEST_TIMEOUT
+            )
         except k8s_client.ApiException as exc:
             if exc.status == _NOT_FOUND:
                 return "gone"

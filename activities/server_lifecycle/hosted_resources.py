@@ -341,6 +341,14 @@ def hosted_control_plane_namespace(namespace: str, name: str) -> str:
     return f"{namespace}-{name.replace('.', '-')}"
 
 
+def admin_kubeconfig_secret(hosted_cluster: dict[str, Any]) -> str | None:
+    """The name of the Secret holding the HostedCluster's admin kubeconfig (`status.kubeconfig.name`).
+
+    In the HostedCluster's own namespace. None until HyperShift publishes it.
+    """
+    return ((hosted_cluster.get("status") or {}).get("kubeconfig") or {}).get("name") or None
+
+
 def hosted_cluster_for(
     hcp_namespace: str, hosted_clusters: list[dict[str, Any]]
 ) -> HostedClusterRef | None:

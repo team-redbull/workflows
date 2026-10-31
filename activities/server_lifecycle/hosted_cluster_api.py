@@ -60,10 +60,36 @@ _RAISE = object()
 # (connect, read) seconds — well under the activity's 90 s start_to_close.
 _REQUEST_TIMEOUT = (10, 30)
 
+# The key HyperShift stores an admin kubeconfig under, in the Secret its
+# HostedCluster's `status.kubeconfig` names.
+ADMIN_KUBECONFIG_KEY = "kubeconfig"
+
 
 def kas_service_url(hcp_namespace: str) -> str:
     """The hosted control plane's API server, by its in-cluster Service on the MCE."""
     return f"https://kube-apiserver.{hcp_namespace}.svc:6443"
+
+
+def admin_kubeconfig(secret_data: dict[str, str] | None, secret: str, hosted_cluster: str) -> str:
+    """The admin kubeconfig's text, from its Secret's `data` as the MCE's API returns it (base64).
+
+    `secret_data` None means the Secret does not exist. `secret` and
+    `hosted_cluster` (`<namespace>/<name>` each) only name them in errors;
+    nothing read from the Secret ever enters one. HostedClusterAccessError
+    when there is no Secret, no `kubeconfig` key, or no text in it.
+    """
+    encoded = (secret_data or {}).get(ADMIN_KUBECONFIG_KEY)
+    if not encoded:
+        raise HostedClusterAccessError(
+            f"Secret {secret} of HostedCluster {hosted_cluster} "
+            f"{'does not exist' if secret_data is None else f'has no {ADMIN_KUBECONFIG_KEY!r} key'}"
+        )
+    try:
+        return base64.b64decode(encoded, validate=True).decode()
+    except (binascii.Error, UnicodeDecodeError, ValueError):
+        raise HostedClusterAccessError(
+            f"Secret {secret} of HostedCluster {hosted_cluster} holds no readable kubeconfig"
+        ) from None
 
 
 def _named(entries: Any, name: str | None, kind: str, cluster: str) -> dict[str, Any]:
@@ -393,8 +419,9 @@ async def delete_node(
 # --- shared with the cluster-upgrade limb ---------------------------------------
 # The cluster-upgrade limb reads other objects in the same hosted clusters, the
 # same way (activities/cluster_upgrade/hosted_upgrade_api.py). Admin kubeconfigs
-# are handled in exactly one place, this module, so it reuses these rather than
-# keeping a second copy of the parsing, the temp directory and the error rules.
+# are handled in exactly one place, this module, so it reuses these — and
+# `admin_kubeconfig`, the Secret's decode — rather than keeping a second copy of
+# the decoding, the parsing, the temp directory and the error rules.
 open_hosted_api = _hosted_api
 call_hosted = _call
 as_plain = _plain

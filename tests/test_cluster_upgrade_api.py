@@ -261,3 +261,51 @@ class TestUpgradeTargets:
         assert client.get(self.PATH, params={"cluster": "C1; drop"}).status_code == 422
         assert fake.target_reads == []
 
+
+class TestMountedOnTheApi:
+    """The routes answer on the real entrypoint, workflow_domains.api:app (DESIGN O18).
+
+    The page at /ui/cluster-upgrade calls them on the API that serves it. A
+    plain TestClient never enters the app's lifespan, so no Temporal is dialled.
+    """
+
+    @pytest.fixture
+    def api(self, fake):
+        from workflow_domains.api import app
+
+        app.dependency_overrides[get_temporal_client] = lambda: fake
+        yield TestClient(app)
+        app.dependency_overrides.pop(get_temporal_client, None)
+
+    def test_a_start_answers_202(self, api, fake):
+        response = api.post(PATH, json=BODY)
+        assert response.status_code == 202 and response.json()["workflow_id"] == RUN
+        assert [workflow_id for workflow_id, _ in fake.starts] == [RUN]
+
+    def test_a_decision_answers_with_what_the_run_said(self, api, fake):
+        response = api.post(f"{PATH}/{RUN}/approve", json={"by": "alice"})
+        assert response.status_code == 200 and response.json() == {"workflow_id": RUN, "decision": "approve"}
+        assert fake.updates[0][:2] == (RUN, UpgradeClusterWorkflow.approve)
+
+    def test_the_targets_answer(self, api, fake):
+        from shared.models.cluster_upgrade import UpgradeTargets
+
+        fake.targets = UpgradeTargets(cluster="c1", mce_cluster="ocp4-m", mce_version="2.17.3",
+                                      control_plane_version="4.19.53", supported_minors=["4.20"], ladder_revision="r")
+        response = api.get("/workflows/cluster-upgrade/upgrade-targets", params={"cluster": "c1"})
+        assert response.status_code == 200 and response.json()["mce_cluster"] == "ocp4-m"
+
+    def test_every_route_the_page_calls_is_in_the_api(self, api):
+        from workflow_domains.api import app
+        from workflow_domains.cluster_upgrade import ui
+
+        page = (ui.UI_DIR / "index.html").read_text()
+        paths = set(app.openapi()["paths"])
+        for path in ("/workflows/cluster-upgrade/upgrade-cluster", "/workflows/cluster-upgrade/upgrade-targets",
+                     "/workflows/runs"):
+            assert path in page and path in paths
+        decisions = {p.rsplit("/", 1)[-1] for p in paths if p.startswith(f"{PATH}/{{workflow_id}}/")}
+        assert decisions >= {"approve", "approve-admin-ack", "continue", "confirm-day2", "pause", "resume",
+                             "abort", "retry"}
+        assert api.get("/ui/cluster-upgrade").status_code == 200
+

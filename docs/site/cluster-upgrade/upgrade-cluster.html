@@ -55,7 +55,7 @@
     is asked only when a gate fails or a watch stalls, and even then a person decides what happens
     next.</p>
     <div class="facts">
-      <div class="fact"><span class="k">Trigger</span><span class="v">POST /workflows/cluster-upgrade/upgrade-cluster &middot; not mounted yet</span></div>
+      <div class="fact"><span class="k">Trigger</span><span class="v">POST /workflows/cluster-upgrade/upgrade-cluster</span></div>
       <div class="fact"><span class="k">Workflow id</span><span class="v">one per HostedCluster: upgrade-cluster-&lt;cluster&gt;</span></div>
       <div class="fact"><span class="k">Child</span><span class="v">upgrade-control-plane-&lt;mce&gt;_&lt;slot&gt;, one per control-plane step</span></div>
       <div class="fact"><span class="k">Workflow queues</span><span class="v">upgrade-cluster-workflow &middot; upgrade-control-plane-workflow</span></div>
@@ -84,16 +84,17 @@
             moves, admin acks, continue-as-new.</li>
           <li><b>Replay tests</b> of saved histories.</li>
           <li>The path resolver and every check, as pure code.</li>
-          <li>The HTTP routes, with their own tests.</li>
+          <li>The HTTP routes, with their own tests, <b>mounted</b> on the API.</li>
+          <li>The <b>MCE limb</b>, <code>cluster-upgrade-worker</code>: the reads, the admin-ack write, the
+            Argo CD sync, the watches, the NodePool gate and the tier-2 actions, with its worker, image and
+            chart (RBAC derived from its calls). It reaches the HostedCluster by its own name
+            (<code>openshift-&lt;clusterName&gt;</code> in <code>hcp-&lt;clusterName&gt;</code>) and syncs the
+            multi-source Application at the day1 commit, in its <code>ref: values</code> source.</li>
         </ul>
       </div>
       <div class="panel warn">
         <h3>Not yet</h3>
         <ul>
-          <li>The routes are <b>not mounted</b> in the API. They come with the first limb.</li>
-          <li>The <b>MCE limb</b>&rsquo;s activities are written and tested: the reads, the admin-ack write, the
-            Argo CD sync, the watches, the NodePool gate and the tier-2 actions. Several were run against a live
-            hosted cluster. It has no worker, image or chart yet.</li>
           <li>Still to build: the hub limb (day1 git, the mirror, day2, Brain), the agent&rsquo;s judge and tier-1
             tools, and the RBAC and admission policies.</li>
           <li>Abort commits <code>pausedUntil</code>, which the hostedclusters-setup chart does not render
@@ -794,9 +795,9 @@ or retry to check again (the count covers 24 hours)</pre>
   <!-- ================================================================ API -->
   <section id="api">
     <div class="sec-head">
-      <div class="eyebrow">HTTP surface &middot; not mounted yet</div>
+      <div class="eyebrow">HTTP surface</div>
       <h2>How you start it, steer it and watch it</h2>
-      <p class="lede">Served by <code>workflows-orchestrator-api</code> once the router is mounted. Every route
+      <p class="lede">Served by <code>workflows-orchestrator-api</code>. Every route
       lives under <code>/workflows/cluster-upgrade/upgrade-cluster</code>. Decisions are <b>Temporal
       Updates</b>, answered at once: the run itself says whether it was waiting for that decision.</p>
     </div>

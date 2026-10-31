@@ -76,7 +76,7 @@
       // Three limbs: the per-MCE cluster limb shown here (reads, Argo CD syncs,
       // watches), plus upgrade-gitops-activity on the hub (day1 git, the mirror)
       // and upgrade-agent-activity-<mce> (the agent). Built and tested on a fake
-      // fleet; its routes are not mounted yet, so no run can be started.
+      // fleet; its routes are mounted, and a run waits on any limb not deployed yet.
       queue: "cluster-upgrade-activity-<mce>",
       workflows: [
         {

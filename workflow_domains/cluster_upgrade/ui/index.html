@@ -479,7 +479,7 @@ async function send(method, path, payload) {
     let detail = text;
     try { const j = JSON.parse(text); detail = typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail ?? j); } catch (e) {}
     if (response.ok) toast("Done: the run took it.");
-    else if (response.status === 404 && /^\{"detail":"Not Found"\}$/.test(text)) toast("The upgrade routes are not mounted on this API yet: they come with the limbs (DESIGN O18).", 8000);
+    else if (response.status === 404 && /^\{"detail":"Not Found"\}$/.test(text)) toast("This API has no such route: is it older than the cluster-upgrade routes?", 8000);
     else toast(`${response.status}: ${detail}`, 9000);
   } catch (err) {
     toast(`Not sent: ${err.message}`);
@@ -524,7 +524,7 @@ async function loadTargets(cluster) {
   const text = await response.text();
   let detail = text;
   try { const j = JSON.parse(text); if (response.ok) return j; detail = typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail); } catch (e) {}
-  if (response.status === 404 && /^\{"detail":"Not Found"\}$/.test(text)) detail = "the upgrade routes are not mounted on this API yet (DESIGN O18)";
+  if (response.status === 404 && /^\{"detail":"Not Found"\}$/.test(text)) detail = "this API has no upgrade-targets route: is it older than the cluster-upgrade routes?";
   throw new Error(`${response.status}: ${detail}`);
 }
 

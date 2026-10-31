@@ -6,9 +6,8 @@ calls the API it is served by, so it needs no CORS: `GET /workflows/runs` to
 list upgrade-cluster runs, `GET /workflows/runs/{id}` for each one's progress,
 and the decision routes of router.py for approve, continue and the rest.
 
-It shows only the runs this API reports: until the upgrade routes are mounted
-(DESIGN O18) there are none, and its start form and decisions answer that the
-routes are not there yet.
+It shows only the runs this API reports, on the upgrade routes api.py mounts
+beside it (DESIGN O18).
 
 The page has no auth of its own, like the rest of api.py.
 """

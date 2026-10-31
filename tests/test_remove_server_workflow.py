@@ -13,7 +13,7 @@ import asyncio
 import uuid
 
 import pytest
-from temporalio import activity
+from temporalio import activity, workflow
 from temporalio.client import Client, WorkflowFailureError
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.exceptions import ActivityError, ApplicationError
@@ -27,9 +27,11 @@ from shared.consts import (
 )
 from shared.exceptions import (
     AgentBoundToClusterError,
+    AmbiguousServerNameError,
     InventorySegmentNotFoundError,
     PxeMapAuthError,
     PxeMapError,
+    ServerScanAuthError,
 )
 from shared.models.segment_lifecycle import SegmentEntry, SegmentType
 from shared.models.server_lifecycle import (
@@ -42,10 +44,16 @@ from shared.models.server_lifecycle import (
     InventoryHostState,
     PxeHostEntriesRef,
     PxeHostEntriesRemoval,
+    ReleaseServerRequest,
     RemoveServerInput,
     RemoveServerRunArgs,
+    ServerLockRecord,
+    ServerMembership,
+    ServerMembershipRequest,
+    ServerReservation,
     TeardownResult,
 )
+from workflow_domains.server_lifecycle import install_server, remove_server, uninstall_server
 from workflow_domains.server_lifecycle.remove_server import RemoveServerWorkflow
 
 MCE = "ocp4-mce-bat-yam-01"
@@ -67,6 +75,18 @@ UNBOUND = AgentBinding(name="agent-1")
 BOUND = AgentBinding(name="agent-1", cluster_deployment="clusters/hc-01")
 FULL = InventoryHostState(bmh_found=True, nmstate_found=True, powered_on=True, agents=[UNBOUND])
 
+# server-scan's record of the server: no live lock unless a test gives one.
+MEMBERSHIP = ServerMembership(
+    found=True, server_id="srv_123", server_name=SERVER, lifecycle_state="INSTALLED_TO_INVENTORY",
+    mce_name=MCE,
+)
+INSTALL_RUN = f"install-server-{MCE}_{SERVER}"
+# install-server's day-long hold after it installed the server into THIS MCE.
+INSTALL_LOCK = ServerLockRecord(
+    live=True, holder="install-server", workflow_id=INSTALL_RUN, mce_cluster=MCE,
+    expires_at="2026-11-01T09:00:00Z",
+)
+
 
 def make_mocks(
     *,
@@ -80,10 +100,17 @@ def make_mocks(
     legacy_limb: bool = False,
     segment: SegmentEntry | None = None,
     segment_error: Exception | None = None,
+    lock: ServerLockRecord | None = None,
+    membership: ServerMembership = MEMBERSHIP,
+    membership_error: Exception | None = None,
+    legacy_membership: bool = False,
+    release_detail: str | None = None,
+    release_error: Exception | None = None,
 ):
     """`state` is what the first inspection finds; `after` what every later
     one finds (the final check) — gone by default. `pxe_kept` names the MACs
-    the PXE VM keeps because another MCE's boot entry owns them."""
+    the PXE VM keeps because another MCE's boot entry owns them. `lock` is
+    server-scan's install lock on the server (none live by default)."""
     leftover = after if after is not None else InventoryHostState()
     kept = pxe_kept or set()
     calls: dict[str, list] = {
@@ -96,9 +123,31 @@ def make_mocks(
             "delete_agents",
             "remove_host_pxe_entries",
             "get_inventory_segment",
+            "lookup_server_membership",
+            "release_server",
             "order",
         )
     }
+
+    @activity.defn
+    async def lookup_server_membership(request: ServerMembershipRequest) -> ServerMembership:
+        calls["lookup_server_membership"].append(request)
+        calls["order"].append("lock")
+        if membership_error is not None:
+            raise membership_error
+        record = membership.model_copy(update={"lock": lock or ServerLockRecord()})
+        if legacy_membership:
+            # A limb that predates the lock read sends a payload without the key.
+            return record.model_dump(exclude={"lock"})
+        return record
+
+    @activity.defn
+    async def release_server(request: ReleaseServerRequest) -> ServerReservation:
+        calls["release_server"].append(request)
+        calls["order"].append("release")
+        if release_error is not None:
+            raise release_error
+        return ServerReservation(server_id=request.server_id, held=False, detail=release_detail)
 
     @activity.defn
     async def get_inventory_segment(mce_cluster: str) -> SegmentEntry:
@@ -169,6 +218,8 @@ def make_mocks(
             teardown_bmh_resources,
             delete_agents,
             remove_host_pxe_entries,
+            lookup_server_membership,
+            release_server,
         ],
         SEGMENT_LIFECYCLE_ACTIVITY_QUEUE: [get_inventory_segment],
     }
@@ -225,7 +276,7 @@ async def test_an_inventory_host_is_powered_off_then_removed_agent_last():
     async with _Harness(acts) as client:
         result = await _execute(client)
 
-    assert calls["order"] == ["inspect", "power-off", "teardown", "delete-agents", "verify"]
+    assert calls["order"] == ["inspect", "power-off", "teardown", "delete-agents", "verify", "lock"]
     assert result.found and result.powered_off
     assert result.agents_removed == ["agent-1"]
     assert result.resources_removed == [
@@ -283,7 +334,10 @@ async def test_nothing_on_the_mce_is_a_successful_no_op():
         result = await _execute(client)
 
     assert result.found is False
+    # Not even the lock: nothing ties the server to this MCE, and an install
+    # that has locked it may not have written anything yet.
     assert calls["order"] == ["inspect"]
+    assert not result.lock_released and result.lock_detail is None
 
 
 async def test_a_host_without_an_agent_still_has_its_resources_removed():
@@ -291,7 +345,7 @@ async def test_a_host_without_an_agent_still_has_its_resources_removed():
     async with _Harness(acts) as client:
         result = await _execute(client)
 
-    assert calls["order"] == ["inspect", "power-off", "teardown", "verify"]
+    assert calls["order"] == ["inspect", "power-off", "teardown", "verify", "lock"]
     assert result.agents_removed == []
 
 
@@ -308,7 +362,7 @@ async def test_an_agent_left_without_its_bmh_is_still_deleted():
     async with _Harness(acts) as client:
         result = await _execute(client)
 
-    assert calls["order"] == ["inspect", "delete-agents", "segment", "pxe", "verify"]
+    assert calls["order"] == ["inspect", "delete-agents", "segment", "pxe", "verify", "lock"]
     assert result.powered_off is False
     assert result.agents_removed == ["agent-1"]
     # Its MACs are still cleared from the PXE map: found by server-scan's.
@@ -359,7 +413,7 @@ class TestThePxeMapIsCleared:
             result = await _execute(client)
 
         assert calls["order"] == [
-            "inspect", "power-off", "teardown", "delete-agents", "segment", "pxe", "verify",
+            "inspect", "power-off", "teardown", "delete-agents", "segment", "pxe", "verify", "lock",
         ]
         # Every MAC the host is known by, conditional on THIS MCE, and only on
         # the MCE's own site's VM — the one install-server mapped it on.
@@ -459,3 +513,132 @@ async def test_every_step_runs_on_the_target_mces_queue():
     assert result.mce_cluster == MCE
     # The first inspection and the final check, both of this server.
     assert calls["inspect_inventory_host"] == [BmhRef(server_name=SERVER, namespace=NS)] * 2
+    assert calls["lookup_server_membership"] == [ServerMembershipRequest(server_name=SERVER)]
+
+
+class TestServerScansLock:
+    """Once nothing is left on the MCE, install-server's lock FOR THIS MCE goes back (2026-10-31)."""
+
+    async def test_install_servers_lock_for_this_mce_is_released_after_the_check(self):
+        calls, acts = make_mocks(state=WITH_MACS, lock=INSTALL_LOCK)
+        async with _Harness(acts) as client:
+            result = await _execute(client)
+
+        assert calls["order"][-3:] == ["verify", "lock", "release"]
+        # With the holder and run read, so server-scan compares and deletes exactly that lock.
+        assert calls["release_server"] == [ReleaseServerRequest(
+            server_id="srv_123", server_name=SERVER, holder="install-server", workflow_id=INSTALL_RUN,
+        )]
+        assert result.lock_released is True
+        assert result.lock_detail.startswith("released 'install-server'") and INSTALL_RUN in result.lock_detail
+
+    async def test_the_mce_is_compared_whatever_its_spelling(self):
+        unprefixed = INSTALL_LOCK.model_copy(update={"mce_cluster": "mce-bat-yam-01"})
+        calls, acts = make_mocks(lock=unprefixed)
+        async with _Harness(acts) as client:
+            result = await _execute(client)
+        assert result.lock_released and len(calls["release_server"]) == 1
+
+    async def test_another_mces_lock_is_left_alone(self):
+        elsewhere = INSTALL_LOCK.model_copy(update={"mce_cluster": "ocp4-mce-other"})
+        calls, acts = make_mocks(lock=elsewhere)
+        async with _Harness(acts) as client:
+            result = await _execute(client)
+
+        assert calls["release_server"] == []
+        assert result.lock_released is False
+        assert "another MCE" in result.lock_detail and "ocp4-mce-other" in result.lock_detail
+
+    async def test_uninstall_servers_lock_is_left_to_its_own_run(self):
+        """remove-server as uninstall-server's child: the parent releases its own lock after it."""
+        parents = ServerLockRecord(live=True, holder="uninstall-server",
+                                   workflow_id=f"uninstall-server-{SERVER.lower()}", mce_cluster=MCE)
+        calls, acts = make_mocks(lock=parents)
+        async with _Harness(acts) as client:
+            result = await _execute(client)
+
+        assert calls["release_server"] == []
+        assert result.lock_released is False
+        assert result.lock_detail.startswith("left to uninstall-server")
+
+    async def test_any_other_holders_lock_is_left_alone(self):
+        operator = ServerLockRecord(live=True, holder="operator", workflow_id="by-hand", mce_cluster=MCE)
+        calls, acts = make_mocks(lock=operator)
+        async with _Harness(acts) as client:
+            result = await _execute(client)
+        assert calls["release_server"] == [] and not result.lock_released
+        assert "not an install-server run" in result.lock_detail
+
+    async def test_no_live_lock_is_nothing_to_release(self):
+        lapsed = INSTALL_LOCK.model_copy(update={"live": False})
+        calls, acts = make_mocks(lock=lapsed)
+        async with _Harness(acts) as client:
+            result = await _execute(client)
+        assert calls["release_server"] == [] and not result.lock_released
+        assert result.lock_detail == "no live lock in server-scan: nothing to release"
+
+    async def test_nothing_found_on_the_mce_releases_nothing(self):
+        calls, acts = make_mocks(state=InventoryHostState(), lock=INSTALL_LOCK)
+        async with _Harness(acts) as client:
+            result = await _execute(client)
+        assert calls["lookup_server_membership"] == calls["release_server"] == []
+        assert result.found is False and not result.lock_released
+
+    async def test_a_failed_pxe_cleanup_keeps_the_lock(self):
+        # The host's MACs may still chain to this MCE's discovery image.
+        calls, acts = make_mocks(state=WITH_MACS, lock=INSTALL_LOCK,
+                                 pxe_error=PxeMapAuthError("check PXE_MAP_TOKEN"))
+        async with _Harness(acts) as client:
+            result = await _execute(client)
+
+        assert result.found and result.pxe_failed
+        assert calls["lookup_server_membership"] == calls["release_server"] == []
+        assert result.lock_released is False and "PXE cleanup failed" in result.lock_detail
+
+    async def test_a_lock_taken_since_the_read_is_reported_not_cleared(self):
+        # server-scan's 409 `held_by`: another run took the machine between the read and the release.
+        calls, acts = make_mocks(lock=INSTALL_LOCK,
+                                 release_detail="left alone, it is not ours: held by another run")
+        async with _Harness(acts) as client:
+            result = await _execute(client)
+        assert len(calls["release_server"]) == 1
+        assert result.lock_released is False and "not ours" in result.lock_detail
+
+    async def test_a_refused_release_is_reported_and_the_removal_completes(self):
+        calls, acts = make_mocks(lock=INSTALL_LOCK, release_error=ServerScanAuthError("needs ADMIN"))
+        async with _Harness(acts) as client:
+            result = await _execute(client)
+        assert result.found and result.agents_removed == ["agent-1"]
+        assert len(calls["release_server"]) == 1  # non-retryable
+        assert not result.lock_released and "ServerScanAuthError: needs ADMIN" in result.lock_detail
+
+    async def test_an_ambiguous_name_is_reported_and_the_removal_completes(self):
+        calls, acts = make_mocks(membership_error=AmbiguousServerNameError("srv_1, srv_9"))
+        async with _Harness(acts) as client:
+            result = await _execute(client)
+        assert len(calls["lookup_server_membership"]) == 1  # non-retryable
+        assert calls["release_server"] == []
+        assert not result.lock_released and result.lock_detail.startswith("not read: AmbiguousServerNameError")
+
+    async def test_a_limb_that_predates_the_lock_read_releases_nothing(self):
+        calls, acts = make_mocks(lock=INSTALL_LOCK, legacy_membership=True)
+        async with _Harness(acts) as client:
+            result = await _execute(client)
+        assert calls["release_server"] == [] and not result.lock_released
+        assert "predates the lock read" in result.lock_detail
+
+    async def test_a_run_recorded_before_the_release_leaves_the_lock(self, monkeypatch):
+        monkeypatch.setattr(
+            workflow, "patched", lambda patch_id: patch_id != remove_server._RELEASE_LOCK_PATCH
+        )
+        calls, acts = make_mocks(lock=INSTALL_LOCK)
+        async with _Harness(acts) as client:
+            result = await _execute(client)
+        assert calls["order"][-1] == "verify"
+        assert calls["lookup_server_membership"] == calls["release_server"] == []
+        assert not result.lock_released and result.lock_detail is None
+
+
+def test_the_lock_holders_are_the_workflows_own():
+    assert remove_server._INSTALL_HOLDER == install_server._RESERVATION_HOLDER
+    assert remove_server._UNINSTALL_HOLDER == uninstall_server._RESERVATION_HOLDER

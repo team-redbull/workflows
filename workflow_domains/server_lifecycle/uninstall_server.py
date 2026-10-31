@@ -103,6 +103,15 @@ Shape of the run (the `progress` query exposes the phase and the MCE's queue):
   6. holding-server     — the lock extended to 24 h BEFORE the child starts,
                            so the hold covers the inventory half too.
   7. removing-from-inventory — remove-server, awaited; its result is embedded.
+                           The child leaves this run's lock alone.
+  8. releasing-server   — the run's OWN lock given back once the child
+                           completed with nothing left on the MCE and no PXE
+                           cleanup failure (`lock_released`). Kept — to its
+                           expiry, and named in `skipped` — when the PXE
+                           cleanup failed (the host's MACs may still chain to
+                           this MCE's discovery image), and never reached with
+                           keep_inventory (the server stays in the InfraEnv) or
+                           when the child failed.
 
 Every skipped step is named in the result's `skipped`; what HyperShift had
 left is in `leftovers_at_start`, and every write the run made on a
@@ -138,11 +147,17 @@ moment its Node disappears, and the MCE's agents job re-claims it as
 INSTALLED_TO_INVENTORY on its own 15-minute cadence. Between the two the
 document can read AVAILABLE while the host is still in this MCE's InfraEnv —
 and another MCE's install-server would draw it. The lock closes that window
-from before the first write; on success it is held for a day (install-server's
-`_INSTALLED_HOLD`), and on failure it is left to its TTL, because the host may
-still be half-way out. A lock another run holds — install-server's day-long
-hold after it installed the machine, typically — fails the run before anything
-is written.
+from before the first write and is extended to a day before the inventory
+half (install-server's `_INSTALLED_HOLD`); on failure it is left to its TTL,
+because the host may still be half-way out. Once remove-server has taken the
+host off the MCE the window is closed for good, so the run RELEASES it (the
+operator's decision, 2026-10-31: a server just uninstalled could not be
+installed anywhere for a day) — unless the PXE cleanup failed, or with
+keep_inventory, where the server is still in this InfraEnv and the day-long
+hold stays. Runs recorded before `uninstall-server-release-after-removal`
+keep the hold. A lock another run holds — install-server's day-long hold
+after it installed the machine, typically — fails the run before anything is
+written.
 
 WHAT IS NEVER DONE: no NodePool change; no drain or Node delete where CAPI can
 still do it (only for a Node no Machine stands behind, and a Node is deleted
@@ -214,6 +229,7 @@ with workflow.unsafe.imports_passed_through():
         lookup_server_membership,
         release_agent,
         release_machine_hook,
+        release_server,
         reserve_server,
     )
     from shared.models.server_lifecycle import (
@@ -233,6 +249,7 @@ with workflow.unsafe.imports_passed_through():
         HostedNodeRef,
         MachineRef,
         MachineState,
+        ReleaseServerRequest,
         RemoveServerInput,
         RemoveServerResult,
         RemoveServerRunArgs,
@@ -317,6 +334,9 @@ _LEFTOVERS_PATCH = "uninstall-server-hosted-leftovers"
 # An inventory host is inspected again right before remove-server. Runs
 # recorded before it go straight to the hold.
 _INVENTORY_VERIFY_PATCH = "uninstall-server-inventory-verify"
+# The run's own lock is released once remove-server took the host off the MCE.
+# Runs recorded before it end at the child and keep the day-long hold.
+_RELEASE_PATCH = "uninstall-server-release-after-removal"
 # The leftover flow can drain a lost Node AND wait out a Machine drain, and
 # verifies three things after the unbind instead of two.
 _LEFTOVERS_RESERVATION_TTL = (
@@ -586,6 +606,10 @@ class UninstallServerWorkflow:
 
         if request.keep_inventory:
             skipped.append(self._kept_note(request, host))
+            skipped.append(
+                "releasing-server: keep_inventory was asked — the server is still in this "
+                "InfraEnv, so the lock is left to its expiry"
+            )
             result.kept_in_inventory = True
             result.skipped = skipped
             self._phase = "completed"
@@ -606,19 +630,87 @@ class UninstallServerWorkflow:
         result.remove_server = await self._remove_from_inventory(
             request, result.remove_server_workflow_id
         )
+
+        # Step 7 — the host is off the MCE, so the window the lock closed is
+        # closed for good: the run's own lock goes back.
+        if workflow.patched(_RELEASE_PATCH):
+            result.lock_released = await self._release(
+                request, membership, result.remove_server, skipped, activity_queue
+            )
         result.skipped = skipped
 
         self._phase = "completed"
         workflow.logger.info(
-            "Uninstalled %s from MCE %s: hosted=%s machine=%s node=%s, removal found=%s",
+            "Uninstalled %s from MCE %s: hosted=%s machine=%s node=%s, removal found=%s, "
+            "lock released=%s",
             request.server_name,
             request.mce_cluster,
             result.hosted,
             result.machine,
             result.node_name,
             result.remove_server.found,
+            result.lock_released,
         )
         return result
+
+    async def _release(
+        self,
+        request: UninstallServerInput,
+        membership: ServerMembership,
+        removal: RemoveServerResult,
+        skipped: list[str],
+        task_queue: str,
+    ) -> bool:
+        """Give the run's own lock back once remove-server completed. True when released.
+
+        Its own holder and workflow id, so server-scan's compare-and-delete
+        never clears a lock another run took after this one's lapsed. Kept when
+        remove-server's PXE cleanup failed: the host's MACs may still chain to
+        this MCE's discovery image. Never fails the run — the server is out of
+        the MCE by now and the lock expires on its own — so a refusal is
+        named in `skipped` instead.
+        """
+        if removal.pxe_failed:
+            skipped.append(
+                "releasing-server: remove-server's PXE cleanup failed ("
+                + "; ".join(removal.pxe_failed)
+                + "), so the host may still boot this MCE's discovery image — the lock is "
+                "left to its expiry"
+            )
+            return False
+        self._phase = "releasing-server"
+        try:
+            released = await self._call(
+                release_server,
+                ReleaseServerRequest(
+                    server_id=membership.server_id or "",
+                    server_name=membership.server_name or request.server_name,
+                    holder=_RESERVATION_HOLDER,
+                    workflow_id=workflow.info().workflow_id,
+                ),
+                task_queue,
+            )
+        except ActivityError as err:
+            cause = err.cause
+            detail = (
+                f"{cause.type}: {cause.message}"
+                if isinstance(cause, ApplicationError)
+                else f"{type(cause).__name__ if cause else 'ActivityError'}: {cause or err}"
+            )
+            workflow.logger.warning(
+                "server-scan refused to release the lock on %s (%s); it runs to its expiry",
+                request.server_name,
+                detail,
+            )
+            skipped.append(
+                f"releasing-server: server-scan refused the release ({detail}) — the lock "
+                "runs to its expiry"
+            )
+            return False
+        if released.detail:
+            skipped.append(f"releasing-server: not released — {released.detail}")
+            return False
+        return True
 
     @staticmethod
     def _kept_note(request: UninstallServerInput, host: BoundHostState) -> str:

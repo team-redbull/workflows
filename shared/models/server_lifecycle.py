@@ -673,6 +673,13 @@ class RemoveServerResult(BaseModel):
     # by then the host is gone from the MCE, so a PXE VM that rejects the token
     # or cannot be reached is reported here (and logged), never a failed run.
     pxe_failed: list[str] = Field(default_factory=list)
+    # server-scan's install lock, once nothing of the host is left here and
+    # the PXE cleanup had no failure: install-server's lock FOR THIS MCE is
+    # released (`lock_released`); any other — another MCE's, uninstall-server's,
+    # none live — is left, and `lock_detail` says what was found and why.
+    # None/False on a found=false run and on runs recorded before the release.
+    lock_released: bool = False
+    lock_detail: str | None = None
 
 
 class PublishInfraEnvBootInput(BaseModel):
@@ -840,6 +847,21 @@ class ServerMembershipRequest(BaseModel):
     server_name: str = Field(min_length=1)
 
 
+class ServerLockRecord(BaseModel):
+    """server-scan's install lock on one server, as its document stores it (ADR-0035).
+
+    `live` is judged by the limb at read time — held, and either no expiry or
+    one still ahead — the same test server-scan applies. server-scan keys "the
+    same claim" on `workflow_id`, so that is what says the lock is a run's own.
+    """
+
+    live: bool = False
+    holder: str | None = None
+    workflow_id: str | None = None
+    mce_cluster: str | None = None
+    expires_at: str | None = None
+
+
 class ServerMembership(BaseModel):
     """server-scan's record of WHERE one server is — the authority for it.
 
@@ -865,21 +887,12 @@ class ServerMembership(BaseModel):
     contested_with: str | None = None
     maintenance: bool = False
     maintenance_reason: str | None = None
-
-
-class ServerLockRecord(BaseModel):
-    """server-scan's install lock on one server, as its document stores it (ADR-0035).
-
-    `live` is judged by the limb at read time — held, and either no expiry or
-    one still ahead — the same test server-scan applies. server-scan keys "the
-    same claim" on `workflow_id`, so that is what says the lock is a run's own.
-    """
-
-    live: bool = False
-    holder: str | None = None
-    workflow_id: str | None = None
-    mce_cluster: str | None = None
-    expires_at: str | None = None
+    # The install lock on it, as lookup_server_membership read it — what
+    # remove-server releases once the host is gone from this MCE. Absent from a
+    # limb predating it, so a workflow reads it only by the key's presence
+    # (CLAUDE.md §5). lookup_install_candidate reports the lock as its own
+    # `InstallCandidateRecord.lock` and leaves this one at its default.
+    lock: ServerLockRecord = Field(default_factory=ServerLockRecord)
 
 
 class InstallCandidateRecord(BaseModel):
@@ -1301,6 +1314,12 @@ class UninstallServerResult(BaseModel):
     leftovers_at_start: list[str] = Field(default_factory=list)
     cleaned_up: list[str] = Field(default_factory=list)
     reservation_expires_at: str | None = None
+    # The run's own install lock was given back once remove-server completed
+    # with nothing left on the MCE and no PXE cleanup failure, so the server can
+    # be installed again at once. False otherwise (keep_inventory, a PXE
+    # failure, a release server-scan refused — `skipped` says which) and on runs
+    # recorded before the release: the hold then runs to `reservation_expires_at`.
+    lock_released: bool = False
     # keep_inventory was asked: the server was left in the MCE's inventory, and
     # remove-server never started (remove_server* stay None).
     kept_in_inventory: bool = False

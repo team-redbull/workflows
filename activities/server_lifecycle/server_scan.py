@@ -264,7 +264,7 @@ async def _detail_by_exact_name(
     EXACTLY (case-insensitive — a search hit alone could be another machine).
     Two documents of one name are an ERROR, not a union: the answer is one
     machine and its `srv_…` id, which the install lock is then taken on.
-    `purpose` finishes the ambiguity message ("to uninstall", "to install").
+    `purpose` finishes the ambiguity message ("to look up", "to install").
     """
     wanted = server_name.lower()
     async with httpx.AsyncClient(
@@ -307,19 +307,22 @@ def _membership(detail: dict[str, Any]) -> ServerMembership:
 
 
 async def server_membership_by_name(
-    base_url: str, token: str, server_name: str
+    base_url: str, token: str, server_name: str, *, now: datetime | None = None
 ) -> ServerMembership:
-    """server-scan's record of where the server of this exact name is.
+    """server-scan's record of where the server of this exact name is, and its lock.
 
     The same two steps as server_macs_by_name — search narrows, the detail
     confirms the name exactly — but here two documents of one name are an
     ERROR, not a union: the answer is one machine's membership and its
-    `srv_…` id, which the install lock is then taken on.
+    `srv_…` id, which the install lock is then taken on (uninstall-server) or
+    released from (remove-server). The lock is judged live at read time.
     """
-    detail = await _detail_by_exact_name(base_url, token, server_name, "to uninstall")
+    detail = await _detail_by_exact_name(base_url, token, server_name, "to look up")
     if detail is None:
         return ServerMembership(found=False)
-    return _membership(detail)
+    membership = _membership(detail)
+    membership.lock = _lock_record(detail.get("reservation") or {}, now or datetime.now(UTC))
+    return membership
 
 
 def bmc_vendor_for(vendor: str | None, source_provider: str | None) -> str | None:
@@ -357,6 +360,19 @@ def _lock_is_live(reservation: dict[str, Any], now: datetime) -> bool:
     if expiry.tzinfo is None:
         expiry = expiry.replace(tzinfo=UTC)
     return now < expiry
+
+
+def _lock_record(reservation: dict[str, Any], now: datetime) -> ServerLockRecord:
+    """The document's `reservation` as the lock it is, judged live at `now`."""
+    return ServerLockRecord(
+        live=_lock_is_live(reservation, now),
+        holder=reservation.get("holder"),
+        workflow_id=reservation.get("workflow_id"),
+        mce_cluster=reservation.get("mce_cluster"),
+        expires_at=(
+            None if reservation.get("expires_at") is None else str(reservation["expires_at"])
+        ),
+    )
 
 
 def _acquired_from_detail(detail: dict[str, Any]) -> AcquiredServer:
@@ -406,22 +422,13 @@ async def install_candidate_by_name(
     if detail is None:
         return InstallCandidateRecord()
     health = detail.get("health") or {}
-    reservation = detail.get("reservation") or {}
     reachable = detail.get("reachable")
     return InstallCandidateRecord(
         membership=_membership(detail),
         server=_acquired_from_detail(detail),
         health={key: str(health[key]) for key in _HEALTH_KEYS if health.get(key) is not None},
         reachable=None if reachable is None else bool(reachable),
-        lock=ServerLockRecord(
-            live=_lock_is_live(reservation, now or datetime.now(UTC)),
-            holder=reservation.get("holder"),
-            workflow_id=reservation.get("workflow_id"),
-            mce_cluster=reservation.get("mce_cluster"),
-            expires_at=(
-                None if reservation.get("expires_at") is None else str(reservation["expires_at"])
-            ),
-        ),
+        lock=_lock_record(detail.get("reservation") or {}, now or datetime.now(UTC)),
     )
 
 

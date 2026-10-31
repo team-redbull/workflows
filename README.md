@@ -164,6 +164,9 @@ check sees only *this* MCE, so without the lock a run for MCE-B could draw S1
 minutes after MCE-A installed it. `/servers/available` never hands out a locked
 machine. The 24 h hold after success writes nothing to any cluster — it only
 keeps S1 out of other draws until server-scan can see it in a cluster itself.
+A server taken out of that MCE within the day gets it back early: remove-server
+releases install-server's lock for its MCE once nothing of the server is left
+there (the operator's decision, 2026-10-31).
 
 **Who checks what.** server-scan: unclaimed, not in maintenance, BMC
 reachable, health tier, the **network category HEALTHY — at least two links
@@ -531,7 +534,12 @@ takes server-scan's **install lock** (holder `uninstall-server`): the hosted
 cluster's nodes job frees the server the moment its Node is gone while the
 MCE's agents job re-claims it only every 15 min, so in between it can read
 `AVAILABLE` while still in this InfraEnv. The lock is extended to 24 h before
-the child starts and left to its TTL on a failure. A lock another run holds —
+the child starts and left to its TTL on a failure. Once remove-server completed
+with nothing left on the MCE and no PXE cleanup failure, the run **releases**
+it (**releasing-server**, `lock_released: true`; the operator's decision,
+2026-10-31), so the server can be installed again at once. With
+`keep_inventory`, or when the PXE cleanup failed, the day-long hold stays. A
+lock another run holds —
 install-server's day-long hold after it installed the machine, typically —
 fails the run (`ServerReservedError`); release it in server-scan and re-run.
 

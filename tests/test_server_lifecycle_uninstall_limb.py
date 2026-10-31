@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import base64
 import pathlib
+from datetime import UTC, datetime
 from typing import ClassVar
 
 import httpx
@@ -83,6 +84,41 @@ class TestServerMembership:
         assert membership.contested_with is None
         assert membership.maintenance and membership.maintenance_reason == "fan swap"
         assert not other.called
+
+    @respx.mock
+    async def test_the_install_lock_is_read_and_judged_live_at_read_time(self):
+        """What remove-server releases install-server's lock for its MCE by."""
+        respx.get(f"{SS}/servers").mock(return_value=httpx.Response(200, json={"items": [
+            {"id": "srv_1", "name": SERVER},
+        ]}))
+        respx.get(f"{SS}/servers/srv_1").mock(return_value=httpx.Response(200, json={
+            "name": SERVER,
+            "reservation": {"holder": "install-server", "workflow_id": "install-server-run-a",
+                            "mce_cluster": "ocp4-mce-a", "expires_at": "2026-10-31T12:00:00Z"},
+        }))
+        before = datetime(2026, 10, 31, 11, 0, tzinfo=UTC)
+        after = datetime(2026, 10, 31, 13, 0, tzinfo=UTC)
+
+        live = await server_scan.server_membership_by_name(SS, "t", SERVER, now=before)
+        assert live.lock.live is True
+        assert (live.lock.holder, live.lock.workflow_id, live.lock.mce_cluster, live.lock.expires_at) == (
+            "install-server", "install-server-run-a", "ocp4-mce-a", "2026-10-31T12:00:00Z",
+        )
+        lapsed = await server_scan.server_membership_by_name(SS, "t", SERVER, now=after)
+        assert lapsed.lock.live is False and lapsed.lock.holder == "install-server"
+
+    @respx.mock
+    async def test_no_reservation_is_no_live_lock(self):
+        respx.get(f"{SS}/servers").mock(return_value=httpx.Response(200, json={"items": [
+            {"id": "srv_1", "name": SERVER},
+        ]}))
+        respx.get(f"{SS}/servers/srv_1").mock(return_value=httpx.Response(200, json={
+            "name": SERVER, "reservation": {"holder": None},
+        }))
+        membership = await server_scan.server_membership_by_name(SS, "t", SERVER)
+        assert membership.found and membership.lock.live is False and membership.lock.holder is None
+        # The key is always sent, so a workflow can tell this limb from one predating it.
+        assert "lock" in type(membership).model_validate(membership.model_dump()).model_fields_set
 
     @respx.mock
     async def test_an_unknown_name_is_found_false(self):

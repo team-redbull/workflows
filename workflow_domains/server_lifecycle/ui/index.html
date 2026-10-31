@@ -318,6 +318,7 @@ const FLOWS = {
       "removing-agent": ["Deleting the Agent", "Last, once nothing can bring it back."],
       "removing-pxe-boot": ["Clearing the PXE map", "Every MAC the host is known by comes off its site's PXE VM. Best effort: a failure here is reported, not fatal."],
       "verifying": ["Verifying it is gone", "Re-inspects (up to 5 min) until nothing of the server is left on the MCE."],
+      "releasing-server": ["Releasing the lock", "install-server's lock for this MCE goes back to server-scan, so the server can be installed again. Any other lock is left alone."],
       "completed": ["Removed", ""],
     },
     steps: [
@@ -327,6 +328,7 @@ const FLOWS = {
       ["Delete the Agent", ["removing-agent"]],
       ["Clear the PXE map", ["removing-pxe-boot"]],
       ["Verify nothing is left", ["verifying"]],
+      ["Release the lock", ["releasing-server"]],
     ],
   },
   uninstall: {
@@ -345,6 +347,7 @@ const FLOWS = {
       "verifying-agent": ["Verifying the Agent is free", ""],
       "holding-server": ["Holding the lock a day", "So no other MCE draws the machine meanwhile."],
       "removing-from-inventory": ["Removing it from the inventory", "remove-server runs as an awaited child."],
+      "releasing-server": ["Releasing the lock", "The server is out of the MCE: its lock goes back to server-scan, so it can be installed again."],
       "completed": ["Uninstalled", ""],
     },
     sub: { draining: "Draining: the Agent is still bound", releasing: "Releasing: the run unbinds the Agent itself",
@@ -357,6 +360,7 @@ const FLOWS = {
       ["Verify AgentMachine, Node, Agent", ["verifying-agentmachine", "verifying-node", "verifying-agent"]],
       ["Hold the lock a day", ["holding-server"]],
       ["Remove from the inventory (remove-server)", ["removing-from-inventory"]],
+      ["Release the lock", ["releasing-server"]],
     ],
   },
   publish: {
@@ -606,6 +610,8 @@ function steps(v) {
       else note(4, [cleared.length && `${cleared.length} cleared`, kept.length && `${kept.length} kept (another MCE's)`,
         failed.length && `${failed.length} failed`].filter(Boolean).join(", "));
       note(5, "Nothing left on the MCE");
+      if (r.lock_released) note(6, "Released: it can be installed again");
+      else skip(6, r.lock_detail || "Left to its expiry: a run from before the release");
     }
   } else if (v.flow === FLOWS.uninstall) {
     if (r) {
@@ -617,10 +623,14 @@ function steps(v) {
       if (r.hosted || arr(r.cleaned_up).length) note(3, r.machine_deleted_by_run ? `Deleted Machine ${r.machine}` : r.machine ? `Machine ${r.machine} was already going` : "");
       else skip(3, "Not a hosted cluster's node");
       if (nothing) skip(4, "Nothing to verify");
-      if (r.reservation_expires_at) note(5, `Until ${clock(r.reservation_expires_at)}`);
+      if (r.reservation_expires_at) note(5, r.lock_released ? "Held until the server was out of the MCE" : `Until ${clock(r.reservation_expires_at)}`);
       else if (nothing) skip(5, "No lock taken"); else note(5, "Not extended: the run's log says why");
       if (r.kept_in_inventory) skip(6, "keep_inventory: left in the MCE's inventory");
       else if (r.remove_server) note(6, r.remove_server.found ? `Removed by ${r.remove_server_workflow_id}` : "Nothing of it was left on the MCE");
+      const kept = arr(r.skipped).find((x) => x.startsWith("releasing-server: "));
+      if (r.lock_released) note(7, "Released: it can be installed again");
+      else if (nothing) skip(7, "No lock taken");
+      else skip(7, kept ? kept.slice("releasing-server: ".length) : "Left to its expiry: a run from before the release");
     } else if (p.phase === "awaiting-machine-deletion") {
       note(3, [v.flow.sub[p.sub_phase] || p.sub_phase, p.agent_state && `Agent ${p.agent_state}`].filter(Boolean).join(" · "));
     }
@@ -752,11 +762,12 @@ function renderNow(v) {
 function summary(v) {
   const r = v.r || {};
   if (v.flow === FLOWS.install) return `${r.server_name} is installable in InfraEnv ${r.namespace}/${r.infra_env}: its Agent ${r.agent_name || "(not named)"} registered${r.attempts > 1 ? ` on attempt ${r.attempts}` : ""}.`;
-  if (v.flow === FLOWS.remove) return r.found ? `${r.server_name} is out of the inventory of ${r.mce_cluster}.` : `Nothing of ${r.server_name} was on ${r.mce_cluster}: nothing to remove.`;
+  const again = r.lock_released ? " Its lock is released: it can be installed again." : "";
+  if (v.flow === FLOWS.remove) return r.found ? `${r.server_name} is out of the inventory of ${r.mce_cluster}.${again}` : `Nothing of ${r.server_name} was on ${r.mce_cluster}: nothing to remove.`;
   if (v.flow === FLOWS.uninstall) {
     const where = r.hosted ? `left ${r.hosted_cluster || "its hosted cluster"}` : "was only inventory";
     return r.kept_in_inventory ? `${r.server_name} ${where} and stays in the inventory of ${r.mce_cluster} as a free Agent.`
-      : `${r.server_name} ${where} and is out of ${r.mce_cluster}.`;
+      : `${r.server_name} ${where} and is out of ${r.mce_cluster}.${again}`;
   }
   return r.superseded ? `The ${r.site} PXE VM already held a newer image of ${r.infra_env}, and kept it: the entry is current.`
     : `The ${r.site} PXE VM serves the image of ${r.infra_env} created ${clock(r.image_created_at)}.`;
@@ -806,6 +817,7 @@ function renderFacts(v) {
         ["PXE cleared", codeList(r.pxe_cleared), true],
         ["PXE kept", codeList(r.pxe_kept), true],
         ["PXE failed", codeList(r.pxe_failed, "warn"), true],
+        r.found && ["Lock", r.lock_released ? "released" : r.lock_detail || null],
       ]);
     }
     return kv([
@@ -824,7 +836,8 @@ function renderFacts(v) {
         ["Machine", r.machine ? `${code(r.machine)}${r.machine_deleted_by_run ? " · deleted by this run" : ""}` : null, true],
         ["AgentMachine", r.agent_machine ? code(r.agent_machine) : null, true],
         ["Node", r.node_name ? code(r.node_name) : null, true],
-        ["Lock", r.reservation_expires_at ? `held until ${clock(r.reservation_expires_at)}` : null],
+        ["Lock", r.lock_released ? "released once the server was out of the MCE"
+          : r.reservation_expires_at ? `held until ${clock(r.reservation_expires_at)}` : null],
         ["Kept in inventory", r.kept_in_inventory ? "yes: a free Agent of the InfraEnv" : null],
         ["Leftovers found", codeList(r.leftovers_at_start), true],
         ["Cleaned up", codeList(r.cleaned_up), true],

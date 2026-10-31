@@ -206,7 +206,9 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   server installed into MCE-A is drawn again for MCE-B. Taken after the probe,
   before any write; holder `install-server` + the run's workflow id, so a retry
   or a renewal EXTENDS it; renewed as the Agent wait begins; held a day after
-  success; released ONLY after a teardown (a failure elsewhere leaves it to its
+  success, unless the server leaves the MCE first — remove-server then releases
+  it (the operator's decision, 2026-10-31, below); install-server itself
+  releases it ONLY after a teardown (a failure elsewhere leaves it to its
   TTL, since half-created resources may still name the machine). A lock held
   elsewhere is a skip (`reserved`), like every candidate reason. A RE-RUN of the
   same named install (same workflow id) after such a failure never reached
@@ -338,8 +340,18 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   found NOWHERE on the MCE touches the PXE map neither (nothing ties its MACs
   to this MCE). The InfraEnv's boot entry is shared and never removed. An OLD
   pxe-map-api ignores `?mce_cluster` and deletes unconditionally — upgrade the
-  PXE VMs first. Leaves server-scan's lock alone. Needs `delete` on agents in
-  the limb's RBAC.
+  PXE VMs first. LAST, server-scan's install lock (`releasing-server`, gated
+  `remove-server-release-own-mce-lock`; the operator's decision, 2026-10-31 —
+  a server removed the day it was installed stayed undrawable for the rest of
+  install-server's day-long hold): once nothing is left and `pxe_failed` is
+  empty, the lock is read (`lookup_server_membership`, which returns `lock`
+  now — read by the key's presence, §5) and released with the holder +
+  workflow id read, so server-scan compares and deletes exactly that lock —
+  ONLY when it is live, `install-server`'s and for THIS MCE (canonical names).
+  Left alone: another MCE's, `uninstall-server`'s (its run releases its own
+  after this child completes — never raced), any other holder's; not read at
+  all on found=false or a PXE failure. Never fails the run: `lock_released`,
+  `lock_detail`. Needs `delete` on agents in the limb's RBAC.
 - **uninstall-server takes ONE server all the way out of an MCE, whatever its
   Agent's state** (`workflow_domains/server_lifecycle/uninstall_server.py`, own
   queue `uninstall-server-workflow`, id `uninstall-server-<server lowercased>`,
@@ -401,7 +413,8 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   `verifying-agent` (no
   binding, no label, known-unbound, approved, BMH present and not in error; 5 min,
   `AgentStillBoundError`) → `holding-server` (24 h BEFORE the child, so the hold
-  covers the inventory half) → `removing-from-inventory`. Every skip goes into
+  covers the inventory half) → `removing-from-inventory` → `releasing-server`
+  (the lock given back, below). Every skip goes into
   `result.skipped`. NOTHING IS UNDONE after the Machine delete — it cannot be —
   and a re-run of the same id RESUMES. NODEPOOL REPLICAS ARE NOT ITS BUSINESS:
   the run deletes the Machine ITSELF (no prerequisite) and the NodePool backfills
@@ -422,6 +435,14 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   held elsewhere fails the run (install-server's day-long `_INSTALLED_HOLD` on a
   freshly installed machine does — release it in server-scan); on failure left
   to its TTL; a refused 24 h extension is logged and the child still runs.
+  Once the child completed with `pxe_failed` empty (found=false included:
+  nothing on the MCE), the run RELEASES ITS OWN lock (`releasing-server`, gated
+  `uninstall-server-release-after-removal`; the operator's decision,
+  2026-10-31 — an uninstalled server could not be installed anywhere for a
+  day). Kept: with `keep_inventory` (still in the InfraEnv) and on a PXE
+  failure (its MACs may still chain to this MCE's discovery image); a child
+  failure never reaches it; a refused release is named in `skipped`, never a
+  failure. `lock_released` on the result.
   HOSTED-CLUSTER ACCESS: `HostedCluster.status.kubeconfig.name` in the
   HostedCluster's namespace, the kubeconfig parsed BY THE LIMB
   (`activities/server_lifecycle/hosted_cluster_api.py` — the kubernetes client's

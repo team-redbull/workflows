@@ -129,6 +129,8 @@
               <li><b>verify</b> that no BareMetalHost, NMStateConfig or Agent of it is left (5 min).</li>
             </ol>
           </li>
+          <li><b>Releases the lock</b> in server-scan, so the server can be installed again at once
+            (<a href="#lock">kept when the PXE cleanup failed</a>).</li>
         </ol>
       </div>
     </div>
@@ -183,8 +185,8 @@
       <h3><code>"keep_inventory": true</code> &mdash; out of the hosted cluster, still in the inventory</h3>
       <p>Everything up to the end of the hosted-cluster half runs exactly as above &mdash; Machine deleted,
       Agent released and back in discovery, Machine, AgentMachine and Node verified gone, the Agent verified
-      <code>known-unbound</code> and approved &mdash; and the lock is held for a day. Then the run
-      <b>stops</b>: no remove-server. The host stays <b>powered on in discovery</b>, a free Agent of the
+      <code>known-unbound</code> and approved &mdash; and the lock is held for a day, and <b>kept</b>: the
+      server is still in this InfraEnv. Then the run <b>stops</b>: no remove-server. The host stays <b>powered on in discovery</b>, a free Agent of the
       InfraEnv; its BareMetalHost, NMStateConfig, Agent and PXE mapping are left as they are. The result
       says <code>kept_in_inventory: true</code>, with <code>remove_server: null</code>.</p>
       <p class="note">On a server that is already only inventory there is nothing to do: the run completes
@@ -523,6 +525,9 @@
               site&rsquo;s PXE VM (best effort).</li>
             <li><b>verifying</b> &mdash; no BareMetalHost, NMStateConfig or Agent of it left (5 min, else
               <code>ServerStillPresentError</code>).</li>
+            <li><b>releasing-server</b> &mdash; reads server-scan&rsquo;s lock and finds this run&rsquo;s
+              (holder <code>uninstall-server</code>): <b>left alone</b>, for this run to release in step 8.
+              Only an <code>install-server</code> lock for this MCE is released by remove-server.</li>
           </ol>
           <div class="calls">
             <div class="call sm"><span class="verb">PATCH</span><span class="path">baremetalhosts/&lt;server&gt; <em>&middot; spec.online: false, then annotation detached</em></span></div>
@@ -538,6 +543,30 @@
           between its power-off and its deletes. A remove-server already running on that id fails this run
           (<code>RemoveServerAlreadyRunningError</code>, naming it); a child that fails fails it too
           (<code>RemoveServerFailedError</code>, carrying the child&rsquo;s own error).</p>
+        </div>
+      </div>
+
+      <!-- 8 -->
+      <div class="step">
+        <div class="marker">8</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>release_server</h3>
+            <span class="phase">phase <b>releasing-server</b></span>
+          </div>
+          <p>The server is out of the MCE, so nothing can draw it while it is still in this InfraEnv any
+          more: the run gives <b>its own</b> lock back &mdash; holder <code>uninstall-server</code> and its
+          own workflow id, which server-scan compares before it deletes &mdash; and the server can be
+          installed again at once (<code>lock_released: true</code>). The operator&rsquo;s decision,
+          2026-10-31: before it, an uninstalled server could not be installed anywhere for a day.</p>
+          <div class="calls">
+            <div class="call sm"><span class="verb">DELETE</span><span class="path">/servers/{id}/reservation <em>&middot; {holder, workflow_id}</em></span></div>
+          </div>
+          <p class="note"><b>Kept</b>, to its expiry, when remove-server&rsquo;s PXE cleanup failed (the
+          host&rsquo;s MACs may still chain to this MCE&rsquo;s discovery image) &mdash; named in
+          <code>skipped</code>. Never reached with <code>keep_inventory</code> (the server is still in the
+          InfraEnv) or when the child failed. A release server-scan refuses is named in
+          <code>skipped</code>, and the run still completes.</p>
         </div>
       </div>
 
@@ -612,12 +641,15 @@
         clusters on one BMC.</p>
       </div>
       <div class="panel">
-        <h3>Taken first, held a day, never released by a failure</h3>
+        <h3>Taken first, released once the server is out, never by a failure</h3>
         <p>Taken before the first write, with a TTL covering the hosted-cluster half; extended to 24 h before
-        the inventory half; on a failure <b>left to its TTL</b>, because the host may still be half-way
-        out.</p>
-        <p class="note">The flip side of the day-long hold: a machine uninstalled now is not drawable by
-        install-server for a day, unless someone releases it in server-scan.</p>
+        the inventory half; <b>released</b> once remove-server took the host off the MCE with no PXE
+        cleanup failure &mdash; the window is closed for good then. On a failure <b>left to its TTL</b>,
+        because the host may still be half-way out.</p>
+        <p class="note">The operator&rsquo;s decision, 2026-10-31: before it, a machine just uninstalled
+        was not drawable by install-server for a day. The day-long hold now stays only where the server is
+        still tied to this MCE: <code>keep_inventory</code>, or a PXE cleanup that failed. Runs started
+        before it keep the hold.</p>
       </div>
     </div>
   </section>
@@ -805,9 +837,11 @@
     "leftovers_at_start": [],                     <span class="c">// what HyperShift had left, in words</span>
     "cleaned_up": [],                             <span class="c">// every write made on a controller's behalf, and why</span>
     "reservation_expires_at": "2026-10-25T09:00:00Z",
+    "lock_released": true,                        <span class="c">// false: why is the releasing-server entry in skipped</span>
     "kept_in_inventory": false,                   <span class="c">// true: remove_server* are null</span>
     "remove_server_workflow_id": "remove-server-ocp-cisco-m6-bat-yam-64c-512gb-wzp12345",
-    "remove_server": { "found": true, "powered_off": true, "agents_removed": [ "…" ], … }
+    "remove_server": { "found": true, "powered_off": true, "agents_removed": [ "…" ],
+                       "lock_released": false, "lock_detail": "left to uninstall-server: …", … }
   }
 }</pre>
           <p class="note"><code>machine_deleted_by_run: false</code> with a <code>deleting-machine:</code>
@@ -852,6 +886,7 @@
           <tr><td class="k">verifying-agent</td><td class="muted">Hosted nodes: the Agent is a clean inventory host</td><td class="muted">&le; 5 min</td></tr>
           <tr><td class="k">holding-server</td><td class="muted">The lock extended to 24 h</td><td class="muted">instant</td></tr>
           <tr><td class="k">removing-from-inventory</td><td class="muted">remove-server, awaited (its own phases are on its own id); never with <code>keep_inventory</code></td><td class="muted">minutes &mdash; remove-server&rsquo;s bounds</td></tr>
+          <tr><td class="k">releasing-server</td><td class="muted">The run&rsquo;s own lock given back, once remove-server completed with no PXE cleanup failure</td><td class="muted">instant</td></tr>
           <tr><td class="k">completed</td><td class="muted">The server is off the hosted cluster and out of the MCE</td><td class="muted">&mdash;</td></tr>
         </tbody>
       </table>

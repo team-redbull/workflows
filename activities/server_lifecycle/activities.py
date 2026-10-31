@@ -259,7 +259,7 @@ async def lookup_install_candidate(request: ServerMembershipRequest) -> InstallC
 
 @activity.defn
 async def release_server(request: ReleaseServerRequest) -> ServerReservation:
-    """Give the install lock back after a candidate was rolled back."""
+    """Give an install lock back: a rolled-back candidate's, or a server's leaving its MCE."""
     reservation = await server_scan.release_server(
         _settings.server_scan_url, _settings.server_scan_api_token, request
     )
@@ -984,12 +984,13 @@ _INFRAENV_LABEL = "infraenvs.agent-install.openshift.io"
 
 @activity.defn
 async def lookup_server_membership(request: ServerMembershipRequest) -> ServerMembership:
-    """server-scan's record of where this server is (search + exact-name detail)."""
+    """server-scan's record of where this server is, and its install lock (search + exact-name detail)."""
     membership = await server_scan.server_membership_by_name(
         _settings.server_scan_url, _settings.server_scan_api_token, request.server_name
     )
     activity.logger.info(
-        "server-scan on %s: found=%s id=%s state=%s cluster=%s mce=%s contested=%s maintenance=%s",
+        "server-scan on %s: found=%s id=%s state=%s cluster=%s mce=%s contested=%s maintenance=%s "
+        "lock=%s",
         request.server_name,
         membership.found,
         membership.server_id,
@@ -998,6 +999,7 @@ async def lookup_server_membership(request: ServerMembershipRequest) -> ServerMe
         membership.mce_name,
         membership.contested_with,
         membership.maintenance,
+        membership.lock.model_dump() if membership.lock.live else "none live",
     )
     return membership
 

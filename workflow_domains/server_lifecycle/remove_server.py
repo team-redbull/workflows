@@ -45,6 +45,16 @@ Shape of the run:
                         ServerStillPresentError naming it — typically an Agent
                         re-registered by a host that had no BMH to power it
                         off through.
+  7. releasing-server — server-scan's install lock, once nothing is left and
+                        the PXE cleanup had no failure: read from server-scan
+                        and released (with the holder and workflow id read, so
+                        server-scan compares and deletes exactly that lock)
+                        ONLY when it is live, install-server's, and for THIS
+                        MCE. Left alone: another MCE's, uninstall-server's
+                        (its run releases its own once this one, its child,
+                        completes), any other holder's. Never fails the run —
+                        the removal is done; `lock_released` / `lock_detail`
+                        say what was found.
 
 WHY POWER OFF FIRST, AND DELETE THE AGENT LAST. The host is still running the
 discovery image, and its agent re-registers with assisted-service when its
@@ -53,11 +63,19 @@ through its BMH stops that, and deleting the Agent only once the host is off
 means nothing is left to bring it back. (The detach in step 4 is then safe: the
 host is already off, so there is nothing for a deprovision to do.)
 
+WHY THE LOCK IS RELEASED (the operator's decision, 2026-10-31). install-server
+holds its lock a day after a success, until server-scan sees the machine in a
+cluster, so a machine removed within that day stayed undrawable for the rest
+of it. Once the host is fully out of this MCE that hold protects nothing, and
+it is given back — only this MCE's: nothing here says another MCE's install is
+over. Runs recorded before `remove-server-release-own-mce-lock` leave the lock
+to its TTL.
+
 The BMC Secret goes with the BMH (ownerReference, or explicitly). Not touched:
-server-scan's install lock (it expires on its own) and the InfraEnv's boot
-entry on the PXE VM (`<mce>/<infraenv>.ipxe`), which every other host of the
-InfraEnv chains through. A server found NOWHERE on the MCE is a no-op that
-touches the PXE map neither: nothing then ties its MACs to this MCE.
+the InfraEnv's boot entry on the PXE VM (`<mce>/<infraenv>.ipxe`), which every
+other host of the InfraEnv chains through. A server found NOWHERE on the MCE
+is a no-op that touches neither the PXE map nor the lock: nothing then ties
+its MACs to this MCE, and the lock may be an install that has not written yet.
 """
 
 from __future__ import annotations
@@ -69,6 +87,7 @@ from temporalio.common import RetryPolicy
 from temporalio.exceptions import ActivityError, ApplicationError
 
 with workflow.unsafe.imports_passed_through():
+    from shared.cluster_names import canonical_mce_cluster
     from shared.consts import (
         SEGMENT_LIFECYCLE_ACTIVITY_QUEUE,
         server_lifecycle_activity_queue,
@@ -76,6 +95,7 @@ with workflow.unsafe.imports_passed_through():
     from shared.exceptions import (
         AgentBoundToClusterError,
         AmbiguousInventorySegmentError,
+        AmbiguousServerNameError,
         BmhPrerequisiteMissingError,
         BmhRequestInvalidError,
         HostPowerOffTimeoutError,
@@ -85,6 +105,7 @@ with workflow.unsafe.imports_passed_through():
         PxeMapRequestRejectedError,
         SegmentsManagerAuthError,
         ServerScanAuthError,
+        ServerScanRequestInvalidError,
         ServerStillPresentError,
     )
     from shared.interfaces.segment_lifecycle import get_inventory_segment
@@ -92,6 +113,8 @@ with workflow.unsafe.imports_passed_through():
         delete_agents,
         get_baremetal_host,
         inspect_inventory_host,
+        lookup_server_membership,
+        release_server,
         remove_host_pxe_entries,
         set_host_online,
         teardown_bmh_resources,
@@ -102,9 +125,14 @@ with workflow.unsafe.imports_passed_through():
         HostPowerRequest,
         InventoryHostState,
         PxeHostEntriesRef,
+        ReleaseServerRequest,
+        RemoveServerInput,
         RemoveServerProgress,
         RemoveServerResult,
         RemoveServerRunArgs,
+        ServerMembership,
+        ServerMembershipRequest,
+        ServerReservation,
     )
 
 _ACTIVITY_TIMEOUT = timedelta(seconds=90)
@@ -121,6 +149,8 @@ _PERMANENT_ACTIVITY_ERRORS: tuple[type[Exception], ...] = (
     BmhRequestInvalidError,
     InvalidServerNameError,
     ServerScanAuthError,
+    ServerScanRequestInvalidError,
+    AmbiguousServerNameError,
     PxeMapAuthError,
     PxeMapRequestRejectedError,
     InventorySegmentNotFoundError,
@@ -160,6 +190,15 @@ _PXE_OWN_SITE_PATCH = "remove-server-pxe-own-site"
 # to its final check. (CLAUDE.md §5's unbounded retries out-wait outages the
 # RUN depends on; nothing about this removal depends on the PXE VM.)
 _PXE_CLEANUP_DEADLINE = timedelta(minutes=10)
+
+# Gates releasing install-server's lock for this MCE once the host is gone.
+# Runs recorded before it end at the final check and leave the lock to its TTL.
+_RELEASE_LOCK_PATCH = "remove-server-release-own-mce-lock"
+# The holders server-scan's lock may name: install_server._RESERVATION_HOLDER
+# and uninstall_server._RESERVATION_HOLDER (a test keeps them in step; this
+# module cannot import uninstall-server's, which imports it).
+_INSTALL_HOLDER = "install-server"
+_UNINSTALL_HOLDER = "uninstall-server"
 
 
 def _cause(err: ActivityError) -> str:
@@ -336,13 +375,23 @@ class RemoveServerWorkflow:
                 type=ServerStillPresentError.__name__,
             )
 
+        # Step 7 — nothing of the host is left here, so install-server's hold
+        # on it for THIS MCE protects nothing any more: given back.
+        lock_released = False
+        lock_detail: str | None = None
+        if workflow.patched(_RELEASE_LOCK_PATCH):
+            lock_released, lock_detail = await self._release_own_mce_lock(
+                request, pxe_failed, activity_queue
+            )
+
         self._phase = "completed"
         workflow.logger.info(
-            "Removed %s from MCE %s inventory: agents %s, resources %s",
+            "Removed %s from MCE %s inventory: agents %s, resources %s, lock: %s",
             request.server_name,
             request.mce_cluster,
             agents_removed,
             resources_removed,
+            lock_detail,
         )
         return result(
             found=True,
@@ -352,7 +401,82 @@ class RemoveServerWorkflow:
             pxe_cleared=pxe_cleared,
             pxe_kept=pxe_kept,
             pxe_failed=pxe_failed,
+            lock_released=lock_released,
+            lock_detail=lock_detail,
         )
+
+    async def _release_own_mce_lock(
+        self, request: RemoveServerInput, pxe_failed: list[str], task_queue: str
+    ) -> tuple[bool, str]:
+        """(released, what was found) for server-scan's install lock, the host gone.
+
+        Released ONLY when live, held by install-server, and for this run's
+        MCE — with the holder and workflow id just read, so server-scan's
+        compare-and-delete gives back exactly that lock, and one taken since
+        is answered 409 and left. uninstall-server's lock is its own run's to
+        release (this run is then its child, and must not race it); another
+        MCE's is an install this run knows nothing about. Nothing is read
+        when the PXE cleanup failed: the host's MACs may still chain to this
+        MCE's discovery image, so the hold stays. Never fails the run — the
+        removal is done and the lock expires on its own — so a refusal from
+        server-scan is reported, not raised.
+        """
+        server = request.server_name
+        if pxe_failed:
+            return self._kept(
+                server,
+                "kept: the PXE cleanup failed, so the host may still boot this MCE's "
+                "discovery image; the lock runs to its expiry",
+            )
+        self._phase = "releasing-server"
+        try:
+            membership: ServerMembership = await self._call(
+                lookup_server_membership, ServerMembershipRequest(server_name=server), task_queue
+            )
+        except ActivityError as err:
+            return self._kept(server, f"not read: {_cause(err)}")
+        if "lock" not in membership.model_fields_set:
+            # A limb predating the lock read (CLAUDE.md §5): nothing to go on.
+            return self._kept(server, "not read: the server-lifecycle worker predates the lock read")
+        if not membership.found or not membership.server_id:
+            return False, f"server-scan has no server named {server}: no lock to release"
+        lock = membership.lock
+        if not lock.live:
+            return False, "no live lock in server-scan: nothing to release"
+        held = f"{lock.holder!r} (run {lock.workflow_id!r}, MCE {lock.mce_cluster!r})"
+        if lock.holder == _UNINSTALL_HOLDER:
+            return False, (
+                f"left to uninstall-server: held by {held}, which releases its own lock "
+                "once its remove-server child completes"
+            )
+        if lock.holder != _INSTALL_HOLDER or not lock.workflow_id:
+            return self._kept(server, f"left alone: held by {held}, not an install-server run")
+        if not lock.mce_cluster or canonical_mce_cluster(lock.mce_cluster) != canonical_mce_cluster(
+            request.mce_cluster
+        ):
+            return self._kept(server, f"left alone: held by {held}, an install into another MCE")
+        try:
+            released: ServerReservation = await self._call(
+                release_server,
+                ReleaseServerRequest(
+                    server_id=membership.server_id,
+                    server_name=membership.server_name or server,
+                    holder=lock.holder,
+                    workflow_id=lock.workflow_id,
+                ),
+                task_queue,
+            )
+        except ActivityError as err:
+            return self._kept(server, f"release refused: {_cause(err)}; the lock runs to its expiry")
+        if released.detail:
+            return self._kept(server, f"not released: {released.detail}")
+        workflow.logger.info("Released the install lock on %s in server-scan: %s", server, held)
+        return True, f"released {held}"
+
+    @staticmethod
+    def _kept(server: str, why: str) -> tuple[bool, str]:
+        workflow.logger.warning("server-scan's install lock on %s was not released — %s", server, why)
+        return False, why
 
     async def _clear_pxe_own_site(
         self, server_name: str, mce_cluster: str, macs: list[str], task_queue: str

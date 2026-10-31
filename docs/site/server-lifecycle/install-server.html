@@ -163,6 +163,9 @@
         <p>The lock closes that gap: <code>/servers/available</code> never hands out a locked machine. The
         <b>24 h hold</b> after success writes nothing to any cluster. It only keeps S1 out of every
         other run&rsquo;s draw until server-scan can see it in a cluster for itself.</p>
+        <p class="note">Taken out of MCE-A within that day, S1 gets its lock back early:
+        remove-server releases install-server&rsquo;s lock for <em>its</em> MCE once nothing of S1 is left there (the operator&rsquo;s decision,
+        2026-10-31). Another MCE&rsquo;s lock it leaves alone.</p>
       </div>
       <div class="panel">
         <h3>Who checks what</h3>
@@ -193,6 +196,7 @@
           <tr><td>A candidate fails a check</td><td class="muted">Skips it, tries the next</td><td class="muted">never taken</td></tr>
           <tr><td>Another run holds the candidate</td><td class="muted">Skips it, tries the next</td><td class="muted">theirs, untouched</td></tr>
           <tr><td>The Agent appears</td><td class="muted">Succeeds</td><td class="muted">held 24 h for this run</td></tr>
+          <tr><td>The server is removed from this MCE within that day (remove-server)</td><td class="muted">&mdash;</td><td class="muted">released by remove-server once nothing of it is left on the MCE</td></tr>
           <tr><td>No Agent within 1 h</td><td class="muted">Deletes the candidate&rsquo;s resources, tries the next</td><td class="muted">released at once</td></tr>
           <tr><td>The lock lapsed mid-install and another run took the machine</td><td class="muted">Deletes <em>its own</em> resources, tries the next</td><td class="muted">the other run&rsquo;s, untouched</td></tr>
           <tr><td>Every candidate skipped or tried</td><td class="muted">Fails, reasons grouped</td><td class="muted">none left held</td></tr>

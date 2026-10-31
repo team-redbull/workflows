@@ -141,14 +141,18 @@ async def lookup_install_candidate(request: ServerMembershipRequest) -> InstallC
 
 @activity.defn
 async def release_server(request: ReleaseServerRequest) -> ServerReservation:
-    """Give the install lock back after a candidate was rolled back.
+    """Give an install lock back, so the machine is drawable at once.
 
-    Not needed for correctness — the lock expires on its own — but without it
-    a rolled-back machine stays undrawable for the rest of its TTL. Never a
-    failure when there is nothing of ours to release: an expired lock, a server
-    gone from the inventory (404) or a lock another run has since taken (409)
-    all answer held=False with `detail` saying which. Only the holder +
-    workflow id release, so another run's lock is never cleared by accident.
+    install-server's after a rolled-back candidate; uninstall-server's own once
+    its remove-server child took the host off the MCE; and remove-server's
+    release of install-server's lock for ITS MCE once the host is gone from it
+    (the holder + workflow id it read). Not needed for correctness — the lock
+    expires on its own — but without it the machine stays undrawable for the
+    rest of its TTL, a day after an install. Never a failure when there is
+    nothing to release: an expired lock, a server gone from the inventory
+    (404) or a lock another run has since taken (409) all answer held=False
+    with `detail` saying which. server-scan compares holder + workflow id and
+    deletes only on a match, so another run's lock is never cleared by accident.
 
     Raises ServerScanAuthError / ServerScanRequestInvalidError (non-retryable);
     anything else is transient ServerScanError.
@@ -518,15 +522,17 @@ async def teardown_bmh_resources(ref: BmhRef) -> TeardownResult:
 
 @activity.defn
 async def lookup_server_membership(request: ServerMembershipRequest) -> ServerMembership:
-    """uninstall-server: server-scan's record of where this server is.
+    """uninstall-server and remove-server: server-scan's record of where this server is.
 
     `GET /servers?search=<name>`, then `GET /servers/{id}` for every hit whose
     name matches EXACTLY (case-insensitive) — the same two-step read
     remove-server's MAC lookup makes, and never `/servers/available`, which
     hides claimed and reserved machines. Returns the `srv_…` id (the install
     lock's key), `openshift.{lifecycle_state, cluster_name, mce_name,
-    contested_with}` and `maintenance`. found=False for a name server-scan
-    does not know — the workflow decides what that means.
+    contested_with}`, `maintenance` and the install lock (holder, workflow id,
+    MCE, expiry; judged live at read time — remove-server releases
+    install-server's lock for its MCE by it). found=False for a name
+    server-scan does not know — the workflow decides what that means.
 
     Raises AmbiguousServerNameError when two documents carry the name and
     ServerScanAuthError on a rejected token (both non-retryable);

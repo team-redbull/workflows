@@ -30,7 +30,12 @@ from shared.consts import (
     UNINSTALL_SERVER_WORKFLOW_QUEUE,
     server_lifecycle_activity_queue,
 )
-from shared.exceptions import OrchestratorError, ServerReservedError
+from shared.exceptions import (
+    OrchestratorError,
+    PxeMapAuthError,
+    ServerReservedError,
+    ServerScanAuthError,
+)
 from shared.models.segment_lifecycle import SegmentEntry, SegmentType
 from shared.models.server_lifecycle import (
     AgentBinding,
@@ -65,7 +70,9 @@ from shared.models.server_lifecycle import (
     MachineState,
     PxeHostEntriesRef,
     PxeHostEntriesRemoval,
+    ReleaseServerRequest,
     ReserveServerRequest,
+    ServerLockRecord,
     ServerMembership,
     ServerMembershipRequest,
     ServerReservation,
@@ -173,6 +180,13 @@ ON_THE_MCE = InventoryHostState(
 )
 
 
+# An install into another MCE, holding the machine once this run's lock lapsed.
+OTHER_RUNS_LOCK = ServerLockRecord(
+    live=True, holder="install-server", workflow_id=f"install-server-ocp4-mce-other_{SERVER}",
+    mce_cluster="ocp4-mce-other", expires_at="2026-10-25T10:00:00Z",
+)
+
+
 def make_mocks(
     *,
     membership: ServerMembership = INSTALLED,
@@ -191,13 +205,17 @@ def make_mocks(
     reserve_error: Exception | None = None,
     hold_error: Exception | None = None,
     inventory: InventoryHostState = ON_THE_MCE,
+    pxe_error: Exception | None = None,
+    release_error: Exception | None = None,
 ):
     """Each sequence is consumed one item per call; its last item repeats.
 
     `nodes` is what find_hosted_nodes answers, call after call: by default the
     hosted node's own Node at the first look and none once its Machine went.
     `rechecks` is what inspect_bound_host answers after the lock is taken (an
-    inventory host's last look); by default `host` again.
+    inventory host's last look); by default `host` again. server-scan's lock
+    is modelled as server-scan keeps it: taken by reserve_server, cleared by a
+    release from the same holder and run, read back by remove-server's lookup.
     """
     recheck_seq = list(rechecks or [host])
     machine_seq = list(machines or MACHINE_TIMELINE)
@@ -205,6 +223,7 @@ def make_mocks(
     nodes_seq = list(nodes if nodes is not None else ([[THE_NODE], []] if host.machine else [[]]))
     drain_seq = list(drains or [HostedNodeDrain(found=True, remaining=[])])
     cleanup_seq = list(cleanups or [AgentMachineCleanup()])
+    lock = {"record": ServerLockRecord()}
     calls: dict[str, list] = {
         k: []
         for k in (
@@ -214,7 +233,7 @@ def make_mocks(
             "inspect_inventory_host", "set_host_online", "teardown_bmh_resources",
             "delete_agents", "remove_host_pxe_entries", "find_hosted_nodes",
             "drain_hosted_node", "delete_hosted_node", "release_agent",
-            "release_machine_hook", "clean_up_agent_machines", "order",
+            "release_machine_hook", "clean_up_agent_machines", "release_server", "order",
         )
     }
 
@@ -229,8 +248,22 @@ def make_mocks(
     @activity.defn
     async def lookup_server_membership(request: ServerMembershipRequest) -> ServerMembership:
         calls["lookup_server_membership"].append(request)
-        _mark("lookup")
-        return membership
+        # The first is the parent's; any later one is remove-server's lock read.
+        _mark("lookup" if len(calls["lookup_server_membership"]) == 1 else "child-lock")
+        return membership.model_copy(update={"lock": lock["record"]})
+
+    @activity.defn
+    async def release_server(request: ReleaseServerRequest) -> ServerReservation:
+        calls["release_server"].append(request)
+        _mark("release")
+        if release_error is not None:
+            raise release_error
+        held = lock["record"]
+        if held.live and (held.holder, held.workflow_id) != (request.holder, request.workflow_id):
+            return ServerReservation(server_id=request.server_id, held=False,
+                                     detail=f"left alone, it is not ours: held by {held.holder}")
+        lock["record"] = ServerLockRecord()
+        return ServerReservation(server_id=request.server_id, held=False)
 
     @activity.defn
     async def inspect_bound_host(ref: BmhRef) -> BoundHostState:
@@ -247,12 +280,16 @@ def make_mocks(
         first = len(calls["reserve_server"]) == 1
         _mark("reserve" if first else "hold")
         error = reserve_error if first else hold_error
+        if isinstance(error, ServerReservedError):
+            # server-scan's 409 `held_by`: another run holds the machine now.
+            lock["record"] = OTHER_RUNS_LOCK
         if error is not None:
             raise error
-        return ServerReservation(
-            server_id=request.server_id, held=True,
-            expires_at="2026-10-25T09:00:00Z" if not first else "2026-10-24T10:00:00Z",
-        )
+        expires_at = "2026-10-25T09:00:00Z" if not first else "2026-10-24T10:00:00Z"
+        lock["record"] = ServerLockRecord(live=True, holder=request.holder,
+                                          workflow_id=request.workflow_id,
+                                          mce_cluster=request.mce_cluster, expires_at=expires_at)
+        return ServerReservation(server_id=request.server_id, held=True, expires_at=expires_at)
 
     @activity.defn
     async def ensure_machine_deleting(ref: MachineRef) -> MachineDeletion:
@@ -373,6 +410,8 @@ def make_mocks(
     async def remove_host_pxe_entries(ref: PxeHostEntriesRef) -> PxeHostEntriesRemoval:
         calls["remove_host_pxe_entries"].append(ref)
         _mark("child-pxe")
+        if pxe_error is not None:
+            raise pxe_error
         return PxeHostEntriesRemoval(cleared=[f"bat-yam/{m.replace(':', '')}" for m in ref.macs])
 
     @activity.defn
@@ -387,7 +426,7 @@ def make_mocks(
             inspect_inventory_host, set_host_online, teardown_bmh_resources,
             delete_agents, remove_host_pxe_entries, find_hosted_nodes,
             drain_hosted_node, delete_hosted_node, release_agent,
-            release_machine_hook, clean_up_agent_machines,
+            release_machine_hook, clean_up_agent_machines, release_server,
         ],
         SEGMENT_LIFECYCLE_ACTIVITY_QUEUE: [get_inventory_segment],
     }
@@ -456,8 +495,10 @@ async def _fails(client: Client, **kwargs) -> ApplicationError:
     return cause
 
 
+# remove-server's steps, its lock read last (it leaves this run's lock alone),
+# then the parent's release of its own lock.
 CHILD = ["child-inspect", "child-power-off", "child-teardown", "child-delete-agents",
-         "child-pxe", "child-verify"]
+         "child-pxe", "child-verify", "child-lock", "release"]
 HOSTED_HALF = ["delete-machine", "await-machine", "verify-agentmachine", "verify-node"]
 
 
@@ -957,8 +998,10 @@ class TestAnInventoryHost:
             result = await _execute(client)
 
         assert result.remove_server.found is False
+        # Nothing of it on the MCE: the child reads no lock, and the run gives its own back.
         assert calls["order"] == ["lookup", "inspect", "reserve", "verify-inventory", "hold",
-                                  "child-inspect"]
+                                  "child-inspect", "release"]
+        assert result.lock_released
 
     async def test_a_stale_installed_reading_after_an_unbind_is_not_a_contradiction(self):
         """A re-run's normal view: server-scan has not caught up with the unbinding yet."""
@@ -1032,8 +1075,11 @@ class TestKeepInventory:
                           "delete_agents", "remove_host_pxe_entries"):
             assert calls[untouched] == [], untouched
         assert result.reservation_expires_at == "2026-10-25T09:00:00Z"
-        assert result.skipped[-1].startswith("removing-from-inventory: keep_inventory was asked")
-        assert "InfraEnv cisco-m6-bat-yam-64c-512gb" in result.skipped[-1]
+        assert result.skipped[-2].startswith("removing-from-inventory: keep_inventory was asked")
+        assert "InfraEnv cisco-m6-bat-yam-64c-512gb" in result.skipped[-2]
+        # Still in this InfraEnv, so the day-long hold stays (the operator, 2026-10-31).
+        assert result.skipped[-1].startswith("releasing-server: keep_inventory was asked")
+        assert calls["release_server"] == [] and result.lock_released is False
 
     async def test_an_inventory_host_has_nothing_to_do_and_takes_no_lock(self):
         calls, acts = make_mocks(membership=IN_INVENTORY, host=INVENTORY_HOST)
@@ -1152,6 +1198,103 @@ class TestTheInventoryHalf:
         assert error.type == "RemoveServerFailedError"
         assert "AgentBoundToClusterError" in error.message
         assert f"remove-server-{SERVER.lower()}" in error.message
+
+
+class TestTheLockIsGivenBack:
+    """Once remove-server took the host off the MCE, the run's own lock goes back (2026-10-31)."""
+
+    async def test_a_hosted_node_is_drawable_again_once_it_is_out_of_the_mce(self):
+        calls, acts = make_mocks()
+        async with _Harness(acts) as client:
+            result = await _execute(client, workflow_id="uninstall-server-release")
+
+        assert calls["order"][-3:] == ["child-verify", "child-lock", "release"]
+        # Its OWN lock — holder and run — so server-scan's compare-and-delete never
+        # clears another run's.
+        assert calls["release_server"] == [ReleaseServerRequest(
+            server_id="srv_123", server_name=SERVER, holder="uninstall-server",
+            workflow_id="uninstall-server-release",
+        )]
+        assert result.lock_released is True
+        assert not any(s.startswith("releasing-server") for s in result.skipped)
+
+    async def test_the_child_leaves_the_parents_lock_to_the_parent(self):
+        calls, acts = make_mocks()
+        async with _Harness(acts) as client:
+            result = await _execute(client, workflow_id="uninstall-server-parent")
+
+        # remove-server read the lock, saw uninstall-server's and released nothing:
+        # the one release is the parent's, after the child completed.
+        assert result.remove_server.lock_released is False
+        assert result.remove_server.lock_detail.startswith("left to uninstall-server")
+        assert "uninstall-server-parent" in result.remove_server.lock_detail
+        assert [r.holder for r in calls["release_server"]] == ["uninstall-server"]
+        assert calls["order"].index("release") > calls["order"].index("child-lock")
+
+    async def test_an_inventory_host_has_its_lock_released_too(self):
+        calls, acts = make_mocks(membership=IN_INVENTORY, host=INVENTORY_HOST)
+        async with _Harness(acts) as client:
+            result = await _execute(client)
+        assert result.lock_released and len(calls["release_server"]) == 1
+
+    async def test_a_failed_pxe_cleanup_keeps_the_hold(self):
+        # Its MACs may still point at this MCE's discovery image.
+        calls, acts = make_mocks(pxe_error=PxeMapAuthError("check PXE_MAP_TOKEN"))
+        async with _Harness(acts) as client:
+            result = await _execute(client)
+
+        assert result.remove_server.pxe_failed
+        assert calls["release_server"] == [] and result.lock_released is False
+        assert result.reservation_expires_at == "2026-10-25T09:00:00Z"
+        assert result.skipped[-1].startswith("releasing-server: remove-server's PXE cleanup failed")
+        assert "PxeMapAuthError" in result.skipped[-1]
+
+    async def test_a_failed_child_releases_nothing(self):
+        rebound = ON_THE_MCE.model_copy(update={
+            "agents": [AgentBinding(name="agent-1", cluster_deployment="clusters-hc-02/hc-02")]
+        })
+        calls, acts = make_mocks(membership=IN_INVENTORY, host=INVENTORY_HOST, inventory=rebound)
+        async with _Harness(acts) as client:
+            error = await _fails(client)
+        assert error.type == "RemoveServerFailedError"
+        assert calls["release_server"] == []
+
+    async def test_a_refused_release_is_named_and_the_uninstall_completes(self):
+        calls, acts = make_mocks(release_error=ServerScanAuthError("needs ADMIN"))
+        async with _Harness(acts) as client:
+            result = await _execute(client)
+
+        assert result.remove_server.found and result.lock_released is False
+        assert len(calls["release_server"]) == 1  # non-retryable
+        assert result.skipped[-1].startswith("releasing-server: server-scan refused the release")
+        assert "ServerScanAuthError: needs ADMIN" in result.skipped[-1]
+
+    async def test_a_lock_another_run_took_since_is_reported_not_cleared(self):
+        # The hold was refused: this run's lock had lapsed and another MCE's install took it.
+        other = ServerReservedError("reserved by 'install-server' for MCE 'ocp4-mce-other'")
+        calls, acts = make_mocks(membership=IN_INVENTORY, host=INVENTORY_HOST, hold_error=other)
+        async with _Harness(acts) as client:
+            result = await _execute(client)
+
+        assert result.reservation_expires_at is None and result.remove_server.found
+        # Asked with this run's holder and id, server-scan keeps the other run's lock.
+        assert [r.holder for r in calls["release_server"]] == ["uninstall-server"]
+        assert result.lock_released is False
+        assert result.skipped[-1].startswith("releasing-server: not released — left alone, it is not ours")
+        # remove-server left another MCE's lock alone as well.
+        assert "another MCE" in result.remove_server.lock_detail
+
+    async def test_a_run_recorded_before_the_release_keeps_the_day_long_hold(self, monkeypatch):
+        monkeypatch.setattr(
+            workflow, "patched", lambda patch_id: patch_id != uninstall_server._RELEASE_PATCH
+        )
+        calls, acts = make_mocks()
+        async with _Harness(acts) as client:
+            result = await _execute(client)
+
+        assert calls["order"][-1] == "child-lock"
+        assert calls["release_server"] == [] and result.lock_released is False
+        assert result.reservation_expires_at == "2026-10-25T09:00:00Z"
 
 
 async def test_a_run_recorded_before_the_leftover_patch_keeps_its_flow(monkeypatch):

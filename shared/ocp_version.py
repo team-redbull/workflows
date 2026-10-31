@@ -64,3 +64,21 @@ def minor_of(version: str) -> int:
 def minor_name(minor: int) -> str:
     """`4.<minor>`, the way supported-versions and the docs spell a minor."""
     return f"{SUPPORTED_MAJOR}.{minor}"
+
+
+_MINOR_RE = re.compile(r"(\d+)\.(\d+)")
+
+
+def parse_minor(text: str) -> int:
+    """The minor number of a `4.<minor>` string (22 for `"4.22"`).
+
+    The spelling a person asks for a target minor in, and the one
+    supported-versions lists. Raises ValueError for anything else.
+    """
+    match = _MINOR_RE.fullmatch(text.strip())
+    if match is None:
+        raise ValueError(f"not an OCP minor: {text!r} (expected 4.<minor>, e.g. 4.22)")
+    major, minor = (int(part) for part in match.groups())
+    if major != SUPPORTED_MAJOR:
+        raise ValueError(f"not an OCP {SUPPORTED_MAJOR} minor: {text!r}")
+    return minor

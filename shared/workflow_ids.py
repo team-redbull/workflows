@@ -197,3 +197,30 @@ def release_segment_workflow_id(segment_type: SegmentType, cluster: str) -> str:
     from colliding on one id.
     """
     return f"release-segment-{segment_type.value}-{cluster}"
+
+
+def upgrade_cluster_workflow_id(mce_cluster: str, cluster: str) -> str:
+    """`upgrade-cluster-<mce>_<cluster>`: one upgrade per HostedCluster at a time.
+
+    Keyed on the cluster, so a second request while one runs is a 409 — two
+    runs committing mastertag and workertag to one file would undo each other.
+    The MCE comes first and `_` follows it, as in install-server's ids: a
+    Kubernetes name cannot contain `_`, so a hub's runs all sit under
+    `upgrade-cluster-<mce>_` and never under an MCE whose name extends it.
+    """
+    return f"upgrade-cluster-{mce_cluster}_{cluster}"
+
+
+def upgrade_control_plane_workflow_id(mce_cluster: str, slot: int) -> str:
+    """`upgrade-control-plane-<mce>_<slot>`: one of an MCE's control-plane upgrade SLOTS.
+
+    The id IS the concurrency cap. An MCE allows `maxConcurrentControlPlanes`
+    hosted control planes upgrading at once (day1 `upgrade/mces/<mce>.yaml`);
+    a run takes slot 1, 2, … in turn, and Temporal's one-running-workflow-per-id
+    makes a busy slot a WorkflowAlreadyStartedError, so the run moves on, or
+    waits when every slot is taken. Temporal's own limits cap activities per
+    worker or per second, not "N control planes in flight per MCE", so they
+    do not fit. A finished slot is free again (closed ids are reusable), the
+    install-server slot precedent.
+    """
+    return f"upgrade-control-plane-{mce_cluster}_{slot}"

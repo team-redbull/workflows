@@ -31,11 +31,17 @@ from shared.consts import (
     RELEASE_SEGMENT_WORKFLOW_QUEUE,
     REMOVE_SERVER_WORKFLOW_QUEUE,
     UNINSTALL_SERVER_WORKFLOW_QUEUE,
+    UPGRADE_CLUSTER_WORKFLOW_QUEUE,
+    UPGRADE_CONTROL_PLANE_WORKFLOW_QUEUE,
 )
 from shared.logging_config import configure_logging
 from shared.settings import TemporalSettings
 from shared.shutdown import install_shutdown_handler
 from shared.temporal_client import connect_temporal
+from workflow_domains.cluster_upgrade.upgrade_cluster import UpgradeClusterWorkflow
+from workflow_domains.cluster_upgrade.upgrade_control_plane import (
+    UpgradeControlPlaneWorkflow,
+)
 from workflow_domains.segment_lifecycle.allocate_segment import (
     AllocateSegmentWorkflow,
 )
@@ -69,6 +75,8 @@ _WORKER_SPECS: list[tuple[str, list[type]]] = [
     (REMOVE_SERVER_WORKFLOW_QUEUE, [RemoveServerWorkflow]),
     (PUBLISH_INFRAENV_BOOT_WORKFLOW_QUEUE, [PublishInfraEnvBootWorkflow]),
     (UNINSTALL_SERVER_WORKFLOW_QUEUE, [UninstallServerWorkflow]),
+    (UPGRADE_CLUSTER_WORKFLOW_QUEUE, [UpgradeClusterWorkflow]),
+    (UPGRADE_CONTROL_PLANE_WORKFLOW_QUEUE, [UpgradeControlPlaneWorkflow]),
 ]
 
 

@@ -930,3 +930,63 @@ class UpgradePathRefusedError(OrchestratorError):
     not render. Fix the ladder (day1 `upgrade/ladder.yaml`) or the request,
     then start a new run.
     """
+
+
+class UpgradePlanningFailedError(OrchestratorError):
+    """WORKFLOW-RAISED. A planning check failed before approval; nothing was committed.
+
+    The message lists every failed check at once — rules and MCE disagree, a
+    release missing from the mirror (with the ImageSetConfiguration to mirror
+    it), the cluster file not upgradeable as written, a day2 layer missing —
+    so one fix-and-rerun covers them all.
+    """
+
+
+class UpgradeUpdateRefusedError(OrchestratorError):
+    """WORKFLOW-RAISED, by an Update validator: the decision does not fit the run's state.
+
+    `continue` while nothing waits for one, `approve` after approval, `retry`
+    outside needs-human. Nothing changed; the API answers 409 with the reason.
+    """
+
+
+class UpgradeRulesInvalidError(OrchestratorError):
+    """The day1 upgrade rules for an MCE are missing or do not validate.
+
+    `upgrade/ladder.yaml` or `upgrade/mces/<mce>.yaml` is absent, or fails
+    `scripts/validate_upgrade_rules.py`. Permanent until someone fixes git.
+    """
+
+
+class Day1FileChangedError(OrchestratorError):
+    """The cluster file is no longer the one the run last wrote or read.
+
+    Someone edited it between two of the run's commits. The run never commits
+    over a person: it waits for one (needs-human), and a retry re-reads the
+    file and carries on from it.
+    """
+
+
+class Day1ChangeRejectedError(OrchestratorError):
+    """The day1 validator refused the edited cluster file, so nothing was pushed.
+
+    `scripts/validate_all_clusters.py` failed on the result; the message is its
+    output. Permanent: the same edit fails the same way.
+    """
+
+
+class ArgoSyncRefusedError(OrchestratorError):
+    """The cluster's Application has changes pending that this run did not make.
+
+    Syncing would deploy someone else's commit under this run's name, so the
+    run waits for a person instead. The message names the resources.
+    """
+
+
+class ProposedActionRefusedError(OrchestratorError):
+    """A tier-2 action names a kind the typed action catalog does not have.
+
+    The agent proposed it; a person approved it; the limb still refuses it,
+    because permissions live in the catalog and the admission policies, never
+    in a proposal.
+    """

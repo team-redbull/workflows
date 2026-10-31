@@ -71,6 +71,13 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   (one dep+cred set: Segments Manager HTTP + bearer token, day1 git push token).
 - Keep `shared/interfaces/` signatures clean so an activity (e.g. "get segment") can be
   re-registered on another queue by a future sub-workflow without moving code.
+- **One domain may need several limbs** when its work spans several credential sets — the rule
+  above, applied. cluster-upgrade has three: `upgrade-gitops` on the hub (day1 push, mirror pull,
+  Brain push tokens), and per MCE `cluster-upgrade` (the workflow ServiceAccount) and
+  `upgrade-agent` (no Kubernetes credential at all). Each limb gets its OWN interface module
+  (`shared/interfaces/{upgrade_gitops,cluster_upgrade,upgrade_agent}.py`), so the contract test
+  still pairs one interface module with one `activities/<limb>/activities.py`; the domain keeps
+  one models module and one `workflow_domains/cluster_upgrade/`.
 - **Brain is ONE deployment for every domain**, not one per workflow — the `workflows-orchestrator`
   chart is standalone, deployed once. Each new domain adds `activities/<domain>/` + a
   `gitops/charts/<domain>-worker/` chart folder (plus its `gitops/services/` app.yaml) and registers
@@ -702,6 +709,52 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   retries that, so runs in the brain-before-limb window are DELAYED; prefer it when keeping the old
   shape would let the old limb act on the wrong input and FAIL them (`locate_cluster_file(cluster:
   str)` would have searched `main` and raised `ClusterFileNotFoundError`).
+- **A person's decision on a running workflow is a Temporal UPDATE with a validator, never a
+  signal** (upgrade-cluster: approve, continue, confirm-day2, pause, resume, abort, retry, tier-2
+  actions). The caller must learn AT ONCE whether the run took it: a `continue` while no NodePool
+  waits is a 409 naming what the run does wait for, where a signal would vanish into a run that
+  ignores it. The VALIDATOR only reads state and refuses by raising
+  `ApplicationError(type=UpgradeUpdateRefusedError.__name__)`; the HANDLER is a plain `def` that
+  records who and why and sets a flag; the `run` loop does all the work, so every side effect stays
+  in one ordered place. A human wait is a bare `wait_condition` on that flag — no timer, no poll, no
+  deadline — so a week between two NodePools adds nothing to history. `@workflow.init` takes the run
+  argument so an Update reaching a CONTINUED run before `run()` starts is validated against the
+  restored state; `await workflow.wait_condition(workflow.all_handlers_finished)` precedes every
+  `continue_as_new` and every return. The router's decision routes send the Update and map the
+  answer (409 refused, 404 no such run, 504 no brain worker); they never read the run's state to
+  second-guess its validator.
+- **A long MACHINE wait is ONE heartbeating activity, not a workflow poll loop**
+  (`watch_control_plane`, `watch_nodepool`, `watch_nodepool_gate`): it polls inside the activity,
+  heartbeats every poll (`heartbeat_timeout` 2 min), keeps its progress snapshot and clocks in the
+  heartbeat details so a retry after a dead worker resumes them, and returns `done | stalled |
+  deadline` on its own clock, with `start_to_close_timeout` only a margin past that deadline. A
+  three-hour control-plane upgrade is then a handful of history events. Retries stay unbounded per
+  the rule above. Started with `workflow.start_activity` (`TRY_CANCEL`) so an abort can cancel it;
+  commits and syncs are `WAIT_CANCELLATION_COMPLETED`, so a cancel never abandons a push half-way.
+- **Cancellation does not stop work in flight — so a stop is a FLAG checked before every act.**
+  Cancelling a task or a child that is awaiting a non-heartbeating `WAIT_CANCELLATION_COMPLETED`
+  call is swallowed: the call finishes, its result comes back as if nothing happened, and the code
+  goes on to its next commit (found in review, 2026-10-31). So upgrade-cluster never relies on it
+  for anything but a `TRY_CANCEL` watch: an abort or a pause is checked by `_checkpoint()` right
+  before every commit, sync, child start and agent call, and the parent drives its control-plane
+  child with SIGNALS (`stop`, `hold`, `retry`; the child reports needs-human back by signal) — code
+  to code, fire-and-forget, where Updates are for people. A child that may outlive the parent's
+  patience (ABANDON) must be stoppable this way.
+- **No `schedule_to_start_timeout` on a long-lived run's activities.** Temporal never retries
+  that timeout, so on upgrade-cluster it would FAIL a weeks-long run the moment a limb pod took five
+  minutes to come back. Its activities wait for a worker instead (visible as a pending activity);
+  the one exception is the agent call, whose timeout the workflow catches and answers as
+  needs-human. Short runs (install-server and its siblings) keep theirs as the "no worker" signal.
+- **The one bounded retry: the LLM agent call** (`invoke_upgrade_agent`, `maximum_attempts=2`, per
+  Temporal's AI guidance). Two attempts cover a dead worker; past that, an agent that cannot answer
+  is answered in the workflow as `needs_human`, so the run waits for a person instead of retrying
+  forever. Safe because the request carries an invocation id the tool server keys its budget and
+  executed actions on.
+- **Replay tests guard runs in flight** (`tests/test_upgrade_cluster_replay.py`): histories recorded
+  from scenarios on the fake fleet replay at once with `temporalio.worker.Replayer`, and GOLDEN
+  histories committed under `tests/histories/cluster_upgrade/` replay on the current code. A golden
+  replay failing means the change needs `workflow.patched()` — never re-record to make it pass;
+  re-record (`UPDATE_REPLAY_HISTORIES=1`) only while no run of the old shape can exist.
 
 ## 6. Idempotency (required for all activities)
 

@@ -63,3 +63,35 @@ def server_lifecycle_activity_queue(mce_cluster: str) -> str:
 # OME has nothing in common with an Intersight claim beyond its end state.
 PROVISION_DELL_SERVER_WORKFLOW_QUEUE = "provision-dell-server-workflow"
 SERVER_PROVISIONING_ACTIVITY_QUEUE = "server-provisioning-activity"
+
+# -- Cluster-upgrade domain --
+# Two workflows, each on its own queue as everywhere above: the per-cluster run,
+# and the control-plane step it starts as a child on a per-MCE SLOT id (the
+# slot is the concurrency cap, see shared/workflow_ids.py).
+#
+# THREE activity queues for one domain, because the domain's work needs three
+# different credential sets (CLAUDE.md §2: the deployment follows the
+# dependency + credential set):
+#   * the HUB limb holds the day1 git push token, the mirror registry pull
+#     credential and the Brain push token — one queue, like segment-lifecycle;
+#   * the per-MCE cluster limb runs as the workflow ServiceAccount inside that
+#     MCE (reads, and the Argo CD sync that is the run's only cluster write) —
+#     a queue per MCE, routed exactly like server-lifecycle above;
+#   * the per-MCE agent limb holds no Kubernetes credential at all: it calls
+#     the kagent agent inside that MCE, whose tools run under their own
+#     identity — a queue per MCE as well.
+UPGRADE_CLUSTER_WORKFLOW_QUEUE = "upgrade-cluster-workflow"
+UPGRADE_CONTROL_PLANE_WORKFLOW_QUEUE = "upgrade-control-plane-workflow"
+UPGRADE_GITOPS_ACTIVITY_QUEUE = "upgrade-gitops-activity"
+CLUSTER_UPGRADE_ACTIVITY_QUEUE = "cluster-upgrade-activity"
+UPGRADE_AGENT_ACTIVITY_QUEUE = "upgrade-agent-activity"
+
+
+def cluster_upgrade_activity_queue(mce_cluster: str) -> str:
+    """The cluster-upgrade activity queue for ONE MCE (see server_lifecycle_activity_queue)."""
+    return f"{CLUSTER_UPGRADE_ACTIVITY_QUEUE}-{mce_cluster}"
+
+
+def upgrade_agent_activity_queue(mce_cluster: str) -> str:
+    """The upgrade-agent activity queue for ONE MCE: the agent runs where its tools read."""
+    return f"{UPGRADE_AGENT_ACTIVITY_QUEUE}-{mce_cluster}"

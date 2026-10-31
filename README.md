@@ -1,6 +1,6 @@
 # Cluster Orchestrator
 
-An OpenShift cluster lifecycle orchestrator built on Temporal. Three domains today:
+An OpenShift cluster lifecycle orchestrator built on Temporal. Four domains today:
 
 - **segment-lifecycle** owns the segments a hosted cluster runs on: **creating**
   them in the team's **Segments Manager**, **allocating** one to a cluster
@@ -18,6 +18,12 @@ An OpenShift cluster lifecycle orchestrator built on Temporal. Three domains tod
   Non-RAID, has the naming service rename it, and completes when server-scan
   lists it — ready for install-server. It replaces the DC team's manual OME and
   BIOS work; Cisco, HPE and Intersight get their own workflows later.
+- **cluster-upgrade** (in progress) upgrades a HyperShift HostedCluster through
+  day1 git and Argo CD, never by patching it: the control plane one minor at a
+  time along a verified ladder, then the NodePools one at a time, at a person's
+  pace. **upgrade-cluster** and its control-plane step child are built and
+  tested on a fake fleet; their three limbs, and the routes that start a run,
+  come next — until then nothing can start one.
 
 **One entry point, one Temporal run.** The Segments Manager used to own creation and
 then fire a best-effort HTTP trigger at this service — which put creation outside
@@ -58,6 +64,10 @@ workflow_domains/                 The brain — one folder per domain, plus main
   server_provisioning/            provision_dell_server.py, storage_plan.py and
                                     server_name.py (its pure rules), regions.py
                                     (iDRAC prefix -> region), router.py
+  cluster_upgrade/                upgrade_cluster.py, upgrade_control_plane.py (the
+                                    per-MCE slot child), upgrade_path.py and gates.py
+                                    (its pure rules), dispatch.py, router.py (not
+                                    mounted yet)
   routers/                        What no domain owns: deps, shared models, runs.py (status)
 activities/<domain>/              The limbs
   activities.py                   The @activity.defn surface ONLY — thin

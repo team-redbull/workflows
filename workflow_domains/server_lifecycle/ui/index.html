@@ -12,8 +12,7 @@
     POST /workflows/server-lifecycle/install-server     start installs (a pool draw or named servers)
     POST /workflows/server-lifecycle/remove-server      start a removal
   Self-contained on purpose: production is air-gapped, so nothing loads from another host.
-  Demo mode reads /ui/server-lifecycle/demo-runs.json, recorded from the workflows' tests.
-  It shows what the runs report and nothing more; the page invents no field.
+  It shows what the runs on this API report and nothing more; the page invents no field.
 -->
 <style>
 :root {
@@ -63,14 +62,11 @@ header h1 { font-size: 17px; margin: 0; }
 .nav a:hover { color: var(--ink); background: var(--soft); }
 .nav a[aria-current="page"] { color: var(--ink); background: var(--soft); }
 .spacer { flex: 1; }
-.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
-.seg button { border: none; border-radius: 0; padding: 6px 12px; }
-.seg button[aria-pressed="true"] { background: var(--soft); font-weight: 600; }
 .refreshed { color: var(--muted); font-size: 12px; min-width: 110px; text-align: right; }
 
-.banner { margin: 14px 20px 0; padding: 10px 14px; border-radius: 10px; background: var(--person-bg);
+.banner { margin: 14px 20px 0; padding: 10px 14px; border-radius: 10px; background: var(--alert-bg);
   color: var(--ink); border: 1px solid var(--line); }
-.banner b { color: var(--person); }
+.banner b { color: var(--alert); }
 
 .tabs { display: flex; gap: 6px; padding: 14px 20px 0; overflow-x: auto; scrollbar-width: none; }
 .tabs::-webkit-scrollbar { display: none; }
@@ -196,10 +192,6 @@ fieldset.choice input { width: auto; }
   <span class="tag" title="Until the ClickCluster Platform UI exists">temporary</span>
   <nav class="nav" aria-label="Pages"><a href="/ui/cluster-upgrade">Cluster upgrades</a><a href="/ui/server-lifecycle" aria-current="page">Server lifecycle</a></nav>
   <span class="spacer"></span>
-  <div class="seg" role="group" aria-label="Data source">
-    <button id="mode-live" type="button" aria-pressed="false">Live</button>
-    <button id="mode-demo" type="button" aria-pressed="false">Demo</button>
-  </div>
   <span class="refreshed" id="refreshed" aria-live="polite"></span>
 </header>
 <div class="banner" id="banner" hidden></div>
@@ -246,7 +238,6 @@ fieldset.choice input { width: auto; }
 const RUNS = "/workflows/runs";
 const INSTALL = "/workflows/server-lifecycle/install-server";
 const REMOVE = "/workflows/server-lifecycle/remove-server";
-const DEMO_URL = "/ui/server-lifecycle/demo-runs.json";
 const POLL_MS = 10000;
 const DETAILS_PER_REFRESH = 20;
 const QUEUE_PREFIX = "server-lifecycle-activity-";
@@ -255,8 +246,6 @@ const SKIP = JSON.parse(document.getElementById("skip-reasons").textContent);
 const $ = (id) => document.getElementById(id);
 const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const code = (v) => `<code>${esc(v)}</code>`;
-function store(key, value) { try { value === undefined ? localStorage.removeItem(key) : localStorage.setItem(key, value); } catch (e) {} }
-function recall(key) { try { return localStorage.getItem(key); } catch (e) { return null; } }
 
 function ago(iso) {
   if (!iso) return "";
@@ -390,7 +379,7 @@ const TAB_KEYS = Object.keys(FLOWS);
 const STATUS = { FAILED: ["Failed", "bad"], TERMINATED: ["Terminated", "bad"], CANCELED: ["Cancelled", "muted"],
   TIMED_OUT: ["Timed out", "bad"], CONTINUED_AS_NEW: ["Continued", "muted"], UNKNOWN: ["Unknown", "muted"] };
 
-const state = { mode: "live", tab: "install", lists: {}, runs: {}, selected: null, demo: null, liveNote: "" };
+const state = { tab: "install", lists: {}, runs: {}, selected: null, error: "" };
 
 // --- reading -------------------------------------------------------------------------------
 
@@ -398,12 +387,6 @@ async function getJSON(url) {
   const response = await fetch(url, { headers: { accept: "application/json" } });
   if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
   return response.json();
-}
-
-async function loadDemo() {
-  if (!state.demo) state.demo = await getJSON(DEMO_URL);
-  state.lists = state.demo.lists;
-  state.runs = state.demo.runs;
 }
 
 async function fetchRun(id) {
@@ -427,36 +410,21 @@ async function loadLive() {
 
 async function refresh() {
   try {
-    if (state.mode === "demo") await loadDemo(); else await loadLive();
+    await loadLive();
     const list = currentList();
     if (!state.selected || !list.some((r) => r.workflow_id === state.selected)) {
       state.selected = (list[0] || {}).workflow_id || null;
     }
-    $("refreshed").textContent = state.mode === "demo" ? "demo data" : `updated ${new Date().toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" })}`;
+    state.error = "";
+    $("refreshed").textContent = `updated ${new Date().toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" })}`;
   } catch (err) {
-    if (state.mode === "live") {
-      state.liveNote = `The run list could not be read (${err.message}).`;
-      return setMode("demo", true);
-    }
-    toast(`Could not load: ${err.message}`);
+    state.error = `The run list could not be read (${err.message}).`;
+    $("refreshed").textContent = "not updated";
   }
-  render();
-}
-
-function setMode(mode, automatic) {
-  state.mode = mode;
-  if (!automatic) store("sl-mode", mode);
-  $("mode-live").setAttribute("aria-pressed", String(mode === "live"));
-  $("mode-demo").setAttribute("aria-pressed", String(mode === "demo"));
   const banner = $("banner");
-  if (mode === "demo") {
-    banner.hidden = false;
-    banner.innerHTML = `<b>Demo data.</b> ${esc(state.liveNote)} These runs were recorded from the workflows' own test harnesses on fake MCEs, with demo names. The start buttons show the request they would send instead of sending it.`;
-  } else {
-    banner.hidden = true;
-  }
-  state.lists = {}; state.runs = {};
-  return refresh();
+  banner.hidden = !state.error;
+  banner.innerHTML = state.error ? `<b>Not updated.</b> ${esc(state.error)} The page tries again every ${POLL_MS / 1000} s.` : "";
+  render();
 }
 
 function setTab(tab, selected) {
@@ -705,7 +673,7 @@ function renderList() {
   const ul = $("runs");
   const list = currentList();
   if (!list.length) {
-    ul.innerHTML = `<li class="empty">No ${esc(FLOWS[state.tab].noun)} runs yet.${state.mode === "live" ? " Switch to Demo to see what a run looks like." : ""}</li>`;
+    ul.innerHTML = `<li class="empty">${state.error ? "No runs could be read." : `No ${esc(FLOWS[state.tab].noun)} runs yet.`}</li>`;
     return;
   }
   ul.innerHTML = list.map((item) => {
@@ -733,8 +701,7 @@ function renderDetail() {
     v.flow === FLOWS.install && ["InfraEnv", (v.r && v.r.infra_env) || v.ids.infraEnv],
     v.flow === FLOWS.install && ["Drawn", v.ids.slot ? `from the pool, slot ${v.ids.slot}` : "by name"],
     v.listed.start_time && ["Started", clock(v.listed.start_time)],
-    // A demo run was recorded long ago: how long it has been running says nothing.
-    v.listed.start_time && !(isOpen(v) && state.mode === "demo") && [isOpen(v) ? "Running for" : "Took", span(v.listed.start_time, v.listed.close_time)],
+    v.listed.start_time && [isOpen(v) ? "Running for" : "Took", span(v.listed.start_time, v.listed.close_time)],
   ].filter((f) => f && f[1]);
   const candidates = v.flow === FLOWS.install ? renderCandidates(v) : "";
   el.innerHTML = [
@@ -934,7 +901,7 @@ function collect(form, route) {
 
 function openDialog({ title, explain, path, route, fields, ready = () => true, danger = false, sent }) {
   const form = $("dialog-form");
-  const label = state.mode === "demo" ? "Show what it sends" : danger ? "Remove it" : "Start";
+  const label = danger ? "Remove it" : "Start";
   form.innerHTML = `<h3>${esc(title)}</h3>${explain ? `<p class="explain">${esc(explain)}</p>` : ""}
     ${fields}
     <details style="margin-top:12px"><summary>The request</summary><pre id="f-preview"></pre></details>
@@ -958,10 +925,6 @@ function openDialog({ title, explain, path, route, fields, ready = () => true, d
 }
 
 async function send(path, payload, sent) {
-  if (state.mode === "demo") {
-    toast(`Demo: nothing was sent. Live, this would be\nPOST ${path}\n${JSON.stringify(payload)}`, 9000);
-    return;
-  }
   try {
     const response = await fetch(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
     const text = await response.text();
@@ -1063,7 +1026,7 @@ document.addEventListener("click", async (event) => {
   if (run) {
     state.selected = run.dataset.id; render();
     if (window.matchMedia("(max-width: 860px)").matches) $("detail").scrollIntoView({ behavior: "smooth" });
-    if (state.mode === "live" && !(state.runs[state.selected] || {}).status) {
+    if (!(state.runs[state.selected] || {}).status) {
       try { await fetchRun(state.selected); } catch (err) { toast(`Could not read the run: ${err.message}`); }
       render();
     }
@@ -1080,8 +1043,6 @@ $("tabs").addEventListener("keydown", (event) => {
   const next = TAB_KEYS[(TAB_KEYS.indexOf(state.tab) + (event.key === "ArrowRight" ? 1 : TAB_KEYS.length - 1)) % TAB_KEYS.length];
   setTab(next).then(() => document.querySelector(`[data-tab="${next}"]`).focus());
 });
-$("mode-live").onclick = () => { state.liveNote = ""; setMode("live"); };
-$("mode-demo").onclick = () => setMode("demo");
 window.addEventListener("hashchange", () => {
   const { tab, id } = readHash();
   if (tab !== state.tab) setTab(tab, id);
@@ -1092,17 +1053,9 @@ window.addEventListener("hashchange", () => {
   const { tab, id } = readHash();
   state.tab = tab; state.selected = id;
   renderTabs();
-  if (recall("sl-mode") === "demo") return setMode("demo");
-  try {
-    const lists = await Promise.all(TAB_KEYS.map((key) => getJSON(`${RUNS}?workflow_type=${FLOWS[key].type}&limit=1`)));
-    if (lists.every((l) => !l.length)) { state.liveNote = "There are no server-lifecycle runs on this API yet."; return setMode("demo", true); }
-    await setMode("live", true);
-  } catch (err) {
-    state.liveNote = `The run list could not be read (${err.message}).`;
-    await setMode("demo", true);
-  }
+  await refresh();
 })();
-setInterval(() => { if (state.mode === "live" && !$("dialog").open && document.visibilityState === "visible") refresh(); }, POLL_MS);
+setInterval(() => { if (!$("dialog").open && document.visibilityState === "visible") refresh(); }, POLL_MS);
 </script>
 </body>
 </html>

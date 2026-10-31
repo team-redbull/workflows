@@ -11,7 +11,7 @@
     GET  /workflows/runs/{workflow_id}                          one run's progress or result
     POST /workflows/cluster-upgrade/upgrade-cluster[/{id}/...]  start, and every decision
   Self-contained on purpose: production is air-gapped, so nothing loads from another host.
-  Demo mode reads /ui/cluster-upgrade/demo-runs.json, recorded from the workflow's tests.
+  It shows only the runs this API reports.
 -->
 <style>
 :root {
@@ -59,16 +59,13 @@ header h1 { font-size: 17px; margin: 0; }
 .nav a:hover { color: var(--ink); background: var(--soft); }
 .nav a[aria-current="page"] { color: var(--ink); background: var(--soft); }
 .spacer { flex: 1; }
-.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
-.seg button { border: none; border-radius: 0; padding: 6px 12px; }
-.seg button[aria-pressed="true"] { background: var(--soft); font-weight: 600; }
 .who { display: flex; align-items: center; gap: 6px; }
 .who input { width: 150px; padding: 5px 8px; }
 .refreshed { color: var(--muted); font-size: 12px; min-width: 110px; text-align: right; }
 
-.banner { margin: 14px 20px 0; padding: 10px 14px; border-radius: 10px; background: var(--person-bg);
+.banner { margin: 14px 20px 0; padding: 10px 14px; border-radius: 10px; background: var(--alert-bg);
   color: var(--ink); border: 1px solid var(--line); }
-.banner b { color: var(--person); }
+.banner b { color: var(--alert); }
 
 main { display: grid; grid-template-columns: 320px minmax(0, 1fr); gap: 16px; padding: 16px 20px 40px; }
 @media (max-width: 860px) {
@@ -169,10 +166,6 @@ dialog .buttons { display: flex; justify-content: flex-end; gap: 8px; margin-top
   <nav class="nav" aria-label="Pages"><a href="/ui/cluster-upgrade" aria-current="page">Cluster upgrades</a><a href="/ui/server-lifecycle">Server lifecycle</a></nav>
   <span class="spacer"></span>
   <div class="who"><label for="who" style="margin:0">You</label><input id="who" placeholder="your name" autocomplete="name"></div>
-  <div class="seg" role="group" aria-label="Data source">
-    <button id="mode-live" type="button" aria-pressed="false">Live</button>
-    <button id="mode-demo" type="button" aria-pressed="false">Demo</button>
-  </div>
   <span class="refreshed" id="refreshed" aria-live="polite"></span>
 </header>
 <div class="banner" id="banner" hidden></div>
@@ -192,7 +185,6 @@ dialog .buttons { display: flex; justify-content: flex-end; gap: 8px; margin-top
 const API = "/workflows/cluster-upgrade/upgrade-cluster";
 const TARGETS = "/workflows/cluster-upgrade/upgrade-targets";
 const RUNS = "/workflows/runs";
-const DEMO_URL = "/ui/cluster-upgrade/demo-runs.json";
 const POLL_MS = 10000;
 
 // Phase -> [words a person reads, tone]. Tones: person (someone must act), machine, alert, ok, muted, bad.
@@ -227,7 +219,7 @@ const DECISIONS = {
 };
 const ACTIVE = (phase) => !["done", "cancelled", "aborted", "aborting"].includes(phase);
 
-const state = { mode: "live", list: [], runs: {}, selected: null, demo: null, liveNote: "" };
+const state = { list: [], runs: {}, selected: null, error: "" };
 const $ = (id) => document.getElementById(id);
 const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const cluster = (id) => id.replace(/^upgrade-cluster-/, "");
@@ -257,12 +249,6 @@ async function getJSON(url) {
   return response.json();
 }
 
-async function loadDemo() {
-  if (!state.demo) state.demo = await getJSON(DEMO_URL);
-  state.list = state.demo.list;
-  state.runs = state.demo.runs;
-}
-
 async function loadLive() {
   state.list = await getJSON(`${RUNS}?workflow_type=UpgradeClusterWorkflow&limit=50`);
   const ids = state.list.slice(0, 25).map((r) => r.workflow_id);
@@ -274,35 +260,20 @@ async function loadLive() {
 
 async function refresh() {
   try {
-    if (state.mode === "demo") await loadDemo(); else await loadLive();
+    await loadLive();
     if (!state.selected || !state.list.some((r) => r.workflow_id === state.selected)) {
       state.selected = (state.list.find((r) => tone(r.workflow_id) === "person" || tone(r.workflow_id) === "alert") || state.list[0] || {}).workflow_id || null;
     }
-    $("refreshed").textContent = state.mode === "demo" ? "demo data" : `updated ${new Date().toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" })}`;
+    state.error = "";
+    $("refreshed").textContent = `updated ${new Date().toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" })}`;
   } catch (err) {
-    if (state.mode === "live") {
-      state.liveNote = `The run list could not be read (${err.message}).`;
-      return setMode("demo", true);
-    }
-    toast(`Could not load: ${err.message}`);
+    state.error = `The run list could not be read (${err.message}).`;
+    $("refreshed").textContent = "not updated";
   }
-  render();
-}
-
-function setMode(mode, automatic) {
-  state.mode = mode;
-  if (!automatic) store("cu-mode", mode);
-  $("mode-live").setAttribute("aria-pressed", String(mode === "live"));
-  $("mode-demo").setAttribute("aria-pressed", String(mode === "demo"));
   const banner = $("banner");
-  if (mode === "demo") {
-    banner.hidden = false;
-    banner.innerHTML = `<b>Demo data.</b> ${esc(state.liveNote)} These runs were recorded from the workflow's own test scenarios on a fake fleet. Buttons show the request they would send instead of sending it.`;
-  } else {
-    banner.hidden = true;
-  }
-  state.selected = null;
-  return refresh();
+  banner.hidden = !state.error;
+  banner.innerHTML = state.error ? `<b>Not updated.</b> ${esc(state.error)} The page tries again every ${POLL_MS / 1000} s.` : "";
+  render();
 }
 
 // --- what a run says -----------------------------------------------------------------------
@@ -358,7 +329,7 @@ function render() { renderList(); renderDetail(); }
 function renderList() {
   const ul = $("runs");
   if (!state.list.length) {
-    ul.innerHTML = `<li class="empty">No upgrade runs yet.${state.mode === "live" ? " Switch to Demo to see what a run looks like." : ""}</li>`;
+    ul.innerHTML = `<li class="empty">${state.error ? "No runs could be read." : "No upgrade runs yet."}</li>`;
     return;
   }
   ul.innerHTML = state.list.map((item) => {
@@ -483,7 +454,7 @@ function openDialog({ title, explain, method = "POST", path, fields = [], body, 
     <label for="f-by">Who decides</label><input id="f-by" required value="${esc(who())}" placeholder="your name">
     ${fields.join("")}
     <details style="margin-top:12px"><summary>The request</summary><pre id="f-preview"></pre></details>
-    <div class="buttons"><button type="button" value="cancel" id="f-cancel">Cancel</button><button type="submit" class="primary" id="f-send">${state.mode === "demo" ? "Show what it sends" : "Send"}</button></div>`;
+    <div class="buttons"><button type="button" value="cancel" id="f-cancel">Cancel</button><button type="submit" class="primary" id="f-send">Send</button></div>`;
   const preview = () => { $("f-preview").textContent = `${method} ${path}\n${JSON.stringify(body(form), null, 2)}`; };
   form.oninput = preview; preview();
   if (onOpen) onOpen(form, preview);
@@ -502,10 +473,6 @@ function openDialog({ title, explain, method = "POST", path, fields = [], body, 
 }
 
 async function send(method, path, payload) {
-  if (state.mode === "demo") {
-    toast(`Demo: nothing was sent. Live, this would be\n${method} ${path}\n${JSON.stringify(payload)}`, 8000);
-    return;
-  }
   try {
     const response = await fetch(path, { method, headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
     const text = await response.text();
@@ -551,13 +518,8 @@ const SIMPLE = {
 };
 
 // The "New upgrade" form's choices for one cluster (GET upgrade-targets, D22): ladder rungs
-// newer than it, of minors its MCE supports. The demo has them for its own clusters.
+// newer than it, of minors its MCE supports.
 async function loadTargets(cluster) {
-  if (state.mode === "demo") {
-    const known = (state.demo && state.demo.targets) || {};
-    if (!known[cluster]) throw new Error(`the demo has no cluster ${cluster}; try ${Object.keys(known).join(", ")}`);
-    return known[cluster];
-  }
   const response = await fetch(`${TARGETS}?cluster=${encodeURIComponent(cluster)}`, { headers: { accept: "application/json" } });
   const text = await response.text();
   let detail = text;
@@ -567,9 +529,7 @@ async function loadTargets(cluster) {
 }
 
 function knownClusters() {
-  const names = new Set(state.list.map((r) => cluster(r.workflow_id)));
-  if (state.mode === "demo" && state.demo) Object.keys(state.demo.targets || {}).forEach((n) => names.add(n));
-  return [...names].sort();
+  return [...new Set(state.list.map((r) => cluster(r.workflow_id)))].sort();
 }
 
 function wireTargets(form, preview) {
@@ -665,24 +625,11 @@ document.addEventListener("click", (event) => {
   }
 });
 $("new-run").onclick = newRun;
-$("mode-live").onclick = () => { state.liveNote = ""; setMode("live"); };
-$("mode-demo").onclick = () => setMode("demo");
 $("who").value = recall("cu-by") || "";
 $("who").onchange = () => store("cu-by", who());
 
-(async function start() {
-  const wanted = recall("cu-mode");
-  if (wanted === "demo") return setMode("demo");
-  try {
-    const list = await getJSON(`${RUNS}?workflow_type=UpgradeClusterWorkflow&limit=1`);
-    if (!list.length) { state.liveNote = "There are no upgrade runs on this API yet."; return setMode("demo", true); }
-    await setMode("live", true);
-  } catch (err) {
-    state.liveNote = `The run list could not be read (${err.message}).`;
-    await setMode("demo", true);
-  }
-})();
-setInterval(() => { if (state.mode === "live" && !$("dialog").open) refresh(); }, POLL_MS);
+refresh();
+setInterval(() => { if (!$("dialog").open) refresh(); }, POLL_MS);
 </script>
 </body>
 </html>

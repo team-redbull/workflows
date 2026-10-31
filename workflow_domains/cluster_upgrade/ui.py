@@ -6,10 +6,9 @@ calls the API it is served by, so it needs no CORS: `GET /workflows/runs` to
 list upgrade-cluster runs, `GET /workflows/runs/{id}` for each one's progress,
 and the decision routes of router.py for approve, continue and the rest.
 
-Until the upgrade routes are mounted (DESIGN O18) there are no runs, so the page
-also has a demo mode: demo-runs.json holds the `progress` and `result` the real
-workflow returned in its test scenarios on the fake fleet
-(`UPDATE_UI_DEMO=1 pytest tests/test_cluster_upgrade_ui.py` regenerates it).
+It shows only the runs this API reports: until the upgrade routes are mounted
+(DESIGN O18) there are none, and its start form and decisions answer that the
+routes are not there yet.
 
 The page has no auth of its own, like the rest of api.py.
 """
@@ -29,8 +28,3 @@ UI_DIR = Path(__file__).parent / "ui"
 @router.get("")
 async def page() -> FileResponse:
     return FileResponse(UI_DIR / "index.html", media_type="text/html")
-
-
-@router.get("/demo-runs.json")
-async def demo_runs() -> FileResponse:
-    return FileResponse(UI_DIR / "demo-runs.json", media_type="application/json")

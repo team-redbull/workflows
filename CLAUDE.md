@@ -124,10 +124,11 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   and server-lifecycle's, `workflow_domains/<domain>/ui.py`, until the ClickCluster Platform UI
   exists; each links to the other). ONE self-contained HTML file in the domain folder, nothing from
   another host (production is air-gapped; `tests/test_<domain>_ui.py` checks it), same origin so no
-  CORS. Its demo data is recorded from the workflow's own test scenarios (`UPDATE_UI_DEMO=1`) and
-  checked against the models, so the page cannot drift from the API. It shows only what a run
-  reports, and a start form offers only the request fields its test pins. It adds no auth: the API
-  has none (§9).
+  CORS. It shows only the runs the API reports, and only what a run reports: there is no demo
+  mode or recorded data (removed 2026-10-31, the owner found it not needed). Its test checks it
+  against the workflow instead, so the page cannot drift from the API: it has words for every
+  phase a run reports, and a start form offers only the request fields its test pins. It adds no
+  auth: the API has none (§9).
 
 ## 3. Deployment-target agnostic
 

@@ -106,7 +106,8 @@
         activity waiting for a worker that does not exist yet.</p>
         <p><b>To see it:</b> the workflows API serves a temporary page at <code>/ui/cluster-upgrade</code>, until the
         ClickCluster Platform UI exists. It lists the runs, draws each plan, says what a run waits for and offers its
-        decisions. With no runs yet it shows demo runs recorded from the workflow&rsquo;s own tests.</p>
+        decisions. It shows only the runs the API reports, so until the routes that start a run are mounted
+        its list is empty.</p>
         <p class="note">Read this page as the contract the limbs are being built to. Design:
         <code>docs/upgrade/DESIGN.md</code> in the Cluster-AutoUpgrade workspace.</p>
       </div>

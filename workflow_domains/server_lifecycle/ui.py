@@ -15,10 +15,6 @@ failure it ends with when none could be installed; the page reads them out of
 that message using `install_server._REJECTION_SUMMARY`, copied into the page
 and kept equal to it by tests/test_server_lifecycle_ui.py.
 
-Demo mode reads demo-runs.json: the status GET /workflows/runs/{id} returned
-for runs driven by the workflows' own test harnesses, with demo names
-(`UPDATE_UI_DEMO=1 pytest tests/test_server_lifecycle_ui.py` regenerates it).
-
 The page has no auth of its own, like the rest of api.py.
 """
 
@@ -37,8 +33,3 @@ UI_DIR = Path(__file__).parent / "ui"
 @router.get("")
 async def page() -> FileResponse:
     return FileResponse(UI_DIR / "index.html", media_type="text/html")
-
-
-@router.get("/demo-runs.json")
-async def demo_runs() -> FileResponse:
-    return FileResponse(UI_DIR / "demo-runs.json", media_type="application/json")

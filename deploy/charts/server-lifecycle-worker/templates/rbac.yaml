@@ -4,11 +4,7 @@
 ---
 # Exactly the verbs install-server's activities use in one InfraEnv namespace:
 # creating and tearing down a candidate's three resources, the Agent poll, and
-# the InfraEnv read an IPMI server's network boot needs. `list` on
-# baremetalhosts: before replacing an NMStateConfig that differs from the
-# install, install-server looks for ANY BareMetalHost booting from one of the
-# server's MACs (one made by hand under another name) — without it that check
-# fails closed (403), only on that path.
+# the InfraEnv read an IPMI server's network boot needs.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -22,7 +18,7 @@ rules:
     verbs: [get, create, delete]
   - apiGroups: [metal3.io]
     resources: [baremetalhosts]
-    verbs: [get, list, create, delete, patch]
+    verbs: [get, create, delete, patch]
   - apiGroups: [agent-install.openshift.io]
     resources: [nmstateconfigs]
     verbs: [get, create, delete]

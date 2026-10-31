@@ -131,14 +131,15 @@ SCENARIOS: dict[str, Callable[[], Scenario]] = {
         mocks={"acquire_error": _refused(), "record": scan_record(one_nic_up_server())},
         input=_unhealthy(),
     ),
-    # A stale NMStateConfig of the server's name, nothing in use: replaced
-    # before the first create, and the install goes on.
+    # A stale NMStateConfig of the server's name: replaced before the first
+    # create, and the install goes on.
     "nmstate-replaced": lambda: Scenario(
         mocks={"nmstate_differs": {SERVER_NAME: ["VLAN id: want ['24'], found ['77']"]}},
         input=_named(SERVER_NAME),
     ),
-    # ... and the same with a BareMetalHost of it already there: refused, the
-    # lock given back, nothing written.
+    # An OLDER limb's answer (before 2026-10-31's revision) when a
+    # BareMetalHost of it was there: refused, the lock given back, nothing
+    # written. The current limb never refuses; the workflow still handles it.
     "nmstate-in-use": lambda: Scenario(
         mocks={"in_use": {SERVER_NAME: f"BareMetalHost {SERVER_NAME.lower()} exists"}},
         input=_named(SERVER_NAME),

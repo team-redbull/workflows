@@ -376,57 +376,6 @@ def agent_cluster_deployment(agent: dict[str, Any]) -> str | None:
     return f"{ref.get('namespace') or '-'}/{name}"
 
 
-def server_in_use_signs(
-    bmh_name: str,
-    macs: Iterable[str],
-    bmhs: list[dict[str, Any]],
-    agents: list[dict[str, Any]],
-) -> list[str]:
-    """What on the MCE shows a server installed or being installed — why NOT to replace its NMStateConfig.
-
-    Conservative on purpose, because a conflicting NMStateConfig may be the one
-    a running host was booted with:
-
-      * a BareMetalHost named after the server (install-server's and bmhgen's
-        name) — whoever created it, and whatever state it is in;
-      * any BareMetalHost whose `bootMACAddress` is one of the server's MACs —
-        one made by hand under another name;
-      * any Agent BMAC linked to that BareMetalHost name, or reporting one of
-        the MACs, BOUND OR NOT: an unbound Agent is a host running discovery,
-        which is what install-server calls installed.
-
-    Each sign is one readable sentence for the refusal; [] means nothing shows
-    the server in use, in the namespace these were listed from.
-    """
-    wanted = {_mac(mac) for mac in macs}
-    signs: list[str] = []
-    for bmh in bmhs:
-        metadata = bmh.get("metadata") or {}
-        name = metadata.get("name")
-        boot_mac = _mac(((bmh.get("spec") or {}).get("bootMACAddress")))
-        state = ((bmh.get("status") or {}).get("provisioning") or {}).get("state")
-        if name == bmh_name:
-            signs.append(
-                f"BareMetalHost {name} exists (provisioning state {state!r}, created "
-                f"{metadata.get('creationTimestamp')})"
-            )
-        elif boot_mac in wanted:
-            signs.append(
-                f"BareMetalHost {name} boots from its MAC {boot_mac} (provisioning state {state!r})"
-            )
-    for agent in agents:
-        if not agent_belongs_to_host(agent, bmh_name, wanted):
-            continue
-        bound_to = agent_cluster_deployment(agent)
-        state = ((agent.get("status") or {}).get("debugInfo") or {}).get("state")
-        signs.append(
-            f"Agent {(agent.get('metadata') or {}).get('name')} is this host's "
-            f"({f'bound to cluster {bound_to}' if bound_to else 'unbound — the host runs discovery'}"
-            f"{f', state {state}' if state else ''})"
-        )
-    return signs
-
-
 def infraenv_ipxe_script_url(infra_env: dict[str, Any]) -> str | None:
     """The iPXE script URL an InfraEnv publishes, or None until it has one.
 

@@ -1,0 +1,38 @@
+{
+  "apiVersion": "config.openshift.io/v1",
+  "kind": "ClusterOperator",
+  "metadata": {
+    "name": "image-registry"
+  },
+  "status": {
+    "conditions": [
+      {
+        "lastTransitionTime": "2026-10-31T14:52:42Z",
+        "message": "Available: The registry is ready\nNodeCADaemonAvailable: The daemon set node-ca has available replicas\nImagePrunerAvailable: Pruner CronJob has been created",
+        "reason": "Ready",
+        "status": "True",
+        "type": "Available"
+      },
+      {
+        "lastTransitionTime": "2026-10-31T14:52:42Z",
+        "message": "Progressing: The registry is ready\nNodeCADaemonProgressing: The daemon set node-ca is deployed",
+        "reason": "Ready",
+        "status": "False",
+        "type": "Progressing"
+      },
+      {
+        "lastTransitionTime": "2026-10-31T15:27:50Z",
+        "message": "ImagePrunerDegraded: Job has reached the specified backoff limit",
+        "reason": "ImagePrunerJobFailed",
+        "status": "True",
+        "type": "Degraded"
+      }
+    ],
+    "versions": [
+      {
+        "name": "operator",
+        "version": "4.19.53"
+      }
+    ]
+  }
+}

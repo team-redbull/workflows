@@ -251,8 +251,9 @@ def make_mock_activities(
 
     `replace_conflicting_nmstate_config` answers per server: `nmstate_differs`
     names servers whose existing NMStateConfig differs (and is replaced, with
-    those differences), `in_use` servers a BareMetalHost or Agent shows in use
-    (refused with that sign). Anyone else has no NMStateConfig yet.
+    those differences), `in_use` servers an OLDER limb refuses because a
+    BareMetalHost or Agent shows them in use (the current limb never does).
+    Anyone else has no NMStateConfig yet.
     """
     calls: dict[str, list] = {
         name: []
@@ -2023,7 +2024,7 @@ class TestAllowUnhealthy:
         assert len(calls["release_server"]) == 1
 
 
-# --- a conflicting NMStateConfig: replaced only when nothing is in use --------
+# --- a conflicting NMStateConfig: replaced --------------------------------------
 
 _STALE = ["VLAN id: want ['24'], found ['77']"]
 _IN_USE = "BareMetalHost ocp-x exists (provisioning state 'provisioned')"
@@ -2034,7 +2035,7 @@ class TestAConflictingNmStateConfig:
 
     The run now checks it before anything else is written for the candidate —
     after the lock, ahead of the PXE map and every create, in BOTH orders — and
-    replaces it when no BareMetalHost or Agent shows the server in use.
+    the limb replaces it (tests/test_server_lifecycle_nmstate_replace.py).
     """
 
     _NAMED = INPUT.model_copy(update={"server_name": SERVER_NAME})
@@ -2048,8 +2049,8 @@ class TestAConflictingNmStateConfig:
 
         assert result.nmstate_replaced == _STALE
         assert result.resources_changed is True
-        # Redfish order: checked BEFORE the run creates its own BareMetalHost,
-        # so a BareMetalHost found can only be one that existed before the run.
+        # Redfish order: replaced BEFORE any create, so create_nmstate_config
+        # finds it matching.
         assert calls["order"].index("replace_conflicting_nmstate_config") < calls["order"].index(
             "create_bmc_secret"
         ) < calls["order"].index("create_baremetal_host") < calls["order"].index(
@@ -2085,9 +2086,17 @@ class TestAConflictingNmStateConfig:
 
         [check] = calls["replace_conflicting_nmstate_config"]
         assert check.resource == calls["create_nmstate_config"][0]
-        # Every MAC server-scan handed out, not only the bond members.
-        assert check.server_macs == ["aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:02"]
         assert result.nmstate_replaced == []
+
+
+class TestAnOlderLimbsInUseRefusal:
+    """For a few hours on 2026-10-31 the limb refused a server that looked in use.
+
+    It no longer looks (the operator: server-scan offering the machine is the
+    proof it is free), but a limb deployed before that can still raise
+    ServerLooksInstalledError while the brain rolls out first, so the run still
+    answers it without writing anything for the candidate.
+    """
 
     async def test_a_named_server_in_use_fails_naming_it_and_writes_nothing(self):
         blade = ucs_server()

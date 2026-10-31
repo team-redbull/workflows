@@ -35,9 +35,8 @@ Shape of the run:
      checking-nmstateconfig — before anything else is written for it, in both
                            create orders: an NMStateConfig already under the
                            server's name that differs from this install is
-                           replaced, unless a BareMetalHost or Agent shows the
-                           server installed or in progress — then nothing is
-                           changed and it is refused.
+                           replaced. server-scan offering the machine is the
+                           proof it is free, so nothing else is checked first.
      registering-pxe-boot — IPMI servers only (a UCS-managed blade). IPMI has
                            no virtual media, so the host PXE-boots and the PXE
                            VM of the inventory segment's SITE must map both
@@ -371,9 +370,10 @@ _PXE_INFRAENV_BOOT_PATCH = "pxe-map-infraenv-boot"
 # mapped both bond MACs, so its rollback must unmap both.
 _PXE_BOOT_MAC_ONLY_PATCH = "pxe-map-boot-mac-only"
 # Gates the NMStateConfig check before a candidate's first write: one that
-# differs from the install is REPLACED once nothing shows the server in use, and
-# the server refused when something does. A run recorded before it met the
-# conflict at create_nmstate_config instead (BmhConflictError).
+# differs from the install is REPLACED. A run recorded before it met the
+# conflict at create_nmstate_config instead (BmhConflictError). The id is from
+# when the limb also refused a server that looked in use; it stays, being in
+# recorded histories.
 _NMSTATE_REPLACE_PATCH = "nmstateconfig-replace-unless-in-use"
 # Gates the second look at a NAMED server /servers/available refuses: a re-run
 # recovers its own workflow id's leftover lock, and any other refusal says why.
@@ -751,11 +751,10 @@ class InstallServerWorkflow:
             )
 
             # An NMStateConfig already under the server's name that differs from
-            # this install is REPLACED — but only once nothing shows the server
-            # in use. Checked here, after the lock and BEFORE anything else is
-            # written for the candidate (the PXE map, a create) in BOTH create
-            # orders, so "a BareMetalHost that existed before this run" is just
-            # "a BareMetalHost now": a Redfish run has not created its own yet.
+            # this install is REPLACED. Checked here, after the lock and BEFORE
+            # anything else is written for the candidate (the PXE map, a
+            # create) in BOTH create orders: create_nmstate_config would fail
+            # on it, and nothing written yet means nothing to roll back.
             nmstate_replaced: list[str] = []
             if self._nmstate_replace:
                 self._phase = "checking-nmstateconfig"
@@ -1241,23 +1240,20 @@ class InstallServerWorkflow:
         task_queue: str,
         rejections: list[tuple[str, str]],
     ) -> NmStateConfigReplacement | None:
-        """Replace a differing NMStateConfig unless the server is in use, or None with a skip recorded.
+        """Replace a differing NMStateConfig, or None with a skip recorded.
 
-        replace_conflicting_nmstate_config refuses (ServerLooksInstalledError,
-        nothing changed) when a BareMetalHost or Agent shows the machine
-        installed or in progress. Nothing has been written for the candidate
-        yet, so its lock goes straight back either way. A NAMED server then
-        fails the run with that error — it was asked for by name, and the
-        message says what was found. A pool candidate is a SKIP, like every
-        reason a candidate is unusable, under `already-installed`.
+        The current limb replaces without looking further (the operator,
+        2026-10-31: server-scan offering the machine is the proof it is free).
+        A limb from before that refuses with ServerLooksInstalledError when a
+        BareMetalHost or Agent shows the machine in use, so that answer is
+        still handled: nothing has been written for the candidate yet, so its
+        lock goes straight back; a NAMED server fails the run with that error,
+        and a pool candidate is a SKIP under `already-installed`.
         """
         try:
             replacement = await workflow.execute_activity(
                 replace_conflicting_nmstate_config,
-                NmStateConfigReplaceRequest(
-                    resource=resource_request,
-                    server_macs=[i.mac for i in candidate.interfaces if i.mac is not None],
-                ),
+                NmStateConfigReplaceRequest(resource=resource_request),
                 task_queue=task_queue,
                 start_to_close_timeout=_ACTIVITY_TIMEOUT,
                 schedule_to_start_timeout=_SCHEDULE_TO_START_TIMEOUT,
@@ -1280,7 +1276,7 @@ class InstallServerWorkflow:
             return None
         if replacement.replaced:
             workflow.logger.warning(
-                "nmstateconfig-replaced for %s (no BareMetalHost or Agent in use): %s",
+                "nmstateconfig-replaced for %s: %s",
                 candidate.name,
                 "; ".join(replacement.differences),
             )

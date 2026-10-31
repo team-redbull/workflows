@@ -403,30 +403,26 @@ async def create_nmstate_config(request: BmhResourceRequest) -> CreatedResource:
 async def replace_conflicting_nmstate_config(
     request: NmStateConfigReplaceRequest,
 ) -> NmStateConfigReplacement:
-    """Replace the server's NMStateConfig when it differs from this install — never while in use.
+    """Replace the server's NMStateConfig when it differs from this install.
 
     Called once per candidate, right after its lock and BEFORE the run writes
     anything else for it (the PXE map, the NMStateConfig, the Secret, the
-    BareMetalHost), in BOTH create orders. That placement is what makes "a
-    BareMetalHost that existed before this run" simply "a BareMetalHost now":
-    a Redfish run would otherwise have just created its own.
+    BareMetalHost), in BOTH create orders.
 
     `nmstate-config-<server>` absent: found=False, nothing written —
     create_nmstate_config makes it as always. Present and matching (MAC set,
     VLAN id, InfraEnv label, as create_nmstate_config compares): found=True,
-    nothing written. Present and DIFFERING, in this order:
+    nothing written. Present and DIFFERING: delete exactly the object compared
+    (UID + resourceVersion preconditions), create it from `resource`, read it
+    back, and log `nmstateconfig-replaced` with what differed.
 
-      1. Is the server in use? (bmh_resources.server_in_use_signs) A
-         BareMetalHost named after it, any BareMetalHost booting from one of
-         its MACs, or any Agent — bound or not — linked to that name or
-         reporting one of its MACs, in the request's namespace. The MACs are
-         `server_macs`, the bond members, every MAC server-scan holds for the
-         name, and the existing NMStateConfig's. Any sign raises
-         ServerLooksInstalledError (non-retryable) naming it, and NOTHING is
-         changed.
-      2. Only then: delete exactly the object compared (UID + resourceVersion
-         preconditions), create it from `resource`, read it back.
-      3. Log `nmstateconfig-replaced` with what differed; return it.
+    No check for a BareMetalHost or Agent first (the operator, 2026-10-31).
+    server-scan offering the machine is the proof it is not in use: it reports
+    a server claimed once a cluster or InfraEnv holds it, and the install lock
+    covers the gap until it does (held a day after a success). A BareMetalHost
+    left without an Agent is a failed install, and its NMStateConfig is the
+    thing to fix. Before that decision this activity refused with
+    ServerLooksInstalledError on any such sign; only a limb from then still does.
 
     Delete-and-create, not an update: the limb's Role has no update verb on
     nmstateconfigs, and the NEW creationTimestamp is what an IPMI blade's
@@ -435,9 +431,7 @@ async def replace_conflicting_nmstate_config(
     Idempotent on retries: after the delete the retry finds it absent (and the
     create step makes it); after the create, matching. An object changed
     between read and delete is transient BmhResourceError — read and decided
-    again. Needs `list` on baremetalhosts (only when no host carries the
-    server's name); a 403 is BmhPrerequisiteMissingError, so a missing verb
-    fails closed. server-scan unreachable is transient ServerScanError.
+    again.
     """
     ...
 

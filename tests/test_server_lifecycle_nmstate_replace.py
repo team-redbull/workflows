@@ -1,12 +1,13 @@
-"""replace_conflicting_nmstate_config: replace a differing NMStateConfig — never while the server is in use.
+"""replace_conflicting_nmstate_config: replace a differing NMStateConfig.
 
 The incident it exists for: a healthy server's install failed because an
 NMStateConfig of its name already existed with other content (BmhConflictError
 at create_nmstate_config), and an operator had to delete it by hand. Now the
-limb replaces it itself, but only after checking that nothing — no
-BareMetalHost by name or by boot MAC, no Agent bound or not — shows the server
-installed or in progress. Driven against a small fake of cluster_api, as the
-PXE tests drive theirs.
+limb replaces it itself — and looks at nothing else first (the operator,
+2026-10-31): server-scan offering the machine is the proof it is free, and a
+BareMetalHost left without an Agent is the failed install whose NMStateConfig
+needs fixing. Driven against a small fake of cluster_api, as the PXE tests
+drive theirs.
 """
 
 from __future__ import annotations
@@ -22,13 +23,11 @@ from activities.server_lifecycle import activities, cluster_api, server_scan
 from activities.server_lifecycle.bmh_resources import (
     build_nmstate_config,
     nmstate_config_differences,
-    server_in_use_signs,
 )
 from shared.exceptions import (
     BmhConflictError,
     BmhPrerequisiteMissingError,
     BmhResourceError,
-    ServerLooksInstalledError,
 )
 from shared.models.server_lifecycle import (
     BmcEndpoint,
@@ -54,12 +53,7 @@ RESOURCE = BmhResourceRequest(
     ],
     vlan_id=24,
 )
-REQUEST = NmStateConfigReplaceRequest(
-    resource=RESOURCE,
-    server_macs=["aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:02", "aa:bb:cc:dd:ee:03"],
-)
-# What server-scan holds for the name: NPAR partition MACs too.
-SCAN_MACS = ["aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:02", "aa:bb:cc:dd:ee:41"]
+REQUEST = NmStateConfigReplaceRequest(resource=RESOURCE)
 
 
 def _stale_nmstate(vlan: int = 77, macs: tuple[str, ...] = ("aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:02")) -> dict:
@@ -105,27 +99,24 @@ class FakeCluster:
     def __init__(self, monkeypatch, objects: dict[tuple[str, str], dict] | None = None) -> None:
         self.objects = dict(objects or {})
         self.writes: list[tuple[str, ...]] = []
-        self.lists: list[str] = []
+        self.reads: list[str] = []
         self.change_before_delete = False
         monkeypatch.setattr(cluster_api, "read_custom_object", self.read)
-        monkeypatch.setattr(cluster_api, "list_custom_objects", self.list)
+        monkeypatch.setattr(cluster_api, "list_custom_objects", self.listed)
         monkeypatch.setattr(cluster_api, "delete_custom_object_exactly", self.delete_exactly)
         monkeypatch.setattr(cluster_api, "create_custom_object_if_absent", self.create)
-
-        async def _scan_macs(_url: str, _token: str, name: str) -> list[str]:
-            assert name == SERVER
-            return list(SCAN_MACS)
-
-        monkeypatch.setattr(server_scan, "server_macs_by_name", _scan_macs)
+        monkeypatch.setattr(server_scan, "server_macs_by_name", self.asked_server_scan)
 
     async def read(self, *, plural: str, namespace: str, name: str, **_: Any) -> dict | None:
         assert namespace == NAMESPACE
+        self.reads.append(plural)
         return self.objects.get((plural, name))
 
-    async def list(self, *, plural: str, namespace: str, **_: Any) -> list[dict]:
-        assert namespace == NAMESPACE
-        self.lists.append(plural)
-        return [obj for (p, _), obj in self.objects.items() if p == plural]
+    async def listed(self, *, plural: str, **_: Any) -> list[dict]:
+        raise AssertionError(f"listed {plural}: the replace looks at the NMStateConfig only")
+
+    async def asked_server_scan(self, *_: Any) -> list[str]:
+        raise AssertionError("asked server-scan: offering the machine already said it is free")
 
     async def delete_exactly(self, *, plural: str, name: str, uid: str, resource_version: str, **_: Any) -> bool:
         current = self.objects.get((plural, name))
@@ -193,20 +184,6 @@ class TestReplacedWhenNothingIsInUse:
         assert "nmstateconfig-replaced" in caplog.text
         assert "VLAN id" in caplog.text
 
-    async def test_hosts_and_agents_of_other_servers_do_not_count(self, monkeypatch):
-        cluster = FakeCluster(
-            monkeypatch,
-            {
-                ("nmstateconfigs", NMSTATE_NAME): _stale_nmstate(),
-                ("baremetalhosts", "ocp-other"): _bmh("ocp-other", "11:22:33:44:55:66"),
-                ("agents", "agent-other"): _agent("agent-other", ["11:22:33:44:55:66"], bound_to="hc-a"),
-            },
-        )
-        result = await activities.replace_conflicting_nmstate_config(REQUEST)
-
-        assert result.replaced
-        assert cluster.lists == ["baremetalhosts", "agents"]
-
     async def test_a_retry_after_the_delete_leaves_the_create_to_the_install(self, stale):
         """Idempotent: absent now, so the run's create_nmstate_config makes it as always."""
         del stale.objects[("nmstateconfigs", NMSTATE_NAME)]
@@ -227,91 +204,46 @@ class TestReplacedWhenNothingIsInUse:
         assert stale.writes == []
 
 
-class TestRefusedWhileTheServerLooksInUse:
-    """Any sign, and NOTHING is changed."""
+class TestNothingElseIsCheckedFirst:
+    """No BareMetalHost or Agent check before the replace (the operator, 2026-10-31).
+
+    server-scan offered the machine, so it is free; a BareMetalHost without an
+    Agent is a failed install — the incident's own re-run met one, left by the
+    run that failed on this very NMStateConfig.
+    """
 
     @pytest.mark.parametrize(
-        ("extra", "says"),
+        "extra",
         [
             pytest.param(
-                {("baremetalhosts", BMH_NAME): _bmh(BMH_NAME, "aa:bb:cc:dd:ee:01")},
-                f"BareMetalHost {BMH_NAME} exists (provisioning state 'provisioned'",
-                id="bmh-named-after-it",
+                {("baremetalhosts", BMH_NAME): _bmh(BMH_NAME, "aa:bb:cc:dd:ee:01", state="inspecting")},
+                id="bmh-left-by-the-failed-run",
             ),
             pytest.param(
-                {("baremetalhosts", "hand-made"): _bmh("hand-made", "AA:BB:CC:DD:EE:41")},
-                "BareMetalHost hand-made boots from its MAC aa:bb:cc:dd:ee:41",
-                id="bmh-booting-from-an-npar-mac-server-scan-holds",
-            ),
-            pytest.param(
-                {("baremetalhosts", "hand-made"): _bmh("hand-made", "aa:bb:cc:dd:ee:99")},
-                "BareMetalHost hand-made boots from its MAC aa:bb:cc:dd:ee:99",
-                id="bmh-booting-from-a-mac-the-stale-config-names",
-            ),
-            pytest.param(
-                {("agents", "agent-1"): _agent("agent-1", ["aa:bb:cc:dd:ee:02"], bound_to="hc-a")},
-                "Agent agent-1 is this host's (bound to cluster hc-ns/hc-a",
-                id="agent-bound-to-a-cluster",
-            ),
-            pytest.param(
-                {("agents", "agent-1"): _agent("agent-1", ["aa:bb:cc:dd:ee:03"])},
-                "unbound — the host runs discovery",
+                {("agents", "agent-1"): _agent("agent-1", ["aa:bb:cc:dd:ee:02"])},
                 id="agent-in-inventory",
-            ),
-            pytest.param(
-                {("agents", "agent-1"): _agent("agent-1", ["12:34:56:78:9a:bc"], label=BMH_NAME)},
-                "Agent agent-1 is this host's",
-                id="agent-bmac-linked-to-its-name",
             ),
         ],
     )
-    async def test_a_sign_refuses_and_changes_nothing(self, monkeypatch, extra, says):
-        stale_config = _stale_nmstate(macs=("aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:99"))
-        cluster = FakeCluster(monkeypatch, {("nmstateconfigs", NMSTATE_NAME): stale_config, **extra})
+    async def test_it_is_replaced_whatever_else_is_there(self, monkeypatch, extra):
+        cluster = FakeCluster(monkeypatch, {("nmstateconfigs", NMSTATE_NAME): _stale_nmstate(), **extra})
 
-        with pytest.raises(ServerLooksInstalledError) as excinfo:
-            await activities.replace_conflicting_nmstate_config(REQUEST)
+        result = await activities.replace_conflicting_nmstate_config(REQUEST)
 
-        message = str(excinfo.value)
-        assert says in message
-        assert "looks installed or in progress" in message
-        assert "Nothing was changed" in message
-        assert "VLAN id: want ['24'], found ['77']" in message
-        assert cluster.writes == []
-        assert cluster.objects[("nmstateconfigs", NMSTATE_NAME)] is stale_config
+        assert result.replaced
+        assert cluster.writes == [
+            ("delete", "nmstateconfigs", NMSTATE_NAME),
+            ("create", "nmstateconfigs", NMSTATE_NAME),
+        ]
+        # Read: the NMStateConfig, and once more after its create. Nothing else.
+        assert set(cluster.reads) == {"nmstateconfigs"}
 
-    async def test_a_host_named_after_it_decides_without_listing_others(self, monkeypatch):
-        # The `get` alone settles it, so an MCE whose Role predates the `list`
-        # verb on baremetalhosts still refuses correctly here.
-        cluster = FakeCluster(
-            monkeypatch,
-            {
-                ("nmstateconfigs", NMSTATE_NAME): _stale_nmstate(),
-                ("baremetalhosts", BMH_NAME): _bmh(BMH_NAME, "aa:bb:cc:dd:ee:01"),
-            },
+    async def test_a_payload_from_before_still_decodes(self):
+        """A run recorded with the old request shape still carries `server_macs`."""
+        old = NmStateConfigReplaceRequest.model_validate(
+            {"resource": RESOURCE.model_dump(mode="json"), "server_macs": ["aa:bb:cc:dd:ee:01"]}
         )
-        with pytest.raises(ServerLooksInstalledError):
-            await activities.replace_conflicting_nmstate_config(REQUEST)
-        assert "baremetalhosts" not in cluster.lists
-
-    async def test_a_missing_list_verb_fails_closed(self, stale, monkeypatch):
-        async def _forbidden(**_: Any):
-            raise BmhPrerequisiteMissingError("Cannot list BareMetalHost: not authorized")
-
-        monkeypatch.setattr(cluster_api, "list_custom_objects", _forbidden)
-        with pytest.raises(BmhPrerequisiteMissingError):
-            await activities.replace_conflicting_nmstate_config(REQUEST)
-        assert stale.writes == []
-
-
-class TestTheInUseRule:
-    """server_in_use_signs alone, pure."""
-
-    def test_nothing_on_the_mce_is_no_sign(self):
-        assert server_in_use_signs(BMH_NAME, SCAN_MACS, [], []) == []
-
-    def test_a_bmh_with_no_boot_mac_is_no_sign_unless_named_after_it(self):
-        assert server_in_use_signs(BMH_NAME, SCAN_MACS, [{"metadata": {"name": "x"}}], []) == []
+        assert old.resource == RESOURCE
 
 
 class TestDeleteExactly:

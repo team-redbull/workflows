@@ -363,15 +363,15 @@ class BmhConflictError(OrchestratorError):
 
 
 class ServerLooksInstalledError(OrchestratorError):
-    """The server's NMStateConfig differs from this install, and the server looks installed or in progress.
+    """An older limb's refusal to replace a differing NMStateConfig.
 
-    install-server REPLACES a conflicting NMStateConfig only once nothing shows
-    the machine in use: no BareMetalHost named after it, none booting from one
-    of its MACs, no Agent (bound or not) reporting one. Any of those is what
-    the existing NMStateConfig may belong to — a host this or an earlier run
-    created, or one an operator is installing by hand — so nothing is changed
-    and the run (or, in a pool draw, the candidate) stops here; the message
-    names what was found and what differed. Deterministic — non-retryable.
+    Until the operator's decision of 2026-10-31, replace_conflicting_nmstate_config
+    refused when a BareMetalHost named after the server, one booting from its
+    MACs, or an Agent linked to it existed. It no longer looks: server-scan
+    offering the machine is the proof it is free. Kept because a limb deployed
+    before that change can still raise it, and recorded runs failed with it;
+    install-server still handles it (lock given back; a named run fails, a pool
+    candidate is skipped). Deterministic — non-retryable.
     """
 
 

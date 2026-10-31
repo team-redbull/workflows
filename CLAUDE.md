@@ -513,20 +513,21 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   (`lookup_install_candidate`) and sorted by `health_waiver.py`; every waiver lands in
   `allowed_unhealthy` (progress, result, each create's input). No patch gate: no recorded run
   carries the field.
-- **A conflicting NMStateConfig is REPLACED only when nothing shows the server in use** (the
-  operator, 2026-10-31: an install failed on an AlreadyExists NMStateConfig, and deleting it by
-  hand was the only way on). `replace_conflicting_nmstate_config` runs once per candidate right
-  after its lock and BEFORE anything else is written for it — the PXE map, every create — in
-  BOTH orders, so "a BMH that existed before this run" is just "a BMH now" (a Redfish run has
-  not created its own yet). Absent or matching: nothing written. Differing: refused with
-  `ServerLooksInstalledError`, nothing changed and the lock given back (a pool candidate is an
-  `already-installed` skip), if a BMH is named after the server, any BMH boots from one of its
-  MACs (handed out, held by server-scan, or named by the stale config) or any Agent, bound or
-  not, is linked to it; else deleted with UID + resourceVersion preconditions, created from the
-  install, read back and logged `nmstateconfig-replaced` (`result.nmstate_replaced`).
-  Delete-and-create, never update: the Role has no update verb, and the NEW creationTimestamp
-  is what the IPMI boot-entry publish waits on. Gated `nmstateconfig-replace-unless-in-use`.
-  Needs `list` on baremetalhosts — ship the RBAC first; without it the check fails closed.
+- **A conflicting NMStateConfig is REPLACED** (the operator, 2026-10-31: an install failed on an
+  AlreadyExists NMStateConfig, and deleting it by hand was the only way on).
+  `replace_conflicting_nmstate_config` runs once per candidate right after its lock and BEFORE
+  anything else is written for it — the PXE map, every create — in BOTH orders. Absent or
+  matching: nothing written. Differing: deleted with UID + resourceVersion preconditions,
+  created from the install, read back and logged `nmstateconfig-replaced`
+  (`result.nmstate_replaced`). Delete-and-create, never update: the Role has no update verb,
+  and the NEW creationTimestamp is what the IPMI boot-entry publish waits on. Gated
+  `nmstateconfig-replace-unless-in-use`. NO BareMetalHost/Agent check first — do not re-add
+  it (the operator, same day: "no reason to perform double checking"). server-scan offering
+  the machine is the proof it is free, the install lock covers the window before server-scan
+  sees a fresh install, and a BMH left without an Agent is a failed install whose NMStateConfig
+  is exactly what needs fixing — the check would have refused the very re-run that incident
+  needed. For a few hours that day the limb did refuse (`ServerLooksInstalledError`, and `list`
+  on baremetalhosts in the Role); the workflow still handles that error from an older limb.
 - **The inventory VLAN belongs to the MCE, and is resolved once per run** —
   `get_inventory_segment` on the SEGMENT-LIFECYCLE queue, not a second copy of
   that token on the server-lifecycle limb. There is deliberately no `vlan_id`

@@ -274,18 +274,15 @@ class BmhResourceRequest(_QuietDefaults):
 
 
 class NmStateConfigReplaceRequest(BaseModel):
-    """replace_conflicting_nmstate_config: the NMStateConfig this install wants, and the server's MACs.
+    """replace_conflicting_nmstate_config: the NMStateConfig this install wants.
 
     `resource` is the same request the creates take, so the NMStateConfig
-    compared is exactly the one create_nmstate_config would write.
-    `server_macs` is every MAC server-scan handed out for the machine
-    (`interfaces[]`, all ports, not only the bond members); the limb adds the
-    ones server-scan holds for the name and the ones the existing NMStateConfig
-    names, and looks for a BareMetalHost or Agent carrying any of them.
+    compared is exactly the one create_nmstate_config would write. (Payloads
+    recorded before 2026-10-31's revision also carry `server_macs`, the MACs an
+    in-use check looked for; it is ignored.)
     """
 
     resource: BmhResourceRequest
-    server_macs: list[str] = Field(default_factory=list)
 
 
 class NmStateConfigReplacement(BaseModel):
@@ -293,10 +290,10 @@ class NmStateConfigReplacement(BaseModel):
 
     `found=False`: no NMStateConfig of that name — create_nmstate_config makes
     it as always. `found` without `replaced`: it matches, and converges as
-    always. `replaced`: it differed (`differences`, as `want …, found …`), no
-    BareMetalHost or Agent showed the server in use, and it was deleted and
-    created again from this install — so its creationTimestamp is NEW, which is
-    what an IPMI blade's boot-entry publish waits for an image to postdate.
+    always. `replaced`: it differed (`differences`, as `want …, found …`) and
+    was deleted and created again from this install — so its creationTimestamp
+    is NEW, which is what an IPMI blade's boot-entry publish waits for an image
+    to postdate.
     """
 
     found: bool = False
@@ -829,8 +826,8 @@ class InstallServerResult(_QuietDefaults):
     # only ever non-empty when the request asked (`allow_unhealthy`).
     allowed_unhealthy: list[WaivedHealthCheck] = Field(default_factory=list)
     # What differed in an NMStateConfig this run found under the server's name
-    # and replaced — no BareMetalHost or Agent showed the server in use. Empty
-    # when there was none or it matched, and in results recorded before.
+    # and replaced. Empty when there was none or it matched, and in results
+    # recorded before.
     nmstate_replaced: list[str] = Field(default_factory=list)
 
 

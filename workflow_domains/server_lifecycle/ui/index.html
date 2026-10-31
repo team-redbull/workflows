@@ -293,7 +293,7 @@ const FLOWS = {
       "acquiring-server": ["Drawing candidates", "Asks server-scan for the healthy, unclaimed servers listed under the InfraEnv's name."],
       "selecting-server": ["Checking a candidate", "A usable name, a known BMC, two link-up NICs on two physical ports, and no BareMetalHost already. Any reason it fails is a skip to the next candidate."],
       "reserving-server": ["Locking the server", "Takes server-scan's install lock before anything is written, so no other MCE draws this machine."],
-      "checking-nmstateconfig": ["Checking an existing NMStateConfig", "An NMStateConfig already under the server's name that differs from this install is replaced, unless a BareMetalHost or Agent shows the server installed or in progress: then nothing is changed and it is refused."],
+      "checking-nmstateconfig": ["Checking an existing NMStateConfig", "An NMStateConfig already under the server's name that differs from this install is replaced."],
       "registering-pxe-boot": ["Mapping it on the PXE VM", "An IPMI server boots from the network: its boot MAC is mapped on its site's PXE VM."],
       "creating-nmstateconfig": ["Creating the NMStateConfig", "The static network config the discovery image carries."],
       "publishing-pxe-boot": ["Publishing the boot entry", "Waits (up to 10 min) for a discovery image that includes the NMStateConfig, then publishes it as the InfraEnv's boot entry."],

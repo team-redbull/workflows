@@ -30,7 +30,6 @@ from temporalio.client import Client, WorkflowUpdateFailedError, WorkflowUpdateR
 from temporalio.exceptions import ApplicationError, WorkflowAlreadyStartedError
 from temporalio.service import RPCError, RPCStatusCode
 
-from shared.cluster_names import canonical_mce_cluster
 from shared.consts import UPGRADE_CLUSTER_WORKFLOW_QUEUE
 from shared.models.cluster_upgrade import (
     ActionDecision,
@@ -49,24 +48,23 @@ router = APIRouter(prefix="/workflows/cluster-upgrade", tags=["cluster-upgrade"]
 
 _UPGRADE_CLUSTER_PATH = "/upgrade-cluster"
 # `upgrade-cluster-`: every id upgrade_cluster_workflow_id builds starts with it.
-_RUN_ID_PREFIX = upgrade_cluster_workflow_id("", "").removesuffix("_")
+_RUN_ID_PREFIX = upgrade_cluster_workflow_id("")
 # Updates are answered by the run's validator and a handler that only records
 # the decision: seconds at most. Longer means no brain worker is polling.
 _UPDATE_TIMEOUT = timedelta(seconds=15)
-
-_MCE_CLUSTER_DESCRIPTION = (
-    "The hosting MCE, with or without its `ocp4-` prefix; the run always uses "
-    "the prefixed name, which is also its day1 folder `sites/*/mces/<mce>/`."
-)
-
 
 class UpgradeClusterRequest(UpgradeClusterInput):
     """The upgrade-cluster request body: strict at the edge, normalised before the run sees it."""
 
     model_config = ConfigDict(extra="forbid")
 
-    mce_cluster: str = Field(min_length=1, description=_MCE_CLUSTER_DESCRIPTION)
-    cluster: str = Field(min_length=1, description="The HostedCluster: its day1 file's name.")
+    cluster: str = Field(
+        min_length=1,
+        description=(
+            "The HostedCluster: its day1 file's name. The run finds the hosting MCE from "
+            "where that file is, `sites/<site>/mces/<mce>/hostedClusters/<cluster>.yaml`."
+        ),
+    )
     target_version: str | None = Field(
         default=None,
         description="The release to end on, `X.Y.Z` (or `X.Y.Z-x86_64`). Must be in the mirror.",
@@ -88,11 +86,16 @@ class UpgradeClusterRequest(UpgradeClusterInput):
     )
     requested_by: str = Field(min_length=1, description="Who asked; recorded in the run's log.")
 
-    @field_validator("mce_cluster")
+    @model_validator(mode="before")
     @classmethod
-    def _canonical_mce_cluster(cls, value: str) -> str:
-        """Canonical before the run starts: the name builds the queues only that MCE's workers poll."""
-        return canonical_mce_cluster(value)
+    def _no_mce_cluster(cls, data: Any) -> Any:
+        """A caller still sending the MCE learns why it is not taken, not just "extra field"."""
+        if isinstance(data, dict) and "mce_cluster" in data:
+            raise ValueError(
+                "mce_cluster is not taken: the run finds the hosting MCE from where day1 keeps "
+                "the cluster file, sites/<site>/mces/<mce>/hostedClusters/<cluster>.yaml"
+            )
+        return data
 
     @field_validator("target_version")
     @classmethod
@@ -179,7 +182,7 @@ async def start_upgrade_cluster(
     GET /workflows/runs/{workflow_id}: its `progress.waiting_for` says what is
     needed next. One run per cluster: a second start while one runs is a 409.
     """
-    workflow_id = upgrade_cluster_workflow_id(request.mce_cluster, request.cluster)
+    workflow_id = upgrade_cluster_workflow_id(request.cluster)
     try:
         handle = await client.start_workflow(
             UpgradeClusterWorkflow.run,
@@ -190,7 +193,7 @@ async def start_upgrade_cluster(
     except WorkflowAlreadyStartedError:
         raise HTTPException(
             status_code=409,
-            detail=f"{request.cluster} on {request.mce_cluster} already has an upgrade run: {workflow_id}",
+            detail=f"{request.cluster} already has an upgrade run: {workflow_id}",
         )
     return StartWorkflowResponse(workflow_id=handle.id, run_id=handle.result_run_id or "")
 

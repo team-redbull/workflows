@@ -420,3 +420,15 @@ class TestAdminAcks:
             "steps": [UpgradeStep(kind=StepKind.CONTROL_PLANE, version="4.19.53", reason=StepReason.TARGET)],
         })
         assert gates.admin_acks_on_path(z_stream, [RULE]) == []
+
+
+@pytest.mark.parametrize(("path", "mce"), [
+    ("sites/site1/mces/ocp4-prod-mce-site1-a/hostedClusters/ocp4-prod-herzi-site1.yaml", "ocp4-prod-mce-site1-a"),
+    ("sites/s/mces/m/hostedClusters/c.yml", "m"),
+    ("clusters/c.yaml", None),
+    ("sites/s/mces/m/version.yaml", None),
+    ("sites/s/mces/m/hostedClusters/sub/c.yaml", None),
+])
+def test_the_mce_is_the_folder_day1_keeps_the_cluster_file_in(path, mce):
+    assert gates.mce_of_day1_path(path) == mce
+

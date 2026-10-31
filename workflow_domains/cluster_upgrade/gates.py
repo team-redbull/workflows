@@ -5,6 +5,7 @@ hosted cluster's health) and these functions DECIDE, so every rule is a plain
 unit test and the limbs stay dumb readers. It runs inside the workflow sandbox
 on every replay: no clock, no I/O, no set-iteration order in anything returned.
 
+  * mce_of_day1_path — the hosting MCE, from where day1 keeps the cluster file.
   * planning_checks — DESIGN §7 checks 1–4, before approval. Any failure fails
     the run, with every failure listed at once; nothing has been committed.
   * preflight_checks — checks 5–11, before approval and again (5–10) before
@@ -102,6 +103,20 @@ def release_repositories(release: ReleaseLayout) -> list[str]:
 
 
 # --- profile and order ---------------------------------------------------------
+
+
+# Where day1 keeps a hosted cluster's file (CONTEXT §6): the folder names its MCE.
+_DAY1_CLUSTER_PATH = re.compile(r"sites/[^/]+/mces/([^/]+)/hostedClusters/[^/]+\.ya?ml")
+
+
+def mce_of_day1_path(path: str) -> str | None:
+    """The MCE whose folder holds this cluster file, or None for a path outside that layout.
+
+    The folder name is the canonical MCE name (with its `ocp4-` prefix), the
+    one every MCE limb's queue carries.
+    """
+    match = _DAY1_CLUSTER_PATH.fullmatch(path)
+    return match.group(1) if match else None
 
 
 def cluster_profile(day1: Day1Cluster) -> ClusterProfile:

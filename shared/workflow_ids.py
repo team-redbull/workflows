@@ -199,16 +199,15 @@ def release_segment_workflow_id(segment_type: SegmentType, cluster: str) -> str:
     return f"release-segment-{segment_type.value}-{cluster}"
 
 
-def upgrade_cluster_workflow_id(mce_cluster: str, cluster: str) -> str:
-    """`upgrade-cluster-<mce>_<cluster>`: one upgrade per HostedCluster at a time.
+def upgrade_cluster_workflow_id(cluster: str) -> str:
+    """`upgrade-cluster-<cluster>`: one upgrade per HostedCluster at a time.
 
     Keyed on the cluster, so a second request while one runs is a 409 — two
     runs committing mastertag and workertag to one file would undo each other.
-    The MCE comes first and `_` follows it, as in install-server's ids: a
-    Kubernetes name cannot contain `_`, so a hub's runs all sit under
-    `upgrade-cluster-<mce>_` and never under an MCE whose name extends it.
+    No MCE in it: cluster names are unique across day1 (its file lookup refuses
+    a name found twice), and the run finds the MCE there, after the id exists.
     """
-    return f"upgrade-cluster-{mce_cluster}_{cluster}"
+    return f"upgrade-cluster-{cluster}"
 
 
 def upgrade_control_plane_workflow_id(mce_cluster: str, slot: int) -> str:

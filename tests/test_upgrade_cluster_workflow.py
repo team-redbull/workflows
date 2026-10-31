@@ -207,6 +207,25 @@ class TestTheHappyPath:
 
 
 class TestPlanningRefusals:
+    async def test_the_mce_comes_from_the_day1_folder_and_the_day1_read_comes_first(self):
+        fleet = Fleet()
+        async with Harness(fleet) as h:
+            await h.start(request())
+            progress = await h.until(UpgradePhase.AWAITING_APPROVAL)
+        # Every MCE activity reached the fake MCE's queue, named by that folder.
+        assert progress.mce_cluster == MCE
+        assert fleet.calls[:2] == ["read_day1_cluster", "read_upgrade_rules"]
+
+    async def test_a_cluster_file_outside_the_day1_layout_fails_with_nothing_read_on_an_mce(self):
+        fleet = Fleet()
+        fleet.day1_path = f"clusters/{CLUSTER}.yaml"
+        async with Harness(fleet) as h:
+            await h.start(request())
+            failure = await _fails(h)
+        assert failure.type == UpgradePlanningFailedError.__name__
+        assert "not under sites/<site>/mces/<mce>/hostedClusters/" in failure.message
+        assert fleet.calls == ["read_day1_cluster"]
+
     async def test_a_release_missing_from_the_mirror_fails_naming_what_to_mirror(self):
         fleet = Fleet(mirror=["4.20.44"])
         async with Harness(fleet) as h:

@@ -30,9 +30,8 @@ from workflow_domains.cluster_upgrade.upgrade_cluster import UpgradeClusterWorkf
 from workflow_domains.routers.deps import get_temporal_client
 
 PATH = "/workflows/cluster-upgrade/upgrade-cluster"
-RUN = "upgrade-cluster-ocp4-prod-mce-site1-a_ocp4-prod-herzi-site1"
+RUN = "upgrade-cluster-ocp4-prod-herzi-site1"
 BODY = {
-    "mce_cluster": "prod-mce-site1-a",
     "cluster": "ocp4-prod-herzi-site1",
     "target_version": "4.20.44",
     "requested_by": "alice",
@@ -84,7 +83,7 @@ def client(fake: _FakeClient) -> TestClient:
 
 
 class TestStart:
-    def test_a_start_is_one_run_per_cluster_on_its_canonical_mce(self, client, fake):
+    def test_a_start_is_one_run_per_cluster(self, client, fake):
         response = client.post(PATH, json=BODY)
 
         assert response.status_code == 202
@@ -94,9 +93,14 @@ class TestStart:
         # The run's input is the history model itself, never the edge subclass,
         # with the defaults written into it.
         assert type(args.input) is UpgradeClusterInput
-        assert args.input.mce_cluster == "ocp4-prod-mce-site1-a"
         assert args.input.nodepool_mode is NodePoolMode.MANUAL
         assert args.resume is None
+
+    def test_the_mce_is_not_asked_for_and_says_why(self, client, fake):
+        # The run reads it from sites/<site>/mces/<mce>/hostedClusters/<cluster>.yaml.
+        response = client.post(PATH, json={**BODY, "mce_cluster": "prod-mce-site1-a"})
+        assert response.status_code == 422 and "finds the hosting MCE" in response.text
+        assert fake.starts == []
 
     def test_a_tag_spelling_becomes_the_bare_version(self, client, fake):
         assert client.post(PATH, json={**BODY, "target_version": "4.20.44-x86_64"}).status_code == 202

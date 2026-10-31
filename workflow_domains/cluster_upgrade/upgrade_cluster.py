@@ -240,7 +240,8 @@ class UpgradeClusterWorkflow:
     @workflow.init
     def __init__(self, run_args: UpgradeClusterRunArgs) -> None:
         self._input: UpgradeClusterInput = run_args.input
-        self._mce = run_args.input.mce_cluster
+        # Found in day1 during planning; restored from the context on a continued run.
+        self._mce = ""
         self._cluster = run_args.input.cluster
         self._context: UpgradeContext | None = None
         self._phase = UpgradePhase.PLANNING
@@ -278,6 +279,7 @@ class UpgradeClusterWorkflow:
         resume = run_args.resume
         if resume is not None:
             self._context = resume.context
+            self._mce = resume.context.mce_cluster or ""
             self._approved_by = resume.approved_by
             self._next_step = resume.next_step
             self._nodepools_done = list(resume.nodepools_done)
@@ -297,6 +299,7 @@ class UpgradeClusterWorkflow:
         return UpgradeClusterProgress(
             phase=self._phase,
             waiting_for=self._waiting_for,
+            mce_cluster=self._mce or None,
             plan=context.plan if context else None,
             profile=context.profile if context else None,
             current_step=self._next_step if context else None,
@@ -487,10 +490,14 @@ class UpgradeClusterWorkflow:
         """Planning, pre-flight, approval. True when the cluster is already at the target."""
         request = self._input
         self._phase = UpgradePhase.PLANNING
+        day1: Day1Cluster = await on_hub(read_day1_cluster, Day1ClusterRequest(cluster=self._cluster))
+        mce_cluster = gates.mce_of_day1_path(day1.path)
+        if mce_cluster is None:
+            self._fail_planning(
+                f"day1 file {day1.path} is not under sites/<site>/mces/<mce>/hostedClusters/: no MCE to run on"
+            )
+        self._mce = mce_cluster
         rules: UpgradeRules = await on_hub(read_upgrade_rules, UpgradeRulesRequest(mce_cluster=self._mce))
-        day1: Day1Cluster = await on_hub(
-            read_day1_cluster, Day1ClusterRequest(mce_cluster=self._mce, cluster=self._cluster)
-        )
         mce: MceState = await on_mce(self._mce, read_mce_state, MceRequest(mce_cluster=self._mce))
         hosted: HostedClusterState = await on_mce(
             self._mce, read_hosted_cluster, HostedClusterRequest(mce_cluster=self._mce, cluster=self._cluster)
@@ -533,6 +540,7 @@ class UpgradeClusterWorkflow:
             release=rules.release,
             verified_against_graph=rules.verified_against_graph,
             day1_path=day1.path,
+            mce_cluster=self._mce,
             tier1_enabled=day1.upgrade.wave in _TIER1_WAVES,
             admin_acks=rules.admin_acks,
             api_usage_ignored_users=rules.api_usage_ignored_users,
@@ -1155,9 +1163,7 @@ class UpgradeClusterWorkflow:
         """After a person's retry on a conflict, carry on from the file as they left it."""
         if not self._day1_stale:
             return
-        day1: Day1Cluster = await on_hub(
-            read_day1_cluster, Day1ClusterRequest(mce_cluster=self._mce, cluster=self._cluster)
-        )
+        day1: Day1Cluster = await on_hub(read_day1_cluster, Day1ClusterRequest(cluster=self._cluster))
         self._day1_blob = day1.blob
         self._day1_stale = False
         self._log("day1-reread", detail=f"{day1.path} at {day1.revision}")

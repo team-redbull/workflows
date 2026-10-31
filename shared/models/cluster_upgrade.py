@@ -115,9 +115,10 @@ class UpgradeClusterInput(BaseModel):
     Exactly one of `target_version` and `target_minor` is set; the router
     enforces it. With `target_minor`, the run picks the recommended target:
     the newest release of that minor that is both mirrored and a ladder rung.
+    No MCE: the run reads it from where day1 keeps the cluster file,
+    `sites/<site>/mces/<mce>/hostedClusters/<cluster>.yaml`.
     """
 
-    mce_cluster: str
     cluster: str
     target_version: str | None = None
     target_minor: str | None = None
@@ -176,6 +177,9 @@ class UpgradeContext(BaseModel):
     release: ReleaseLayout
     verified_against_graph: str | None = None
     day1_path: str
+    # The hosting MCE, read from day1_path's `sites/<site>/mces/<mce>/` (canonical,
+    # with its `ocp4-` prefix): which MCE's queue the run's activities go to.
+    mce_cluster: str | None = None
     tier1_enabled: bool = False
     # The acks the run may give by itself, and whose calls to a gated API do
     # not count (rules file, D16). Empty in runs planned before them.
@@ -281,6 +285,7 @@ class UpgradeClusterProgress(BaseModel):
 
     phase: UpgradePhase
     waiting_for: str | None = None
+    mce_cluster: str | None = None  # found in day1 during planning
     plan: UpgradePlan | None = None
     profile: ClusterProfile | None = None
     current_step: int | None = None
@@ -370,7 +375,8 @@ class UpgradeRules(BaseModel):
 
 
 class Day1ClusterRequest(BaseModel):
-    mce_cluster: str
+    """Find `<cluster>.yaml` under any `sites/*/mces/*/hostedClusters/`: names are unique in day1."""
+
     cluster: str
 
 

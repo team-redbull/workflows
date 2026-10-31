@@ -46,7 +46,9 @@ async def read_upgrade_rules(request: UpgradeRulesRequest) -> UpgradeRules:
 async def read_day1_cluster(request: Day1ClusterRequest) -> Day1Cluster:
     """The cluster's day1 file at `main`, its blob id, and what its parser refused.
 
-    Raises ClusterFileNotFoundError / AmbiguousClusterFileError (permanent).
+    Searched under every `sites/*/mces/*/hostedClusters/`; its path names the
+    hosting MCE, which is how the run learns it. Raises ClusterFileNotFoundError
+    / AmbiguousClusterFileError (permanent).
     """
     ...
 

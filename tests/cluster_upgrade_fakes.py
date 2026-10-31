@@ -97,7 +97,7 @@ from workflow_domains.cluster_upgrade.upgrade_control_plane import UpgradeContro
 
 MCE = "ocp4-prod-mce-site1-a"
 CLUSTER = "ocp4-prod-herzi-site1"
-WORKFLOW_ID = upgrade_cluster_workflow_id(MCE, CLUSTER)
+WORKFLOW_ID = upgrade_cluster_workflow_id(CLUSTER)
 HUB_QUEUE = UPGRADE_GITOPS_ACTIVITY_QUEUE
 MCE_QUEUE = cluster_upgrade_activity_queue(MCE)
 AGENT_QUEUE = upgrade_agent_activity_queue(MCE)
@@ -171,6 +171,8 @@ class Fleet:
         self.mirror = mirror if mirror is not None else [r.version for r in LADDER]
         self.max_concurrent_control_planes = max_concurrent_control_planes
         # day1, as written: production files pin every NodePool's workertag.
+        # Its folder names the MCE the run then works on.
+        self.day1_path = DAY1_PATH
         self.mastertag = control_plane
         self.workertags = dict(self.nodepools)
         self.paused_until = False
@@ -261,7 +263,7 @@ class Fleet:
         async def read_day1_cluster(request: Day1ClusterRequest) -> Day1Cluster:
             fleet.calls.append("read_day1_cluster")
             return Day1Cluster(
-                path=DAY1_PATH, revision=f"rev-{fleet.revision}", blob=fleet._blob(),
+                path=fleet.day1_path, revision=f"rev-{fleet.revision}", blob=fleet._blob(),
                 mastertag=fleet.mastertag, image_path=IMAGE_PATH,
                 nodepools=[
                     Day1NodePool(name=name, workertag=fleet.workertags.get(name), upgrade_type="InPlace",
@@ -606,7 +608,7 @@ class Harness:
 
 def request(**kwargs: Any) -> UpgradeClusterInput:
     defaults: dict[str, Any] = {
-        "mce_cluster": MCE, "cluster": CLUSTER, "target_version": "4.20.44", "requested_by": "ops@example",
+        "cluster": CLUSTER, "target_version": "4.20.44", "requested_by": "ops@example",
     }
     defaults.update(kwargs)
     return UpgradeClusterInput(**defaults)

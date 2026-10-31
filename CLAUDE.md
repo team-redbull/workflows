@@ -127,7 +127,10 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   a workflow wanting a live progress surface just defines `@workflow.query def progress`; one that
   doesn't degrades to status-only. `GET /workflows/runs?workflow_type=<WorkflowClass>` lists one
   workflow's newest runs (status and times only; the type is pattern-checked because it goes into
-  the visibility query).
+  the visibility query). ONE route is synchronous on purpose: `GET
+  /workflows/cluster-upgrade/upgrade-targets` runs a short read-only workflow (`upgrade-targets`,
+  60 s execution timeout) and returns its answer in the response — a question, not a job, so it
+  has no run to poll (DESIGN D22). Every route that STARTS work stays asynchronous.
 - **A temporary page may live at `/ui/<domain>`, served by the API it calls** (cluster-upgrade's
   and server-lifecycle's, `workflow_domains/<domain>/ui.py`, until the ClickCluster Platform UI
   exists; each links to the other). ONE self-contained HTML file in the domain folder, nothing from
@@ -616,12 +619,20 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   ONLY its key lines as text, re-parses, and refuses (`Day1ChangeRejectedError`) unless only those
   keys moved and the file now renders what was asked; "already so" is checked BEFORE the blob
   compare-and-set, or a retry would read its own landed push as someone else's edit
-  (`Day1FileChangedError`). `DAY1_VALIDATE_COMMAND` runs in the clone first; a rejected push is
-  retried from a fresh clone, never forced. Releases are pinned over the registry v2 API and
-  checked with `oc adm release info` (the image carries `oc`): a gap is reported, an outage or a
-  refused credential on the release repo is the retryable `ReleaseRegistryError`. No
-  `DAY2_REPO_URL` / `BRAIN_REPO_URL` is a `note` in the result, never an error, so a lab runs
-  without them; a Brain page its validator refuses is not pushed, and the run is told.
+  (`Day1FileChangedError`). `DAY1_VALIDATE_COMMAND` runs in the clone first; ONE clone per
+  attempt, and a rejected push raises the retryable error so Temporal re-clones — never a retry
+  loop inside the attempt, never forced. The clone's `origin` is reset to the URL WITHOUT the
+  token right after cloning and the push goes to the authenticated URL built in memory, so no
+  file of the clone holds a token while day1's or Brain's own scripts run in it. Those scripts
+  still run as this pod's user, which can read its environment and the mounted registry auth;
+  moving them to a separate Job is the fix (the chart README says so). Releases are pinned over
+  the registry v2 API and checked with `oc adm release info` (the image carries `oc`): only a
+  deterministic "not found / manifest unknown" is a gap; a timeout, a missing `oc`, non-JSON, an
+  outage or a refused credential is the retryable `ReleaseRegistryError`. No `DAY2_REPO_URL` /
+  `BRAIN_REPO_URL` is a `note` in the result, never an error, so a lab runs without them. Brain
+  never holds a gate: `write_incident` always returns, with a `note` when Brain is missing,
+  unreachable after its third attempt, or refuses; a page its validator refuses, or a validator
+  that times out or crashes, is not pushed (fail closed), and the run is told.
 - **allocate-segment writes to the BRANCH THE RUN NAMES, and ends at the push.** Until a
   create-cluster workflow exists, allocate-segment is a step INSIDE the day1 values repo's GitLab
   pipeline, which runs only on non-`main` branches: a human pushes a temp branch with the new

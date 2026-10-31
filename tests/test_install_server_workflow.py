@@ -198,6 +198,7 @@ def make_mock_activities(
     image_after_polls: int = 0,
     image_never_updates: bool = False,
     boot_superseded: bool = False,
+    nmstate_error: Exception | None = None,
 ):
     """Build the full mock activity set + a call recorder.
 
@@ -222,6 +223,9 @@ def make_mock_activities(
     unpublished for the first `image_after_polls` polls (the image is still
     being regenerated), or forever with `image_never_updates`; `boot_superseded`
     makes the PXE VM report a newer image already published.
+
+    `nmstate_error` is raised by `create_nmstate_config` — the incident in which
+    the NMStateConfig already existed with other content (BmhConflictError).
     """
     calls: dict[str, list] = {
         name: []
@@ -342,6 +346,8 @@ def make_mock_activities(
     async def create_nmstate_config(request: BmhResourceRequest) -> CreatedResource:
         calls["create_nmstate_config"].append(request)
         calls["order"].append("create_nmstate_config")
+        if nmstate_error is not None:
+            raise nmstate_error
         return _created("NMStateConfig", f"nmstate-config-{request.server_name}")
 
     @activity.defn

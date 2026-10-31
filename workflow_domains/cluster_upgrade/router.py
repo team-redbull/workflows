@@ -42,6 +42,7 @@ from shared.models.cluster_upgrade import (
     ActionDecision,
     ContinueNodePool,
     HumanDecision,
+    NodePoolMode,
     UpgradeClusterInput,
     UpgradeClusterRunArgs,
     UpgradeTargets,
@@ -93,6 +94,35 @@ class UpgradeClusterRequest(UpgradeClusterInput):
         description=(
             "The order NodePools roll in; each exactly once. Default: the cluster "
             "file's `upgrade.nodePoolOrder`, else by zone, else file order."
+        ),
+    )
+    # The three modes (docs: upgrade-cluster.html#modes). The two automatic ones are
+    # refused at planning unless the cluster file says upgrade.wave 0 or 1 (gates.py).
+    nodepool_mode: NodePoolMode = Field(
+        default=NodePoolMode.MANUAL,
+        description=(
+            "Who starts each NodePool roll. `manual` (default): the run waits for `continue` before "
+            "every NodePool, the customer's sign-off after their own readiness checks. `auto`: the "
+            "next NodePool rolls once the previous one's gate has held for the soak, and nobody is "
+            "asked. `auto` only for a cluster file with `upgrade.wave` 0 or 1 (lab, canary), else "
+            "planning fails."
+        ),
+    )
+    workers_to_target: bool = Field(
+        default=True,
+        description=(
+            "`true` (default): the plan ends with every NodePool at the target. `false`: control "
+            "plane only; a NodePool moves only where the path forces it (more than `maxWorkerSkew` "
+            "minors behind, or a `dataPlane: required` rung)."
+        ),
+    )
+    auto_approve: bool = Field(
+        default=False,
+        description=(
+            "`true`: the run approves its own plan after pre-flight instead of waiting for "
+            "`approve`. Only for a cluster file with `upgrade.wave` 0 or 1 (lab, canary), else "
+            "planning fails. `confirm-day2`, an admin ack a client still needs, every needs-human "
+            "stop and every agent proposal still wait for a person."
         ),
     )
     requested_by: str = Field(min_length=1, description="Who asked; recorded in the run's log.")

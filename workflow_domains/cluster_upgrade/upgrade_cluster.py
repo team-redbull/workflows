@@ -37,6 +37,18 @@ what a person has to do next):
   5. postflight         — the top-level workertag the run added is dropped;
                           the cluster checked at the target.
 
+MODES, from the request, checked at planning (docs: upgrade-cluster.html#modes).
+`auto_approve` removes the one approval: the run approves itself after
+pre-flight. `nodepool_mode: auto` removes the customer's `continue`: each
+NodePool rolls once the previous gate held for the soak. Both are only for a
+cluster file with `upgrade.wave` 0 or 1, lab and canary (gates._UNATTENDED_WAVES,
+D20); elsewhere planning FAILS saying why, never a quiet switch to manual.
+`workers_to_target: false` ends at the control plane, the NodePools moving only
+where the path forces them. The wave also sets the agent's `tier1_enabled`
+(_TIER1_WAVES), which the agent ignores until tier 1 exists. No mode skips
+`confirm-day2`, an admin ack a client still needs, a needs-human stop or an
+agent proposal: those always wait for a person.
+
 A failed gate goes to the agent once (dispatch.diagnose); it may clear the gate
 for ONE more try. Anything else is needs-human: `retry` re-runs the same gate,
 and a tier-2 action the agent proposed runs only after a person approves it.

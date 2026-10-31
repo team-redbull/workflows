@@ -70,7 +70,7 @@
   <section id="status">
     <div class="sec-head">
       <div class="eyebrow">Where it stands</div>
-      <h2>Built and tested on a fake fleet &mdash; not runnable yet</h2>
+      <h2>Built, and run on a sandbox HostedCluster &mdash; not in production yet</h2>
       <p class="lede">This page describes the code on <code>main</code>. Where the design says more than the
       code does yet, the page says so.</p>
     </div>
@@ -79,38 +79,44 @@
       <div class="panel ok">
         <h3>Built, on main</h3>
         <ul>
-          <li>The workflow and its control-plane child, every activity mocked against a <b>fake fleet</b>:
-            happy path with a week between NodePools, pause, abort, the agent, the slot cap, a digest that
-            moves, admin acks, continue-as-new.</li>
-          <li><b>Replay tests</b> of saved histories.</li>
+          <li>The workflow and its control-plane child, tested against a <b>fake fleet</b>: happy path with a
+            week between NodePools, pause, abort, the agent, the slot cap, a digest that moves, admin acks,
+            continue-as-new. <b>Replay tests</b> of saved histories.</li>
           <li>The path resolver and every check, as pure code.</li>
-          <li>The HTTP routes, with their own tests, <b>mounted</b> on the API.</li>
-          <li>The <b>MCE limb</b>, <code>cluster-upgrade-worker</code>: the reads, the admin-ack write, the
-            Argo CD sync, the watches, the NodePool gate and the tier-2 actions, with its worker, image and
-            chart (RBAC derived from its calls). It reaches the HostedCluster by its own name
-            (<code>openshift-&lt;clusterName&gt;</code> in <code>hcp-&lt;clusterName&gt;</code>) and syncs the
-            multi-source Application at the day1 commit, in its <code>ref: values</code> source.</li>
+          <li>The HTTP routes, <b>mounted</b> on the API, and the temporary page.</li>
+          <li><b>All three limbs</b>, each with its worker, image and chart:
+            <code>upgrade-gitops-worker</code> on the hub (day1 read and commit with day1&rsquo;s own validator,
+            release digests over the registry API and <code>oc adm release info</code>, day2 layers, Brain);
+            <code>cluster-upgrade-worker</code> per MCE (the reads, the admin-ack write, the Argo CD sync of the
+            multi-source Application at the day1 commit, the watches, the NodePool gate, approved proposals);
+            <code>upgrade-agent-worker</code> per MCE, calling the <b>upgrade agent service</b> (its own repo), run
+            as a kubernetes-sigs agent-sandbox <code>Sandbox</code>.</li>
+          <li>Abort&rsquo;s <code>pausedUntil</code>: the hostedclusters-setup chart renders it on the HostedCluster
+            and every NodePool.</li>
         </ul>
       </div>
       <div class="panel warn">
         <h3>Not yet</h3>
         <ul>
-          <li>Still to build: the hub limb (day1 git, the mirror, day2, Brain), the agent&rsquo;s judge and tier-1
-            tools, and the RBAC and admission policies.</li>
-          <li>Abort commits <code>pausedUntil</code>, which the hostedclusters-setup chart does not render
-            yet.</li>
+          <li>The agent&rsquo;s <b>judge</b> and <b>tier-1</b> tools: every fix is a proposal a person approves, in
+            every wave (<a href="#modes">modes</a>).</li>
+          <li>The <b>RBAC and admission policies</b> that fence the agent&rsquo;s identities.</li>
+          <li>The three workers&rsquo; charts in redbull-platform: CI builds their images, and they are installed
+            from <code>deploy/charts/</code> by hand.</li>
+          <li>Fleet waves and their circuit breaker.</li>
         </ul>
       </div>
       <div class="panel">
         <h3>So, today</h3>
-        <p>A run <b>cannot be started</b>. Started by hand, it would sit in <code>planning</code>, its first
-        activity waiting for a worker that does not exist yet.</p>
+        <p><b>On the sandbox (2026-10-31):</b> a KubeVirt HostedCluster created by Argo CD from a day1 file
+        through the hostedclusters-setup chart, being upgraded 4.19.53 &rarr; 4.20.44 by this workflow. So far a
+        failed pre-flight went to the agent (the lab model did not answer, so a person retried), the run gave
+        the 4.19 admin ack itself, and the control plane moved by a day1 commit and an Argo CD sync, nobody
+        touching the HostedCluster.</p>
         <p><b>To see it:</b> the workflows API serves a temporary page at <code>/ui/cluster-upgrade</code>, until the
-        ClickCluster Platform UI exists. It lists the runs, draws each plan, says what a run waits for and offers its
-        decisions. It shows only the runs the API reports, so until the routes that start a run are mounted
-        its list is empty.</p>
-        <p class="note">Read this page as the contract the limbs are being built to. Design:
-        <code>docs/upgrade/DESIGN.md</code> in the Cluster-AutoUpgrade workspace.</p>
+        ClickCluster Platform UI exists. It starts a run, lists the runs, draws each plan, says what a run waits
+        for and offers its decisions.</p>
+        <p class="note">Design: <code>docs/upgrade/DESIGN.md</code> in the Cluster-AutoUpgrade workspace.</p>
       </div>
     </div>
   </section>
@@ -468,7 +474,7 @@
           <code>abort</code> here ends the run <b>CANCELLED</b>: nothing was committed.</p>
           <p class="note">This is also the dry run: start, read the plan, abort. With
           <code>auto_approve</code>, only allowed when the cluster file says <code>upgrade.wave</code> 0 or 1
-          (lab, canary), the run approves itself.</p>
+          (lab, canary), the run approves itself (<a href="#modes">modes</a>).</p>
         </div>
       </div>
 
@@ -537,7 +543,8 @@
               workloads &mdash; after the control plane, then after each NodePool &mdash; and
               <code>continue</code> is their sign-off. The workflow runs no customer checks itself. This can take a
               week. Auto mode goes on after the previous gate&rsquo;s soak without asking anyone, so it is <b>for lab and
-              canary clusters only</b> (<code>upgrade.wave</code> 0 or 1): elsewhere planning fails, saying why.</li>
+              canary clusters only</b> (<code>upgrade.wave</code> 0 or 1): elsewhere planning fails, saying why
+              (<a href="#modes">modes</a>).</li>
             <li><b>Pre-flight 5&ndash;10</b>, scoped to this NodePool, and the digest re-checked.</li>
             <li><b>Commit</b> <code>nodepool[&lt;name&gt;].workertag</code> and <b>sync</b>, refused if anything but
               <code>NodePool/&lt;name&gt;</code> is out of sync. A sync refused after the commit landed is retried
@@ -599,6 +606,115 @@
         it never ends half-aborted. <b>There is no downgrade</b>, and no commit is ever reverted.</p>
       </div>
     </div>
+  </section>
+
+  <!-- ============================================================== MODES -->
+  <section id="modes">
+    <div class="sec-head">
+      <div class="eyebrow">Who has to be there</div>
+      <h2>Modes: what runs by itself, and what always waits for a person</h2>
+      <p class="lede">Three request fields set how much of a run happens without anyone.
+      <code>auto_approve</code> removes the one approval. <code>nodepool_mode</code> removes the customer&rsquo;s
+      <code>continue</code> before each NodePool. <code>workers_to_target</code> says whether the NodePools are
+      rolled at all at the end. The two automatic options are <b>only for lab and canary clusters</b>, the
+      cluster file&rsquo;s <code>upgrade.wave</code> 0 or 1. Asked for anywhere else, planning <b>fails</b>,
+      saying why, with nothing committed. The run never switches to manual by itself.</p>
+    </div>
+
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>field</th><th>default</th><th>the other value</th><th>allowed</th></tr></thead>
+        <tbody>
+          <tr>
+            <td class="k"><code>auto_approve</code></td>
+            <td class="muted"><code>false</code>: after pre-flight the run waits in <code>awaiting-approval</code>
+              for <code>approve</code></td>
+            <td class="muted"><code>true</code>: the run approves its own plan right after pre-flight, logged
+              as <code>auto-approve, requested by &lt;requested_by&gt;</code>. Pre-flight still runs first, and an
+              <code>abort</code> sent during it still cancels</td>
+            <td class="muted"><code>upgrade.wave</code> 0 or 1, else check <code>auto-approve-wave</code> fails
+              planning</td>
+          </tr>
+          <tr>
+            <td class="k"><code>nodepool_mode</code></td>
+            <td class="muted"><code>manual</code>: before <b>every</b> NodePool, the first one after the control
+              plane included, the run waits in <code>awaiting-continue</code>. The customer runs their own
+              readiness checks, and <code>continue</code> is their sign-off. It may name which NodePool goes
+              next</td>
+            <td class="muted"><code>auto</code>: the first NodePool rolls as soon as the control plane is done,
+              and each next one once the previous gate has held for the soak. Nobody is asked, so the customer
+              gets no turn to check. Order: <code>nodepool_order</code>, else <code>upgrade.nodePoolOrder</code>,
+              else by zone, else file order</td>
+            <td class="muted"><code>upgrade.wave</code> 0 or 1, else check <code>auto-mode-wave</code> fails
+              planning. A plan that rolls no NodePool is not checked</td>
+          </tr>
+          <tr>
+            <td class="k"><code>workers_to_target</code></td>
+            <td class="muted"><code>true</code>: the plan ends with a worker step that brings every NodePool to
+              the target</td>
+            <td class="muted"><code>false</code>: control plane only. A NodePool still moves where the path
+              forces it: before it would fall more than <code>maxWorkerSkew</code> minors behind, and at a
+              <code>dataPlane: required</code> rung. Post-flight accepts the NodePools where the plan left
+              them. A later run to the same target, with <code>true</code>, plans only the worker step</td>
+            <td class="muted">any wave</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="grid-2" style="margin-top:18px">
+      <div class="panel">
+        <h3>The wave: a label in the cluster file</h3>
+        <p><code>upgrade.wave</code>, an integer in the cluster&rsquo;s day1 file
+        (<code style="overflow-wrap:anywhere">sites/&lt;site&gt;/mces/&lt;mce&gt;/hostedClusters/&lt;cluster&gt;.yaml</code>). The chart never
+        reads it. <b>0</b> is a lab cluster, <b>1</b> a canary. Production is <b>2 and up</b> (in the design,
+        2 for generic clusters and 3 for zoned or critical ones), but the code only tells 0&ndash;1 from
+        everything else. <b>No wave counts as production:</b> nothing automatic.</p>
+        <p>What the wave decides:</p>
+        <ul>
+          <li><code>auto_approve</code> and <code>nodepool_mode: auto</code>: allowed in waves 0&ndash;1; in any
+            other wave, or with none, planning fails.</li>
+          <li>The agent&rsquo;s tier 1 (<code>tier1_enabled</code>): on in waves 0&ndash;1, where the agent will run
+            a known-safe fix itself once its judge and tier-1 tools exist; off elsewhere, where every fix is a
+            proposal a person approves.</li>
+        </ul>
+        <p class="note">Today tier 1 is not built: the agent service ignores <code>tier1_enabled</code> and
+        proposes every fix, in every wave. Fleet waves are not built either: running a whole wave of clusters
+        and pausing it when too many end <code>needs-human</code>. For now a wave is only this label.</p>
+      </div>
+      <div class="panel warn">
+        <h3>Always a person, in every mode</h3>
+        <ul>
+          <li><code>confirm-day2</code> after <b>every</b> control-plane step, intermediate ones included: the
+            day2 team syncs their layer for the new version, and only they confirm. So even a wave-0 run with
+            both automatic options stops once per control-plane step.</li>
+          <li><code>approve-admin-ack</code> when a client called a gated API in the last 24 hours. With no
+            caller the run gives the ack itself, in every mode; a gate the rules do not list is
+            <code>needs-human</code>.</li>
+          <li><code>needs-human</code>: a check or gate that failed again after the agent&rsquo;s one retry, a
+            watch past its deadline, a commit or sync refused. Then <code>retry</code> or <code>abort</code>.</li>
+          <li>Every agent proposal (tier 2): <code>actions/{id}/approve</code> or <code>reject</code>.</li>
+          <li><code>pause</code>, <code>resume</code> and <code>abort</code>: only a person, never the run or
+            the agent.</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="table-scroll" style="margin-top:18px">
+      <table>
+        <thead><tr><th>in practice</th><th>request</th><th>the run stops for</th></tr></thead>
+        <tbody>
+          <tr><td class="k">production (the default)</td><td class="muted">nothing extra</td><td class="muted"><code>approve</code> &rarr; per control-plane step <code>confirm-day2</code> &rarr; per NodePool <code>continue</code></td></tr>
+          <tr><td class="k">lab, hands-off</td><td class="muted"><code>"auto_approve": true, "nodepool_mode": "auto"</code> on wave 0 or 1</td><td class="muted">only <code>confirm-day2</code> per control-plane step, plus anything in the list above</td></tr>
+          <tr><td class="k">control plane now, workers later</td><td class="muted"><code>"workers_to_target": false</code></td><td class="muted"><code>approve</code> &rarr; <code>confirm-day2</code> per step; the NodePools only where the path forces it</td></tr>
+          <tr><td class="k">a dry run</td><td class="muted">any; then <code>abort</code> at <code>awaiting-approval</code></td><td class="muted">the plan, pinned and pre-flighted; ends CANCELLED with nothing committed. With <code>auto_approve</code> there is no stop to abort at</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note" style="margin-top:14px">The temporary page at <code>/ui/cluster-upgrade</code> offers <code>nodepool_mode</code> and
+    <code>auto_approve</code> on its start form. <code>workers_to_target</code> is API only. The rules are in
+    <code>workflow_domains/cluster_upgrade/gates.py</code> (<code>_UNATTENDED_WAVES</code>) and
+    <code>upgrade_cluster.py</code> (<code>_TIER1_WAVES</code>).</p>
   </section>
 
   <!-- ========================================================== PREFLIGHT -->
@@ -823,7 +939,7 @@ or retry to check again (the count covers 24 hours)</pre>
   "target_minor":      "4.21",               <span class="c">// or "target_version": "4.21.40"</span>
   "nodepool_mode":     "manual",             <span class="c">// default; "auto" rolls on after each soak, upgrade.wave 0 or 1 only</span>
   "nodepool_order":    null,                 <span class="c">// default: upgrade.nodePoolOrder, else zone, else file order</span>
-  "workers_to_target": true,                 <span class="c">// default</span>
+  "workers_to_target": true,                 <span class="c">// default; false = control plane only, NodePools where the path forces them</span>
   "auto_approve":      false,                <span class="c">// default; planning fails unless upgrade.wave is 0 or 1</span>
   "requested_by":      "&lt;you&gt;"
 }
@@ -831,7 +947,8 @@ or retry to check again (the count covers 24 hours)</pre>
 <span class="c">// 202 response</span>
 { "workflow_id": "upgrade-cluster-&lt;cluster&gt;", "run_id": "…" }</pre>
           <p class="note">Starting is the dry run: the run plans, pins, pre-flights and waits for
-          <code>approve</code> with nothing committed. Read the plan, then <code>abort</code>: CANCELLED.</p>
+          <code>approve</code> with nothing committed. Read the plan, then <code>abort</code>: CANCELLED.
+          What each mode field does, and where it is allowed: <a href="#modes">modes</a>.</p>
         </div>
       </div>
 

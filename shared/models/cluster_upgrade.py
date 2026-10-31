@@ -126,10 +126,14 @@ class UpgradeClusterInput(BaseModel):
     cluster: str
     target_version: str | None = None
     target_minor: str | None = None
+    # The modes (upgrade_cluster.py "MODES"): AUTO and auto_approve only with the
+    # cluster file's upgrade.wave 0 or 1, else planning fails.
     nodepool_mode: NodePoolMode = NodePoolMode.MANUAL
     # Default: the cluster file's `upgrade.nodePoolOrder`, else zone order.
     nodepool_order: list[str] | None = None
+    # False: control plane only; NodePools move only where the path forces them.
     workers_to_target: bool = True
+    # True: the run approves its own plan after pre-flight.
     auto_approve: bool = False
     requested_by: str
 

@@ -293,6 +293,7 @@ const FLOWS = {
       "acquiring-server": ["Drawing candidates", "Asks server-scan for the healthy, unclaimed servers listed under the InfraEnv's name."],
       "selecting-server": ["Checking a candidate", "A usable name, a known BMC, two link-up NICs on two physical ports, and no BareMetalHost already. Any reason it fails is a skip to the next candidate."],
       "reserving-server": ["Locking the server", "Takes server-scan's install lock before anything is written, so no other MCE draws this machine."],
+      "checking-nmstateconfig": ["Checking an existing NMStateConfig", "An NMStateConfig already under the server's name that differs from this install is replaced, unless a BareMetalHost or Agent shows the server installed or in progress: then nothing is changed and it is refused."],
       "registering-pxe-boot": ["Mapping it on the PXE VM", "An IPMI server boots from the network: its boot MAC is mapped on its site's PXE VM."],
       "creating-nmstateconfig": ["Creating the NMStateConfig", "The static network config the discovery image carries."],
       "publishing-pxe-boot": ["Publishing the boot entry", "Waits (up to 10 min) for a discovery image that includes the NMStateConfig, then publishes it as the InfraEnv's boot entry."],
@@ -311,6 +312,7 @@ const FLOWS = {
       ["Draw candidates", ["acquiring-server"]],
       ["Choose a server", ["selecting-server", "rolling-back", "unregistering-pxe-boot", "releasing-server"]],
       ["Lock it in server-scan", ["reserving-server"]],
+      ["Existing NMStateConfig", ["checking-nmstateconfig"]],
       ["PXE boot entry (IPMI only)", ["registering-pxe-boot", "publishing-pxe-boot"]],
       ["Secret, BareMetalHost, NMStateConfig", ["creating-secret", "creating-baremetalhost", "creating-nmstateconfig"]],
       ["Agent registers", ["awaiting-agent"]],
@@ -500,7 +502,7 @@ function mceOf(v) {
 // install-server's `progress.server_name` is the candidate of the latest ATTEMPT: set once a
 // candidate is locked and about to be created, and kept while the run rolls it back and
 // checks the next one. What it means therefore depends on the phase.
-const INSTALLING = ["creating-nmstateconfig", "publishing-pxe-boot", "creating-secret", "creating-baremetalhost", "awaiting-agent", "holding-server", "completed"];
+const INSTALLING = ["checking-nmstateconfig", "creating-nmstateconfig", "publishing-pxe-boot", "creating-secret", "creating-baremetalhost", "awaiting-agent", "holding-server", "completed"];
 const ROLLING_BACK = ["rolling-back", "unregistering-pxe-boot", "releasing-server"];
 function serverRole(v) {
   const phase = v.p && v.p.phase;

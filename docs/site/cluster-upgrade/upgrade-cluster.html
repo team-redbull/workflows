@@ -528,7 +528,11 @@
           when every NodePool has one, else file order. For each NodePool:</p>
           <ol>
             <li><b>Wait</b> (manual mode, the default) for <code>continue</code>, which may name the next
-              NodePool. This can take a week. Auto mode goes on after the previous gate&rsquo;s soak.</li>
+              NodePool. <b>This is the customer&rsquo;s turn:</b> they run their own readiness checks on their
+              workloads &mdash; after the control plane, then after each NodePool &mdash; and
+              <code>continue</code> is their sign-off. The workflow runs no customer checks itself. This can take a
+              week. Auto mode goes on after the previous gate&rsquo;s soak without asking anyone, so it suits only a
+              customer who agreed not to check between NodePools.</li>
             <li><b>Pre-flight 5&ndash;10</b>, scoped to this NodePool, and the digest re-checked.</li>
             <li><b>Commit</b> <code>nodepool[&lt;name&gt;].workertag</code> and <b>sync</b>, refused if anything but
               <code>NodePool/&lt;name&gt;</code> is out of sync. A sync refused after the commit landed is retried
@@ -539,13 +543,11 @@
               for <b>10 min</b> is handed over early (<a href="#drain">below</a>). Deadline:
               <code>ceil(replicas / maxUnavailable)</code> &times; 60 min, <code>maxUnavailable</code> 0 counting
               as 1.</li>
-            <li><b>Gate</b>: all the NodePool&rsquo;s nodes Ready and schedulable; for a <code>zoned</code> cluster,
-              or one that declares readiness checks, also PDBs back to <code>disruptionsAllowed &ge; 1</code>,
-              StatefulSets ready, and the cluster&rsquo;s own checks (PromQL or HTTP). All of it must hold for the
-              <b>soak</b> &mdash; 30 min zoned, 0 generic, or <code>upgrade.soakMinutes</code>. Deadline: the soak
-              plus 60 min. <b>For now a declared check fails as &ldquo;not run&rdquo;</b>, so a cluster that
-              declares one waits for a person at every gate: how the limb reaches the hosted Prometheus (it needs a
-              token there) and a customer&rsquo;s route from the MCE is still open (design O22).</li>
+            <li><b>Gate</b> (the platform&rsquo;s own checks): all the NodePool&rsquo;s nodes Ready and
+              schedulable; for a <code>zoned</code> cluster also PDBs back to <code>disruptionsAllowed &ge; 1</code>
+              and StatefulSets ready. All of it must hold for the <b>soak</b> &mdash; 30 min zoned, 0 generic, or
+              <code>upgrade.soakMinutes</code>. Deadline: the soak plus 60 min. Then the customer checks (the wait
+              above).</li>
           </ol>
           <div class="calls">
             <div class="call nxt"><span class="verb">HUB</span><span class="path">pin_release_digests &middot; commit_day1_change <em>&middot; nodepool</em></span></div>
@@ -842,7 +844,7 @@ or retry to check again (the count covers 24 hours)</pre>
               <tbody>
                 <tr><td class="k">approve</td><td class="muted"><code>{by, reason?}</code></td><td class="muted">awaiting-approval</td><td class="muted">starts the steps</td></tr>
                 <tr><td class="k">approve-admin-ack</td><td class="muted"><code>{by, reason}</code> &mdash; reason required</td><td class="muted">awaiting-admin-ack</td><td class="muted">gives the acks although clients still call the APIs; the person answers for them</td></tr>
-                <tr><td class="k">continue</td><td class="muted"><code>{by, nodepool?}</code></td><td class="muted">awaiting-continue</td><td class="muted">rolls the next NodePool, or the one named (it must be one still waiting)</td></tr>
+                <tr><td class="k">continue</td><td class="muted"><code>{by, nodepool?}</code></td><td class="muted">awaiting-continue</td><td class="muted">the customer&rsquo;s sign-off that their readiness checks passed: rolls the next NodePool, or the one named (it must be one still waiting)</td></tr>
                 <tr><td class="k">confirm-day2</td><td class="muted"><code>{by}</code></td><td class="muted">awaiting-day2-confirm</td><td class="muted">carries on after the day2 team synced their layer</td></tr>
                 <tr><td class="k">pause</td><td class="muted"><code>{by, reason?}</code></td><td class="muted">after approval, not already paused</td><td class="muted">holds before the next commit; forwarded to a running child</td></tr>
                 <tr><td class="k">resume</td><td class="muted"><code>{by, reason?}</code></td><td class="muted">paused</td><td class="muted">carries on from where it held</td></tr>
@@ -941,9 +943,9 @@ or retry to check again (the count covers 24 hours)</pre>
           <tr><td class="k">waiting-for-slot</td><td class="muted">every control-plane slot on the MCE busy; polled every 2 min</td><td class="muted">the other runs&rsquo; steps</td></tr>
           <tr><td class="k">control-plane-step</td><td class="muted">the slot child commits, syncs and watches (its own phases on its own id)</td><td class="muted">stall 20 min, deadline 3 h</td></tr>
           <tr><td class="k">awaiting-day2-confirm</td><td class="muted">the day2 team syncs their layer for the new version</td><td class="muted">a person</td></tr>
-          <tr><td class="k">awaiting-continue</td><td class="muted">manual mode: the next NodePool waits for a person</td><td class="muted">a person</td></tr>
+          <tr><td class="k">awaiting-continue</td><td class="muted">manual mode: the customer runs their readiness checks, then sends continue</td><td class="muted">a person</td></tr>
           <tr><td class="k">nodepool-roll</td><td class="muted">commit, sync, watch the roll</td><td class="muted">stall 30 min (drain blocked 10 min); batches &times; 60 min</td></tr>
-          <tr><td class="k">nodepool-gate</td><td class="muted">nodes, workloads, readiness checks, held for the soak</td><td class="muted">soak + 60 min</td></tr>
+          <tr><td class="k">nodepool-gate</td><td class="muted">nodes and, for zoned clusters, PDBs and StatefulSets, held for the soak</td><td class="muted">soak + 60 min</td></tr>
           <tr><td class="k">agent-invocation</td><td class="muted">the upgrade agent on a failed gate</td><td class="muted">15 min budget + 2 min</td></tr>
           <tr><td class="k">needs-human</td><td class="muted"><code>retry</code>, an action decision, or <code>abort</code></td><td class="muted">a person</td></tr>
           <tr><td class="k">paused</td><td class="muted">held before the next commit</td><td class="muted">a person</td></tr>

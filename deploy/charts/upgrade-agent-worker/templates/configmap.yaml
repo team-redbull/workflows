@@ -1,0 +1,18 @@
+{{- include "uaw.validate" . -}}
+# Everything this worker reads but the token. An MCE has no brain ConfigMap,
+# so the Temporal endpoint is rendered here too.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "uaw.fullname" . }}-config
+  labels:
+    {{- include "uaw.labels" . | nindent 4 }}
+data:
+  TEMPORAL_HOST: {{ .Values.temporal.host | quote }}
+  TEMPORAL_NAMESPACE: {{ .Values.temporal.namespace | quote }}
+  MCE_CLUSTER: {{ .Values.mceCluster | quote }}
+  UPGRADE_AGENT_URL: {{ .Values.upgradeAgent.url | quote }}
+  {{- if .Values.temporal.tls.enabled }}
+  TEMPORAL_TLS_CA: /etc/temporal-tls/ca.crt
+  TEMPORAL_TLS_SERVER_NAME: {{ .Values.temporal.tls.serverName | default (first (splitList ":" .Values.temporal.host)) | quote }}
+  {{- end }}

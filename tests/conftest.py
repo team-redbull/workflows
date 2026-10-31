@@ -22,6 +22,7 @@ from shared.settings import (
     ServerLifecycleActivitySettings,
     ServerProvisioningActivitySettings,
     TemporalSettings,
+    UpgradeAgentActivitySettings,
 )
 
 for _settings_class in (
@@ -30,6 +31,7 @@ for _settings_class in (
     ServerLifecycleActivitySettings,
     ServerProvisioningActivitySettings,
     TemporalSettings,
+    UpgradeAgentActivitySettings,
 ):
     _settings_class.model_config["env_file"] = None
 
@@ -67,5 +69,8 @@ os.environ.update(
         # --- release-segment: the DHCP scope API ---
         "DHCP_API_URL": "http://dhcp.test",
         "DHCP_API_TOKEN": "test-dhcp-token",
+        # --- cluster-upgrade: the upgrade agent service ---
+        "UPGRADE_AGENT_URL": "http://upgrade-agent.test:8080",
+        "UPGRADE_AGENT_TOKEN": "test-agent-token",
     }
 )

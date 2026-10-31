@@ -202,6 +202,38 @@ jobs:
       helm-image-path: activityWorker.image
     secrets: inherit
 
+  build-upgrade-agent-worker:
+    # The cluster-upgrade agent limb (activities/upgrade_agent/). IMAGE ONLY, NO CHART BUMP:
+    # its chart does not exist in redbull-platform yet (it is deploy/charts/upgrade-agent-worker/
+    # here), and the shared ghcr-build-push workflow always bumps the chart on main, so that
+    # bump would fail. Until the chart is vendored there, this job publishes
+    # ghcr.io/<owner>/upgrade-agent-worker:<branch-slug>-<short sha> and the tag is set by hand;
+    # then switch it to the reusable workflow like the other limbs. Outside the sequential
+    # chain on purpose: it pushes nothing to redbull-platform, so it races with nothing.
+    needs: changes
+    if: ${{ needs.changes.outputs.limb == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - id: tag
+        run: |
+          slug="$(echo "${GITHUB_REF_NAME}" | tr -c 'a-zA-Z0-9' '-' | tr 'A-Z' 'a-z' | sed 's/-\+/-/g; s/^-//; s/-$//')"
+          echo "tag=${slug}-$(git rev-parse --short HEAD)" >> "${GITHUB_OUTPUT}"
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: activities/upgrade_agent/Dockerfile
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/upgrade-agent-worker:${{ steps.tag.outputs.tag }}
+
   cleanup-workflow-brain-on-delete:
     if: github.event_name == 'delete'
     uses: team-redbull/.github/.github/workflows/ghcr-cleanup-on-delete.yml@main
@@ -228,6 +260,13 @@ jobs:
     uses: team-redbull/.github/.github/workflows/ghcr-cleanup-on-delete.yml@main
     with:
       image-name: server-provisioning-worker
+    secrets: inherit
+
+  cleanup-upgrade-agent-worker-on-delete:
+    if: github.event_name == 'delete'
+    uses: team-redbull/.github/.github/workflows/ghcr-cleanup-on-delete.yml@main
+    with:
+      image-name: upgrade-agent-worker
     secrets: inherit
 
   cleanup-workflows-docs-on-delete:

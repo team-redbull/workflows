@@ -1,0 +1,54 @@
+# upgrade-agent-worker — one release per MCE, installed in that MCE.
+#
+# It calls the upgrade agent service (the k8s-agent folder's `upgrade-agent`
+# chart: an agent-sandbox Sandbox and its Service) in the same MCE. Install
+# that first; this worker only carries requests there and verdicts back.
+
+# REQUIRED. The MCE this worker serves: names the queue it polls
+# (upgrade-agent-activity-<mceCluster>). The `ocp4-` prefix is added when left out.
+mceCluster: ""
+
+replicaCount: 1
+
+image:
+  # Disconnected production: the mirror of ghcr.io/team-redbull/upgrade-agent-worker.
+  repository: ghcr.io/team-redbull/upgrade-agent-worker
+  tag: ""            # defaults to the chart's appVersion
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+# The hub's Temporal frontend, as reachable FROM THIS MCE (as in the
+# server-lifecycle-worker chart; see its README for the Route and TLS shape).
+temporal:
+  host: ""           # REQUIRED, host:port
+  namespace: default # the TEMPORAL namespace; must match the hub
+  tls:
+    enabled: false
+    serverName: ""   # defaults to the host part of `host`
+    caCert: ""       # the PUBLIC CA that signed the frontend's certificate
+
+# The upgrade agent service.
+upgradeAgent:
+  # REQUIRED. Its Service URL, e.g. http://upgrade-agent.upgrade-agent.svc:8080.
+  url: ""
+  # The bearer token the service asks for (its apiToken), from an EXISTING
+  # Secret in this namespace. Empty: no token is sent.
+  tokenSecret:
+    name: ""
+    key: token
+
+resources:
+  requests:
+    cpu: 20m
+    memory: 96Mi
+  limits:
+    memory: 256Mi
+
+# In-flight activities get 20s to finish after SIGTERM (worker_init.py); keep
+# the pod's grace period above it.
+terminationGracePeriodSeconds: 30
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}

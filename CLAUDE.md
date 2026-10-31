@@ -74,7 +74,9 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
 - **One domain may need several limbs** when its work spans several credential sets — the rule
   above, applied. cluster-upgrade has three: `upgrade-gitops` on the hub (day1 push, mirror pull,
   Brain push tokens), and per MCE `cluster-upgrade` (the workflow ServiceAccount) and
-  `upgrade-agent` (no Kubernetes credential at all). Each limb gets its OWN interface module
+  `upgrade-agent` (no Kubernetes credential at all: it POSTs to the upgrade agent service, our own
+  service in its own repo, run as a kubernetes-sigs agent-sandbox `Sandbox` in the MCE; the
+  service vendors the agent contract, `tests/test_upgrade_agent_contract.py` keeps the two equal). Each limb gets its OWN interface module
   (`shared/interfaces/{upgrade_gitops,cluster_upgrade,upgrade_agent}.py`), so the contract test
   still pairs one interface module with one `activities/<limb>/activities.py`; the domain keeps
   one models module and one `workflow_domains/cluster_upgrade/`.
@@ -815,8 +817,10 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
 - **The one bounded retry: the LLM agent call** (`invoke_upgrade_agent`, `maximum_attempts=2`, per
   Temporal's AI guidance). Two attempts cover a dead worker; past that, an agent that cannot answer
   is answered in the workflow as `needs_human`, so the run waits for a person instead of retrying
-  forever. Safe because the request carries an invocation id the tool server keys its budget and
-  executed actions on.
+  forever. Safe because the request carries an invocation id the agent service keys its run and
+  verdict on: a retry joins or returns the first attempt's. The limb raises only when a second
+  attempt can help (unreachable, timeout, 429, 5xx); a refusal (other 4xx) is non-retryable, and a
+  reply that is not an AgentVerdict comes back as `needs_human`.
 - **Replay tests guard runs in flight** (`tests/test_upgrade_cluster_replay.py`): histories recorded
   from scenarios on the fake fleet replay at once with `temporalio.worker.Replayer`, and GOLDEN
   histories committed under `tests/histories/cluster_upgrade/` replay on the current code. A golden

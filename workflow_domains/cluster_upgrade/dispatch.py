@@ -248,6 +248,8 @@ async def diagnose(
         evidence=evidence,
         budget=budget,
         tier1_enabled=tier1_enabled,
+        hosted_cluster=hosted_cluster,
+        hosted_cluster_namespace=hosted_cluster_namespace,
     )
     handle = workflow.start_activity(
         invoke_upgrade_agent,

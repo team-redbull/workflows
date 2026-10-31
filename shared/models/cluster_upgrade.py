@@ -872,6 +872,7 @@ class AgentBudget(BaseModel):
     wall_clock_seconds: int = 900  # judge latency counts against it (AGENT.md #24)
     max_tool_calls: int = 40
     max_tier1_actions: int = 2  # moot while tier1_enabled is False
+    max_model_calls: int = 20  # chat completions, repair prompts included
 
 
 class AgentRequest(BaseModel):
@@ -896,6 +897,10 @@ class AgentRequest(BaseModel):
     evidence: EvidenceBundle
     budget: AgentBudget = Field(default_factory=AgentBudget)
     tier1_enabled: bool = False
+    # The HostedCluster's own name and namespace, where the agent reads on the
+    # MCE (as on HostedClusterRequest); None: the one named `cluster`.
+    hosted_cluster: str | None = None
+    hosted_cluster_namespace: str | None = None
 
 
 class ToolCallRecord(BaseModel):

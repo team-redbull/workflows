@@ -1,0 +1,10 @@
+apiVersion: v2
+name: upgrade-agent-worker
+description: >-
+  The cluster-upgrade agent limb, one release PER MCE, installed INSIDE that
+  MCE beside the upgrade agent service. It dials out to the hub's Temporal
+  frontend, polls upgrade-agent-activity-<mceCluster>, and calls the agent
+  service's HTTP API. It holds no Kubernetes credential and no RBAC.
+type: application
+version: 0.1.0
+appVersion: "v1.0.0"

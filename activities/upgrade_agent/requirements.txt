@@ -1,0 +1,5 @@
+temporalio>=1.28,<2
+pydantic>=2,<3
+pydantic-settings>=2,<3
+# The upgrade agent service's HTTP API.
+httpx>=0.27,<1

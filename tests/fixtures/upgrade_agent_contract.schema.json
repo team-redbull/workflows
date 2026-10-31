@@ -1,0 +1,392 @@
+{
+ "AgentRequest": {
+  "$defs": {
+   "AgentBudget": {
+    "properties": {
+     "max_model_calls": {
+      "default": 20,
+      "title": "Max Model Calls",
+      "type": "integer"
+     },
+     "max_tier1_actions": {
+      "default": 2,
+      "title": "Max Tier1 Actions",
+      "type": "integer"
+     },
+     "max_tool_calls": {
+      "default": 40,
+      "title": "Max Tool Calls",
+      "type": "integer"
+     },
+     "wall_clock_seconds": {
+      "default": 900,
+      "title": "Wall Clock Seconds",
+      "type": "integer"
+     }
+    },
+    "title": "AgentBudget",
+    "type": "object"
+   },
+   "CheckFailure": {
+    "enum": [
+     "failed",
+     "needs-human",
+     "notify-owner",
+     "wait"
+    ],
+    "title": "CheckFailure",
+    "type": "string"
+   },
+   "CheckResult": {
+    "properties": {
+     "expected": {
+      "default": "",
+      "title": "Expected",
+      "type": "string"
+     },
+     "name": {
+      "title": "Name",
+      "type": "string"
+     },
+     "observed": {
+      "default": "",
+      "title": "Observed",
+      "type": "string"
+     },
+     "on_failure": {
+      "$ref": "#/$defs/CheckFailure",
+      "default": "needs-human"
+     },
+     "passed": {
+      "title": "Passed",
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "name",
+     "passed"
+    ],
+    "title": "CheckResult",
+    "type": "object"
+   },
+   "ClusterProfile": {
+    "enum": [
+     "generic",
+     "zoned"
+    ],
+    "title": "ClusterProfile",
+    "type": "string"
+   },
+   "EvidenceBundle": {
+    "properties": {
+     "sections": {
+      "additionalProperties": {
+       "type": "string"
+      },
+      "title": "Sections",
+      "type": "object"
+     },
+     "truncated": {
+      "default": false,
+      "title": "Truncated",
+      "type": "boolean"
+     }
+    },
+    "title": "EvidenceBundle",
+    "type": "object"
+   },
+   "StepKind": {
+    "enum": [
+     "control-plane",
+     "workers"
+    ],
+    "title": "StepKind",
+    "type": "string"
+   },
+   "StepReason": {
+    "enum": [
+     "ladder",
+     "target",
+     "skew",
+     "rung-required",
+     "final"
+    ],
+    "title": "StepReason",
+    "type": "string"
+   },
+   "UpgradeStep": {
+    "properties": {
+     "kind": {
+      "$ref": "#/$defs/StepKind"
+     },
+     "nodepools": {
+      "items": {
+       "type": "string"
+      },
+      "title": "Nodepools",
+      "type": "array"
+     },
+     "reason": {
+      "$ref": "#/$defs/StepReason"
+     },
+     "version": {
+      "title": "Version",
+      "type": "string"
+     }
+    },
+    "required": [
+     "kind",
+     "version",
+     "reason"
+    ],
+    "title": "UpgradeStep",
+    "type": "object"
+   }
+  },
+  "properties": {
+   "budget": {
+    "$ref": "#/$defs/AgentBudget"
+   },
+   "cluster": {
+    "title": "Cluster",
+    "type": "string"
+   },
+   "evidence": {
+    "$ref": "#/$defs/EvidenceBundle"
+   },
+   "failing_checks": {
+    "items": {
+     "$ref": "#/$defs/CheckResult"
+    },
+    "title": "Failing Checks",
+    "type": "array"
+   },
+   "from_version": {
+    "anyOf": [
+     {
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "title": "From Version"
+   },
+   "gate": {
+    "title": "Gate",
+    "type": "string"
+   },
+   "hosted_cluster": {
+    "anyOf": [
+     {
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "title": "Hosted Cluster"
+   },
+   "hosted_cluster_namespace": {
+    "anyOf": [
+     {
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "title": "Hosted Cluster Namespace"
+   },
+   "invocation_id": {
+    "title": "Invocation Id",
+    "type": "string"
+   },
+   "mce_cluster": {
+    "title": "Mce Cluster",
+    "type": "string"
+   },
+   "nodepool": {
+    "anyOf": [
+     {
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "title": "Nodepool"
+   },
+   "phase": {
+    "title": "Phase",
+    "type": "string"
+   },
+   "profile": {
+    "$ref": "#/$defs/ClusterProfile"
+   },
+   "step": {
+    "$ref": "#/$defs/UpgradeStep"
+   },
+   "tier1_enabled": {
+    "default": false,
+    "title": "Tier1 Enabled",
+    "type": "boolean"
+   },
+   "workflow_id": {
+    "title": "Workflow Id",
+    "type": "string"
+   }
+  },
+  "required": [
+   "invocation_id",
+   "workflow_id",
+   "mce_cluster",
+   "cluster",
+   "profile",
+   "phase",
+   "step",
+   "gate",
+   "evidence"
+  ],
+  "title": "AgentRequest",
+  "type": "object"
+ },
+ "AgentVerdict": {
+  "$defs": {
+   "ProposedAction": {
+    "properties": {
+     "action_id": {
+      "title": "Action Id",
+      "type": "string"
+     },
+     "args": {
+      "additionalProperties": {
+       "type": "string"
+      },
+      "title": "Args",
+      "type": "object"
+     },
+     "kind": {
+      "title": "Kind",
+      "type": "string"
+     },
+     "rationale": {
+      "default": "",
+      "title": "Rationale",
+      "type": "string"
+     },
+     "target": {
+      "title": "Target",
+      "type": "string"
+     }
+    },
+    "required": [
+     "action_id",
+     "kind",
+     "target"
+    ],
+    "title": "ProposedAction",
+    "type": "object"
+   },
+   "ToolCallRecord": {
+    "properties": {
+     "args": {
+      "additionalProperties": {
+       "type": "string"
+      },
+      "title": "Args",
+      "type": "object"
+     },
+     "at": {
+      "format": "date-time",
+      "title": "At",
+      "type": "string"
+     },
+     "judged": {
+      "default": "n/a",
+      "enum": [
+       "n/a",
+       "approved",
+       "rejected"
+      ],
+      "title": "Judged",
+      "type": "string"
+     },
+     "result": {
+      "default": "",
+      "title": "Result",
+      "type": "string"
+     },
+     "tier": {
+      "enum": [
+       0,
+       1
+      ],
+      "title": "Tier",
+      "type": "integer"
+     },
+     "tool": {
+      "title": "Tool",
+      "type": "string"
+     }
+    },
+    "required": [
+     "tool",
+     "tier",
+     "at"
+    ],
+    "title": "ToolCallRecord",
+    "type": "object"
+   }
+  },
+  "properties": {
+   "actions_proposed": {
+    "items": {
+     "$ref": "#/$defs/ProposedAction"
+    },
+    "title": "Actions Proposed",
+    "type": "array"
+   },
+   "actions_taken": {
+    "items": {
+     "$ref": "#/$defs/ToolCallRecord"
+    },
+    "title": "Actions Taken",
+    "type": "array"
+   },
+   "confidence": {
+    "enum": [
+     "verified",
+     "observed",
+     "hypothesis"
+    ],
+    "title": "Confidence",
+    "type": "string"
+   },
+   "diagnosis": {
+    "title": "Diagnosis",
+    "type": "string"
+   },
+   "verdict": {
+    "enum": [
+     "retry_gate",
+     "needs_human",
+     "abort_recommended"
+    ],
+    "title": "Verdict",
+    "type": "string"
+   }
+  },
+  "required": [
+   "diagnosis",
+   "confidence",
+   "verdict"
+  ],
+  "title": "AgentVerdict",
+  "type": "object"
+ }
+}

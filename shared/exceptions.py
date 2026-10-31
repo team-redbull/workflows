@@ -1032,3 +1032,23 @@ class ProposedActionRefusedError(OrchestratorError):
     because permissions live in the catalog and the admission policies, never
     in a proposal.
     """
+
+
+class UpgradeAgentUnavailableError(OrchestratorError):
+    """The upgrade agent service could not answer: unreachable, timed out, 429 or 5xx.
+
+    RETRYABLE, within the agent call's two attempts (CLAUDE.md §5): the second
+    covers a pod being rescheduled, and the service joins or returns the first
+    attempt's run by its invocation id. Past that the workflow answers
+    needs_human.
+    """
+
+
+class UpgradeAgentRefusedError(OrchestratorError):
+    """The upgrade agent service refused the request (a 4xx other than 429).
+
+    A wrong token, or a request the service's copy of the contract cannot
+    decode: no retry fixes either, so the limb raises it non-retryable and the
+    workflow answers needs_human at once. It is configuration, not a diagnosis,
+    so no incident is written.
+    """

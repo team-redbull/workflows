@@ -1,0 +1,86 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "uaw.fullname" . }}
+  labels:
+    {{- include "uaw.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "uaw.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "uaw.selectorLabels" . | nindent 8 }}
+      annotations:
+        # Settings are read once at import (fail-fast): a config change takes
+        # effect through the rollout this checksum forces.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if .Values.temporal.tls.enabled }}
+        checksum/temporal-ca: {{ include (print $.Template.BasePath "/temporal-tls-ca.yaml") . | sha256sum }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "uaw.fullname" . }}
+      # No Kubernetes API access at all: the limb's only peer is the agent service.
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: upgrade-agent-worker
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # No ports and no probes: the worker serves nothing. It dials out to
+          # Temporal, and a worker that cannot reach it exits and restarts.
+          envFrom:
+            - configMapRef:
+                name: {{ include "uaw.fullname" . }}-config
+          {{- with .Values.upgradeAgent.tokenSecret.name }}
+          env:
+            - name: UPGRADE_AGENT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . }}
+                  key: {{ $.Values.upgradeAgent.tokenSecret.key }}
+          {{- end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          {{- if .Values.temporal.tls.enabled }}
+          volumeMounts:
+            - name: temporal-ca
+              mountPath: /etc/temporal-tls
+              readOnly: true
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      {{- if .Values.temporal.tls.enabled }}
+      volumes:
+        - name: temporal-ca
+          configMap:
+            name: {{ include "uaw.fullname" . }}-temporal-ca
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

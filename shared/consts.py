@@ -78,8 +78,8 @@ SERVER_PROVISIONING_ACTIVITY_QUEUE = "server-provisioning-activity"
 #     MCE (reads, and the Argo CD sync that is the run's only cluster write) —
 #     a queue per MCE, routed exactly like server-lifecycle above;
 #   * the per-MCE agent limb holds no Kubernetes credential at all: it calls
-#     the kagent agent inside that MCE, whose tools run under their own
-#     identity — a queue per MCE as well.
+#     the upgrade agent service inside that MCE (an agent-sandbox Sandbox),
+#     whose tools run under their own identity — a queue per MCE as well.
 UPGRADE_CLUSTER_WORKFLOW_QUEUE = "upgrade-cluster-workflow"
 UPGRADE_CONTROL_PLANE_WORKFLOW_QUEUE = "upgrade-control-plane-workflow"
 # The "New upgrade" form's short read of what a cluster can be upgraded to (D22).

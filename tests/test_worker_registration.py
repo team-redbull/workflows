@@ -29,6 +29,7 @@ _WORKERS = {
     "SERVER_LIFECYCLE_ACTIVITY_QUEUE": "activities/server_lifecycle/worker_init.py",
     "server_lifecycle_activity_queue": "activities/server_lifecycle/worker_init.py",
     "SERVER_PROVISIONING_ACTIVITY_QUEUE": "activities/server_provisioning/worker_init.py",
+    "upgrade_agent_activity_queue": "activities/upgrade_agent/worker_init.py",
 }
 
 # the workflow modules that dispatch activities, and the interface module each
@@ -276,3 +277,16 @@ def test_uninstall_server_dispatches_everything_to_the_mces_own_worker():
         "find_hosted_nodes", "drain_hosted_node", "delete_hosted_node", "release_agent",
         "release_machine_hook", "clean_up_agent_machines",
     }
+
+
+def test_the_agent_call_lands_on_the_upgrade_agent_worker():
+    """cluster-upgrade starts the agent with start_activity (cancellable), which _dispatched does not read."""
+    tree = _tree("workflow_domains/cluster_upgrade/dispatch.py")
+    started = [
+        (node.args[0].id, next(k.value.func.id for k in node.keywords if k.arg == "task_queue"))
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and getattr(node.func, "attr", None) == "start_activity"
+        and node.args and getattr(node.args[0], "id", None) == "invoke_upgrade_agent"
+    ]
+    assert started == [("invoke_upgrade_agent", "upgrade_agent_activity_queue")]
+    assert "invoke_upgrade_agent" in _registered_activities(_WORKERS["upgrade_agent_activity_queue"])

@@ -94,8 +94,8 @@
           <li>The <b>MCE limb</b>&rsquo;s activities are written and tested: the reads, the admin-ack write, the
             Argo CD sync, the watches, the NodePool gate and the tier-2 actions. Several were run against a live
             hosted cluster. It has no worker, image or chart yet.</li>
-          <li>Still to build: the hub limb (day1 git, the mirror, day2, Brain), the agent limb, kagent&rsquo;s
-            <code>upgrade-agent</code> and judge, the tool server, and the RBAC and admission policies.</li>
+          <li>Still to build: the hub limb (day1 git, the mirror, day2, Brain), the agent&rsquo;s judge and tier-1
+            tools, and the RBAC and admission policies.</li>
           <li>Abort commits <code>pausedUntil</code>, which the hostedclusters-setup chart does not render
             yet.</li>
         </ul>
@@ -717,9 +717,9 @@ or retry to check again (the count covers 24 hours)</pre>
       <div class="eyebrow">Only when a gate fails</div>
       <h2>The upgrade agent: diagnoses, proposes, never decides</h2>
       <p class="lede">One activity, <code>invoke_upgrade_agent</code>, on <code>upgrade-agent-activity-&lt;mce&gt;</code>,
-      called only on a failed gate or a stalled watch. It runs on kagent inside the MCE (GLM 5.3 in
-      production) and holds no credentials: its tools run in a separate <code>upgrade-tools</code> server
-      under the agent&rsquo;s own identity.</p>
+      called only on a failed gate or a stalled watch. The limb holds no credentials: it calls the upgrade
+      agent service inside the MCE, a kubernetes-sigs agent-sandbox <code>Sandbox</code> talking to an
+      OpenAI-compatible model, whose read-only tools run under the agent&rsquo;s own identity.</p>
     </div>
 
     <div class="grid-2">
@@ -967,7 +967,7 @@ or retry to check again (the count covers 24 hours)</pre>
         <tbody>
           <tr><td class="k">upgrade-gitops-worker</td><td class="muted">upgrade-gitops-activity (hub)</td><td class="muted">the git and registry tokens</td><td class="muted">rules, day1 read and commit (with the day1 validator), the mirror, day2 layers, Brain incidents. No Kubernetes write</td></tr>
           <tr><td class="k">cluster-upgrade-worker</td><td class="muted">cluster-upgrade-activity-&lt;mce&gt;</td><td class="muted">the workflow identity on that MCE</td><td class="muted">reads of the HostedCluster, NodePools and hosted health; the Argo sync; the watches; the admin ack; approved proposals</td></tr>
-          <tr><td class="k">upgrade-agent-worker</td><td class="muted">upgrade-agent-activity-&lt;mce&gt;</td><td class="muted">nothing</td><td class="muted">calls kagent&rsquo;s <code>upgrade-agent</code>; the tools run under the agent&rsquo;s own identity</td></tr>
+          <tr><td class="k">upgrade-agent-worker</td><td class="muted">upgrade-agent-activity-&lt;mce&gt;</td><td class="muted">nothing</td><td class="muted">calls the upgrade agent service (an agent-sandbox <code>Sandbox</code>); its tools run under the agent&rsquo;s own identity</td></tr>
         </tbody>
       </table>
     </div>

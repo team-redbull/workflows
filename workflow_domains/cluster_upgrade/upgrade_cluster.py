@@ -32,7 +32,8 @@ what a person has to do next):
                            auto mode goes on after the soak), pre-flight 5–10,
                            the digest re-checked, the commit and the sync, the
                            roll watched, then the gate (nodes, workloads, the
-                           cluster's readiness checks, the soak).
+                           soak). The customer runs their own readiness checks;
+                           their `continue` is the sign-off (D19).
   5. postflight         — the top-level workertag the run added is dropped;
                           the cluster checked at the target.
 
@@ -535,7 +536,6 @@ class UpgradeClusterWorkflow:
             profile=profile,
             nodepool_order=order,
             soak_minutes=gates.soak_minutes(profile, day1),
-            readiness_checks=day1.upgrade.readiness_checks,
             max_concurrent_control_planes=rules.max_concurrent_control_planes,
             release=rules.release,
             verified_against_graph=rules.verified_against_graph,
@@ -924,9 +924,11 @@ class UpgradeClusterWorkflow:
         self._continue = None
         self._phase = UpgradePhase.AWAITING_CONTINUE
         self._continue_choices = list(remaining)
+        # The customer runs their own readiness checks; their continue is the sign-off (D19).
+        after = f"NodePool {self._nodepools_done[-1]}" if self._nodepools_done else "the control plane"
         self._waiting_for = (
-            f"continue: roll the next NodePool to {step.version}, one of {', '.join(remaining)} "
-            f"({remaining[0]} unless named)"
+            f"continue, once the customer's readiness checks after {after} pass: rolls the next NodePool "
+            f"to {step.version}, one of {', '.join(remaining)} ({remaining[0]} unless named)"
         )
         await self._wait_for(lambda: self._continue is not None)
         choice = (self._continue.nodepool if self._continue else None) or remaining[0]
@@ -1030,10 +1032,7 @@ class UpgradeClusterWorkflow:
                     cluster=self._cluster,
                     nodepool=nodepool,
                     version=step.version,
-                    workload_checks=(
-                        context.profile is ClusterProfile.ZONED or bool(context.readiness_checks)
-                    ),
-                    readiness_checks=context.readiness_checks,
+                    workload_checks=context.profile is ClusterProfile.ZONED,
                     soak_minutes=context.soak_minutes,
                     deadline_minutes=deadline,
                 ),

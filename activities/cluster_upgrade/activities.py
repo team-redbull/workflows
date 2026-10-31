@@ -403,7 +403,7 @@ async def watch_nodepool(request: WatchNodePoolRequest) -> WatchOutcome:
 
 
 async def _gate_checks(request: NodePoolGateRequest) -> list[CheckResult]:
-    """This poll's gate checks: platform and workload from the hosted cluster, then the declared ones."""
+    """This poll's gate checks: platform and, when asked, workload, from the hosted cluster."""
     hosted = await _hosted_cluster(request.cluster)
     objects, unreadable = None, f"HostedCluster {request.cluster} not found on the MCE"
     if hosted is not None:
@@ -415,8 +415,7 @@ async def _gate_checks(request: NodePoolGateRequest) -> list[CheckResult]:
         except (HostedClusterUnreachableError, HostedClusterAccessError) as err:
             activity.logger.info("hosted cluster %s unreadable this poll: %s", request.cluster, err)
             unreadable = f"the hosted API was unreadable: {err}"
-    checks = upgrade_state.gate_checks(request.nodepool, objects, request.workload_checks, unreadable)
-    return checks + [upgrade_state.readiness_not_run(check) for check in request.readiness_checks]
+    return upgrade_state.gate_checks(request.nodepool, objects, request.workload_checks, unreadable)
 
 
 @activity.defn
@@ -425,9 +424,9 @@ async def watch_nodepool_gate(request: NodePoolGateRequest) -> GateOutcome:
 
     Platform: the NodePool's nodes Ready and schedulable. Workload (when asked):
     PDBs on its nodes back to disruptionsAllowed >= 1, StatefulSets ready.
-    Then the cluster's declared readiness checks, which fail as "not run" until
-    the limb can run them (DESIGN O22). Heartbeats every poll; a retry keeps
-    the soak clock.
+    The customer's own readiness checks are not run here: the customer runs
+    them, and their `continue` is the sign-off (D19). Heartbeats every poll; a
+    retry keeps the soak clock.
     """
     snapshot = _resumed_snapshot()
     while True:

@@ -117,10 +117,13 @@ class TestTheHappyPath:
             assert "2026-10-31" in approval.waiting_for
 
             await _approve_through_control_plane(h)
-            await h.until(UpgradePhase.AWAITING_CONTINUE)
+            first = await h.until(UpgradePhase.AWAITING_CONTINUE)
+            # The customer runs their own readiness checks; continue is their sign-off (D19).
+            assert first.waiting_for.startswith("continue, once the customer's readiness checks after the control plane pass")
             await h.decide(Run.continue_nodepool, ContinueNodePool(by="alice"))
             waiting = await h.until(UpgradePhase.AWAITING_CONTINUE)
             assert waiting.nodepools_done == ["np-a"]
+            assert "readiness checks after NodePool np-a pass: rolls the next NodePool to 4.20.44" in waiting.waiting_for
             # The week a person takes between two NodePools costs the run nothing.
             await h.env.sleep(SEVEN_DAYS)
             await h.decide(Run.continue_nodepool, ContinueNodePool(by="bob"))

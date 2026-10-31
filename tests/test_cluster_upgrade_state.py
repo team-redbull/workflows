@@ -496,13 +496,6 @@ class TestTheNodePoolGate:
         (unread,) = upgrade_state.gate_checks("np-a", None, workload=True, unreadable="the hosted API was unreadable: 503")
         assert not unread.passed and unread.observed.endswith("503")
 
-    def test_a_declared_check_fails_until_the_limb_can_run_it(self):
-        from shared.models.cluster_upgrade import ReadinessCheck
-
-        check = upgrade_state.readiness_not_run(ReadinessCheck(name="db-quorum", promql='min(pg_up{namespace="db"})', expect="== 1"))
-        assert (check.name, check.passed, check.expected) == ("readiness:db-quorum", False, 'min(pg_up{namespace="db"}) == 1')
-        assert "DESIGN O22" in check.observed
-
     def test_the_soak_runs_from_when_every_check_last_started_passing(self):
         good = upgrade_state.gate_checks("np-a", self._objects(), workload=True)
         bad = upgrade_state.gate_checks("np-a", self._objects(nodes=[_node("w-1", ready="False")]), workload=True)

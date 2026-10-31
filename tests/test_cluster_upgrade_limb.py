@@ -381,22 +381,6 @@ class TestTheNodePoolGate:
         assert seen == {"server": "https://kube-apiserver.hcp-lab-upgrade-lab-upgrade.svc:6443", "nodepool": "np",
                         "label": "hypershift.openshift.io/nodePool", "workload": False}
 
-    async def test_a_declared_check_holds_the_gate_until_its_deadline(self, mce, monkeypatch):
-        from shared.models.cluster_upgrade import ReadinessCheck
-
-        async def _read(*args):
-            return {"nodes": [{"metadata": {"name": "w-1"}, "spec": {},
-                               "status": {"conditions": [{"type": "Ready", "status": "True"}]}}],
-                    "pods": [], "pdbs": [], "statefulsets": []}
-
-        monkeypatch.setattr(hosted_upgrade_api, "read_gate_objects", _read)
-        self._quiet(monkeypatch)
-        outcome = await limb.watch_nodepool_gate(self._request(
-            workload_checks=True, deadline_minutes=0,
-            readiness_checks=[ReadinessCheck(name="api", http="https://app.example/healthz", expect_status=200)]))
-        assert outcome.result.value == "deadline"
-        assert [c.name for c in outcome.failing_checks] == ["readiness:api"]
-
     async def test_an_unreadable_cluster_fails_the_platform_check_saying_why(self, mce, monkeypatch):
         from shared.exceptions import HostedClusterUnreachableError
 

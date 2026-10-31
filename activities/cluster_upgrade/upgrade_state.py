@@ -27,7 +27,6 @@ from shared.models.cluster_upgrade import (
     HostedClusterState,
     NodePoolState,
     ProgressSnapshot,
-    ReadinessCheck,
     WatchResult,
 )
 from shared.ocp_version import release_version
@@ -747,19 +746,6 @@ def gate_checks(
         checks.append(_gate_pdbs(objects["nodes"], objects["pods"], objects["pdbs"]))
         checks.append(_gate_statefulsets(objects["statefulsets"]))
     return checks
-
-
-def readiness_not_run(check: ReadinessCheck) -> CheckResult:
-    """A declared check the limb cannot run yet: it fails, so the gate waits for a person (DESIGN O22).
-
-    Neither kind has a decided way to run from the MCE: PromQL needs a token in the
-    hosted cluster and a path to its Thanos Querier, HTTP a path to the customer's
-    route. Passing a check nobody ran would be the one wrong answer.
-    """
-    what = f"{check.promql} {check.expect or ''}".strip() if check.promql else f"{check.http} -> {check.expect_status}"
-    return CheckResult(name=f"readiness:{check.name}", passed=False, expected=what,
-                       observed="not run: the limb cannot run declared readiness checks yet (DESIGN O22)",
-                       on_failure=CheckFailure.NEEDS_HUMAN)
 
 
 def gate_snapshot(checks: list[CheckResult]) -> ProgressSnapshot:

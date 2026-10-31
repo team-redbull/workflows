@@ -137,19 +137,6 @@ class ClusterProfile(str, Enum):
     ZONED = "zoned"
 
 
-class ReadinessCheck(BaseModel):
-    """A customer-declared check a NodePool gate waits on (cluster file `upgrade.readinessChecks`).
-
-    Exactly one of `promql` and `http` is set; the day1 validator enforces it.
-    """
-
-    name: str
-    promql: str | None = None
-    expect: str | None = None  # e.g. "== 1", compared with the query's single value
-    http: str | None = None
-    expect_status: int | None = None
-
-
 class ReleaseLayout(BaseModel):
     """How a release image reference is built (ladder.yaml `release`), templates unexpanded."""
 
@@ -172,7 +159,6 @@ class UpgradeContext(BaseModel):
     profile: ClusterProfile
     nodepool_order: list[str]
     soak_minutes: int
-    readiness_checks: list[ReadinessCheck] = Field(default_factory=list)
     max_concurrent_control_planes: int
     release: ReleaseLayout
     verified_against_graph: str | None = None
@@ -396,7 +382,6 @@ class ClusterUpgradeSettings(BaseModel):
 
     profile: ClusterProfile | None = None
     nodepool_order: list[str] | None = None
-    readiness_checks: list[ReadinessCheck] = Field(default_factory=list)
     soak_minutes: int | None = None
     wave: int | None = None
 
@@ -745,8 +730,7 @@ class NodePoolGateRequest(BaseModel):
     cluster: str
     nodepool: str
     version: str
-    workload_checks: bool  # PDBs and StatefulSets; zoned profile, or any declared check
-    readiness_checks: list[ReadinessCheck] = Field(default_factory=list)
+    workload_checks: bool  # PDBs and StatefulSets; the zoned profile
     soak_minutes: int
     deadline_minutes: int
 

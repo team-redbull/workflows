@@ -568,7 +568,9 @@ class UpgradeClusterWorkflow:
         self._day1_blob = day1.blob
         self._log("planned", detail=self._plan_summary())
 
-        await self._preflight(include_idms=True, nodepools=[])
+        await self._preflight(
+            plan.steps[0], include_idms=True, nodepools=[], from_version=hosted.control_plane_version
+        )
 
         if request.auto_approve:
             # An abort that came in during the pre-flight must still CANCEL.
@@ -650,7 +652,7 @@ class UpgradeClusterWorkflow:
         while True:
             await self._checkpoint()
             if not self._step_committed:
-                await self._preflight(include_idms=False, nodepools=[])
+                await self._preflight(step, include_idms=False, nodepools=[], from_version=from_version)
                 if minor_of(step.version) > minor_of(from_version):
                     await self._admin_acks(step, from_version)
             await self._take_current_day1_if_stale()
@@ -945,7 +947,7 @@ class UpgradeClusterWorkflow:
         while True:
             await self._checkpoint()
             if not self._step_committed:
-                await self._preflight(include_idms=False, nodepools=[nodepool])
+                await self._preflight(step, include_idms=False, nodepools=[nodepool], from_version=from_version)
                 reason = await self._commit(Day1ChangeKind.NODEPOOL, step.version, nodepool)
                 if reason is not None:
                     await self._needs_human(reason)
@@ -1167,14 +1169,24 @@ class UpgradeClusterWorkflow:
         self._day1_stale = False
         self._log("day1-reread", detail=f"{day1.path} at {day1.revision}")
 
-    async def _preflight(self, *, include_idms: bool, nodepools: list[str]) -> None:
-        """Checks 5–10 (and 11) until they pass, waiting for a person on a failure.
+    async def _preflight(
+        self, step: UpgradeStep, *, include_idms: bool, nodepools: list[str], from_version: str | None
+    ) -> None:
+        """Checks 5–10 (and 11) until they pass; on a failure the agent looks first, then a person.
 
         A control plane still settling is re-checked for a while first. Before
         approval a FAILED-kind check fails the run, as planning does; after it,
         the run never fails on a check, it waits.
+
+        A failed check is a failed gate, so the agent diagnoses it before anyone
+        is asked (AGENT.md #1, DESIGN §8.1): a retry_gate with nothing proposed
+        re-runs the checks at once, anything else goes to a person with the
+        verdict and its proposals. Once per failure: a second failure after the
+        agent's retry goes to a person. A check only its owner can clear (a
+        customer PDB, AGENT.md #12) goes straight to a person.
         """
         settling = timedelta(0)
+        verdict: AgentVerdict | None = None
         while True:
             self._phase = UpgradePhase.PREFLIGHT
             self._waiting_for = None
@@ -1190,8 +1202,17 @@ class UpgradeClusterWorkflow:
             if worst is CheckFailure.FAILED and self._approved_by is None:
                 self._fail_planning(gates.describe(checks))
             owner = "its owner must act first, then retry. " if worst is CheckFailure.NOTIFY_OWNER else ""
-            await self._needs_human(f"pre-flight failed: {owner}\n{gates.describe(checks)}")
+            if worst is not CheckFailure.NOTIFY_OWNER and verdict is None:
+                diagnosis = await self._diagnose(
+                    step, from_version, nodepools[0] if nodepools else None, "preflight",
+                    [check for check in checks if not check.passed],
+                )
+                verdict = diagnosis.verdict
+                if clears_gate(diagnosis):
+                    continue
+            await self._needs_human(f"pre-flight failed: {owner}\n{gates.describe(checks)}", verdict=verdict)
             settling = timedelta(0)
+            verdict = None
 
     async def _preflight_checks(self, *, include_idms: bool, nodepools: list[str]) -> list[CheckResult]:
         cluster = HostedClusterRequest(mce_cluster=self._mce, cluster=self._cluster)

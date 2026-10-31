@@ -34,14 +34,18 @@ from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.worker import Replayer
 
 from shared.models.cluster_upgrade import (
+    ActionDecision,
     ApiUsage,
+    ClusterUpgradeSettings,
     ContinueNodePool,
+    HostedHealth,
     HumanDecision,
     NodePoolMode,
+    ProposedAction,
     UpgradePhase,
     WatchResult,
 )
-from tests.cluster_upgrade_fakes import Fleet, Harness, request, verdict, SEVEN_DAYS
+from tests.cluster_upgrade_fakes import MIRRORS, Fleet, Harness, request, verdict, SEVEN_DAYS
 from workflow_domains.cluster_upgrade.upgrade_cluster import UpgradeClusterWorkflow as Run
 from workflow_domains.cluster_upgrade.upgrade_control_plane import UpgradeControlPlaneWorkflow
 
@@ -129,11 +133,34 @@ async def _admin_ack_in_use(h: Harness) -> None:
     await h.result()
 
 
+async def _image_pruner_degraded(h: Harness) -> None:
+    # Pre-flight finds image-registry Degraded by a failed pruner Job; the agent proposes
+    # deleting it, a person approves, retries, and the run goes on (D21).
+    h.fleet.health_script = [HostedHealth(
+        reachable=True, cluster_version_upgradeable=True, idms_mirrors=MIRRORS,
+        operators_unhealthy=["image-registry (Degraded=True: ImagePrunerJobFailed)"],
+    )]
+    h.fleet.verdicts = [verdict("needs_human", diagnosis="a failed image-pruner Job", actions_proposed=[ProposedAction(
+        action_id="act-pruner", kind="delete_failed_job", target="openshift-image-registry/image-pruner-29365920",
+    )])]
+    await h.start(request(workers_to_target=False))
+    await h.until(UpgradePhase.NEEDS_HUMAN)
+    await h.decide(Run.approve_action, ActionDecision(by="alice", action_id="act-pruner"))
+    await h.decide(Run.retry, ALICE)
+    await h.until(UpgradePhase.AWAITING_APPROVAL)
+    await h.decide(Run.approve, ALICE)
+    for _ in range(2):
+        await h.until(UpgradePhase.AWAITING_DAY2_CONFIRM)
+        await h.decide(Run.confirm_day2, HumanDecision(by="day2-team"))
+    await h.result()
+
+
 SCENARIOS: dict[str, tuple[Callable[[], Fleet], Callable[[Harness], Awaitable[None]]]] = {
     "happy-path": (Fleet, _happy_path),
     "abort-mid-roll": (Fleet, _abort_mid_roll),
     "control-plane-stall": (Fleet, _control_plane_stall),
     "admin-ack-in-use": (Fleet, _admin_ack_in_use),
+    "image-pruner-degraded": (lambda: Fleet(upgrade=ClusterUpgradeSettings(wave=2)), _image_pruner_degraded),
     "agent-then-person": (
         lambda: Fleet(control_plane="4.20.44", nodepools={"np-a": "4.19.53"}),
         _agent_then_person,

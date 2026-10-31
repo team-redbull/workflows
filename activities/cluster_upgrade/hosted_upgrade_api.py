@@ -11,8 +11,8 @@ It only fetches and writes. What the objects mean is upgrade_state.py's.
 Its WRITES are an admin ack (DESIGN §6.2a, D16) — one key of
 openshift-config/admin-acks, only for a gate openshift-config-managed/admin-gates
 holds, read back before returning — and the tier-2 actions a person approved
-(DESIGN §8.3), which action_catalog.py checked first: a pod delete and a Job
-from a CronJob.
+(DESIGN §8.3), which action_catalog.py checked first: a pod delete, a Job from
+a CronJob, and the delete of a Job that has failed.
 """
 
 from __future__ import annotations
@@ -389,4 +389,49 @@ def _rerun_cronjob(kubeconfig: str, server: str, cluster: str, namespace: str, n
 async def rerun_cronjob(kubeconfig: str, server: str, cluster: str, namespace: str, name: str, job_name: str) -> str:
     """A Job from the CronJob, named `job_name`: "created", "exists" (a retry) or "missing" (no CronJob)."""
     return await asyncio.to_thread(_rerun_cronjob, kubeconfig, server, cluster, namespace, name, job_name)
+
+
+def job_failed(job: dict[str, Any]) -> bool:
+    """A Job the Job controller has marked Failed (condition Failed=True): finished, nothing left running."""
+    return any(
+        c.get("type") == "Failed" and c.get("status") == "True" for c in (job.get("status") or {}).get("conditions") or []
+    )
+
+
+def _delete_failed_job(kubeconfig: str, server: str, cluster: str, namespace: str, name: str, uid: str | None) -> str:
+    with open_hosted_api(kubeconfig, server, cluster) as (api_client, _core):
+        batch = k8s_client.BatchV1Api(api_client)
+        job = call_hosted(
+            lambda: batch.read_namespaced_job(name=name, namespace=namespace, _request_timeout=_REQUEST_TIMEOUT),
+            cluster, f"a read of Job {namespace}/{name}", absent=None,
+        )
+        if job is None:
+            return "gone"
+        job = as_plain(api_client, job)
+        current = (job.get("metadata") or {}).get("uid")
+        if uid and current != uid:
+            return "replaced"
+        if not job_failed(job):
+            return "not-failed"
+        # The UID read just now is the precondition, so a Job recreated under the
+        # name in between is never the one deleted; Background takes its Pods too.
+        body = k8s_client.V1DeleteOptions(
+            propagation_policy="Background", preconditions=k8s_client.V1Preconditions(uid=current),
+        )
+
+        def _delete() -> str:
+            try:
+                batch.delete_namespaced_job(name=name, namespace=namespace, body=body, _request_timeout=_REQUEST_TIMEOUT)
+            except k8s_client.ApiException as exc:
+                if exc.status == _CONFLICT:
+                    return "replaced"
+                raise
+            return "deleted"
+
+        return call_hosted(_delete, cluster, f"a delete of Job {namespace}/{name}", absent="gone")
+
+
+async def delete_failed_job(kubeconfig: str, server: str, cluster: str, namespace: str, name: str, uid: str | None) -> str:
+    """Delete one Job only if it has failed: "deleted", "gone", "replaced" (its UID is not `uid`) or "not-failed"."""
+    return await asyncio.to_thread(_delete_failed_job, kubeconfig, server, cluster, namespace, name, uid)
 

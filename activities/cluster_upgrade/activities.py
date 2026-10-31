@@ -500,6 +500,7 @@ _ACTION_OUTCOMES = {
     "created": (True, "created Job {job}"),
     "exists": (True, "created Job {job} (found on retry)"),
     "missing": (False, "not executed: no such CronJob"),
+    "not-failed": (False, "not executed: the Job has not failed (it is running or Complete)"),
 }
 
 
@@ -525,6 +526,9 @@ async def execute_proposed_action(request: ProposedActionRequest) -> ActionResul
         server = hosted_cluster_api.kas_service_url(_hcp_namespace(hosted))
         if action.kind == action_catalog.DELETE_POD:
             outcome = await hosted_upgrade_api.delete_pod(
+                kubeconfig, server, request.cluster, action.namespace or "", action.name, action.uid)
+        elif action.kind == action_catalog.DELETE_FAILED_JOB:
+            outcome = await hosted_upgrade_api.delete_failed_job(
                 kubeconfig, server, request.cluster, action.namespace or "", action.name, action.uid)
         else:
             job = action_catalog.rerun_job_name(action.name, action_id)

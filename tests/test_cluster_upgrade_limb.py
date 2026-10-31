@@ -408,6 +408,8 @@ class TestTheActionCatalog:
         ("delete_hcp_pod", "cluster-version-operator-7d9f", (None, "cluster-version-operator-7d9f")),
         ("rerun_cronjob", "openshift-operator-lifecycle-manager/collect-profiles",
          ("openshift-operator-lifecycle-manager", "collect-profiles")),
+        ("delete_failed_job", "openshift-image-registry/image-pruner-29365920",
+         ("openshift-image-registry", "image-pruner-29365920")),
     ])
     def test_in_the_catalog(self, kind, target, where):
         from activities.cluster_upgrade import action_catalog
@@ -415,6 +417,7 @@ class TestTheActionCatalog:
         action = action_catalog.check(_action(kind, target, uid="u-1"))
         assert (action.namespace, action.name) == where
         assert action.uid == (None if kind == "rerun_cronjob" else "u-1")
+        assert action.kind == kind
 
     @pytest.mark.parametrize(("kind", "target", "why"), [
         ("delete_deployment", "openshift-console/console", "not in the catalog"),
@@ -427,6 +430,8 @@ class TestTheActionCatalog:
         ("delete_hcp_pod", "kube-apiserver-5f6d", "never deleted"),
         ("delete_hcp_pod", "ns/pod", "pod in the cluster's HCP namespace"),
         ("rerun_cronjob", "default/backup", "only namespaces openshift-*"),
+        ("delete_failed_job", "shop/nightly-report-1", "only namespaces openshift-*"),
+        ("delete_job", "openshift-image-registry/image-pruner-1", "not in the catalog"),
     ])
     def test_refused_whoever_approved_it(self, kind, target, why):
         from activities.cluster_upgrade import action_catalog
@@ -450,6 +455,7 @@ class _FakeActionCore:
         self.pods = dict(pods or {})  # (namespace, name) -> uid
         self.cronjobs = dict(cronjobs or {})
         self.jobs = {}
+        self.deleted_jobs = []
 
     def delete_namespaced_pod(self, name, namespace, body=None, _request_timeout=None):
         from kubernetes import client as k8s_client
@@ -464,6 +470,21 @@ class _FakeActionCore:
         if (namespace, name) not in self.cronjobs:
             raise k8s_client.ApiException(status=404)
         return self.cronjobs[(namespace, name)]
+
+    def read_namespaced_job(self, name, namespace, _request_timeout=None):
+        from kubernetes import client as k8s_client
+        if (namespace, name) not in self.jobs:
+            raise k8s_client.ApiException(status=404)
+        return self.jobs[(namespace, name)]
+
+    def delete_namespaced_job(self, name, namespace, body=None, _request_timeout=None):
+        from kubernetes import client as k8s_client
+        if (namespace, name) not in self.jobs:
+            raise k8s_client.ApiException(status=404)
+        if body.preconditions.uid != self.jobs[(namespace, name)]["metadata"]["uid"]:
+            raise k8s_client.ApiException(status=409)
+        self.deleted_jobs.append((name, body.propagation_policy))
+        del self.jobs[(namespace, name)]
 
     def create_namespaced_job(self, namespace, body, _request_timeout=None):
         from kubernetes import client as k8s_client
@@ -492,6 +513,25 @@ class TestTheActionWrites:
         # Recreated under the same name since the agent saw it: left alone.
         assert delete("k", "s", "c", "openshift-console", "sts-0", "u-old") == "replaced"
         assert ("openshift-console", "sts-0") in core.pods
+
+    def test_only_a_failed_job_is_deleted_and_only_the_one_seen(self, monkeypatch):
+        def job(name, uid, condition):
+            return {"metadata": {"name": name, "namespace": "openshift-image-registry", "uid": uid},
+                    "status": {"conditions": [{"type": condition, "status": "True"}]}}
+
+        core = _FakeActionCore()
+        core.jobs = {("openshift-image-registry", "image-pruner-1"): job("image-pruner-1", "u-1", "Failed"),
+                     ("openshift-image-registry", "image-pruner-2"): job("image-pruner-2", "u-2", "Complete")}
+        self._open(monkeypatch, core)
+        delete = hosted_upgrade_api._delete_failed_job
+        # A Complete Job, or one recreated since the proposal, is left alone.
+        assert delete("k", "s", "c", "openshift-image-registry", "image-pruner-2", None) == "not-failed"
+        assert delete("k", "s", "c", "openshift-image-registry", "image-pruner-1", "u-old") == "replaced"
+        assert delete("k", "s", "c", "openshift-image-registry", "image-pruner-1", "u-1") == "deleted"
+        assert delete("k", "s", "c", "openshift-image-registry", "image-pruner-1", "u-1") == "gone"
+        # Background propagation takes the Job's Pods with it.
+        assert core.deleted_jobs == [("image-pruner-1", "Background")]
+        assert ("openshift-image-registry", "image-pruner-2") in core.jobs
 
     def test_a_cronjob_rerun_makes_the_job_oc_would_and_only_once(self, monkeypatch):
         cronjob = {"metadata": {"name": "collect-profiles", "namespace": "openshift-olm", "uid": "cj-uid"},
@@ -542,6 +582,20 @@ class TestExecuteProposedAction:
         result = await limb.execute_proposed_action(self._request("delete_hcp_pod", "cluster-version-operator-7d9f"))
         assert seen == [("hcp-lab-upgrade-lab-upgrade", "cluster-version-operator-7d9f", None)]
         assert (result.executed, result.detail) == (False, "not executed: already gone")
+
+    async def test_a_failed_job_goes_to_the_control_plane_service(self, mce, monkeypatch):
+        seen = {}
+
+        async def _delete(kubeconfig, server, cluster, namespace, name, uid):
+            seen.update(server=server, namespace=namespace, name=name, uid=uid)
+            return "not-failed"
+
+        monkeypatch.setattr(hosted_upgrade_api, "delete_failed_job", _delete)
+        result = await limb.execute_proposed_action(
+            self._request("delete_failed_job", "openshift-image-registry/image-pruner-29365920", uid="u-9"))
+        assert seen == {"server": "https://kube-apiserver.hcp-lab-upgrade-lab-upgrade.svc:6443",
+                        "namespace": "openshift-image-registry", "name": "image-pruner-29365920", "uid": "u-9"}
+        assert (result.executed, result.detail) == (False, "not executed: the Job has not failed (it is running or Complete)")
 
     async def test_a_rerun_names_its_job(self, mce, monkeypatch):
         async def _rerun(kubeconfig, server, cluster, namespace, name, job):

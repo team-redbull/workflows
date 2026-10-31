@@ -14,7 +14,7 @@ The default fleet: control plane and both NodePools at 4.18.56, target
 from __future__ import annotations
 
 import asyncio
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from temporalio.client import WorkflowExecutionStatus, WorkflowFailureError, WorkflowUpdateFailedError
@@ -982,3 +982,94 @@ def test_every_interface_is_mocked_on_its_own_queue():
         MCE_QUEUE: names(cluster_interface),
         AGENT_QUEUE: names(agent_interface),
     }
+
+
+# Seen on real clusters (Red Hat KCS 6988893): one failed image-pruner Job leaves image-registry
+# Degraded until the next midnight run, and pre-flight refuses every step meanwhile. The fix is
+# deleting the failed Job (D21).
+PRUNER_DEGRADED = HostedHealth(
+    reachable=True, cluster_version_upgradeable=True, idms_mirrors=MIRRORS,
+    operators_unhealthy=["image-registry (Degraded=True: ImagePrunerJobFailed)"],
+)
+PRUNER_FIX = ProposedAction(
+    action_id="act-pruner", kind="delete_failed_job", target="openshift-image-registry/image-pruner-29365920",
+    args={"uid": "5b2c"}, rationale="KCS 6988893: the operator clears ImagePrunerDegraded once no failed Job is left",
+)
+PRUNER_DIAGNOSIS = ("image-registry is Degraded: ImagePrunerDegraded: Job has reached the specified backoff limit. "
+                    "Job openshift-image-registry/image-pruner-29365920 failed (OOMKilled); nothing else is wrong.")
+
+
+class TestAFailedPreflightGoesToTheAgentFirst:
+    """A pre-flight check is a gate: the agent diagnoses a failure before a person is asked (AGENT.md #1)."""
+
+    async def test_an_image_pruner_degraded_cluster_gets_the_fix_proposed_and_a_person_approves_it(self):
+        fleet = Fleet(upgrade=ClusterUpgradeSettings(wave=2))
+        fleet.health_script = [PRUNER_DEGRADED]
+        fleet.verdicts = [verdict("needs_human", diagnosis=PRUNER_DIAGNOSIS, actions_proposed=[PRUNER_FIX])]
+        async with Harness(fleet) as h:
+            await h.start(request(workers_to_target=False))
+            waiting = await h.until(UpgradePhase.NEEDS_HUMAN)
+            assert "operators-healthy" in waiting.waiting_for and "ImagePrunerJobFailed" in waiting.waiting_for
+            assert [p.action.kind for p in waiting.pending_actions] == ["delete_failed_job"]
+            assert fleet.actions == []  # production: a proposal waits for a person
+            await h.decide(Run.approve_action, ActionDecision(by="alice", action_id="act-pruner"))
+            await h.decide(Run.retry, ALICE)
+            await h.until(UpgradePhase.AWAITING_APPROVAL)
+            await h.decide(Run.approve, ALICE)
+            for _ in range(2):
+                await h.until(UpgradePhase.AWAITING_DAY2_CONFIRM)
+                await h.decide(Run.confirm_day2, DAY2)
+            result = await h.result()
+
+        assert result.outcome is UpgradeOutcome.DONE
+        (asked,) = fleet.agent_requests
+        assert asked.gate == "preflight" and asked.tier1_enabled is False
+        assert [c.name for c in asked.failing_checks] == ["operators-healthy"]
+        (executed,) = fleet.actions
+        assert (executed.action.kind, executed.approved_by) == ("delete_failed_job", "alice")
+        # Diagnosed and fixed before the approval: nothing was committed while it was Degraded.
+        assert fleet.calls.index("agent:preflight") < fleet.calls.index("commit:control-plane::4.19.53")
+
+    async def test_in_a_lab_wave_the_agent_deletes_the_job_itself_and_the_checks_run_again_at_once(self):
+        fleet = Fleet(upgrade=ClusterUpgradeSettings(wave=1))
+        fleet.health_script = [PRUNER_DEGRADED]
+        fleet.verdicts = [verdict("retry_gate", diagnosis=PRUNER_DIAGNOSIS, actions_taken=[ToolCallRecord(
+            tool="delete_failed_job", args={"namespace": "openshift-image-registry", "name": "image-pruner-29365920"},
+            tier=1, judged="approved", result="deleted", at=datetime(2026, 10, 31, tzinfo=UTC),
+        )])]
+        async with Harness(fleet) as h:
+            await h.start(request(workers_to_target=False))
+            await h.until(UpgradePhase.AWAITING_APPROVAL)
+            await h.decide(Run.abort, HumanDecision(by="alice", reason="end of test"))
+            result = await h.result()
+
+        assert result.outcome is UpgradeOutcome.CANCELLED
+        (asked,) = fleet.agent_requests
+        assert asked.tier1_enabled is True
+        assert not [e for e in result.log if e.event == "needs-human"]
+        assert fleet.calls.count("read_hosted_health") == 2  # failed, then passed once the Job was gone
+
+    async def test_a_retry_the_agent_asked_for_that_fails_again_goes_to_a_person_not_back_to_the_agent(self):
+        fleet = Fleet(upgrade=ClusterUpgradeSettings(wave=1))
+        fleet.health_script = [PRUNER_DEGRADED, PRUNER_DEGRADED]
+        fleet.verdicts = [verdict("retry_gate", diagnosis="a transient pruner failure; checking again")]
+        async with Harness(fleet) as h:
+            await h.start(request(workers_to_target=False))
+            waiting = await h.until(UpgradePhase.NEEDS_HUMAN)
+            assert "ImagePrunerJobFailed" in waiting.waiting_for
+            assert waiting.last_verdict is not None and waiting.last_verdict.verdict == "retry_gate"
+            await h.decide(Run.abort, HumanDecision(by="alice", reason="end of test"))
+            await h.result()
+        assert len(fleet.agent_requests) == 1
+
+    async def test_a_customer_pdb_goes_to_its_owner_without_the_agent(self):
+        fleet = Fleet(upgrade=ClusterUpgradeSettings(wave=2))
+        fleet.health_script = [HostedHealth(reachable=True, cluster_version_upgradeable=True, idms_mirrors=MIRRORS,
+                                            blocking_pdbs=["shop/db"])]
+        async with Harness(fleet) as h:
+            await h.start(request(workers_to_target=False))
+            waiting = await h.until(UpgradePhase.NEEDS_HUMAN)
+            assert "its owner must act first" in waiting.waiting_for
+            await h.decide(Run.abort, HumanDecision(by="alice", reason="end of test"))
+            await h.result()
+        assert fleet.agent_requests == []

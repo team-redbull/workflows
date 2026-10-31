@@ -18,7 +18,11 @@ from shared.models.cluster_upgrade import ProposedAction
 DELETE_POD = "delete_pod"  # a pod in openshift-* on the hosted cluster
 DELETE_HCP_POD = "delete_hcp_pod"  # a pod in this cluster's HCP namespace on the MCE
 RERUN_CRONJOB = "rerun_cronjob"  # a Job from a CronJob in openshift-* on the hosted cluster
-KINDS = (DELETE_POD, DELETE_HCP_POD, RERUN_CRONJOB)
+# A FAILED Job in openshift-* on the hosted cluster (owner's decision D21): Red Hat's fix
+# for ImagePrunerDegraded is deleting the failed image-pruner Jobs (KCS 6988893). A
+# failed Job is already finished, so deleting it stops nothing.
+DELETE_FAILED_JOB = "delete_failed_job"
+KINDS = (DELETE_POD, DELETE_HCP_POD, RERUN_CRONJOB, DELETE_FAILED_JOB)
 
 _HOSTED_NAMESPACE_PREFIX = "openshift-"
 _HOSTED_DENIED_NAMESPACES = ("openshift-ovn-kubernetes", "openshift-multus")
@@ -41,7 +45,7 @@ def check(action: ProposedAction) -> CatalogAction:
         return ProposedActionRefusedError(f"action {action.action_id} ({action.kind} {action.target}): {why}")
 
     uid = action.args.get("uid") or None
-    if action.kind in (DELETE_POD, RERUN_CRONJOB):
+    if action.kind in (DELETE_POD, RERUN_CRONJOB, DELETE_FAILED_JOB):
         namespace, _, name = action.target.partition("/")
         if not (_NAME.fullmatch(namespace) and _NAME.fullmatch(name)):
             raise refuse("the target must be <namespace>/<name>")
@@ -49,7 +53,7 @@ def check(action: ProposedAction) -> CatalogAction:
             raise refuse(f"only namespaces {_HOSTED_NAMESPACE_PREFIX}* are in the catalog")
         if action.kind == DELETE_POD and namespace in _HOSTED_DENIED_NAMESPACES:
             raise refuse(f"pods in {namespace} are never deleted by the upgrade")
-        return CatalogAction(action.kind, namespace, name, uid if action.kind == DELETE_POD else None)
+        return CatalogAction(action.kind, namespace, name, None if action.kind == RERUN_CRONJOB else uid)
     if action.kind == DELETE_HCP_POD:
         if not _NAME.fullmatch(action.target):
             raise refuse("the target must be the name of a pod in the cluster's HCP namespace")

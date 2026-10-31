@@ -685,6 +685,23 @@ class TestAdminAcks:
         (logged,) = [e for e in result.log if e.event == "admin-ack"]
         assert logged.by == "workflow" and "no client called its APIs" in logged.detail
 
+    async def test_a_gate_gone_by_the_time_of_the_ack_is_read_again_not_written(self):
+        fleet = Fleet()
+        fleet.ack_gate_vanishes = True
+        async with Harness(fleet) as h:
+            await h.start(request(nodepool_mode=NodePoolMode.AUTO))
+            await h.until(UpgradePhase.AWAITING_APPROVAL)
+            await _approve_through_control_plane(h)
+            result = await h.result()
+
+        assert result.outcome is UpgradeOutcome.DONE
+        assert fleet.acks_given == [] and not [e for e in result.log if e.event == "admin-ack"]
+        (gone,) = [e for e in result.log if e.event == "admin-ack-gone"]
+        assert ADMIN_GATE in gone.detail and "nothing was written" in gone.detail
+        # The refusal sends the run back to read the gates, not on to the commit.
+        refused_at = fleet.calls.index(f"ack:{ADMIN_GATE}")
+        assert fleet.calls.index("read_admin_acks", refused_at) < fleet.calls.index("commit:control-plane::4.20.44")
+
     async def test_a_client_still_calling_a_removed_api_waits_for_a_person(self):
         fleet = Fleet()
         fleet.api_usage = [KYVERNO]

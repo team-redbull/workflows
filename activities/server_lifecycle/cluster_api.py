@@ -534,3 +534,23 @@ async def read_secret_data(namespace: str, name: str) -> dict[str, str] | None:
         return dict(secret.data or {})
 
     return await asyncio.to_thread(_read)
+
+
+async def read_config_map_data(namespace: str, name: str) -> dict[str, str] | None:
+    """One ConfigMap's `data`, or None when it does not exist.
+
+    The cluster-upgrade limb's read of `hypershift/supported-versions` (it reuses
+    this module for the MCE's own API, as it reuses hosted_cluster_api.py).
+    """
+
+    def _read() -> dict[str, str] | None:
+        _load_kube()
+        try:
+            config_map = k8s_client.CoreV1Api().read_namespaced_config_map(name=name, namespace=namespace)
+        except k8s_client.ApiException as exc:
+            if exc.status == _NOT_FOUND:
+                return None
+            raise _classify(exc, "read", "ConfigMap", f"{namespace}/{name}") from None
+        return dict(config_map.data or {})
+
+    return await asyncio.to_thread(_read)

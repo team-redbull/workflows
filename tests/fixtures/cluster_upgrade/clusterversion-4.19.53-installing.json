@@ -1,0 +1,80 @@
+{
+ "apiVersion": "config.openshift.io/v1",
+ "kind": "ClusterVersion",
+ "metadata": {
+  "name": "version"
+ },
+ "status": {
+  "conditions": [
+   {
+    "lastTransitionTime": "2026-10-31T11:18:15Z",
+    "message": "The update channel has not been configured.",
+    "reason": "NoChannel",
+    "status": "False",
+    "type": "RetrievedUpdates"
+   },
+   {
+    "lastTransitionTime": "2026-10-31T11:18:15Z",
+    "message": "Capabilities match configured spec",
+    "reason": "AsExpected",
+    "status": "False",
+    "type": "ImplicitlyEnabledCapabilities"
+   },
+   {
+    "lastTransitionTime": "2026-10-31T11:18:15Z",
+    "message": "Payload loaded version=\"4.19.53\" image=\"quay.io/openshift-release-dev/ocp-release@sha256:<digest>\" architecture=\"amd64\"",
+    "reason": "PayloadLoaded",
+    "status": "True",
+    "type": "ReleaseAccepted"
+   },
+   {
+    "lastTransitionTime": "2026-10-31T11:18:15Z",
+    "status": "False",
+    "type": "Available"
+   },
+   {
+    "lastTransitionTime": "2026-10-31T11:19:00Z",
+    "message": "Cluster operators console, dns, image-registry, ingress, insights, kube-storage-version-migrator, monitoring, network, node-tuning, openshift-samples, service-ca are not available",
+    "reason": "ClusterOperatorsNotAvailable",
+    "status": "True",
+    "type": "Failing"
+   },
+   {
+    "lastTransitionTime": "2026-10-31T11:18:15Z",
+    "message": "Unable to apply 4.19.53: some cluster operators are not available",
+    "reason": "ClusterOperatorsNotAvailable",
+    "status": "True",
+    "type": "Progressing"
+   },
+   {
+    "lastTransitionTime": "2026-10-31T11:18:30Z",
+    "message": "Cluster should not be upgraded between minor versions for multiple reasons: AdminAckRequired,UpdateInProgress\n* The admissionregistration.k8s.io/v1beta1 group version is deprecated in 4.19 and will be removed in 4.20. Any clients using the v1beta1 version of these resources must be updated to use the corresponding v1 version instead. See https://access.redhat.com/articles/7130599 for more information.\n* An update is already in progress and the details are in the Progressing condition",
+    "reason": "MultipleReasons",
+    "status": "False",
+    "type": "Upgradeable"
+   },
+   {
+    "lastTransitionTime": "2026-10-31T11:18:30Z",
+    "message": "The admissionregistration.k8s.io/v1beta1 group version is deprecated in 4.19 and will be removed in 4.20. Any clients using the v1beta1 version of these resources must be updated to use the corresponding v1 version instead. See https://access.redhat.com/articles/7130599 for more information.",
+    "reason": "AdminAckRequired",
+    "status": "False",
+    "type": "UpgradeableAdminAckRequired"
+   },
+   {
+    "lastTransitionTime": "2026-10-31T11:18:30Z",
+    "message": "An update is already in progress and the details are in the Progressing condition",
+    "reason": "UpdateInProgress",
+    "status": "True",
+    "type": "UpgradeableUpgradeInProgress"
+   }
+  ],
+  "history": [
+   {
+    "completionTime": null,
+    "startedTime": "2026-10-31T11:18:15Z",
+    "state": "Partial",
+    "version": "4.19.53"
+   }
+  ]
+ }
+}

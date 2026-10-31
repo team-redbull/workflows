@@ -983,6 +983,24 @@ class ArgoSyncRefusedError(OrchestratorError):
     """
 
 
+class ArgoSyncFailedError(OrchestratorError):
+    """Argo CD ran the sync and it ended Failed or Error, or did not finish in time.
+
+    RETRYABLE: the next attempt asks for the same revision again, so a
+    transient apply failure clears by itself; one that never clears shows on
+    the activity, its message naming Argo CD's own.
+    """
+
+
+class AdminGateNotFoundError(OrchestratorError):
+    """give_admin_ack was asked to ack a gate the hosted admin-gates does not hold.
+
+    The limb writes an ack only for a gate the cluster itself asks for: the
+    run read the gates moments before, so a missing one means they changed
+    under it, and it reads them again rather than writing a key nobody checks.
+    """
+
+
 class ProposedActionRefusedError(OrchestratorError):
     """A tier-2 action names a kind the typed action catalog does not have.
 

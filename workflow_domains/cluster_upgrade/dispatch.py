@@ -32,6 +32,7 @@ with workflow.unsafe.imports_passed_through():
         upgrade_agent_activity_queue,
     )
     from shared.exceptions import (
+        AdminGateNotFoundError,
         AmbiguousClusterFileError,
         ArgoSyncRefusedError,
         ClusterFileNotFoundError,
@@ -88,6 +89,7 @@ PERMANENT_ACTIVITY_ERRORS: tuple[type[Exception], ...] = (
     Day1ChangeRejectedError,
     ArgoSyncRefusedError,
     ProposedActionRefusedError,
+    AdminGateNotFoundError,
 )
 RETRY_POLICY = RetryPolicy(
     initial_interval=timedelta(seconds=1),

@@ -1,0 +1,258 @@
+{
+ "apiVersion": "apiserver.openshift.io/v1",
+ "kind": "APIRequestCount",
+ "metadata": {
+  "name": "validatingadmissionpolicies.v1beta1.admissionregistration.k8s.io"
+ },
+ "status": {
+  "currentHour": {
+   "byNode": [
+    {
+     "byUser": [
+      {
+       "byVerb": [
+        {
+         "requestCount": 3,
+         "verb": "list"
+        }
+       ],
+       "requestCount": 3,
+       "userAgent": "oc/4.22.18",
+       "username": "system:admin"
+      }
+     ],
+     "nodeName": "10.0.0.1",
+     "requestCount": 3
+    }
+   ],
+   "requestCount": 3
+  },
+  "last24h": [
+   {
+    "byNode": [
+     {
+      "nodeName": "10.0.0.1",
+      "requestCount": 0
+     }
+    ],
+    "requestCount": 0
+   },
+   {
+    "byNode": [
+     {
+      "nodeName": "10.0.0.1",
+      "requestCount": 0
+     }
+    ],
+    "requestCount": 0
+   },
+   {
+    "byNode": [
+     {
+      "nodeName": "10.0.0.1",
+      "requestCount": 0
+     }
+    ],
+    "requestCount": 0
+   },
+   {
+    "byNode": [
+     {
+      "nodeName": "10.0.0.1",
+      "requestCount": 0
+     }
+    ],
+    "requestCount": 0
+   },
+   {
+    "byNode": [
+     {
+      "nodeName": "10.0.0.1",
+      "requestCount": 0
+     }
+    ],
+    "requestCount": 0
+   },
+   {
+    "byNode": [
+     {
+      "nodeName": "10.0.0.1",
+      "requestCount": 0
+     }
+    ],
+    "requestCount": 0
+   },
+   {
+    "byNode": [
+     {
+      "nodeName": "10.0.0.1",
+      "requestCount": 0
+     }
+    ],
+    "requestCount": 0
+   },
+   {
+    "byNode": [
+     {
+      "nodeName": "10.0.0.1",
+      "requestCount": 0
+     }
+    ],
+    "requestCount": 0
+   },
+   {
+    "byNode": [
+     {
+      "nodeName": "10.0.0.1",
+      "requestCount": 0
+     }
+    ],
+    "requestCount": 0
+   },
+   {
+    "byNode": [
+     {
+      "nodeName": "10.0.0.1",
+      "requestCount": 0
+     }
+    ],
+    "requestCount": 0
+   },
+   {
+    "byNode": [
+     {
+      "nodeName": "10.0.0.1",
+      "requestCount": 0
+     }
+    ],
+    "requestCount": 0
+   },
+   {
+    "byNode": [
+     {
+      "byUser": [
+       {
+        "byVerb": [
+         {
+          "requestCount": 3,
+          "verb": "list"
+         }
+        ],
+        "requestCount": 3,
+        "userAgent": "oc/4.22.18",
+        "username": "system:admin"
+       }
+      ],
+      "nodeName": "10.0.0.1",
+      "requestCount": 3
+     }
+    ],
+    "requestCount": 3
+   },
+   {
+    "requestCount": 0
+   },
+   {
+    "byNode": [
+     {
+      "nodeName": "10.0.0.1",
+      "requestCount": 0
+     }
+    ],
+    "requestCount": 0
+   },
+   {
+    "byNode": [
+     {
+      "nodeName": "10.0.0.1",
+      "requestCount": 0
+     }
+    ],
+    "requestCount": 0
+   },
+   {
+    "byNode": [
+     {
+      "nodeName": "10.0.0.1",
+      "requestCount": 0
+     }
+    ],
+    "requestCount": 0
+   },
+   {
+    "byNode": [
+     {
+      "nodeName": "10.0.0.1",
+      "requestCount": 0
+     }
+    ],
+    "requestCount": 0
+   },
+   {
+    "byNode": [
+     {
+      "nodeName": "10.0.0.1",
+      "requestCount": 0
+     }
+    ],
+    "requestCount": 0
+   },
+   {
+    "byNode": [
+     {
+      "nodeName": "10.0.0.1",
+      "requestCount": 0
+     }
+    ],
+    "requestCount": 0
+   },
+   {
+    "byNode": [
+     {
+      "nodeName": "10.0.0.1",
+      "requestCount": 0
+     }
+    ],
+    "requestCount": 0
+   },
+   {
+    "byNode": [
+     {
+      "nodeName": "10.0.0.1",
+      "requestCount": 0
+     }
+    ],
+    "requestCount": 0
+   },
+   {
+    "byNode": [
+     {
+      "nodeName": "10.0.0.1",
+      "requestCount": 0
+     }
+    ],
+    "requestCount": 0
+   },
+   {
+    "byNode": [
+     {
+      "nodeName": "10.0.0.1",
+      "requestCount": 0
+     }
+    ],
+    "requestCount": 0
+   },
+   {
+    "byNode": [
+     {
+      "nodeName": "10.0.0.1",
+      "requestCount": 0
+     }
+    ],
+    "requestCount": 0
+   }
+  ],
+  "removedInRelease": "1.33",
+  "requestCount": 3
+ }
+}

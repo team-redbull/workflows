@@ -388,3 +388,14 @@ async def delete_node(
     was matched with (`matches` False).
     """
     return await asyncio.to_thread(_delete_node, kubeconfig, server, node_name, provider_id, cluster)
+
+
+# --- shared with the cluster-upgrade limb ---------------------------------------
+# The cluster-upgrade limb reads other objects in the same hosted clusters, the
+# same way (activities/cluster_upgrade/hosted_upgrade_api.py). Admin kubeconfigs
+# are handled in exactly one place, this module, so it reuses these rather than
+# keeping a second copy of the parsing, the temp directory and the error rules.
+open_hosted_api = _hosted_api
+call_hosted = _call
+as_plain = _plain
+HOSTED_REQUEST_TIMEOUT = _REQUEST_TIMEOUT

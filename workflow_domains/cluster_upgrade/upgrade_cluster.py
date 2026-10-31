@@ -82,6 +82,7 @@ from temporalio.workflow import ParentClosePolicy
 with workflow.unsafe.imports_passed_through():
     from shared.consts import UPGRADE_CONTROL_PLANE_WORKFLOW_QUEUE
     from shared.exceptions import (
+        AdminGateNotFoundError,
         ArgoSyncRefusedError,
         Day1ChangeRejectedError,
         Day1FileChangedError,
@@ -752,10 +753,17 @@ class UpgradeClusterWorkflow:
                 approved_by.update({review.gate: decision.by for review in in_use})
             for review in reviews:
                 await self._checkpoint()
-                given: AdminAckGiven = await on_mce(
-                    self._mce, give_admin_ack,
-                    GiveAdminAckRequest(mce_cluster=self._mce, cluster=self._cluster, gate=review.gate),
-                )
+                try:
+                    given: AdminAckGiven = await on_mce(
+                        self._mce, give_admin_ack,
+                        GiveAdminAckRequest(mce_cluster=self._mce, cluster=self._cluster, gate=review.gate),
+                    )
+                except ActivityError as err:
+                    if error_type(err) != AdminGateNotFoundError.__name__:
+                        raise
+                    # The gates changed since the read: read them again.
+                    self._log("admin-ack-gone", detail=error_message(err))
+                    break
                 self._log(
                     "admin-ack",
                     approved_by.get(review.gate, "workflow"),

@@ -33,7 +33,7 @@ from shared.consts import (
     cluster_upgrade_activity_queue,
     upgrade_agent_activity_queue,
 )
-from shared.exceptions import ArgoSyncRefusedError, Day1FileChangedError
+from shared.exceptions import AdminGateNotFoundError, ArgoSyncRefusedError, Day1FileChangedError
 from shared.models.cluster_upgrade import (
     ActionResult,
     AdminAckGiven,
@@ -196,6 +196,8 @@ class Fleet:
         self.api_usage: list[ApiUsage] = []
         self.cvo_ack_lag = 0
         self._cvo_lagging = 0
+        # The next ack finds its gate gone from admin-gates (changed since the read).
+        self.ack_gate_vanishes = False
         # How many more HostedCluster reads report the control plane Progressing.
         self.settling = 0
         self.agent_down = False
@@ -384,6 +386,13 @@ class Fleet:
         @activity.defn(name="give_admin_ack")
         async def give_admin_ack(request: GiveAdminAckRequest) -> AdminAckGiven:
             fleet.calls.append(f"ack:{request.gate}")
+            if fleet.ack_gate_vanishes:
+                fleet.ack_gate_vanishes = False
+                fleet.admin_gates.pop(request.gate, None)
+                raise AdminGateNotFoundError(
+                    f"hosted cluster {request.cluster} holds no admin gate {request.gate} in "
+                    "openshift-config-managed/admin-gates; nothing was written"
+                )
             assert request.gate in fleet.admin_gates, "acked a gate the cluster does not hold"
             changed = fleet.admin_acks.get(request.gate) != "true"
             fleet.admin_acks[request.gate] = "true"

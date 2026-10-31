@@ -598,7 +598,9 @@ class HostedHealth(BaseModel):
     # aggregate Upgradeable condition; with several it says MultipleReasons
     # there and keeps one Upgradeable<Check> condition per reason, e.g.
     # UpgradeableAdminAckRequired (setUpgradeableConditions, pkg/cvo/upgradeable.go,
-    # release-4.19). The reader lists those reasons; empty when upgradeable.
+    # release-4.19). Such a condition exists only while its check fails, whatever
+    # its status: UpgradeableUpgradeInProgress is True by design. The reader
+    # lists those reasons; empty when upgradeable.
     upgradeable_reasons: list[str] = Field(default_factory=list)
     nodes_not_ready: list[str] = Field(default_factory=list)
     nodepools_short: list[str] = Field(default_factory=list)  # below desired replicas

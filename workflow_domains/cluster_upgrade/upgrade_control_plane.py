@@ -41,14 +41,14 @@ so fire-and-forget signals fit; a person's decisions are Updates, on the parent.
 
 An early end before the sync (mirror changed, someone else's edit, the day1
 validator, Argo CD refusing) is a RESULT, never a failure, and frees the slot:
-the HostedCluster is not upgrading. A retry starts the child again, and each
-part is idempotent for it — the commit sees the file already says so, the sync
-sees the revision already synced.
+the HostedCluster is not upgrading. Its last phase is then `done`, as after
+the version is reached (the result's outcome says which); after the parent's
+stop it is `stopped`. A retry starts the child again, and each part is
+idempotent for it — the commit sees the file already says so, the sync sees
+the revision already synced.
 """
 
 from __future__ import annotations
-
-import asyncio
 
 from temporalio import workflow
 from temporalio.exceptions import ActivityError
@@ -60,8 +60,9 @@ with workflow.unsafe.imports_passed_through():
         Day1FileChangedError,
     )
     from shared.interfaces.cluster_upgrade import sync_argo_application, watch_control_plane
-    from shared.interfaces.upgrade_gitops import commit_day1_change, pin_release_digests
+    from shared.interfaces.upgrade_gitops import commit_day1_change
     from shared.models.cluster_upgrade import (
+        AgentVerdict,
         ArgoSyncRequest,
         CheckFailure,
         CheckResult,
@@ -69,7 +70,6 @@ with workflow.unsafe.imports_passed_through():
         Day1ChangeKind,
         Day1ChangeRequest,
         Day1Commit,
-        PinReleasesRequest,
         UpgradeControlPlaneInput,
         UpgradeControlPlaneProgress,
         UpgradeControlPlaneResult,
@@ -78,26 +78,26 @@ with workflow.unsafe.imports_passed_through():
         WatchOutcome,
         WatchResult,
     )
-    from shared.ocp_version import release_tag
-
-from workflow_domains.cluster_upgrade.dispatch import (
-    REGISTRY_TIMEOUT,
-    SYNC_TIMEOUT,
-    clears_gate,
-    diagnose,
-    error_message,
-    error_type,
-    on_hub,
-    on_mce,
-    start_watch,
-)
+    from workflow_domains.cluster_upgrade.dispatch import (
+        SYNC_TIMEOUT,
+        clears_gate,
+        diagnose,
+        error_message,
+        error_type,
+        hosted_cluster_name,
+        mirror_change,
+        on_hub,
+        on_mce,
+        start_watch,
+        until_done,
+    )
 
 # MACHINE convergence, so real deadlines (CLAUDE.md §5). A hosted control plane
 # upgrade is CVO-driven and takes well under an hour on a healthy MCE; no
 # change at all in 20 minutes is a stall worth a diagnosis, and three hours is
 # the end of waiting (DESIGN §6.2).
-CONTROL_PLANE_STALL_MINUTES = 20
-CONTROL_PLANE_DEADLINE_MINUTES = 180
+_CONTROL_PLANE_STALL_MINUTES = 20
+_CONTROL_PLANE_DEADLINE_MINUTES = 180
 
 # The signal the child sends its parent when the step needs a person. A name,
 # not a method reference: the parent's module imports this one.
@@ -116,6 +116,9 @@ class UpgradeControlPlaneWorkflow:
         self._stop = False
         self._held = False
         self._retry = False
+        # The step's commit, once it landed: every result from then on carries it.
+        self._revision: str | None = None
+        self._day1_blob: str | None = None
 
     @workflow.query
     def progress(self) -> UpgradeControlPlaneProgress:
@@ -146,38 +149,20 @@ class UpgradeControlPlaneWorkflow:
     async def run(self, run_args: UpgradeControlPlaneRunArgs) -> UpgradeControlPlaneResult:
         request = run_args.input
         self._input = request
-        committed: dict = {}
         try:
-            return await self._step(request, committed)
+            return await self._step(request)
         except _Stopped:
-            self._phase = "stopped"
-            return UpgradeControlPlaneResult(
-                outcome=ControlPlaneStepOutcome.STOPPED, step_index=request.step_index, **committed
-            )
+            return self._result(ControlPlaneStepOutcome.STOPPED)
 
-    async def _step(self, request: UpgradeControlPlaneInput, committed: dict) -> UpgradeControlPlaneResult:
+    async def _step(self, request: UpgradeControlPlaneInput) -> UpgradeControlPlaneResult:
         version = request.step.version
 
         # 1 — the release the run was approved with is still the one the tag names.
         await self._checkpoint()
         self._phase = "checking-mirror"
-        now = await on_hub(
-            pin_release_digests,
-            PinReleasesRequest(versions=[version], release=request.release),
-            timeout=REGISTRY_TIMEOUT,
-        )
-        current = now.pinned.get(version)
-        if current != request.pinned:
-            return self._result(
-                request,
-                ControlPlaneStepOutcome.MIRROR_CHANGED,
-                detail=(
-                    f"the mirror changed under the run: {release_tag(version)} was approved as "
-                    f"{request.pinned.release} (operator {request.pinned.control_plane_operator}) "
-                    f"and now resolves to "
-                    + (f"{current.release} (operator {current.control_plane_operator})" if current else "nothing")
-                ),
-            )
+        moved = await mirror_change(version, request.pinned, request.release)
+        if moved is not None:
+            return self._result(ControlPlaneStepOutcome.MIRROR_CHANGED, detail=moved)
 
         # 2 — the commit: mastertag, with every worker pinned where it is.
         await self._checkpoint()
@@ -203,8 +188,8 @@ class UpgradeControlPlaneWorkflow:
             }.get(error_type(err) or "")
             if outcome is None:
                 raise
-            return self._result(request, outcome, detail=error_message(err))
-        committed.update(committed=True, revision=commit.revision, day1_blob=commit.blob)
+            return self._result(outcome, detail=error_message(err))
+        self._revision, self._day1_blob = commit.revision, commit.blob
 
         # 3 — Argo CD applies exactly that commit, and nothing of anyone else's.
         await self._checkpoint()
@@ -218,16 +203,16 @@ class UpgradeControlPlaneWorkflow:
                     cluster=request.cluster,
                     revision=commit.revision,
                     # Argo CD lists the HostedCluster by its own name, not the file's.
-                    allowed_out_of_sync=[f"HostedCluster/{request.hosted_cluster or request.cluster}"],
+                    allowed_out_of_sync=[
+                        f"HostedCluster/{hosted_cluster_name(request.hosted_cluster, request.cluster)}"
+                    ],
                 ),
                 timeout=SYNC_TIMEOUT,
             )
         except ActivityError as err:
             if error_type(err) != ArgoSyncRefusedError.__name__:
                 raise
-            return self._result(
-                request, ControlPlaneStepOutcome.SYNC_REFUSED, detail=error_message(err), **committed
-            )
+            return self._result(ControlPlaneStepOutcome.SYNC_REFUSED, detail=error_message(err))
 
         # From here the HostedCluster is upgrading: the step, and its slot,
         # last until it runs the version or the parent stops it.
@@ -236,8 +221,7 @@ class UpgradeControlPlaneWorkflow:
             self._phase = "watching"
             outcome = await self._watch(request)
             if outcome.result is WatchResult.DONE:
-                self._phase = "done"
-                return self._result(request, ControlPlaneStepOutcome.DONE, **committed)
+                return self._result(ControlPlaneStepOutcome.DONE)
 
             # 5 — a stall or the deadline: ask the agent, then the same gate at most once more.
             await self._checkpoint()
@@ -271,10 +255,8 @@ class UpgradeControlPlaneWorkflow:
                 self._phase = "watching"
                 outcome = await self._watch(request)
                 if outcome.result is WatchResult.DONE:
-                    self._phase = "done"
                     return self._result(
-                        request, ControlPlaneStepOutcome.DONE,
-                        verdict=diagnosis.verdict, incident_path=diagnosis.incident_path, **committed,
+                        ControlPlaneStepOutcome.DONE, verdict=diagnosis.verdict, incident_path=diagnosis.incident_path
                     )
                 failing = failing.model_copy(
                     update={"observed": f"{outcome.result.value} again: {outcome.snapshot.summary}"}
@@ -284,13 +266,11 @@ class UpgradeControlPlaneWorkflow:
             self._phase = "needs-human"
             self._retry = False
             report = self._result(
-                request,
                 ControlPlaneStepOutcome.NEEDS_HUMAN,
                 detail=f"the control plane did not reach {version}: {failing.observed}",
                 verdict=diagnosis.verdict,
                 incident_path=diagnosis.incident_path,
                 failing_checks=[failing],
-                **committed,
             )
             await workflow.get_external_workflow_handle(request.parent_workflow_id).signal(
                 NEEDS_HUMAN_SIGNAL, report
@@ -317,24 +297,44 @@ class UpgradeControlPlaneWorkflow:
                 mce_cluster=request.mce_cluster,
                 cluster=request.cluster,
                 version=request.step.version,
-                stall_minutes=CONTROL_PLANE_STALL_MINUTES,
-                deadline_minutes=CONTROL_PLANE_DEADLINE_MINUTES,
+                stall_minutes=_CONTROL_PLANE_STALL_MINUTES,
+                deadline_minutes=_CONTROL_PLANE_DEADLINE_MINUTES,
                 hosted_cluster=request.hosted_cluster,
                 hosted_cluster_namespace=request.hosted_cluster_namespace,
             ),
-            deadline_minutes=CONTROL_PLANE_DEADLINE_MINUTES,
+            deadline_minutes=_CONTROL_PLANE_DEADLINE_MINUTES,
         )
-        await workflow.wait_condition(lambda: handle.done() or self._stop)
-        if not handle.done():
-            handle.cancel()
-            try:
-                await handle
-            except (asyncio.CancelledError, ActivityError):
-                pass
+        if not await until_done(handle, lambda: self._stop):
             raise _Stopped()
         return handle.result()
 
     def _result(
-        self, request: UpgradeControlPlaneInput, outcome: ControlPlaneStepOutcome, **fields
+        self,
+        outcome: ControlPlaneStepOutcome,
+        *,
+        detail: str = "",
+        verdict: AgentVerdict | None = None,
+        incident_path: str | None = None,
+        failing_checks: list[CheckResult] | None = None,
     ) -> UpgradeControlPlaneResult:
-        return UpgradeControlPlaneResult(outcome=outcome, step_index=request.step_index, **fields)
+        """The step's result, with what it committed — or, NEEDS_HUMAN, its report to the parent.
+
+        Every other outcome ends the step, so this sets its last phase: `done`
+        for every end the parent carries on from (the version reached, or an
+        early end before the sync, which frees the slot all the same; the
+        outcome says which), `stopped` for the parent's stop.
+        """
+        if outcome is not ControlPlaneStepOutcome.NEEDS_HUMAN:
+            self._phase = "stopped" if outcome is ControlPlaneStepOutcome.STOPPED else "done"
+        assert self._input is not None, "run() sets the input before any result"
+        return UpgradeControlPlaneResult(
+            outcome=outcome,
+            step_index=self._input.step_index,
+            detail=detail,
+            committed=self._revision is not None,
+            revision=self._revision,
+            day1_blob=self._day1_blob,
+            verdict=verdict,
+            incident_path=incident_path,
+            failing_checks=failing_checks or [],
+        )

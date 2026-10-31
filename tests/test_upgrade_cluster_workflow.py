@@ -152,6 +152,12 @@ class TestTheHappyPath:
         ]
         # One run per unit of work: each control-plane step, each NodePool.
         assert len(set(fleet.commit_runs)) == 4
+        # The child's commits are in the run's own log, as the NodePools' are.
+        assert [(e.event, e.detail) for e in result.log if e.event.startswith("commit-")] == [
+            ("commit-control-plane", "rev-2 4.19.53"), ("commit-control-plane", "rev-3 4.20.44"),
+            ("commit-nodepool", "rev-4 np-a 4.20.44"), ("commit-nodepool", "rev-5 np-b 4.20.44"),
+            ("commit-finish", "rev-5"),  # the file already said so: nothing new to commit
+        ]
         continued = [e.at for e in result.log if e.event == "continue"]
         assert continued[1] - continued[0] >= SEVEN_DAYS
         # The happy path is boring: no agent, no incident.
@@ -410,8 +416,10 @@ class TestAbortDuringAControlPlaneStep:
                 UpgradeControlPlaneWorkflow.run, upgrade_control_plane_workflow_id(MCE, 1)
             )
             stopped = await child.result()
+            phase = (await child.query(UpgradeControlPlaneWorkflow.progress)).phase
 
         assert result.outcome is UpgradeOutcome.ABORTED
+        assert phase == "stopped"
         # The step's own commit stays: nothing is ever reverted, the run pauses instead.
         assert fleet.commit_summary() == ["control-plane::4.19.53", "pause"]
         # Stopped by signal — not cancelled — and closed, so the slot is free.
@@ -580,6 +588,12 @@ class TestGatesAndTheAgent:
         assert asked.tier1_enabled is False  # everything is a proposal in production (AGENT.md #25)
         assert asked.evidence.sections
         assert len(fleet.incidents) == 1 and fleet.incidents[0].verdict.verdict == "retry_gate"
+        # The audit line names the incident and the invocation the agent service keys on.
+        (logged,) = [e for e in result.log if e.event == "agent"]
+        assert logged.detail == (
+            "retry_gate: a pruner pod was stuck (incidents/2026-11-01-hypershift-stall-1.md) "
+            f"[invocation {asked.invocation_id}]"
+        )
 
     async def test_a_second_failure_waits_for_a_person_and_retry_re_runs_the_same_gate(self):
         fleet = Fleet(control_plane="4.20.44", nodepools={"np-a": "4.19.53"})
@@ -693,7 +707,7 @@ class TestGatesAndTheAgent:
     async def test_a_drain_a_pdb_blocks_goes_to_the_agent_early_and_lab_waves_let_it_act(self):
         # Seen live (CONTEXT §8.13): an OpenShift PDB whose pods crash-loop
         # blocks a node's drain for ever. The watch hands it over after
-        # DRAIN_BLOCKED_MINUTES; in a lab wave the agent deletes those pods
+        # _DRAIN_BLOCKED_MINUTES; in a lab wave the agent deletes those pods
         # itself (tier 1, AGENT.md #25) and the run watches once more (D17).
         fleet = Fleet(control_plane="4.20.44", nodepools={"np-a": "4.19.53"},
                       upgrade=ClusterUpgradeSettings(wave=0))
@@ -737,11 +751,16 @@ class TestGatesAndTheAgent:
             await h.decide(Run.retry, ALICE)
             await h.until(UpgradePhase.AWAITING_DAY2_CONFIRM)
             await h.decide(Run.abort, HumanDecision(by="alice", reason="end of test"))
-            await h.result()
+            result = await h.result()
         # The retry re-ran the same child's watch: no second commit, no second agent call.
         assert fleet.commit_summary() == ["control-plane::4.19.53", "pause"]
         assert [c for c in fleet.calls if c.startswith("watch-cp")] == ["watch-cp:4.19.53"] * 2
         assert len(fleet.agent_requests) == 1
+        # The child's verdict and its incident reach the parent's log; its commit, once.
+        assert [e.detail for e in result.log if e.event == "agent"] == [
+            "retry_gate: a pruner pod was stuck (incidents/2026-11-01-hypershift-stall-1.md)"
+        ]
+        assert [e.detail for e in result.log if e.event == "commit-control-plane"] == ["rev-2 4.19.53"]
 
     async def test_an_agent_that_cannot_be_reached_is_a_person_s_call_not_a_failure(self):
         fleet = Fleet(control_plane="4.20.44", nodepools={"np-a": "4.19.53"})
@@ -956,6 +975,12 @@ class TestTheMirrorAndGit:
             assert "the mirror changed under the run" in waiting.waiting_for
             assert "sha256:release-4.19.53-moved" in waiting.waiting_for
             assert fleet.commits == []
+            # The child ended early, freeing its slot: it says so, not "checking-mirror" for ever.
+            child = h.client.get_workflow_handle_for(
+                UpgradeControlPlaneWorkflow.run, upgrade_control_plane_workflow_id(MCE, 1)
+            )
+            assert (await child.result()).outcome is ControlPlaneStepOutcome.MIRROR_CHANGED
+            assert (await child.query(UpgradeControlPlaneWorkflow.progress)).phase == "done"
             await h.decide(Run.abort, HumanDecision(by="alice", reason="re-plan"))
             result = await h.result()
         assert result.outcome is UpgradeOutcome.ABORTED

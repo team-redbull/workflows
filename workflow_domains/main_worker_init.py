@@ -32,18 +32,18 @@ from shared.consts import (
     REMOVE_SERVER_WORKFLOW_QUEUE,
     UNINSTALL_SERVER_WORKFLOW_QUEUE,
     UPGRADE_CLUSTER_WORKFLOW_QUEUE,
-    UPGRADE_TARGETS_WORKFLOW_QUEUE,
     UPGRADE_CONTROL_PLANE_WORKFLOW_QUEUE,
+    UPGRADE_TARGETS_WORKFLOW_QUEUE,
 )
 from shared.logging_config import configure_logging
 from shared.settings import TemporalSettings
 from shared.shutdown import install_shutdown_handler
 from shared.temporal_client import connect_temporal
 from workflow_domains.cluster_upgrade.upgrade_cluster import UpgradeClusterWorkflow
-from workflow_domains.cluster_upgrade.upgrade_targets import UpgradeTargetsWorkflow
 from workflow_domains.cluster_upgrade.upgrade_control_plane import (
     UpgradeControlPlaneWorkflow,
 )
+from workflow_domains.cluster_upgrade.upgrade_targets import UpgradeTargetsWorkflow
 from workflow_domains.segment_lifecycle.allocate_segment import (
     AllocateSegmentWorkflow,
 )
@@ -67,15 +67,16 @@ _settings = TemporalSettings()
 
 # The brain's registry: (task queue, workflows polled on it). Adding a workflow
 # — in this domain or a brand-new one — is one entry here plus its queue name in
-# shared/consts.py; no new deployment, image or chart.
+# shared/consts.py; no new deployment, image or chart. Alphabetical by queue:
+# the order is only the order the Workers start in.
 _WORKER_SPECS: list[tuple[str, list[type]]] = [
-    (INITIALIZE_SEGMENT_WORKFLOW_QUEUE, [InitializeSegmentWorkflow]),
     (ALLOCATE_SEGMENT_WORKFLOW_QUEUE, [AllocateSegmentWorkflow]),
+    (INITIALIZE_SEGMENT_WORKFLOW_QUEUE, [InitializeSegmentWorkflow]),
     (INSTALL_SERVER_WORKFLOW_QUEUE, [InstallServerWorkflow]),
     (PROVISION_DELL_SERVER_WORKFLOW_QUEUE, [ProvisionDellServerWorkflow]),
+    (PUBLISH_INFRAENV_BOOT_WORKFLOW_QUEUE, [PublishInfraEnvBootWorkflow]),
     (RELEASE_SEGMENT_WORKFLOW_QUEUE, [ReleaseSegmentWorkflow]),
     (REMOVE_SERVER_WORKFLOW_QUEUE, [RemoveServerWorkflow]),
-    (PUBLISH_INFRAENV_BOOT_WORKFLOW_QUEUE, [PublishInfraEnvBootWorkflow]),
     (UNINSTALL_SERVER_WORKFLOW_QUEUE, [UninstallServerWorkflow]),
     (UPGRADE_CLUSTER_WORKFLOW_QUEUE, [UpgradeClusterWorkflow]),
     (UPGRADE_CONTROL_PLANE_WORKFLOW_QUEUE, [UpgradeControlPlaneWorkflow]),

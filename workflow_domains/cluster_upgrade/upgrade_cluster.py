@@ -6,36 +6,64 @@ HostedCluster or NodePool, and Argo CD stays their only writer. The control
 plane moves one minor at a time along the ladder (upgrade_path.py); NodePools
 follow one at a time, at a person's pace, and may wait weeks between two.
 
-Shape of the run (the `progress` query exposes all of it, `waiting_for` says
-what a person has to do next):
+Shape of the run, by the phase the `progress` query reports (`waiting_for`
+says what a person has to do next):
 
-  1. planning           — rules, the day1 file, the MCE and the HostedCluster
-                          read; the path resolved; every release pinned to a
-                          digest; checks 1–4 (gates.py). Any failure FAILS the
-                          run, listing every failed check; nothing committed.
-  2. preflight          — checks 5–11. A failure waits for a person
-                          (needs-human), never fails: a PDB's owner can fix it
-                          and `retry`.
-  3. awaiting-approval  — the one approval, before anything is committed
-                          (AGENT.md #3). `abort` here CANCELS: nothing changed.
-  4. the steps, in plan order:
-       control plane     — pre-flight 5–10; before a MINOR step, the admin
-                           acks the hosted cluster asks for (D16: given by the
-                           run when no client used the APIs they remove in the
-                           last 24 hours, else awaiting-admin-ack); a free slot
-                           on the MCE; then the child workflow
-                           (upgrade_control_plane.py) commits, syncs and
-                           watches. Then awaiting-day2-confirm: the day2 team
-                           syncs their layer for the new version and confirms
-                           (D14). After EVERY control-plane step.
-       workers           — for each NodePool: awaiting-continue (manual mode;
-                           auto mode goes on after the soak), pre-flight 5–10,
-                           the digest re-checked, the commit and the sync, the
-                           roll watched, then the gate (nodes, workloads, the
-                           soak). The customer runs their own readiness checks;
-                           their `continue` is the sign-off (D19).
-  5. postflight         — the top-level workertag the run added is dropped;
-                          the cluster checked at the target.
+  1. planning              — rules, the day1 file (its folder names the MCE),
+                             the MCE and the HostedCluster read; the path
+                             resolved; every release pinned to a digest; checks
+                             1–4 (gates.py). Any failure FAILS the run, listing
+                             every failed check; nothing committed. A cluster
+                             already at the target ends here, done.
+  2. preflight             — checks 5–11. A control plane still settling (a
+                             WAIT check) is re-checked every minute for up to
+                             30. Before approval a FAILED-kind check fails the
+                             run, as planning does; any other failure goes to
+                             the agent, then to a person (needs-human): a PDB's
+                             owner can fix it and `retry`. After approval no
+                             check ever fails the run: every failure waits.
+  3. awaiting-approval     — the one approval, before anything is committed
+                             (AGENT.md #3). `abort` here CANCELS: nothing
+                             changed. `auto_approve` skips it (MODES, below).
+  4. the steps, in plan order. A CONTROL-PLANE step:
+       preflight             — checks 5–10 again;
+       admin-acks            — before a MINOR step, the admin acks the hosted
+                               cluster asks for (D16): given by the run when no
+                               client called the APIs they remove in the last
+                               24 hours, then the CVO waited for;
+       awaiting-admin-ack    — else a person approves them, with a reason, or
+                               retries once the callers moved;
+       waiting-for-slot      — every control-plane slot of the MCE taken:
+                               looked at again every 2 minutes;
+       control-plane-step    — the child workflow (upgrade_control_plane.py)
+                               commits, syncs and watches;
+       awaiting-day2-confirm — the day2 team syncs their layer for the new
+                               version and confirms (D14). After EVERY
+                               control-plane step.
+     A WORKERS step, for each NodePool:
+       awaiting-continue     — manual mode: the customer runs their own
+                               readiness checks, and their `continue` is the
+                               sign-off (D19). Auto mode goes on once the
+                               previous gate held for the soak;
+       preflight             — checks 5–10, then the digest re-checked, the
+                               commit and the sync;
+       nodepool-roll         — the roll watched;
+       nodepool-gate         — nodes, workloads, the soak.
+  5. postflight            — the top-level workertag the run added is dropped;
+                             the cluster checked at the target.
+  6. done                  — at the target.
+
+And wherever the run is:
+     agent-invocation      — a failed gate or a stalled watch goes to the
+                             upgrade agent (dispatch.diagnose);
+     needs-human           — waiting for `retry` or `abort`, and for decisions
+                             on what the agent proposed;
+     paused                — a person's pause, held right before the next act
+                             until `resume`;
+     aborting              — an abort after approval: pausedUntil committed
+                             and synced (below), ending
+     aborted               — or, for an abort before approval,
+     cancelled             — with nothing committed.
 
 MODES, from the request, checked at planning (docs: upgrade-cluster.html#modes).
 `auto_approve` removes the one approval: the run approves itself after
@@ -67,10 +95,11 @@ NodePool, which keeps each run short however long the upgrade, and lets new
 code take over between units.
 
 ABORT AND PAUSE ARE CHECKED RIGHT BEFORE EVERY ACT: every commit, every sync,
-every admin ack, every child start and every agent call (`_checkpoint`), besides
-every wait and every watch. An abort stops the control-plane child by signal and waits for it,
-then commits `pausedUntil` for the HostedCluster and its NodePools and syncs
-(ABORTED); if Argo CD refuses that sync, a person is asked, never the run
+every admin ack, every child start, every agent call and every approved action
+(`_checkpoint`), besides every wait and every watch. An abort stops the
+control-plane child by signal and waits for it, then commits `pausedUntil` for
+the HostedCluster and its NodePools and syncs (ABORTED); if Argo CD refuses
+that sync, or the cluster file is gone, a person is asked, never the run
 failed. Before approval an abort CANCELS, with nothing committed. There is no
 downgrade, and no commit is ever reverted.
 """
@@ -78,8 +107,8 @@ downgrade, and no commit is ever reverted.
 from __future__ import annotations
 
 import asyncio
-from datetime import timedelta
 from collections.abc import Callable
+from datetime import timedelta
 from typing import Any, NoReturn
 
 from temporalio import workflow
@@ -179,40 +208,44 @@ with workflow.unsafe.imports_passed_through():
         WatchOutcome,
         WatchResult,
     )
-    from shared.ocp_version import minor_name, minor_of, parse_minor, release_tag
+    from shared.ocp_version import minor_name, minor_of, parse_minor
     from shared.workflow_ids import upgrade_control_plane_workflow_id
+    from workflow_domains.cluster_upgrade import gates
+    from workflow_domains.cluster_upgrade.dispatch import (
+        REGISTRY_TIMEOUT,
+        SYNC_TIMEOUT,
+        Diagnosis,
+        clears_gate,
+        diagnose,
+        error_message,
+        error_type,
+        hosted_cluster_name,
+        hosting_mce,
+        mirror_change,
+        on_hub,
+        on_mce,
+        start_watch,
+        until_done,
+    )
+    from workflow_domains.cluster_upgrade.upgrade_path import recommended_target, resolve_upgrade_path
 
-from workflow_domains.cluster_upgrade import gates
-from workflow_domains.cluster_upgrade.dispatch import (
-    REGISTRY_TIMEOUT,
-    SYNC_TIMEOUT,
-    Diagnosis,
-    clears_gate,
-    diagnose,
-    error_message,
-    error_type,
-    on_hub,
-    on_mce,
-    start_watch,
-)
 from workflow_domains.cluster_upgrade.upgrade_control_plane import (
     NEEDS_HUMAN_SIGNAL,
     UpgradeControlPlaneWorkflow,
 )
-from workflow_domains.cluster_upgrade.upgrade_path import recommended_target, resolve_upgrade_path
 
 # MACHINE convergence gets deadlines (CLAUDE.md §5); human waits never do.
 # Changing any of these is a non-deterministic change for in-flight runs.
 #
 # A NodePool roll with no node finishing in this long is a stall worth a
 # diagnosis; its deadline is per batch of nodes (gates.nodepool_roll_deadline_minutes).
-NODEPOOL_STALL_MINUTES = 30
+_NODEPOOL_STALL_MINUTES = 30
 # A drain the eviction API refuses (a PDB at disruptionsAllowed 0) never clears
 # by itself — nodeDrainTimeout 0 waits for ever — so the watch hands it to the
 # agent after this long instead of the full stall window (D17; CONTEXT §8.13).
-DRAIN_BLOCKED_MINUTES = 10
+_DRAIN_BLOCKED_MINUTES = 10
 # The gate's own deadline, on top of the soak it has to hold for.
-GATE_DEADLINE_MINUTES = 60
+_GATE_DEADLINE_MINUTES = 60
 # A control plane still settling (pre-flight check 7) is re-checked this
 # often, for this long, before a person is asked.
 _SETTLE_POLL = timedelta(minutes=1)
@@ -525,19 +558,11 @@ class UpgradeClusterWorkflow:
         request = self._input
         self._phase = UpgradePhase.PLANNING
         day1: Day1Cluster = await on_hub(read_day1_cluster, Day1ClusterRequest(cluster=self._cluster))
-        mce_cluster = gates.mce_of_day1_path(day1.path)
-        if mce_cluster is None:
-            self._fail_planning(
-                f"day1 file {day1.path} is not under sites/<site>/mces/<mce>/hostedClusters/: no MCE to run on"
-            )
-        self._mce = mce_cluster
+        self._mce = hosting_mce(day1)
         self._hosted, self._hosted_ns = day1.hosted_cluster, day1.hosted_cluster_namespace
         rules: UpgradeRules = await on_hub(read_upgrade_rules, UpgradeRulesRequest(mce_cluster=self._mce))
         mce: MceState = await on_mce(self._mce, read_mce_state, MceRequest(mce_cluster=self._mce))
-        hosted: HostedClusterState = await on_mce(
-            self._mce, read_hosted_cluster,
-            HostedClusterRequest(mce_cluster=self._mce, cluster=self._cluster, **self._on_hc()),
-        )
+        hosted: HostedClusterState = await on_mce(self._mce, read_hosted_cluster, self._hc_request())
         if not hosted.found:
             self._fail_planning(f"HostedCluster {self._hc_label} not found on {self._mce}")
         if hosted.control_plane_version is None:
@@ -600,7 +625,7 @@ class UpgradeClusterWorkflow:
         )
         if gates.failed(checks):
             self._fail_planning(gates.describe(checks))
-        plan.pinned = {version: pinned.pinned[version] for version in versions}
+        context.plan.pinned = {version: pinned.pinned[version] for version in versions}
         self._context = context
         self._day1_blob = day1.blob
         self._log("planned", detail=self._plan_summary())
@@ -907,13 +932,23 @@ class UpgradeClusterWorkflow:
         self._cp_workflow_id = None
 
     def _absorb(self, result: UpgradeControlPlaneResult) -> None:
-        """What a step result tells the parent: a commit landed, the file's new blob, a verdict."""
+        """What a step result tells the parent: a commit landed, the file's new blob, a verdict.
+
+        The commit and the verdict go into the run's log as the NodePool path's
+        do: the child commits and asks the agent, the parent keeps the record.
+        """
         if result.committed:
             self._step_committed = True
+            if result.revision:
+                detail = f"{result.revision} {self._ctx.plan.steps[self._next_step].version}"
+                # Every report of the step carries its commit; log it once.
+                if not any(e.event == "commit-control-plane" and e.detail == detail for e in self._log_entries):
+                    self._log("commit-control-plane", detail=detail)
         if result.day1_blob:
             self._day1_blob = result.day1_blob
         if result.verdict is not None:
             self._last_verdict = result.verdict
+            self._log_agent(result.verdict, result.incident_path)
 
     async def _take_slot(self, step: UpgradeStep, from_version: str) -> workflow.ChildWorkflowHandle:
         """Start the step's child on the first free slot of the MCE; wait while all are taken."""
@@ -1044,10 +1079,7 @@ class UpgradeClusterWorkflow:
             return
 
     async def _watch_nodepool(self, step: UpgradeStep, nodepool: str) -> WatchOutcome:
-        hosted: HostedClusterState = await on_mce(
-            self._mce, read_hosted_cluster,
-            HostedClusterRequest(mce_cluster=self._mce, cluster=self._cluster, **self._on_hc()),
-        )
+        hosted: HostedClusterState = await on_mce(self._mce, read_hosted_cluster, self._hc_request())
         state = next((np for np in hosted.nodepools if np.name == nodepool), None)
         deadline = gates.nodepool_roll_deadline_minutes(
             state.replicas if state else None, state.max_unavailable if state else None
@@ -1061,9 +1093,9 @@ class UpgradeClusterWorkflow:
                     cluster=self._cluster,
                     nodepool=nodepool,
                     version=step.version,
-                    stall_minutes=NODEPOOL_STALL_MINUTES,
+                    stall_minutes=_NODEPOOL_STALL_MINUTES,
                     deadline_minutes=deadline,
-                    drain_blocked_minutes=DRAIN_BLOCKED_MINUTES,
+                    drain_blocked_minutes=_DRAIN_BLOCKED_MINUTES,
                     **self._on_hc(),
                 ),
                 deadline_minutes=deadline,
@@ -1072,7 +1104,7 @@ class UpgradeClusterWorkflow:
 
     async def _watch_gate(self, step: UpgradeStep, nodepool: str) -> GateOutcome:
         context = self._ctx
-        deadline = context.soak_minutes + GATE_DEADLINE_MINUTES
+        deadline = context.soak_minutes + _GATE_DEADLINE_MINUTES
         return await self._until_done(
             start_watch(
                 self._mce,
@@ -1107,10 +1139,7 @@ class UpgradeClusterWorkflow:
                 # NodePool carries its own tag by now, so nothing may be out of sync.
                 reason = await self._sync_pending(allowed=[])
             if reason is None:
-                hosted: HostedClusterState = await on_mce(
-                    self._mce, read_hosted_cluster,
-                    HostedClusterRequest(mce_cluster=self._mce, cluster=self._cluster, **self._on_hc()),
-                )
+                hosted: HostedClusterState = await on_mce(self._mce, read_hosted_cluster, self._hc_request())
                 reason = self._not_at_target(hosted, context)
             if reason is None:
                 self._log("done", detail=f"at {context.plan.target}")
@@ -1141,13 +1170,9 @@ class UpgradeClusterWorkflow:
         context = self._ctx
         await self._checkpoint()
         if version is not None:
-            now = await on_hub(
-                pin_release_digests,
-                PinReleasesRequest(versions=[version], release=context.release),
-                timeout=REGISTRY_TIMEOUT,
-            )
-            if now.pinned.get(version) != context.plan.pinned.get(version):
-                return f"the mirror changed under the run: {release_tag(version)} no longer resolves to the approved digests"
+            moved = await mirror_change(version, context.plan.pinned.get(version), context.release)
+            if moved is not None:
+                return moved
         reason = await self._take_current_day1_if_stale()
         if reason is not None:
             return reason
@@ -1304,7 +1329,7 @@ class UpgradeClusterWorkflow:
             verdict = None
 
     async def _preflight_checks(self, *, include_idms: bool, nodepools: list[str]) -> list[CheckResult]:
-        cluster = HostedClusterRequest(mce_cluster=self._mce, cluster=self._cluster, **self._on_hc())
+        cluster = self._hc_request()
         argo, hosted, health = await asyncio.gather(
             on_mce(self._mce, read_argo_application, cluster),
             on_mce(self._mce, read_hosted_cluster, cluster),
@@ -1354,12 +1379,22 @@ class UpgradeClusterWorkflow:
         if diagnosis is None:
             raise _AbortRequested()
         self._last_verdict = diagnosis.verdict
+        self._log_agent(diagnosis.verdict, diagnosis.incident_path, diagnosis.invocation_id)
+        return diagnosis
+
+    def _log_agent(self, verdict: AgentVerdict, incident_path: str | None, invocation_id: str | None = None) -> None:
+        """One agent answer in the run's log: the verdict, where Brain recorded it, the invocation.
+
+        The invocation id is what the agent service keys its run, its tool
+        calls and its verdict on. A control-plane child's answer reaches the
+        parent without it (UpgradeControlPlaneResult has no field for it).
+        """
         self._log(
             "agent",
-            detail=f"{diagnosis.verdict.verdict}: {diagnosis.verdict.diagnosis}"
-            + (f" ({diagnosis.incident_path})" if diagnosis.incident_path else ""),
+            detail=f"{verdict.verdict}: {verdict.diagnosis}"
+            + (f" ({incident_path})" if incident_path else "")
+            + (f" [invocation {invocation_id}]" if invocation_id else ""),
         )
-        return diagnosis
 
     async def _needs_human(
         self, reason: str, *, verdict: AgentVerdict | None = None, during_abort: bool = False
@@ -1526,23 +1561,16 @@ class UpgradeClusterWorkflow:
             return
         raise _AbortRequested()
 
-    async def _until_done(self, task: Any) -> Any:
+    async def _until_done(self, watch: workflow.ActivityHandle) -> Any:
         """Await a watch activity (started TRY_CANCEL) — unless a person aborts first, which cancels it.
 
-        Only for those: a cancelled TRY_CANCEL activity is let go at once. A
-        child, or anything awaiting a WAIT_CANCELLATION_COMPLETED call, would
+        A child, or anything awaiting a WAIT_CANCELLATION_COMPLETED call, would
         run on regardless — those stop through _checkpoint and signals instead.
         """
-        await workflow.wait_condition(lambda: task.done() or self._abort is not None)
-        if self._abort is None:
-            return task.result()
-        if not task.done():
-            task.cancel()
-            try:
-                await task
-            except (asyncio.CancelledError, ActivityError):
-                pass
-        raise _AbortRequested()
+        await until_done(watch, lambda: self._abort is not None)
+        if self._abort is not None:
+            raise _AbortRequested()
+        return watch.result()
 
     async def _continue_as_new(self) -> None:
         await workflow.wait_condition(workflow.all_handlers_finished)
@@ -1594,6 +1622,10 @@ class UpgradeClusterWorkflow:
         assert self._context is not None, "planning sets the context before any step"
         return self._context
 
+    def _hc_request(self) -> HostedClusterRequest:
+        """The request that names the HostedCluster on the MCE: the day1 file's cluster, by its own name."""
+        return HostedClusterRequest(mce_cluster=self._mce, cluster=self._cluster, **self._on_hc())
+
     def _on_hc(self) -> dict[str, str | None]:
         """The HostedCluster's own name and namespace, for every request to the MCE limb.
 
@@ -1607,7 +1639,7 @@ class UpgradeClusterWorkflow:
     @property
     def _hc_name(self) -> str:
         """The HostedCluster's metadata.name, as Argo CD lists it among the Application's resources."""
-        return self._hosted or self._cluster
+        return hosted_cluster_name(self._hosted, self._cluster)
 
     @property
     def _hc_label(self) -> str:
@@ -1624,5 +1656,9 @@ class UpgradeClusterWorkflow:
         return f"{plan.control_plane} → {plan.target} in {len(plan.steps)} steps ({steps})"
 
     def _log(self, event: str, by: str | None = None, detail: str = "") -> None:
+        """One milestone: into the run's log (progress, result), and the worker's (not on replay)."""
         self._log_entries.append(UpgradeLogEntry(at=workflow.now(), event=event, by=by, detail=detail))
         del self._log_entries[:-_LOG_LIMIT]
+        workflow.logger.info(
+            "upgrade-cluster %s: %s%s%s", self._cluster, event, f" by {by}" if by else "", f": {detail}" if detail else ""
+        )

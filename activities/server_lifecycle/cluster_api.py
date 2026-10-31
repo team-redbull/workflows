@@ -388,6 +388,50 @@ async def delete_custom_object(
     return await asyncio.to_thread(_delete)
 
 
+async def delete_custom_object_exactly(
+    *,
+    group: str,
+    version: str,
+    plural: str,
+    kind: str,
+    namespace: str,
+    name: str,
+    uid: str,
+    resource_version: str,
+) -> bool:
+    """Delete ONE version of one custom resource: the object read, not whatever has the name now.
+
+    Preconditions on both the UID and the resourceVersion, so a delete that
+    follows a comparison removes exactly what was compared — an object edited
+    or recreated in between answers 409, which is raised as the TRANSIENT
+    BmhResourceError: the activity's retry reads it again and decides again.
+    False when it is already gone.
+    """
+
+    def _delete() -> bool:
+        _load_kube()
+        options = k8s_client.V1DeleteOptions(
+            preconditions=k8s_client.V1Preconditions(uid=uid, resource_version=resource_version)
+        )
+        try:
+            k8s_client.CustomObjectsApi().delete_namespaced_custom_object(
+                group=group, version=version, namespace=namespace, plural=plural, name=name,
+                body=options,
+            )
+        except k8s_client.ApiException as exc:
+            if exc.status == _NOT_FOUND:
+                return False
+            if exc.status == _CONFLICT:
+                raise BmhResourceError(
+                    f"{kind} {namespace}/{name} changed between its read and its delete "
+                    f"({_detail(exc)}); it is read and compared again"
+                ) from None
+            raise _classify(exc, "delete", kind, name) from exc
+        return True
+
+    return await asyncio.to_thread(_delete)
+
+
 async def clear_custom_object_finalizers(
     *,
     group: str,

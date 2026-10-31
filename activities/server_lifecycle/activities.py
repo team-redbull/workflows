@@ -70,6 +70,7 @@ from activities.server_lifecycle.bmh_resources import (
     infraenv_image_wait_reason,
     infraenv_ipxe_script_url,
     nmstate_config_differences,
+    server_in_use_signs,
 )
 from activities.server_lifecycle.server_scan import fetch_available_servers
 from shared.bmc_address import k8s_resource_name, nmstate_config_name
@@ -77,11 +78,13 @@ from shared.exceptions import (
     AgentBindingChangedError,
     AgentBoundToClusterError,
     BmcCredentialsMissingError,
+    BmhResourceError,
     BmhTeardownError,
     HostedClusterAccessError,
     InfraEnvNotFoundError,
     InfraEnvNotReadyError,
     PxeSiteNotConfiguredError,
+    ServerLooksInstalledError,
 )
 from shared.models.server_lifecycle import (
     AcquiredServer,
@@ -125,6 +128,8 @@ from shared.models.server_lifecycle import (
     MachineHookRelease,
     MachineRef,
     MachineState,
+    NmStateConfigReplacement,
+    NmStateConfigReplaceRequest,
     PxeBootRegistration,
     PxeBootRequest,
     PxeHostEntriesRef,
@@ -706,6 +711,106 @@ async def create_nmstate_config(request: BmhResourceRequest) -> CreatedResource:
             differences=nmstate_config_differences,
         )
     )
+
+
+@activity.defn
+async def replace_conflicting_nmstate_config(
+    request: NmStateConfigReplaceRequest,
+) -> NmStateConfigReplacement:
+    """Replace the server's NMStateConfig when it differs — only once nothing shows the server in use.
+
+    The contract, and why the order is what it is, is in
+    shared/interfaces/server_lifecycle.py.
+    """
+    resource = request.resource
+    namespace = resource.namespace
+    desired = build_nmstate_config(resource)
+    name = desired["metadata"]["name"]
+    existing = await _read(NMSTATE_GROUP, NMSTATE_VERSION, NMSTATE_PLURAL, _NMSTATE_KIND, namespace, name)
+    if existing is None:
+        return NmStateConfigReplacement(found=False)
+    differences = nmstate_config_differences(desired, existing)
+    if not differences:
+        return NmStateConfigReplacement(found=True)
+
+    # 1. Is the server in use? Every MAC it is known by: the ones server-scan
+    #    handed out, the ones it holds for the name (NPAR partitions included),
+    #    and the ones the existing NMStateConfig names.
+    bmh_name = k8s_resource_name(resource.server_name)
+    scan_macs = await server_scan.server_macs_by_name(
+        _settings.server_scan_url, _settings.server_scan_api_token, resource.server_name
+    )
+    macs = sorted(
+        {mac.lower() for mac in [*request.server_macs, *(m.mac for m in resource.bond_members), *scan_macs]}
+        | set(host_macs(None, existing))
+    )
+    own = await _read(BMH_GROUP, BMH_VERSION, BMH_PLURAL, _BMH_KIND, namespace, bmh_name)
+    # One named after the server already decides it; only without one are the
+    # rest listed for a boot MAC (the `list` verb on baremetalhosts).
+    bmhs = (
+        [own]
+        if own is not None
+        else await cluster_api.list_custom_objects(
+            group=BMH_GROUP, version=BMH_VERSION, plural=BMH_PLURAL, kind=_BMH_KIND,
+            namespace=namespace,
+        )
+    )
+    signs = server_in_use_signs(bmh_name, macs, bmhs, await _list_agents(namespace))
+    if signs:
+        raise ServerLooksInstalledError(
+            f"NMStateConfig {namespace}/{name} differs from this install of "
+            f"{resource.server_name} ({'; '.join(differences)}), and the server looks "
+            f"installed or in progress: {'; '.join(signs)}. Nothing was changed — "
+            "uninstall it first, or reconcile the NMStateConfig by hand"
+        )
+
+    # 2. Replace EXACTLY the object compared, then create it from this install
+    #    and read it back. Delete-and-create rather than an update: the limb
+    #    holds no update verb, and a NEW creationTimestamp is what an IPMI
+    #    blade's boot-entry publish waits for the discovery image to postdate.
+    metadata = existing.get("metadata") or {}
+    activity.logger.warning(
+        "nmstateconfig-replacing %s/%s: no BareMetalHost or Agent shows %s in use "
+        "(MACs %s); it differs: %s",
+        namespace,
+        name,
+        resource.server_name,
+        macs,
+        "; ".join(differences),
+    )
+    await cluster_api.delete_custom_object_exactly(
+        group=NMSTATE_GROUP,
+        version=NMSTATE_VERSION,
+        plural=NMSTATE_PLURAL,
+        kind=_NMSTATE_KIND,
+        namespace=namespace,
+        name=name,
+        uid=metadata.get("uid"),
+        resource_version=metadata.get("resourceVersion"),
+    )
+    await cluster_api.create_custom_object_if_absent(
+        group=NMSTATE_GROUP,
+        version=NMSTATE_VERSION,
+        plural=NMSTATE_PLURAL,
+        kind=_NMSTATE_KIND,
+        namespace=namespace,
+        body=desired,
+        differences=nmstate_config_differences,
+    )
+    written = await _read(NMSTATE_GROUP, NMSTATE_VERSION, NMSTATE_PLURAL, _NMSTATE_KIND, namespace, name)
+    if written is None or nmstate_config_differences(desired, written):
+        raise BmhResourceError(
+            f"NMStateConfig {namespace}/{name} did not read back as written after its "
+            "replacement; it is read and compared again"
+        )
+    activity.logger.warning(
+        "nmstateconfig-replaced %s/%s for %s: %s",
+        namespace,
+        name,
+        resource.server_name,
+        "; ".join(differences),
+    )
+    return NmStateConfigReplacement(found=True, replaced=True, differences=differences)
 
 
 @activity.defn

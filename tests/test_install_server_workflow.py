@@ -30,6 +30,7 @@ from shared.consts import (
 )
 from shared.exceptions import (
     InfraEnvNotFoundError,
+    ServerLooksInstalledError,
     InventorySegmentNotFoundError,
     PxeMapAuthError,
     PxeSiteNotConfiguredError,
@@ -56,6 +57,8 @@ from shared.models.server_lifecycle import (
     InstallServerInput,
     InstallServerRunArgs,
     LinkState,
+    NmStateConfigReplacement,
+    NmStateConfigReplaceRequest,
     PxeBootRegistration,
     PxeBootRequest,
     PxeMapRef,
@@ -204,6 +207,8 @@ def make_mock_activities(
     boot_superseded: bool = False,
     nmstate_error: Exception | None = None,
     record: InstallCandidateRecord | None = None,
+    nmstate_differs: dict[str, list[str]] | None = None,
+    in_use: dict[str, str] | None = None,
 ):
     """Build the full mock activity set + a call recorder.
 
@@ -235,6 +240,11 @@ def make_mock_activities(
     `record` is what `lookup_install_candidate` reads from server-scan for a
     named server `/servers/available` refused; None = server-scan does not
     know the name.
+
+    `replace_conflicting_nmstate_config` answers per server: `nmstate_differs`
+    names servers whose existing NMStateConfig differs (and is replaced, with
+    those differences), `in_use` servers a BareMetalHost or Agent shows in use
+    (refused with that sign). Anyone else has no NMStateConfig yet.
     """
     calls: dict[str, list] = {
         name: []
@@ -254,6 +264,7 @@ def make_mock_activities(
             "publish_infra_env_boot",
             "check_infra_env",
             "lookup_install_candidate",
+            "replace_conflicting_nmstate_config",
             # Activity names in call order, for the ones whose ORDER matters.
             "order",
         )
@@ -292,6 +303,25 @@ def make_mock_activities(
         calls["lookup_install_candidate"].append(request)
         calls["order"].append("lookup_install_candidate")
         return record if record is not None else InstallCandidateRecord()
+
+    @activity.defn
+    async def replace_conflicting_nmstate_config(
+        request: NmStateConfigReplaceRequest,
+    ) -> NmStateConfigReplacement:
+        calls["replace_conflicting_nmstate_config"].append(request)
+        calls["order"].append("replace_conflicting_nmstate_config")
+        server = request.resource.server_name
+        if server in (in_use or {}):
+            raise ServerLooksInstalledError(
+                f"NMStateConfig nmstate-config-{server} differs from this install, and the "
+                f"server looks installed or in progress: {(in_use or {})[server]}. Nothing "
+                "was changed"
+            )
+        if server in (nmstate_differs or {}):
+            return NmStateConfigReplacement(
+                found=True, replaced=True, differences=(nmstate_differs or {})[server]
+            )
+        return NmStateConfigReplacement(found=False)
 
     def _created(kind: str, name: str) -> CreatedResource:
         return CreatedResource(kind=kind, name=name, changed=not resources_exist)
@@ -480,6 +510,7 @@ def make_mock_activities(
     server_activities = [
         acquire_servers,
         lookup_install_candidate,
+        replace_conflicting_nmstate_config,
         create_bmc_secret,
         create_baremetal_host,
         create_nmstate_config,
@@ -1971,3 +2002,116 @@ class TestAllowUnhealthy:
         # Rolled back and released like any other candidate.
         assert len(calls["teardown_bmh_resources"]) == 1
         assert len(calls["release_server"]) == 1
+
+
+# --- a conflicting NMStateConfig: replaced only when nothing is in use --------
+
+_STALE = ["VLAN id: want ['24'], found ['77']"]
+_IN_USE = "BareMetalHost ocp-x exists (provisioning state 'provisioned')"
+
+
+class TestAConflictingNmStateConfig:
+    """The incident: a healthy server failed on an NMStateConfig already there.
+
+    The run now checks it before anything else is written for the candidate —
+    after the lock, ahead of the PXE map and every create, in BOTH orders — and
+    replaces it when no BareMetalHost or Agent shows the server in use.
+    """
+
+    _NAMED = INPUT.model_copy(update={"server_name": SERVER_NAME})
+
+    async def test_the_incident_now_installs_instead_of_failing(self):
+        calls, segment_acts, server_acts = make_mock_activities(
+            nmstate_differs={SERVER_NAME: _STALE}
+        )
+        async with _Harness(segment_acts, server_acts) as client:
+            result = await _execute(client, InstallServerRunArgs(input=self._NAMED))
+
+        assert result.nmstate_replaced == _STALE
+        assert result.resources_changed is True
+        # Redfish order: checked BEFORE the run creates its own BareMetalHost,
+        # so a BareMetalHost found can only be one that existed before the run.
+        assert calls["order"].index("replace_conflicting_nmstate_config") < calls["order"].index(
+            "create_bmc_secret"
+        ) < calls["order"].index("create_baremetal_host") < calls["order"].index(
+            "create_nmstate_config"
+        )
+
+    async def test_a_replacement_counts_as_a_change_even_over_existing_resources(self):
+        _, segment_acts, server_acts = make_mock_activities(
+            resources_exist=True, nmstate_differs={SERVER_NAME: _STALE}
+        )
+        async with _Harness(segment_acts, server_acts) as client:
+            result = await _execute(client, InstallServerRunArgs(input=self._NAMED))
+        assert result.resources_changed is True
+
+    async def test_an_ipmi_blade_is_checked_before_its_pxe_map_and_its_nmstateconfig(self):
+        blade = ucs_server()
+        calls, segment_acts, server_acts = make_mock_activities(
+            candidates=[blade], nmstate_differs={blade.name: _STALE}
+        )
+        async with _Harness(segment_acts, server_acts) as client:
+            result = await _execute(client, InstallServerRunArgs(input=INPUT))
+
+        assert result.nmstate_replaced == _STALE
+        order = calls["order"]
+        assert order.index("replace_conflicting_nmstate_config") < order.index(
+            "register_pxe_boot"
+        ) < order.index("create_nmstate_config") < order.index("publish_infra_env_boot")
+
+    async def test_the_check_compares_what_the_creates_will_write(self):
+        calls, segment_acts, server_acts = make_mock_activities()
+        async with _Harness(segment_acts, server_acts) as client:
+            result = await _execute(client, InstallServerRunArgs(input=INPUT))
+
+        [check] = calls["replace_conflicting_nmstate_config"]
+        assert check.resource == calls["create_nmstate_config"][0]
+        # Every MAC server-scan handed out, not only the bond members.
+        assert check.server_macs == ["aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:02"]
+        assert result.nmstate_replaced == []
+
+    async def test_a_named_server_in_use_fails_naming_it_and_writes_nothing(self):
+        blade = ucs_server()
+        calls, segment_acts, server_acts = make_mock_activities(
+            candidates=[blade], in_use={blade.name: _IN_USE}
+        )
+        named = INPUT.model_copy(update={"server_name": blade.name})
+        async with _Harness(segment_acts, server_acts) as client:
+            with pytest.raises(WorkflowFailureError) as excinfo:
+                await _execute(client, InstallServerRunArgs(input=named))
+
+        error = _application_error(excinfo.value)
+        assert error.type == "ServerLooksInstalledError"
+        assert _IN_USE in str(error) and "looks installed or in progress" in str(error)
+        # Nothing written for it — not even the PXE map — and its lock given back,
+        # so a re-run after the cleanup is not held off for two hours.
+        for kind in ("register_pxe_boot", "create_nmstate_config", "create_bmc_secret",
+                     "create_baremetal_host", "teardown_bmh_resources"):
+            assert calls[kind] == [], kind
+        assert [r.server_name for r in calls["release_server"]] == [blade.name]
+
+    async def test_a_pool_candidate_in_use_is_skipped_for_the_next(self):
+        busy = bondable_server("srv_busy", name="ocp-busy", mac_prefix="11:22:33:44:55")
+        calls, segment_acts, server_acts = make_mock_activities(
+            candidates=[busy, bondable_server()], in_use={"ocp-busy": _IN_USE}
+        )
+        async with _Harness(segment_acts, server_acts) as client:
+            result = await _execute(client, InstallServerRunArgs(input=INPUT))
+
+        assert result.server_name == SERVER_NAME
+        assert result.attempts == 1
+        assert [r.server_name for r in calls["release_server"]] == ["ocp-busy"]
+        assert [c.server_name for c in calls["create_bmc_secret"]] == [SERVER_NAME]
+
+    async def test_a_pool_all_in_use_fails_with_each_sign(self):
+        busy = bondable_server("srv_busy", name="ocp-busy", mac_prefix="11:22:33:44:55")
+        _, segment_acts, server_acts = make_mock_activities(
+            candidates=[busy], in_use={"ocp-busy": _IN_USE}
+        )
+        async with _Harness(segment_acts, server_acts) as client:
+            with pytest.raises(WorkflowFailureError) as excinfo:
+                await _execute(client, InstallServerRunArgs(input=INPUT))
+
+        message = str(_application_error(excinfo.value))
+        assert "already hold a BareMetalHost" in message
+        assert _IN_USE in message

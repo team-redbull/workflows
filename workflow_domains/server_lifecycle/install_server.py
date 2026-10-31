@@ -32,6 +32,12 @@ Shape of the run:
      reserving-server    — server-scan's install lock on the chosen machine
                            (ADR-0035). A lock another run holds is one more
                            skip reason.
+     checking-nmstateconfig — before anything else is written for it, in both
+                           create orders: an NMStateConfig already under the
+                           server's name that differs from this install is
+                           replaced, unless a BareMetalHost or Agent shows the
+                           server installed or in progress — then nothing is
+                           changed and it is refused.
      registering-pxe-boot — IPMI servers only (a UCS-managed blade). IPMI has
                            no virtual media, so the host PXE-boots and the PXE
                            VM of the inventory segment's SITE must map both
@@ -192,6 +198,7 @@ with workflow.unsafe.imports_passed_through():
         PxeSiteNotConfiguredError,
         SegmentsManagerAuthError,
         ServerNotAvailableError,
+        ServerLooksInstalledError,
         ServerReservedError,
         ServerScanAuthError,
         ServerScanRequestInvalidError,
@@ -211,6 +218,7 @@ with workflow.unsafe.imports_passed_through():
         publish_infra_env_boot,
         register_pxe_boot,
         release_server,
+        replace_conflicting_nmstate_config,
         reserve_server,
         teardown_bmh_resources,
         unregister_pxe_boot,
@@ -232,6 +240,8 @@ with workflow.unsafe.imports_passed_through():
         InfraEnvBootState,
         InfraEnvRef,
         InstallServerRunArgs,
+        NmStateConfigReplacement,
+        NmStateConfigReplaceRequest,
         PxeBootRequest,
         PxeMapRef,
         ReleaseServerRequest,
@@ -288,6 +298,7 @@ _PERMANENT_ACTIVITY_ERRORS: tuple[type[Exception], ...] = (
     InfraEnvNotFoundError,
     PxeMapAuthError,
     PxeMapRequestRejectedError,
+    ServerLooksInstalledError,
 )
 _RETRY_POLICY = RetryPolicy(
     initial_interval=timedelta(seconds=1),
@@ -355,6 +366,11 @@ _PXE_INFRAENV_BOOT_PATCH = "pxe-map-infraenv-boot"
 # link-up NIC server-scan lists — bond member nic1). A run recorded before it
 # mapped both bond MACs, so its rollback must unmap both.
 _PXE_BOOT_MAC_ONLY_PATCH = "pxe-map-boot-mac-only"
+# Gates the NMStateConfig check before a candidate's first write: one that
+# differs from the install is REPLACED once nothing shows the server in use, and
+# the server refused when something does. A run recorded before it met the
+# conflict at create_nmstate_config instead (BmhConflictError).
+_NMSTATE_REPLACE_PATCH = "nmstateconfig-replace-unless-in-use"
 
 # assisted-service regenerates the discovery image within seconds of an
 # NMStateConfig change; ten minutes of no new image means it is not going to
@@ -570,6 +586,7 @@ class InstallServerWorkflow:
         self._pxe_cleanup = False
         self._infra_env_boot = False
         self._pxe_boot_mac_only = False
+        self._nmstate_replace = False
         # The health refusals waived for the server being installed
         # (`allow_unhealthy`), each with what was observed.
         self._allowed_unhealthy: list[WaivedHealthCheck] = []
@@ -605,6 +622,7 @@ class InstallServerWorkflow:
         self._pxe_cleanup = workflow.patched(_PXE_CLEANUP_PATCH)
         self._infra_env_boot = workflow.patched(_PXE_INFRAENV_BOOT_PATCH)
         self._pxe_boot_mac_only = workflow.patched(_PXE_BOOT_MAC_ONLY_PATCH)
+        self._nmstate_replace = workflow.patched(_NMSTATE_REPLACE_PATCH)
         workflow.logger.info(
             "Installing a server into InfraEnv=%s for MCE=%s",
             infra_env,
@@ -708,6 +726,36 @@ class InstallServerWorkflow:
                 if lock is None:
                     continue
 
+            resource_request = BmhResourceRequest(
+                server_name=candidate.name,
+                namespace=namespace,
+                infra_env=infra_env,
+                # Narrowed by the evaluation: an unusable vendor is a rejection
+                # reason, so a candidate that gets here always has one.
+                bmc_vendor=str(candidate.bmc_vendor),
+                bmc=candidate.bmc,
+                bond_members=bond_members,
+                vlan_id=segment.vlan_id,
+                labels=install_input.labels,
+                allowed_unhealthy=self._allowed_unhealthy,
+            )
+
+            # An NMStateConfig already under the server's name that differs from
+            # this install is REPLACED — but only once nothing shows the server
+            # in use. Checked here, after the lock and BEFORE anything else is
+            # written for the candidate (the PXE map, a create) in BOTH create
+            # orders, so "a BareMetalHost that existed before this run" is just
+            # "a BareMetalHost now": a Redfish run has not created its own yet.
+            nmstate_replaced: list[str] = []
+            if self._nmstate_replace:
+                self._phase = "checking-nmstateconfig"
+                replacement = await self._replace_conflicting_nmstate(
+                    candidate, resource_request, install_input, activity_queue, rejections
+                )
+                if replacement is None:
+                    continue
+                nmstate_replaced = replacement.differences
+
             # An IPMI BMC has no virtual media: the host boots from the network,
             # so its site's PXE VM must know what to hand its MACs BEFORE the
             # BareMetalHost exists — Ironic may power it on as soon as it
@@ -736,19 +784,6 @@ class InstallServerWorkflow:
 
             attempts += 1
             self._server_name = candidate.name
-            resource_request = BmhResourceRequest(
-                server_name=candidate.name,
-                namespace=namespace,
-                infra_env=infra_env,
-                # Narrowed by the evaluation: an unusable vendor is a rejection
-                # reason, so a candidate that gets here always has one.
-                bmc_vendor=str(candidate.bmc_vendor),
-                bmc=candidate.bmc,
-                bond_members=bond_members,
-                vlan_id=segment.vlan_id,
-                labels=install_input.labels,
-                allowed_unhealthy=self._allowed_unhealthy,
-            )
             bmh_ref = BmhRef(server_name=candidate.name, namespace=namespace)
 
             # Step 3b — an IPMI host boots whatever its site's PXE VM hands it,
@@ -874,9 +909,8 @@ class InstallServerWorkflow:
                     ),
                     bond_macs=[member.mac for member in bond_members],
                     boot_mac=bond_members[0].mac,
-                    resources_changed=any(
-                        resource.changed for resource in (secret, bmh, nmstate)
-                    ),
+                    resources_changed=bool(nmstate_replaced)
+                    or any(resource.changed for resource in (secret, bmh, nmstate)),
                     # An Agent cannot exist unless Ironic registered the host
                     # and drove it through a boot, so this is implied rather
                     # than separately observed.
@@ -886,6 +920,7 @@ class InstallServerWorkflow:
                     reservation_expires_at=reservation_expires_at,
                     pxe_registered=pxe_registered,
                     allowed_unhealthy=self._allowed_unhealthy,
+                    nmstate_replaced=nmstate_replaced,
                 )
 
             # No Agent. Take the machine back out of this MCE before trying
@@ -1132,6 +1167,59 @@ class InstallServerWorkflow:
             else:
                 rejections.append(("gone", candidate.name))
             return None
+
+    async def _replace_conflicting_nmstate(
+        self,
+        candidate: AcquiredServer,
+        resource_request: BmhResourceRequest,
+        install_input: InstallServerInput,
+        task_queue: str,
+        rejections: list[tuple[str, str]],
+    ) -> NmStateConfigReplacement | None:
+        """Replace a differing NMStateConfig unless the server is in use, or None with a skip recorded.
+
+        replace_conflicting_nmstate_config refuses (ServerLooksInstalledError,
+        nothing changed) when a BareMetalHost or Agent shows the machine
+        installed or in progress. Nothing has been written for the candidate
+        yet, so its lock goes straight back either way. A NAMED server then
+        fails the run with that error — it was asked for by name, and the
+        message says what was found. A pool candidate is a SKIP, like every
+        reason a candidate is unusable, under `already-installed`.
+        """
+        try:
+            replacement = await workflow.execute_activity(
+                replace_conflicting_nmstate_config,
+                NmStateConfigReplaceRequest(
+                    resource=resource_request,
+                    server_macs=[i.mac for i in candidate.interfaces if i.mac is not None],
+                ),
+                task_queue=task_queue,
+                start_to_close_timeout=_ACTIVITY_TIMEOUT,
+                schedule_to_start_timeout=_SCHEDULE_TO_START_TIMEOUT,
+                retry_policy=_RETRY_POLICY,
+            )
+        except ActivityError as err:
+            cause = err.cause
+            if not (
+                isinstance(cause, ApplicationError)
+                and cause.type == ServerLooksInstalledError.__name__
+            ):
+                raise
+            workflow.logger.warning("%s looks installed or in progress: %s", candidate.name, cause.message)
+            if self._reserving:
+                self._phase = "releasing-server"
+                await self._release(candidate, task_queue)
+            if install_input.server_name:
+                raise
+            rejections.append(("already-installed", f"{candidate.name} ({cause.message})"))
+            return None
+        if replacement.replaced:
+            workflow.logger.warning(
+                "nmstateconfig-replaced for %s (no BareMetalHost or Agent in use): %s",
+                candidate.name,
+                "; ".join(replacement.differences),
+            )
+        return replacement
 
     def _pxe_macs(self, bond_members: list[BondMember]) -> list[str]:
         """The MACs an IPMI host gets on its site's PXE VM.

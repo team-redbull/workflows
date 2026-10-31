@@ -41,7 +41,11 @@ from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.worker import Replayer
 
 from shared.consts import INSTALL_SERVER_WORKFLOW_QUEUE
-from shared.exceptions import BmhConflictError, ServerNotAvailableError
+from shared.exceptions import (
+    BmhConflictError,
+    ServerLooksInstalledError,
+    ServerNotAvailableError,
+)
 from shared.models.server_lifecycle import InstallServerInput, InstallServerRunArgs
 from tests.test_install_server_workflow import (
     INPUT,
@@ -121,6 +125,19 @@ SCENARIOS: dict[str, Callable[[], Scenario]] = {
     "allow-unhealthy-one-nic": lambda: Scenario(
         mocks={"acquire_error": _refused(), "record": scan_record(one_nic_up_server())},
         input=_unhealthy(),
+    ),
+    # A stale NMStateConfig of the server's name, nothing in use: replaced
+    # before the first create, and the install goes on.
+    "nmstate-replaced": lambda: Scenario(
+        mocks={"nmstate_differs": {SERVER_NAME: ["VLAN id: want ['24'], found ['77']"]}},
+        input=_named(SERVER_NAME),
+    ),
+    # ... and the same with a BareMetalHost of it already there: refused, the
+    # lock given back, nothing written.
+    "nmstate-in-use": lambda: Scenario(
+        mocks={"in_use": {SERVER_NAME: f"BareMetalHost {SERVER_NAME.lower()} exists"}},
+        input=_named(SERVER_NAME),
+        fails_with=ServerLooksInstalledError.__name__,
     ),
     # Skips before the install: no bond, another run's lock, then the next.
     "skips-then-install": lambda: Scenario(

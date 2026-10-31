@@ -362,6 +362,19 @@ class BmhConflictError(OrchestratorError):
     """
 
 
+class ServerLooksInstalledError(OrchestratorError):
+    """The server's NMStateConfig differs from this install, and the server looks installed or in progress.
+
+    install-server REPLACES a conflicting NMStateConfig only once nothing shows
+    the machine in use: no BareMetalHost named after it, none booting from one
+    of its MACs, no Agent (bound or not) reporting one. Any of those is what
+    the existing NMStateConfig may belong to — a host this or an earlier run
+    created, or one an operator is installing by hand — so nothing is changed
+    and the run (or, in a pool draw, the candidate) stops here; the message
+    names what was found and what differed. Deterministic — non-retryable.
+    """
+
+
 class BmhPrerequisiteMissingError(OrchestratorError):
     """The target cluster cannot accept the write at all (404 or 403).
 

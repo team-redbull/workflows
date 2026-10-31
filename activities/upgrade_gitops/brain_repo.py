@@ -235,7 +235,10 @@ async def write_incident(
                 ["-c", f"user.name={author.name}", "-c", f"user.email={author.email}", "commit", "-m", subject],
                 cwd=clone, secrets=secrets,
             )
-            code, _, stderr = await git_repo.exec_git(["push", "origin", f"HEAD:{BRANCH}"], cwd=clone, secrets=secrets)
+            # To the token URL, never `origin`: the clone's config holds no token.
+            code, _, stderr = await git_repo.exec_git(
+                ["push", git_repo.authenticated_url(repo_url, token), f"HEAD:{BRANCH}"], cwd=clone, secrets=secrets
+            )
             if code == 0:
                 return IncidentRecord(path=relative)
             if attempt == PUSH_ATTEMPTS:

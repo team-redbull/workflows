@@ -9,7 +9,9 @@ same approach as tests/test_values_repo.py.
 
 from __future__ import annotations
 
+import shlex
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -23,6 +25,7 @@ from shared.exceptions import (
     UpgradeRulesInvalidError,
 )
 from shared.models.cluster_upgrade import ClusterProfile, Day1ChangeKind, Day1ChangeRequest
+from tests.test_git_repo import SECRET, files_holding, serve_over_https
 
 MCE = "ocp4-mce-a"
 SITE = "site1"
@@ -504,6 +507,33 @@ class TestControlPlaneCommits:
         assert raced and commit.changed
         log = _git("log", "--format=%s", "-2", "main", cwd=origin).splitlines()
         assert log[0].startswith(f"upgrade({PROD})") and log[1] == "a person's edit"
+
+
+    async def test_day1_code_run_in_the_clone_finds_no_token_and_the_push_still_lands(
+        self, origin, tmp_path, monkeypatch
+    ):
+        """The day1 validator is day1's code: no file of the clone it runs in may hold the token."""
+        serve_over_https(tmp_path, monkeypatch)
+        hunter = tmp_path / "hunter.py"
+        hunter.write_text(TOKEN_HUNTER)
+        request = _request(Day1ChangeKind.CONTROL_PLANE, version="4.19.53", expected_blob=_blob(origin, PROD_PATH))
+        commit = await day1_repo.commit_change(
+            repo_url="https://git.test/day1.git", token=SECRET, request=request,
+            validate_command=f"{shlex.quote(sys.executable)} {shlex.quote(str(hunter))} {SECRET}", author=AUTHOR,
+        )
+        assert commit.changed and commit.revision == _git("rev-parse", "main", cwd=origin).strip()
+        assert files_holding(origin, SECRET) == []
+
+
+# Stands in for day1 code that goes looking for a credential: it fails when any
+# file of the clone it runs in (`.git/` included) holds the token.
+TOKEN_HUNTER = """\
+import pathlib, sys
+secret = sys.argv[1].encode()
+found = [str(p) for p in pathlib.Path(".").rglob("*") if p.is_file() and secret in p.read_bytes()]
+print(f"the token is in {found}" if found else "no token in the clone")
+sys.exit(1 if found else 0)
+"""
 
 
 class TestNodePoolCommits:

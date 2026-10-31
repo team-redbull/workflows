@@ -21,6 +21,18 @@ incidents. It calls no Kubernetes API: no RBAC, and its ServiceAccount mounts no
 The image carries git and `oc` (from `quay.io/openshift/origin-cli:4.20`); it runs as any
 non-root UID with a read-only root filesystem, everything it writes on the `/tmp` emptyDir.
 
+## Repo code runs with this pod's credentials
+
+The worker runs two repos' own scripts inside their clones: day1's
+`scripts/validate_upgrade_rules.py` and `day1.validateCommand`, and Brain's `scripts/brain.py
+validate` / `index`. They get no `*_TOKEN` variable, and no file of the clone holds a token
+(`origin` is rewritten to the plain URL right after the clone; pushes name the token URL in
+memory). That stops them being handed a credential, not taking one: they run as this pod's UID,
+so they can read `/proc/1/environ` (every token of the worker) and the mounted registry auth
+file. This cannot be closed inside the pod. **day1's and Brain's validator scripts run with this
+pod's credentials; moving them to a separate Job is the fix.** Until then, whoever can merge to
+day1's or Brain's `main` can read this worker's tokens.
+
 ## Install (the sandbox hub)
 
 The chart creates no Secret. With the cluster's pull secret copied into the namespace as

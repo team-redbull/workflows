@@ -17,6 +17,11 @@ Rules this module enforces (CLAUDE.md §5, "Git-subprocess activities"):
     (https://x-access-token:<token>@...) and NEVER logged: every command echo
     and every error message passes through redact() BEFORE an exception is
     constructed — a git error lands verbatim in Temporal history and the UI.
+  * No file of a clone holds the token: clone() points `origin` back at the
+    plain URL the moment the clone exists, and a push goes to the token URL
+    built in memory again (authenticated_url), never to `origin`. The hub
+    limb runs day1's and Brain's own scripts inside their clones, and those
+    scripts must not find a credential in `.git/config`.
   * Every command runs under GIT_COMMAND_TIMEOUT_SECONDS, below the git
     activities' 180s start_to_close_timeout.
   * A clone first checks its branch with `git ls-remote --exit-code --heads`
@@ -150,7 +155,10 @@ async def clone(
     """Shallow single-branch clone of a checked branch — retries always start from a clean tree.
 
     The branch is checked FIRST (require_branch), so a missing one fails as
-    ValuesBranchNotFoundError and the clone never sees an unchecked branch."""
+    ValuesBranchNotFoundError and the clone never sees an unchecked branch.
+    Then `origin` is set back to the plain URL: git stores the URL a clone was
+    given in `.git/config`, and a repo's own script run in the clone afterwards
+    must not read the token there. A push names authenticated_url() itself."""
     await require_branch(
         repo_url=repo_url, branch=branch, token=token, missing_message=missing_message
     )
@@ -168,3 +176,4 @@ async def clone(
         cwd=None,
         secrets=[token],
     )
+    await run_git(["remote", "set-url", "origin", repo_url], cwd=dest, secrets=[token])

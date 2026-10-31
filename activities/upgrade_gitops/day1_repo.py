@@ -68,7 +68,14 @@ async def run_command(argv: list[str], *, cwd: Path, secrets: list[str], timeout
     """Run a repo's own script in its clone; (exit code, its output's tail, scrubbed).
 
     No shell. The child gets no `*_TOKEN` variable from this worker's
-    environment: it is the repo's code, and has no business with them.
+    environment, and no file of the clone holds a token (git_repo.clone): it
+    is the repo's code, and has no business with them. What this does NOT
+    close: the script runs as this pod's UID, so it can still read
+    /proc/1/environ — the worker's own environment, every token in it — and
+    the mounted registry auth file. That cannot be fixed inside this pod:
+    day1's and Brain's validator scripts run with this pod's credentials, and
+    moving them to a separate Job (no Secret mounted, the clone handed over as
+    data) is the fix.
     """
     env = {key: value for key, value in os.environ.items() if not key.upper().endswith("_TOKEN")}
     try:
@@ -227,7 +234,10 @@ async def commit_change(
                  "commit", "-m", commit_message(request, edit.summary)],
                 cwd=clone, secrets=secrets,
             )
-            code, _, stderr = await git_repo.exec_git(["push", "origin", f"HEAD:{BRANCH}"], cwd=clone, secrets=secrets)
+            # To the token URL, never `origin`: the clone's config holds no token.
+            code, _, stderr = await git_repo.exec_git(
+                ["push", git_repo.authenticated_url(repo_url, token), f"HEAD:{BRANCH}"], cwd=clone, secrets=secrets
+            )
             if code == 0:
                 return Day1Commit(
                     revision=await head(clone, token=token),

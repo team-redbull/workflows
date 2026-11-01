@@ -112,7 +112,7 @@ def _raise_for_status(resp: httpx.Response, request: AcquireServerRequest) -> No
     if resp.status_code in (401, 403):
         raise ServerScanAuthError(
             f"server-scan rejected our credentials ({resp.status_code}): check "
-            "SERVER_SCAN_API_TOKEN (install-server needs the ADMIN role, for its install lock)"
+            "SERVER_SCAN_API_TOKEN (add-server-to-mce needs the ADMIN role, for its install lock)"
         )
     if resp.status_code == 404:
         raise ServerNotAvailableError(
@@ -314,8 +314,8 @@ async def server_membership_by_name(
     The same two steps as server_macs_by_name — search narrows, the detail
     confirms the name exactly — but here two documents of one name are an
     ERROR, not a union: the answer is one machine's membership and its
-    `srv_…` id, which the install lock is then taken on (uninstall-server) or
-    released from (remove-server). The lock is judged live at read time.
+    `srv_…` id, which the install lock is then taken on (uninstall-server-from-hc) or
+    released from (remove-server-from-mce). The lock is judged live at read time.
     """
     detail = await _detail_by_exact_name(base_url, token, server_name, "to look up")
     if detail is None:
@@ -332,7 +332,7 @@ def bmc_vendor_for(vendor: str | None, source_provider: str | None) -> str | Non
     a server's DETAIL document carries only `identity.vendor` and the collector:
     a Cisco is CISCO (UCS, driven over IPMI) unless Intersight collected it, a
     Dell DELL, an HP HP, and a STANDALONE machine None — its driver is the
-    caller's decision, which install-server refuses to guess.
+    caller's decision, which add-server-to-mce refuses to guess.
     """
     normalized = (vendor or "").lower()
     if normalized == "cisco":
@@ -410,10 +410,10 @@ _HEALTH_KEYS = ("overall", "cpu", "memory", "storage", "network", "connectivity"
 async def install_candidate_by_name(
     base_url: str, token: str, server_name: str, *, now: datetime | None = None
 ) -> InstallCandidateRecord:
-    """Everything server-scan STORES about one named server — what install-server
+    """Everything server-scan STORES about one named server — what add-server-to-mce
     reads once `/servers/available` has refused it, to learn why.
 
-    The same exact-name read as uninstall-server's, never `/servers/available`,
+    The same exact-name read as uninstall-server-from-hc's, never `/servers/available`,
     which is the thing that refused. Nothing is decided here: the workflow
     tells a safety refusal (a cluster's claim, maintenance, another run's lock)
     from the server's own health, which a request may waive.

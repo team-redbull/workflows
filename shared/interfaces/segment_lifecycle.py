@@ -141,7 +141,7 @@ async def get_inventory_segment(mce_cluster: str) -> SegmentEntry:
 
     Lives in THIS domain, not server-lifecycle, because it reads the Segments
     Manager — whose base URL and token already sit on the segment-lifecycle
-    limb. install-server calls it across domains with
+    limb. add-server-to-mce calls it across domains with
     task_queue=SEGMENT_LIFECYCLE_ACTIVITY_QUEUE rather than a second
     deployment holding a copy of that credential.
 

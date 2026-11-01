@@ -1,26 +1,31 @@
-"""Replay: every history remove-server records must replay on the current code.
+"""Replay: every history remove-server-from-mce records must replay on the current code.
 
-remove-server runs in flight whenever a brain is deployed — a power-off and the
-final check take minutes, and as uninstall-server's child it starts hours
+remove-server-from-mce runs in flight whenever a brain is deployed — a power-off and the
+final check take minutes, and as uninstall-server-from-hc's child it starts hours
 after its parent — so a change to the commands a recorded run issued fails
 that run on its next replay with a non-determinism error. The cure is
-`workflow.patched()`. Two sources of histories catch it, as for install-server
-(tests/test_install_server_replay.py, whose recorder this follows):
+`workflow.patched()`. Two sources of histories catch it, as for add-server-to-mce
+(tests/test_add_server_to_mce_replay.py, whose recorder this follows):
 
   1. histories recorded HERE, from scenarios on the mock limbs of
-     tests/test_remove_server_workflow.py, replayed at once;
-  2. GOLDEN histories in tests/histories/remove_server/, recorded by earlier
+     tests/test_remove_server_from_mce_workflow.py, replayed at once;
+  2. GOLDEN histories in tests/histories/remove_server_from_mce/, recorded by earlier
      code and committed. When one fails, the change needs `workflow.patched()`
      — do NOT re-record. Recording writes ONLY the scenarios with no golden
      file yet:
 
-         UPDATE_REPLAY_HISTORIES=1 .venv/bin/pytest tests/test_remove_server_replay.py
+         UPDATE_REPLAY_HISTORIES=1 .venv/bin/pytest tests/test_remove_server_from_mce_replay.py
 
 The first five goldens were recorded on the workflow as it stood before it
 released server-scan's install lock (2026-10-31), so
 `remove-server-release-own-mce-lock` is proven against the shape production
 runs have; the lock scenarios were recorded with it, so the next change is
 proven against those too.
+
+The workflow was remove-server until 2026-11-01. Those goldens stay in
+tests/histories/remove_server/ (LEGACY_GOLDEN), as runs of type
+`RemoveServerWorkflow`, replayed by the legacy subclass; the goldens recorded
+since, under the new type, are in tests/histories/remove_server_from_mce/.
 """
 
 from __future__ import annotations
@@ -38,16 +43,16 @@ from temporalio.client import WorkflowFailureError, WorkflowHistory
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.worker import Replayer
 
-from shared.consts import REMOVE_SERVER_WORKFLOW_QUEUE
+from shared.consts import REMOVE_SERVER_FROM_MCE_WORKFLOW_QUEUE
 from shared.exceptions import PxeMapAuthError
 from shared.models.server_lifecycle import (
     InventoryHostState,
-    RemoveServerInput,
-    RemoveServerRunArgs,
+    RemoveServerFromMceInput,
+    RemoveServerFromMceRunArgs,
     ServerLockRecord,
 )
-from tests.test_install_server_replay import _scrubbed
-from tests.test_remove_server_workflow import (
+from tests.test_add_server_to_mce_replay import _scrubbed
+from tests.test_remove_server_from_mce_workflow import (
     AGENT_ONLY,
     INPUT,
     INSTALL_LOCK,
@@ -57,9 +62,14 @@ from tests.test_remove_server_workflow import (
     _Harness,
     make_mocks,
 )
-from workflow_domains.server_lifecycle.remove_server import RemoveServerWorkflow
+from workflow_domains.server_lifecycle.remove_server_from_mce import (
+    RemoveServerFromMceWorkflow,
+    RemoveServerWorkflow,
+)
 
-GOLDEN = pathlib.Path(__file__).parent / "histories" / "remove_server"
+GOLDEN = pathlib.Path(__file__).parent / "histories" / "remove_server_from_mce"
+# Recorded as remove-server, before the rename: never re-recorded, only replayed.
+LEGACY_GOLDEN = pathlib.Path(__file__).parent / "histories" / "remove_server"
 _RECORD = os.environ.get("UPDATE_REPLAY_HISTORIES") == "1"
 
 
@@ -68,7 +78,7 @@ class Scenario:
     """One run: the mock limbs' behaviour, the input, and how it must end."""
 
     mocks: dict[str, Any] = field(default_factory=dict)
-    input: RemoveServerInput = field(default_factory=lambda: INPUT)
+    input: RemoveServerFromMceInput = field(default_factory=lambda: INPUT)
     # The ApplicationError type the run fails with; None = it completes.
     fails_with: str | None = None
 
@@ -89,16 +99,16 @@ SCENARIOS: dict[str, Callable[[], Scenario]] = {
         mocks={"state": AGENT_ONLY, "after": InventoryHostState(bmh_found=True)},
         fails_with="ServerStillPresentError",
     ),
-    # Since 2026-10-31: install-server's lock for THIS MCE released after the check ...
+    # Since 2026-10-31: add-server-to-mce's lock for THIS MCE released after the check ...
     "releases-install-lock": lambda: Scenario(mocks={"state": WITH_MACS, "lock": INSTALL_LOCK}),
     # ... another MCE's left alone ...
     "another-mces-lock": lambda: Scenario(
         mocks={"lock": INSTALL_LOCK.model_copy(update={"mce_cluster": "ocp4-mce-other"})}
     ),
-    # ... uninstall-server's (this run as its child) left to the parent ...
+    # ... uninstall-server-from-hc's (this run as its child) left to the parent ...
     "parents-lock-left": lambda: Scenario(
-        mocks={"lock": ServerLockRecord(live=True, holder="uninstall-server",
-                                        workflow_id="uninstall-server-x", mce_cluster=MCE)}
+        mocks={"lock": ServerLockRecord(live=True, holder="uninstall-server-from-hc",
+                                        workflow_id="uninstall-server-from-hc-x", mce_cluster=MCE)}
     ),
     # ... and nothing read when the PXE cleanup failed.
     "pxe-failed-lock-kept": lambda: Scenario(
@@ -109,7 +119,11 @@ SCENARIOS: dict[str, Callable[[], Scenario]] = {
 
 
 def _replayer() -> Replayer:
-    return Replayer(workflows=[RemoveServerWorkflow], data_converter=pydantic_data_converter)
+    # Each history picks its class by the workflow type it recorded.
+    return Replayer(
+        workflows=[RemoveServerFromMceWorkflow, RemoveServerWorkflow],
+        data_converter=pydantic_data_converter,
+    )
 
 
 async def _record(name: str) -> WorkflowHistory:
@@ -117,10 +131,10 @@ async def _record(name: str) -> WorkflowHistory:
     _, acts = make_mocks(**scenario.mocks)
     async with _Harness(acts) as client:
         handle = await client.start_workflow(
-            RemoveServerWorkflow.run,
-            RemoveServerRunArgs(input=scenario.input),
-            id=f"remove-server-replay-{name}",
-            task_queue=REMOVE_SERVER_WORKFLOW_QUEUE,
+            RemoveServerFromMceWorkflow.run,
+            RemoveServerFromMceRunArgs(input=scenario.input),
+            id=f"remove-server-from-mce-replay-{name}",
+            task_queue=REMOVE_SERVER_FROM_MCE_WORKFLOW_QUEUE,
         )
         if scenario.fails_with is None:
             await asyncio.wait_for(handle.result(), timeout=60)
@@ -152,15 +166,15 @@ async def test_every_run_a_scenario_records_replays(scenario):
 
 
 def _golden_files() -> list[pathlib.Path]:
-    return sorted(GOLDEN.glob("*.json"))
+    return sorted([*GOLDEN.glob("*.json"), *LEGACY_GOLDEN.glob("*.json")])
 
 
 def test_there_are_golden_histories():
-    """No committed history protects nothing in flight."""
-    assert _golden_files()
+    """No committed history protects nothing in flight — under either name."""
+    assert sorted(GOLDEN.glob("*.json")) and sorted(LEGACY_GOLDEN.glob("*.json"))
 
 
-@pytest.mark.parametrize("path", _golden_files(), ids=lambda p: p.stem)
+@pytest.mark.parametrize("path", _golden_files(), ids=lambda p: f"{p.parent.name}/{p.stem}")
 async def test_golden_histories_replay_on_the_current_code(path):
     recorded = json.loads(path.read_text())
     history = WorkflowHistory.from_json(recorded["workflow_id"], recorded["history"])

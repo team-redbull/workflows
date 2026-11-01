@@ -23,14 +23,18 @@ from contextlib import AsyncExitStack
 from temporalio.worker import Worker
 
 from shared.consts import (
+    ADD_SERVER_TO_MCE_WORKFLOW_QUEUE,
     ALLOCATE_SEGMENT_WORKFLOW_QUEUE,
     INITIALIZE_SEGMENT_WORKFLOW_QUEUE,
-    INSTALL_SERVER_WORKFLOW_QUEUE,
+    LEGACY_INSTALL_SERVER_WORKFLOW_QUEUE,
+    LEGACY_PUBLISH_INFRAENV_BOOT_WORKFLOW_QUEUE,
+    LEGACY_REMOVE_SERVER_WORKFLOW_QUEUE,
+    LEGACY_UNINSTALL_SERVER_WORKFLOW_QUEUE,
     PROVISION_DELL_SERVER_WORKFLOW_QUEUE,
-    PUBLISH_INFRAENV_BOOT_WORKFLOW_QUEUE,
+    PUBLISH_INFRAENV_TO_PXE_SERVER_WORKFLOW_QUEUE,
     RELEASE_SEGMENT_WORKFLOW_QUEUE,
-    REMOVE_SERVER_WORKFLOW_QUEUE,
-    UNINSTALL_SERVER_WORKFLOW_QUEUE,
+    REMOVE_SERVER_FROM_MCE_WORKFLOW_QUEUE,
+    UNINSTALL_SERVER_FROM_HC_WORKFLOW_QUEUE,
     UPGRADE_CLUSTER_WORKFLOW_QUEUE,
     UPGRADE_CONTROL_PLANE_WORKFLOW_QUEUE,
     UPGRADE_TARGETS_WORKFLOW_QUEUE,
@@ -53,12 +57,22 @@ from workflow_domains.segment_lifecycle.initialize_segment import (
 from workflow_domains.segment_lifecycle.release_segment import (
     ReleaseSegmentWorkflow,
 )
-from workflow_domains.server_lifecycle.install_server import InstallServerWorkflow
-from workflow_domains.server_lifecycle.publish_infraenv_boot import (
-    PublishInfraEnvBootWorkflow,
+from workflow_domains.server_lifecycle.add_server_to_mce import (
+    AddServerToMceWorkflow,
+    InstallServerWorkflow,
 )
-from workflow_domains.server_lifecycle.remove_server import RemoveServerWorkflow
-from workflow_domains.server_lifecycle.uninstall_server import UninstallServerWorkflow
+from workflow_domains.server_lifecycle.publish_infraenv_to_pxe_server import (
+    PublishInfraEnvBootWorkflow,
+    PublishInfraEnvToPxeServerWorkflow,
+)
+from workflow_domains.server_lifecycle.remove_server_from_mce import (
+    RemoveServerFromMceWorkflow,
+    RemoveServerWorkflow,
+)
+from workflow_domains.server_lifecycle.uninstall_server_from_hc import (
+    UninstallServerFromHcWorkflow,
+    UninstallServerWorkflow,
+)
 from workflow_domains.server_provisioning.provision_dell_server import (
     ProvisionDellServerWorkflow,
 )
@@ -70,17 +84,24 @@ _settings = TemporalSettings()
 # shared/consts.py; no new deployment, image or chart. Alphabetical by queue:
 # the order is only the order the Workers start in.
 _WORKER_SPECS: list[tuple[str, list[type]]] = [
+    (ADD_SERVER_TO_MCE_WORKFLOW_QUEUE, [AddServerToMceWorkflow]),
     (ALLOCATE_SEGMENT_WORKFLOW_QUEUE, [AllocateSegmentWorkflow]),
     (INITIALIZE_SEGMENT_WORKFLOW_QUEUE, [InitializeSegmentWorkflow]),
-    (INSTALL_SERVER_WORKFLOW_QUEUE, [InstallServerWorkflow]),
     (PROVISION_DELL_SERVER_WORKFLOW_QUEUE, [ProvisionDellServerWorkflow]),
-    (PUBLISH_INFRAENV_BOOT_WORKFLOW_QUEUE, [PublishInfraEnvBootWorkflow]),
+    (PUBLISH_INFRAENV_TO_PXE_SERVER_WORKFLOW_QUEUE, [PublishInfraEnvToPxeServerWorkflow]),
     (RELEASE_SEGMENT_WORKFLOW_QUEUE, [ReleaseSegmentWorkflow]),
-    (REMOVE_SERVER_WORKFLOW_QUEUE, [RemoveServerWorkflow]),
-    (UNINSTALL_SERVER_WORKFLOW_QUEUE, [UninstallServerWorkflow]),
+    (REMOVE_SERVER_FROM_MCE_WORKFLOW_QUEUE, [RemoveServerFromMceWorkflow]),
+    (UNINSTALL_SERVER_FROM_HC_WORKFLOW_QUEUE, [UninstallServerFromHcWorkflow]),
     (UPGRADE_CLUSTER_WORKFLOW_QUEUE, [UpgradeClusterWorkflow]),
     (UPGRADE_CONTROL_PLANE_WORKFLOW_QUEUE, [UpgradeControlPlaneWorkflow]),
     (UPGRADE_TARGETS_WORKFLOW_QUEUE, [UpgradeTargetsWorkflow]),
+    # The server-lifecycle workflows under their names before 2026-11-01: runs
+    # started then replay only as their old type on their old queue. Each goes
+    # with its class once no run of it is open (see the class).
+    (LEGACY_INSTALL_SERVER_WORKFLOW_QUEUE, [InstallServerWorkflow]),
+    (LEGACY_PUBLISH_INFRAENV_BOOT_WORKFLOW_QUEUE, [PublishInfraEnvBootWorkflow]),
+    (LEGACY_REMOVE_SERVER_WORKFLOW_QUEUE, [RemoveServerWorkflow]),
+    (LEGACY_UNINSTALL_SERVER_WORKFLOW_QUEUE, [UninstallServerWorkflow]),
 ]
 
 

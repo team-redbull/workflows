@@ -47,7 +47,7 @@ _DEFAULT_PATH_BY_VENDOR = {
 _DEFAULT_IPMI_PORT = 623
 
 
-# The vendor vocabulary this module can drive, as ONE definition. install-server
+# The vendor vocabulary this module can drive, as ONE definition. add-server-to-mce
 # gates on it before writing anything, because server-scan reports
 # `bmc_vendor: null` for a STANDALONE machine and guessing IPMI would be
 # silently wrong for a Redfish-only BMC. Exported so that adding a vendor to the

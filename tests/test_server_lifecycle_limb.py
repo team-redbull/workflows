@@ -90,8 +90,8 @@ RESERVATION = f"{SS}/servers/srv_1/reservation"
 RESERVE = ReserveServerRequest(
     server_id="srv_1",
     server_name="ocp-dell-r650-tlv-64c-1024gb-DEL0000485",
-    holder="install-server",
-    workflow_id="install-server-dell-r650-tlv",
+    holder="add-server-to-mce",
+    workflow_id="add-server-to-mce-dell-r650-tlv",
     mce_cluster="ocp4-mce-tlv-01",
     infra_env="dell-r650-tlv",
     namespace="multicluster-engine",
@@ -100,8 +100,8 @@ RESERVE = ReserveServerRequest(
 RELEASE = ReleaseServerRequest(
     server_id="srv_1",
     server_name=RESERVE.server_name,
-    holder="install-server",
-    workflow_id="install-server-dell-r650-tlv",
+    holder="add-server-to-mce",
+    workflow_id="add-server-to-mce-dell-r650-tlv",
 )
 
 
@@ -128,8 +128,8 @@ class TestTheInstallLock:
         assert request.headers["Authorization"] == "Bearer admin-token"
         # The name is for messages only: the lock is keyed on the id in the path.
         assert json.loads(request.content) == {
-            "holder": "install-server",
-            "workflow_id": "install-server-dell-r650-tlv",
+            "holder": "add-server-to-mce",
+            "workflow_id": "add-server-to-mce-dell-r650-tlv",
             "mce_cluster": "ocp4-mce-tlv-01",
             "infra_env": "dell-r650-tlv",
             "namespace": "multicluster-engine",
@@ -142,9 +142,9 @@ class TestTheInstallLock:
             return_value=_problem(
                 409,
                 "reserved",
-                held_by="install-server",
+                held_by="add-server-to-mce",
                 held_for_mce="ocp4-mce-other",
-                workflow_id="install-server-other",
+                workflow_id="add-server-to-mce-other",
                 expires_at="2026-10-02T12:00:00Z",
             )
         )
@@ -156,7 +156,7 @@ class TestTheInstallLock:
         # No `held_by`: some other write won (often a collector run), and a
         # retry either takes the lock or turns into the refusal above.
         respx.post(RESERVATION).mock(
-            return_value=_problem(409, "modified by another caller", requested_by="install-server")
+            return_value=_problem(409, "modified by another caller", requested_by="add-server-to-mce")
         )
         with pytest.raises(ServerScanError) as excinfo:
             await reserve_server(SS, "", RESERVE)
@@ -199,8 +199,8 @@ class TestTheInstallLock:
         assert released.detail is None
         # Without both, server-scan treats a release as an operator override.
         assert json.loads(route.calls.last.request.content) == {
-            "holder": "install-server",
-            "workflow_id": "install-server-dell-r650-tlv",
+            "holder": "add-server-to-mce",
+            "workflow_id": "add-server-to-mce-dell-r650-tlv",
         }
 
     @respx.mock
@@ -215,8 +215,8 @@ class TestTheInstallLock:
         # server-scan's ConflictError for a lock that is not ours carries held_by.
         respx.delete(RESERVATION).mock(
             return_value=_problem(
-                409, "reserved by 'install-server' for MCE 'ocp4-mce-other', not by 'install-server'",
-                server_id="srv_1", held_by="install-server", held_for_mce="ocp4-mce-other",
+                409, "reserved by 'add-server-to-mce' for MCE 'ocp4-mce-other', not by 'add-server-to-mce'",
+                server_id="srv_1", held_by="add-server-to-mce", held_for_mce="ocp4-mce-other",
             )
         )
         released = await release_server(SS, "", RELEASE)
@@ -556,7 +556,7 @@ class TestTheStoredRecordOfANamedServer:
 
     @respx.mock
     async def test_a_lock_still_ahead_is_live_and_one_past_is_not(self):
-        held = {"holder": "install-server", "workflow_id": "run-a", "mce_cluster": "ocp4-a",
+        held = {"holder": "add-server-to-mce", "workflow_id": "run-a", "mce_cluster": "ocp4-a",
                 "expires_at": "2026-10-31T12:00:00Z"}
         _scan_serves(_detail(reservation=held))
         before = datetime(2026, 10, 31, 11, 0, tzinfo=UTC)
@@ -565,7 +565,7 @@ class TestTheStoredRecordOfANamedServer:
         live = await install_candidate_by_name(SS, "t", _NAMED, now=before)
         assert live.lock.live is True
         assert (live.lock.holder, live.lock.workflow_id, live.lock.mce_cluster) == (
-            "install-server", "run-a", "ocp4-a",
+            "add-server-to-mce", "run-a", "ocp4-a",
         )
         assert (await install_candidate_by_name(SS, "t", _NAMED, now=after)).lock.live is False
 

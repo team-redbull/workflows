@@ -562,7 +562,7 @@ async def list_cluster_custom_objects(
 ) -> list[dict[str, Any]]:
     """Every custom resource of one kind across ALL namespaces, or [] when there are none.
 
-    uninstall-server's reads of AgentMachines and HostedClusters: they live in
+    uninstall-server-from-hc's reads of AgentMachines and HostedClusters: they live in
     hosted control-plane namespaces the request does not name, so they are
     found by listing. A 404 is an empty list for the reason
     list_custom_objects gives — an MCE without HyperShift has no such type,

@@ -150,7 +150,7 @@ jobs:
     secrets: inherit
 
   build-server-lifecycle-worker:
-    # The install-server limb. Sequential behind the segment-lifecycle one for
+    # The add-server-to-mce limb. Sequential behind the segment-lifecycle one for
     # the same reason that one is behind the brain: both push to the same
     # redbull-platform branch, so running them together makes them race.
     #

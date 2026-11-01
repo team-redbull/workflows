@@ -98,7 +98,7 @@ AGENT_TIMEOUT_MARGIN = timedelta(seconds=120)
 # Activity-raised failures no retry can fix, as CLASSES (a wrong name is an
 # ImportError at worker start, not a silent "retry forever").
 #
-# DELIBERATELY NOT HERE, unlike uninstall-server's list: HostedClusterAccessError,
+# DELIBERATELY NOT HERE, unlike uninstall-server-from-hc's list: HostedClusterAccessError,
 # BmhPrerequisiteMissingError, BmhRequestInvalidError. A run that lives for weeks
 # must never FAIL after approval — the HostedCluster may be mid-upgrade, and a
 # failed run leaves it with nobody watching. A refused RBAC or a broken admin

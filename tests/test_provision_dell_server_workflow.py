@@ -1,6 +1,6 @@
 """Workflow tests: real ProvisionDellServerWorkflow, mock activities, time-skipping env.
 
-Same harness shape as tests/test_install_server_workflow.py. The time-skipping
+Same harness shape as tests/test_add_server_to_mce_workflow.py. The time-skipping
 environment collapses every durable timer — the iDRAC lockout wait, the
 discovery / template / storage polls and the hours-long server-scan wait — to
 milliseconds, so each deadline can be driven to expiry.

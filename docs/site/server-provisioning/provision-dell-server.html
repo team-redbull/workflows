@@ -45,7 +45,7 @@
       A technician racks a Dell and gives its iDRAC an IP. That is the last manual step. This workflow
       takes it from there to <b>a fully configured machine</b> &mdash; root on the enforced password, the
       template applied, the boot RAID built and the profile named &mdash; after which
-      <a href="/server-lifecycle/install-server.html">install-server</a> can draw it.
+      <a href="/server-lifecycle/add-server-to-mce.html">add-server-to-mce</a> can draw it.
     </p>
     <p class="lede">It replaces what the DC team used to do by hand in OpenManage Enterprise: discover the
     machine, build a server profile, attach a template, rename the profile &mdash; plus the RAID 1 someone
@@ -557,7 +557,7 @@
           <tr><td class="k">verifying-storage</td><td class="muted">Reading the layout back; convergence is the only success</td><td class="muted">seconds</td></tr>
           <tr><td class="k">naming-server</td><td class="muted">Asking the naming service to rename the profile</td><td class="muted">seconds</td></tr>
           <tr><td class="k">verifying-name</td><td class="muted">Reading the name back off the OME profile</td><td class="muted">30 min</td></tr>
-          <tr><td class="k">completed</td><td class="muted">The machine is configured; install-server can draw it once server-scan has collected it</td><td class="muted">&mdash;</td></tr>
+          <tr><td class="k">completed</td><td class="muted">The machine is configured; add-server-to-mce can draw it once server-scan has collected it</td><td class="muted">&mdash;</td></tr>
         </tbody>
       </table>
     </div>

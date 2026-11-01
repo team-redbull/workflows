@@ -51,32 +51,34 @@ def allocate_segment_workflow_id(segment_type: SegmentType, cluster: str) -> str
 
 
 # The install run's ids carry the workflow name, then the MCE, then `_` before
-# every further part: `install-server-<mce>_<...>`. The MCE ends at the first
+# every further part: `add-server-to-mce-<mce>_<...>`. The MCE ends at the first
 # `_` because a Kubernetes name cannot contain one, so a hub's runs all sit under
-# `install-server-<mce>_` and never under another hub's, even when one MCE's name
+# `add-server-to-mce-<mce>_` and never under another hub's, even when one MCE's name
 # extends another's (`ocp4-a`, `ocp4-a-b`). An id is not part of a run's replayed
-# history, so adding the MCE cannot break a run in flight. Runs started before it
-# keep the ids they were started with (`install-server-name-<server>`,
-# `install-server-<infraEnv>_<slot>`); anything that counts runs by id has to look
-# for both until they have closed.
-_INSTALL_SERVER = "install-server"
+# history, so neither adding the MCE nor renaming the workflow can break a run in
+# flight. Runs started before either keep the ids they were started with — before
+# the MCE, `install-server-name-<server>` and `install-server-<infraEnv>_<slot>`;
+# before the rename to add-server-to-mce (2026-11-01), `install-server-<mce>_<...>`
+# — and anything that counts runs by id has to look for those too until they have
+# closed.
+_ADD_SERVER_TO_MCE = "add-server-to-mce"
 
 
-def install_server_name_workflow_id(mce_cluster: str, server_name: str) -> str:
-    """`install-server-<mce>_<server>`: an install of ONE NAMED machine on one MCE.
+def add_server_to_mce_name_workflow_id(mce_cluster: str, server_name: str) -> str:
+    """`add-server-to-mce-<mce>_<server>`: an install of ONE NAMED machine on one MCE.
 
-    install-server builds it for every name in `server_names`, one or a list,
+    add-server-to-mce builds it for every name in `server_names`, one or a list,
     so one machine is one run however it is asked for: a second request for it
     while it installs on that MCE is a dedup hit, never a second run.
 
     The MCE is in the id so every run on a hub is found under one prefix,
-    `install-server-<mce>_`, and a hub never sees another's runs. Two hubs
+    `add-server-to-mce-<mce>_`, and a hub never sees another's runs. Two hubs
     installing the SAME machine at once are no longer stopped by this id: the
     server-scan install lock stops the second.
 
     The MCE is followed by `_` because a Kubernetes name cannot contain it, so
     where the MCE ends is unambiguous. With `-` after it, the prefix
-    `install-server-ocp4-a-` would also match the runs of an MCE `ocp4-a-b`. A
+    `add-server-to-mce-ocp4-a-` would also match the runs of an MCE `ocp4-a-b`. A
     server name with an underscore is not a valid Kubernetes name, so a named id
     can not equal a pool id (`..._<infraEnv>_<slot>`) either.
 
@@ -88,13 +90,13 @@ def install_server_name_workflow_id(mce_cluster: str, server_name: str) -> str:
     exists to prevent. Two different servers cannot collide by lowercasing:
     server-scan names differ by more than case.
     """
-    return f"{_INSTALL_SERVER}-{mce_cluster}_{server_name.lower()}"
+    return f"{_ADD_SERVER_TO_MCE}-{mce_cluster}_{server_name.lower()}"
 
 
-def install_server_slot_workflow_id(mce_cluster: str, infra_env: str, slot: int) -> str:
-    """`install-server-<mce>_<infraEnv>_<slot>`: one of the PARALLEL draws from a pool.
+def add_server_to_mce_slot_workflow_id(mce_cluster: str, infra_env: str, slot: int) -> str:
+    """`add-server-to-mce-<mce>_<infraEnv>_<slot>`: one of the PARALLEL draws from a pool.
 
-    Every install-server run that lets the pool pick is on a slot: `count: N`
+    Every add-server-to-mce run that lets the pool pick is on a slot: `count: N`
     fills N free ones, and a request without `count` fills one. Keyed on the
     HUB, the CANDIDATE POOL and a slot number, and on none of the obvious
     other things:
@@ -127,46 +129,57 @@ def install_server_slot_workflow_id(mce_cluster: str, infra_env: str, slot: int)
     more server, and the 409 refused exactly that.
 
     `_` follows the MCE and joins the parts after it, for the reason
-    install_server_name_workflow_id gives.
+    add_server_to_mce_name_workflow_id gives.
     """
-    return f"{_INSTALL_SERVER}-{mce_cluster}_{infra_env}_{slot}"
+    return f"{_ADD_SERVER_TO_MCE}-{mce_cluster}_{infra_env}_{slot}"
 
 
-def remove_server_workflow_id(server_name: str) -> str:
-    """`remove-server-<server>`: one removal of a machine at a time.
+def remove_server_from_mce_workflow_id(server_name: str) -> str:
+    """`remove-server-from-mce-<server>`: one removal of a machine at a time.
 
-    Keyed on the MACHINE, unlike install-server: the server is named up front,
+    Keyed on the MACHINE, unlike add-server-to-mce: the server is named up front,
     and it is what two removals would race on. The distinct prefix keeps a
     removal from colliding with an install of the same server. Lowercased for
-    the reason install_server_name_workflow_id gives — one machine, one id, however
+    the reason add_server_to_mce_name_workflow_id gives — one machine, one id, however
     a caller typed its uppercase serial.
+    """
+    return f"remove-server-from-mce-{server_name.lower()}"
+
+
+def legacy_remove_server_workflow_id(server_name: str) -> str:
+    """`remove-server-<server>`: remove-server-from-mce's id before 2026-11-01.
+
+    Built for ONE caller: an uninstall started before the rename (type
+    `UninstallServerWorkflow`) starts its remove-server child under the id,
+    type and queue its history recorded, or its replay fails. Goes when that
+    legacy type does.
     """
     return f"remove-server-{server_name.lower()}"
 
 
-def uninstall_server_workflow_id(server_name: str) -> str:
-    """`uninstall-server-<server>`: one uninstall of a machine at a time.
+def uninstall_server_from_hc_workflow_id(server_name: str) -> str:
+    """`uninstall-server-from-hc-<server>`: one uninstall of a machine at a time.
 
-    Keyed on the MACHINE, like remove-server: the server is named up front and
+    Keyed on the MACHINE, like remove-server-from-mce: the server is named up front and
     it is what two uninstalls would race on — two runs deleting one Machine and
     waiting on one Agent. The `uninstall-` prefix is what keeps it apart from
     the other two ids of the same machine, and both distinctions matter:
 
-      * `install-server-<mce>_<server>` — an install and an uninstall of one
+      * `add-server-to-mce-<mce>_<server>` — an install and an uninstall of one
         machine are different operations, and refusing one because the other
         once ran (or is running) would be wrong in both directions;
-      * `remove-server-<server>` — uninstall-server STARTS that id as its
+      * `remove-server-from-mce-<server>` — uninstall-server-from-hc STARTS that id as its
         last step, an awaited child, so sharing it would make every uninstall
         collide with itself.
 
-    Lowercased for the reason install_server_name_workflow_id gives — one
+    Lowercased for the reason add_server_to_mce_name_workflow_id gives — one
     machine, one id, however a caller typed its uppercase serial.
     """
-    return f"uninstall-server-{server_name.lower()}"
+    return f"uninstall-server-from-hc-{server_name.lower()}"
 
 
-def publish_infraenv_boot_workflow_id(mce_cluster: str, infra_env: str) -> str:
-    """`publish-infraenv-boot-<mce>-<infraEnv>`: one publish of a boot entry at a time.
+def publish_infraenv_to_pxe_server_workflow_id(mce_cluster: str, infra_env: str) -> str:
+    """`publish-infraenv-to-pxe-server-<mce>-<infraEnv>`: one publish of a boot entry at a time.
 
     Keyed on what it writes — ONE file per (MCE, InfraEnv) on the PXE VM — so
     two triggers for the same entry dedup, while the same InfraEnv name on two
@@ -174,7 +187,7 @@ def publish_infraenv_boot_workflow_id(mce_cluster: str, infra_env: str) -> str:
     harmless anyway (the PXE VM keeps the newer image), so this is dedup, not
     a safety lock.
     """
-    return f"publish-infraenv-boot-{mce_cluster}-{infra_env}"
+    return f"publish-infraenv-to-pxe-server-{mce_cluster}-{infra_env}"
 
 
 def provision_dell_server_workflow_id(idrac_ip: str) -> str:
@@ -225,6 +238,6 @@ def upgrade_control_plane_workflow_id(mce_cluster: str, slot: int) -> str:
     waits when every slot is taken. Temporal's own limits cap activities per
     worker or per second, not "N control planes in flight per MCE", so they
     do not fit. A finished slot is free again (closed ids are reusable), the
-    install-server slot precedent.
+    add-server-to-mce slot precedent.
     """
     return f"upgrade-control-plane-{mce_cluster}_{slot}"

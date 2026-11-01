@@ -1,4 +1,4 @@
-"""install-server trigger: real route, a stand-in Temporal client.
+"""add-server-to-mce trigger: real route, a stand-in Temporal client.
 
 The router is mounted on a bare app so workflow_domains.api's lifespan, which
 would connect to Temporal, never runs.
@@ -14,12 +14,12 @@ from fastapi.testclient import TestClient
 from pydantic_core import to_json
 from temporalio.exceptions import WorkflowAlreadyStartedError
 
-from shared.consts import INSTALL_SERVER_WORKFLOW_QUEUE
-from shared.models.server_lifecycle import InstallServerInput
+from shared.consts import ADD_SERVER_TO_MCE_WORKFLOW_QUEUE
+from shared.models.server_lifecycle import AddServerToMceInput
 from workflow_domains.routers.deps import get_temporal_client
 from workflow_domains.server_lifecycle import router as router_module
 
-PATH = "/workflows/server-lifecycle/install-server"
+PATH = "/workflows/server-lifecycle/add-server-to-mce"
 BODY = {"infra_env": "cisco-m6-bat-yam-64c-512gb", "mce_cluster": "ocp4-mce-bat-yam-01"}
 
 
@@ -34,7 +34,7 @@ class _FakeClient:
         self.args: list = []
 
     async def start_workflow(self, _run, args, *, id: str, task_queue: str):
-        assert task_queue == INSTALL_SERVER_WORKFLOW_QUEUE
+        assert task_queue == ADD_SERVER_TO_MCE_WORKFLOW_QUEUE
         self.args.append(args)
         return _FakeHandle(id)
 
@@ -87,13 +87,40 @@ def test_a_vlan_is_still_refused(client):
     assert client.post(PATH, json={**BODY, "vlan_id": 24}).status_code == 422
 
 
+_RENAMED = {
+    "install-server": "add-server-to-mce",
+    "remove-server": "remove-server-from-mce",
+    "uninstall-server": "uninstall-server-from-hc",
+    "publish-infraenv-boot": "publish-infraenv-to-pxe-server",
+}
+
+
+@pytest.mark.parametrize("old, new", sorted(_RENAMED.items()))
+@pytest.mark.parametrize("body", [BODY, {"anything": "at all"}])
+def test_an_old_route_points_at_its_new_one_and_starts_nothing(client, fake, old, new, body):
+    # Renamed 2026-11-01. Not an alias: whatever was sent, nothing starts, and
+    # the caller is told where to send it instead.
+    response = client.post(f"/workflows/server-lifecycle/{old}", json=body)
+
+    assert response.status_code == 410
+    assert f"/workflows/server-lifecycle/{new}" in response.json()["detail"]
+    assert fake.args == []
+
+
+def test_the_old_routes_are_not_in_the_api_schema(client):
+    paths = client.get("/openapi.json").json()["paths"]
+    for old, new in _RENAMED.items():
+        assert f"/workflows/server-lifecycle/{new}" in paths
+        assert f"/workflows/server-lifecycle/{old}" not in paths
+
+
 MCE = BODY["mce_cluster"]
-SLOT = "install-server-" + MCE + "_cisco-m6-bat-yam-64c-512gb_{}"
+SLOT = "add-server-to-mce-" + MCE + "_cisco-m6-bat-yam-64c-512gb_{}"
 NAMES = ["ocp-cisco-m6-bat-yam-64c-512gb-WZP1", "ocp-cisco-m6-bat-yam-64c-512gb-WZP2"]
 
 
 def _named_id(name: str) -> str:
-    return f"install-server-{MCE}_{name.lower()}"
+    return f"add-server-to-mce-{MCE}_{name.lower()}"
 
 
 def _with_temporal(fake, *, running: set[str], fail_on: str | None = None) -> set[str]:
@@ -104,7 +131,7 @@ def _with_temporal(fake, *, running: set[str], fail_on: str | None = None) -> se
         if id == fail_on:
             raise RuntimeError("Temporal unavailable")
         if id in running:
-            raise WorkflowAlreadyStartedError(id, "InstallServerWorkflow")
+            raise WorkflowAlreadyStartedError(id, "AddServerToMceWorkflow")
         running.add(id)
         return await original(run, args, id=id, task_queue=task_queue)
 
@@ -185,20 +212,20 @@ def test_a_start_temporal_refuses_is_502_with_its_reason(client, fake, extra):
     "extra",
     [{}, {"count": 2}, {"server_names": NAMES[0]}, {"server_names": NAMES}],
 )
-def test_every_run_input_is_exactly_install_server_input(client, fake, extra):
+def test_every_run_input_is_exactly_add_server_to_mce_input(client, fake, extra):
     # `count` and a list of names are how many runs the ROUTE starts; a run's
     # input is decoded from history on every replay and must stay exactly
-    # InstallServerInput, one server per run.
+    # AddServerToMceInput, one server per run.
     assert client.post(PATH, json={**BODY, **extra}).status_code == 202
-    assert fake.args and all(type(a.input) is InstallServerInput for a in fake.args)
+    assert fake.args and all(type(a.input) is AddServerToMceInput for a in fake.args)
 
 
 def test_every_run_field_can_be_sent():
     # The request is its own model, not a subclass of the run's input, so a
-    # field added to InstallServerInput must be added to it too.
+    # field added to AddServerToMceInput must be added to it too.
     # `server_name` is the one exception: the request takes `server_names`.
-    run_fields = set(InstallServerInput.model_fields) - {"server_name"}
-    assert run_fields <= set(router_module.InstallServerRequest.model_fields)
+    run_fields = set(AddServerToMceInput.model_fields) - {"server_name"}
+    assert run_fields <= set(router_module.AddServerToMceRequest.model_fields)
 
 
 def test_the_old_server_name_field_points_at_server_names(client, fake):
@@ -228,7 +255,7 @@ def test_count_and_candidate_count_are_only_for_the_pool(client, fake, extra, na
 
 
 class TestInstallServerCount:
-    """install-server with `count`: N servers from ONE InfraEnv's pool, in parallel."""
+    """add-server-to-mce with `count`: N servers from ONE InfraEnv's pool, in parallel."""
 
     def test_count_runs_start_each_on_its_own_slot_id(self, client, fake):
         response = client.post(PATH, json={**BODY, "count": 3})
@@ -317,7 +344,7 @@ class TestInstallServerCount:
 
 
 class TestInstallServerByName:
-    """install-server with `server_names`: SPECIFIC machines, one run per name."""
+    """add-server-to-mce with `server_names`: SPECIFIC machines, one run per name."""
 
     def test_one_name_is_one_run_on_its_named_id(self, client, fake):
         response = client.post(PATH, json={**BODY, "server_names": NAMES[0]})
@@ -418,16 +445,16 @@ class TestInstallServerByName:
 
 
 class TestRemoveServer:
-    PATH = "/workflows/server-lifecycle/remove-server"
+    PATH = "/workflows/server-lifecycle/remove-server-from-mce"
     BODY = {"server_name": "ocp-cisco-m6-bat-yam-64c-512gb-FCH0001",
             "mce_cluster": "ocp4-mce-bat-yam-01"}
 
     @pytest.fixture
     def client(self, fake: _FakeClient) -> TestClient:
-        from shared.consts import REMOVE_SERVER_WORKFLOW_QUEUE
+        from shared.consts import REMOVE_SERVER_FROM_MCE_WORKFLOW_QUEUE
 
         async def start_workflow(_run, args, *, id: str, task_queue: str):
-            assert task_queue == REMOVE_SERVER_WORKFLOW_QUEUE
+            assert task_queue == REMOVE_SERVER_FROM_MCE_WORKFLOW_QUEUE
             fake.args.append(args)
             return _FakeHandle(id)
 
@@ -442,7 +469,7 @@ class TestRemoveServer:
         assert response.status_code == 202
         assert fake.args[0].input.namespace == "inventory"
         # One id per machine, however its serial was typed.
-        assert response.json()["workflow_id"] == "remove-server-ocp-cisco-m6-bat-yam-64c-512gb-fch0001"
+        assert response.json()["workflow_id"] == "remove-server-from-mce-ocp-cisco-m6-bat-yam-64c-512gb-fch0001"
 
     def test_an_explicit_namespace_is_kept(self, client, fake):
         client.post(self.PATH, json={**self.BODY, "namespace": "lab-kv"})
@@ -459,15 +486,15 @@ class TestRemoveServer:
 
 
 class TestPublishInfraEnvBoot:
-    PATH = "/workflows/server-lifecycle/publish-infraenv-boot"
+    PATH = "/workflows/server-lifecycle/publish-infraenv-to-pxe-server"
     BODY = {"mce_cluster": "mce-bat-yam-01", "infra_env": "cisco-m6-bat-yam-64c-512gb"}
 
     @pytest.fixture
     def client(self, fake: _FakeClient) -> TestClient:
-        from shared.consts import PUBLISH_INFRAENV_BOOT_WORKFLOW_QUEUE
+        from shared.consts import PUBLISH_INFRAENV_TO_PXE_SERVER_WORKFLOW_QUEUE
 
         async def start_workflow(_run, args, *, id: str, task_queue: str):
-            assert task_queue == PUBLISH_INFRAENV_BOOT_WORKFLOW_QUEUE
+            assert task_queue == PUBLISH_INFRAENV_TO_PXE_SERVER_WORKFLOW_QUEUE
             fake.args.append(args)
             return _FakeHandle(id)
 
@@ -486,7 +513,7 @@ class TestPublishInfraEnvBoot:
         assert run_input.mce_cluster == "ocp4-mce-bat-yam-01"
         assert run_input.namespace == "inventory"
         assert response.json()["workflow_id"] == (
-            "publish-infraenv-boot-ocp4-mce-bat-yam-01-cisco-m6-bat-yam-64c-512gb"
+            "publish-infraenv-to-pxe-server-ocp4-mce-bat-yam-01-cisco-m6-bat-yam-64c-512gb"
         )
 
     def test_an_explicit_namespace_is_kept(self, client, fake):
@@ -502,9 +529,9 @@ class TestPublishInfraEnvBoot:
         assert client.post(self.PATH, json={**self.BODY, "ipxe_url": "http://x"}).status_code == 422
 
 
-# --- uninstall-server -----------------------------------------------------------------
+# --- uninstall-server-from-hc -----------------------------------------------------------------
 
-UNINSTALL = "/workflows/server-lifecycle/uninstall-server"
+UNINSTALL = "/workflows/server-lifecycle/uninstall-server-from-hc"
 UNINSTALL_BODY = {"mce_cluster": "mce-bat-yam-01"}
 
 
@@ -520,7 +547,7 @@ class _FakeUninstallClient:
         if id == self.fail_on:
             raise RuntimeError("Temporal unavailable")
         if id in self.running:
-            raise WorkflowAlreadyStartedError(id, "UninstallServerWorkflow")
+            raise WorkflowAlreadyStartedError(id, "UninstallServerFromHcWorkflow")
         self.running.add(id)
         self.started.append((id, task_queue, args.input))
         return _FakeHandle(id)
@@ -534,13 +561,13 @@ def _uninstall_client(fake) -> TestClient:
 
 
 def _uninstall_id(name: str) -> str:
-    return f"uninstall-server-{name.lower()}"
+    return f"uninstall-server-from-hc-{name.lower()}"
 
 
 class TestUninstallServer:
     def test_one_name_is_one_run_on_its_own_queue_and_id(self):
-        from shared.consts import UNINSTALL_SERVER_WORKFLOW_QUEUE
-        from shared.models.server_lifecycle import UninstallServerInput
+        from shared.consts import UNINSTALL_SERVER_FROM_HC_WORKFLOW_QUEUE
+        from shared.models.server_lifecycle import UninstallServerFromHcInput
 
         fake = _FakeUninstallClient()
         response = _uninstall_client(fake).post(UNINSTALL, json={**UNINSTALL_BODY, "server_names": NAMES[0]})
@@ -548,11 +575,11 @@ class TestUninstallServer:
         assert response.status_code == 202
         assert response.json() == {"workflow_id": _uninstall_id(NAMES[0]), "run_id": "run-1"}
         [(workflow_id, queue, run_input)] = fake.started
-        assert queue == UNINSTALL_SERVER_WORKFLOW_QUEUE
+        assert queue == UNINSTALL_SERVER_FROM_HC_WORKFLOW_QUEUE
         # The run's input is exactly the history model: one server, the MCE
         # canonical, the namespace defaulted here at the edge.
-        assert type(run_input) is UninstallServerInput
-        assert run_input == UninstallServerInput(
+        assert type(run_input) is UninstallServerFromHcInput
+        assert run_input == UninstallServerFromHcInput(
             server_name=NAMES[0], mce_cluster="ocp4-mce-bat-yam-01", namespace="inventory"
         )
 
@@ -637,11 +664,11 @@ class TestUninstallServer:
 
     def test_every_run_field_can_be_sent(self):
         # Its own model, not a subclass of the run's input: a field added to
-        # UninstallServerInput must be added to the request too.
-        from shared.models.server_lifecycle import UninstallServerInput
+        # UninstallServerFromHcInput must be added to the request too.
+        from shared.models.server_lifecycle import UninstallServerFromHcInput
 
-        run_fields = set(UninstallServerInput.model_fields) - {"server_name"}
-        assert run_fields <= set(router_module.UninstallServerRequest.model_fields)
+        run_fields = set(UninstallServerFromHcInput.model_fields) - {"server_name"}
+        assert run_fields <= set(router_module.UninstallServerFromHcRequest.model_fields)
 
 
 class TestTheHiddenAllowUnhealthy:
@@ -658,7 +685,7 @@ class TestTheHiddenAllowUnhealthy:
 
         assert spec.status_code == 200
         assert "unhealthy" not in spec.text.lower()
-        schema = spec.json()["components"]["schemas"]["InstallServerRequest"]
+        schema = spec.json()["components"]["schemas"]["AddServerToMceRequest"]
         assert "allow_unhealthy" not in schema["properties"]
 
     def test_it_is_not_in_the_whole_apis_openapi_either(self):

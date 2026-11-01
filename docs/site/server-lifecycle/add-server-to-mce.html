@@ -3,12 +3,12 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>install-server — Redbull Workflows</title>
-<meta name="description" content="The install-server workflow: take a healthy, unclaimed server from the server-scan inventory and make it installable in an MCE InfraEnv — BareMetalHost, BMC Secret and NMStateConfig, on the MCE that owns the InfraEnv.">
+<title>add-server-to-mce — Redbull Workflows</title>
+<meta name="description" content="The add-server-to-mce workflow: take a healthy, unclaimed server from the server-scan inventory and make it installable in an MCE InfraEnv — BareMetalHost, BMC Secret and NMStateConfig, on the MCE that owns the InfraEnv.">
 <link rel="icon" href="/assets/favicon.svg?v=__DOC_VERSION__" type="image/svg+xml">
 <link rel="stylesheet" href="/assets/site.css?v=__DOC_VERSION__">
 </head>
-<body data-page="/server-lifecycle/install-server.html">
+<body data-page="/server-lifecycle/add-server-to-mce.html">
 
 <a class="skip-link" href="#main">Skip to content</a>
 
@@ -31,7 +31,7 @@
       <div class="wfmenu-panel" id="wfmenu-panel" role="menu" aria-label="Workflows by domain" hidden></div>
     </div>
     <noscript>
-      <a class="topnav-link" href="/server-lifecycle/install-server.html">install-server</a>
+      <a class="topnav-link" href="/server-lifecycle/add-server-to-mce.html">add-server-to-mce</a>
     </noscript>
   </nav>
 </header>
@@ -40,7 +40,7 @@
 <header class="masthead">
   <div class="masthead-inner">
     <div class="eyebrow">Temporal workflow &middot; domain: server-lifecycle</div>
-    <h1>install-server<span class="dim"> &mdash; what actually happens</span></h1>
+    <h1>add-server-to-mce<span class="dim"> &mdash; what actually happens</span></h1>
     <p class="lede">
       One request makes a physical server installable in an MCE <b>InfraEnv</b>: the workflow asks
       <b>server-scan</b> for a healthy, unclaimed machine matching that InfraEnv, picks two NICs for a
@@ -51,12 +51,16 @@
     queried HP OneView, UCS Central, Dell OME and Intersight live on every reconcile. server-scan
     already collects all of that on a 6-hour cron, so one HTTP call replaced four vendor SDKs.</p>
     <div class="facts">
-      <div class="fact"><span class="k">Trigger</span><span class="v">POST /workflows/server-lifecycle/install-server</span></div>
-      <div class="fact"><span class="k">Workflow id</span><span class="v">one per server: install-server-&lt;mce&gt;_&lt;infraEnv&gt;_&lt;slot&gt; from the pool &middot; install-server-&lt;mce&gt;_&lt;server&gt;</span></div>
-      <div class="fact"><span class="k">Workflow queue</span><span class="v">install-server-workflow</span></div>
+      <div class="fact"><span class="k">Trigger</span><span class="v">POST /workflows/server-lifecycle/add-server-to-mce</span></div>
+      <div class="fact"><span class="k">Workflow id</span><span class="v">one per server: add-server-to-mce-&lt;mce&gt;_&lt;infraEnv&gt;_&lt;slot&gt; from the pool &middot; add-server-to-mce-&lt;mce&gt;_&lt;server&gt;</span></div>
+      <div class="fact"><span class="k">Workflow queue</span><span class="v">add-server-to-mce-workflow</span></div>
       <div class="fact"><span class="k">Activity queue</span><span class="v">server-lifecycle-activity-&lt;mce_cluster&gt;</span></div>
     </div>
-    <p class="note">The way back out is <a href="/server-lifecycle/uninstall-server.html">uninstall-server</a>:
+    <p class="note">Named <b>install-server</b> until 2026-11-01. <code>POST
+    /workflows/server-lifecycle/install-server</code> now answers <b>410</b> naming this route and starts
+    nothing &mdash; send the same body here. Runs started before the rename finish as they began, under
+    their <code>install-server-&hellip;</code> ids.</p>
+    <p class="note">The way back out is <a href="/server-lifecycle/uninstall-server-from-hc.html">uninstall-server-from-hc</a>:
     out of its hosted cluster first, if a NodePool took it, then out of the MCE&rsquo;s inventory.</p>
   </div>
 </header>
@@ -82,7 +86,7 @@
           <tr><td class="k">server-scan query</td><td class="muted"><code>?pattern=^ocp-&lt;infraEnv&gt;&amp;count=&lt;candidate_count&gt;</code></td><td class="muted"><code>?name=&lt;server&gt;&amp;count=1</code></td></tr>
           <tr><td class="k">candidates drawn</td><td class="muted"><code>candidate_count</code> &mdash; default runs on the pool + 2 (3 for a lone install), range 1&ndash;20</td><td class="muted">one</td></tr>
           <tr><td class="k">already has a BareMetalHost</td><td class="muted"><b>skipped</b>, next candidate tried</td><td class="muted"><b>converged</b> &mdash; that is the point</td></tr>
-          <tr><td class="k">workflow id</td><td class="muted"><code>install-server-&lt;mce&gt;_&lt;infraEnv&gt;_&lt;slot&gt;</code>, the first free slot</td><td class="muted"><code>install-server-&lt;mce&gt;_&lt;server&gt;</code></td></tr>
+          <tr><td class="k">workflow id</td><td class="muted"><code>add-server-to-mce-&lt;mce&gt;_&lt;infraEnv&gt;_&lt;slot&gt;</code>, the first free slot</td><td class="muted"><code>add-server-to-mce-&lt;mce&gt;_&lt;server&gt;</code></td></tr>
           <tr><td class="k">use it for</td><td class="muted">routine capacity: take whatever is free and healthy</td><td class="muted">re-running or repairing one known host</td></tr>
         </tbody>
       </table>
@@ -164,7 +168,7 @@
         <b>24 h hold</b> after success writes nothing to any cluster. It only keeps S1 out of every
         other run&rsquo;s draw until server-scan can see it in a cluster for itself.</p>
         <p class="note">Taken out of MCE-A within that day, S1 gets its lock back early:
-        remove-server releases install-server&rsquo;s lock for <em>its</em> MCE once nothing of S1 is left there (the operator&rsquo;s decision,
+        remove-server-from-mce releases add-server-to-mce&rsquo;s lock for <em>its</em> MCE once nothing of S1 is left there (the operator&rsquo;s decision,
         2026-10-31). Another MCE&rsquo;s lock it leaves alone.</p>
       </div>
       <div class="panel">
@@ -196,7 +200,7 @@
           <tr><td>A candidate fails a check</td><td class="muted">Skips it, tries the next</td><td class="muted">never taken</td></tr>
           <tr><td>Another run holds the candidate</td><td class="muted">Skips it, tries the next</td><td class="muted">theirs, untouched</td></tr>
           <tr><td>The Agent appears</td><td class="muted">Succeeds</td><td class="muted">held 24 h for this run</td></tr>
-          <tr><td>The server is removed from this MCE within that day (remove-server)</td><td class="muted">&mdash;</td><td class="muted">released by remove-server once nothing of it is left on the MCE</td></tr>
+          <tr><td>The server is removed from this MCE within that day (remove-server-from-mce)</td><td class="muted">&mdash;</td><td class="muted">released by remove-server-from-mce once nothing of it is left on the MCE</td></tr>
           <tr><td>No Agent within 1 h</td><td class="muted">Deletes the candidate&rsquo;s resources, tries the next</td><td class="muted">released at once</td></tr>
           <tr><td>The lock lapsed mid-install and another run took the machine</td><td class="muted">Deletes <em>its own</em> resources, tries the next</td><td class="muted">the other run&rsquo;s, untouched</td></tr>
           <tr><td>Every candidate skipped or tried</td><td class="muted">Fails, reasons grouped</td><td class="muted">none left held</td></tr>
@@ -210,7 +214,7 @@
 
     <div class="panel warn" style="margin-top:20px">
       <h3>One precondition, and one known gap</h3>
-      <p><b>The 24 h hold relies on server-scan&rsquo;s agents job.</b> Every MCE install-server targets
+      <p><b>The 24 h hold relies on server-scan&rsquo;s agents job.</b> Every MCE add-server-to-mce targets
       runs the Agent stack (an InfraEnv and an <code>AgentServiceConfig</code>), and server-scan&rsquo;s
       <code>nodes-status</code> <code>agents</code> job runs there every 15 minutes: it marks a server
       with an unbound Agent <code>INSTALLED_TO_INVENTORY</code>, after which it is never drawn again. So
@@ -626,7 +630,7 @@
       </div>
       <div class="panel">
         <h3>The id names a slot of the POOL; the probe and the lock cover the rest</h3>
-        <p><code>install-server-&lt;mce&gt;_&lt;infraEnv&gt;_&lt;slot&gt;</code> keys on the hub and its candidate
+        <p><code>add-server-to-mce-&lt;mce&gt;_&lt;infraEnv&gt;_&lt;slot&gt;</code> keys on the hub and its candidate
         <b>pool</b> (<code>^ocp-&lt;infraEnv&gt;</code>), not on the machine &mdash; which is not known when the
         run starts &mdash; and not on the target. Each hub has its own slots, so it finds only its own runs;
         the machines themselves are shared by every hub and the install lock keeps them apart. A second trigger while one is in flight takes the next slot: it is a <b>second
@@ -645,7 +649,7 @@
       <h3>Several servers at once: <code>count</code>, or a list of <code>server_names</code></h3>
       <p>Every server is <b>its own workflow run</b> &mdash; its own id, status and failure, never one
       run for a batch. Every run the pool picks for is on a slot
-      (<code>install-server-&lt;mce&gt;_&lt;infraEnv&gt;_&lt;slot&gt;</code>), and slots still running are stepped
+      (<code>add-server-to-mce-&lt;mce&gt;_&lt;infraEnv&gt;_&lt;slot&gt;</code>), and slots still running are stepped
       over: send nothing more and one install takes the first free slot; send <code>count: N</code> and
       N are installed in parallel. So a second install while the first runs takes <code>_2</code>, and a
       second batch of 5 while the first installs takes <code>_6</code>&ndash;<code>_10</code>.
@@ -687,7 +691,7 @@
         Swagger or curl, not controllers. Revisit this if a controller ever calls it.</li>
       </ul>
       <p class="note">The options that were weighed, and the collision cases, are in
-      <code>docs/design/install-server-api.md</code>.</p>
+      <code>docs/design/add-server-to-mce-api.md</code>.</p>
     </div>
   </section>
 
@@ -707,7 +711,7 @@
       <div class="endpoint">
         <div class="endpoint-head">
           <span class="method">POST</span>
-          <span class="path">/workflows/server-lifecycle/install-server</span>
+          <span class="path">/workflows/server-lifecycle/add-server-to-mce</span>
           <span class="ret">202 &middot; 409 if that named machine is already installing</span>
         </div>
         <div class="endpoint-body">
@@ -732,7 +736,7 @@
 }
 
 <span class="c">// 202 response</span>
-{ "workflow_id": "install-server-ocp4-mce-bat-yam-01_cisco-m6-bat-yam-64c-512gb_1", "run_id": "…" }
+{ "workflow_id": "add-server-to-mce-ocp4-mce-bat-yam-01_cisco-m6-bat-yam-64c-512gb_1", "run_id": "…" }
 
 <span class="c">// request — three servers from the pool, in parallel</span>
 {
@@ -745,7 +749,7 @@
 <span class="c">// 202 response — one run per slot; a slot still running is stepped over</span>
 { "started": 3, "already_running": 0, "failed": 0,
   "results": [ { "slot": 1, "server_name": null,
-                 "workflow_id": "install-server-ocp4-mce-bat-yam-01_cisco-m6-bat-yam-64c-512gb_1",
+                 "workflow_id": "add-server-to-mce-ocp4-mce-bat-yam-01_cisco-m6-bat-yam-64c-512gb_1",
                  "status": "started", "run_id": "…" }, … ] }
 
 <span class="c">// request — specific machines, one run each</span>
@@ -760,7 +764,7 @@
 <span class="c">// 202 response — a machine already installing is "already_running"</span>
 { "started": 2, "already_running": 0, "failed": 0,
   "results": [ { "slot": null, "server_name": "ocp-cisco-m6-bat-yam-64c-512gb-WZP12345",
-                 "workflow_id": "install-server-ocp4-mce-bat-yam-01_ocp-cisco-m6-bat-yam-64c-512gb-wzp12345",
+                 "workflow_id": "add-server-to-mce-ocp4-mce-bat-yam-01_ocp-cisco-m6-bat-yam-64c-512gb-wzp12345",
                  "status": "started", "run_id": "…" }, … ] }</pre>
           <p class="note">The body <b>forbids unknown fields</b>. Chiefly that means a <code>vlan_id</code>
           is a 422 rather than a silently ignored value: the VLAN comes from the MCE&rsquo;s segment, and a
@@ -813,7 +817,7 @@
       <h2>Inputs, phases, and what the limb needs configured</h2>
     </div>
 
-    <h3 style="margin-bottom:10px">Request body &mdash; <code>InstallServerRequest</code></h3>
+    <h3 style="margin-bottom:10px">Request body &mdash; <code>AddServerToMceRequest</code></h3>
     <div class="table-scroll">
       <table>
         <thead><tr><th>Field</th><th>Type</th><th>Rules</th><th>What it&rsquo;s for</th></tr></thead>
@@ -830,7 +834,7 @@
     </div>
     <p class="note" style="margin-top:10px">No <code>vlan_id</code>, on purpose: it belongs to the MCE&rsquo;s
     inventory segment, and a supplied one could contradict it. Each run is started with an
-    <code>InstallServerInput</code> for ONE server (<code>server_name</code>, or null for a pool draw) and
+    <code>AddServerToMceInput</code> for ONE server (<code>server_name</code>, or null for a pool draw) and
     never <code>count</code>: that model is decoded from Temporal history on replay, so it keeps its shape.</p>
 
     <h3 style="margin:28px 0 10px">Phases you&rsquo;ll see on the status endpoint</h3>
@@ -877,7 +881,7 @@
   </section>
 
   <footer>
-    <span>workflow_domains/server_lifecycle/install_server.py</span>
+    <span>workflow_domains/server_lifecycle/add_server_to_mce.py</span>
     <span>workflow_domains/server_lifecycle/bond_selection.py</span>
     <span>activities/server_lifecycle/activities.py</span>
     <span>activities/server_lifecycle/server_scan.py</span>
@@ -885,7 +889,7 @@
     <span>activities/server_lifecycle/bmh_resources.py</span>
     <span>shared/models/server_lifecycle.py</span>
     <span>shared/bmc_address.py</span>
-    <span>docs/design/install-server-api.md</span>
+    <span>docs/design/add-server-to-mce-api.md</span>
   </footer>
 
 </div>

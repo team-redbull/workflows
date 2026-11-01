@@ -9,8 +9,8 @@
   Served by the workflows API (workflow_domains/server_lifecycle/ui.py), which it calls:
     GET  /workflows/runs?workflow_type=<class>          one workflow's run list
     GET  /workflows/runs/{workflow_id}                  one run's progress, result or error
-    POST /workflows/server-lifecycle/install-server     start installs (a pool draw or named servers)
-    POST /workflows/server-lifecycle/remove-server      start a removal
+    POST /workflows/server-lifecycle/add-server-to-mce     start installs (a pool draw or named servers)
+    POST /workflows/server-lifecycle/remove-server-from-mce      start a removal
   Self-contained on purpose: production is air-gapped, so nothing loads from another host.
   It shows what the runs on this API report and nothing more; the page invents no field.
 -->
@@ -207,7 +207,7 @@ fieldset.choice input { width: auto; }
 <dialog id="dialog"><form method="dialog" id="dialog-form" novalidate></form></dialog>
 <div class="toast" id="toast" role="status"></div>
 
-<!-- Why install-server skips a candidate: install_server._REJECTION_SUMMARY word for word (a test
+<!-- Why add-server-to-mce skips a candidate: add_server_to_mce._REJECTION_SUMMARY word for word (a test
      keeps them equal), plus a short label. A failed run's message is "<summary>: <entries>" per reason. -->
 <script type="application/json" id="skip-reasons">
 {
@@ -236,8 +236,8 @@ fieldset.choice input { width: auto; }
 <script>
 "use strict";
 const RUNS = "/workflows/runs";
-const INSTALL = "/workflows/server-lifecycle/install-server";
-const REMOVE = "/workflows/server-lifecycle/remove-server";
+const INSTALL = "/workflows/server-lifecycle/add-server-to-mce";
+const REMOVE = "/workflows/server-lifecycle/remove-server-from-mce";
 const POLL_MS = 10000;
 const DETAILS_PER_REFRESH = 20;
 const QUEUE_PREFIX = "server-lifecycle-activity-";
@@ -271,10 +271,13 @@ function span(fromIso, toIso) {
 // --- the four workflows ------------------------------------------------------------------
 // Phase words come from each workflow's `progress.phase`; steps group those phases in the
 // order the workflow runs them (workflow_domains/server_lifecycle/<workflow>.py).
+// `legacy` is the same workflow under its name before 2026-11-01: runs started then are
+// still that type, with ids under that noun, and are listed with the new ones until done.
 
 const FLOWS = {
   install: {
-    type: "InstallServerWorkflow", tab: "Install", noun: "install-server",
+    type: "AddServerToMceWorkflow", tab: "Install", noun: "add-server-to-mce",
+    legacy: { type: "InstallServerWorkflow", noun: "install-server" },
     phases: {
       "pending": ["Starting", ""],
       "resolving-vlan": ["Reading the inventory VLAN", "The VLAN is the MCE's: it comes from the MCE's inventory segment in the Segments Manager, never from the caller."],
@@ -309,7 +312,8 @@ const FLOWS = {
     ],
   },
   remove: {
-    type: "RemoveServerWorkflow", tab: "Remove", noun: "remove-server",
+    type: "RemoveServerFromMceWorkflow", tab: "Remove", noun: "remove-server-from-mce",
+    legacy: { type: "RemoveServerWorkflow", noun: "remove-server" },
     phases: {
       "pending": ["Starting", ""],
       "inspecting": ["Inspecting the MCE", "Finds the server's BareMetalHost, NMStateConfig and Agents. An Agent bound to a cluster stops the run with nothing changed."],
@@ -318,7 +322,7 @@ const FLOWS = {
       "removing-agent": ["Deleting the Agent", "Last, once nothing can bring it back."],
       "removing-pxe-boot": ["Clearing the PXE map", "Every MAC the host is known by comes off its site's PXE VM. Best effort: a failure here is reported, not fatal."],
       "verifying": ["Verifying it is gone", "Re-inspects (up to 5 min) until nothing of the server is left on the MCE."],
-      "releasing-server": ["Releasing the lock", "install-server's lock for this MCE goes back to server-scan, so the server can be installed again. Any other lock is left alone."],
+      "releasing-server": ["Releasing the lock", "add-server-to-mce's lock for this MCE goes back to server-scan, so the server can be installed again. Any other lock is left alone."],
       "completed": ["Removed", ""],
     },
     steps: [
@@ -332,7 +336,8 @@ const FLOWS = {
     ],
   },
   uninstall: {
-    type: "UninstallServerWorkflow", tab: "Uninstall", noun: "uninstall-server",
+    type: "UninstallServerFromHcWorkflow", tab: "Uninstall", noun: "uninstall-server-from-hc",
+    legacy: { type: "UninstallServerWorkflow", noun: "uninstall-server" },
     phases: {
       "pending": ["Starting", ""],
       "checking-inventory": ["Asking server-scan", "Where server-scan says the server is. Only a contradiction stops the run."],
@@ -346,7 +351,7 @@ const FLOWS = {
       "verifying-node": ["Verifying no Node is the server", ""],
       "verifying-agent": ["Verifying the Agent is free", ""],
       "holding-server": ["Holding the lock a day", "So no other MCE draws the machine meanwhile."],
-      "removing-from-inventory": ["Removing it from the inventory", "remove-server runs as an awaited child."],
+      "removing-from-inventory": ["Removing it from the inventory", "remove-server-from-mce runs as an awaited child."],
       "releasing-server": ["Releasing the lock", "The server is out of the MCE: its lock goes back to server-scan, so it can be installed again."],
       "completed": ["Uninstalled", ""],
     },
@@ -359,12 +364,13 @@ const FLOWS = {
       ["Leave the hosted cluster", ["draining-node", "deleting-machine", "awaiting-machine-deletion"]],
       ["Verify AgentMachine, Node, Agent", ["verifying-agentmachine", "verifying-node", "verifying-agent"]],
       ["Hold the lock a day", ["holding-server"]],
-      ["Remove from the inventory (remove-server)", ["removing-from-inventory"]],
+      ["Remove from the inventory (remove-server-from-mce)", ["removing-from-inventory"]],
       ["Release the lock", ["releasing-server"]],
     ],
   },
   publish: {
-    type: "PublishInfraEnvBootWorkflow", tab: "Boot entry", noun: "publish-infraenv-boot",
+    type: "PublishInfraEnvToPxeServerWorkflow", tab: "Boot entry", noun: "publish-infraenv-to-pxe-server",
+    legacy: { type: "PublishInfraEnvBootWorkflow", noun: "publish-infraenv-boot" },
     phases: {
       "pending": ["Starting", ""],
       "resolving-site": ["Finding the site", "The MCE's inventory segment names the site, and so the PXE VM to write to."],
@@ -398,9 +404,14 @@ async function fetchRun(id) {
 }
 
 async function loadLive() {
-  const type = FLOWS[state.tab].type;
-  const list = await getJSON(`${RUNS}?workflow_type=${type}&limit=50`);
-  state.lists[type] = list;
+  const flow = FLOWS[state.tab];
+  // The workflow's runs and its legacy type's, newest first, as one list.
+  const lists = await Promise.all([flow.type, flow.legacy.type].map((type) =>
+    getJSON(`${RUNS}?workflow_type=${type}&limit=50`)));
+  const list = lists.flat()
+    .sort((a, b) => String(b.start_time || "").localeCompare(String(a.start_time || "")))
+    .slice(0, 50);
+  state.lists[flow.type] = list;
   const wanted = list.slice(0, DETAILS_PER_REFRESH).map((r) => r.workflow_id);
   if (state.selected && !wanted.includes(state.selected) && list.some((r) => r.workflow_id === state.selected)) wanted.push(state.selected);
   // A closed run's status never changes again: fetch it once.
@@ -452,9 +463,11 @@ function view(id) {
     error: status.error || null, ids: parseId(flow, id) };
 }
 
-// What a workflow id says, by the builders in shared/workflow_ids.py (old shapes included).
+// What a workflow id says, by the builders in shared/workflow_ids.py (old shapes included,
+// and the ids of runs started under the workflow's legacy name).
 function parseId(flow, id) {
-  const rest = id.startsWith(`${flow.noun}-`) ? id.slice(flow.noun.length + 1) : id;
+  const noun = [flow.noun, flow.legacy.noun].find((n) => id.startsWith(`${n}-`));
+  const rest = noun ? id.slice(noun.length + 1) : id;
   if (flow === FLOWS.install) {
     if (rest.startsWith("name-")) return { server: rest.slice(5) };
     const parts = rest.split("_");
@@ -471,7 +484,7 @@ function mceOf(v) {
   return (v.r && v.r.mce_cluster) || v.ids.mce || (q && q.startsWith(QUEUE_PREFIX) ? q.slice(QUEUE_PREFIX.length) : null);
 }
 
-// install-server's `progress.server_name` is the candidate of the latest ATTEMPT: set once a
+// add-server-to-mce's `progress.server_name` is the candidate of the latest ATTEMPT: set once a
 // candidate is locked and about to be created, and kept while the run rolls it back and
 // checks the next one. What it means therefore depends on the phase.
 const INSTALLING = ["checking-nmstateconfig", "creating-nmstateconfig", "publishing-pxe-boot", "creating-secret", "creating-baremetalhost", "awaiting-agent", "holding-server", "completed"];
@@ -519,7 +532,7 @@ function splitError(text) {
   return m ? { type: m[1], message: m[2] } : { type: null, message: text || "" };
 }
 
-// install-server names its candidates only in the failure it ends with when none could be
+// add-server-to-mce names its candidates only in the failure it ends with when none could be
 // installed: "Checked N candidate(s) — <summary>: <entry>; <entry>. <summary>: …".
 function parseCandidates(message) {
   const m = /^([\s\S]*?Checked (\d+) candidate\(s\)) — ([\s\S]*)$/.exec(message || "");
@@ -842,7 +855,7 @@ function renderFacts(v) {
         ["Leftovers found", codeList(r.leftovers_at_start), true],
         ["Cleaned up", codeList(r.cleaned_up), true],
         ["Skipped", codeList(r.skipped), true],
-        ["remove-server", r.remove_server_workflow_id ? `${code(r.remove_server_workflow_id)}${child ? `<div class="step-note">${esc(child.found
+        ["remove-server-from-mce", r.remove_server_workflow_id ? `${code(r.remove_server_workflow_id)}${child ? `<div class="step-note">${esc(child.found
           ? [child.powered_off && "powered off", arr(child.resources_removed).length && `removed ${child.resources_removed.join(", ")}`,
             arr(child.agents_removed).length && `Agents ${child.agents_removed.join(", ")}`, arr(child.pxe_cleared).length && `${child.pxe_cleared.length} PXE entries cleared`,
             arr(child.pxe_failed).length && `PXE failed: ${child.pxe_failed.join("; ")}`].filter(Boolean).join(" · ")
@@ -962,20 +975,20 @@ async function send(path, payload, sent) {
 
 function installDialog() {
   openDialog({
-    title: "Install servers", path: INSTALL, route: "install-server",
+    title: "Install servers", path: INSTALL, route: "add-server-to-mce",
     explain: "Every server is its own run. The InfraEnv's name states the hardware, so it is also the pool: the healthy, unclaimed servers server-scan lists under that name.",
     fields: `
       <label for="f-infra">InfraEnv <span class="hint">the one to fill</span></label>
-      <input id="f-infra" data-send="install-server:infra_env" required autocomplete="off" spellcheck="false" placeholder="cisco-m6-site1-64c-512gb">
+      <input id="f-infra" data-send="add-server-to-mce:infra_env" required autocomplete="off" spellcheck="false" placeholder="cisco-m6-site1-64c-512gb">
       <label for="f-mce">MCE <span class="hint">with or without its ocp4- prefix</span></label>
-      <input id="f-mce" data-send="install-server:mce_cluster" required autocomplete="off" spellcheck="false" placeholder="ocp4-mce-site1-a">
+      <input id="f-mce" data-send="add-server-to-mce:mce_cluster" required autocomplete="off" spellcheck="false" placeholder="ocp4-mce-site1-a">
       <fieldset class="choice"><legend>Which servers</legend>
         <label><input type="radio" name="f-which" value="pool" checked> The pool picks</label>
         <label><input type="radio" name="f-which" value="named"> Named servers</label></fieldset>
       <div data-which="pool"><label for="f-count">How many <span class="hint">1 to 20, in parallel; empty is one</span></label>
-        <input id="f-count" type="number" min="1" max="20" step="1" inputmode="numeric" data-send="install-server:count" placeholder="1"></div>
+        <input id="f-count" type="number" min="1" max="20" step="1" inputmode="numeric" data-send="add-server-to-mce:count" placeholder="1"></div>
       <div data-which="named" hidden><label for="f-names">Server names <span class="hint">server-scan's names, one per line, up to 20</span></label>
-        <textarea id="f-names" rows="4" spellcheck="false" data-send="install-server:server_names"></textarea></div>`,
+        <textarea id="f-names" rows="4" spellcheck="false" data-send="add-server-to-mce:server_names"></textarea></div>`,
     ready: (form) => {
       const named = form.querySelector('input[name="f-which"]:checked').value === "named";
       form.querySelectorAll("[data-which]").forEach((el) => {
@@ -998,13 +1011,13 @@ function installDialog() {
 
 function removeDialog() {
   openDialog({
-    title: "Remove a server from an MCE's inventory", path: REMOVE, route: "remove-server", danger: true,
+    title: "Remove a server from an MCE's inventory", path: REMOVE, route: "remove-server-from-mce", danger: true,
     explain: "For a server that is only inventory: if its Agent is bound to a cluster, the run fails having changed nothing. A server that has nothing on the MCE completes as a no-op.",
     fields: `
       <label for="f-server">Server <span class="hint">its server-scan name</span></label>
-      <input id="f-server" data-send="remove-server:server_name" required autocomplete="off" spellcheck="false">
+      <input id="f-server" data-send="remove-server-from-mce:server_name" required autocomplete="off" spellcheck="false">
       <label for="f-mce">MCE <span class="hint">with or without its ocp4- prefix</span></label>
-      <input id="f-mce" data-send="remove-server:mce_cluster" required autocomplete="off" spellcheck="false">
+      <input id="f-mce" data-send="remove-server-from-mce:mce_cluster" required autocomplete="off" spellcheck="false">
       <div class="confirm"><p><b>This cannot be undone.</b> The host is powered off, then its BareMetalHost, NMStateConfig and Agent are deleted and its MACs cleared from the site's PXE VM.</p>
         <label for="f-confirm">Type the server name again to confirm</label>
         <input id="f-confirm" autocomplete="off" spellcheck="false"></div>`,

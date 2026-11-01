@@ -1,4 +1,4 @@
-"""What uninstall-server reads off CAPI and HyperShift objects — pure functions only.
+"""What uninstall-server-from-hc reads off CAPI and HyperShift objects — pure functions only.
 
 The sibling of bmh_resources.py for the hosted-cluster side: no client, no
 settings, no Temporal, so every rule here is tested on plain dicts. Each shape
@@ -21,7 +21,7 @@ documented as an API:
     finalizer dropped WITHOUT the unbind, and one with no owner at all keeps
     the finalizer for ever. A Machine whose AgentMachine is gone keeps the
     provider's hook for ever. These are the leftovers a broken HyperShift
-    deletion leaves, and why uninstall-server does the provider's writes
+    deletion leaves, and why uninstall-server-from-hc does the provider's writes
     itself when the provider cannot (`agent_release_patch`, the hook, the
     finalizer).
   * It sets the AgentMachine's — and so the Machine's — `spec.providerID` to
@@ -296,7 +296,7 @@ def _describe(condition: dict[str, Any]) -> str:
 
 
 def machine_state(machine: dict[str, Any] | None) -> MachineState:
-    """A Machine as uninstall-server watches it; found=False for None."""
+    """A Machine as uninstall-server-from-hc watches it; found=False for None."""
     if machine is None:
         return MachineState(found=False)
     metadata = _metadata(machine)

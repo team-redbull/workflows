@@ -1,21 +1,21 @@
-"""Replay: every history install-server records must replay on the current code.
+"""Replay: every history add-server-to-mce records must replay on the current code.
 
-Production install-server runs are in flight whenever a brain is deployed — an
+Production add-server-to-mce runs are in flight whenever a brain is deployed — an
 Agent wait alone is an hour per candidate — so a change to the commands a
 recorded run issued (an activity added before an existing one, a branch taken
 differently) fails that run on its next replay with a non-determinism error.
 The only cure is `workflow.patched()`. Two sources of histories catch it:
 
   1. histories recorded HERE, from scenarios on the mock limbs of
-     tests/test_install_server_workflow.py, replayed at once: they catch
+     tests/test_add_server_to_mce_workflow.py, replayed at once: they catch
      non-determinism inside the code (a clock, a random, a set's order);
-  2. GOLDEN histories in tests/histories/install_server/, recorded by earlier
+  2. GOLDEN histories in tests/histories/add_server_to_mce/, recorded by earlier
      code and committed: they catch a change that would break a run in flight.
      When this fails, the change needs `workflow.patched()` — do NOT re-record.
      Recording writes ONLY the scenarios that have no golden file yet, so a new
      scenario gets one and an old shape is never overwritten by accident:
 
-         UPDATE_REPLAY_HISTORIES=1 .venv/bin/pytest tests/test_install_server_replay.py
+         UPDATE_REPLAY_HISTORIES=1 .venv/bin/pytest tests/test_add_server_to_mce_replay.py
 
      Re-record an existing one (delete its file first) only once no run of
      that shape can still exist.
@@ -23,6 +23,12 @@ The only cure is `workflow.patched()`. Two sources of histories catch it:
 The golden set was first recorded on the workflow as it stood before
 `allow_unhealthy`, the NMStateConfig replacement and the own-lock re-run, so
 each of those patches is proven against the shape production runs have.
+
+The workflow was install-server until 2026-11-01. Those goldens stay where they
+were recorded, in tests/histories/install_server/ (LEGACY_GOLDEN), as runs of
+type `InstallServerWorkflow`: replayed by the legacy subclass, they prove a run
+started before the rename finishes on the renamed code. The goldens recorded
+since, under the new type, are in tests/histories/add_server_to_mce/.
 """
 
 from __future__ import annotations
@@ -40,18 +46,18 @@ from temporalio.client import WorkflowFailureError, WorkflowHistory
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.worker import Replayer
 
-from shared.consts import INSTALL_SERVER_WORKFLOW_QUEUE
+from shared.consts import ADD_SERVER_TO_MCE_WORKFLOW_QUEUE
 from shared.exceptions import (
     BmhConflictError,
     ServerLooksInstalledError,
     ServerNotAvailableError,
 )
 from shared.models.server_lifecycle import (
-    InstallServerInput,
-    InstallServerRunArgs,
+    AddServerToMceInput,
+    AddServerToMceRunArgs,
     ServerLockRecord,
 )
-from tests.test_install_server_workflow import (
+from tests.test_add_server_to_mce_workflow import (
     INPUT,
     SERVER_NAME,
     _application_error,
@@ -66,9 +72,14 @@ from tests.test_install_server_workflow import (
     scan_record,
     ucs_server,
 )
-from workflow_domains.server_lifecycle.install_server import InstallServerWorkflow
+from workflow_domains.server_lifecycle.add_server_to_mce import (
+    AddServerToMceWorkflow,
+    InstallServerWorkflow,
+)
 
-GOLDEN = pathlib.Path(__file__).parent / "histories" / "install_server"
+GOLDEN = pathlib.Path(__file__).parent / "histories" / "add_server_to_mce"
+# Recorded as install-server, before the rename: never re-recorded, only replayed.
+LEGACY_GOLDEN = pathlib.Path(__file__).parent / "histories" / "install_server"
 _RECORD = os.environ.get("UPDATE_REPLAY_HISTORIES") == "1"
 
 _BLADE = "ocp-cisco-m6-bat-yam-64c-512gb-FCH0001"
@@ -78,7 +89,7 @@ _CONFLICT = BmhConflictError(
 )
 
 
-def _named(server_name: str) -> InstallServerInput:
+def _named(server_name: str) -> AddServerToMceInput:
     return INPUT.model_copy(update={"server_name": server_name})
 
 
@@ -87,7 +98,7 @@ class Scenario:
     """One run: the mock limbs' behaviour, the input, and how it must end."""
 
     mocks: dict[str, Any] = field(default_factory=dict)
-    input: InstallServerInput = field(default_factory=lambda: INPUT)
+    input: AddServerToMceInput = field(default_factory=lambda: INPUT)
     # The ApplicationError type the run fails with; None = it completes.
     fails_with: str | None = None
 
@@ -155,8 +166,8 @@ SCENARIOS: dict[str, Callable[[], Scenario]] = {
                 health=_FINE,
                 lock=ServerLockRecord(
                     live=True,
-                    holder="install-server",
-                    workflow_id="install-server-replay-named-own-lock-rerun",
+                    holder="add-server-to-mce",
+                    workflow_id="add-server-to-mce-replay-named-own-lock-rerun",
                 ),
             ),
         },
@@ -197,7 +208,11 @@ def _scrubbed(node: Any) -> Any:
 
 
 def _replayer() -> Replayer:
-    return Replayer(workflows=[InstallServerWorkflow], data_converter=pydantic_data_converter)
+    # Each history picks its class by the workflow type it recorded.
+    return Replayer(
+        workflows=[AddServerToMceWorkflow, InstallServerWorkflow],
+        data_converter=pydantic_data_converter,
+    )
 
 
 async def _record(name: str) -> WorkflowHistory:
@@ -205,10 +220,10 @@ async def _record(name: str) -> WorkflowHistory:
     _, segment_acts, server_acts = make_mock_activities(**scenario.mocks)
     async with _Harness(segment_acts, server_acts) as client:
         handle = await client.start_workflow(
-            InstallServerWorkflow.run,
-            InstallServerRunArgs(input=scenario.input),
-            id=f"install-server-replay-{name}",
-            task_queue=INSTALL_SERVER_WORKFLOW_QUEUE,
+            AddServerToMceWorkflow.run,
+            AddServerToMceRunArgs(input=scenario.input),
+            id=f"add-server-to-mce-replay-{name}",
+            task_queue=ADD_SERVER_TO_MCE_WORKFLOW_QUEUE,
         )
         if scenario.fails_with is None:
             await asyncio.wait_for(handle.result(), timeout=60)
@@ -240,15 +255,15 @@ async def test_every_run_a_scenario_records_replays(scenario):
 
 
 def _golden_files() -> list[pathlib.Path]:
-    return sorted(GOLDEN.glob("*.json"))
+    return sorted([*GOLDEN.glob("*.json"), *LEGACY_GOLDEN.glob("*.json")])
 
 
 def test_there_are_golden_histories():
-    """No committed history protects nothing in flight."""
-    assert _golden_files()
+    """No committed history protects nothing in flight — under either name."""
+    assert sorted(GOLDEN.glob("*.json")) and sorted(LEGACY_GOLDEN.glob("*.json"))
 
 
-@pytest.mark.parametrize("path", _golden_files(), ids=lambda p: p.stem)
+@pytest.mark.parametrize("path", _golden_files(), ids=lambda p: f"{p.parent.name}/{p.stem}")
 async def test_golden_histories_replay_on_the_current_code(path):
     recorded = json.loads(path.read_text())
     history = WorkflowHistory.from_json(recorded["workflow_id"], recorded["history"])

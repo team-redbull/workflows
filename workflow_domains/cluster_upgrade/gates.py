@@ -70,7 +70,7 @@ _ZONED_SOAK_MINUTES = 30
 _GENERIC_SOAK_MINUTES = 0
 
 # How long one InPlace batch of nodes may take: drain, the MachineConfig, a
-# bare-metal reboot. The hour install-server allows a bare-metal POST and boot.
+# bare-metal reboot. The hour add-server-to-mce allows a bare-metal POST and boot.
 PER_BATCH_MINUTES = 60
 
 # The waves whose clusters may run without a person: lab and canary. Three

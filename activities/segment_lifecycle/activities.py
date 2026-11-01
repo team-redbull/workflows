@@ -393,7 +393,7 @@ async def append_allocation_to_cluster_values(
 
 # --- shared with the server-lifecycle domain --------------------------------
 
-# The Segments Manager's own name for an MCE's inventory network. install-server
+# The Segments Manager's own name for an MCE's inventory network. add-server-to-mce
 # tags every NMStateConfig with the VLAN of the segment carrying this type. One
 # type, because there is one inventory scope per cluster: the class-per-BMC-
 # protocol split (INVENTORY_REDFISH / INVENTORY_IPMI) is reverted on both sides.

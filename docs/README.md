@@ -22,7 +22,7 @@ docs/
       allocate-segment.html
       release-segment.html
     server-lifecycle/
-      install-server.html
+      add-server-to-mce.html
     server-provisioning/
       provision-dell-server.html
     cluster-upgrade/
@@ -45,7 +45,7 @@ docs/
 A workflow that has no page yet gets `href: null`. It renders as a non-clickable
 *planned* row in both places — visible, but never a dead link.
 
-Domains and workflows in the catalogue that are not built yet (`uninstall-server`)
+Domains and workflows in the catalogue that are not built yet (`uninstall-server-from-hc`)
 are there to show the shape the catalogue takes as it grows; delete them once real ones
 replace them.
 

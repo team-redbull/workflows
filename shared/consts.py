@@ -12,8 +12,9 @@ SEGMENT_LIFECYCLE_ACTIVITY_QUEUE = "segment-lifecycle-activity"
 
 # -- Server-lifecycle domain --
 # Same split as above for the WORKFLOW queue — each workflow gets its own, and
-# every one of them (install, remove, uninstall, publish-infraenv-boot) runs
-# its activities on the same per-MCE limb.
+# every one of them (add-server-to-mce, remove-server-from-mce,
+# uninstall-server-from-hc, publish-infraenv-to-pxe-server) runs its activities
+# on the same per-MCE limb.
 #
 # The ACTIVITY queue is NOT the same, and this is the one place the pattern
 # differs. It is scoped to the domain AND to one MCE cluster, because these
@@ -33,10 +34,18 @@ SEGMENT_LIFECYCLE_ACTIVITY_QUEUE = "segment-lifecycle-activity"
 # It also makes a whole class of mistake impossible: the queue name IS the
 # target, so the MCE whose VLAN is used and the cluster written to cannot
 # disagree.
-INSTALL_SERVER_WORKFLOW_QUEUE = "install-server-workflow"
-REMOVE_SERVER_WORKFLOW_QUEUE = "remove-server-workflow"
-UNINSTALL_SERVER_WORKFLOW_QUEUE = "uninstall-server-workflow"
-PUBLISH_INFRAENV_BOOT_WORKFLOW_QUEUE = "publish-infraenv-boot-workflow"
+ADD_SERVER_TO_MCE_WORKFLOW_QUEUE = "add-server-to-mce-workflow"
+REMOVE_SERVER_FROM_MCE_WORKFLOW_QUEUE = "remove-server-from-mce-workflow"
+UNINSTALL_SERVER_FROM_HC_WORKFLOW_QUEUE = "uninstall-server-from-hc-workflow"
+PUBLISH_INFRAENV_TO_PXE_SERVER_WORKFLOW_QUEUE = "publish-infraenv-to-pxe-server-workflow"
+# The four were install-server, remove-server, uninstall-server and
+# publish-infraenv-boot until 2026-11-01. A run started before the renames is
+# its OLD workflow type on its OLD queue and replays only there, so the brain
+# keeps polling these until none is left open — then they go.
+LEGACY_INSTALL_SERVER_WORKFLOW_QUEUE = "install-server-workflow"
+LEGACY_REMOVE_SERVER_WORKFLOW_QUEUE = "remove-server-workflow"
+LEGACY_UNINSTALL_SERVER_WORKFLOW_QUEUE = "uninstall-server-workflow"
+LEGACY_PUBLISH_INFRAENV_BOOT_WORKFLOW_QUEUE = "publish-infraenv-boot-workflow"
 SERVER_LIFECYCLE_ACTIVITY_QUEUE = "server-lifecycle-activity"
 
 

@@ -1,6 +1,6 @@
 """Which two NICs of a candidate server carry the bond — pure, deterministic.
 
-Split out of install_server.py because it is POLICY, not orchestration: it makes
+Split out of add_server_to_mce.py because it is POLICY, not orchestration: it makes
 no activity call, reads no clock and touches no I/O, so it is the one part of
 that workflow which can be unit-tested with no Temporal environment at all. The
 workflow file is then only the shape of the run.
@@ -36,7 +36,7 @@ with workflow.unsafe.imports_passed_through():
 # No NIC count is asked of server-scan: /servers/available already requires the
 # network health category HEALTHY, i.e. at least two links observed up.
 #
-# `allow_link_down` (install-server's hidden `allow_unhealthy`, CLAUDE.md §4)
+# `allow_link_down` (add-server-to-mce's hidden `allow_unhealthy`, CLAUDE.md §4)
 # relaxes ONLY the link state. The bond keeps its two members on two distinct
 # physical ports — a bond with one member DOWN, which the fabric's LAG carries
 # on the remaining link — and never becomes bmhgen's non-bonded layout above.

@@ -1,4 +1,4 @@
-"""The three Kubernetes resources install-server writes, checked as structures.
+"""The three Kubernetes resources add-server-to-mce writes, checked as structures.
 
 These are what the Assisted Installer actually consumes, so the shape matters
 more than the code path that produces it — and resource NAMES are checked

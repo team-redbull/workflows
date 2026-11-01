@@ -404,7 +404,7 @@ class TestPublishInfraEnvBoot:
 
     @respx.mock
     async def test_without_a_server_the_current_image_is_published_no_nmstate_read(self, cluster):
-        # publish-infraenv-boot: an image from BEFORE any host's NMStateConfig
+        # publish-infraenv-to-pxe-server: an image from BEFORE any host's NMStateConfig
         # is still the InfraEnv's current one, and that is what is asked for.
         reads = cluster({"infraenvs": _image(created_at="2026-10-19T09:00:00Z")})
         route = respx.put(ENTRY).mock(return_value=httpx.Response(200))

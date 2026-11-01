@@ -26,7 +26,7 @@ from workflow_domains.server_lifecycle.health_waiver import (
     safety_refusal,
 )
 
-RUN = "install-server-ocp4-mce-a_ocp-x"
+RUN = "add-server-to-mce-ocp4-mce-a_ocp-x"
 
 
 def _server(*links: LinkState) -> AcquiredServer:
@@ -96,7 +96,7 @@ class TestSafetyIsNeverWaived:
 
     def test_another_runs_live_lock(self):
         lock = ServerLockRecord(
-            live=True, holder="install-server", workflow_id="other", mce_cluster="ocp4-b",
+            live=True, holder="add-server-to-mce", workflow_id="other", mce_cluster="ocp4-b",
             expires_at="2026-10-31T12:00:00Z",
         )
         refusal = safety_refusal(_record(lock=lock), RUN)
@@ -104,12 +104,12 @@ class TestSafetyIsNeverWaived:
         assert "'other'" in refusal.reason and "ocp4-b" in refusal.reason
 
     def test_its_own_live_lock_is_no_reason(self):
-        own = ServerLockRecord(live=True, holder="install-server", workflow_id=RUN)
+        own = ServerLockRecord(live=True, holder="add-server-to-mce", workflow_id=RUN)
         assert safety_refusal(_record(lock=own), RUN) is None
         assert holds_own_lock(_record(lock=own), RUN) is True
 
     def test_an_expired_lock_is_no_reason(self):
-        stale = ServerLockRecord(live=False, holder="install-server", workflow_id="other")
+        stale = ServerLockRecord(live=False, holder="add-server-to-mce", workflow_id="other")
         assert safety_refusal(_record(lock=stale), RUN) is None
         assert holds_own_lock(_record(lock=stale), RUN) is False
 

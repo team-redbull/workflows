@@ -1,7 +1,7 @@
-"""Workflow tests: real InstallServerWorkflow, mock activities, time-skipping env.
+"""Workflow tests: real AddServerToMceWorkflow, mock activities, time-skipping env.
 
 Same harness shape as tests/test_allocate_segment_workflow.py, with one extra
-worker: install-server spans TWO activity queues, because the inventory VLAN is
+worker: add-server-to-mce spans TWO activity queues, because the inventory VLAN is
 read through a segment-lifecycle activity on that domain's limb rather than by
 this domain holding a second copy of the Segments Manager token.
 
@@ -24,7 +24,7 @@ from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
 from shared.consts import (
-    INSTALL_SERVER_WORKFLOW_QUEUE,
+    ADD_SERVER_TO_MCE_WORKFLOW_QUEUE,
     SEGMENT_LIFECYCLE_ACTIVITY_QUEUE,
     server_lifecycle_activity_queue,
 )
@@ -43,6 +43,8 @@ from shared.models.segment_lifecycle import SegmentEntry, SegmentType
 from shared.models.server_lifecycle import (
     AcquiredServer,
     AcquireServerRequest,
+    AddServerToMceInput,
+    AddServerToMceRunArgs,
     AgentRef,
     AgentState,
     BmcEndpoint,
@@ -55,8 +57,6 @@ from shared.models.server_lifecycle import (
     InfraEnvRef,
     InfraEnvState,
     InstallCandidateRecord,
-    InstallServerInput,
-    InstallServerRunArgs,
     LinkState,
     NmStateConfigReplacement,
     NmStateConfigReplaceRequest,
@@ -73,7 +73,7 @@ from shared.models.server_lifecycle import (
     ServerReservation,
     TeardownResult,
 )
-from workflow_domains.server_lifecycle.install_server import InstallServerWorkflow
+from workflow_domains.server_lifecycle.add_server_to_mce import AddServerToMceWorkflow
 
 INFRA_ENV = "cisco-m6-bat-yam-64c-512gb"
 MCE_CLUSTER = "ocp4-mce-bat-yam-01"
@@ -85,7 +85,7 @@ NAMESPACE = "multicluster-engine"
 VLAN_ID = 24
 SERVER_NAME = "ocp-dell-r650-tlv-64c-1024gb-DEL0000485"
 
-INPUT = InstallServerInput(
+INPUT = AddServerToMceInput(
     infra_env=INFRA_ENV, mce_cluster=MCE_CLUSTER, namespace=NAMESPACE
 )
 
@@ -496,7 +496,7 @@ def make_mock_activities(
             del locks[request.server_id]
         if request.server_name in held_elsewhere:
             raise ServerReservedError(
-                f"{request.server_name} is reserved by 'install-server' for MCE "
+                f"{request.server_name} is reserved by 'add-server-to-mce' for MCE "
                 "'ocp4-mce-other'"
             )
         # server-scan's rule (reservation_service.py there): a live lock is
@@ -506,7 +506,7 @@ def make_mock_activities(
         held_by = locks.get(request.server_id)
         if held_by is not None and held_by != request.workflow_id:
             raise ServerReservedError(
-                f"{request.server_name} is reserved by 'install-server' (run {held_by!r})"
+                f"{request.server_name} is reserved by 'add-server-to-mce' (run {held_by!r})"
             )
         locks[request.server_id] = request.workflow_id
         return ServerReservation(
@@ -563,8 +563,8 @@ class _Harness:
         self._workers = [
             Worker(
                 client,
-                task_queue=INSTALL_SERVER_WORKFLOW_QUEUE,
-                workflows=[InstallServerWorkflow],
+                task_queue=ADD_SERVER_TO_MCE_WORKFLOW_QUEUE,
+                workflows=[AddServerToMceWorkflow],
             ),
             Worker(
                 client,
@@ -587,13 +587,13 @@ class _Harness:
         await self._env.__aexit__(*exc_info)
 
 
-async def _execute(client: Client, args: InstallServerRunArgs):
+async def _execute(client: Client, args: AddServerToMceRunArgs):
     return await asyncio.wait_for(
         client.execute_workflow(
-            InstallServerWorkflow.run,
+            AddServerToMceWorkflow.run,
             args,
             id=f"test-{uuid.uuid4()}",
-            task_queue=INSTALL_SERVER_WORKFLOW_QUEUE,
+            task_queue=ADD_SERVER_TO_MCE_WORKFLOW_QUEUE,
         ),
         timeout=60,  # real seconds — a misclassified error would retry forever
     )
@@ -611,7 +611,7 @@ def _application_error(exc: WorkflowFailureError) -> ApplicationError:
 async def test_happy_path_resolves_vlan_acquires_creates_and_awaits_the_agent():
     calls, segment_acts, server_acts = make_mock_activities()
     async with _Harness(segment_acts, server_acts) as client:
-        result = await _execute(client, InstallServerRunArgs(input=INPUT))
+        result = await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
     assert result.server_name == SERVER_NAME
     assert result.vlan_id == VLAN_ID
@@ -637,7 +637,7 @@ async def test_happy_path_resolves_vlan_acquires_creates_and_awaits_the_agent():
 async def test_the_infraenv_becomes_the_server_query():
     calls, segment_acts, server_acts = make_mock_activities()
     async with _Harness(segment_acts, server_acts) as client:
-        await _execute(client, InstallServerRunArgs(input=INPUT))
+        await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
     request = calls["acquire_servers"][0]
     # Escaped, because the InfraEnv name is caller data going into a regex that
@@ -652,7 +652,7 @@ async def test_an_explicit_server_name_bypasses_the_pattern():
     calls, segment_acts, server_acts = make_mock_activities()
     named = INPUT.model_copy(update={"server_name": SERVER_NAME})
     async with _Harness(segment_acts, server_acts) as client:
-        await _execute(client, InstallServerRunArgs(input=named))
+        await _execute(client, AddServerToMceRunArgs(input=named))
 
     request = calls["acquire_servers"][0]
     assert request.name == SERVER_NAME
@@ -665,7 +665,7 @@ async def test_the_vlan_comes_from_the_mce_segment_not_the_caller():
         segment=INVENTORY_SEGMENT.model_copy(update={"vlan_id": 777})
     )
     async with _Harness(segment_acts, server_acts) as client:
-        result = await _execute(client, InstallServerRunArgs(input=INPUT))
+        result = await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
     assert result.vlan_id == 777
     for kind in ("create_baremetal_host", "create_nmstate_config"):
@@ -680,7 +680,7 @@ async def test_a_segment_allocated_to_another_cluster_is_refused():
     )
     async with _Harness(segment_acts, server_acts) as client:
         with pytest.raises(WorkflowFailureError) as excinfo:
-            await _execute(client, InstallServerRunArgs(input=INPUT))
+            await _execute(client, AddServerToMceRunArgs(input=INPUT))
     assert _application_error(excinfo.value).type == "InventorySegmentMismatchError"
 
 
@@ -698,7 +698,7 @@ class TestTheInventoryNetworkIsOneScopePerCluster:
     async def test_the_lookup_is_the_cluster_name_and_nothing_else(self) -> None:
         calls, segment_acts, server_acts = make_mock_activities()
         async with _Harness(segment_acts, server_acts) as client:
-            await _execute(client, InstallServerRunArgs(input=INPUT))
+            await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
         assert calls["get_inventory_segment"] == [MCE_CLUSTER]
 
@@ -711,7 +711,7 @@ class TestTheInventoryNetworkIsOneScopePerCluster:
         ucs = bondable_server().model_copy(update={"bmc_vendor": "CISCO"})
         calls, segment_acts, server_acts = make_mock_activities(candidates=[ucs])
         async with _Harness(segment_acts, server_acts) as client:
-            result = await _execute(client, InstallServerRunArgs(input=INPUT))
+            result = await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
         assert result.vlan_id == VLAN_ID
         assert calls["get_inventory_segment"] == [MCE_CLUSTER]
@@ -730,7 +730,7 @@ class TestTheInventoryNetworkIsOneScopePerCluster:
             candidates=pool, already_installed={"ocp-a", "ocp-b"}
         )
         async with _Harness(segment_acts, server_acts) as client:
-            result = await _execute(client, InstallServerRunArgs(input=INPUT))
+            result = await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
         assert result.server_name == "ocp-c"
         assert calls["get_inventory_segment"] == [MCE_CLUSTER]
@@ -752,7 +752,7 @@ class TestTheInventoryNetworkIsOneScopePerCluster:
         )
         async with _Harness(segment_acts, server_acts) as client:
             with pytest.raises(WorkflowFailureError) as excinfo:
-                await _execute(client, InstallServerRunArgs(input=INPUT))
+                await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
         assert (
             _application_error(excinfo.value).type
@@ -768,7 +768,7 @@ async def test_no_assignable_server_fails_fast():
     )
     async with _Harness(segment_acts, server_acts) as client:
         with pytest.raises(WorkflowFailureError) as excinfo:
-            await _execute(client, InstallServerRunArgs(input=INPUT))
+            await _execute(client, AddServerToMceRunArgs(input=INPUT))
     assert _application_error(excinfo.value).type == "ServerNotAvailableError"
 
 
@@ -780,7 +780,7 @@ async def test_npar_partitions_are_never_bonded():
     )
     async with _Harness(segment_acts, server_acts) as client:
         with pytest.raises(WorkflowFailureError) as excinfo:
-            await _execute(client, InstallServerRunArgs(input=INPUT))
+            await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
     error = _application_error(excinfo.value)
     assert error.type == "NoBondableInterfacesError"
@@ -791,7 +791,7 @@ async def test_a_oneview_candidate_fails_visibly_not_silently():
     _, segment_acts, server_acts = make_mock_activities(candidates=[oneview_server()])
     async with _Harness(segment_acts, server_acts) as client:
         with pytest.raises(WorkflowFailureError) as excinfo:
-            await _execute(client, InstallServerRunArgs(input=INPUT))
+            await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
     error = _application_error(excinfo.value)
     assert error.type == "NoBondableInterfacesError"
@@ -808,7 +808,7 @@ async def test_an_unusable_candidate_is_stepped_over_for_the_next():
         candidates=[oneview_server(), npar_server(), bondable_server("srv_good")]
     )
     async with _Harness(segment_acts, server_acts) as client:
-        result = await _execute(client, InstallServerRunArgs(input=INPUT))
+        result = await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
     assert result.server_id == "srv_good"
     assert calls["create_baremetal_host"][0].server_name == SERVER_NAME
@@ -825,7 +825,7 @@ async def test_a_standalone_server_is_refused_rather_than_guessed():
     calls, segment_acts, server_acts = make_mock_activities(candidates=[standalone])
     async with _Harness(segment_acts, server_acts) as client:
         with pytest.raises(WorkflowFailureError) as excinfo:
-            await _execute(client, InstallServerRunArgs(input=INPUT))
+            await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
     assert _application_error(excinfo.value).type == "UnknownBmcVendorError"
     assert calls["create_bmc_secret"] == []
@@ -834,7 +834,7 @@ async def test_a_standalone_server_is_refused_rather_than_guessed():
 async def test_a_rerun_over_existing_resources_succeeds_and_reports_no_change():
     _, segment_acts, server_acts = make_mock_activities(resources_exist=True)
     async with _Harness(segment_acts, server_acts) as client:
-        result = await _execute(client, InstallServerRunArgs(input=INPUT))
+        result = await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
     assert result.resources_changed is False
     assert result.bmh_registered is True
@@ -855,7 +855,7 @@ async def test_a_host_that_never_produces_an_agent_is_rolled_back_and_retried():
         candidates=[doomed, good], agent_never_for={"ocp-doomed"}
     )
     async with _Harness(segment_acts, server_acts) as client:
-        result = await _execute(client, InstallServerRunArgs(input=INPUT))
+        result = await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
     assert result.server_name == SERVER_NAME
     assert result.attempts == 2
@@ -877,7 +877,7 @@ async def test_a_whole_pool_without_agents_fails_and_tears_every_one_down():
     )
     async with _Harness(segment_acts, server_acts) as client:
         with pytest.raises(WorkflowFailureError) as excinfo:
-            await _execute(client, InstallServerRunArgs(input=INPUT))
+            await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
     error = _application_error(excinfo.value)
     assert error.type == "AgentNeverAppearedError"
@@ -892,7 +892,7 @@ async def test_an_agent_that_takes_its_time_is_waited_for():
     """Bare metal POSTs for longer than a VM takes to boot; that is not a failure."""
     calls, segment_acts, server_acts = make_mock_activities(agent_after_polls=20)
     async with _Harness(segment_acts, server_acts) as client:
-        result = await _execute(client, InstallServerRunArgs(input=INPUT))
+        result = await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
     assert result.attempts == 1
     assert result.bmh_registered is True
@@ -910,7 +910,7 @@ async def test_the_agent_is_looked_for_by_bond_mac_not_by_name():
     """
     calls, segment_acts, server_acts = make_mock_activities()
     async with _Harness(segment_acts, server_acts) as client:
-        await _execute(client, InstallServerRunArgs(input=INPUT))
+        await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
     looked_up = calls["find_agent_for_host"][0]
     created = calls["create_baremetal_host"][0]
@@ -941,7 +941,7 @@ async def test_a_registration_error_points_the_failure_at_the_bmc():
     )
     async with _Harness(segment_acts, server_acts) as client:
         with pytest.raises(WorkflowFailureError) as excinfo:
-            await _execute(client, InstallServerRunArgs(input=INPUT))
+            await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
     message = str(_application_error(excinfo.value))
     assert "registration error" in message
@@ -961,7 +961,7 @@ async def test_without_a_registration_error_the_failure_points_at_the_network():
     )
     async with _Harness(segment_acts, server_acts) as client:
         with pytest.raises(WorkflowFailureError) as excinfo:
-            await _execute(client, InstallServerRunArgs(input=INPUT))
+            await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
     message = str(_application_error(excinfo.value))
     assert "bond" in message and "VLAN" in message and "DHCP" in message
@@ -972,7 +972,7 @@ async def test_resources_are_created_in_dependency_order():
     # The BareMetalHost references the Secret by name, so the Secret goes first.
     calls, segment_acts, server_acts = make_mock_activities()
     async with _Harness(segment_acts, server_acts) as client:
-        await _execute(client, InstallServerRunArgs(input=INPUT))
+        await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
     assert len(calls["create_bmc_secret"]) == 1
     assert len(calls["create_baremetal_host"]) == 1
@@ -994,7 +994,7 @@ async def test_a_candidate_that_already_has_a_baremetalhost_is_skipped():
         candidates=[taken, free], already_installed={"ocp-taken"}
     )
     async with _Harness(segment_acts, server_acts) as client:
-        result = await _execute(client, InstallServerRunArgs(input=INPUT))
+        result = await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
     assert result.server_name == SERVER_NAME
     assert [c.server_name for c in calls["create_baremetal_host"]] == [SERVER_NAME]
@@ -1013,7 +1013,7 @@ async def test_a_candidate_kubernetes_cannot_name_is_skipped_not_fatal():
     good = bondable_server("srv_good")
     calls, segment_acts, server_acts = make_mock_activities(candidates=[bad, good])
     async with _Harness(segment_acts, server_acts) as client:
-        result = await _execute(client, InstallServerRunArgs(input=INPUT))
+        result = await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
     assert result.server_name == SERVER_NAME
     # Never even probed: the probe itself would have raised on the name.
@@ -1027,7 +1027,7 @@ async def test_a_pool_of_unnameable_candidates_says_to_rename_them():
     calls, segment_acts, server_acts = make_mock_activities(candidates=[bad])
     async with _Harness(segment_acts, server_acts) as client:
         with pytest.raises(WorkflowFailureError) as excinfo:
-            await _execute(client, InstallServerRunArgs(input=INPUT))
+            await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
     error = _application_error(excinfo.value)
     # Every candidate was rejected for the SAME reason, so the failure names it
@@ -1045,7 +1045,7 @@ async def test_every_candidate_already_installed_fails_rather_than_reporting_suc
     )
     async with _Harness(segment_acts, server_acts) as client:
         with pytest.raises(WorkflowFailureError) as excinfo:
-            await _execute(client, InstallServerRunArgs(input=INPUT))
+            await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
     error = _application_error(excinfo.value)
     assert error.type == "NoBondableInterfacesError"
@@ -1055,7 +1055,7 @@ async def test_every_candidate_already_installed_fails_rather_than_reporting_suc
 
 async def test_an_explicitly_named_server_is_converged_not_skipped():
     """Naming a server asks for THAT machine, so an existing host is the point."""
-    named = InstallServerInput(
+    named = AddServerToMceInput(
         infra_env=INFRA_ENV, mce_cluster=MCE_CLUSTER, namespace=NAMESPACE,
         server_name=SERVER_NAME,
     )
@@ -1063,7 +1063,7 @@ async def test_an_explicitly_named_server_is_converged_not_skipped():
         candidates=[bondable_server()], already_installed={SERVER_NAME}
     )
     async with _Harness(segment_acts, server_acts) as client:
-        result = await _execute(client, InstallServerRunArgs(input=named))
+        result = await _execute(client, AddServerToMceRunArgs(input=named))
 
     assert result.server_name == SERVER_NAME
     assert len(calls["create_baremetal_host"]) == 1
@@ -1082,7 +1082,7 @@ async def test_a_malformed_mac_fails_before_any_resource_is_written():
     calls, segment_acts, server_acts = make_mock_activities(candidates=[broken])
     async with _Harness(segment_acts, server_acts) as client:
         with pytest.raises(WorkflowFailureError) as excinfo:
-            await _execute(client, InstallServerRunArgs(input=INPUT))
+            await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
     error = _application_error(excinfo.value)
     assert error.type == "InvalidMacError"
@@ -1104,7 +1104,7 @@ async def test_a_server_with_no_bmc_host_fails_in_seconds_not_in_ten_minutes():
     calls, segment_acts, server_acts = make_mock_activities(candidates=[hostless])
     async with _Harness(segment_acts, server_acts) as client:
         with pytest.raises(WorkflowFailureError) as excinfo:
-            await _execute(client, InstallServerRunArgs(input=INPUT))
+            await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
     error = _application_error(excinfo.value)
     assert error.type == "BmcEndpointMissingError"
@@ -1138,7 +1138,7 @@ class TestPerMceRouting:
         # anywhere else the run could not finish.
         calls, segment_acts, server_acts = make_mock_activities()
         async with _Harness(segment_acts, server_acts, MCE_ACTIVITY_QUEUE) as client:
-            result = await _execute(client, InstallServerRunArgs(input=INPUT))
+            result = await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
         assert result.server_name == SERVER_NAME
         assert len(calls["create_baremetal_host"]) == 1
@@ -1155,20 +1155,20 @@ class TestPerMceRouting:
         # The segment has to match the MCE asked for, or the workflow's own
         # mismatch guard fires first and we never reach the routing.
         matching = INVENTORY_SEGMENT.model_copy(update={"cluster_name": other_mce})
-        other = InstallServerInput(
+        other = AddServerToMceInput(
             infra_env=INFRA_ENV, mce_cluster=other_mce, namespace=NAMESPACE
         )
         calls, segment_acts, server_acts = make_mock_activities(segment=matching)
         async with _Harness(segment_acts, server_acts, MCE_ACTIVITY_QUEUE) as client:
             handle = await client.start_workflow(
-                InstallServerWorkflow.run,
-                InstallServerRunArgs(input=other),
+                AddServerToMceWorkflow.run,
+                AddServerToMceRunArgs(input=other),
                 id=f"test-{uuid.uuid4()}",
-                task_queue=INSTALL_SERVER_WORKFLOW_QUEUE,
+                task_queue=ADD_SERVER_TO_MCE_WORKFLOW_QUEUE,
             )
             with pytest.raises(asyncio.TimeoutError):
                 await asyncio.wait_for(handle.result(), timeout=5)
-            progress = await handle.query(InstallServerWorkflow.progress)
+            progress = await handle.query(AddServerToMceWorkflow.progress)
 
         # Nothing reached this MCE's worker...
         assert calls["acquire_servers"] == []
@@ -1183,7 +1183,7 @@ class TestPerMceRouting:
     async def test_the_result_still_reports_which_mce_was_targeted(self) -> None:
         calls, segment_acts, server_acts = make_mock_activities()
         async with _Harness(segment_acts, server_acts) as client:
-            result = await _execute(client, InstallServerRunArgs(input=INPUT))
+            result = await _execute(client, AddServerToMceRunArgs(input=INPUT))
         assert result.mce_cluster == MCE_CLUSTER
         assert len(calls["create_baremetal_host"]) == 1
 
@@ -1199,13 +1199,13 @@ class TestTheInstallLock:
     async def test_the_chosen_machine_is_locked_renewed_and_held_after_success(self):
         calls, segment_acts, server_acts = make_mock_activities()
         async with _Harness(segment_acts, server_acts) as client:
-            result = await _execute(client, InstallServerRunArgs(input=INPUT))
+            result = await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
         claims = calls["reserve_server"]
         # Taken, renewed as the Agent wait begins, then held for a day.
         assert [c.ttl_seconds for c in claims] == [7200, 7200, 86_400]
         assert {c.server_id for c in claims} == {"srv_001"}
-        assert {c.holder for c in claims} == {"install-server"}
+        assert {c.holder for c in claims} == {"add-server-to-mce"}
         # One workflow id across all three: server-scan EXTENDS a lock its own
         # run re-takes, and treats anyone else's as a lost race.
         assert len({c.workflow_id for c in claims}) == 1
@@ -1223,7 +1223,7 @@ class TestTheInstallLock:
             candidates=[held, free], reserved_elsewhere={"ocp-held"}
         )
         async with _Harness(segment_acts, server_acts) as client:
-            result = await _execute(client, InstallServerRunArgs(input=INPUT))
+            result = await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
         assert result.server_name == SERVER_NAME
         # A refused lock is not an attempt: nothing was installed or watched.
@@ -1237,7 +1237,7 @@ class TestTheInstallLock:
         )
         async with _Harness(segment_acts, server_acts) as client:
             with pytest.raises(WorkflowFailureError) as excinfo:
-                await _execute(client, InstallServerRunArgs(input=INPUT))
+                await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
         error = _application_error(excinfo.value)
         assert error.type == "ServerReservedError"
@@ -1250,7 +1250,7 @@ class TestTheInstallLock:
             candidates=[gone, bondable_server()], gone_from_inventory={"ocp-gone"}
         )
         async with _Harness(segment_acts, server_acts) as client:
-            result = await _execute(client, InstallServerRunArgs(input=INPUT))
+            result = await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
         assert result.server_name == SERVER_NAME
         assert [c.server_name for c in calls["create_bmc_secret"]] == [SERVER_NAME]
@@ -1263,7 +1263,7 @@ class TestTheInstallLock:
             already_installed={"ocp-a"},
         )
         async with _Harness(segment_acts, server_acts) as client:
-            await _execute(client, InstallServerRunArgs(input=INPUT))
+            await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
         assert {c.server_name for c in calls["reserve_server"]} == {SERVER_NAME}
 
@@ -1273,11 +1273,11 @@ class TestTheInstallLock:
             candidates=[doomed, bondable_server()], agent_never_for={"ocp-doomed"}
         )
         async with _Harness(segment_acts, server_acts) as client:
-            await _execute(client, InstallServerRunArgs(input=INPUT))
+            await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
         released = calls["release_server"]
         assert [r.server_id for r in released] == ["srv_doomed"]
-        assert released[0].holder == "install-server"
+        assert released[0].holder == "add-server-to-mce"
         assert released[0].workflow_id == calls["reserve_server"][0].workflow_id
 
     async def test_a_lock_lost_before_the_agent_wait_rolls_back_without_releasing(self):
@@ -1287,7 +1287,7 @@ class TestTheInstallLock:
             candidates=[lapsed, bondable_server()], lock_lapses_for={"ocp-lapsed"}
         )
         async with _Harness(segment_acts, server_acts) as client:
-            result = await _execute(client, InstallServerRunArgs(input=INPUT))
+            result = await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
         assert result.server_name == SERVER_NAME
         assert [t.server_name for t in calls["teardown_bmh_resources"]] == ["ocp-lapsed"]
@@ -1303,7 +1303,7 @@ class TestTheInstallLock:
         )
         async with _Harness(segment_acts, server_acts) as client:
             with pytest.raises(WorkflowFailureError) as excinfo:
-                await _execute(client, InstallServerRunArgs(input=INPUT))
+                await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
         assert _application_error(excinfo.value).type == "ServerScanAuthError"
         # Once: permanent, not retried every minute, and not a per-candidate skip.
@@ -1322,7 +1322,7 @@ class TestThePxeBootOfAnIpmiServer:
     async def test_a_ucs_blade_is_mapped_before_anything_is_created(self):
         calls, segment_acts, server_acts = make_mock_activities(candidates=[ucs_server()])
         async with _Harness(segment_acts, server_acts) as client:
-            result = await _execute(client, InstallServerRunArgs(input=INPUT))
+            result = await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
         assert result.pxe_registered is True
         watched = {"register_pxe_boot", "create_bmc_secret", "create_baremetal_host"}
@@ -1349,7 +1349,7 @@ class TestThePxeBootOfAnIpmiServer:
     async def test_a_redfish_server_never_touches_the_pxe_map(self):
         calls, segment_acts, server_acts = make_mock_activities()
         async with _Harness(segment_acts, server_acts) as client:
-            result = await _execute(client, InstallServerRunArgs(input=INPUT))
+            result = await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
         assert result.pxe_registered is False
         assert calls["register_pxe_boot"] == []
@@ -1361,7 +1361,7 @@ class TestThePxeBootOfAnIpmiServer:
         )
         async with _Harness(segment_acts, server_acts) as client:
             with pytest.raises(WorkflowFailureError):
-                await _execute(client, InstallServerRunArgs(input=INPUT))
+                await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
         assert calls["register_pxe_boot"] == []
 
@@ -1371,7 +1371,7 @@ class TestThePxeBootOfAnIpmiServer:
             candidates=[ucs_server(), bondable_server()], pxe_sites=set()
         )
         async with _Harness(segment_acts, server_acts) as client:
-            result = await _execute(client, InstallServerRunArgs(input=INPUT))
+            result = await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
         assert result.server_name == SERVER_NAME
         assert result.attempts == 1
@@ -1386,7 +1386,7 @@ class TestThePxeBootOfAnIpmiServer:
         )
         async with _Harness(segment_acts, server_acts) as client:
             with pytest.raises(WorkflowFailureError) as excinfo:
-                await _execute(client, InstallServerRunArgs(input=INPUT))
+                await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
         error = _application_error(excinfo.value)
         assert error.type == "PxeSiteNotConfiguredError"
@@ -1401,7 +1401,7 @@ class TestThePxeBootOfAnIpmiServer:
         )
         async with _Harness(segment_acts, server_acts) as client:
             with pytest.raises(WorkflowFailureError) as excinfo:
-                await _execute(client, InstallServerRunArgs(input=INPUT))
+                await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
         assert _application_error(excinfo.value).type == "PxeMapAuthError"
         assert len(calls["register_pxe_boot"]) == 1
@@ -1413,13 +1413,13 @@ class TestThePxeBootOfAnIpmiServer:
         )
         async with _Harness(segment_acts, server_acts) as client:
             with pytest.raises(WorkflowFailureError) as excinfo:
-                await _execute(client, InstallServerRunArgs(input=INPUT))
+                await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
         assert "PXE map" in _application_error(excinfo.value).message
 
 
 class TestParallelRunsOnOnePool:
-    """install-server `count`'s premise: N runs drawing one pool AT ONCE land on N machines.
+    """add-server-to-mce `count`'s premise: N runs drawing one pool AT ONCE land on N machines.
 
     Both runs share one mock server-scan, whose lock behaves as the real one
     (reservation_service.py there): a live lock is refused to any other
@@ -1434,14 +1434,14 @@ class TestParallelRunsOnOnePool:
             bondable_server("srv_c", name="ocp-dell-c", mac_prefix="cc:cc:cc:cc:cc"),
         ]
         calls, segment_acts, server_acts = make_mock_activities(candidates=pool)
-        args = InstallServerRunArgs(input=INPUT.model_copy(update={"candidate_count": 3}))
+        args = AddServerToMceRunArgs(input=INPUT.model_copy(update={"candidate_count": 3}))
         async with _Harness(segment_acts, server_acts) as client:
             handles = [
                 await client.start_workflow(
-                    InstallServerWorkflow.run,
+                    AddServerToMceWorkflow.run,
                     args,
-                    id=f"install-server-{INFRA_ENV}_{slot}",
-                    task_queue=INSTALL_SERVER_WORKFLOW_QUEUE,
+                    id=f"add-server-to-mce-{INFRA_ENV}_{slot}",
+                    task_queue=ADD_SERVER_TO_MCE_WORKFLOW_QUEUE,
                 )
                 for slot in (1, 2)
             ]
@@ -1457,7 +1457,7 @@ class TestParallelRunsOnOnePool:
 
 
 class TestAFinishedSlotIsFreeAgain:
-    """install-server `count` reuses a slot whose run has finished: Temporal must allow it."""
+    """add-server-to-mce `count` reuses a slot whose run has finished: Temporal must allow it."""
 
     async def test_a_completed_slot_id_starts_a_new_run(self):
         pool = [
@@ -1465,19 +1465,19 @@ class TestAFinishedSlotIsFreeAgain:
             bondable_server("srv_b", name="ocp-dell-b", mac_prefix="bb:bb:bb:bb:bb"),
         ]
         _, segment_acts, server_acts = make_mock_activities(candidates=pool)
-        slot = f"install-server-{INFRA_ENV}_1"
-        args = InstallServerRunArgs(input=INPUT.model_copy(update={"candidate_count": 2}))
+        slot = f"add-server-to-mce-{INFRA_ENV}_1"
+        args = AddServerToMceRunArgs(input=INPUT.model_copy(update={"candidate_count": 2}))
         async with _Harness(segment_acts, server_acts) as client:
             first = await asyncio.wait_for(
                 client.execute_workflow(
-                    InstallServerWorkflow.run, args, id=slot, task_queue=INSTALL_SERVER_WORKFLOW_QUEUE
+                    AddServerToMceWorkflow.run, args, id=slot, task_queue=ADD_SERVER_TO_MCE_WORKFLOW_QUEUE
                 ),
                 timeout=60,
             )
             # Same id again, the first run COMPLETED: a new run, not a refusal.
             second = await asyncio.wait_for(
                 client.execute_workflow(
-                    InstallServerWorkflow.run, args, id=slot, task_queue=INSTALL_SERVER_WORKFLOW_QUEUE
+                    AddServerToMceWorkflow.run, args, id=slot, task_queue=ADD_SERVER_TO_MCE_WORKFLOW_QUEUE
                 ),
                 timeout=60,
             )
@@ -1508,7 +1508,7 @@ class TestTheInfraEnvBootEntry:
     async def test_the_entry_is_published_after_the_nmstateconfig_and_before_the_bmh(self):
         calls, segment_acts, server_acts = make_mock_activities(candidates=[ucs_server()])
         async with _Harness(segment_acts, server_acts) as client:
-            result = await _execute(client, InstallServerRunArgs(input=INPUT))
+            result = await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
         assert result.pxe_registered is True
         assert [name for name in calls["order"] if name in self._WATCHED] == [
@@ -1537,7 +1537,7 @@ class TestTheInfraEnvBootEntry:
             candidates=[ucs_server()], image_after_polls=3
         )
         async with _Harness(segment_acts, server_acts) as client:
-            result = await _execute(client, InstallServerRunArgs(input=INPUT))
+            result = await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
         assert result.pxe_registered is True
         assert len(calls["publish_infra_env_boot"]) == 4
@@ -1550,7 +1550,7 @@ class TestTheInfraEnvBootEntry:
             candidates=[ucs_server()], boot_superseded=True
         )
         async with _Harness(segment_acts, server_acts) as client:
-            result = await _execute(client, InstallServerRunArgs(input=INPUT))
+            result = await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
         assert result.agent_name == f"agent-{ucs_server().name}"
         assert len(calls["publish_infra_env_boot"]) == 1
@@ -1564,7 +1564,7 @@ class TestTheInfraEnvBootEntry:
         )
         async with _Harness(segment_acts, server_acts) as client:
             with pytest.raises(WorkflowFailureError) as excinfo:
-                await _execute(client, InstallServerRunArgs(input=INPUT))
+                await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
         error = _application_error(excinfo.value)
         assert error.type == "InfraEnvImageNotUpdatedError"
@@ -1587,7 +1587,7 @@ class TestTheInfraEnvBootEntry:
     async def test_a_redfish_server_keeps_its_order_and_never_publishes(self):
         calls, segment_acts, server_acts = make_mock_activities()
         async with _Harness(segment_acts, server_acts) as client:
-            await _execute(client, InstallServerRunArgs(input=INPUT))
+            await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
         assert calls["publish_infra_env_boot"] == []
         assert [name for name in calls["order"] if name in self._WATCHED] == [
@@ -1603,7 +1603,7 @@ class TestTheInfraEnvIsCheckedFirst:
     async def test_the_infraenv_is_checked_on_the_mce_before_the_draw(self):
         calls, segment_acts, server_acts = make_mock_activities()
         async with _Harness(segment_acts, server_acts) as client:
-            await _execute(client, InstallServerRunArgs(input=INPUT))
+            await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
         assert calls["check_infra_env"] == [
             InfraEnvRef(name=INFRA_ENV, namespace=NAMESPACE)
@@ -1615,7 +1615,7 @@ class TestTheInfraEnvIsCheckedFirst:
         calls, segment_acts, server_acts = make_mock_activities(infra_env_missing=True)
         async with _Harness(segment_acts, server_acts) as client:
             with pytest.raises(WorkflowFailureError) as excinfo:
-                await _execute(client, InstallServerRunArgs(input=INPUT))
+                await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
         assert _application_error(excinfo.value).type == "InfraEnvNotFoundError"
         # Once: permanent, not retried every minute.
@@ -1634,7 +1634,7 @@ class TestThePxeMapIsCleanedOnRollback:
             candidates=[blade, bondable_server()], agent_never_for={blade.name}
         )
         async with _Harness(segment_acts, server_acts) as client:
-            result = await _execute(client, InstallServerRunArgs(input=INPUT))
+            result = await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
         assert result.server_name == SERVER_NAME
         # Exactly what was mapped: the boot MAC.
@@ -1661,7 +1661,7 @@ class TestThePxeMapIsCleanedOnRollback:
             candidates=[doomed, bondable_server()], agent_never_for={"ocp-doomed"}
         )
         async with _Harness(segment_acts, server_acts) as client:
-            await _execute(client, InstallServerRunArgs(input=INPUT))
+            await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
         assert [t.server_name for t in calls["teardown_bmh_resources"]] == ["ocp-doomed"]
         assert calls["unregister_pxe_boot"] == []
@@ -1673,7 +1673,7 @@ class TestThePxeMapIsCleanedOnRollback:
             candidates=[blade, bondable_server()], lock_lapses_for={blade.name}
         )
         async with _Harness(segment_acts, server_acts) as client:
-            result = await _execute(client, InstallServerRunArgs(input=INPUT))
+            result = await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
         assert result.server_name == SERVER_NAME
         assert [t.server_name for t in calls["teardown_bmh_resources"]] == [blade.name]
@@ -1682,7 +1682,7 @@ class TestThePxeMapIsCleanedOnRollback:
     async def test_an_installed_blade_keeps_its_mapping(self):
         calls, segment_acts, server_acts = make_mock_activities(candidates=[ucs_server()])
         async with _Harness(segment_acts, server_acts) as client:
-            result = await _execute(client, InstallServerRunArgs(input=INPUT))
+            result = await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
         assert result.pxe_registered is True
         assert calls["unregister_pxe_boot"] == []
@@ -1753,17 +1753,17 @@ def _refused(name: str = SERVER_NAME) -> ServerNotAvailableError:
     )
 
 
-def _unhealthy(name: str = SERVER_NAME) -> InstallServerInput:
+def _unhealthy(name: str = SERVER_NAME) -> AddServerToMceInput:
     return INPUT.model_copy(update={"server_name": name, "allow_unhealthy": True})
 
 
-async def _execute_as(client: Client, args: InstallServerRunArgs, workflow_id: str):
+async def _execute_as(client: Client, args: AddServerToMceRunArgs, workflow_id: str):
     return await asyncio.wait_for(
         client.execute_workflow(
-            InstallServerWorkflow.run,
+            AddServerToMceWorkflow.run,
             args,
             id=workflow_id,
-            task_queue=INSTALL_SERVER_WORKFLOW_QUEUE,
+            task_queue=ADD_SERVER_TO_MCE_WORKFLOW_QUEUE,
         ),
         timeout=60,
     )
@@ -1783,13 +1783,13 @@ class TestAllowUnhealthy:
         )
         async with _Harness(segment_acts, server_acts) as client:
             handle = await client.start_workflow(
-                InstallServerWorkflow.run,
-                InstallServerRunArgs(input=_unhealthy()),
+                AddServerToMceWorkflow.run,
+                AddServerToMceRunArgs(input=_unhealthy()),
                 id=f"test-{uuid.uuid4()}",
-                task_queue=INSTALL_SERVER_WORKFLOW_QUEUE,
+                task_queue=ADD_SERVER_TO_MCE_WORKFLOW_QUEUE,
             )
             result = await asyncio.wait_for(handle.result(), timeout=60)
-            progress = await handle.query(InstallServerWorkflow.progress)
+            progress = await handle.query(AddServerToMceWorkflow.progress)
 
         assert result.server_name == SERVER_NAME
         # The usual choice: nic1, the boot MAC, is the live NIC; nic2 the one down.
@@ -1818,7 +1818,7 @@ class TestAllowUnhealthy:
         named = INPUT.model_copy(update={"server_name": SERVER_NAME})
         async with _Harness(segment_acts, server_acts) as client:
             with pytest.raises(WorkflowFailureError) as excinfo:
-                await _execute(client, InstallServerRunArgs(input=named))
+                await _execute(client, AddServerToMceRunArgs(input=named))
 
         assert _application_error(excinfo.value).type == "ServerNotAvailableError"
         assert calls["reserve_server"] == []
@@ -1827,7 +1827,7 @@ class TestAllowUnhealthy:
     async def test_a_healthy_server_takes_the_normal_path_and_waives_nothing(self):
         calls, segment_acts, server_acts = make_mock_activities()
         async with _Harness(segment_acts, server_acts) as client:
-            result = await _execute(client, InstallServerRunArgs(input=_unhealthy()))
+            result = await _execute(client, AddServerToMceRunArgs(input=_unhealthy()))
 
         assert result.allowed_unhealthy == []
         assert calls["lookup_install_candidate"] == []
@@ -1838,7 +1838,7 @@ class TestAllowUnhealthy:
         hpe = oneview_server()
         _, segment_acts, server_acts = make_mock_activities(candidates=[hpe])
         async with _Harness(segment_acts, server_acts) as client:
-            result = await _execute(client, InstallServerRunArgs(input=_unhealthy(hpe.name)))
+            result = await _execute(client, AddServerToMceRunArgs(input=_unhealthy(hpe.name)))
 
         assert result.boot_mac == "aa:bb:cc:dd:ee:11"
         [waiver] = result.allowed_unhealthy
@@ -1884,8 +1884,8 @@ class TestAllowUnhealthy:
                     one_nic_up_server(),
                     lock=ServerLockRecord(
                         live=True,
-                        holder="install-server",
-                        workflow_id="install-server-ocp4-other_x",
+                        holder="add-server-to-mce",
+                        workflow_id="add-server-to-mce-ocp4-other_x",
                         mce_cluster="ocp4-other",
                         expires_at="2026-10-31T12:00:00Z",
                     ),
@@ -1902,7 +1902,7 @@ class TestAllowUnhealthy:
         )
         async with _Harness(segment_acts, server_acts) as client:
             with pytest.raises(WorkflowFailureError) as excinfo:
-                await _execute(client, InstallServerRunArgs(input=_unhealthy()))
+                await _execute(client, AddServerToMceRunArgs(input=_unhealthy()))
 
         error = _application_error(excinfo.value)
         assert error.type == error_type
@@ -1912,25 +1912,25 @@ class TestAllowUnhealthy:
         assert calls["create_bmc_secret"] == []
 
     async def test_an_expired_lock_of_another_run_is_no_refusal(self):
-        stale = ServerLockRecord(live=False, holder="install-server", workflow_id="old-run")
+        stale = ServerLockRecord(live=False, holder="add-server-to-mce", workflow_id="old-run")
         _, segment_acts, server_acts = make_mock_activities(
             acquire_error=_refused(), record=scan_record(one_nic_up_server(), lock=stale)
         )
         async with _Harness(segment_acts, server_acts) as client:
-            result = await _execute(client, InstallServerRunArgs(input=_unhealthy()))
+            result = await _execute(client, AddServerToMceRunArgs(input=_unhealthy()))
         assert result.server_name == SERVER_NAME
 
     async def test_its_own_leftover_lock_is_no_reason_to_refuse(self):
         """An earlier run on the SAME id failed and left its lock: re-taking it extends it."""
-        workflow_id = f"install-server-{MCE_CLUSTER}_{SERVER_NAME.lower()}"
-        own = ServerLockRecord(live=True, holder="install-server", workflow_id=workflow_id)
+        workflow_id = f"add-server-to-mce-{MCE_CLUSTER}_{SERVER_NAME.lower()}"
+        own = ServerLockRecord(live=True, holder="add-server-to-mce", workflow_id=workflow_id)
         calls, segment_acts, server_acts = make_mock_activities(
             acquire_error=_refused(),
             record=scan_record(bondable_server(), health=_FINE, lock=own),
         )
         async with _Harness(segment_acts, server_acts) as client:
             result = await _execute_as(
-                client, InstallServerRunArgs(input=_unhealthy()), workflow_id
+                client, AddServerToMceRunArgs(input=_unhealthy()), workflow_id
             )
 
         assert result.allowed_unhealthy == []  # nothing unhealthy was waived
@@ -1941,7 +1941,7 @@ class TestAllowUnhealthy:
             acquire_error=_refused(), record=scan_record(bondable_server(), health=_FINE)
         )
         async with _Harness(segment_acts, server_acts) as client:
-            result = await _execute(client, InstallServerRunArgs(input=_unhealthy()))
+            result = await _execute(client, AddServerToMceRunArgs(input=_unhealthy()))
 
         [waiver] = result.allowed_unhealthy
         assert waiver.check == "server-scan-recheck"
@@ -1953,7 +1953,7 @@ class TestAllowUnhealthy:
             record=scan_record(bondable_server(), health=_FINE, reachable=False),
         )
         async with _Harness(segment_acts, server_acts) as client:
-            result = await _execute(client, InstallServerRunArgs(input=_unhealthy()))
+            result = await _execute(client, AddServerToMceRunArgs(input=_unhealthy()))
         assert [w.check for w in result.allowed_unhealthy] == ["bmc-reachable"]
 
     async def test_a_server_with_one_port_is_still_refused(self):
@@ -1968,7 +1968,7 @@ class TestAllowUnhealthy:
         calls, segment_acts, server_acts = make_mock_activities(candidates=[single])
         async with _Harness(segment_acts, server_acts) as client:
             with pytest.raises(WorkflowFailureError) as excinfo:
-                await _execute(client, InstallServerRunArgs(input=_unhealthy()))
+                await _execute(client, AddServerToMceRunArgs(input=_unhealthy()))
 
         error = _application_error(excinfo.value)
         assert error.type == "NoBondableInterfacesError"
@@ -1981,7 +1981,7 @@ class TestAllowUnhealthy:
         pool = INPUT.model_copy(update={"allow_unhealthy": True})
         async with _Harness(segment_acts, server_acts) as client:
             with pytest.raises(WorkflowFailureError) as excinfo:
-                await _execute(client, InstallServerRunArgs(input=pool))
+                await _execute(client, AddServerToMceRunArgs(input=pool))
 
         assert _application_error(excinfo.value).type == "AllowUnhealthyNeedsServerNameError"
         assert calls["get_inventory_segment"] == []
@@ -2000,7 +2000,7 @@ class TestAllowUnhealthy:
             acquire_error=_refused(blade.name), record=scan_record(blade)
         )
         async with _Harness(segment_acts, server_acts) as client:
-            result = await _execute(client, InstallServerRunArgs(input=_unhealthy(blade.name)))
+            result = await _execute(client, AddServerToMceRunArgs(input=_unhealthy(blade.name)))
 
         # The PXE VM maps the BMH's boot MAC only — the live NIC.
         assert calls["register_pxe_boot"][0].macs == ["00:25:b5:00:00:02"]
@@ -2014,7 +2014,7 @@ class TestAllowUnhealthy:
         )
         async with _Harness(segment_acts, server_acts) as client:
             with pytest.raises(WorkflowFailureError) as excinfo:
-                await _execute(client, InstallServerRunArgs(input=_unhealthy()))
+                await _execute(client, AddServerToMceRunArgs(input=_unhealthy()))
 
         error = _application_error(excinfo.value)
         assert error.type == "AgentNeverAppearedError"
@@ -2045,7 +2045,7 @@ class TestAConflictingNmStateConfig:
             nmstate_differs={SERVER_NAME: _STALE}
         )
         async with _Harness(segment_acts, server_acts) as client:
-            result = await _execute(client, InstallServerRunArgs(input=self._NAMED))
+            result = await _execute(client, AddServerToMceRunArgs(input=self._NAMED))
 
         assert result.nmstate_replaced == _STALE
         assert result.resources_changed is True
@@ -2062,7 +2062,7 @@ class TestAConflictingNmStateConfig:
             resources_exist=True, nmstate_differs={SERVER_NAME: _STALE}
         )
         async with _Harness(segment_acts, server_acts) as client:
-            result = await _execute(client, InstallServerRunArgs(input=self._NAMED))
+            result = await _execute(client, AddServerToMceRunArgs(input=self._NAMED))
         assert result.resources_changed is True
 
     async def test_an_ipmi_blade_is_checked_before_its_pxe_map_and_its_nmstateconfig(self):
@@ -2071,7 +2071,7 @@ class TestAConflictingNmStateConfig:
             candidates=[blade], nmstate_differs={blade.name: _STALE}
         )
         async with _Harness(segment_acts, server_acts) as client:
-            result = await _execute(client, InstallServerRunArgs(input=INPUT))
+            result = await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
         assert result.nmstate_replaced == _STALE
         order = calls["order"]
@@ -2082,7 +2082,7 @@ class TestAConflictingNmStateConfig:
     async def test_the_check_compares_what_the_creates_will_write(self):
         calls, segment_acts, server_acts = make_mock_activities()
         async with _Harness(segment_acts, server_acts) as client:
-            result = await _execute(client, InstallServerRunArgs(input=INPUT))
+            result = await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
         [check] = calls["replace_conflicting_nmstate_config"]
         assert check.resource == calls["create_nmstate_config"][0]
@@ -2106,7 +2106,7 @@ class TestAnOlderLimbsInUseRefusal:
         named = INPUT.model_copy(update={"server_name": blade.name})
         async with _Harness(segment_acts, server_acts) as client:
             with pytest.raises(WorkflowFailureError) as excinfo:
-                await _execute(client, InstallServerRunArgs(input=named))
+                await _execute(client, AddServerToMceRunArgs(input=named))
 
         error = _application_error(excinfo.value)
         assert error.type == "ServerLooksInstalledError"
@@ -2124,7 +2124,7 @@ class TestAnOlderLimbsInUseRefusal:
             candidates=[busy, bondable_server()], in_use={"ocp-busy": _IN_USE}
         )
         async with _Harness(segment_acts, server_acts) as client:
-            result = await _execute(client, InstallServerRunArgs(input=INPUT))
+            result = await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
         assert result.server_name == SERVER_NAME
         assert result.attempts == 1
@@ -2138,7 +2138,7 @@ class TestAnOlderLimbsInUseRefusal:
         )
         async with _Harness(segment_acts, server_acts) as client:
             with pytest.raises(WorkflowFailureError) as excinfo:
-                await _execute(client, InstallServerRunArgs(input=INPUT))
+                await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
         message = str(_application_error(excinfo.value))
         assert "already hold a BareMetalHost" in message
@@ -2147,9 +2147,9 @@ class TestAnOlderLimbsInUseRefusal:
 
 # --- a re-run of a named install after a failure: its own leftover lock -------
 
-_RERUN_ID = f"install-server-{MCE_CLUSTER}_{SERVER_NAME.lower()}"
+_RERUN_ID = f"add-server-to-mce-{MCE_CLUSTER}_{SERVER_NAME.lower()}"
 _OWN_LOCK = ServerLockRecord(
-    live=True, holder="install-server", workflow_id=_RERUN_ID, mce_cluster=MCE_CLUSTER,
+    live=True, holder="add-server-to-mce", workflow_id=_RERUN_ID, mce_cluster=MCE_CLUSTER,
     expires_at="2026-10-31T16:00:00Z",
 )
 _NAMED_RUN = INPUT.model_copy(update={"server_name": SERVER_NAME})
@@ -2180,13 +2180,13 @@ class TestARerunAfterAFailure:
         )
         async with _Harness(segment_acts, server_acts) as client:
             with pytest.raises(WorkflowFailureError) as excinfo:
-                await _execute_as(client, InstallServerRunArgs(input=_NAMED_RUN), _RERUN_ID)
+                await _execute_as(client, AddServerToMceRunArgs(input=_NAMED_RUN), _RERUN_ID)
             # The first run: failed mid-create, lock left to its TTL by design.
             assert _application_error(excinfo.value).type == "BmhConflictError"
             assert calls["release_server"] == []
 
             # The operator deletes the NMStateConfig and runs it again.
-            result = await _execute_as(client, InstallServerRunArgs(input=_NAMED_RUN), _RERUN_ID)
+            result = await _execute_as(client, AddServerToMceRunArgs(input=_NAMED_RUN), _RERUN_ID)
 
         assert result.server_name == SERVER_NAME
         assert [r.server_name for r in calls["lookup_install_candidate"]] == [SERVER_NAME]
@@ -2197,7 +2197,7 @@ class TestARerunAfterAFailure:
 
     async def test_another_runs_lock_fails_saying_whose_and_until_when(self):
         theirs = ServerLockRecord(
-            live=True, holder="install-server", workflow_id="install-server-ocp4-b_pool_1",
+            live=True, holder="add-server-to-mce", workflow_id="add-server-to-mce-ocp4-b_pool_1",
             mce_cluster="ocp4-b", expires_at="2026-10-31T16:00:00Z",
         )
         calls, segment_acts, server_acts = make_mock_activities(
@@ -2205,12 +2205,12 @@ class TestARerunAfterAFailure:
         )
         async with _Harness(segment_acts, server_acts) as client:
             with pytest.raises(WorkflowFailureError) as excinfo:
-                await _execute_as(client, InstallServerRunArgs(input=_NAMED_RUN), _RERUN_ID)
+                await _execute_as(client, AddServerToMceRunArgs(input=_NAMED_RUN), _RERUN_ID)
 
         error = _application_error(excinfo.value)
         assert error.type == "ServerReservedError"
         message = str(error)
-        assert "install-server-ocp4-b_pool_1" in message and "2026-10-31T16:00:00Z" in message
+        assert "add-server-to-mce-ocp4-b_pool_1" in message and "2026-10-31T16:00:00Z" in message
         assert "keeps its lock until it expires" in message
         assert "unhealthy" not in message  # the hidden option is never named
         assert calls["reserve_server"] == []
@@ -2222,7 +2222,7 @@ class TestARerunAfterAFailure:
         )
         async with _Harness(segment_acts, server_acts) as client:
             with pytest.raises(WorkflowFailureError) as excinfo:
-                await _execute_as(client, InstallServerRunArgs(input=_NAMED_RUN), _RERUN_ID)
+                await _execute_as(client, AddServerToMceRunArgs(input=_NAMED_RUN), _RERUN_ID)
 
         error = _application_error(excinfo.value)
         assert error.type == "ServerNotAvailableError"
@@ -2235,7 +2235,7 @@ class TestARerunAfterAFailure:
         )
         async with _Harness(segment_acts, server_acts) as client:
             with pytest.raises(WorkflowFailureError) as excinfo:
-                await _execute_as(client, InstallServerRunArgs(input=_NAMED_RUN), _RERUN_ID)
+                await _execute_as(client, AddServerToMceRunArgs(input=_NAMED_RUN), _RERUN_ID)
         assert _application_error(excinfo.value).type == "ServerNotAvailableError"
 
     async def test_a_claimed_server_fails_saying_so(self):
@@ -2245,7 +2245,7 @@ class TestARerunAfterAFailure:
         )
         async with _Harness(segment_acts, server_acts) as client:
             with pytest.raises(WorkflowFailureError) as excinfo:
-                await _execute_as(client, InstallServerRunArgs(input=_NAMED_RUN), _RERUN_ID)
+                await _execute_as(client, AddServerToMceRunArgs(input=_NAMED_RUN), _RERUN_ID)
 
         error = _application_error(excinfo.value)
         assert error.type == "ServerNotAvailableError"
@@ -2258,7 +2258,7 @@ class TestARerunAfterAFailure:
         )
         async with _Harness(segment_acts, server_acts) as client:
             with pytest.raises(WorkflowFailureError) as excinfo:
-                await _execute_as(client, InstallServerRunArgs(input=_NAMED_RUN), _RERUN_ID)
+                await _execute_as(client, AddServerToMceRunArgs(input=_NAMED_RUN), _RERUN_ID)
 
         error = _application_error(excinfo.value)
         assert error.type == "ServerNotAvailableError"
@@ -2268,5 +2268,5 @@ class TestARerunAfterAFailure:
         calls, segment_acts, server_acts = make_mock_activities(acquire_error=_refused())
         async with _Harness(segment_acts, server_acts) as client:
             with pytest.raises(WorkflowFailureError):
-                await _execute(client, InstallServerRunArgs(input=INPUT))
+                await _execute(client, AddServerToMceRunArgs(input=INPUT))
         assert calls["lookup_install_candidate"] == []

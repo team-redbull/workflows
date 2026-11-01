@@ -239,7 +239,7 @@ class ServerScanAuthError(OrchestratorError):
     """server-scan rejected our credentials (401/403).
 
     Deterministic — a bad SERVER_SCAN_API_TOKEN never fixes itself, so the
-    workflow lists this in non_retryable_error_types. install-server's token
+    workflow lists this in non_retryable_error_types. add-server-to-mce's token
     needs server-scan's ADMIN role: the install lock is taken and released
     through two of its mutation endpoints. provision-dell-server only reads, so
     a viewer token is enough there.
@@ -251,7 +251,7 @@ class ServerReservedError(OrchestratorError):
 
     Deterministic for this candidate and non-retryable — the holder's lock lasts
     until it is released or expires, and waiting it out would stall the run on a
-    machine some other MCE is installing. install-server treats it as a SKIP:
+    machine some other MCE is installing. add-server-to-mce treats it as a SKIP:
     the next candidate is tried. The message names the holder, its MCE and the
     expiry, because that is the run an operator goes and looks at.
     """
@@ -298,7 +298,7 @@ class NoBondableInterfacesError(OrchestratorError):
 
 
 class AllowUnhealthyNeedsServerNameError(OrchestratorError):
-    """WORKFLOW-RAISED. install-server was asked to waive health checks on a pool draw.
+    """WORKFLOW-RAISED. add-server-to-mce was asked to waive health checks on a pool draw.
 
     `allow_unhealthy` (hidden, CLAUDE.md §4) waives health refusals for the ONE
     machine a request names — a person's decision about that server. On a pool
@@ -312,7 +312,7 @@ class UnknownBmcVendorError(OrchestratorError):
     """WORKFLOW-RAISED. server-scan reported no BMC driver vocabulary for this server.
 
     `bmc_vendor` is null for a STANDALONE machine — server-scan leaves the
-    driver choice to the caller by design — and install-server declines to
+    driver choice to the caller by design — and add-server-to-mce declines to
     guess, because an IPMI fallback would be silently wrong for a Redfish-only
     BMC. Deterministic — non-retryable.
     """
@@ -370,7 +370,7 @@ class ServerLooksInstalledError(OrchestratorError):
     MACs, or an Agent linked to it existed. It no longer looks: server-scan
     offering the machine is the proof it is free. Kept because a limb deployed
     before that change can still raise it, and recorded runs failed with it;
-    install-server still handles it (lock given back; a named run fails, a pool
+    add-server-to-mce still handles it (lock given back; a named run fails, a pool
     candidate is skipped). Deterministic — non-retryable.
     """
 
@@ -408,7 +408,7 @@ class InvalidMacError(OrchestratorError):
 class AgentNeverAppearedError(OrchestratorError):
     """WORKFLOW-RAISED. No candidate the run drew ever registered an Agent.
 
-    The Agent CR is the success signal install-server waits on, and it is the
+    The Agent CR is the success signal add-server-to-mce waits on, and it is the
     only one that proves the whole chain at once: an Agent exists because the
     host booted the discovery ISO and reached assisted-service, which means the
     BMC accepted virtual media, the bond came up, the VLAN was right and DHCP
@@ -500,7 +500,7 @@ class PxeSiteNotConfiguredError(OrchestratorError):
     network and the site's PXE VM must be told which iPXE script to hand its
     MACs. PXE_MAP_URLS on this MCE's worker has no entry for that site, so
     there is nobody to tell. Deterministic — an operator adds the entry.
-    install-server treats it as a SKIP: a Redfish candidate in the same draw
+    add-server-to-mce treats it as a SKIP: a Redfish candidate in the same draw
     needs no PXE map and may still be installable.
     """
 
@@ -525,11 +525,11 @@ class InfraEnvNotReadyError(OrchestratorError):
 
 class InfraEnvImageNotUpdatedError(OrchestratorError):
     """WORKFLOW-RAISED. The InfraEnv never published a discovery image created
-    after this host's NMStateConfig — or, for publish-infraenv-boot, never
+    after this host's NMStateConfig — or, for publish-infraenv-to-pxe-server, never
     showed a ready image at all (ImageCreated True, an ipxeScript, a
     createdTime) within its deadline.
 
-    install-server publishes an IPMI host's iPXE boot entry only once
+    add-server-to-mce publishes an IPMI host's iPXE boot entry only once
     `status.createdTime` is no older than the NMStateConfig, so the host never
     boots an image that lacks its own static network config. assisted-service
     regenerates within seconds of an NMStateConfig change, so a deadline here
@@ -543,7 +543,7 @@ class InfraEnvImageNotUpdatedError(OrchestratorError):
 class AgentBoundToClusterError(OrchestratorError):
     """The server's Agent is bound to a cluster, so it is not just inventory.
 
-    remove-server only takes a host out of an MCE's inventory: one whose Agent
+    remove-server-from-mce only takes a host out of an MCE's inventory: one whose Agent
     is unbound (`spec.clusterDeploymentName` empty). A bound Agent belongs to a
     cluster — installing or running as a node — and powering it off or
     deleting it would take a node away from that cluster. Nothing is changed.
@@ -558,7 +558,7 @@ class AgentBoundToClusterError(OrchestratorError):
 class ServerStillPresentError(OrchestratorError):
     """WORKFLOW-RAISED. After the deletes, the server is still on the MCE.
 
-    remove-server ends by reading the cluster again and requires its Agent,
+    remove-server-from-mce ends by reading the cluster again and requires its Agent,
     BMH and NMStateConfig all gone; an Agent's own finalizer makes that take
     seconds, so it waits a bounded time first. Still there means something
     re-created it — most often a host that could not be powered off (no BMH to
@@ -570,7 +570,7 @@ class ServerStillPresentError(OrchestratorError):
 class HostPowerOffTimeoutError(OrchestratorError):
     """WORKFLOW-RAISED. The BareMetalHost never reported the host powered off.
 
-    remove-server powers the host off BEFORE deleting anything: a host left
+    remove-server-from-mce powers the host off BEFORE deleting anything: a host left
     running the discovery image re-registers its Agent within a minute of the
     Agent being deleted. The BMH is left with `online: false` and nothing is
     deleted; the usual cause is an unreachable BMC. Re-run once it answers.
@@ -594,13 +594,13 @@ class PxeMapRequestRejectedError(OrchestratorError):
     """
 
 
-# --- server-lifecycle: uninstall-server -------------------------------------
+# --- server-lifecycle: uninstall-server-from-hc -------------------------------------
 
 
 class HostedClusterUnreachableError(OrchestratorError):
     """A hosted cluster's API server could not be reached. Retried without bound.
 
-    uninstall-server reads one Node from the hosted cluster, through its
+    uninstall-server-from-hc reads one Node from the hosted cluster, through its
     control plane's in-cluster Service (`kube-apiserver.<hcp-ns>.svc:6443`).
     A control plane that is restarting, a Service with no ready endpoints or a
     5xx all clear on their own, so the run waits them out (CLAUDE.md §5) rather
@@ -625,17 +625,17 @@ class HostedClusterAccessError(OrchestratorError):
 class ServerNotInServerScanError(OrchestratorError):
     """WORKFLOW-RAISED. server-scan has no server of this exact name.
 
-    uninstall-server takes server-scan's install lock on the machine before it
+    uninstall-server-from-hc takes server-scan's install lock on the machine before it
     changes anything, and the lock is keyed on server-scan's `srv_…` id, so a
     machine server-scan does not know cannot be held. Nothing is changed. A
-    host that is only on the MCE, unknown to server-scan, is remove-server's.
+    host that is only on the MCE, unknown to server-scan, is remove-server-from-mce's.
     """
 
 
 class ClusterMembershipMismatchError(OrchestratorError):
     """WORKFLOW-RAISED. server-scan's record of the server contradicts the MCE.
 
-    server-scan is the authority on WHERE a server is. uninstall-server refuses,
+    server-scan is the authority on WHERE a server is. uninstall-server-from-hc refuses,
     changing nothing, when that record contradicts the request or the MCE: it
     names another MCE, it names another cluster than the one the Agent is
     bound to, it says INSTALLED_TO_INVENTORY while the Agent is bound, or two
@@ -656,7 +656,7 @@ class MultipleBoundAgentsError(OrchestratorError):
 class NotHostedClusterNodeError(OrchestratorError):
     """WORKFLOW-RAISED. The Agent is bound, but not as a hosted cluster's node.
 
-    uninstall-server takes a node out of a HyperShift HostedCluster. An Agent
+    uninstall-server-from-hc takes a node out of a HyperShift HostedCluster. An Agent
     bound to a ClusterDeployment that is no HostedCluster's control plane, with
     no AgentMachine or Machine behind it — an early-bound ACM/ZTP cluster — is
     not one; nor is an AgentMachine whose namespace belongs to no HostedCluster
@@ -680,7 +680,7 @@ class NodeDrainTimeoutError(OrchestratorError):
     """WORKFLOW-RAISED. A Node with no Machine behind it did not drain within 20 minutes.
 
     CAPI drains a Node only through its Machine, so for a Node HyperShift lost
-    track of, uninstall-server cordons it and evicts its Pods itself — CAPI's
+    track of, uninstall-server-from-hc cordons it and evicts its Pods itself — CAPI's
     drain rules: everything but DaemonSet and mirror Pods. The message names
     the Pods left and why their evictions were refused (a PodDisruptionBudget,
     typically). The Node stays cordoned (`oc adm uncordon` undoes it); a re-run
@@ -706,7 +706,7 @@ class AgentUnbindTimeoutError(OrchestratorError):
 
     Once the Machine is past its drain, the Agent provider clears the Agent's
     binding and the host reboots into the discovery image, which on bare
-    metal is the same POST-and-boot install-server allows an hour for. The
+    metal is the same POST-and-boot add-server-to-mce allows an hour for. The
     message names the Agent's last state. A re-run resumes the wait.
     """
 
@@ -725,7 +725,7 @@ class HostedNodeStillPresentError(OrchestratorError):
     """WORKFLOW-RAISED. The hosted cluster still has the server's Node, and it cannot go.
 
     CAPI deletes a Machine's Node as the Machine goes; a Node left behind with
-    nothing running as it, uninstall-server deletes itself. It raises this
+    nothing running as it, uninstall-server-from-hc deletes itself. It raises this
     instead when the Node is still Ready — a kubelet still runs as it — once
     the host should no longer be (back in discovery), or before any write when
     a Ready Node has nothing left on the MCE to release the host through. The
@@ -750,7 +750,7 @@ class AgentRetakenError(OrchestratorError):
 
     A NodePool's new AgentMachine takes ANY free Agent its selector matches
     (cluster-api-provider-agent `findAgent`). Two ways that meets this run:
-    NodePool replicas are not uninstall-server's, so the NodePool replaces the
+    NodePool replicas are not uninstall-server-from-hc's, so the NodePool replaces the
     Machine the run deleted — with this server's own Agent once released, when
     the InfraEnv has no other; and an inventory host's Agent is free from the
     start, so any NodePool may take it between the inspection and the removal.
@@ -763,7 +763,7 @@ class AgentRetakenError(OrchestratorError):
 class AgentStillBoundError(OrchestratorError):
     """WORKFLOW-RAISED. After the Machine went, the Agent is not a clean inventory host.
 
-    Required before remove-server may take it: the Agent exists, carries no
+    Required before remove-server-from-mce may take it: the Agent exists, carries no
     `clusterDeploymentName` and no `agentMachineRef` label, is `known-unbound`
     and approved, and its BareMetalHost is present and not in error (remove-
     server powers the host off through it). Polled for a bounded five minutes;
@@ -771,18 +771,18 @@ class AgentStillBoundError(OrchestratorError):
     """
 
 
-class RemoveServerAlreadyRunningError(OrchestratorError):
-    """WORKFLOW-RAISED. remove-server is already running for this server.
+class RemoveServerFromMceAlreadyRunningError(OrchestratorError):
+    """WORKFLOW-RAISED. remove-server-from-mce is already running for this server.
 
-    uninstall-server ends by running remove-server as its child on the shared
-    id `remove-server-<server>`. One already running there — started on its
+    uninstall-server-from-hc ends by running remove-server-from-mce as its child on the shared
+    id `remove-server-from-mce-<server>`. One already running there — started on its
     own route — would be a second removal of the same host, so the uninstall
     stops instead. The message names the id: let that run finish, then re-run.
     """
 
 
-class RemoveServerFailedError(OrchestratorError):
-    """WORKFLOW-RAISED. The remove-server child failed.
+class RemoveServerFromMceFailedError(OrchestratorError):
+    """WORKFLOW-RAISED. The remove-server-from-mce child failed.
 
     The hosted-cluster half had completed; the inventory half did not. The
     message carries the child's own failure type and message, and its id — the

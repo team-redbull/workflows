@@ -210,7 +210,7 @@ class ServerLifecycleActivitySettings(BaseSettings):
     """Config for the server-lifecycle activity worker only.
 
     The brain never reads these (it holds no credentials), and neither does the
-    segment-lifecycle limb — except SEGMENTS_MANAGER_URL, which install-server
+    segment-lifecycle limb — except SEGMENTS_MANAGER_URL, which add-server-to-mce
     reaches through a segment-lifecycle activity on THAT limb rather than by
     holding a second copy of its token here.
 
@@ -224,7 +224,7 @@ class ServerLifecycleActivitySettings(BaseSettings):
     # --- which MCE cluster this worker serves --------------------------------
     # Names the activity queue this worker polls
     # (`server-lifecycle-activity-<mce_cluster>`), so it must match the
-    # `mce_cluster` callers put in an install-server request — the same string
+    # `mce_cluster` callers put in an add-server-to-mce request — the same string
     # the Segments Manager holds as that segment's `cluster_name`.
     #
     # Required, with no default, because a wrong value here is undetectable at
@@ -244,7 +244,7 @@ class ServerLifecycleActivitySettings(BaseSettings):
 
     # --- server-scan: the inventory platform --------------------------------
     # Base URL INCLUDING the /api/v1 prefix. The token needs server-scan's
-    # ADMIN role: besides the /servers/available GET, install-server takes and
+    # ADMIN role: besides the /servers/available GET, add-server-to-mce takes and
     # releases the install lock (POST/DELETE /servers/{id}/reservation, ADR-0035),
     # and those are mutations. It may be empty — server-scan's auth is disabled
     # by default, which auto-admits every caller.

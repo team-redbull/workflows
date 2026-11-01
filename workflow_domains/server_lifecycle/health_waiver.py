@@ -2,7 +2,7 @@
 
 `/servers/available` refuses a named machine with one 404 whatever the reason,
 and its detail names neither the network category nor the install lock. Once
-it has, install-server reads the machine's stored record
+it has, add-server-to-mce reads the machine's stored record
 (`lookup_install_candidate`) and sorts the reasons here, with no I/O, so the
 sort is tested without Temporal and replays identically (bond_selection.py is
 the precedent).

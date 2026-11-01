@@ -55,5 +55,5 @@ app.include_router(runs_router)
 # The temporary cluster-upgrade page, on the routes above.
 app.include_router(cluster_upgrade_ui_router)
 # The temporary server-lifecycle page: install, remove, uninstall and
-# publish-infraenv-boot runs, on the routes above.
+# publish-infraenv-to-pxe-server runs, on the routes above.
 app.include_router(server_lifecycle_ui_router)

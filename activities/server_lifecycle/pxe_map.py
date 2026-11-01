@@ -24,7 +24,7 @@ The calls:
     gets 409, which is success for the caller (a newer image is published);
   * `DELETE /pxe-map/<mac>` — a rollback removing it; an entry already gone
     (404) is the state wanted, so it is success, not an error;
-  * `DELETE /pxe-map/<mac>?mce_cluster=<mce>` — remove-server's CONDITIONAL
+  * `DELETE /pxe-map/<mac>?mce_cluster=<mce>` — remove-server-from-mce's CONDITIONAL
     delete: the PXE VM keeps (409) a MAC chaining to another MCE's boot entry.
 """
 

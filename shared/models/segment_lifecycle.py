@@ -31,7 +31,7 @@ class SegmentType(str, Enum):
     # Ironic reaches a Redfish BMC on one network and a UCS-managed blade over
     # IPMI on another. Reverted with the Segments Manager: the team keeps one
     # inventory scope per cluster, so an MCE's inventory VLAN is a property of
-    # the CLUSTER alone and install-server resolves it once per run.
+    # the CLUSTER alone and add-server-to-mce resolves it once per run.
     INVENTORY = "INVENTORY"
     PXE = "PXE"
 

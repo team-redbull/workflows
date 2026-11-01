@@ -1,6 +1,6 @@
-"""remove-server — takes one server out of an MCE's inventory.
+"""remove-server-from-mce — takes one server out of an MCE's inventory.
 
-The reverse of install-server's end state: the BareMetalHost `<server>`, its
+The reverse of add-server-to-mce's end state: the BareMetalHost `<server>`, its
 NMStateConfig `nmstate-config-<server>` and the server's Agent are deleted, so
 the machine no longer sits in that MCE's InfraEnv. ONLY for a server that is
 just inventory: if its Agent is bound to a cluster, the run fails having
@@ -23,14 +23,14 @@ Shape of the run:
                         and nothing is deleted. The activity re-checks the Agents
                         are still unbound right before it acts.
   4. removing-host    — the NMStateConfig and the BMH (and its BMC Secret), by
-                        the same teardown install-server's rollback uses: detach
+                        the same teardown add-server-to-mce's rollback uses: detach
                         first, so metal3 does not try to deprovision through the
                         BMC, then delete, then drop the finalizer if it sticks.
   5. removing-agent   — the Agent(s), each re-checked as unbound right before
                         its delete.
      removing-pxe-boot — every MAC the host is known by is cleared from the
                         PXE VM of the MCE's OWN site (its inventory segment's,
-                        the same VM install-server mapped it on), so the machine
+                        the same VM add-server-to-mce mapped it on), so the machine
                         can no longer network-boot this MCE's discovery image
                         and re-register. CONDITIONAL on the PXE VM: a MAC
                         chaining to ANOTHER MCE's boot entry is kept (reported
@@ -49,8 +49,8 @@ Shape of the run:
                         the PXE cleanup had no failure: read from server-scan
                         and released (with the holder and workflow id read, so
                         server-scan compares and deletes exactly that lock)
-                        ONLY when it is live, install-server's, and for THIS
-                        MCE. Left alone: another MCE's, uninstall-server's
+                        ONLY when it is live, add-server-to-mce's, and for THIS
+                        MCE. Left alone: another MCE's, uninstall-server-from-hc's
                         (its run releases its own once this one, its child,
                         completes), any other holder's. Never fails the run —
                         the removal is done; `lock_released` / `lock_detail`
@@ -63,7 +63,7 @@ through its BMH stops that, and deleting the Agent only once the host is off
 means nothing is left to bring it back. (The detach in step 4 is then safe: the
 host is already off, so there is nothing for a deprovision to do.)
 
-WHY THE LOCK IS RELEASED (the operator's decision, 2026-10-31). install-server
+WHY THE LOCK IS RELEASED (the operator's decision, 2026-10-31). add-server-to-mce
 holds its lock a day after a success, until server-scan sees the machine in a
 cluster, so a machine removed within that day stayed undrawable for the rest
 of it. Once the host is fully out of this MCE that hold protects nothing, and
@@ -76,6 +76,12 @@ the InfraEnv's boot entry on the PXE VM (`<mce>/<infraenv>.ipxe`), which every
 other host of the InfraEnv chains through. A server found NOWHERE on the MCE
 is a no-op that touches neither the PXE map nor the lock: nothing then ties
 its MACs to this MCE, and the lock may be an install that has not written yet.
+
+Named remove-server until 2026-11-01 — route, id, queue and type. A run
+started before the rename is a `RemoveServerWorkflow` (the subclass at the
+bottom of this file) and replays on its old queue; so does the child an
+uninstall started before the rename starts. The holders it gives way to or
+releases are recognised under both spellings, old and new.
 """
 
 from __future__ import annotations
@@ -126,10 +132,10 @@ with workflow.unsafe.imports_passed_through():
         InventoryHostState,
         PxeHostEntriesRef,
         ReleaseServerRequest,
-        RemoveServerInput,
-        RemoveServerProgress,
-        RemoveServerResult,
-        RemoveServerRunArgs,
+        RemoveServerFromMceInput,
+        RemoveServerFromMceProgress,
+        RemoveServerFromMceResult,
+        RemoveServerFromMceRunArgs,
         ServerMembership,
         ServerMembershipRequest,
         ServerReservation,
@@ -137,7 +143,7 @@ with workflow.unsafe.imports_passed_through():
 
 _ACTIVITY_TIMEOUT = timedelta(seconds=90)
 # How long a cluster call may wait for the MCE's worker to pick it up before
-# Temporal reports it — the same signal install-server uses for "no worker
+# Temporal reports it — the same signal add-server-to-mce uses for "no worker
 # polls this MCE's queue".
 _SCHEDULE_TO_START_TIMEOUT = timedelta(minutes=5)
 
@@ -191,14 +197,18 @@ _PXE_OWN_SITE_PATCH = "remove-server-pxe-own-site"
 # RUN depends on; nothing about this removal depends on the PXE VM.)
 _PXE_CLEANUP_DEADLINE = timedelta(minutes=10)
 
-# Gates releasing install-server's lock for this MCE once the host is gone.
+# Gates releasing add-server-to-mce's lock for this MCE once the host is gone.
 # Runs recorded before it end at the final check and leave the lock to its TTL.
 _RELEASE_LOCK_PATCH = "remove-server-release-own-mce-lock"
-# The holders server-scan's lock may name: install_server._RESERVATION_HOLDER
-# and uninstall_server._RESERVATION_HOLDER (a test keeps them in step; this
-# module cannot import uninstall-server's, which imports it).
-_INSTALL_HOLDER = "install-server"
-_UNINSTALL_HOLDER = "uninstall-server"
+# The holders server-scan's lock may name: add_server_to_mce's and
+# uninstall_server_from_hc's _RESERVATION_HOLDER, plus the _LEGACY_ one each
+# kept for runs started before the renames (a test keeps them in step; this
+# module cannot import uninstall-server-from-hc's, which imports it). A recorded
+# run read only an old holder, which is in its set, so it replays unchanged.
+_INSTALL_HOLDERS = frozenset({"add-server-to-mce", "install-server"})
+_UNINSTALL_HOLDERS = frozenset({"uninstall-server-from-hc", "uninstall-server"})
+# The workflow type of every run started before the rename.
+_LEGACY_WORKFLOW_TYPE = "RemoveServerWorkflow"
 
 
 def _cause(err: ActivityError) -> str:
@@ -220,7 +230,7 @@ def _describe_leftover(state: InventoryHostState) -> str:
 
 
 @workflow.defn
-class RemoveServerWorkflow:
+class RemoveServerFromMceWorkflow:
     def __init__(self) -> None:
         self._phase = "pending"
         self._activity_queue: str | None = None
@@ -228,11 +238,11 @@ class RemoveServerWorkflow:
         self._pxe_own_site = False
 
     @workflow.query
-    def progress(self) -> RemoveServerProgress:
-        return RemoveServerProgress(phase=self._phase, activity_queue=self._activity_queue)
+    def progress(self) -> RemoveServerFromMceProgress:
+        return RemoveServerFromMceProgress(phase=self._phase, activity_queue=self._activity_queue)
 
     @workflow.run
-    async def run(self, run_args: RemoveServerRunArgs) -> RemoveServerResult:
+    async def run(self, run_args: RemoveServerFromMceRunArgs) -> RemoveServerFromMceResult:
         request = run_args.input
         activity_queue = server_lifecycle_activity_queue(request.mce_cluster)
         self._activity_queue = activity_queue
@@ -240,8 +250,8 @@ class RemoveServerWorkflow:
         self._pxe_own_site = workflow.patched(_PXE_OWN_SITE_PATCH)
         ref = BmhRef(server_name=request.server_name, namespace=request.namespace)
 
-        def result(**fields) -> RemoveServerResult:
-            return RemoveServerResult(
+        def result(**fields) -> RemoveServerFromMceResult:
+            return RemoveServerFromMceResult(
                 server_name=request.server_name,
                 namespace=request.namespace,
                 mce_cluster=request.mce_cluster,
@@ -375,7 +385,7 @@ class RemoveServerWorkflow:
                 type=ServerStillPresentError.__name__,
             )
 
-        # Step 7 — nothing of the host is left here, so install-server's hold
+        # Step 7 — nothing of the host is left here, so add-server-to-mce's hold
         # on it for THIS MCE protects nothing any more: given back.
         lock_released = False
         lock_detail: str | None = None
@@ -406,14 +416,14 @@ class RemoveServerWorkflow:
         )
 
     async def _release_own_mce_lock(
-        self, request: RemoveServerInput, pxe_failed: list[str], task_queue: str
+        self, request: RemoveServerFromMceInput, pxe_failed: list[str], task_queue: str
     ) -> tuple[bool, str]:
         """(released, what was found) for server-scan's install lock, the host gone.
 
-        Released ONLY when live, held by install-server, and for this run's
+        Released ONLY when live, held by add-server-to-mce, and for this run's
         MCE — with the holder and workflow id just read, so server-scan's
         compare-and-delete gives back exactly that lock, and one taken since
-        is answered 409 and left. uninstall-server's lock is its own run's to
+        is answered 409 and left. uninstall-server-from-hc's lock is its own run's to
         release (this run is then its child, and must not race it); another
         MCE's is an install this run knows nothing about. Nothing is read
         when the PXE cleanup failed: the host's MACs may still chain to this
@@ -444,13 +454,13 @@ class RemoveServerWorkflow:
         if not lock.live:
             return False, "no live lock in server-scan: nothing to release"
         held = f"{lock.holder!r} (run {lock.workflow_id!r}, MCE {lock.mce_cluster!r})"
-        if lock.holder == _UNINSTALL_HOLDER:
+        if lock.holder in _UNINSTALL_HOLDERS:
             return False, (
-                f"left to uninstall-server: held by {held}, which releases its own lock "
-                "once its remove-server child completes"
+                f"left to uninstall-server-from-hc: held by {held}, which releases its own lock "
+                "once its remove-server-from-mce child completes"
             )
-        if lock.holder != _INSTALL_HOLDER or not lock.workflow_id:
-            return self._kept(server, f"left alone: held by {held}, not an install-server run")
+        if lock.holder not in _INSTALL_HOLDERS or not lock.workflow_id:
+            return self._kept(server, f"left alone: held by {held}, not an add-server-to-mce run")
         if not lock.mce_cluster or canonical_mce_cluster(lock.mce_cluster) != canonical_mce_cluster(
             request.mce_cluster
         ):
@@ -484,7 +494,7 @@ class RemoveServerWorkflow:
         """(cleared, kept, failed) for the host's MACs on its OWN site's PXE VM.
 
         The site is the MCE's inventory segment's — the same rule
-        install-server maps the host by, so this is the one VM that can hold
+        add-server-to-mce maps the host by, so this is the one VM that can hold
         its entries, and the one whose token and network path the worker has.
         BEST EFFORT throughout: a missing segment, a rejected token or request,
         or a VM unreachable for the whole deadline is recorded as `failed`, and
@@ -575,3 +585,23 @@ class RemoveServerWorkflow:
             if workflow.now() - started_at >= _POWER_OFF_DEADLINE:
                 return False
             await workflow.sleep(_POWER_POLL_INTERVAL)  # durable, replay-safe
+
+
+@workflow.defn(name=_LEGACY_WORKFLOW_TYPE)
+class RemoveServerWorkflow(RemoveServerFromMceWorkflow):
+    """remove-server-from-mce under its old type, for runs started before the rename.
+
+    Their history names `RemoveServerWorkflow` on the old queue
+    (LEGACY_REMOVE_SERVER_WORKFLOW_QUEUE) — a remove-server run started on its
+    own, or the child an uninstall started before the rename starts there —
+    and only a worker registering that type there can replay them;
+    tests/histories/remove_server/ is the proof. Nothing new starts it except
+    such an uninstall: delete it, and its registration in main_worker_init.py,
+    once neither `RemoveServerWorkflow` nor `UninstallServerWorkflow` has a run
+    open.
+    """
+
+    # The SDK takes @workflow.run only from the class it registers, not a base.
+    @workflow.run
+    async def run(self, run_args: RemoveServerFromMceRunArgs) -> RemoveServerFromMceResult:
+        return await super().run(run_args)

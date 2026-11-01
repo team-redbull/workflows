@@ -6,7 +6,7 @@ an untyped dict.
 None of these models carries `extra="forbid"`: they are decoded from Temporal
 history on every replay, so a field removed later would wedge in-flight runs.
 Strictness about unknown fields belongs on the API-edge request models in the
-router (RemoveServerRequest, InstallServerRequest), exactly as
+router (RemoveServerFromMceRequest, AddServerToMceRequest), exactly as
 InitializeSegmentRequest does it.
 """
 
@@ -34,7 +34,7 @@ def mac_is_valid(mac: str) -> bool:
 class _QuietDefaults(BaseModel):
     """Leaves the fields named in `_quiet_defaults` OUT of a payload while they hold their default.
 
-    For install-server's hidden `allow_unhealthy` (CLAUDE.md §4): a field
+    For add-server-to-mce's hidden `allow_unhealthy` (CLAUDE.md §4): a field
     serialized as `false` / `[]` into EVERY run's input, progress, result and
     create would show the knob to anyone browsing a run in the Temporal UI, which
     is exactly what hiding it from the OpenAPI schema is for. Absent on the wire
@@ -55,7 +55,7 @@ class _QuietDefaults(BaseModel):
 
 
 class WaivedHealthCheck(BaseModel):
-    """One health refusal install-server did NOT apply, because the request asked (`allow_unhealthy`).
+    """One health refusal add-server-to-mce did NOT apply, because the request asked (`allow_unhealthy`).
 
     `check` names the rule — `server-scan-health` (its health tier, every
     category worse than HEALTHY listed), `network-health` (its network
@@ -78,7 +78,7 @@ class LinkState(str, Enum):
     usable vNIC signal in 2026-09 (`operability`). HPE OneView reports
     `UNKNOWN` unconditionally — its `portMap` carries no link state at all, so
     there is nothing to normalize — and Intersight vNICs mostly report it
-    empty. install-server requires UP strictly (see `select_bond_members`), so
+    empty. add-server-to-mce requires UP strictly (see `select_bond_members`), so
     those two vendors fail the bond selection rather than being silently
     skipped; that is a deliberate, accepted gap.
     """
@@ -111,7 +111,7 @@ class BmcEndpoint(BaseModel):
 class ServerInterface(BaseModel):
     """One NIC of a candidate server, as `GET /servers/available` reports it.
 
-    This is the ONLY source install-server selects bond members from. The
+    This is the ONLY source add-server-to-mce selects bond members from. The
     server's `nic_macs` list is deliberately not modelled: server-scan reduces
     NPAR partitions to one entry per physical port in `network.interfaces` but
     leaves `identity.nic_macs` whole on purpose, so a partitioned Dell card
@@ -347,7 +347,7 @@ class InfraEnvBootRequest(BaseModel):
     `server_name` is the host whose NMStateConfig the published image must
     already include: the activity publishes only once the InfraEnv's
     `status.createdTime` is no older than that NMStateConfig. None
-    (publish-infraenv-boot) publishes the InfraEnv's CURRENT image as soon as
+    (publish-infraenv-to-pxe-server) publishes the InfraEnv's CURRENT image as soon as
     it is ready, tied to no host. Like PxeBootRequest, the URL itself never
     enters history.
     """
@@ -400,7 +400,7 @@ class PxeUnregistration(BaseModel):
 
 
 class PxeHostEntriesRef(BaseModel):
-    """remove-server: clear one host's MACs from every PXE VM this MCE's worker knows.
+    """remove-server-from-mce: clear one host's MACs from every PXE VM this MCE's worker knows.
 
     `mce_cluster` is the MCE the host is being removed from. The PXE VM deletes
     a MAC only if it does NOT chain to another MCE's boot entry, so a machine
@@ -411,7 +411,7 @@ class PxeHostEntriesRef(BaseModel):
     mce_cluster: str = Field(min_length=1)
     macs: list[str] = Field(min_length=1)
     # The MCE's inventory-segment site: only THAT site's PXE VM is cleared,
-    # the same one install-server mapped the host on. None in payloads of a
+    # the same one add-server-to-mce mapped the host on. None in payloads of a
     # run recorded before `remove-server-pxe-own-site`, which tried every VM
     # in PXE_MAP_URLS — and failed on every site but its own, whose token and
     # network path the worker does not have.
@@ -419,7 +419,7 @@ class PxeHostEntriesRef(BaseModel):
 
 
 class PxeHostEntriesRemoval(BaseModel):
-    """What remove-server's PXE cleanup did, as `<site>/<mac key>` entries.
+    """What remove-server-from-mce's PXE cleanup did, as `<site>/<mac key>` entries.
 
     `cleared` MACs are no longer mapped on that VM — removed, or never there
     (the PXE map answers 204 for both). `kept` belong to another MCE's boot
@@ -493,7 +493,7 @@ class BmhState(BaseModel):
     error_type: str | None = None
     error_message: str | None = None
     # `status.poweredOn` as metal3 last observed it through the BMC. None from
-    # a limb that predates the field — read only by remove-server, which also
+    # a limb that predates the field — read only by remove-server-from-mce, which also
     # needs that newer limb for its own activities.
     powered_on: bool | None = None
 
@@ -591,7 +591,7 @@ class InventoryHostState(BaseModel):
     # The MACs server-scan holds for the server; [] when it does not know it.
     server_scan_macs: list[str] = Field(default_factory=list)
     # EVERY MAC the host is known by — the BMH's boot MAC, the NMStateConfig's
-    # and server-scan's — which is what remove-server clears from the PXE map.
+    # and server-scan's — which is what remove-server-from-mce clears from the PXE map.
     # Always emitted by the limb (an empty list included); absent from payloads
     # of a limb that predates it, which the workflow tells apart by
     # `model_fields_set` and falls back to `server_scan_macs` for (CLAUDE.md §5).
@@ -630,8 +630,8 @@ class AgentDeletion(BaseModel):
     absent: list[str] = Field(default_factory=list)
 
 
-class RemoveServerInput(BaseModel):
-    """Input to RemoveServerWorkflow: which server to take out of which MCE's inventory.
+class RemoveServerFromMceInput(BaseModel):
+    """Input to RemoveServerFromMceWorkflow: which server to take out of which MCE's inventory.
 
     `namespace` is required HERE; the API defaults it to `inventory` on its
     edge model, so a recorded run always carries the namespace it acted on.
@@ -642,20 +642,20 @@ class RemoveServerInput(BaseModel):
     namespace: str = Field(min_length=1)
 
 
-class RemoveServerRunArgs(BaseModel):
-    """The workflow's single argument (see InstallServerRunArgs for why a wrapper)."""
+class RemoveServerFromMceRunArgs(BaseModel):
+    """The workflow's single argument (see AddServerToMceRunArgs for why a wrapper)."""
 
-    input: RemoveServerInput
+    input: RemoveServerFromMceInput
 
 
-class RemoveServerProgress(BaseModel):
+class RemoveServerFromMceProgress(BaseModel):
     """Returned by the `progress` query; `activity_queue` names the MCE's queue."""
 
     phase: str
     activity_queue: str | None = None
 
 
-class RemoveServerResult(BaseModel):
+class RemoveServerFromMceResult(BaseModel):
     """What the removal did. `found=False`: nothing of the server was on the MCE."""
 
     server_name: str
@@ -674,16 +674,16 @@ class RemoveServerResult(BaseModel):
     # or cannot be reached is reported here (and logged), never a failed run.
     pxe_failed: list[str] = Field(default_factory=list)
     # server-scan's install lock, once nothing of the host is left here and
-    # the PXE cleanup had no failure: install-server's lock FOR THIS MCE is
-    # released (`lock_released`); any other — another MCE's, uninstall-server's,
+    # the PXE cleanup had no failure: add-server-to-mce's lock FOR THIS MCE is
+    # released (`lock_released`); any other — another MCE's, uninstall-server-from-hc's,
     # none live — is left, and `lock_detail` says what was found and why.
     # None/False on a found=false run and on runs recorded before the release.
     lock_released: bool = False
     lock_detail: str | None = None
 
 
-class PublishInfraEnvBootInput(BaseModel):
-    """Input to PublishInfraEnvBootWorkflow: which InfraEnv's boot entry to (re)publish.
+class PublishInfraEnvToPxeServerInput(BaseModel):
+    """Input to PublishInfraEnvToPxeServerWorkflow: which InfraEnv's boot entry to (re)publish.
 
     `namespace` is required HERE; the API defaults it to `inventory` on its
     edge model, so a recorded run always carries the namespace it read.
@@ -694,20 +694,20 @@ class PublishInfraEnvBootInput(BaseModel):
     namespace: str = Field(min_length=1)
 
 
-class PublishInfraEnvBootRunArgs(BaseModel):
-    """The workflow's single argument (see InstallServerRunArgs for why a wrapper)."""
+class PublishInfraEnvToPxeServerRunArgs(BaseModel):
+    """The workflow's single argument (see AddServerToMceRunArgs for why a wrapper)."""
 
-    input: PublishInfraEnvBootInput
+    input: PublishInfraEnvToPxeServerInput
 
 
-class PublishInfraEnvBootProgress(BaseModel):
+class PublishInfraEnvToPxeServerProgress(BaseModel):
     """Returned by the `progress` query; `activity_queue` names the MCE's queue."""
 
     phase: str
     activity_queue: str | None = None
 
 
-class PublishInfraEnvBootResult(BaseModel):
+class PublishInfraEnvToPxeServerResult(BaseModel):
     """What the PXE VM of the MCE's site now serves as the InfraEnv's boot entry.
 
     `superseded` means the VM already held a NEWER image than the one read
@@ -723,8 +723,8 @@ class PublishInfraEnvBootResult(BaseModel):
     superseded: bool = False
 
 
-class InstallServerInput(_QuietDefaults):
-    """Input to InstallServerWorkflow: which InfraEnv to fill, and from where.
+class AddServerToMceInput(_QuietDefaults):
+    """Input to AddServerToMceWorkflow: which InfraEnv to fill, and from where.
 
     `infra_env` does double duty by design. It labels the BareMetalHost and the
     NMStateConfig, and its name states which hardware the InfraEnv is for
@@ -756,7 +756,7 @@ class InstallServerInput(_QuietDefaults):
     allow_unhealthy: bool = False
 
 
-class InstallServerRunArgs(BaseModel):
+class AddServerToMceRunArgs(BaseModel):
     """The workflow's single argument.
 
     A single-model argument is the Temporal-recommended shape, and it avoids an
@@ -766,10 +766,10 @@ class InstallServerRunArgs(BaseModel):
     one field — it is the shape run() is pinned to.
     """
 
-    input: InstallServerInput
+    input: AddServerToMceInput
 
 
-class InstallServerProgress(_QuietDefaults):
+class AddServerToMceProgress(_QuietDefaults):
     """Returned by the workflow's `progress` query (surfaced by the status API).
 
     `activity_queue` names the MCE-scoped queue this run's cluster writes go
@@ -790,7 +790,7 @@ class InstallServerProgress(_QuietDefaults):
     allowed_unhealthy: list[WaivedHealthCheck] = Field(default_factory=list)
 
 
-class InstallServerResult(_QuietDefaults):
+class AddServerToMceResult(_QuietDefaults):
     """The run's outcome: the server that is now installable in the InfraEnv.
 
     `resources_changed` is False for a re-run that found all three resources
@@ -838,11 +838,11 @@ class InstallServerResult(_QuietDefaults):
     nmstate_replaced: list[str] = Field(default_factory=list)
 
 
-# --- uninstall-server ---------------------------------------------------------
+# --- uninstall-server-from-hc ---------------------------------------------------------
 
 
 class ServerMembershipRequest(BaseModel):
-    """uninstall-server: which server to ask server-scan about, by exact name."""
+    """uninstall-server-from-hc: which server to ask server-scan about, by exact name."""
 
     server_name: str = Field(min_length=1)
 
@@ -888,7 +888,7 @@ class ServerMembership(BaseModel):
     maintenance: bool = False
     maintenance_reason: str | None = None
     # The install lock on it, as lookup_server_membership read it — what
-    # remove-server releases once the host is gone from this MCE. Absent from a
+    # remove-server-from-mce releases once the host is gone from this MCE. Absent from a
     # limb predating it, so a workflow reads it only by the key's presence
     # (CLAUDE.md §5). lookup_install_candidate reports the lock as its own
     # `InstallCandidateRecord.lock` and leaves this one at its default.
@@ -901,7 +901,7 @@ class InstallCandidateRecord(BaseModel):
 
     Read only once `/servers/available` has refused a named machine, so the
     workflow can see WHY (its 404 detail names neither the network category nor
-    the install lock): `membership` is uninstall-server's reading (found,
+    the install lock): `membership` is uninstall-server-from-hc's reading (found,
     lifecycle state, contest, maintenance), `server` the same projection
     `/servers/available` would have handed out (no live recheck behind it),
     `health` every category server-scan rolls up (`overall`, `network`,
@@ -1103,7 +1103,7 @@ class HostedNodeState(BaseModel):
     node_name: str
 
 
-# --- uninstall-server: what a broken HyperShift deletion left behind ----------
+# --- uninstall-server-from-hc: what a broken HyperShift deletion left behind ----------
 
 
 class HostedNodeQuery(BaseModel):
@@ -1236,8 +1236,8 @@ class AgentMachineCleanup(BaseModel):
     machines: list[str] = Field(default_factory=list)
 
 
-class UninstallServerInput(BaseModel):
-    """Input to UninstallServerWorkflow: which server to take out of which MCE.
+class UninstallServerFromHcInput(BaseModel):
+    """Input to UninstallServerFromHcWorkflow: which server to take out of which MCE.
 
     No cluster, NodePool or HostedCluster input on purpose: server-scan and the
     Agent's own binding say where the server is, and a caller-supplied cluster
@@ -1250,19 +1250,19 @@ class UninstallServerInput(BaseModel):
     server_name: str = Field(min_length=1)
     mce_cluster: str = Field(min_length=1)
     namespace: str = Field(min_length=1)
-    # Take the server out of its hosted cluster and STOP: no remove-server, so it
+    # Take the server out of its hosted cluster and STOP: no remove-server-from-mce, so it
     # stays in this MCE's inventory as a free Agent. False — also for every run
     # recorded before the field — takes it out of the MCE too.
     keep_inventory: bool = False
 
 
-class UninstallServerRunArgs(BaseModel):
-    """The workflow's single argument (see InstallServerRunArgs for why a wrapper)."""
+class UninstallServerFromHcRunArgs(BaseModel):
+    """The workflow's single argument (see AddServerToMceRunArgs for why a wrapper)."""
 
-    input: UninstallServerInput
+    input: UninstallServerFromHcInput
 
 
-class UninstallServerProgress(BaseModel):
+class UninstallServerFromHcProgress(BaseModel):
     """Returned by the `progress` query.
 
     `sub_phase` is set while the run waits for the Machine to go:
@@ -1279,14 +1279,14 @@ class UninstallServerProgress(BaseModel):
     agent_state: str | None = None
 
 
-class UninstallServerResult(BaseModel):
+class UninstallServerFromHcResult(BaseModel):
     """What the uninstall did, both halves.
 
     `hosted` says whether the hosted-cluster half ran (the host was a hosted
     cluster's node, or still going away as one). `skipped` names every step
     that did not need doing and why — a Machine already deleting, a Node
     check with no Node to check, the whole hosted-cluster half for an
-    inventory host. `remove_server` is the awaited remove-server child's own
+    inventory host. `remove_server` is the awaited remove-server-from-mce child's own
     result, on `remove_server_workflow_id` — None with `kept_in_inventory`. `leftovers_at_start` and
     `cleaned_up` say what HyperShift had left behind and what the run did
     about it.
@@ -1314,14 +1314,14 @@ class UninstallServerResult(BaseModel):
     leftovers_at_start: list[str] = Field(default_factory=list)
     cleaned_up: list[str] = Field(default_factory=list)
     reservation_expires_at: str | None = None
-    # The run's own install lock was given back once remove-server completed
+    # The run's own install lock was given back once remove-server-from-mce completed
     # with nothing left on the MCE and no PXE cleanup failure, so the server can
     # be installed again at once. False otherwise (keep_inventory, a PXE
     # failure, a release server-scan refused — `skipped` says which) and on runs
     # recorded before the release: the hold then runs to `reservation_expires_at`.
     lock_released: bool = False
     # keep_inventory was asked: the server was left in the MCE's inventory, and
-    # remove-server never started (remove_server* stay None).
+    # remove-server-from-mce never started (remove_server* stay None).
     kept_in_inventory: bool = False
     remove_server_workflow_id: str | None = None
-    remove_server: RemoveServerResult | None = None
+    remove_server: RemoveServerFromMceResult | None = None

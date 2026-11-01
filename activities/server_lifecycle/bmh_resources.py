@@ -1,4 +1,4 @@
-"""Builders for the three Kubernetes resources install-server creates.
+"""Builders for the three Kubernetes resources add-server-to-mce creates.
 
 Pure functions — no API calls, so they are unit-testable on their own. Ported
 from BareMetalHostUCS's `src/yaml_generators.py`, with two deliberate changes:
@@ -337,7 +337,7 @@ def nmstate_config_differences(
 
 # The label BMAC puts on an Agent it has linked to a BareMetalHost, valued with
 # the BMH's name. Not always present — an Agent can register before BMAC links
-# it — so remove-server matches on MAC as well.
+# it — so remove-server-from-mce matches on MAC as well.
 AGENT_BMH_LABEL = "agent-install.openshift.io/bmh"
 
 

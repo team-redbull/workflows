@@ -1,4 +1,4 @@
-"""A hosted cluster's own API server — what uninstall-server reads and writes there.
+"""A hosted cluster's own API server — what uninstall-server-from-hc reads and writes there.
 
 Split out like cluster_api.py: one technology, plain parameters, no settings and
 no Temporal. cluster_api.py talks to the MCE this worker runs in, as the pod's

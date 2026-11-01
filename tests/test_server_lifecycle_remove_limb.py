@@ -1,4 +1,4 @@
-"""remove-server's limb activities against a fake cluster API.
+"""remove-server-from-mce's limb activities against a fake cluster API.
 
 What matters is which Agents count as the host's, when an Agent counts as
 bound, and that the two activities that ACT re-check the binding first.

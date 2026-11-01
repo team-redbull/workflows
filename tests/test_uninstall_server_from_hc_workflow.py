@@ -1,9 +1,9 @@
-"""uninstall-server: real UninstallServerWorkflow, real remove-server child, mock limb.
+"""uninstall-server-from-hc: real UninstallServerFromHcWorkflow, real remove-server-from-mce child, mock limb.
 
 Every limb activity is registered ONLY on the target MCE's queue — as in
-production, a dispatch anywhere else would hang the run — and remove-server's
+production, a dispatch anywhere else would hang the run — and remove-server-from-mce's
 inventory-segment read on the segment-lifecycle queue. The child is the REAL
-RemoveServerWorkflow on its own queue, so "every path ends in remove-server" is
+RemoveServerFromMceWorkflow on its own queue, so "every path ends in remove-server-from-mce" is
 exercised end to end. The time-skipping environment collapses the 30 s Machine
 poll and the 20-minute / 1-hour deadlines.
 """
@@ -25,9 +25,9 @@ from temporalio.worker import UnsandboxedWorkflowRunner, Worker
 
 from shared import exceptions
 from shared.consts import (
-    REMOVE_SERVER_WORKFLOW_QUEUE,
+    REMOVE_SERVER_FROM_MCE_WORKFLOW_QUEUE,
     SEGMENT_LIFECYCLE_ACTIVITY_QUEUE,
-    UNINSTALL_SERVER_WORKFLOW_QUEUE,
+    UNINSTALL_SERVER_FROM_HC_WORKFLOW_QUEUE,
     server_lifecycle_activity_queue,
 )
 from shared.exceptions import (
@@ -77,18 +77,18 @@ from shared.models.server_lifecycle import (
     ServerMembershipRequest,
     ServerReservation,
     TeardownResult,
-    UninstallServerInput,
-    UninstallServerRunArgs,
+    UninstallServerFromHcInput,
+    UninstallServerFromHcRunArgs,
 )
-from workflow_domains.server_lifecycle import uninstall_server
-from workflow_domains.server_lifecycle.remove_server import RemoveServerWorkflow
-from workflow_domains.server_lifecycle.uninstall_server import UninstallServerWorkflow
+from workflow_domains.server_lifecycle import uninstall_server_from_hc
+from workflow_domains.server_lifecycle.remove_server_from_mce import RemoveServerFromMceWorkflow
+from workflow_domains.server_lifecycle.uninstall_server_from_hc import UninstallServerFromHcWorkflow
 
 MCE = "ocp4-mce-bat-yam-01"
 QUEUE = server_lifecycle_activity_queue(MCE)
 SERVER = "ocp-cisco-m6-bat-yam-64c-512gb-FCH0001"
 NS = "inventory"
-INPUT = UninstallServerInput(server_name=SERVER, mce_cluster=MCE, namespace=NS)
+INPUT = UninstallServerFromHcInput(server_name=SERVER, mce_cluster=MCE, namespace=NS)
 
 HC = HostedClusterRef(namespace="clusters", name="hc-01", hcp_namespace="clusters-hc-01")
 MACHINE = MachineRef(namespace="clusters-hc-01", name="hc-01-np-x7k2p")
@@ -182,7 +182,7 @@ ON_THE_MCE = InventoryHostState(
 
 # An install into another MCE, holding the machine once this run's lock lapsed.
 OTHER_RUNS_LOCK = ServerLockRecord(
-    live=True, holder="install-server", workflow_id=f"install-server-ocp4-mce-other_{SERVER}",
+    live=True, holder="add-server-to-mce", workflow_id=f"add-server-to-mce-ocp4-mce-other_{SERVER}",
     mce_cluster="ocp4-mce-other", expires_at="2026-10-25T10:00:00Z",
 )
 
@@ -215,7 +215,7 @@ def make_mocks(
     `rechecks` is what inspect_bound_host answers after the lock is taken (an
     inventory host's last look); by default `host` again. server-scan's lock
     is modelled as server-scan keeps it: taken by reserve_server, cleared by a
-    release from the same holder and run, read back by remove-server's lookup.
+    release from the same holder and run, read back by remove-server-from-mce's lookup.
     """
     recheck_seq = list(rechecks or [host])
     machine_seq = list(machines or MACHINE_TIMELINE)
@@ -248,7 +248,7 @@ def make_mocks(
     @activity.defn
     async def lookup_server_membership(request: ServerMembershipRequest) -> ServerMembership:
         calls["lookup_server_membership"].append(request)
-        # The first is the parent's; any later one is remove-server's lock read.
+        # The first is the parent's; any later one is remove-server-from-mce's lock read.
         _mark("lookup" if len(calls["lookup_server_membership"]) == 1 else "child-lock")
         return membership.model_copy(update={"lock": lock["record"]})
 
@@ -380,7 +380,7 @@ def make_mocks(
         return BmhState(found=True, provisioning_state="externally provisioned",
                         operational_status="OK", powered_on=False)
 
-    # --- remove-server, the child --------------------------------------------
+    # --- remove-server-from-mce, the child --------------------------------------------
     @activity.defn
     async def inspect_inventory_host(ref: BmhRef) -> InventoryHostState:
         calls["inspect_inventory_host"].append(ref)
@@ -437,7 +437,7 @@ _BLOCKER_QUEUE = "test-blocker"
 
 @workflow.defn(name="Blocker")
 class _Blocker:
-    """Holds a workflow id open forever — another remove-server of the same server."""
+    """Holds a workflow id open forever — another remove-server-from-mce of the same server."""
 
     @workflow.run
     async def run(self) -> None:
@@ -454,8 +454,8 @@ class _Harness:
         config["data_converter"] = pydantic_data_converter
         client = Client(**config)
         self._workers = [
-            Worker(client, task_queue=UNINSTALL_SERVER_WORKFLOW_QUEUE, workflows=[UninstallServerWorkflow]),
-            Worker(client, task_queue=REMOVE_SERVER_WORKFLOW_QUEUE, workflows=[RemoveServerWorkflow]),
+            Worker(client, task_queue=UNINSTALL_SERVER_FROM_HC_WORKFLOW_QUEUE, workflows=[UninstallServerFromHcWorkflow]),
+            Worker(client, task_queue=REMOVE_SERVER_FROM_MCE_WORKFLOW_QUEUE, workflows=[RemoveServerFromMceWorkflow]),
             Worker(client, task_queue=_BLOCKER_QUEUE, workflows=[_Blocker],
                    workflow_runner=UnsandboxedWorkflowRunner()),
             *(
@@ -473,13 +473,13 @@ class _Harness:
         await self._env.__aexit__(*exc_info)
 
 
-async def _execute(client: Client, request: UninstallServerInput = INPUT, workflow_id: str | None = None):
+async def _execute(client: Client, request: UninstallServerFromHcInput = INPUT, workflow_id: str | None = None):
     return await asyncio.wait_for(
         client.execute_workflow(
-            UninstallServerWorkflow.run,
-            UninstallServerRunArgs(input=request),
+            UninstallServerFromHcWorkflow.run,
+            UninstallServerFromHcRunArgs(input=request),
             id=workflow_id or f"test-{uuid.uuid4()}",
-            task_queue=UNINSTALL_SERVER_WORKFLOW_QUEUE,
+            task_queue=UNINSTALL_SERVER_FROM_HC_WORKFLOW_QUEUE,
         ),
         timeout=60,
     )
@@ -495,7 +495,7 @@ async def _fails(client: Client, **kwargs) -> ApplicationError:
     return cause
 
 
-# remove-server's steps, its lock read last (it leaves this run's lock alone),
+# remove-server-from-mce's steps, its lock read last (it leaves this run's lock alone),
 # then the parent's release of its own lock.
 CHILD = ["child-inspect", "child-power-off", "child-teardown", "child-delete-agents",
          "child-pxe", "child-verify", "child-lock", "release"]
@@ -506,7 +506,7 @@ class TestAHostedClustersNode:
     async def test_it_leaves_the_hosted_cluster_then_the_inventory(self):
         calls, acts = make_mocks()
         async with _Harness(acts) as client:
-            result = await _execute(client, workflow_id="uninstall-server-test-happy")
+            result = await _execute(client, workflow_id="uninstall-server-from-hc-test-happy")
 
         assert calls["order"] == ["lookup", "inspect", "find-nodes", "reserve", *HOSTED_HALF,
                                   "hold", *CHILD]
@@ -531,23 +531,23 @@ class TestAHostedClustersNode:
         assert first == HostedNodeQuery(hosted_cluster=HC, server_name=SERVER, agent_name="agent-1",
                                         hostname=NODE, node_name=NODE)
         assert after and all(q.hosted_cluster == HC for q in after)
-        # The inventory half is remove-server's, awaited, on its own id.
-        assert result.remove_server_workflow_id == f"remove-server-{SERVER.lower()}"
+        # The inventory half is remove-server-from-mce's, awaited, on its own id.
+        assert result.remove_server_workflow_id == f"remove-server-from-mce-{SERVER.lower()}"
         assert result.remove_server.found and result.remove_server.agents_removed == ["agent-1"]
         assert result.reservation_expires_at == "2026-10-25T09:00:00Z"
 
     async def test_the_lock_is_taken_before_any_write_and_held_a_day_before_the_child(self):
         calls, acts = make_mocks()
         async with _Harness(acts) as client:
-            await _execute(client, workflow_id="uninstall-server-lock")
+            await _execute(client, workflow_id="uninstall-server-from-hc-lock")
 
         reserve, hold = calls["reserve_server"]
-        assert reserve.holder == hold.holder == "uninstall-server"
-        assert reserve.workflow_id == hold.workflow_id == "uninstall-server-lock"
+        assert reserve.holder == hold.holder == "uninstall-server-from-hc"
+        assert reserve.workflow_id == hold.workflow_id == "uninstall-server-from-hc-lock"
         assert (reserve.server_id, reserve.mce_cluster) == ("srv_123", MCE)
         assert reserve.infra_env == "cisco-m6-bat-yam-64c-512gb"
         # The TTL covers the whole hosted-cluster half; the hold is a day.
-        assert reserve.ttl_seconds == int(uninstall_server._LEFTOVERS_RESERVATION_TTL.total_seconds())
+        assert reserve.ttl_seconds == int(uninstall_server_from_hc._LEFTOVERS_RESERVATION_TTL.total_seconds())
         assert hold.ttl_seconds == 86_400
         order = calls["order"]
         assert order.index("reserve") < order.index("delete-machine")
@@ -946,17 +946,17 @@ class TestTheNodePoolTakingTheServerBack:
     def test_a_limb_predating_the_field_never_reads_as_a_retake(self):
         # Built in-process, so an unsent key is really absent — as in an old limb's payload.
         old_inspection = HostAgent(name="agent-1", namespace=NS, agent_machine=AM)
-        assert uninstall_server._started_from(old_inspection) is None
-        assert uninstall_server._retaken_by(RETAKEN, None) is None
+        assert uninstall_server_from_hc._started_from(old_inspection) is None
+        assert uninstall_server_from_hc._retaken_by(RETAKEN, None) is None
 
-        started = uninstall_server._started_from(old_inspection.model_copy(
+        started = uninstall_server_from_hc._started_from(old_inspection.model_copy(
             update={"labelled_agent_machine": None}))
         assert started == frozenset({AM})
         old_poll = AgentBindingState(found=True, cluster_deployment="clusters-hc-01/hc-01",
                                      agent_machine_label=True)
-        assert uninstall_server._retaken_by(old_poll, started) is None
-        assert uninstall_server._retaken_by(RETAKEN, started) == NEW_AM
-        assert uninstall_server._retaken_by(AGENT_UNBINDING.model_copy(
+        assert uninstall_server_from_hc._retaken_by(old_poll, started) is None
+        assert uninstall_server_from_hc._retaken_by(RETAKEN, started) == NEW_AM
+        assert uninstall_server_from_hc._retaken_by(AGENT_UNBINDING.model_copy(
             update={"agent_machine": None}), started) is None
 
 
@@ -966,7 +966,7 @@ class TestAnInventoryHost:
         async with _Harness(acts) as client:
             result = await _execute(client)
 
-        # Looked at again, fresh, right before remove-server: a free Agent is
+        # Looked at again, fresh, right before remove-server-from-mce: a free Agent is
         # what any NodePool's new Machine takes.
         assert calls["order"] == ["lookup", "inspect", "reserve", "verify-inventory", "hold", *CHILD]
         assert len(calls["inspect_bound_host"]) == 2
@@ -1046,7 +1046,7 @@ class TestAnInventoryHost:
     async def test_a_run_recorded_before_the_recheck_goes_straight_to_the_hold(self, monkeypatch):
         monkeypatch.setattr(
             workflow, "patched",
-            lambda patch_id: patch_id != uninstall_server._INVENTORY_VERIFY_PATCH,
+            lambda patch_id: patch_id != uninstall_server_from_hc._INVENTORY_VERIFY_PATCH,
         )
         calls, acts = make_mocks(membership=IN_INVENTORY, host=INVENTORY_HOST)
         async with _Harness(acts) as client:
@@ -1060,7 +1060,7 @@ KEEP = INPUT.model_copy(update={"keep_inventory": True})
 
 
 class TestKeepInventory:
-    """keep_inventory: out of the hosted cluster, and no further — no remove-server."""
+    """keep_inventory: out of the hosted cluster, and no further — no remove-server-from-mce."""
 
     async def test_a_hosted_node_leaves_its_cluster_and_stays_in_the_inventory(self):
         calls, acts = make_mocks()
@@ -1152,13 +1152,13 @@ class TestRefusedBeforeAnyWrite:
 
     async def test_a_lock_another_run_holds_fails_the_run(self):
         calls, acts = make_mocks(reserve_error=ServerReservedError(
-            f"{SERVER} is reserved by 'install-server' for MCE 'ocp4-mce-bat-yam-01'"
+            f"{SERVER} is reserved by 'add-server-to-mce' for MCE 'ocp4-mce-bat-yam-01'"
         ))
         async with _Harness(acts) as client:
             error = await _fails(client)
 
         assert error.type == "ServerReservedError"
-        assert "install-server" in error.message and "Nothing was changed" in error.message
+        assert "add-server-to-mce" in error.message and "Nothing was changed" in error.message
         assert calls["order"] == ["lookup", "inspect", "find-nodes", "reserve"]
         assert len(calls["reserve_server"]) == 1  # non-retryable
 
@@ -1167,7 +1167,7 @@ class TestTheInventoryHalf:
     async def test_a_hold_refused_at_the_end_still_removes_the_host(self):
         _calls, acts = make_mocks(
             membership=IN_INVENTORY, host=INVENTORY_HOST,
-            hold_error=ServerReservedError("reserved by 'install-server' on another MCE"),
+            hold_error=ServerReservedError("reserved by 'add-server-to-mce' on another MCE"),
         )
         async with _Harness(acts) as client:
             result = await _execute(client)
@@ -1175,19 +1175,19 @@ class TestTheInventoryHalf:
         assert result.reservation_expires_at is None
         assert result.remove_server.found
 
-    async def test_remove_server_already_running_is_a_named_error(self):
+    async def test_remove_server_from_mce_already_running_is_a_named_error(self):
         calls, acts = make_mocks(membership=IN_INVENTORY, host=INVENTORY_HOST)
-        child_id = f"remove-server-{SERVER.lower()}"
+        child_id = f"remove-server-from-mce-{SERVER.lower()}"
         async with _Harness(acts) as client:
             await client.start_workflow("Blocker", id=child_id, task_queue=_BLOCKER_QUEUE)
             error = await _fails(client)
 
-        assert error.type == "RemoveServerAlreadyRunningError"
+        assert error.type == "RemoveServerFromMceAlreadyRunningError"
         assert child_id in error.message
         assert calls["inspect_inventory_host"] == []
 
     async def test_a_failed_child_fails_the_uninstall_with_its_cause(self):
-        # remove-server's own refusal: an Agent bound since this run inspected.
+        # remove-server-from-mce's own refusal: an Agent bound since this run inspected.
         rebound = ON_THE_MCE.model_copy(update={
             "agents": [AgentBinding(name="agent-1", cluster_deployment="clusters-hc-02/hc-02")]
         })
@@ -1195,25 +1195,25 @@ class TestTheInventoryHalf:
         async with _Harness(acts) as client:
             error = await _fails(client)
 
-        assert error.type == "RemoveServerFailedError"
+        assert error.type == "RemoveServerFromMceFailedError"
         assert "AgentBoundToClusterError" in error.message
-        assert f"remove-server-{SERVER.lower()}" in error.message
+        assert f"remove-server-from-mce-{SERVER.lower()}" in error.message
 
 
 class TestTheLockIsGivenBack:
-    """Once remove-server took the host off the MCE, the run's own lock goes back (2026-10-31)."""
+    """Once remove-server-from-mce took the host off the MCE, the run's own lock goes back (2026-10-31)."""
 
     async def test_a_hosted_node_is_drawable_again_once_it_is_out_of_the_mce(self):
         calls, acts = make_mocks()
         async with _Harness(acts) as client:
-            result = await _execute(client, workflow_id="uninstall-server-release")
+            result = await _execute(client, workflow_id="uninstall-server-from-hc-release")
 
         assert calls["order"][-3:] == ["child-verify", "child-lock", "release"]
         # Its OWN lock — holder and run — so server-scan's compare-and-delete never
         # clears another run's.
         assert calls["release_server"] == [ReleaseServerRequest(
-            server_id="srv_123", server_name=SERVER, holder="uninstall-server",
-            workflow_id="uninstall-server-release",
+            server_id="srv_123", server_name=SERVER, holder="uninstall-server-from-hc",
+            workflow_id="uninstall-server-from-hc-release",
         )]
         assert result.lock_released is True
         assert not any(s.startswith("releasing-server") for s in result.skipped)
@@ -1221,14 +1221,14 @@ class TestTheLockIsGivenBack:
     async def test_the_child_leaves_the_parents_lock_to_the_parent(self):
         calls, acts = make_mocks()
         async with _Harness(acts) as client:
-            result = await _execute(client, workflow_id="uninstall-server-parent")
+            result = await _execute(client, workflow_id="uninstall-server-from-hc-parent")
 
-        # remove-server read the lock, saw uninstall-server's and released nothing:
+        # remove-server-from-mce read the lock, saw uninstall-server-from-hc's and released nothing:
         # the one release is the parent's, after the child completed.
         assert result.remove_server.lock_released is False
-        assert result.remove_server.lock_detail.startswith("left to uninstall-server")
-        assert "uninstall-server-parent" in result.remove_server.lock_detail
-        assert [r.holder for r in calls["release_server"]] == ["uninstall-server"]
+        assert result.remove_server.lock_detail.startswith("left to uninstall-server-from-hc")
+        assert "uninstall-server-from-hc-parent" in result.remove_server.lock_detail
+        assert [r.holder for r in calls["release_server"]] == ["uninstall-server-from-hc"]
         assert calls["order"].index("release") > calls["order"].index("child-lock")
 
     async def test_an_inventory_host_has_its_lock_released_too(self):
@@ -1246,7 +1246,7 @@ class TestTheLockIsGivenBack:
         assert result.remove_server.pxe_failed
         assert calls["release_server"] == [] and result.lock_released is False
         assert result.reservation_expires_at == "2026-10-25T09:00:00Z"
-        assert result.skipped[-1].startswith("releasing-server: remove-server's PXE cleanup failed")
+        assert result.skipped[-1].startswith("releasing-server: remove-server-from-mce's PXE cleanup failed")
         assert "PxeMapAuthError" in result.skipped[-1]
 
     async def test_a_failed_child_releases_nothing(self):
@@ -1256,7 +1256,7 @@ class TestTheLockIsGivenBack:
         calls, acts = make_mocks(membership=IN_INVENTORY, host=INVENTORY_HOST, inventory=rebound)
         async with _Harness(acts) as client:
             error = await _fails(client)
-        assert error.type == "RemoveServerFailedError"
+        assert error.type == "RemoveServerFromMceFailedError"
         assert calls["release_server"] == []
 
     async def test_a_refused_release_is_named_and_the_uninstall_completes(self):
@@ -1271,22 +1271,22 @@ class TestTheLockIsGivenBack:
 
     async def test_a_lock_another_run_took_since_is_reported_not_cleared(self):
         # The hold was refused: this run's lock had lapsed and another MCE's install took it.
-        other = ServerReservedError("reserved by 'install-server' for MCE 'ocp4-mce-other'")
+        other = ServerReservedError("reserved by 'add-server-to-mce' for MCE 'ocp4-mce-other'")
         calls, acts = make_mocks(membership=IN_INVENTORY, host=INVENTORY_HOST, hold_error=other)
         async with _Harness(acts) as client:
             result = await _execute(client)
 
         assert result.reservation_expires_at is None and result.remove_server.found
         # Asked with this run's holder and id, server-scan keeps the other run's lock.
-        assert [r.holder for r in calls["release_server"]] == ["uninstall-server"]
+        assert [r.holder for r in calls["release_server"]] == ["uninstall-server-from-hc"]
         assert result.lock_released is False
         assert result.skipped[-1].startswith("releasing-server: not released — left alone, it is not ours")
-        # remove-server left another MCE's lock alone as well.
+        # remove-server-from-mce left another MCE's lock alone as well.
         assert "another MCE" in result.remove_server.lock_detail
 
     async def test_a_run_recorded_before_the_release_keeps_the_day_long_hold(self, monkeypatch):
         monkeypatch.setattr(
-            workflow, "patched", lambda patch_id: patch_id != uninstall_server._RELEASE_PATCH
+            workflow, "patched", lambda patch_id: patch_id != uninstall_server_from_hc._RELEASE_PATCH
         )
         calls, acts = make_mocks()
         async with _Harness(acts) as client:
@@ -1301,7 +1301,7 @@ async def test_a_run_recorded_before_the_leftover_patch_keeps_its_flow(monkeypat
     """`workflow.patched` False — a run replaying from older history — takes the old path."""
     monkeypatch.setattr(
         workflow, "patched",
-        lambda patch_id: patch_id != uninstall_server._LEFTOVERS_PATCH,
+        lambda patch_id: patch_id != uninstall_server_from_hc._LEFTOVERS_PATCH,
     )
     calls, acts = make_mocks(machines=[DELETING, GONE], agents=[AGENT_BOUND, AGENT_FREE])
     async with _Harness(acts) as client:
@@ -1311,7 +1311,7 @@ async def test_a_run_recorded_before_the_leftover_patch_keeps_its_flow(monkeypat
                               "verify-agentmachine-old", "verify-node-old", "hold", *CHILD]
     assert calls["find_hosted_nodes"] == calls["clean_up_agent_machines"] == []
     assert calls["check_hosted_node"] == [HostedNodeRef(hosted_cluster=HC, node_name=NODE)]
-    assert calls["reserve_server"][0].ttl_seconds == int(uninstall_server._RESERVATION_TTL.total_seconds())
+    assert calls["reserve_server"][0].ttl_seconds == int(uninstall_server_from_hc._RESERVATION_TTL.total_seconds())
     assert result.remove_server.found
 
 
@@ -1324,9 +1324,9 @@ async def test_every_step_runs_on_the_target_mces_queue():
     assert calls["inspect_bound_host"] == [BmhRef(server_name=SERVER, namespace=NS)]
 
 
-# --- error classification, as install-server's is guarded ---------------------
+# --- error classification, as add-server-to-mce's is guarded ---------------------
 
-_MODULE = pathlib.Path(uninstall_server.__file__)
+_MODULE = pathlib.Path(uninstall_server_from_hc.__file__)
 
 
 def _workflow_raised() -> set[str]:
@@ -1340,7 +1340,7 @@ def _workflow_raised() -> set[str]:
 
 
 def test_the_non_retryable_list_names_only_activity_raised_classes():
-    listed = set(uninstall_server._RETRY_POLICY.non_retryable_error_types or [])
+    listed = set(uninstall_server_from_hc._RETRY_POLICY.non_retryable_error_types or [])
     assert listed and all(isinstance(getattr(exceptions, n, None), type) for n in listed)
     assert not listed & _workflow_raised()
 

@@ -158,7 +158,7 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
 ## 4. External dependencies are black boxes
 
 - **provision-dell-server (domain `server-provisioning`) takes a Dell from "iDRAC has an IP" to
-  "this machine is configured"**, after which install-server can draw it. Designed with the
+  "this machine is configured"**, after which add-server-to-mce can draw it. Designed with the
   operator 2026-09-30.
   The pieces that are decisions, not incidental:
   - **Credentials by POSITION, never by value in history.** Root only (iDRAC user 2); the OME
@@ -199,7 +199,7 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
     Either way, never ask server-scan to refresh and never call `/servers/available` (live vendor
     recheck).
 
-- **server-scan is the inventory source of record for install-server**
+- **server-scan is the inventory source of record for add-server-to-mce**
   (`SERVER_SCAN_URL`). The workflow makes ONE read — `GET /servers/available`
   — plus the install lock below, and never queries a vendor manager itself: server-scan already collects HP
   OneView / UCS Central / Dell OME / Intersight / standalone Redfish on a
@@ -209,16 +209,18 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   ours; `live_recheck_performed` per item says when it degraded to the stored
   document. It returns DATA ONLY — never BMC credentials, which server-scan
   does not hold; those stay in this worker's own Secret.
-- **install-server LOCKS the machine it chose in server-scan** (server-scan's
+- **add-server-to-mce LOCKS the machine it chose in server-scan** (server-scan's
   ADR-0035, `POST`/`DELETE /servers/{id}/reservation`, `reserve_server`/
   `release_server` on the MCE's queue). `/servers/available` hands candidates
   out unlocked and lists a machine AVAILABLE until a cluster reports it, while
   the BareMetalHost probe only sees the run's OWN MCE — so without the lock a
   server installed into MCE-A is drawn again for MCE-B. Taken after the probe,
-  before any write; holder `install-server` + the run's workflow id, so a retry
-  or a renewal EXTENDS it; renewed as the Agent wait begins; held a day after
-  success, unless the server leaves the MCE first — remove-server then releases
-  it (the operator's decision, 2026-10-31, below); install-server itself
+  before any write; holder `add-server-to-mce` + the run's workflow id, so a retry
+  or a renewal EXTENDS it (server-scan matches BOTH, so a run started as
+  install-server keeps holder `install-server` to the end — `_reservation_holder`,
+  by workflow type); renewed as the Agent wait begins; held a day after
+  success, unless the server leaves the MCE first — remove-server-from-mce then releases
+  it (the operator's decision, 2026-10-31, below); add-server-to-mce itself
   releases it ONLY after a teardown (a failure elsewhere leaves it to its
   TTL, since half-created resources may still name the machine). A lock held
   elsewhere is a skip (`reserved`), like every candidate reason. A RE-RUN of the
@@ -232,7 +234,7 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   `SERVER_SCAN_API_TOKEN`. Gated by `workflow.patched("server-scan-install-lock")`
   so runs started before it replay unchanged — keep the patch until none can
   remain in history.
-- **An IPMI server boots from the NETWORK, so install-server maps it on the
+- **An IPMI server boots from the NETWORK, so add-server-to-mce maps it on the
   site's PXE VM first.** IPMI (a UCS-managed `CISCO` blade; `boots_from_network`
   in `shared/bmc_address.py`) has no virtual media. After the install lock and
   BEFORE the Secret/BareMetalHost, `register_pxe_boot` `PUT /pxe-map/<mac>`
@@ -281,15 +283,15 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   refuses the `infra_env` body (422) and lacks the entry route (404), both
   non-retryable and named in the error. Needs `get` on `infraenvs` and
   `nmstateconfigs` in the limb's RBAC (both already granted).
-- **publish-infraenv-boot republishes one InfraEnv's boot entry on demand, tied
-  to no host.** (`workflow_domains/server_lifecycle/publish_infraenv_boot.py`,
-  own queue `publish-infraenv-boot-workflow`, id
-  `publish-infraenv-boot-<mce>-<infra_env>` — keyed on the FILE it writes, one
-  per (MCE, InfraEnv) — API `POST /workflows/server-lifecycle/publish-infraenv-boot`,
+- **publish-infraenv-to-pxe-server republishes one InfraEnv's boot entry on demand, tied
+  to no host.** (`workflow_domains/server_lifecycle/publish_infraenv_to_pxe_server.py`,
+  own queue `publish-infraenv-to-pxe-server-workflow`, id
+  `publish-infraenv-to-pxe-server-<mce>-<infra_env>` — keyed on the FILE it writes, one
+  per (MCE, InfraEnv) — API `POST /workflows/server-lifecycle/publish-infraenv-to-pxe-server`,
   `namespace` defaulting to `inventory`, MCE canonicalised at the edge because
   it is also the entry's directory on the PXE VM.) Site from the MCE's
   inventory segment (`get_inventory_segment`, segment-lifecycle queue,
-  cluster re-checked) — the same PXE VM install-server maps hosts on; then
+  cluster re-checked) — the same PXE VM add-server-to-mce maps hosts on; then
   `check_infra_env`; then the SAME `publish_infra_env_boot` activity with
   `server_name=None`, which skips the NMStateConfig comparison and publishes
   the InfraEnv's current image once `infraenv_image_not_ready_reason` passes
@@ -297,7 +299,7 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   `InfraEnvImageNotUpdatedError`. The PXE VM's compare-and-set means it can
   never roll an entry back: a newer image there is `superseded`, success.
   Writes nothing on the MCE.
-- **install-server checks the InfraEnv exists on the MCE before drawing**
+- **add-server-to-mce checks the InfraEnv exists on the MCE before drawing**
   (`check_infra_env`, phase `validating-infraenv`, gated by
   `infraenv-precheck`): a missing one fails the run with `InfraEnvNotFoundError`
   instead of locking, booting and waiting an hour on every candidate. An
@@ -310,10 +312,10 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   setting — the two ends of the queue name — and NEVER on a model decoded from
   history, where renaming a recorded run's MCE would change the queue it replays
   against.
-- **remove-server takes a server OUT of an MCE's inventory — only inventory.**
-  (`workflow_domains/server_lifecycle/remove_server.py`, own queue
-  `remove-server-workflow`, id `remove-server-<server lowercased>`, API
-  `POST /workflows/server-lifecycle/remove-server`, `namespace` defaulting to
+- **remove-server-from-mce takes a server OUT of an MCE's inventory — only inventory.**
+  (`workflow_domains/server_lifecycle/remove_server_from_mce.py`, own queue
+  `remove-server-from-mce-workflow`, id `remove-server-from-mce-<server lowercased>`, API
+  `POST /workflows/server-lifecycle/remove-server-from-mce`, `namespace` defaulting to
   `inventory`.) It finds the host's Agents by BMAC's `agent-install.openshift.io/bmh`
   label or by ANY MAC of the machine — from the BMH / NMStateConfig and every
   MAC server-scan holds for the name (`GET /servers?search=` + exact name on
@@ -323,7 +325,7 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   (`spec.clusterDeploymentName`). Order is load-bearing: POWER OFF first
   (`spec.online: false`, bounded wait on `status.poweredOn`, else
   `HostPowerOffTimeoutError` with nothing deleted), then the BMH + NMStateConfig
-  via the same `teardown_bmh_resources` as install-server's rollback, and the
+  via the same `teardown_bmh_resources` as add-server-to-mce's rollback, and the
   Agent LAST — a host still running discovery re-registers a deleted Agent
   within a minute. The power-off and the Agent delete each re-check the binding
   right before acting. It ENDS by re-inspecting until none of the three is left
@@ -354,28 +356,28 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   PXE VMs first. LAST, server-scan's install lock (`releasing-server`, gated
   `remove-server-release-own-mce-lock`; the operator's decision, 2026-10-31 —
   a server removed the day it was installed stayed undrawable for the rest of
-  install-server's day-long hold): once nothing is left and `pxe_failed` is
+  add-server-to-mce's day-long hold): once nothing is left and `pxe_failed` is
   empty, the lock is read (`lookup_server_membership`, which returns `lock`
   now — read by the key's presence, §5) and released with the holder +
   workflow id read, so server-scan compares and deletes exactly that lock —
-  ONLY when it is live, `install-server`'s and for THIS MCE (canonical names).
-  Left alone: another MCE's, `uninstall-server`'s (its run releases its own
+  ONLY when it is live, `add-server-to-mce`'s and for THIS MCE (canonical names).
+  Left alone: another MCE's, `uninstall-server-from-hc`'s (its run releases its own
   after this child completes — never raced), any other holder's; not read at
   all on found=false or a PXE failure. Never fails the run: `lock_released`,
   `lock_detail`. Needs `delete` on agents in the limb's RBAC.
-- **uninstall-server takes ONE server all the way out of an MCE, whatever its
-  Agent's state** (`workflow_domains/server_lifecycle/uninstall_server.py`, own
-  queue `uninstall-server-workflow`, id `uninstall-server-<server lowercased>`,
-  API `POST /workflows/server-lifecycle/uninstall-server` — `server_names` ONLY,
+- **uninstall-server-from-hc takes ONE server all the way out of an MCE, whatever its
+  Agent's state** (`workflow_domains/server_lifecycle/uninstall_server_from_hc.py`, own
+  queue `uninstall-server-from-hc-workflow`, id `uninstall-server-from-hc-<server lowercased>`,
+  API `POST /workflows/server-lifecycle/uninstall-server-from-hc` — `server_names` ONLY,
   a string or a list of 1-20, each once case-insensitively, plus `mce_cluster`
   canonicalised and `namespace` defaulting to `inventory`, and `keep_inventory`
   (default false; the operator, 2026-10-24) which STOPS after the hosted half and
-  the day-long hold — no remove-server child, the server left in the InfraEnv as
+  the day-long hold — no remove-server-from-mce child, the server left in the InfraEnv as
   a free Agent, `kept_in_inventory: true`; on an inventory host that is a no-op
   with NO lock. Absent from recorded runs = false, so no patch gate. NO `count`, NodePool or
   HostedCluster field: server-scan and the Agent's binding say where it is. A
   string is `{workflow_id, run_id}` and a 409 while it runs, a list the per-run
-  report install-server's named list uses (`ServerRunItem`); `UninstallServerRequest`
+  report add-server-to-mce's named list uses (`ServerRunItem`); `UninstallServerFromHcRequest`
   is its OWN model with `run_input()`, guarded by `test_every_run_field_can_be_sent`.)
   Designed with the operator 2026-10-23. The PATH is picked by the BINDING seen
   at inspection, never by the Agent's state string: a HOSTED NODE is an Agent
@@ -386,17 +388,17 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   `pre-terminate.delete.hook.machine.cluster.x-k8s.io/agentmachine` until the
   Agent is unbound), so without the agentRef match a re-run mid-unbinding would
   skip the hosted half instead of resuming it. Anything else is an INVENTORY HOST
-  and skips that half — but is INSPECTED AGAIN, fresh, right before remove-server
+  and skips that half — but is INSPECTED AGAIN, fresh, right before remove-server-from-mce
   (`verifying-agentmachine`, gated `uninstall-server-inventory-verify`; the
   operator, 2026-10-24: "should still verify no AgentMachine, Machine"): a free
   Agent is what ANY NodePool's new AgentMachine takes, so one now bound or
   labelled fails `AgentRetakenError`, any other AgentMachine / Machine /
-  control-plane link `ServerStillPresentError`, nothing on the MCE written. EVERY path ends in remove-server as an AWAITED CHILD
-  (`remove_server_workflow_id`, `REMOVE_SERVER_WORKFLOW_QUEUE`, ABANDON on parent
+  control-plane link `ServerStillPresentError`, nothing on the MCE written. EVERY path ends in remove-server-from-mce as an AWAITED CHILD
+  (`remove_server_from_mce_workflow_id`, `REMOVE_SERVER_FROM_MCE_WORKFLOW_QUEUE`, ABANDON on parent
   close) — the inventory half, PXE cleanup included, is never reimplemented here
-  and remove-server's own route keeps working alone; `WorkflowAlreadyStartedError`
-  on it is `RemoveServerAlreadyRunningError` naming the id, its failure
-  `RemoveServerFailedError` carrying the child's type; nothing on the MCE
+  and remove-server-from-mce's own route keeps working alone; `WorkflowAlreadyStartedError`
+  on it is `RemoveServerFromMceAlreadyRunningError` naming the id, its failure
+  `RemoveServerFromMceFailedError` carrying the child's type; nothing on the MCE
   completes through the child's `found=false`. ORDER: `checking-inventory`
   (`lookup_server_membership`: `GET /servers?search=` + exact name on
   `/servers/{id}`, never `/servers/available`; refused ONLY on a contradiction —
@@ -416,7 +418,7 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   `awaiting-machine-deletion` (30 s polls of Machine + Agent: `draining` while the
   Agent is bound, 20 min from the first deleting observation, then
   `MachineDrainTimeoutError` naming conditions and pending hooks; `unbinding`
-  once released, 1 h to `known-unbound` — install-server's bare-metal reasoning —
+  once released, 1 h to `known-unbound` — add-server-to-mce's bare-metal reasoning —
   then `AgentUnbindTimeoutError`, or `MachineDeletionTimeoutError` when the Agent
   is free and the Machine still stands) → `verifying-agentmachine` (gone, 5 min,
   `ServerStillPresentError`) → `verifying-node` (no Node is the server — by
@@ -438,12 +440,12 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   `AgentBindingState.agent_machine`, both gated on key presence) and stops with
   `AgentRetakenError`; `release_agent` refuses an Agent whose labelled
   AgentMachine a live Machine holds (`AgentBindingChangedError`). THE LOCK even for an uninstall (holder
-  `uninstall-server`, TTL = two drains + unbind + three verifications + 10 min): the
+  `uninstall-server-from-hc`, TTL = two drains + unbind + three verifications + 10 min): the
   hosted cluster's nodes job frees the server on its Node's absence and the MCE's
   agents job re-claims it INSTALLED_TO_INVENTORY on its own 15-min cadence, so
   between them it can read AVAILABLE while still in this InfraEnv and be drawn by
   another MCE's install. Taken after the inspection, before any write; a lock
-  held elsewhere fails the run (install-server's day-long `_INSTALLED_HOLD` on a
+  held elsewhere fails the run (add-server-to-mce's day-long `_INSTALLED_HOLD` on a
   freshly installed machine does — release it in server-scan); on failure left
   to its TTL; a refused 24 h extension is logged and the child still runs.
   Once the child completed with `pxe_failed` empty (found=false included:
@@ -477,8 +479,8 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   CLUSTER-WIDE — the widest grant the limb holds; the vendored chart in
   redbull-platform needs the same. Never: a NodePool change, a drain or Node
   delete CAPI can still do, anyone's finalizer or hook but the Agent provider's,
-  a PXE map write (remove-server's), a new deployment.
-- **uninstall-server CLEARS what a broken HyperShift deletion left, and verifies
+  a PXE map write (remove-server-from-mce's), a new deployment.
+- **uninstall-server-from-hc CLEARS what a broken HyperShift deletion left, and verifies
   every finalizer's job instead of assuming it** (`workflow.patched(
   "uninstall-server-hosted-leftovers")`; runs recorded before it keep the flow
   above). Decided with the operator 2026-10-24: HyperShift bugs leave an
@@ -526,14 +528,14 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   card reports 4 interfaces and 16 MACs. Indexing the MAC list positionally —
   as bmhgen did — can bond two partitions of ONE physical port: one wire, no
   redundancy, and it looks correct until that wire fails.
-- **install-server requires link_state UP strictly**, and that excludes whole
+- **add-server-to-mce requires link_state UP strictly**, and that excludes whole
   vendors by construction: HPE OneView's `portMap` carries no link state at
   all (server-scan stores UNKNOWN unconditionally) and Intersight vNICs
   usually report none. Those servers fail bond selection with
   `NoBondableInterfacesError` naming the provider and the states observed —
   deliberately loud, so the gap is visible rather than looking like an empty
   inventory. Decided with the operator, 2026-09-25.
-- **install-server's `allow_unhealthy` is HIDDEN ON PURPOSE — not dead code.** The operator's
+- **add-server-to-mce's `allow_unhealthy` is HIDDEN ON PURPOSE — not dead code.** The operator's
   "easter egg" (2026-10-31), after an incident that had to install servers with one NIC up
   and no RAID. Out of OpenAPI/Swagger (`SkipJsonSchema`, pinned by `TestTheHiddenAllowUnhealthy`),
   the README, the docs site and every UI; left out of payloads while unused (`_QuietDefaults`),
@@ -576,12 +578,12 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   a candidate exists, and a missing allocation fails the run rather than
   skipping a candidate — no candidate could make it usable. `bmc_vendor` still
   picks the Ironic DRIVER; it no longer picks a network.
-- **In install-server, EVERY reason a candidate is unusable is a SKIP.** The
+- **In add-server-to-mce, EVERY reason a candidate is unusable is a SKIP.** The
   multi-candidate draw exists so one unusable server is a retry rather than a
   failed run, and a reason handled outside the selection loop silently breaks
   that promise for part of the fleet — a pool of three dying on a STANDALONE
   machine at the front while two installable servers sit behind it. The reasons
-  are two tables in `install_server.py` (`_REJECTION_TYPE`, `_REJECTION_SUMMARY`)
+  are two tables in `add_server_to_mce.py` (`_REJECTION_TYPE`, `_REJECTION_SUMMARY`)
   keyed by the same strings the loop records; when nothing survives they are
   reported as separate groups and the failure takes the specific type only if
   they all agree. A reason missing from either table is a KeyError raised in
@@ -738,7 +740,7 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   retry every minute forever — run sits RUNNING (not FAILED) with the failure on the activity in the UI.
 - **Name an error type ONCE — build the non-retryable list from the CLASSES.** Temporal matches
   `non_retryable_error_types` against the error's type NAME, so a string literal with a typo in it
-  reads as "retryable" and there is nothing to notice. install-server keeps a
+  reads as "retryable" and there is nothing to notice. add-server-to-mce keeps a
   `_PERMANENT_ACTIVITY_ERRORS` tuple of the exception classes and passes
   `[e.__name__ for e in ...]`; a wrong name is then an ImportError at worker startup. The same
   applies to the types raised FROM workflow code: `ApplicationError(..., type=ThatError.__name__)`
@@ -865,7 +867,7 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   that timeout, so on upgrade-cluster it would FAIL a weeks-long run the moment a limb pod took five
   minutes to come back. Its activities wait for a worker instead (visible as a pending activity);
   the one exception is the agent call, whose timeout the workflow catches and answers as
-  needs-human. Short runs (install-server and its siblings) keep theirs as the "no worker" signal.
+  needs-human. Short runs (add-server-to-mce and its siblings) keep theirs as the "no worker" signal.
 - **The one bounded retry: the LLM agent call** (`invoke_upgrade_agent`, `maximum_attempts=2`, per
   Temporal's AI guidance). Two attempts cover a dead worker; past that, an agent that cannot answer
   is answered in the workflow as `needs_human`, so the run waits for a person instead of retrying
@@ -1006,7 +1008,7 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   remote MCE each renders its own Temporal endpoint, since no brain ConfigMap exists there;
   `deploy/` is in `.dockerignore` and triggers no image build. The server-lifecycle limb is the first to need real RBAC: it creates
   secrets, metal3.io/baremetalhosts and agent-install.openshift.io/nmstateconfigs in the target
-  namespace, where segment-lifecycle only makes HTTP and git calls — and, for uninstall-server,
+  namespace, where segment-lifecycle only makes HTTP and git calls — and, for uninstall-server-from-hc,
   a ClusterRole over CAPI Machines, AgentMachines, HostedClusters and Secrets (§4).
   cluster-upgrade-worker holds NO credential Secret — its ServiceAccount is the whole identity —
   and its RBAC is derived call by call from `activities/cluster_upgrade/activities.py` (its
@@ -1021,7 +1023,7 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
 - Assumed already running: a Temporal server and the Segments Manager (via OpenShift routes or
   localhost — no port assumptions in code).
 - Trigger via the unified API: `uvicorn workflow_domains.api:app --port 8080`, Swagger at `/docs`.
-  `POST /workflows/server-lifecycle/install-server` is ASYNC (202 + workflow id) and takes the
+  `POST /workflows/server-lifecycle/add-server-to-mce` is ASYNC (202 + workflow id) and takes the
   InfraEnv to fill plus its MCE cluster; the InfraEnv's name states which hardware it is for
   (`cisco-m6-bat-yam-64c-512gb`) and server names carry the same tokens behind an `ocp-` prefix,
   so the InfraEnv IS the server query. EVERY POOL RUN IS ON A SLOT of its HUB's CANDIDATE POOL — the
@@ -1031,11 +1033,12 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   one machine. The install lock (§4) guards the machine itself, so draws are PARALLEL: a request
   without `count` starts ONE new run and `count` (1-20, on the request ONLY — never in a run's
   input, which is decoded from history) starts `count`, one per SLOT, id
-  `install-server-<mce>_<infraEnv>_<slot>` (`_` follows the MCE and joins the parts after it: it
-  cannot occur in a Kubernetes name, so a hub's runs are all under `install-server-<mce>_` and MCE
-  `ocp4-a` never matches MCE `ocp4-a-b`'s; the id keeps the workflow's name and only gained the MCE —
-  the workflow type, queue and route are unchanged, so a run in flight replays; runs started before keep `install-server-<infraEnv>_<slot>` and
-  `install-server-name-<server>`). It walks slots `_1`..`_100`, steps over
+  `add-server-to-mce-<mce>_<infraEnv>_<slot>` (`_` follows the MCE and joins the parts after it: it
+  cannot occur in a Kubernetes name, so a hub's runs are all under `add-server-to-mce-<mce>_` and MCE
+  `ocp4-a` never matches MCE `ocp4-a-b`'s; an id is not in a run's replayed history, so a run in
+  flight keeps the id it started with — `install-server-<infraEnv>_<slot>` and
+  `install-server-name-<server>` before the MCE, `install-server-<mce>_…` before the rename).
+  It walks slots `_1`..`_100`, steps over
   every slot whose run is still RUNNING (WorkflowAlreadyStartedError) and fills free ones, so a
   second request during the first batch adds installs — it used to collide on `_1`..`_N`. A
   closed slot is reused (Temporal's default ALLOW_DUPLICATE id reuse; `TestAFinishedSlotIsFreeAgain`).
@@ -1049,22 +1052,43 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   ONE ROUTE, ONE RUN PER SERVER — never a batch workflow. Named machines are `server_names`: a
   string is one run (`{workflow_id, run_id}`, 409 while it installs), a list (1-20, each once,
   case-insensitively) one run per name with a per-run report, even for a list of one — the reply
-  follows the request's shape. Every named run is on `install-server-<mce>_<server>`, so one machine
+  follows the request's shape. Every named run is on `add-server-to-mce-<mce>_<server>`, so one machine
   is one run however it is asked for. `count` and `candidate_count` size a POOL draw, so either
-  next to `server_names` is a 422, never silently ignored. `InstallServerRequest` is therefore its
-  OWN model, not an InstallServerInput subclass: one request is many runs, each built by
+  next to `server_names` is a 422, never silently ignored. `AddServerToMceRequest` is therefore its
+  OWN model, not an AddServerToMceInput subclass: one request is many runs, each built by
   `run_input` with ONE `server_name`; `test_every_run_field_can_be_sent` keeps the two in step,
   and the old `server_name` field is a 422 pointing at `server_names`. Decided with the operator
   2026-10-23: `install-server/bulk` (the `count` draw from 2026-10-20) read as "a list of
   servers", the parallel draw went unfound, and a caller asking twice for one InfraEnv met the
-  409 — so `/bulk` was REMOVED (404) and everything moved onto install-server. Retry-safety of a
+  409 — so `/bulk` was REMOVED (404) and everything moved onto install-server (now
+  add-server-to-mce). Retry-safety of a
   `count` request was weighed and left out: its callers are humans, not controllers. REVISED with
   the operator 2026-10-24: a request WITHOUT `count` was still ONE run on the pool's id
   (`install-server-<infraEnv>`), a 409 until the first finished — up to an hour — and asking the
   pool again IS asking for one more server, so it now takes a slot too and is never a 409 (only
   when all 100 slots run). Its reply stays `{workflow_id, run_id}`; only `count` asks for the
-  report. The id builder is `install_server_name_workflow_id`, named-only: nothing builds the pool
+  report. The id builder is `add_server_to_mce_name_workflow_id`, named-only: nothing builds the pool
   id any more, and runs started on it keep it. A named machine keeps its 409.
+  THE FOUR SERVER-LIFECYCLE WORKFLOWS WERE RENAMED on 2026-11-01 (the operator: each name says
+  what it does to what): install-server → add-server-to-mce, remove-server →
+  remove-server-from-mce, uninstall-server → uninstall-server-from-hc, publish-infraenv-boot →
+  publish-infraenv-to-pxe-server — route, ids, queue, type, models, module, tests, docs and lock
+  holder alike. Not aliases: each OLD route answers 410 naming the new one and starts nothing
+  (`_RENAMED_PATHS` in the router). Runs started before replay as their OLD type — a subclass at
+  the bottom of each module, overriding `run` because the SDK refuses an inherited one — on their
+  OLD queue (`LEGACY_*_WORKFLOW_QUEUE`), each choosing by `workflow.info().workflow_type`: its old
+  lock holder (`install-server`, `uninstall-server` — server-scan extends and releases a lock
+  only for the SAME holder and id), and, for an uninstall, its OLD child (`RemoveServerWorkflow`,
+  `remove-server-<server>`, the old queue: a child's id is in the parent's history, and the
+  goldens fail without it). remove-server-from-mce recognises both spellings of each holder it
+  releases or gives way to. The goldens recorded before stay where they are
+  (tests/histories/{install,remove,uninstall}_server/, replayed by the legacy classes — never
+  re-recorded); the new types have their own. NOT renamed: patch ids (history markers),
+  activity names (`publish_infra_env_boot` included), `UninstallServerFromHcResult.remove_server`
+  / `remove_server_workflow_id` (the JSON of results), the replay recorder's identity
+  placeholder `install-server-replay`. Delete each legacy class, its registration and its queue
+  once `WorkflowType='<old type>' AND ExecutionStatus='Running'` is empty — RemoveServerWorkflow
+  only once UninstallServerWorkflow's is too.
   `POST /workflows/segment-lifecycle/initialize-segment` is ASYNC (202 + workflow id) and takes
   the full segment definition; poll `GET /workflows/runs/{workflow_id}` for progress/result. The
   `/bulk` variant takes a list and starts ONE WORKFLOW PER SEGMENT (never one batch workflow — each

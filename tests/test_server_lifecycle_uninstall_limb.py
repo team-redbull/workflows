@@ -1,4 +1,4 @@
-"""uninstall-server's limb: server-scan's membership read, the CAPI / HyperShift reads,
+"""uninstall-server-from-hc's limb: server-scan's membership read, the CAPI / HyperShift reads,
 the Machine delete, and the hosted cluster's Node read through its admin kubeconfig.
 
 What matters: which AgentMachine belongs to the host (by label, or by its
@@ -87,13 +87,13 @@ class TestServerMembership:
 
     @respx.mock
     async def test_the_install_lock_is_read_and_judged_live_at_read_time(self):
-        """What remove-server releases install-server's lock for its MCE by."""
+        """What remove-server-from-mce releases add-server-to-mce's lock for its MCE by."""
         respx.get(f"{SS}/servers").mock(return_value=httpx.Response(200, json={"items": [
             {"id": "srv_1", "name": SERVER},
         ]}))
         respx.get(f"{SS}/servers/srv_1").mock(return_value=httpx.Response(200, json={
             "name": SERVER,
-            "reservation": {"holder": "install-server", "workflow_id": "install-server-run-a",
+            "reservation": {"holder": "add-server-to-mce", "workflow_id": "add-server-to-mce-run-a",
                             "mce_cluster": "ocp4-mce-a", "expires_at": "2026-10-31T12:00:00Z"},
         }))
         before = datetime(2026, 10, 31, 11, 0, tzinfo=UTC)
@@ -102,10 +102,10 @@ class TestServerMembership:
         live = await server_scan.server_membership_by_name(SS, "t", SERVER, now=before)
         assert live.lock.live is True
         assert (live.lock.holder, live.lock.workflow_id, live.lock.mce_cluster, live.lock.expires_at) == (
-            "install-server", "install-server-run-a", "ocp4-mce-a", "2026-10-31T12:00:00Z",
+            "add-server-to-mce", "add-server-to-mce-run-a", "ocp4-mce-a", "2026-10-31T12:00:00Z",
         )
         lapsed = await server_scan.server_membership_by_name(SS, "t", SERVER, now=after)
-        assert lapsed.lock.live is False and lapsed.lock.holder == "install-server"
+        assert lapsed.lock.live is False and lapsed.lock.holder == "add-server-to-mce"
 
     @respx.mock
     async def test_no_reservation_is_no_live_lock(self):

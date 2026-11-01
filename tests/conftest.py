@@ -46,7 +46,7 @@ os.environ.update(
         "DAY1_REPO_URL": "https://git.test/team/gitops-day1-platform-config.git",
         "DAY1_GIT_TOKEN": "test-git-token",
         "DHCP_EXCLUSION_OCTET_RANGES": '{"HC": [[1, 10], [241, 254]]}',
-        # --- install-server: server-scan + BMC credentials ---
+        # --- add-server-to-mce: server-scan + BMC credentials ---
         # Names this worker's queue; one deployment serves one MCE.
         "MCE_CLUSTER": "ocp4-mce-test",
         "SERVER_SCAN_URL": "http://server-scan.test/api/v1",
@@ -57,7 +57,7 @@ os.environ.update(
         "HP_BMC_PASSWORD": "test-hp-pass",
         "CISCO_BMC_USERNAME": "test-cisco-user",
         "CISCO_BMC_PASSWORD": "test-cisco-pass",
-        # --- install-server: the site PXE map, for IPMI servers ---
+        # --- add-server-to-mce: the site PXE map, for IPMI servers ---
         "PXE_MAP_URLS": '{"bat-yam": "http://pxe.bat-yam.test:8080"}',
         "PXE_MAP_TOKEN": "test-pxe-token",
         # --- provision-dell-server: OME, iDRAC root, templates, naming service ---

@@ -1,4 +1,4 @@
-"""uninstall-server — takes ONE server all the way out of an MCE, whatever state its Agent is in.
+"""uninstall-server-from-hc — takes ONE server all the way out of an MCE, whatever state its Agent is in.
 
 A server on an MCE is in one of two shapes, and the run picks its path by the
 BINDING it observes at inspection — never by the Agent's state string:
@@ -17,10 +17,10 @@ BINDING it observes at inspection — never by the Agent's state string:
     hosted-cluster half is skipped (but for a stale Node server-scan's cluster
     still has of it).
 
-Every path then ends by running remove-server as an AWAITED CHILD
-(`remove-server-<server>`, its own queue), so the inventory half — power off,
+Every path then ends by running remove-server-from-mce as an AWAITED CHILD
+(`remove-server-from-mce-<server>`, its own queue), so the inventory half — power off,
 BareMetalHost, NMStateConfig, the Agent last, the PXE map of the MCE's own site —
-is never reimplemented here, and remove-server's own route keeps working alone.
+is never reimplemented here, and remove-server-from-mce's own route keeps working alone.
 A server with nothing on the MCE completes as a no-op through the child's
 `found: false`.
 
@@ -50,7 +50,7 @@ Shape of the run (the `progress` query exposes the phase and the MCE's queue):
                            MCE links the host any more. Refused: two such
                            Nodes; a Ready one nothing on the MCE links (nothing
                            to take the host out of it through).
-  4. reserving-server    — server-scan's install lock, holder `uninstall-server`,
+  4. reserving-server    — server-scan's install lock, holder `uninstall-server-from-hc`,
                            ALWAYS, before any write (below for why).
   5. the hosted-cluster half, for a hosted node — or what is left of one —
        draining-node             a Node with NO Machine behind it is drained by
@@ -91,7 +91,7 @@ Shape of the run (the `progress` query exposes the phase and the MCE's queue):
                                  Bounded 5 min.
        verifying-agent           unbound, no agentMachineRef label,
                                  known-unbound, approved, BMH present and not
-                                 in error (bounded 5 min) — what remove-server
+                                 in error (bounded 5 min) — what remove-server-from-mce
                                  needs to take it.
        Every awaiting pass also stops (AgentRetakenError) when ANOTHER
        AgentMachine holds the Agent: the NodePool replacing the deleted Machine
@@ -102,7 +102,7 @@ Shape of the run (the `progress` query exposes the phase and the MCE's queue):
        Machine or control-plane link = ServerStillPresentError. Nothing written.
   6. holding-server     — the lock extended to 24 h BEFORE the child starts,
                            so the hold covers the inventory half too.
-  7. removing-from-inventory — remove-server, awaited; its result is embedded.
+  7. removing-from-inventory — remove-server-from-mce, awaited; its result is embedded.
                            The child leaves this run's lock alone.
   8. releasing-server   — the run's OWN lock given back once the child
                            completed with nothing left on the MCE and no PXE
@@ -146,25 +146,32 @@ and neither sees the whole move: the hosted cluster's nodes job frees it the
 moment its Node disappears, and the MCE's agents job re-claims it as
 INSTALLED_TO_INVENTORY on its own 15-minute cadence. Between the two the
 document can read AVAILABLE while the host is still in this MCE's InfraEnv —
-and another MCE's install-server would draw it. The lock closes that window
+and another MCE's add-server-to-mce would draw it. The lock closes that window
 from before the first write and is extended to a day before the inventory
-half (install-server's `_INSTALLED_HOLD`); on failure it is left to its TTL,
-because the host may still be half-way out. Once remove-server has taken the
+half (add-server-to-mce's `_INSTALLED_HOLD`); on failure it is left to its TTL,
+because the host may still be half-way out. Once remove-server-from-mce has taken the
 host off the MCE the window is closed for good, so the run RELEASES it (the
 operator's decision, 2026-10-31: a server just uninstalled could not be
 installed anywhere for a day) — unless the PXE cleanup failed, or with
 keep_inventory, where the server is still in this InfraEnv and the day-long
 hold stays. Runs recorded before `uninstall-server-release-after-removal`
-keep the hold. A lock another run holds — install-server's day-long hold
+keep the hold. A lock another run holds — add-server-to-mce's day-long hold
 after it installed the machine, typically — fails the run before anything is
 written.
 
 WHAT IS NEVER DONE: no NodePool change; no drain or Node delete where CAPI can
 still do it (only for a Node no Machine stands behind, and a Node is deleted
 only once NotReady); no finalizer or hook of anyone but the Agent provider's;
-no PXE map write (remove-server's); no undo — a Machine delete cannot be
+no PXE map write (remove-server-from-mce's); no undo — a Machine delete cannot be
 undone, so a failure after it leaves everything as it is and a re-run of the
 same id RESUMES.
+
+Named uninstall-server until 2026-11-01 — route, id, queue, type and lock
+holder. A run started before the rename is an `UninstallServerWorkflow` (the
+subclass at the bottom of this file) and replays on its old queue, to its end,
+as it was recorded: its lock held as `uninstall-server`, and its child the OLD
+remove-server — type `RemoveServerWorkflow`, id `remove-server-<server>`, the
+old queue — because a child's type and id are part of the parent's history.
 """
 
 from __future__ import annotations
@@ -184,7 +191,8 @@ from temporalio.workflow import ParentClosePolicy
 with workflow.unsafe.imports_passed_through():
     from shared.cluster_names import canonical_mce_cluster
     from shared.consts import (
-        REMOVE_SERVER_WORKFLOW_QUEUE,
+        LEGACY_REMOVE_SERVER_WORKFLOW_QUEUE,
+        REMOVE_SERVER_FROM_MCE_WORKFLOW_QUEUE,
         server_lifecycle_activity_queue,
     )
     from shared.exceptions import (
@@ -205,8 +213,8 @@ with workflow.unsafe.imports_passed_through():
         MultipleBoundAgentsError,
         NodeDrainTimeoutError,
         NotHostedClusterNodeError,
-        RemoveServerAlreadyRunningError,
-        RemoveServerFailedError,
+        RemoveServerFromMceAlreadyRunningError,
+        RemoveServerFromMceFailedError,
         ServerNotAvailableError,
         ServerNotInServerScanError,
         ServerReservedError,
@@ -250,24 +258,30 @@ with workflow.unsafe.imports_passed_through():
         MachineRef,
         MachineState,
         ReleaseServerRequest,
-        RemoveServerInput,
-        RemoveServerResult,
-        RemoveServerRunArgs,
+        RemoveServerFromMceInput,
+        RemoveServerFromMceResult,
+        RemoveServerFromMceRunArgs,
         ReserveServerRequest,
         ServerMembership,
         ServerMembershipRequest,
-        UninstallServerInput,
-        UninstallServerProgress,
-        UninstallServerResult,
-        UninstallServerRunArgs,
+        UninstallServerFromHcInput,
+        UninstallServerFromHcProgress,
+        UninstallServerFromHcResult,
+        UninstallServerFromHcRunArgs,
     )
-    from shared.workflow_ids import remove_server_workflow_id
+    from shared.workflow_ids import (
+        legacy_remove_server_workflow_id,
+        remove_server_from_mce_workflow_id,
+    )
 
-from workflow_domains.server_lifecycle.remove_server import RemoveServerWorkflow
+from workflow_domains.server_lifecycle.remove_server_from_mce import (
+    RemoveServerFromMceWorkflow,
+    RemoveServerWorkflow,
+)
 
 _ACTIVITY_TIMEOUT = timedelta(seconds=90)
-# The same signal remove-server and install-server use for "no worker polls
-# this MCE's queue" (see install_server.py).
+# The same signal remove-server-from-mce and add-server-to-mce use for "no worker polls
+# this MCE's queue" (see add_server_to_mce.py).
 _SCHEDULE_TO_START_TIMEOUT = timedelta(minutes=5)
 
 # Activity-raised failures no retry can fix, as CLASSES (a wrong name is an
@@ -291,7 +305,7 @@ _RETRY_POLICY = RetryPolicy(
     non_retryable_error_types=[error.__name__ for error in _PERMANENT_ACTIVITY_ERRORS],
 )
 
-# The Agent state an inventory host settles in, and the only one remove-server
+# The Agent state an inventory host settles in, and the only one remove-server-from-mce
 # is handed a host in.
 _KNOWN_UNBOUND = "known-unbound"
 
@@ -308,7 +322,7 @@ _INSTALLED_TO_INVENTORY = "INSTALLED_TO_INVENTORY"
 # PodDisruptionBudget, a hook) that waiting will not clear.
 _DRAIN_DEADLINE = timedelta(minutes=20)
 # Unbinding: the provider has released the Agent and the host reboots into the
-# discovery image — on bare metal the same POST-and-boot install-server allows
+# discovery image — on bare metal the same POST-and-boot add-server-to-mce allows
 # an hour for.
 _UNBIND_DEADLINE = timedelta(hours=1)
 _MACHINE_POLL_INTERVAL = timedelta(seconds=30)
@@ -321,9 +335,15 @@ _VERIFY_POLL_INTERVAL = timedelta(seconds=10)
 # hosted-cluster half — the drain and the reboot budgets, both verifications —
 # plus a margin, so the bounded waits always reach the day-long hold (or fail)
 # before it lapses. Held a day once the hosted-cluster half is done: the
-# ceiling server-scan accepts, and the precedent of install-server's
+# ceiling server-scan accepts, and the precedent of add-server-to-mce's
 # `_INSTALLED_HOLD`.
-_RESERVATION_HOLDER = "uninstall-server"
+_RESERVATION_HOLDER = "uninstall-server-from-hc"
+# The holder a run started as uninstall-server took its lock under. server-scan
+# extends or releases a lock only for the SAME holder and workflow id, so such a
+# run keeps it to the end (_reservation_holder).
+_LEGACY_RESERVATION_HOLDER = "uninstall-server"
+# The workflow type of every run started before the rename.
+_LEGACY_WORKFLOW_TYPE = "UninstallServerWorkflow"
 _RESERVATION_TTL = _DRAIN_DEADLINE + _UNBIND_DEADLINE + 2 * _VERIFY_DEADLINE + timedelta(minutes=10)
 _RELEASED_HOLD = timedelta(hours=24)
 
@@ -331,10 +351,10 @@ _RELEASED_HOLD = timedelta(hours=24)
 # new run clears what a broken HyperShift deletion left (see the module
 # docstring). Keep it until no run started before it can remain in history.
 _LEFTOVERS_PATCH = "uninstall-server-hosted-leftovers"
-# An inventory host is inspected again right before remove-server. Runs
+# An inventory host is inspected again right before remove-server-from-mce. Runs
 # recorded before it go straight to the hold.
 _INVENTORY_VERIFY_PATCH = "uninstall-server-inventory-verify"
-# The run's own lock is released once remove-server took the host off the MCE.
+# The run's own lock is released once remove-server-from-mce took the host off the MCE.
 # Runs recorded before it end at the child and keep the day-long hold.
 _RELEASE_PATCH = "uninstall-server-release-after-removal"
 # The leftover flow can drain a lost Node AND wait out a Machine drain, and
@@ -394,7 +414,7 @@ def _retaken_by(binding: AgentBindingState, started_from: frozenset[str] | None)
 
 
 def _agent_problems(agent: AgentBindingState, bmh: BmhState) -> list[str]:
-    """Why the Agent is not yet the clean inventory host remove-server takes."""
+    """Why the Agent is not yet the clean inventory host remove-server-from-mce takes."""
     if not agent.found:
         return ["the Agent no longer exists"]
     problems = []
@@ -407,7 +427,7 @@ def _agent_problems(agent: AgentBindingState, bmh: BmhState) -> list[str]:
     if agent.approved is not True:
         problems.append("it is not approved")
     if not bmh.found:
-        problems.append("its BareMetalHost is gone, so remove-server could not power the host off")
+        problems.append("its BareMetalHost is gone, so remove-server-from-mce could not power the host off")
     elif bmh.is_errored():
         problems.append(
             f"its BareMetalHost is in error ({bmh.error_type or 'no type'}: "
@@ -416,8 +436,18 @@ def _agent_problems(agent: AgentBindingState, bmh: BmhState) -> list[str]:
     return problems
 
 
+def _started_as_uninstall_server() -> bool:
+    """Whether this run is one started before the rename — decided by its type, fixed for a run."""
+    return workflow.info().workflow_type == _LEGACY_WORKFLOW_TYPE
+
+
+def _reservation_holder() -> str:
+    """Who this run holds server-scan's install lock as, for every reserve, hold and release."""
+    return _LEGACY_RESERVATION_HOLDER if _started_as_uninstall_server() else _RESERVATION_HOLDER
+
+
 @workflow.defn
-class UninstallServerWorkflow:
+class UninstallServerFromHcWorkflow:
     def __init__(self) -> None:
         self._phase = "pending"
         self._sub_phase: str | None = None
@@ -425,8 +455,8 @@ class UninstallServerWorkflow:
         self._agent_state: str | None = None
 
     @workflow.query
-    def progress(self) -> UninstallServerProgress:
-        return UninstallServerProgress(
+    def progress(self) -> UninstallServerFromHcProgress:
+        return UninstallServerFromHcProgress(
             phase=self._phase,
             sub_phase=self._sub_phase,
             activity_queue=self._activity_queue,
@@ -434,7 +464,7 @@ class UninstallServerWorkflow:
         )
 
     @workflow.run
-    async def run(self, run_args: UninstallServerRunArgs) -> UninstallServerResult:
+    async def run(self, run_args: UninstallServerFromHcRunArgs) -> UninstallServerFromHcResult:
         request = run_args.input
         activity_queue = server_lifecycle_activity_queue(request.mce_cluster)
         self._activity_queue = activity_queue
@@ -465,7 +495,7 @@ class UninstallServerWorkflow:
         self._refuse_contradiction(request, membership, host)
         followed = hosted_agent or (host.agents[0] if host.agents else None)
         self._agent_state = followed.state if followed else None
-        result = UninstallServerResult(
+        result = UninstallServerFromHcResult(
             server_name=request.server_name,
             namespace=request.namespace,
             mce_cluster=request.mce_cluster,
@@ -540,8 +570,8 @@ class UninstallServerWorkflow:
 
         return await self._remove_and_finish(request, membership, host, result, skipped, activity_queue)
 
-    async def _verify_still_inventory(self, request: UninstallServerInput, task_queue: str) -> None:
-        """An inventory host, inspected again right before remove-server: nothing hosted links it.
+    async def _verify_still_inventory(self, request: UninstallServerFromHcInput, task_queue: str) -> None:
+        """An inventory host, inspected again right before remove-server-from-mce: nothing hosted links it.
 
         The first inspection found no AgentMachine, Machine or binding into a
         control plane. But a free Agent is exactly what any NodePool's new
@@ -591,13 +621,13 @@ class UninstallServerWorkflow:
 
     async def _remove_and_finish(
         self,
-        request: UninstallServerInput,
+        request: UninstallServerFromHcInput,
         membership: ServerMembership,
         host: BoundHostState,
-        result: UninstallServerResult,
+        result: UninstallServerFromHcResult,
         skipped: list[str],
         activity_queue: str,
-    ) -> UninstallServerResult:
+    ) -> UninstallServerFromHcResult:
         # Step 5 — hold the machine through the inventory half and beyond. Kept
         # in the inventory too: it stays in this InfraEnv, and server-scan may
         # read it AVAILABLE until the MCE's agents job reports it.
@@ -624,9 +654,14 @@ class UninstallServerWorkflow:
             )
             return result
 
-        # Step 6 — the inventory half: remove-server, awaited.
+        # Step 6 — the inventory half: remove-server-from-mce, awaited.
         self._phase = "removing-from-inventory"
-        result.remove_server_workflow_id = remove_server_workflow_id(request.server_name)
+        # A run started before the rename starts the child it recorded.
+        result.remove_server_workflow_id = (
+            legacy_remove_server_workflow_id(request.server_name)
+            if _started_as_uninstall_server()
+            else remove_server_from_mce_workflow_id(request.server_name)
+        )
         result.remove_server = await self._remove_from_inventory(
             request, result.remove_server_workflow_id
         )
@@ -655,24 +690,24 @@ class UninstallServerWorkflow:
 
     async def _release(
         self,
-        request: UninstallServerInput,
+        request: UninstallServerFromHcInput,
         membership: ServerMembership,
-        removal: RemoveServerResult,
+        removal: RemoveServerFromMceResult,
         skipped: list[str],
         task_queue: str,
     ) -> bool:
-        """Give the run's own lock back once remove-server completed. True when released.
+        """Give the run's own lock back once remove-server-from-mce completed. True when released.
 
         Its own holder and workflow id, so server-scan's compare-and-delete
         never clears a lock another run took after this one's lapsed. Kept when
-        remove-server's PXE cleanup failed: the host's MACs may still chain to
+        remove-server-from-mce's PXE cleanup failed: the host's MACs may still chain to
         this MCE's discovery image. Never fails the run — the server is out of
         the MCE by now and the lock expires on its own — so a refusal is
         named in `skipped` instead.
         """
         if removal.pxe_failed:
             skipped.append(
-                "releasing-server: remove-server's PXE cleanup failed ("
+                "releasing-server: remove-server-from-mce's PXE cleanup failed ("
                 + "; ".join(removal.pxe_failed)
                 + "), so the host may still boot this MCE's discovery image — the lock is "
                 "left to its expiry"
@@ -685,7 +720,7 @@ class UninstallServerWorkflow:
                 ReleaseServerRequest(
                     server_id=membership.server_id or "",
                     server_name=membership.server_name or request.server_name,
-                    holder=_RESERVATION_HOLDER,
+                    holder=_reservation_holder(),
                     workflow_id=workflow.info().workflow_id,
                 ),
                 task_queue,
@@ -713,7 +748,7 @@ class UninstallServerWorkflow:
         return True
 
     @staticmethod
-    def _kept_note(request: UninstallServerInput, host: BoundHostState) -> str:
+    def _kept_note(request: UninstallServerFromHcInput, host: BoundHostState) -> str:
         where = f"InfraEnv {host.infra_env}" if host.infra_env else f"namespace {request.namespace}"
         return (
             f"removing-from-inventory: keep_inventory was asked — the server stays in {where} "
@@ -723,7 +758,7 @@ class UninstallServerWorkflow:
 
     # --- refusals --------------------------------------------------------------
 
-    def _refuse_membership(self, request: UninstallServerInput, membership: ServerMembership) -> None:
+    def _refuse_membership(self, request: UninstallServerFromHcInput, membership: ServerMembership) -> None:
         """Step 1's refusals: what server-scan alone can contradict. Nothing is written yet."""
         server = request.server_name
         if not membership.found:
@@ -731,7 +766,7 @@ class UninstallServerWorkflow:
                 f"server-scan has no server named {server}. The install lock that "
                 "keeps it out of other MCEs' draws cannot be taken on a machine it "
                 "does not know. Nothing was changed. A host that is only on the MCE "
-                "is remove-server's",
+                "is remove-server-from-mce's",
                 type=ServerNotInServerScanError.__name__,
             )
         if membership.maintenance:
@@ -761,7 +796,7 @@ class UninstallServerWorkflow:
                 type=ClusterMembershipMismatchError.__name__,
             )
 
-    def _hosted_agent(self, request: UninstallServerInput, host: BoundHostState) -> HostAgent | None:
+    def _hosted_agent(self, request: UninstallServerFromHcInput, host: BoundHostState) -> HostAgent | None:
         """The Agent the hosted-cluster half follows, or None for an inventory host."""
         server = request.server_name
         if len(host.bound_agents) > 1 or len(host.hosted_agents) > 1:
@@ -811,7 +846,7 @@ class UninstallServerWorkflow:
         return hosted
 
     def _hosted_agent_or_leftover(
-        self, request: UninstallServerInput, host: BoundHostState
+        self, request: UninstallServerFromHcInput, host: BoundHostState
     ) -> HostAgent | None:
         """_hosted_agent for the leftover flow: a hosted node, or what HyperShift left of one.
 
@@ -884,7 +919,7 @@ class UninstallServerWorkflow:
         return hosted
 
     def _refuse_contradiction(
-        self, request: UninstallServerInput, membership: ServerMembership, host: BoundHostState
+        self, request: UninstallServerFromHcInput, membership: ServerMembership, host: BoundHostState
     ) -> None:
         """Step 2's refusals: server-scan against what the MCE shows. Nothing is written yet.
 
@@ -921,7 +956,7 @@ class UninstallServerWorkflow:
 
     def _reservation(
         self,
-        request: UninstallServerInput,
+        request: UninstallServerFromHcInput,
         membership: ServerMembership,
         host: BoundHostState,
         ttl: timedelta,
@@ -929,7 +964,7 @@ class UninstallServerWorkflow:
         return ReserveServerRequest(
             server_id=membership.server_id or "",
             server_name=membership.server_name or request.server_name,
-            holder=_RESERVATION_HOLDER,
+            holder=_reservation_holder(),
             workflow_id=workflow.info().workflow_id,
             mce_cluster=request.mce_cluster,
             infra_env=host.infra_env,
@@ -939,7 +974,7 @@ class UninstallServerWorkflow:
 
     async def _reserve(
         self,
-        request: UninstallServerInput,
+        request: UninstallServerFromHcInput,
         membership: ServerMembership,
         host: BoundHostState,
         task_queue: str,
@@ -956,16 +991,17 @@ class UninstallServerWorkflow:
             cause = err.cause
             if isinstance(cause, ApplicationError) and cause.type == ServerReservedError.__name__:
                 raise ApplicationError(
-                    f"{cause.message}. Nothing was changed. If that is install-server's "
-                    "day-long hold after installing the machine, release it in "
-                    "server-scan, then re-run",
+                    f"{cause.message}. Nothing was changed. If that is add-server-to-mce's "
+                    "day-long hold after installing the machine (holder "
+                    "`add-server-to-mce`, or `install-server` from before the rename), "
+                    "release it in server-scan, then re-run",
                     type=ServerReservedError.__name__,
                 ) from err
             raise
 
     async def _hold(
         self,
-        request: UninstallServerInput,
+        request: UninstallServerFromHcInput,
         membership: ServerMembership,
         host: BoundHostState,
         task_queue: str,
@@ -998,11 +1034,11 @@ class UninstallServerWorkflow:
 
     async def _uninstall_from_hosted_cluster(
         self,
-        request: UninstallServerInput,
+        request: UninstallServerFromHcInput,
         host: BoundHostState,
         cluster: HostedClusterRef,
         agent: HostAgent,
-        result: UninstallServerResult,
+        result: UninstallServerFromHcResult,
         skipped: list[str],
         task_queue: str,
     ) -> None:
@@ -1079,7 +1115,7 @@ class UninstallServerWorkflow:
                     f"Node {node_name} is still in hosted cluster {result.hosted_cluster} "
                     "after its Machine went. It is an orphan, and this run never deletes "
                     f"a Node: run `oc delete node {node_name}` against the hosted cluster, "
-                    "then re-run. remove-server was not started",
+                    "then re-run. remove-server-from-mce was not started",
                     type=HostedNodeStillPresentError.__name__,
                 )
         else:
@@ -1092,9 +1128,9 @@ class UninstallServerWorkflow:
         await self._verify_agent(request, agent_ref, task_queue)
 
     async def _verify_agent(
-        self, request: UninstallServerInput, agent_ref: AgentNameRef, task_queue: str
+        self, request: UninstallServerFromHcInput, agent_ref: AgentNameRef, task_queue: str
     ) -> None:
-        """Until the Agent is the clean inventory host remove-server takes (bounded)."""
+        """Until the Agent is the clean inventory host remove-server-from-mce takes (bounded)."""
         bmh_ref = BmhRef(server_name=request.server_name, namespace=request.namespace)
         started_at = workflow.now()
         while True:
@@ -1109,14 +1145,14 @@ class UninstallServerWorkflow:
                     f"Agent {agent_ref.name} of {request.server_name} is not a clean "
                     f"inventory host {_VERIFY_DEADLINE} after its Machine went: "
                     + "; ".join(problems)
-                    + ". remove-server was not started",
+                    + ". remove-server-from-mce was not started",
                     type=AgentStillBoundError.__name__,
                 )
             await workflow.sleep(_VERIFY_POLL_INTERVAL)  # durable, replay-safe
 
     async def _await_machine_gone(
         self,
-        request: UninstallServerInput,
+        request: UninstallServerFromHcInput,
         machine_ref: MachineRef | None,
         agent_ref: AgentNameRef,
         hosted_cluster: str,
@@ -1198,7 +1234,7 @@ class UninstallServerWorkflow:
 
     async def _find_nodes(
         self,
-        request: UninstallServerInput,
+        request: UninstallServerFromHcInput,
         membership: ServerMembership,
         host: BoundHostState,
         hosted_agent: HostAgent | None,
@@ -1291,13 +1327,13 @@ class UninstallServerWorkflow:
 
     async def _clear_hosted_cluster(
         self,
-        request: UninstallServerInput,
+        request: UninstallServerFromHcInput,
         host: BoundHostState,
         cluster: HostedClusterRef | None,
         agent: HostAgent | None,
         followed: HostAgent | None,
         nodes: list[HostedNode],
-        result: UninstallServerResult,
+        result: UninstallServerFromHcResult,
         skipped: list[str],
         task_queue: str,
     ) -> None:
@@ -1376,7 +1412,7 @@ class UninstallServerWorkflow:
         if cluster is not None:
             await self._clear_nodes(request, cluster, followed, node_name, result, task_queue)
 
-        # 6. The clean inventory host remove-server takes.
+        # 6. The clean inventory host remove-server-from-mce takes.
         if agent is not None and cluster is not None:
             self._phase = "verifying-agent"
             await self._verify_agent(
@@ -1391,7 +1427,7 @@ class UninstallServerWorkflow:
         self,
         cluster: HostedClusterRef,
         node: HostedNode,
-        result: UninstallServerResult,
+        result: UninstallServerFromHcResult,
         task_queue: str,
     ) -> None:
         """Cordon and evict, pass after pass, until no Pod a drain moves is left (20 min)."""
@@ -1432,11 +1468,11 @@ class UninstallServerWorkflow:
 
     async def _await_release(
         self,
-        request: UninstallServerInput,
+        request: UninstallServerFromHcInput,
         machine_ref: MachineRef | None,
         agent_ref: AgentNameRef,
         cluster: HostedClusterRef,
-        result: UninstallServerResult,
+        result: UninstallServerFromHcResult,
         task_queue: str,
         started_from: frozenset[str] | None = None,
     ) -> str | None:
@@ -1573,10 +1609,10 @@ class UninstallServerWorkflow:
 
     async def _clear_agent_machines(
         self,
-        request: UninstallServerInput,
+        request: UninstallServerFromHcInput,
         agent: HostAgent,
         agent_ref: AgentNameRef,
-        result: UninstallServerResult,
+        result: UninstallServerFromHcResult,
         task_queue: str,
     ) -> None:
         """Until no AgentMachine names the Agent, re-derived fresh each pass (bounded 5 min).
@@ -1639,11 +1675,11 @@ class UninstallServerWorkflow:
 
     async def _clear_nodes(
         self,
-        request: UninstallServerInput,
+        request: UninstallServerFromHcInput,
         cluster: HostedClusterRef,
         agent: HostAgent | None,
         node_name: str | None,
-        result: UninstallServerResult,
+        result: UninstallServerFromHcResult,
         task_queue: str,
     ) -> None:
         """Until the hosted cluster has no Node that is the server (bounded 5 min).
@@ -1691,7 +1727,7 @@ class UninstallServerWorkflow:
                     f"{_VERIFY_DEADLINE} after the host left it: "
                     f"{', '.join(n.name for n in found.nodes)} (still Ready: {ready} — "
                     "something still runs as it). Nothing further was changed; "
-                    "remove-server was not started",
+                    "remove-server-from-mce was not started",
                     type=HostedNodeStillPresentError.__name__,
                 )
             await workflow.sleep(_VERIFY_POLL_INTERVAL)  # durable, replay-safe
@@ -1699,21 +1735,30 @@ class UninstallServerWorkflow:
     # --- the inventory half ----------------------------------------------------------
 
     async def _remove_from_inventory(
-        self, request: UninstallServerInput, child_id: str
-    ) -> RemoveServerResult:
-        """remove-server as an awaited child, on its own id and queue."""
+        self, request: UninstallServerFromHcInput, child_id: str
+    ) -> RemoveServerFromMceResult:
+        """remove-server-from-mce as an awaited child, on its own id and queue.
+
+        A run started before the rename starts the OLD remove-server type on
+        its old queue: the child's type is in the parent's history.
+        """
+        legacy = _started_as_uninstall_server()
         try:
             return await workflow.execute_child_workflow(
-                RemoveServerWorkflow.run,
-                RemoveServerRunArgs(
-                    input=RemoveServerInput(
+                RemoveServerWorkflow.run if legacy else RemoveServerFromMceWorkflow.run,
+                RemoveServerFromMceRunArgs(
+                    input=RemoveServerFromMceInput(
                         server_name=request.server_name,
                         mce_cluster=request.mce_cluster,
                         namespace=request.namespace,
                     )
                 ),
                 id=child_id,
-                task_queue=REMOVE_SERVER_WORKFLOW_QUEUE,
+                task_queue=(
+                    LEGACY_REMOVE_SERVER_WORKFLOW_QUEUE
+                    if legacy
+                    else REMOVE_SERVER_FROM_MCE_WORKFLOW_QUEUE
+                ),
                 # The child powers the host off and deletes things in a
                 # load-bearing order; closing this run must never cut it off
                 # between two of those steps.
@@ -1721,10 +1766,10 @@ class UninstallServerWorkflow:
             )
         except WorkflowAlreadyStartedError:
             raise ApplicationError(
-                f"remove-server is already running for {request.server_name} as "
+                f"remove-server-from-mce is already running for {request.server_name} as "
                 f"{child_id}: a second removal of the same host. Let it finish, then "
                 "re-run this uninstall",
-                type=RemoveServerAlreadyRunningError.__name__,
+                type=RemoveServerFromMceAlreadyRunningError.__name__,
             ) from None
         except ChildWorkflowError as err:
             cause = err.cause
@@ -1734,10 +1779,10 @@ class UninstallServerWorkflow:
                 else f"{type(cause).__name__ if cause else 'ChildWorkflowError'}: {cause or err}"
             )
             raise ApplicationError(
-                f"remove-server {child_id} failed taking {request.server_name} out of "
+                f"remove-server-from-mce {child_id} failed taking {request.server_name} out of "
                 f"MCE {request.mce_cluster}'s inventory — {detail}. Its history has "
                 "the detail; re-running this uninstall runs the removal again",
-                type=RemoveServerFailedError.__name__,
+                type=RemoveServerFromMceFailedError.__name__,
             ) from err
 
     async def _call(self, activity_fn, arg, task_queue: str):
@@ -1750,3 +1795,24 @@ class UninstallServerWorkflow:
             schedule_to_start_timeout=_SCHEDULE_TO_START_TIMEOUT,
             retry_policy=_RETRY_POLICY,
         )
+
+
+@workflow.defn(name=_LEGACY_WORKFLOW_TYPE)
+class UninstallServerWorkflow(UninstallServerFromHcWorkflow):
+    """uninstall-server-from-hc under its old type, for runs started before the rename.
+
+    Their history names `UninstallServerWorkflow` on the old queue
+    (LEGACY_UNINSTALL_SERVER_WORKFLOW_QUEUE), and only a worker registering
+    that type there can replay them; tests/histories/uninstall_server/ is the
+    proof. The same run, with _reservation_holder keeping `uninstall-server`
+    and _remove_from_inventory starting the old remove-server child, as
+    recorded. Nothing starts this type any more: delete it, the legacy child
+    choice and its registration in main_worker_init.py, once
+    `WorkflowType='UninstallServerWorkflow' AND ExecutionStatus='Running'`
+    finds nothing.
+    """
+
+    # The SDK takes @workflow.run only from the class it registers, not a base.
+    @workflow.run
+    async def run(self, run_args: UninstallServerFromHcRunArgs) -> UninstallServerFromHcResult:
+        return await super().run(run_args)

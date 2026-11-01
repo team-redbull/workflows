@@ -1,4 +1,4 @@
-"""install-server — takes one healthy, unclaimed server from the server-scan
+"""add-server-to-mce — takes one healthy, unclaimed server from the server-scan
 inventory platform and makes it installable in an MCE InfraEnv, by creating the
 BareMetalHost + BMC Secret + NMStateConfig that the Assisted Installer needs.
 
@@ -8,6 +8,11 @@ OneView / UCS Central / Dell OME / Intersight live on every reconcile to learn a
 server's MACs and BMC address. server-scan already collects that from all five
 collectors on a 6-hour cron and knows which servers are unclaimed, so the whole
 vendor-strategy layer is gone: one HTTP call replaces four vendor SDKs.
+
+Named install-server until 2026-11-01 — route, ids, queue, type and lock
+holder. A run started before the rename is an `InstallServerWorkflow` (the
+subclass at the bottom of this file) and replays on its old queue, holding its
+lock as `install-server` to the end.
 
 Shape of the run:
 
@@ -124,7 +129,7 @@ a cluster reports the node, so nothing else would notice. On CANCELLATION there
 is still deliberately no compensating cleanup: the three resources are
 idempotent, so a re-run converges on them, and a half-created set is what an
 operator needs in order to see how far the run got. Removing a SUCCESSFULLY
-installed server remains a separate uninstall-server workflow.
+installed server remains a separate uninstall-server-from-hc workflow.
 
 THE INSTALL LOCK IS WHAT MAKES "UNCLAIMED" TRUE ACROSS MCEs. server-scan
 reports a machine AVAILABLE until a cluster reports it, and this run's
@@ -229,6 +234,10 @@ with workflow.unsafe.imports_passed_through():
     from shared.models.server_lifecycle import (
         AcquiredServer,
         AcquireServerRequest,
+        AddServerToMceInput,
+        AddServerToMceProgress,
+        AddServerToMceResult,
+        AddServerToMceRunArgs,
         AgentRef,
         AgentState,
         BmhRef,
@@ -236,13 +245,9 @@ with workflow.unsafe.imports_passed_through():
         BmhState,
         BondMember,
         CreatedResource,
-        InstallServerProgress,
-        InstallServerInput,
-        InstallServerResult,
         InfraEnvBootRequest,
         InfraEnvBootState,
         InfraEnvRef,
-        InstallServerRunArgs,
         NmStateConfigReplacement,
         NmStateConfigReplaceRequest,
         PxeBootRequest,
@@ -347,7 +352,13 @@ _AGENT_POLL_INTERVAL = timedelta(seconds=30)
 # exists the machine IS taken, so holding it longer costs nothing: a day — the
 # ceiling server-scan accepts — outlasts any membership job that will then
 # report it in a cluster.
-_RESERVATION_HOLDER = "install-server"
+_RESERVATION_HOLDER = "add-server-to-mce"
+# The holder a run started as install-server took its lock under. server-scan
+# extends or releases a lock only for the SAME holder and workflow id, so such a
+# run keeps that holder to the end (_reservation_holder).
+_LEGACY_RESERVATION_HOLDER = "install-server"
+# The workflow type of every run started before the rename.
+_LEGACY_WORKFLOW_TYPE = "InstallServerWorkflow"
 _RESERVATION_TTL = _AGENT_DEADLINE + timedelta(hours=1)
 _INSTALLED_HOLD = timedelta(hours=24)
 # Gates every lock call, so a run started before the lock replays unchanged.
@@ -582,8 +593,20 @@ def _describe_waived(waived: list[WaivedHealthCheck]) -> str:
     ) + "]"
 
 
+def _reservation_holder() -> str:
+    """Who this run holds server-scan's install lock as.
+
+    Decided by the run's workflow TYPE, which never changes for a run: one
+    started as install-server keeps `install-server` for every reserve,
+    renewal and release, or server-scan would refuse its own lock back to it.
+    """
+    if workflow.info().workflow_type == _LEGACY_WORKFLOW_TYPE:
+        return _LEGACY_RESERVATION_HOLDER
+    return _RESERVATION_HOLDER
+
+
 @workflow.defn
-class InstallServerWorkflow:
+class AddServerToMceWorkflow:
     def __init__(self) -> None:
         self._phase = "pending"
         self._server_name: str | None = None
@@ -601,14 +624,14 @@ class InstallServerWorkflow:
         self._allowed_unhealthy: list[WaivedHealthCheck] = []
 
     @workflow.query
-    def progress(self) -> InstallServerProgress:
+    def progress(self) -> AddServerToMceProgress:
         """Cheap progress surface for the async caller (GET status endpoint).
 
         `activity_queue` is what makes a stalled run diagnosable: a phase that
         does not advance means no `server-lifecycle-worker` is polling that
         MCE's queue, and the queue name says which MCE to go and look at.
         """
-        return InstallServerProgress(
+        return AddServerToMceProgress(
             phase=self._phase,
             server_name=self._server_name,
             activity_queue=self._activity_queue,
@@ -616,7 +639,7 @@ class InstallServerWorkflow:
         )
 
     @workflow.run
-    async def run(self, run_args: InstallServerRunArgs) -> InstallServerResult:
+    async def run(self, run_args: AddServerToMceRunArgs) -> AddServerToMceResult:
         install_input = run_args.input
         infra_env = install_input.infra_env
         namespace = install_input.namespace
@@ -905,7 +928,7 @@ class InstallServerWorkflow:
                     [member.mac for member in bond_members],
                     attempts,
                 )
-                return InstallServerResult(
+                return AddServerToMceResult(
                     server_id=candidate.id,
                     server_name=candidate.name,
                     infra_env=infra_env,
@@ -1041,7 +1064,7 @@ class InstallServerWorkflow:
         return members
 
     async def _acquire(
-        self, install_input: InstallServerInput, task_queue: str
+        self, install_input: AddServerToMceInput, task_queue: str
     ) -> tuple[list[AcquiredServer], list[WaivedHealthCheck]]:
         """The candidates to try, and the health refusals waived to get them.
 
@@ -1178,7 +1201,7 @@ class InstallServerWorkflow:
     async def _reserve(
         self,
         candidate: AcquiredServer,
-        install_input: InstallServerInput,
+        install_input: AddServerToMceInput,
         ttl: timedelta,
         task_queue: str,
         rejections: list[tuple[str, str]] | None,
@@ -1198,7 +1221,7 @@ class InstallServerWorkflow:
                 ReserveServerRequest(
                     server_id=candidate.id,
                     server_name=candidate.name,
-                    holder=_RESERVATION_HOLDER,
+                    holder=_reservation_holder(),
                     workflow_id=workflow.info().workflow_id,
                     mce_cluster=install_input.mce_cluster,
                     infra_env=install_input.infra_env,
@@ -1236,7 +1259,7 @@ class InstallServerWorkflow:
         self,
         candidate: AcquiredServer,
         resource_request: BmhResourceRequest,
-        install_input: InstallServerInput,
+        install_input: AddServerToMceInput,
         task_queue: str,
         rejections: list[tuple[str, str]],
     ) -> NmStateConfigReplacement | None:
@@ -1300,7 +1323,7 @@ class InstallServerWorkflow:
         self,
         candidate: AcquiredServer,
         bond_members: list[BondMember],
-        install_input: InstallServerInput,
+        install_input: AddServerToMceInput,
         site: str,
         task_queue: str,
         rejections: list[tuple[str, str]],
@@ -1355,7 +1378,7 @@ class InstallServerWorkflow:
     async def _await_infra_env_boot(
         self,
         candidate: AcquiredServer,
-        install_input: InstallServerInput,
+        install_input: AddServerToMceInput,
         site: str,
         task_queue: str,
     ) -> InfraEnvBootState:
@@ -1425,7 +1448,7 @@ class InstallServerWorkflow:
             ReleaseServerRequest(
                 server_id=candidate.id,
                 server_name=candidate.name,
-                holder=_RESERVATION_HOLDER,
+                holder=_reservation_holder(),
                 workflow_id=workflow.info().workflow_id,
             ),
             task_queue=task_queue,
@@ -1546,3 +1569,23 @@ class InstallServerWorkflow:
             schedule_to_start_timeout=_SCHEDULE_TO_START_TIMEOUT,
             retry_policy=_RETRY_POLICY,
         )
+
+
+@workflow.defn(name=_LEGACY_WORKFLOW_TYPE)
+class InstallServerWorkflow(AddServerToMceWorkflow):
+    """add-server-to-mce under its old type, for runs started before the rename.
+
+    Their history names `InstallServerWorkflow` on the old queue
+    (LEGACY_INSTALL_SERVER_WORKFLOW_QUEUE), and only a worker registering that
+    type there can replay them — tests/histories/install_server/ is the proof.
+    Same run, same queries; _reservation_holder keeps their lock under
+    `install-server`. Nothing starts this type any more: delete it, and its
+    registration in main_worker_init.py, once
+    `WorkflowType='InstallServerWorkflow' AND ExecutionStatus='Running'` finds
+    nothing.
+    """
+
+    # The SDK takes @workflow.run only from the class it registers, not a base.
+    @workflow.run
+    async def run(self, run_args: AddServerToMceRunArgs) -> AddServerToMceResult:
+        return await super().run(run_args)

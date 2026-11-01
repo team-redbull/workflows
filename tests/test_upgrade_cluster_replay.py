@@ -54,7 +54,7 @@ from shared.models.cluster_upgrade import (
     WatchResult,
 )
 from tests.cluster_upgrade_fakes import CLUSTER, MIRRORS, SEVEN_DAYS, Fleet, Harness, request, verdict
-from tests.test_install_server_replay import _SCRUBBED, _scrubbed
+from tests.test_add_server_to_mce_replay import _SCRUBBED, _scrubbed
 from workflow_domains.cluster_upgrade.upgrade_cluster import UpgradeClusterWorkflow as Run
 from workflow_domains.cluster_upgrade.upgrade_control_plane import UpgradeControlPlaneWorkflow
 
@@ -368,7 +368,7 @@ async def test_every_run_a_scenario_records_replays(scenario):
             )
 
 
-# The placeholder every worker identity is scrubbed to — install-server's
+# The placeholder every worker identity is scrubbed to — add-server-to-mce's
 # scrubber, which every replay test shares — and the one this file's own copy
 # of it wrote into the histories recorded before.
 _PLACEHOLDER_IDENTITIES = {_SCRUBBED["identity"], "upgrade-cluster-replay"}

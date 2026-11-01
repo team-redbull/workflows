@@ -13,7 +13,7 @@ parameters, which is what makes them testable without a Temporal environment:
   * cluster_api.py    — every call to the target cluster's Kubernetes API,
                         including the idempotency rule and error classification.
   * bmh_resources.py  — the three resource BODIES, as pure functions.
-  * hosted_resources.py — what uninstall-server reads off CAPI Machines,
+  * hosted_resources.py — what uninstall-server-from-hc reads off CAPI Machines,
                         AgentMachines and HostedClusters, as pure functions.
   * hosted_cluster_api.py — the one read of a HOSTED cluster's own API server
                         (its Node), through its admin kubeconfig.
@@ -348,7 +348,7 @@ async def inspect_inventory_host(ref: BmhRef) -> InventoryHostState:
 async def remove_host_pxe_entries(ref: PxeHostEntriesRef) -> PxeHostEntriesRemoval:
     """Clear a removed host's MACs from its site's PXE VM, except another MCE's entries."""
     if ref.site is not None:
-        # Its own site only — the VM install-server mapped it on.
+        # Its own site only — the VM add-server-to-mce mapped it on.
         base_url = _settings.pxe_map_urls.get(ref.site)
         if not base_url:
             detail = (
@@ -595,7 +595,7 @@ async def register_pxe_boot(request: PxeBootRequest) -> PxeBootRegistration:
 async def publish_infra_env_boot(request: InfraEnvBootRequest) -> InfraEnvBootState:
     """Publish the InfraEnv's iPXE script as its boot entry, once its image includes this host.
 
-    Without a `server_name` (publish-infraenv-boot): its current image, as soon
+    Without a `server_name` (publish-infraenv-to-pxe-server): its current image, as soon
     as there is a ready one.
     """
     if request.server_name:
@@ -973,7 +973,7 @@ async def teardown_bmh_resources(ref: BmhRef) -> TeardownResult:
     return TeardownResult(removed=removed, finalizers_cleared=finalizers_cleared)
 
 
-# --- uninstall-server ---------------------------------------------------------
+# --- uninstall-server-from-hc ---------------------------------------------------------
 
 _INFRAENV_LABEL = "infraenvs.agent-install.openshift.io"
 
@@ -1304,7 +1304,7 @@ async def check_hosted_node(ref: HostedNodeRef) -> HostedNodeState:
     return HostedNodeState(found=found, node_name=ref.node_name)
 
 
-# --- uninstall-server: leftovers of a broken HyperShift deletion ----------------------
+# --- uninstall-server-from-hc: leftovers of a broken HyperShift deletion ----------------------
 
 
 @activity.defn

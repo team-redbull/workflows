@@ -2,7 +2,7 @@
 {{- $root := . }}
 {{- range $ns := .Values.rbac.targetNamespaces }}
 ---
-# Exactly the verbs install-server's activities use in one InfraEnv namespace:
+# Exactly the verbs add-server-to-mce's activities use in one InfraEnv namespace:
 # creating and tearing down a candidate's three resources, the Agent poll, and
 # the InfraEnv read an IPMI server's network boot needs.
 apiVersion: rbac.authorization.k8s.io/v1
@@ -24,7 +24,7 @@ rules:
     verbs: [get, create, delete]
   - apiGroups: [agent-install.openshift.io]
     resources: [agents]
-    # delete: remove-server; patch: uninstall-server releasing an Agent the
+    # delete: remove-server-from-mce; patch: uninstall-server-from-hc releasing an Agent the
     # provider no longer can (its Machine or AgentMachine gone)
     verbs: [get, list, delete, patch]
   - apiGroups: [agent-install.openshift.io]
@@ -49,7 +49,7 @@ subjects:
 {{- end }}
 {{- if .Values.rbac.hostedClusters }}
 ---
-# uninstall-server's reads of a hosted cluster, and its writes there. Cluster-wide
+# uninstall-server-from-hc's reads of a hosted cluster, and its writes there. Cluster-wide
 # because what it touches lives in each hosted cluster's control-plane
 # namespace (`<hc-ns>-<hc>`) and the HostedCluster's own namespace — neither
 # is an InfraEnv namespace, and neither is named in the request:

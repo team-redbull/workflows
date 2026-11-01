@@ -1,6 +1,6 @@
 """The invariants that keep a permanent failure from retrying forever.
 
-install-server runs with UNBOUNDED activity retries, so a failure Temporal does
+add-server-to-mce runs with UNBOUNDED activity retries, so a failure Temporal does
 not recognise as permanent does not fail the run — it retries every minute with
 the run sitting RUNNING and the error buried on the activity. Two things have to
 hold for that not to happen, and neither is visible in a behavioural test:
@@ -32,15 +32,15 @@ from shared.bmc_address import (
 )
 from shared.exceptions import InvalidServerNameError, OrchestratorError
 from shared.models.server_lifecycle import BmcEndpoint
-from workflow_domains.server_lifecycle.install_server import (
+from workflow_domains.server_lifecycle.add_server_to_mce import (
     _REJECTION_SUMMARY,
     _REJECTION_TYPE,
     _RETRY_POLICY,
 )
 
-_INSTALL_SERVER = (
+_ADD_SERVER_TO_MCE = (
     pathlib.Path(__file__).resolve().parent.parent
-    / "workflow_domains/server_lifecycle/install_server.py"
+    / "workflow_domains/server_lifecycle/add_server_to_mce.py"
 )
 
 
@@ -73,7 +73,7 @@ class TestTheNonRetryableList:
     def test_the_list_is_derived_from_classes_not_written_out(self):
         # A string literal here is the whole failure mode: it type-checks, reads
         # correctly and does nothing.
-        tree = ast.parse(_INSTALL_SERVER.read_text())
+        tree = ast.parse(_ADD_SERVER_TO_MCE.read_text())
         listed = next(
             node.value
             for node in ast.walk(tree)
@@ -93,7 +93,7 @@ class TestWorkflowRaisedTypes:
         run keeps failing under the old name, which is what the status endpoint
         and any alerting key on.
         """
-        tree = ast.parse(_INSTALL_SERVER.read_text())
+        tree = ast.parse(_ADD_SERVER_TO_MCE.read_text())
         literals = [
             ast.unparse(keyword.value)
             for node in ast.walk(tree)
@@ -110,7 +110,7 @@ class TestWorkflowRaisedTypes:
     _RESOLVED_VIA_TABLE = {"error"}
 
     def test_each_type_used_resolves_to_a_class_in_shared_exceptions(self):
-        tree = ast.parse(_INSTALL_SERVER.read_text())
+        tree = ast.parse(_ADD_SERVER_TO_MCE.read_text())
         used = {
             keyword.value.value.id
             for node in ast.walk(tree)
@@ -122,7 +122,7 @@ class TestWorkflowRaisedTypes:
             and keyword.value.attr == "__name__"
             and isinstance(keyword.value.value, ast.Name)
         }
-        assert used, "install_server raises no classified ApplicationError"
+        assert used, "add_server_to_mce raises no classified ApplicationError"
         for name in used - self._RESOLVED_VIA_TABLE:
             assert isinstance(getattr(exceptions, name, None), type), name
 
@@ -141,7 +141,7 @@ class TestRejectionReasons:
         assert set(_REJECTION_TYPE) == set(_REJECTION_SUMMARY)
 
     def test_every_reason_the_loop_records_is_in_both_tables(self):
-        tree = ast.parse(_INSTALL_SERVER.read_text())
+        tree = ast.parse(_ADD_SERVER_TO_MCE.read_text())
         recorded = {
             node.args[0].elts[0].value
             for node in ast.walk(tree)
@@ -159,7 +159,7 @@ class TestRejectionReasons:
     def test_no_reason_is_left_described_but_unreachable(self):
         # The other direction: a reason nothing records any more is dead
         # weight that reads as a case the loop still handles.
-        tree = ast.parse(_INSTALL_SERVER.read_text())
+        tree = ast.parse(_ADD_SERVER_TO_MCE.read_text())
         recorded = {
             node.args[0].elts[0].value
             for node in ast.walk(tree)

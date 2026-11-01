@@ -6,7 +6,7 @@ Workflows import THESE for type-checked activity references.
 
 Note what is NOT here: resolving the inventory VLAN. That reads the Segments
 Manager, whose credential already lives on the segment-lifecycle limb, so
-install-server calls `get_inventory_segment` on the SEGMENT-LIFECYCLE queue
+add-server-to-mce calls `get_inventory_segment` on the SEGMENT-LIFECYCLE queue
 instead of this domain duplicating the token (see shared/interfaces/
 segment_lifecycle.py).
 """
@@ -119,10 +119,10 @@ async def reserve_server(request: ReserveServerRequest) -> ServerReservation:
 
 @activity.defn
 async def lookup_install_candidate(request: ServerMembershipRequest) -> InstallCandidateRecord:
-    """install-server: why `/servers/available` refused a NAMED server — server-scan's stored record.
+    """add-server-to-mce: why `/servers/available` refused a NAMED server — server-scan's stored record.
 
     `GET /servers?search=<name>` + `GET /servers/{id}` with an exact,
-    case-insensitive name match (uninstall-server's read), never
+    case-insensitive name match (uninstall-server-from-hc's read), never
     `/servers/available` — that is what refused it, and its 404 detail names
     neither the network category nor the install lock. Returns the membership
     (lifecycle state, contest, maintenance), the server projected exactly as
@@ -143,9 +143,9 @@ async def lookup_install_candidate(request: ServerMembershipRequest) -> InstallC
 async def release_server(request: ReleaseServerRequest) -> ServerReservation:
     """Give an install lock back, so the machine is drawable at once.
 
-    install-server's after a rolled-back candidate; uninstall-server's own once
-    its remove-server child took the host off the MCE; and remove-server's
-    release of install-server's lock for ITS MCE once the host is gone from it
+    add-server-to-mce's after a rolled-back candidate; uninstall-server-from-hc's own once
+    its remove-server-from-mce child took the host off the MCE; and remove-server-from-mce's
+    release of add-server-to-mce's lock for ITS MCE once the host is gone from it
     (the holder + workflow id it read). Not needed for correctness — the lock
     expires on its own — but without it the machine stays undrawable for the
     rest of its TTL, a day after an install. Never a failure when there is
@@ -162,7 +162,7 @@ async def release_server(request: ReleaseServerRequest) -> ServerReservation:
 
 @activity.defn
 async def inspect_inventory_host(ref: BmhRef) -> InventoryHostState:
-    """remove-server: what one server has on this MCE — BMH, NMStateConfig, Agents.
+    """remove-server-from-mce: what one server has on this MCE — BMH, NMStateConfig, Agents.
 
     Reads only. The BMH is `<server>` and the NMStateConfig
     `nmstate-config-<server>` (both lowercased); Agents are matched by BMAC's
@@ -181,7 +181,7 @@ async def inspect_inventory_host(ref: BmhRef) -> InventoryHostState:
 
 @activity.defn
 async def remove_host_pxe_entries(ref: PxeHostEntriesRef) -> PxeHostEntriesRemoval:
-    """remove-server: clear the host's MACs from the site PXE VMs.
+    """remove-server-from-mce: clear the host's MACs from the site PXE VMs.
 
     For every PXE VM in this worker's PXE_MAP_URLS and every MAC in `ref.macs`:
     `DELETE /pxe-map/<mac>?mce_cluster=<ref.mce_cluster>`. The PXE VM refuses
@@ -192,7 +192,7 @@ async def remove_host_pxe_entries(ref: PxeHostEntriesRef) -> PxeHostEntriesRemov
     Absent is success (204), so a retry converges.
 
     With `ref.site` (every run since `remove-server-pxe-own-site`) ONLY that
-    site's VM — the MCE's inventory-segment site, the one install-server
+    site's VM — the MCE's inventory-segment site, the one add-server-to-mce
     mapped the host on. Without it, every VM in PXE_MAP_URLS, which is what
     runs recorded before did — and why they failed: the worker holds ONE
     PXE_MAP_TOKEN, each site's VM its own token, so every other site answered
@@ -314,7 +314,7 @@ async def publish_infra_env_boot(request: InfraEnvBootRequest) -> InfraEnvBootSt
     answers published=False with `detail` naming what is awaited — an
     observation, not an error; the workflow polls on a bounded timer.
 
-    With `request.server_name` None (publish-infraenv-boot) no NMStateConfig is
+    With `request.server_name` None (publish-infraenv-to-pxe-server) no NMStateConfig is
     read: the InfraEnv's CURRENT image is published as soon as it is ready
     (the same three conditions minus the comparison).
 
@@ -517,21 +517,21 @@ async def teardown_bmh_resources(ref: BmhRef) -> TeardownResult:
     ...
 
 
-# --- uninstall-server ---------------------------------------------------------
+# --- uninstall-server-from-hc ---------------------------------------------------------
 
 
 @activity.defn
 async def lookup_server_membership(request: ServerMembershipRequest) -> ServerMembership:
-    """uninstall-server and remove-server: server-scan's record of where this server is.
+    """uninstall-server-from-hc and remove-server-from-mce: server-scan's record of where this server is.
 
     `GET /servers?search=<name>`, then `GET /servers/{id}` for every hit whose
     name matches EXACTLY (case-insensitive) — the same two-step read
-    remove-server's MAC lookup makes, and never `/servers/available`, which
+    remove-server-from-mce's MAC lookup makes, and never `/servers/available`, which
     hides claimed and reserved machines. Returns the `srv_…` id (the install
     lock's key), `openshift.{lifecycle_state, cluster_name, mce_name,
     contested_with}`, `maintenance` and the install lock (holder, workflow id,
-    MCE, expiry; judged live at read time — remove-server releases
-    install-server's lock for its MCE by it). found=False for a name
+    MCE, expiry; judged live at read time — remove-server-from-mce releases
+    add-server-to-mce's lock for its MCE by it). found=False for a name
     server-scan does not know — the workflow decides what that means.
 
     Raises AmbiguousServerNameError when two documents carry the name and
@@ -543,7 +543,7 @@ async def lookup_server_membership(request: ServerMembershipRequest) -> ServerMe
 
 @activity.defn
 async def inspect_bound_host(ref: BmhRef) -> BoundHostState:
-    """uninstall-server: the host on this MCE, and the hosted-cluster node it is, if any.
+    """uninstall-server-from-hc: the host on this MCE, and the hosted-cluster node it is, if any.
 
     Reads only. The BMH `<server>` (its operational status and InfraEnv
     label); the Agents matched to it by BMAC's bmh label or any MAC (the BMH's,
@@ -573,7 +573,7 @@ async def inspect_bound_host(ref: BmhRef) -> BoundHostState:
 
 @activity.defn
 async def ensure_machine_deleting(ref: MachineRef) -> MachineDeletion:
-    """uninstall-server's ONE write on the MCE: make sure the Machine is being deleted.
+    """uninstall-server-from-hc's ONE write on the MCE: make sure the Machine is being deleted.
 
     A Machine already carrying a deletionTimestamp — a NodePool scale-down, an
     operator, or an earlier run of this same id — is left exactly as it is
@@ -591,7 +591,7 @@ async def ensure_machine_deleting(ref: MachineRef) -> MachineDeletion:
 
 @activity.defn
 async def get_machine_state(ref: MachineRef) -> MachineState:
-    """uninstall-server: one Machine as it is now — the deletion wait's observation.
+    """uninstall-server-from-hc: one Machine as it is now — the deletion wait's observation.
 
     found=False once it is gone. While it is going: its deletionTimestamp, its
     nodeRef, the pre-drain / pre-terminate hook annotations still on it and its
@@ -608,13 +608,13 @@ async def get_machine_state(ref: MachineRef) -> MachineState:
 
 @activity.defn
 async def get_agent_machine_state(ref: AgentMachineRef) -> AgentMachineState:
-    """uninstall-server: whether one AgentMachine is still on the MCE."""
+    """uninstall-server-from-hc: whether one AgentMachine is still on the MCE."""
     ...
 
 
 @activity.defn
 async def get_agent_binding(ref: AgentNameRef) -> AgentBindingState:
-    """uninstall-server: one Agent's binding and state as they are now.
+    """uninstall-server-from-hc: one Agent's binding and state as they are now.
 
     `spec.clusterDeploymentName`, the provider's `agentMachineRef` label,
     `status.debugInfo.state` and `spec.approved`. found=False when the Agent
@@ -625,7 +625,7 @@ async def get_agent_binding(ref: AgentNameRef) -> AgentBindingState:
 
 @activity.defn
 async def check_hosted_node(ref: HostedNodeRef) -> HostedNodeState:
-    """uninstall-server: whether the hosted cluster still has this Node. Reads only.
+    """uninstall-server-from-hc: whether the hosted cluster still has this Node. Reads only.
 
     Reaches the hosted cluster through its admin kubeconfig: the Secret the
     HostedCluster names in `status.kubeconfig`, in the HostedCluster's
@@ -642,12 +642,12 @@ async def check_hosted_node(ref: HostedNodeRef) -> HostedNodeState:
     ...
 
 
-# --- uninstall-server: what a broken HyperShift deletion left behind -----------
+# --- uninstall-server-from-hc: what a broken HyperShift deletion left behind -----------
 
 
 @activity.defn
 async def find_hosted_nodes(query: HostedNodeQuery) -> HostedNodes:
-    """uninstall-server: every Node of the hosted cluster that IS this server. Reads only.
+    """uninstall-server-from-hc: every Node of the hosted cluster that IS this server. Reads only.
 
     The cluster is `query.hosted_cluster`, else the one HostedCluster on the
     MCE named `query.cluster_name` (server-scan's INSTALLED reading) —
@@ -666,7 +666,7 @@ async def find_hosted_nodes(query: HostedNodeQuery) -> HostedNodes:
 
 @activity.defn
 async def drain_hosted_node(action: HostedNodeAction) -> HostedNodeDrain:
-    """uninstall-server: one drain pass over a Node HyperShift lost track of.
+    """uninstall-server-from-hc: one drain pass over a Node HyperShift lost track of.
 
     Only for a Node with no Machine behind it — CAPI drains a Node only
     through its Machine. Cordons it (`spec.unschedulable`), then evicts, through
@@ -682,7 +682,7 @@ async def drain_hosted_node(action: HostedNodeAction) -> HostedNodeDrain:
 
 @activity.defn
 async def delete_hosted_node(action: HostedNodeAction) -> HostedNodeDeletion:
-    """uninstall-server: delete a Node nothing runs as any more.
+    """uninstall-server-from-hc: delete a Node nothing runs as any more.
 
     Only when it is NOT Ready — a running kubelet would register it again at
     once — and carries no other providerID. A Ready one is `ready=True`,
@@ -693,7 +693,7 @@ async def delete_hosted_node(action: HostedNodeAction) -> HostedNodeDeletion:
 
 @activity.defn
 async def release_agent(request: AgentReleaseRequest) -> AgentRelease:
-    """uninstall-server: unbind the Agent the way the Agent provider would.
+    """uninstall-server-from-hc: unbind the Agent the way the Agent provider would.
 
     For an Agent the provider can no longer release: it unbinds only from a
     Machine's pre-terminate hook, so with the Machine (or the AgentMachine)
@@ -711,7 +711,7 @@ async def release_agent(request: AgentReleaseRequest) -> AgentRelease:
 
 @activity.defn
 async def release_machine_hook(ref: MachineRef) -> MachineHookRelease:
-    """uninstall-server: remove the Agent provider's hook from a Machine it can no longer release.
+    """uninstall-server-from-hc: remove the Agent provider's hook from a Machine it can no longer release.
 
     `pre-terminate.delete.hook.machine.cluster.x-k8s.io/agentmachine`, and only
     while the Machine is deleting and the AgentMachine its infrastructureRef
@@ -724,7 +724,7 @@ async def release_machine_hook(ref: MachineRef) -> MachineHookRelease:
 
 @activity.defn
 async def clean_up_agent_machines(request: AgentMachineCleanupRequest) -> AgentMachineCleanup:
-    """uninstall-server: every AgentMachine still naming the Agent, gone — and what is left.
+    """uninstall-server-from-hc: every AgentMachine still naming the Agent, gone — and what is left.
 
     Re-derived fresh on every call, never from the inspection: AgentMachines
     whose `status.agentRef` names the Agent, the one its label names, and

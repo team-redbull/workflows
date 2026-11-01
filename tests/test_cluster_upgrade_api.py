@@ -222,7 +222,7 @@ class TestDecisions:
         assert client.post(f"{PATH}/{RUN}/approve", json={"by": "alice"}).status_code == 504
 
     def test_a_decision_route_reaches_only_upgrade_runs(self, client, fake):
-        response = client.post(f"{PATH}/remove-server-ocp-x/abort", json={"by": "alice", "reason": "x"})
+        response = client.post(f"{PATH}/remove-server-from-mce-ocp-x/abort", json={"by": "alice", "reason": "x"})
         assert response.status_code == 404
         assert fake.updates == []
 

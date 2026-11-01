@@ -22,7 +22,7 @@ builds a RAID 1 in the BIOS.
 
 **The workflow takes the iDRAC IP and finishes only when the server is fully
 configured and visible, ready to install, in server-scan** (the inventory in
-`team-redbull/server-scan`). From there the existing `install-server` workflow
+`team-redbull/server-scan`). From there the existing `add-server-to-mce` workflow
 draws it. Only Dell for now; Cisco, HPE and Intersight get their own workflows
 later.
 
@@ -44,7 +44,7 @@ later.
    name.
 3. **`128c`** is hyperthreaded cores (threads). **`1024gb`** is memory.
    **`10tb`** is all disks combined, rounded up by the naming service. The serial
-   is the Dell service tag. The name must match the InfraEnv tokens install-server
+   is the Dell service tag. The name must match the InfraEnv tokens add-server-to-mce
    searches on (`^ocp-<infraEnv>`).
 4. **Storage:** RAID 1 on the **BOSS** pair; every **PERC** drive **Non-RAID**.
 5. **The workflow runs the OME discovery itself.**

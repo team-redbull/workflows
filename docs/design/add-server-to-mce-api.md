@@ -1,11 +1,16 @@
-# install-server API — one route, one run per server
+# add-server-to-mce API — one route, one run per server
 
 Status: **decided with the operator 2026-10-23, revised 2026-10-24** (a
 request without `count` takes a slot too, so it is never a 409 — see
 [the revision](#revised-2026-10-24-no-409-from-the-pool)). Implemented in
-`workflow_domains/server_lifecycle/router.py` (`InstallServerRequest`,
-`start_install_server`), tested in `tests/test_server_lifecycle_api.py`.
+`workflow_domains/server_lifecycle/router.py` (`AddServerToMceRequest`,
+`start_add_server_to_mce`), tested in `tests/test_server_lifecycle_api.py`.
 The workflow itself did not change.
+
+The workflow was named **install-server** when this was decided; it was
+renamed **add-server-to-mce** on 2026-11-01, and `POST .../install-server` now
+answers 410 pointing at the new route. Below, the old name is kept wherever it
+describes what existed then.
 
 ## The problem
 
@@ -25,7 +30,7 @@ install two servers. Parallel installs from one pool did exist, as
 
 ## The decision
 
-ONE route, `POST /workflows/server-lifecycle/install-server`. The body says
+ONE route, `POST /workflows/server-lifecycle/add-server-to-mce`. The body says
 what you want:
 
 | body | runs | reply |
@@ -97,9 +102,9 @@ what you want:
     workflow ids) was considered and left out, because the callers are people
     using Swagger or curl, not controllers that retry automatically.
   - **Revisit this if a controller or pipeline ever calls `count`.**
-- **`InstallServerRequest` is its own model, not an `InstallServerInput`
+- **`AddServerToMceRequest` is its own model, not an `AddServerToMceInput`
   subclass.** One request is now many runs.
-  - `InstallServerInput` is decoded from Temporal history on every replay, so
+  - `AddServerToMceInput` is decoded from Temporal history on every replay, so
     it keeps its shape: `server_name` singular, and no `count`.
   - `run_input()` builds one input per server.
   - `test_every_run_field_can_be_sent` fails if a field is added to the run
@@ -140,7 +145,8 @@ What stayed:
 - A start Temporal refuses is a **502 with its reason** for one run, named or
   from the pool, instead of a bare 500.
 
-`install_server_workflow_id` became `install_server_name_workflow_id`: nothing
+`install_server_workflow_id` became `install_server_name_workflow_id` (now
+`add_server_to_mce_name_workflow_id`): nothing
 builds the pool id any more. Runs started on it before the change keep it, and
 `GET /workflows/runs/{id}` still finds them.
 
@@ -148,20 +154,22 @@ builds the pool id any more. Runs started on it before the change keep it, and
 
 Workflow ids follow two schemes that never overlap:
 
-- `install-server-<mce>_<infraEnv>_<slot>` for every run the pool picks, one or
-  `count` of them (`install-server-<infraEnv>_<slot>` before 2026-10-25, and
+- `add-server-to-mce-<mce>_<infraEnv>_<slot>` for every run the pool picks, one or
+  `count` of them (`install-server-<mce>_<infraEnv>_<slot>` before the rename on
+  2026-11-01, `install-server-<infraEnv>_<slot>` before 2026-10-25, and
   `install-server-<infraEnv>`, without a slot, before 2026-10-24);
-- `install-server-<mce>_<server>` for a named server, lowercased
-  (`install-server-name-<server>` before 2026-10-25).
+- `add-server-to-mce-<mce>_<server>` for a named server, lowercased
+  (`install-server-<mce>_<server>` before the rename,
+  `install-server-name-<server>` before 2026-10-25).
 
 The MCE is followed by `_`, which a Kubernetes name cannot contain, so no two
 different (MCE, InfraEnv, slot) triples build the same id and a hub's prefix
-`install-server-<mce>_` never matches the runs of an MCE whose name extends it. The MCE is in the id so
+`add-server-to-mce-<mce>_` never matches the runs of an MCE whose name extends it. The MCE is in the id so
 a hub finds only its own runs; the machines a pool draws from are shared by every
 hub, so a run sizing its spare candidates no longer counts another hub's runs
 (`busy` is per hub) — the install lock, not the id, keeps two hubs off one
-machine. The id keeps the workflow's name and only gained the MCE: the workflow type, queue
-and route are unchanged, and runs started on the old ids keep them.
+machine. An id is not part of a run's replayed history, so runs started on an
+old id keep it.
 
 Machines are guarded by server-scan's install lock (ADR-0035 there):
 
@@ -181,6 +189,6 @@ Machines are guarded by server-scan's install lock (ADR-0035 there):
 
 ## What did not change
 
-The workflow code, `InstallServerInput` and every activity are untouched. The
+The workflow code, `AddServerToMceInput` and every activity are untouched. The
 ids are built only in the API, so runs already in flight replay exactly as
 before, and no `workflow.patched` gate was needed.

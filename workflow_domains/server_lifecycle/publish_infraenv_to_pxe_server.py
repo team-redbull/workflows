@@ -1,9 +1,9 @@
-"""publish-infraenv-boot — put an InfraEnv's CURRENT iPXE script on its site's PXE VM.
+"""publish-infraenv-to-pxe-server — put an InfraEnv's CURRENT iPXE script on its site's PXE VM.
 
 Given an MCE and an InfraEnv, (re)writes the InfraEnv's boot entry,
 `/var/www/pxe-map/<mce_cluster>/<infra_env>.ipxe`, on the PXE VM of the MCE's
-site — the file every IPMI host install-server mapped to that InfraEnv chains
-to. install-server publishes it itself, per host; this workflow is the same
+site — the file every IPMI host add-server-to-mce mapped to that InfraEnv chains
+to. add-server-to-mce publishes it itself, per host; this workflow is the same
 publish on demand, tied to no host: to seed the entry before the first install,
 to repair one deleted or corrupted on the VM, or to point it at a regenerated
 image without installing anything.
@@ -13,7 +13,7 @@ Shape of the run:
   1. resolving-site     — the MCE's inventory segment in the Segments Manager
                           (on the SEGMENT-LIFECYCLE queue, where that
                           credential lives) gives the site, and with it the PXE
-                          VM — the same rule install-server maps hosts by.
+                          VM — the same rule add-server-to-mce maps hosts by.
   2. validating-infraenv — the InfraEnv must exist on the MCE; missing fails
                           the run before anything is written.
   3. publishing         — publish_infra_env_boot, polled every 10 s until the
@@ -29,6 +29,11 @@ Shape of the run:
 
 Nothing is written on the MCE. The URL is read and written inside the
 activity, so it never enters history.
+
+Named publish-infraenv-boot until 2026-11-01 — route, id, queue and type. A
+run started before the rename is a `PublishInfraEnvBootWorkflow` (the subclass
+at the bottom of this file) and replays on its old queue. The ACTIVITY keeps
+its name, `publish_infra_env_boot`: activities were not renamed.
 """
 
 from __future__ import annotations
@@ -62,13 +67,15 @@ with workflow.unsafe.imports_passed_through():
         InfraEnvBootRequest,
         InfraEnvBootState,
         InfraEnvRef,
-        PublishInfraEnvBootProgress,
-        PublishInfraEnvBootResult,
-        PublishInfraEnvBootRunArgs,
+        PublishInfraEnvToPxeServerProgress,
+        PublishInfraEnvToPxeServerResult,
+        PublishInfraEnvToPxeServerRunArgs,
     )
 
 _ACTIVITY_TIMEOUT = timedelta(seconds=90)
-# The same "no worker polls this MCE's queue" signal install-server uses.
+# The workflow type of every run started before the rename.
+_LEGACY_WORKFLOW_TYPE = "PublishInfraEnvBootWorkflow"
+# The same "no worker polls this MCE's queue" signal add-server-to-mce uses.
 _SCHEDULE_TO_START_TIMEOUT = timedelta(minutes=5)
 
 # Activity-raised failures no retry can fix, as CLASSES (CLAUDE.md §5).
@@ -89,7 +96,7 @@ _RETRY_POLICY = RetryPolicy(
     non_retryable_error_types=[error.__name__ for error in _PERMANENT_ACTIVITY_ERRORS],
 )
 
-# Machine convergence, so a real deadline — install-server's, for the same
+# Machine convergence, so a real deadline — add-server-to-mce's, for the same
 # reason: an InfraEnv mid-regeneration has a ready image within seconds, and
 # one without for ten minutes is not regenerating. Changing either constant is
 # a non-deterministic change for in-flight runs.
@@ -98,19 +105,19 @@ _IMAGE_POLL_INTERVAL = timedelta(seconds=10)
 
 
 @workflow.defn
-class PublishInfraEnvBootWorkflow:
+class PublishInfraEnvToPxeServerWorkflow:
     def __init__(self) -> None:
         self._phase = "pending"
         self._activity_queue: str | None = None
 
     @workflow.query
-    def progress(self) -> PublishInfraEnvBootProgress:
-        return PublishInfraEnvBootProgress(
+    def progress(self) -> PublishInfraEnvToPxeServerProgress:
+        return PublishInfraEnvToPxeServerProgress(
             phase=self._phase, activity_queue=self._activity_queue
         )
 
     @workflow.run
-    async def run(self, run_args: PublishInfraEnvBootRunArgs) -> PublishInfraEnvBootResult:
+    async def run(self, run_args: PublishInfraEnvToPxeServerRunArgs) -> PublishInfraEnvToPxeServerResult:
         request = run_args.input
         activity_queue = server_lifecycle_activity_queue(request.mce_cluster)
         self._activity_queue = activity_queue
@@ -124,7 +131,7 @@ class PublishInfraEnvBootWorkflow:
             start_to_close_timeout=_ACTIVITY_TIMEOUT,
             retry_policy=_RETRY_POLICY,
         )
-        # Re-checked for install-server's reason: the match is client-side,
+        # Re-checked for add-server-to-mce's reason: the match is client-side,
         # and the wrong segment would publish to another site's PXE VM.
         if segment.cluster_name != request.mce_cluster:
             raise ApplicationError(
@@ -173,7 +180,7 @@ class PublishInfraEnvBootWorkflow:
             "already held a newer image" if boot.superseded else "published",
             boot.image_created_at,
         )
-        return PublishInfraEnvBootResult(
+        return PublishInfraEnvToPxeServerResult(
             mce_cluster=request.mce_cluster,
             infra_env=request.infra_env,
             namespace=request.namespace,
@@ -205,3 +212,24 @@ class PublishInfraEnvBootWorkflow:
             if state.published or workflow.now() - started_at >= _IMAGE_DEADLINE:
                 return state
             await workflow.sleep(_IMAGE_POLL_INTERVAL)  # durable, replay-safe
+
+
+@workflow.defn(name=_LEGACY_WORKFLOW_TYPE)
+class PublishInfraEnvBootWorkflow(PublishInfraEnvToPxeServerWorkflow):
+    """publish-infraenv-to-pxe-server under its old type, for runs started before the rename.
+
+    Their history names `PublishInfraEnvBootWorkflow` on the old queue
+    (LEGACY_PUBLISH_INFRAENV_BOOT_WORKFLOW_QUEUE), and only a worker
+    registering that type there can replay them. A run lasts ten minutes at
+    most, so this goes as soon as a deploy has been out that long: delete it
+    and its registration in main_worker_init.py once
+    `WorkflowType='PublishInfraEnvBootWorkflow' AND ExecutionStatus='Running'`
+    finds nothing.
+    """
+
+    # The SDK takes @workflow.run only from the class it registers, not a base.
+    @workflow.run
+    async def run(
+        self, run_args: PublishInfraEnvToPxeServerRunArgs
+    ) -> PublishInfraEnvToPxeServerResult:
+        return await super().run(run_args)

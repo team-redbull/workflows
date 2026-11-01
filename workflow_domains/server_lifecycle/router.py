@@ -9,8 +9,14 @@ registration wait that can take minutes.
 
 PATHS ARE `/workflows/<domain>/<workflow>`. The domain prefix lives here and
 every workflow in the domain adds its own path under it — a domain holds many
-workflows, so it can never be the endpoint of one of them: install-server,
-remove-server, uninstall-server and publish-infraenv-boot each add a path.
+workflows, so it can never be the endpoint of one of them: add-server-to-mce,
+remove-server-from-mce, uninstall-server-from-hc and
+publish-infraenv-to-pxe-server each add a path.
+
+Their paths before 2026-11-01 — install-server, remove-server, uninstall-server
+and publish-infraenv-boot — answer 410 naming the new one, whatever the body
+(_RENAMED_PATHS, at the bottom). Never aliases: nothing keeps an old name alive
+in the API by default.
 """
 
 from __future__ import annotations
@@ -28,43 +34,43 @@ from temporalio.exceptions import WorkflowAlreadyStartedError
 
 from shared.cluster_names import canonical_mce_cluster
 from shared.consts import (
-    INSTALL_SERVER_WORKFLOW_QUEUE,
-    PUBLISH_INFRAENV_BOOT_WORKFLOW_QUEUE,
-    REMOVE_SERVER_WORKFLOW_QUEUE,
-    UNINSTALL_SERVER_WORKFLOW_QUEUE,
+    ADD_SERVER_TO_MCE_WORKFLOW_QUEUE,
+    PUBLISH_INFRAENV_TO_PXE_SERVER_WORKFLOW_QUEUE,
+    REMOVE_SERVER_FROM_MCE_WORKFLOW_QUEUE,
+    UNINSTALL_SERVER_FROM_HC_WORKFLOW_QUEUE,
 )
 from shared.models.server_lifecycle import (
-    InstallServerInput,
-    InstallServerRunArgs,
-    PublishInfraEnvBootInput,
-    PublishInfraEnvBootRunArgs,
-    RemoveServerInput,
-    RemoveServerRunArgs,
-    UninstallServerInput,
-    UninstallServerRunArgs,
+    AddServerToMceInput,
+    AddServerToMceRunArgs,
+    PublishInfraEnvToPxeServerInput,
+    PublishInfraEnvToPxeServerRunArgs,
+    RemoveServerFromMceInput,
+    RemoveServerFromMceRunArgs,
+    UninstallServerFromHcInput,
+    UninstallServerFromHcRunArgs,
 )
 from shared.workflow_ids import (
-    install_server_name_workflow_id,
-    install_server_slot_workflow_id,
-    publish_infraenv_boot_workflow_id,
-    remove_server_workflow_id,
-    uninstall_server_workflow_id,
+    add_server_to_mce_name_workflow_id,
+    add_server_to_mce_slot_workflow_id,
+    publish_infraenv_to_pxe_server_workflow_id,
+    remove_server_from_mce_workflow_id,
+    uninstall_server_from_hc_workflow_id,
 )
 from workflow_domains.routers.deps import get_temporal_client
 from workflow_domains.routers.models import StartWorkflowResponse
-from workflow_domains.server_lifecycle.install_server import InstallServerWorkflow
-from workflow_domains.server_lifecycle.publish_infraenv_boot import (
-    PublishInfraEnvBootWorkflow,
+from workflow_domains.server_lifecycle.add_server_to_mce import AddServerToMceWorkflow
+from workflow_domains.server_lifecycle.publish_infraenv_to_pxe_server import (
+    PublishInfraEnvToPxeServerWorkflow,
 )
-from workflow_domains.server_lifecycle.remove_server import RemoveServerWorkflow
-from workflow_domains.server_lifecycle.uninstall_server import UninstallServerWorkflow
+from workflow_domains.server_lifecycle.remove_server_from_mce import RemoveServerFromMceWorkflow
+from workflow_domains.server_lifecycle.uninstall_server_from_hc import UninstallServerFromHcWorkflow
 
 router = APIRouter(prefix="/workflows/server-lifecycle", tags=["server-lifecycle"])
 
-_INSTALL_SERVER_PATH = "/install-server"
-_REMOVE_SERVER_PATH = "/remove-server"
-_UNINSTALL_SERVER_PATH = "/uninstall-server"
-_PUBLISH_INFRAENV_BOOT_PATH = "/publish-infraenv-boot"
+_ADD_SERVER_TO_MCE_PATH = "/add-server-to-mce"
+_REMOVE_SERVER_FROM_MCE_PATH = "/remove-server-from-mce"
+_UNINSTALL_SERVER_FROM_HC_PATH = "/uninstall-server-from-hc"
+_PUBLISH_INFRAENV_TO_PXE_SERVER_PATH = "/publish-infraenv-to-pxe-server"
 
 # Where the inventory InfraEnvs live on an MCE unless the caller says otherwise.
 _DEFAULT_NAMESPACE = "inventory"
@@ -78,7 +84,7 @@ _MCE_CLUSTER_DESCRIPTION = (
 
 # The most runs one request starts: `count` and a `server_names` list alike.
 _MAX_INSTALLS_PER_REQUEST = 20
-# InstallServerInput.candidate_count's ceiling, which caps the spares a
+# AddServerToMceInput.candidate_count's ceiling, which caps the spares a
 # pool run gets by default.
 _MAX_CANDIDATES = 20
 # Slots a pool request looks through for free ones: `_1` … `_100`. Far more
@@ -140,18 +146,18 @@ def _refuse_server_name(data: Any) -> Any:
 # Deterministic ids come from shared/workflow_ids.py — the ONE definition per
 # scheme, so the id this route builds and the id anything else builds for the
 # same target can never drift apart: a pool run is on a slot of its InfraEnv on
-# its MCE (install_server_slot_workflow_id), a named run on its machine on its
-# MCE (install_server_name_workflow_id).
+# its MCE (add_server_to_mce_slot_workflow_id), a named run on its machine on its
+# MCE (add_server_to_mce_name_workflow_id).
 
 
-async def _start(client: Client, run_input: InstallServerInput, workflow_id: str):
-    """Start one install-server run. The ways of asking differ only in which id
+async def _start(client: Client, run_input: AddServerToMceInput, workflow_id: str):
+    """Start one add-server-to-mce run. The ways of asking differ only in which id
     each run gets and how the outcome is reported, never in how a run starts."""
     return await client.start_workflow(
-        InstallServerWorkflow.run,
-        InstallServerRunArgs(input=run_input),
+        AddServerToMceWorkflow.run,
+        AddServerToMceRunArgs(input=run_input),
         id=workflow_id,
-        task_queue=INSTALL_SERVER_WORKFLOW_QUEUE,
+        task_queue=ADD_SERVER_TO_MCE_WORKFLOW_QUEUE,
     )
 
 
@@ -162,14 +168,14 @@ def _count_statuses(results: list[Any]) -> dict[str, int]:
     return counts
 
 
-class InstallServerRequest(BaseModel):
-    """The install-server request body: one shape for every way of asking.
+class AddServerToMceRequest(BaseModel):
+    """The add-server-to-mce request body: one shape for every way of asking.
 
     Which servers: with none named, the InfraEnv's pool picks `count` healthy
     ones (1 unless sent); `server_names` names the machines instead, one or a
     list. Either way every server is a run of its own (`run_input`).
 
-    Deliberately NOT InstallServerInput, nor a subclass of it: a request is no
+    Deliberately NOT AddServerToMceInput, nor a subclass of it: a request is no
     longer one run. That model is decoded from Temporal history on every
     replay, so it keeps its shape (`server_name` singular, no `count`) and the
     strictness lives here, at the edge, instead — chiefly a `vlan_id` is
@@ -267,7 +273,7 @@ class InstallServerRequest(BaseModel):
         return _check_each_server_once(names)
 
     @model_validator(mode="after")
-    def _pool_options_need_the_pool(self) -> InstallServerRequest:
+    def _pool_options_need_the_pool(self) -> AddServerToMceRequest:
         # Both size a draw from the pool. A named server is drawn alone, so
         # either one next to `server_names` could only be ignored.
         if self.server_names is not None:
@@ -294,7 +300,7 @@ class InstallServerRequest(BaseModel):
 
     def run_input(
         self, *, server_name: str | None = None, candidate_count: int | None = None
-    ) -> InstallServerInput:
+    ) -> AddServerToMceInput:
         """The input ONE run is started with: one named server, or one pool draw."""
         fields: dict[str, Any] = {
             "infra_env": self.infra_env,
@@ -307,14 +313,14 @@ class InstallServerRequest(BaseModel):
         chosen = candidate_count if candidate_count is not None else self.candidate_count
         if chosen is not None:  # unset, the run's own default applies
             fields["candidate_count"] = chosen
-        return InstallServerInput(**fields)
+        return AddServerToMceInput(**fields)
 
 
 class ServerRunItem(BaseModel):
     """One run of a multi-server request: its START only — the run has barely begun.
 
-    The shape every per-server report in this domain shares: install-server's
-    and uninstall-server's alike, so a caller reads one the way it reads the
+    The shape every per-server report in this domain shares: add-server-to-mce's
+    and uninstall-server-from-hc's alike, so a caller reads one the way it reads the
     other.
     """
 
@@ -325,7 +331,7 @@ class ServerRunItem(BaseModel):
     error: str | None = None
 
 
-class InstallServerItem(ServerRunItem):
+class AddServerToMceItem(ServerRunItem):
     """One install of a multi-server request.
 
     `server_name` for a named server; `slot` for a pool run, whose machine the
@@ -335,7 +341,7 @@ class InstallServerItem(ServerRunItem):
     slot: int | None = None
 
 
-class InstallServerBatchResponse(BaseModel):
+class AddServerToMceBatchResponse(BaseModel):
     """The answer to `count` or a `server_names` list: one item per run.
 
     Always 202 with a per-run report, never one pass/fail code: starting
@@ -352,18 +358,18 @@ class InstallServerBatchResponse(BaseModel):
     started: int
     already_running: int
     failed: int
-    results: list[InstallServerItem]
+    results: list[AddServerToMceItem]
 
 
 @router.post(
-    _INSTALL_SERVER_PATH,
-    response_model=StartWorkflowResponse | InstallServerBatchResponse,
+    _ADD_SERVER_TO_MCE_PATH,
+    response_model=StartWorkflowResponse | AddServerToMceBatchResponse,
     status_code=202,
 )
-async def start_install_server(
-    install_request: InstallServerRequest,
+async def start_add_server_to_mce(
+    install_request: AddServerToMceRequest,
     client: Client = Depends(get_temporal_client),
-) -> StartWorkflowResponse | InstallServerBatchResponse:
+) -> StartWorkflowResponse | AddServerToMceBatchResponse:
     """Install servers into an InfraEnv — returns immediately (202).
 
     The body names the INFRAENV to fill and the MCE cluster it belongs to. The
@@ -377,14 +383,14 @@ async def start_install_server(
     there is never one run for a batch. The body decides how many:
 
     - **Neither `count` nor `server_names`**: the pool picks ONE server, in
-      the first free slot (`install-server-<mce>_<infraEnv>_<slot>`), answered with
+      the first free slot (`add-server-to-mce-<mce>_<infraEnv>_<slot>`), answered with
       `{workflow_id, run_id}`. Slots still running are stepped over, so the
       same request sent again while it installs starts a SECOND install — it
       is never a 409 (only when all 100 slots are busy).
     - **`count: N`**: the pool picks N, installed IN PARALLEL, one per free
       slot, answered with a per-run report. A second request adds N more.
     - **`server_names: "<name>"`**: that one machine
-      (`install-server-<mce>_<server>`), answered with `{workflow_id, run_id}`;
+      (`add-server-to-mce-<mce>_<server>`), answered with `{workflow_id, run_id}`;
       a 409 while it is already installing.
     - **`server_names: [...]`**: each named machine in parallel, answered with
       a per-run report — always, even for a list of one — in which a machine
@@ -410,7 +416,7 @@ async def start_install_server(
 
     results = await _start_pool_installs(client, install_request, install_request.count or 1)
     if install_request.count is not None:
-        return InstallServerBatchResponse(**_count_statuses(results), results=results)
+        return AddServerToMceBatchResponse(**_count_statuses(results), results=results)
     # A lone pool install answers like any single run.
     last = results[-1]
     if last.status == "started":
@@ -421,7 +427,7 @@ async def start_install_server(
         status_code=409,
         detail=(
             f"Every slot of InfraEnv {install_request.infra_env} (`_1` to "
-            f"`_{_MAX_SLOTS}`) has an install-server run in flight"
+            f"`_{_MAX_SLOTS}`) has an add-server-to-mce run in flight"
         ),
     )
 
@@ -479,20 +485,20 @@ async def _start_each_by_name(
 
 
 async def _start_named_install(
-    client: Client, request: InstallServerRequest, server_name: str
+    client: Client, request: AddServerToMceRequest, server_name: str
 ) -> StartWorkflowResponse:
     """One named machine, answered as one run: a 409 while it is installing."""
-    workflow_id = install_server_name_workflow_id(request.mce_cluster, server_name)
+    workflow_id = add_server_to_mce_name_workflow_id(request.mce_cluster, server_name)
     return await _start_one_by_name(
         lambda: _start(client, request.run_input(server_name=server_name), workflow_id),
         workflow_id,
-        f"An install-server run is already in flight for server {server_name}",
+        f"An add-server-to-mce run is already in flight for server {server_name}",
     )
 
 
 async def _start_pool_installs(
-    client: Client, request: InstallServerRequest, count: int
-) -> list[InstallServerItem]:
+    client: Client, request: AddServerToMceRequest, count: int
+) -> list[AddServerToMceItem]:
     """`count` NEW runs from the InfraEnv's pool, each in the first free slot.
 
     Walks the slots from `_1` up and steps over every one whose run is still
@@ -500,12 +506,12 @@ async def _start_pool_installs(
     of a closed run), and two requests at once cannot start one slot twice:
     Temporal allows one running workflow per id, and the loser moves on.
     """
-    results: list[InstallServerItem] = []
+    results: list[AddServerToMceItem] = []
     started = busy = 0
     for slot in range(1, _MAX_SLOTS + 1):
         if started == count:
             break
-        workflow_id = install_server_slot_workflow_id(request.mce_cluster, request.infra_env, slot)
+        workflow_id = add_server_to_mce_slot_workflow_id(request.mce_cluster, request.infra_env, slot)
         # Every run on the pool - the busy slots below this one and the ones
         # this request has started - takes one machine from the same top of
         # the list, so each new run needs that many spares, plus its own.
@@ -521,21 +527,21 @@ async def _start_pool_installs(
         except WorkflowAlreadyStartedError:
             busy += 1
             results.append(
-                InstallServerItem(slot=slot, workflow_id=workflow_id, status="already_running")
+                AddServerToMceItem(slot=slot, workflow_id=workflow_id, status="already_running")
             )
             continue
         except Exception as exc:  # noqa: BLE001 — reported, not raised
             # Not a busy slot: Temporal itself refused. Every further slot would
             # fail the same way, so stop and report what did start.
             results.append(
-                InstallServerItem(
+                AddServerToMceItem(
                     slot=slot, workflow_id=workflow_id, status="failed", error=str(exc)
                 )
             )
             break
         started += 1
         results.append(
-            InstallServerItem(
+            AddServerToMceItem(
                 slot=slot,
                 workflow_id=handle.id,
                 status="started",
@@ -547,8 +553,8 @@ async def _start_pool_installs(
 
 
 async def _start_named_installs(
-    client: Client, request: InstallServerRequest, server_names: list[str]
-) -> InstallServerBatchResponse:
+    client: Client, request: AddServerToMceRequest, server_names: list[str]
+) -> AddServerToMceBatchResponse:
     """One run per named server, all started at once, on the same id a single
     named install uses — so one machine is one run however it was asked for."""
     results = await _start_each_by_name(
@@ -556,16 +562,16 @@ async def _start_named_installs(
         lambda name: _start(
             client,
             request.run_input(server_name=name),
-            install_server_name_workflow_id(request.mce_cluster, name),
+            add_server_to_mce_name_workflow_id(request.mce_cluster, name),
         ),
-        partial(install_server_name_workflow_id, request.mce_cluster),
-        InstallServerItem,
+        partial(add_server_to_mce_name_workflow_id, request.mce_cluster),
+        AddServerToMceItem,
     )
-    return InstallServerBatchResponse(**_count_statuses(results), results=results)
+    return AddServerToMceBatchResponse(**_count_statuses(results), results=results)
 
 
-class RemoveServerRequest(RemoveServerInput):
-    """The remove-server request body: strict at the edge, namespace defaulted here."""
+class RemoveServerFromMceRequest(RemoveServerFromMceInput):
+    """The remove-server-from-mce request body: strict at the edge, namespace defaulted here."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -587,9 +593,9 @@ class RemoveServerRequest(RemoveServerInput):
         return canonical_mce_cluster(value)
 
 
-@router.post(_REMOVE_SERVER_PATH, response_model=StartWorkflowResponse, status_code=202)
-async def start_remove_server(
-    remove_input: RemoveServerRequest,
+@router.post(_REMOVE_SERVER_FROM_MCE_PATH, response_model=StartWorkflowResponse, status_code=202)
+async def start_remove_server_from_mce(
+    remove_input: RemoveServerFromMceRequest,
     client: Client = Depends(get_temporal_client),
 ) -> StartWorkflowResponse:
     """Take one server out of an MCE's inventory — returns immediately (202).
@@ -605,26 +611,26 @@ async def start_remove_server(
     """
     try:
         handle = await client.start_workflow(
-            RemoveServerWorkflow.run,
-            RemoveServerRunArgs(input=remove_input),
-            id=remove_server_workflow_id(remove_input.server_name),
-            task_queue=REMOVE_SERVER_WORKFLOW_QUEUE,
+            RemoveServerFromMceWorkflow.run,
+            RemoveServerFromMceRunArgs(input=remove_input),
+            id=remove_server_from_mce_workflow_id(remove_input.server_name),
+            task_queue=REMOVE_SERVER_FROM_MCE_WORKFLOW_QUEUE,
         )
     except WorkflowAlreadyStartedError:
         raise HTTPException(
             status_code=409,
-            detail=f"A remove-server run is already in flight for {remove_input.server_name}",
+            detail=f"A remove-server-from-mce run is already in flight for {remove_input.server_name}",
         )
     return StartWorkflowResponse(workflow_id=handle.id, run_id=handle.result_run_id or "")
 
 
-class UninstallServerRequest(BaseModel):
-    """The uninstall-server request body: which machines, on which MCE.
+class UninstallServerFromHcRequest(BaseModel):
+    """The uninstall-server-from-hc request body: which machines, on which MCE.
 
     `server_names` ONLY — no cluster, NodePool or HostedCluster field, and no
     `count`: server-scan and each Agent's own binding say where a server is,
     and a caller-supplied cluster could only contradict them. Its OWN model,
-    not an UninstallServerInput subclass, for install-server's reason: one
+    not an UninstallServerFromHcInput subclass, for add-server-to-mce's reason: one
     request is many runs, each built by `run_input` with ONE `server_name`.
     """
 
@@ -643,7 +649,7 @@ class UninstallServerRequest(BaseModel):
             "of the worker inside that MCE."
         ),
     )
-    # Defaulted HERE, at the edge, for the reason InstallServerRequest gives.
+    # Defaulted HERE, at the edge, for the reason AddServerToMceRequest gives.
     namespace: str = Field(
         default=_DEFAULT_NAMESPACE,
         min_length=1,
@@ -659,7 +665,7 @@ class UninstallServerRequest(BaseModel):
             "and stop there. Its BareMetalHost, NMStateConfig, Agent and PXE mapping "
             "stay, and the host is left powered on in discovery — a free Agent of the "
             "InfraEnv. For a server already only in the inventory there is then nothing "
-            "to do. Default false: the server also leaves the MCE, through remove-server."
+            "to do. Default false: the server also leaves the MCE, through remove-server-from-mce."
         ),
     )
 
@@ -685,9 +691,9 @@ class UninstallServerRequest(BaseModel):
     def _each_server_once(cls, names: str | list[str]) -> str | list[str]:
         return _check_each_server_once(names)
 
-    def run_input(self, server_name: str) -> UninstallServerInput:
+    def run_input(self, server_name: str) -> UninstallServerFromHcInput:
         """The input ONE run is started with: one server."""
-        return UninstallServerInput(
+        return UninstallServerFromHcInput(
             server_name=server_name,
             mce_cluster=self.mce_cluster,
             namespace=self.namespace,
@@ -695,10 +701,10 @@ class UninstallServerRequest(BaseModel):
         )
 
 
-class UninstallServerBatchResponse(BaseModel):
+class UninstallServerFromHcBatchResponse(BaseModel):
     """The answer to a `server_names` list: one item per server, in order.
 
-    Always 202 with a per-run report (see InstallServerBatchResponse); a name
+    Always 202 with a per-run report (see AddServerToMceBatchResponse); a name
     already uninstalling is `already_running`, and a refused one does not stop
     the rest.
     """
@@ -709,31 +715,31 @@ class UninstallServerBatchResponse(BaseModel):
     results: list[ServerRunItem]
 
 
-async def _start_uninstall(client: Client, run_input: UninstallServerInput):
+async def _start_uninstall(client: Client, run_input: UninstallServerFromHcInput):
     return await client.start_workflow(
-        UninstallServerWorkflow.run,
-        UninstallServerRunArgs(input=run_input),
-        id=uninstall_server_workflow_id(run_input.server_name),
-        task_queue=UNINSTALL_SERVER_WORKFLOW_QUEUE,
+        UninstallServerFromHcWorkflow.run,
+        UninstallServerFromHcRunArgs(input=run_input),
+        id=uninstall_server_from_hc_workflow_id(run_input.server_name),
+        task_queue=UNINSTALL_SERVER_FROM_HC_WORKFLOW_QUEUE,
     )
 
 
 @router.post(
-    _UNINSTALL_SERVER_PATH,
-    response_model=StartWorkflowResponse | UninstallServerBatchResponse,
+    _UNINSTALL_SERVER_FROM_HC_PATH,
+    response_model=StartWorkflowResponse | UninstallServerFromHcBatchResponse,
     status_code=202,
 )
-async def start_uninstall_server(
-    uninstall_request: UninstallServerRequest,
+async def start_uninstall_server_from_hc(
+    uninstall_request: UninstallServerFromHcRequest,
     client: Client = Depends(get_temporal_client),
-) -> StartWorkflowResponse | UninstallServerBatchResponse:
+) -> StartWorkflowResponse | UninstallServerFromHcBatchResponse:
     """Take servers all the way out of an MCE — returns immediately (202).
 
     Whatever state each server is in. A hosted cluster's node first leaves the
     hosted cluster — its CAPI Machine is deleted, CAPI drains the Node, the
     Agent provider unbinds the Agent — and then, like a host that was only
-    inventory, leaves the MCE through remove-server, run as the uninstall's
-    child (`remove-server-<server>`).
+    inventory, leaves the MCE through remove-server-from-mce, run as the uninstall's
+    child (`remove-server-from-mce-<server>`).
 
     **Nothing has to be done first: the run deletes the node's Machine itself.**
     NodePool replicas are never touched, so the NodePool backfills a new
@@ -742,12 +748,12 @@ async def start_uninstall_server(
     replacement takes it back and the run stops (AgentRetakenError) without
     writing anything more.
 
-    `keep_inventory: true` stops after the hosted cluster: no remove-server, so
+    `keep_inventory: true` stops after the hosted cluster: no remove-server-from-mce, so
     the server stays in the MCE's inventory as a free Agent (on an inventory
     host there is then nothing to do). Default false.
 
     The reply follows what was sent: one name is `{workflow_id, run_id}` on
-    `uninstall-server-<server>` and a 409 while that server is uninstalling;
+    `uninstall-server-from-hc-<server>` and a 409 while that server is uninstalling;
     a list (1-20, each once) is a per-run report, even for a list of one.
 
     Poll GET /workflows/runs/{workflow_id} (one per server) for progress and
@@ -760,19 +766,19 @@ async def start_uninstall_server(
         results = await _start_each_by_name(
             names,
             lambda name: _start_uninstall(client, uninstall_request.run_input(name)),
-            uninstall_server_workflow_id,
+            uninstall_server_from_hc_workflow_id,
             ServerRunItem,
         )
-        return UninstallServerBatchResponse(**_count_statuses(results), results=results)
+        return UninstallServerFromHcBatchResponse(**_count_statuses(results), results=results)
     return await _start_one_by_name(
         lambda: _start_uninstall(client, uninstall_request.run_input(names)),
-        uninstall_server_workflow_id(names),
-        f"An uninstall-server run is already in flight for server {names}",
+        uninstall_server_from_hc_workflow_id(names),
+        f"An uninstall-server-from-hc run is already in flight for server {names}",
     )
 
 
-class PublishInfraEnvBootRequest(PublishInfraEnvBootInput):
-    """The publish-infraenv-boot request body: strict at the edge, namespace defaulted here."""
+class PublishInfraEnvToPxeServerRequest(PublishInfraEnvToPxeServerInput):
+    """The publish-infraenv-to-pxe-server request body: strict at the edge, namespace defaulted here."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -793,9 +799,9 @@ class PublishInfraEnvBootRequest(PublishInfraEnvBootInput):
         return canonical_mce_cluster(value)
 
 
-@router.post(_PUBLISH_INFRAENV_BOOT_PATH, response_model=StartWorkflowResponse, status_code=202)
-async def start_publish_infraenv_boot(
-    publish_input: PublishInfraEnvBootRequest,
+@router.post(_PUBLISH_INFRAENV_TO_PXE_SERVER_PATH, response_model=StartWorkflowResponse, status_code=202)
+async def start_publish_infraenv_to_pxe_server(
+    publish_input: PublishInfraEnvToPxeServerRequest,
     client: Client = Depends(get_temporal_client),
 ) -> StartWorkflowResponse:
     """Put an InfraEnv's current iPXE script on its site's PXE VM — returns immediately (202).
@@ -811,19 +817,56 @@ async def start_publish_infraenv_boot(
     """
     try:
         handle = await client.start_workflow(
-            PublishInfraEnvBootWorkflow.run,
-            PublishInfraEnvBootRunArgs(input=publish_input),
-            id=publish_infraenv_boot_workflow_id(
+            PublishInfraEnvToPxeServerWorkflow.run,
+            PublishInfraEnvToPxeServerRunArgs(input=publish_input),
+            id=publish_infraenv_to_pxe_server_workflow_id(
                 publish_input.mce_cluster, publish_input.infra_env
             ),
-            task_queue=PUBLISH_INFRAENV_BOOT_WORKFLOW_QUEUE,
+            task_queue=PUBLISH_INFRAENV_TO_PXE_SERVER_WORKFLOW_QUEUE,
         )
     except WorkflowAlreadyStartedError:
         raise HTTPException(
             status_code=409,
             detail=(
-                "A publish-infraenv-boot run is already in flight for "
+                "A publish-infraenv-to-pxe-server run is already in flight for "
                 f"{publish_input.mce_cluster}/{publish_input.infra_env}"
             ),
         )
     return StartWorkflowResponse(workflow_id=handle.id, run_id=handle.result_run_id or "")
+
+
+# --- the names before 2026-11-01 ---------------------------------------------------------
+
+# Each old path -> the route it was renamed to (decided with the operator,
+# 2026-11-01: the names say what each does to the MCE, the hosted cluster or
+# the PXE VM).
+_RENAMED_PATHS = {
+    "/install-server": _ADD_SERVER_TO_MCE_PATH,
+    "/remove-server": _REMOVE_SERVER_FROM_MCE_PATH,
+    "/uninstall-server": _UNINSTALL_SERVER_FROM_HC_PATH,
+    "/publish-infraenv-boot": _PUBLISH_INFRAENV_TO_PXE_SERVER_PATH,
+}
+
+
+def _refuse_renamed(old: str, new: str) -> Callable[[], Awaitable[None]]:
+    async def refuse() -> None:
+        """The old name: 410 naming the new route. Starts nothing, whatever the body."""
+        raise HTTPException(
+            status_code=410,
+            detail=(
+                f"{old.lstrip('/')} was renamed to {new.lstrip('/')} — POST "
+                f"{router.prefix}{new} with the same body"
+            ),
+        )
+
+    return refuse
+
+
+for _old, _new in _RENAMED_PATHS.items():
+    router.add_api_route(
+        _old,
+        _refuse_renamed(_old, _new),
+        methods=["POST"],
+        status_code=410,
+        include_in_schema=False,
+    )

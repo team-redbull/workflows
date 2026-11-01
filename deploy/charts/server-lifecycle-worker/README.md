@@ -1,6 +1,6 @@
 # server-lifecycle-worker
 
-The install-server activity worker. **One release per MCE cluster, installed
+The add-server-to-mce activity worker. **One release per MCE cluster, installed
 inside that MCE.** It dials out to the hub's Temporal, polls
 `server-lifecycle-activity-<mceCluster>`, and creates BareMetalHosts, Secrets
 and NMStateConfigs on its own cluster as its own ServiceAccount — no kubeconfig
@@ -390,12 +390,12 @@ The credentials Secret must exist in that namespace first. Its keys:
 `SERVER_SCAN_API_TOKEN` (server-scan ADMIN role), `<VENDOR>_BMC_USERNAME` /
 `<VENDOR>_BMC_PASSWORD` for HP, DELL, CISCO, INTERSIGHT, and `PXE_MAP_TOKEN`.
 
-### RBAC: one Role per InfraEnv namespace, plus one ClusterRole for uninstall-server
+### RBAC: one Role per InfraEnv namespace, plus one ClusterRole for uninstall-server-from-hc
 
-`rbac.targetNamespaces` gets a Role each: everything install-server and
-remove-server do happens in an InfraEnv namespace — and uninstall-server's
+`rbac.targetNamespaces` gets a Role each: everything add-server-to-mce and
+remove-server-from-mce do happens in an InfraEnv namespace — and uninstall-server-from-hc's
 `patch` on agents, the Agent provider's own unbind for an Agent whose Machine
-or AgentMachine a broken HyperShift deletion left behind. uninstall-server reaches
+or AgentMachine a broken HyperShift deletion left behind. uninstall-server-from-hc reaches
 further, so `rbac.hostedClusters` (default `true`) adds a **ClusterRole** —
 **a widening, and the widest grant in this chart**:
 
@@ -410,9 +410,9 @@ They are cluster-wide because a hosted cluster's Machines live in its
 control-plane namespace (`<hc-ns>-<hc>`) and its kubeconfig in the
 HostedCluster's own, neither of which is an InfraEnv namespace or named in
 the request. On an MCE that runs no hosted clusters, set
-`rbac.hostedClusters: false`; uninstall-server then fails its inspection of
+`rbac.hostedClusters: false`; uninstall-server-from-hc then fails its inspection of
 any host with an Agent (a 403 on the AgentMachine list, before anything is
-written), so take inventory hosts out there with remove-server.
+written), so take inventory hosts out there with remove-server-from-mce.
 
 The Node check reaches the hosted API server through its in-cluster Service,
 `https://kube-apiserver.<hc-ns>-<hc>.svc:6443`, so this worker's pods need
@@ -485,6 +485,6 @@ temporal task-queue describe \
 | `pxeMap.urls` | | Site → PXE VM base URL, for IPMI (UCS) servers |
 | `credentials.existingSecret` | | Secret with server-scan token, BMC credentials, PXE token |
 | `rbac.targetNamespaces` | | InfraEnv namespaces the worker may write to |
-| `rbac.hostedClusters` | | uninstall-server's ClusterRole (Machines, AgentMachines, HostedClusters, Secrets get); default `true` |
+| `rbac.hostedClusters` | | uninstall-server-from-hc's ClusterRole (Machines, AgentMachines, HostedClusters, Secrets get); default `true` |
 | `image.repository` / `image.tag` | | Mirror path and tag in a disconnected environment |
 | `replicaCount` | | Pods polling the same queue (load sharing + failover) |

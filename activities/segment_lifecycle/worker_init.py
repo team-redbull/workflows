@@ -56,7 +56,7 @@ async def main() -> None:
             allocate_segment,
             get_segment,
             append_allocation_to_cluster_values,
-            # install-server (server-lifecycle domain) — routed to THIS queue
+            # add-server-to-mce (server-lifecycle domain) — routed to THIS queue
             # because the Segments Manager credential lives on this limb only.
             get_inventory_segment,
             # release-segment

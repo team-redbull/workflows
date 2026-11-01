@@ -1,7 +1,7 @@
 apiVersion: v2
 name: server-lifecycle-worker
 description: >-
-  The install-server activity worker ("limb"), one release PER MCE CLUSTER,
+  The add-server-to-mce activity worker ("limb"), one release PER MCE CLUSTER,
   installed INSIDE that MCE. It dials out to the hub's Temporal frontend, polls
   server-lifecycle-activity-<mceCluster>, and writes BareMetalHosts, Secrets and
   NMStateConfigs to its OWN API server as its own ServiceAccount — so no

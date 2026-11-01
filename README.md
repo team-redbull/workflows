@@ -7,7 +7,7 @@ An OpenShift cluster lifecycle orchestrator built on Temporal. Four domains toda
   and writing its DHCP block into the day1 values repo, and **releasing** it
   back to the pool once the cluster is decommissioned.
 - **server-lifecycle** owns putting physical servers into an MCE inventory:
-  **install-server** takes a healthy, unclaimed server from the **server-scan**
+  **add-server-to-mce** takes a healthy, unclaimed server from the **server-scan**
   inventory platform and creates the `BareMetalHost` + BMC `Secret` +
   `NMStateConfig` an InfraEnv needs. It replaces `bmh-generator-operator`, a
   Kopf operator that queried four vendor managers itself.
@@ -16,7 +16,7 @@ An OpenShift cluster lifecycle orchestrator built on Temporal. Four domains toda
   and discovers it in OpenManage Enterprise, deploys its template (which sets
   root's password), builds the RAID 1 on the BOSS, sets the PERC drives
   Non-RAID, has the naming service rename it, and completes when server-scan
-  lists it — ready for install-server. It replaces the DC team's manual OME and
+  lists it — ready for add-server-to-mce. It replaces the DC team's manual OME and
   BIOS work; Cisco, HPE and Intersight get their own workflows later.
 - **cluster-upgrade** (in progress) upgrades a HyperShift HostedCluster through
   day1 git and Argo CD, never by patching it: the control plane one minor at a
@@ -61,7 +61,7 @@ shared/                           Contract layer (temporalio + pydantic only)
   settings.py / exceptions.py / consts.py / workflow_ids.py / logging_config.py
 workflow_domains/                 The brain — one folder per domain, plus main_worker_init.py + api.py
   segment_lifecycle/              initialize_segment.py, allocate_segment.py, router.py
-  server_lifecycle/               install_server.py (the SHAPE of the run),
+  server_lifecycle/               add_server_to_mce.py (the SHAPE of the run),
                                     bond_selection.py (the pure rule it applies),
                                     router.py
   server_provisioning/            provision_dell_server.py, storage_plan.py and
@@ -105,9 +105,26 @@ Worker-file naming convention: the workflow (brain) worker is
 
 Each has its own workflow queue and its own deterministic id. The three
 segment-lifecycle workflows share the one `segment-lifecycle-activity` queue and
-therefore the one limb deployment; `install-server` runs on
+therefore the one limb deployment; `add-server-to-mce` runs on
 `server-lifecycle-activity` and reaches back to the segment-lifecycle queue for
 one activity (below).
+
+**The server-lifecycle workflows were renamed on 2026-11-01**, so each name says
+what it does to what:
+
+| Before | Now |
+| --- | --- |
+| `install-server` | `add-server-to-mce` |
+| `remove-server` | `remove-server-from-mce` |
+| `uninstall-server` | `uninstall-server-from-hc` |
+| `publish-infraenv-boot` | `publish-infraenv-to-pxe-server` |
+
+The route, ids, queue, workflow type and server-scan lock holder all follow the
+new name. An old route answers **410** naming the new one and starts nothing;
+send the same body to the new route. Runs started before the rename finish as
+they began: their old workflow type on their old queue, their old ids and lock
+holder, and, for an uninstall, its old `remove-server-…` child. The result
+fields `remove_server` and `remove_server_workflow_id` keep their names.
 
 ### `initialize-segment` — create a segment
 
@@ -129,9 +146,9 @@ unbounded retries (a Segments Manager outage is out-waited, and the request
 survives an orchestrator restart), ONE place owning the dedup id, and a pollable
 per-segment status — which is what lets the bulk route start N of them.
 
-### `install-server` — put a server into an MCE inventory
+### `add-server-to-mce` — put a server into an MCE inventory
 
-`POST /workflows/server-lifecycle/install-server` with the **InfraEnv** to fill
+`POST /workflows/server-lifecycle/add-server-to-mce` with the **InfraEnv** to fill
 and its **MCE cluster**.
 
 #### In plain terms — read this first
@@ -164,8 +181,8 @@ check sees only *this* MCE, so without the lock a run for MCE-B could draw S1
 minutes after MCE-A installed it. `/servers/available` never hands out a locked
 machine. The 24 h hold after success writes nothing to any cluster — it only
 keeps S1 out of other draws until server-scan can see it in a cluster itself.
-A server taken out of that MCE within the day gets it back early: remove-server
-releases install-server's lock for its MCE once nothing of the server is left
+A server taken out of that MCE within the day gets it back early: remove-server-from-mce
+releases add-server-to-mce's lock for its MCE once nothing of the server is left
 there (the operator's decision, 2026-10-31).
 
 **Who checks what.** server-scan: unclaimed, not in maintenance, BMC
@@ -192,7 +209,7 @@ check before a cluster write. No NIC count is sent to server-scan
 | server-scan token not admin | fails at the first lock (`ServerScanAuthError`) | never taken |
 
 **Precondition.** The 24 h hold relies on server-scan's `nodes-status` `agents`
-job, which runs on every MCE install-server targets (each has an InfraEnv and an
+job, which runs on every MCE add-server-to-mce targets (each has an InfraEnv and an
 `AgentServiceConfig`): every 15 min it marks a server with an unbound Agent
 `INSTALLED_TO_INVENTORY`, so it is never drawn again. An MCE without that job
 would read the machine `AVAILABLE` again after the 24 h (server-scan's ceiling).
@@ -277,18 +294,19 @@ maintenance, its health — fails saying which.
    watch — 14 hours, measured — so only the deadline itself distinguished a dead
    host from a slow one.
 
-Its id is `install-server-<mce>_<infraEnv>_<slot>` — the hub, the
+Its id is `add-server-to-mce-<mce>_<infraEnv>_<slot>` — the hub, the
 **candidate pool** and a slot. The MCE is in the id so each hub finds only its own
 runs; the pool itself (`^ocp-<infraEnv>`) has no MCE in it, so two hubs filling an
 InfraEnv of the same name still draw from the same machines, and the install
 lock is what keeps them apart. Installs drawing from one pool run in parallel,
 one per slot (see
 [Several servers at once](#several-servers-at-once--count-or-a-list-of-server_names));
-a named machine's is `install-server-<mce>_<server>`. The workflow, its queue
-and its route are `install-server` too; the MCE is followed by `_` (a Kubernetes
-name cannot contain one), so a hub's runs all sit under `install-server-<mce>_`.
-Runs started before 2026-10-25 keep their old `install-server-<infraEnv>_<slot>`
-and `install-server-name-<server>` ids.
+a named machine's is `add-server-to-mce-<mce>_<server>`. The workflow, its queue
+and its route are `add-server-to-mce` too; the MCE is followed by `_` (a Kubernetes
+name cannot contain one), so a hub's runs all sit under `add-server-to-mce-<mce>_`.
+Runs started earlier keep the ids they started with: `install-server-<mce>_…`
+before the rename (2026-11-01), and `install-server-<infraEnv>_<slot>` /
+`install-server-name-<server>` before 2026-10-25.
 
 **The install lock is the guard across MCEs.** server-scan lists a machine
 `AVAILABLE` until a cluster reports it, and the BareMetalHost probe in step 3
@@ -353,7 +371,7 @@ several runs (next sections).
 | server-scan query | `?pattern=^ocp-<infraEnv>&count=<candidate_count>` | `?name=<server>&count=1` |
 | candidates drawn | `candidate_count` (default: runs on the pool + 2, so 3 for a lone install; 1–20) | one |
 | already has a BareMetalHost | **skipped**, next candidate tried | **converged** — that is the point |
-| workflow id | `install-server-<mce>_<infraEnv>_<slot>`, the first free slot | `install-server-<mce>_<server>` |
+| workflow id | `add-server-to-mce-<mce>_<infraEnv>_<slot>`, the first free slot | `add-server-to-mce-<mce>_<server>` |
 | use it for | routine capacity: take whatever is free and healthy | re-running a specific host, or repairing one |
 
 Both modes apply every other rule identically: `HEALTHY` only, at least two NIC
@@ -368,7 +386,7 @@ its provider and each interface's link state, and lists separately those skipped
 as already installed and those whose server-scan name cannot be a Kubernetes
 resource name — three different people's problem, so they are never merged.
 
-### Request body — `InstallServerRequest`
+### Request body — `AddServerToMceRequest`
 
 | field | type | rules | what it is for |
 | --- | --- | --- | --- |
@@ -386,7 +404,7 @@ sending `vlan_id` is a 422 rather than a silently ignored value. So is the old
 `server_name` field, with a message pointing at `server_names`.
 
 The request is not what a run is started with: each run gets an
-`InstallServerInput` for ONE server — `server_name` set from a name, or null
+`AddServerToMceInput` for ONE server — `server_name` set from a name, or null
 for a pool draw — and never `count`. That model is decoded from Temporal
 history on every replay, so it keeps its shape.
 
@@ -409,7 +427,7 @@ pool run or `server_name` for a named one). `count` and `candidate_count` size a
 draw from the pool, so either one with `server_names` is a 422.
 
 **From the pool: slots.** Every run the pool picks for is on a slot,
-`install-server-<mce>_<infraEnv>_<slot>`. The route walks the slots from `_1` up,
+`add-server-to-mce-<mce>_<infraEnv>_<slot>`. The route walks the slots from `_1` up,
 steps over every slot whose run is still going and starts one in each free slot
 — one without `count`, N with `count: N`. So a second install while the first
 still runs takes `_2` instead of a 409, and a second batch of 5 while the first
@@ -417,7 +435,7 @@ still runs takes `_2` instead of a 409, and a second batch of 5 while the first
 closed run's id). The only 409 left from the pool is all 100 slots running.
 
 **By name: a list of `server_names`.** One run per name, on the same id a single
-named install uses (`install-server-<mce>_<server>`), so a machine is one run
+named install uses (`add-server-to-mce-<mce>_<server>`), so a machine is one run
 however it was asked for: a name already installing reports `already_running`
 rather than being installed twice. One refused start does not stop the others.
 
@@ -450,17 +468,17 @@ to learn.
 `count`, starts more installs each time it is sent, so it is not retry-safe: a
 double-click installs two. That was accepted because its callers are people,
 not controllers. The options weighed and the collision cases are in
-[`docs/design/install-server-api.md`](docs/design/install-server-api.md).
+[`docs/design/add-server-to-mce-api.md`](docs/design/add-server-to-mce-api.md).
 
-### `uninstall-server` — a server all the way out of an MCE, whatever its Agent's state
+### `uninstall-server-from-hc` — a server all the way out of an MCE, whatever its Agent's state
 
-`POST /workflows/server-lifecycle/uninstall-server` with `server_names` (one
-name, or a list of 1–20 — one run each, id `uninstall-server-<server>`),
+`POST /workflows/server-lifecycle/uninstall-server-from-hc` with `server_names` (one
+name, or a list of 1–20 — one run each, id `uninstall-server-from-hc-<server>`),
 `mce_cluster` (with or without `ocp4-`) and `namespace` (default `inventory`).
 Nothing else: no `count`, NodePool or HostedCluster field (422) — server-scan
 and the Agent's own binding say where the server is. A string is answered
 `{workflow_id, run_id}` (409 while that server uninstalls), a list with the
-same per-run report as install-server's.
+same per-run report as add-server-to-mce's.
 
 The path is picked by the **binding** seen at inspection, never by the Agent's
 state string:
@@ -495,17 +513,17 @@ state string:
 - **An inventory host** — nothing links it to a hosted cluster; that half is
   skipped (but a stale Node in the cluster server-scan names is deleted). Its
   Agent is free, so any NodePool may take it at any moment: right before
-  remove-server the run inspects it again and stops, changing nothing, if an
+  remove-server-from-mce the run inspects it again and stops, changing nothing, if an
   AgentMachine, a Machine or a binding now links it (`AgentRetakenError` when a
   NodePool took it, `ServerStillPresentError` otherwise).
 
-Either way it then runs **remove-server as an awaited child**
-(`remove-server-<server>`): power off, BareMetalHost, NMStateConfig, the Agent
+Either way it then runs **remove-server-from-mce as an awaited child**
+(`remove-server-from-mce-<server>`): power off, BareMetalHost, NMStateConfig, the Agent
 last, the PXE map of the MCE's own site. A server with nothing on the MCE ends
 there as a no-op (`found: false`). Every skipped step is named in `skipped`.
 
 **`"keep_inventory": true`** (default `false`) stops after the hosted-cluster
-half and the day-long hold: no remove-server, so the server stays in the
+half and the day-long hold: no remove-server-from-mce, so the server stays in the
 InfraEnv as a free Agent — powered on in discovery, its BareMetalHost,
 NMStateConfig, Agent and PXE mapping untouched (`kept_in_inventory: true`,
 `remove_server: null`). The console's *Remove from the cluster* without
@@ -530,17 +548,17 @@ cluster (`NotHostedClusterNodeError`); two Machines, two Nodes, or links into
 two control planes (`ConflictingHostedObjectsError`); a Ready Node nothing on
 the MCE links any more (`HostedNodeStillPresentError`). `AVAILABLE` is not a
 contradiction. Then it
-takes server-scan's **install lock** (holder `uninstall-server`): the hosted
+takes server-scan's **install lock** (holder `uninstall-server-from-hc`): the hosted
 cluster's nodes job frees the server the moment its Node is gone while the
 MCE's agents job re-claims it only every 15 min, so in between it can read
 `AVAILABLE` while still in this InfraEnv. The lock is extended to 24 h before
-the child starts and left to its TTL on a failure. Once remove-server completed
+the child starts and left to its TTL on a failure. Once remove-server-from-mce completed
 with nothing left on the MCE and no PXE cleanup failure, the run **releases**
 it (**releasing-server**, `lock_released: true`; the operator's decision,
 2026-10-31), so the server can be installed again at once. With
 `keep_inventory`, or when the PXE cleanup failed, the day-long hold stays. A
 lock another run holds —
-install-server's day-long hold after it installed the machine, typically —
+add-server-to-mce's day-long hold after it installed the machine, typically —
 fails the run (`ServerReservedError`); release it in server-scan and re-run.
 
 After the Machine delete nothing is undone (it cannot be) and a re-run of the
@@ -564,17 +582,17 @@ get/list/delete/patch, HostedClusters get/list, Secrets get cluster-wide — and
 `patch` on Agents in the InfraEnv Role; see
 [the chart README](deploy/charts/server-lifecycle-worker/README.md).
 
-### `publish-infraenv-boot` — an InfraEnv's current iPXE script onto its PXE VM
+### `publish-infraenv-to-pxe-server` — an InfraEnv's current iPXE script onto its PXE VM
 
-`POST /workflows/server-lifecycle/publish-infraenv-boot` with
+`POST /workflows/server-lifecycle/publish-infraenv-to-pxe-server` with
 `{"mce_cluster": "mce-bat-yam-01", "infra_env": "cisco-m6-bat-yam-64c-512gb"}`
 (`namespace` defaults to `inventory`; the MCE is accepted with or without
 `ocp4-`). It writes the InfraEnv's **boot entry**,
 `/var/www/pxe-map/<mce_cluster>/<infra_env>.ipxe`, on the PXE VM of the MCE's
-inventory-segment site — the file every IPMI host install-server mapped to that
+inventory-segment site — the file every IPMI host add-server-to-mce mapped to that
 InfraEnv chains to. Use it to seed the entry before the first install, to repair
 one lost on the VM, or to point it at a regenerated image without installing
-anything; install-server does the same publish itself, per host.
+anything; add-server-to-mce does the same publish itself, per host.
 
 Phases: `resolving-site` (Segments Manager) → `validating-infraenv` (missing
 fails the run) → `publishing`, which waits — bounded, 10 min, else
@@ -583,10 +601,10 @@ fails the run) → `publishing`, which waits — bounded, 10 min, else
 `createdTime` as its version. A VM already holding a newer image keeps it and
 the run completes with `superseded: true`. Nothing is written on the MCE; the
 URL (it carries an `api_key`) never enters workflow history. Id:
-`publish-infraenv-boot-<mce>-<infra_env>`, so a second trigger for the same
+`publish-infraenv-to-pxe-server-<mce>-<infra_env>`, so a second trigger for the same
 entry while one runs is a 409.
 
-### `provision-dell-server` — from an iDRAC IP to a server install-server can use
+### `provision-dell-server` — from an iDRAC IP to a server add-server-to-mce can use
 
 `POST /workflows/server-provisioning/provision-dell-server` with `{"idrac_ip": "134.1.2.1"}`
 (or `/bulk` with `{"servers": [{"idrac_ip": ...}, ...]}` — one run per machine).
@@ -701,10 +719,10 @@ result.
 | `POST /workflows/segment-lifecycle/initialize-segment/bulk` | one workflow PER segment |
 | `POST /workflows/segment-lifecycle/allocate-segment` | one allocation |
 | `POST /workflows/segment-lifecycle/release-segment` | one release (after the cluster's Application is gone) |
-| `POST /workflows/server-lifecycle/install-server` | one workflow PER server into an InfraEnv: one from its pool, `count` from its pool in parallel, or the machines in `server_names` |
-| `POST /workflows/server-lifecycle/remove-server` | one server out of an MCE's inventory |
-| `POST /workflows/server-lifecycle/uninstall-server` | one workflow PER server in `server_names`: out of its hosted cluster (if a node), then out of the MCE (remove-server, as a child) |
-| `POST /workflows/server-lifecycle/publish-infraenv-boot` | an InfraEnv's current iPXE script onto its site's PXE VM |
+| `POST /workflows/server-lifecycle/add-server-to-mce` | one workflow PER server into an InfraEnv: one from its pool, `count` from its pool in parallel, or the machines in `server_names` |
+| `POST /workflows/server-lifecycle/remove-server-from-mce` | one server out of an MCE's inventory |
+| `POST /workflows/server-lifecycle/uninstall-server-from-hc` | one workflow PER server in `server_names`: out of its hosted cluster (if a node), then out of the MCE (remove-server-from-mce, as a child) |
+| `POST /workflows/server-lifecycle/publish-infraenv-to-pxe-server` | an InfraEnv's current iPXE script onto its site's PXE VM |
 | `POST /workflows/server-provisioning/provision-dell-server` | one Dell server, by iDRAC IP |
 | `POST /workflows/server-provisioning/provision-dell-server/bulk` | one workflow PER iDRAC IP |
 | `GET  /workflows/runs/{workflow_id}` | (status, every domain) |
@@ -756,14 +774,14 @@ would hide which segments actually got a workflow.
   `allocate_segment` is idempotent server-side per (cluster, site, type); the
   values-repo append is a no-op for a file already recording this allocation;
   `release_segment` answers 200 for an already-released segment and the DHCP
-  scope DELETE 204 for an absent scope. install-server's three creates each treat an existing resource as success once
+  scope DELETE 204 for an absent scope. add-server-to-mce's three creates each treat an existing resource as success once
   it matches, and a run skips candidates that already have a BareMetalHost.
   Workflow ids are deterministic (`initialize-segment-<network>`,
   `allocate-segment-<TYPE>-<cluster>`, `release-segment-<TYPE>-<cluster>`,
-  `install-server-<mce>_<server>`, `remove-server-<server>`,
-  `uninstall-server-<server>`), so a duplicate trigger while running gets
-  HTTP 409. install-server's pool draws are the exception on purpose: each takes
-  a free slot (`install-server-<mce>_<infraEnv>_<slot>`), and the install lock keeps
+  `add-server-to-mce-<mce>_<server>`, `remove-server-from-mce-<server>`,
+  `uninstall-server-from-hc-<server>`), so a duplicate trigger while running gets
+  HTTP 409. add-server-to-mce's pool draws are the exception on purpose: each takes
+  a free slot (`add-server-to-mce-<mce>_<infraEnv>_<slot>`), and the install lock keeps
   them on different machines.
 
 ## Configuration
@@ -780,7 +798,7 @@ would hide which segments actually got a workflow.
 | `DHCP_API_TOKEN` | Secret `dhcp-api-token` | the scope DELETE; a copy of the DHCP API's own token — rotate together |
 | `MCE_CLUSTER` | `server-lifecycle-config` | which MCE this worker serves — names its queue, so it must match callers' `mce_cluster` |
 | `SERVER_SCAN_URL` | `server-lifecycle-config` | inventory API base, INCLUDING `/api/v1` |
-| `SERVER_SCAN_API_TOKEN` | Secret | an **admin** token — install-server takes and releases the install lock |
+| `SERVER_SCAN_API_TOKEN` | Secret | an **admin** token — add-server-to-mce takes and releases the install lock |
 | `{HP,DELL,CISCO,INTERSIGHT}_BMC_USERNAME`/`_PASSWORD` | Secret | what Ironic drives the BMC with |
 | `OME_URL` | `server-provisioning-config` | the OpenManage Enterprise appliance, `https://` |
 | `OME_USERNAME`/`OME_PASSWORD` | Secret | discovers devices and deploys templates |

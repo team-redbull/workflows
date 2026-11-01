@@ -13,11 +13,11 @@ A separate deployment from the segment-lifecycle limb because the driver for
 one is the dependency + credential set, and this one's is entirely different: a
 Kubernetes client with RBAC to create BareMetalHosts, Secrets and
 NMStateConfigs (and read InfraEnvs) in the target namespace — and, for
-uninstall-server, to read AgentMachines, HostedClusters and their admin
+uninstall-server-from-hc, to read AgentMachines, HostedClusters and their admin
 kubeconfig Secrets and delete CAPI Machines cluster-wide — plus per-vendor BMC
 credentials, a server-scan token and, for IPMI servers, the site PXE map's.
 
-install-server's VLAN lookup is deliberately NOT registered here: it reads the
+add-server-to-mce's VLAN lookup is deliberately NOT registered here: it reads the
 Segments Manager, whose credential lives on the segment-lifecycle limb, so the
 workflow routes that one activity to that queue instead of this deployment
 holding a second copy of the token.
@@ -87,7 +87,7 @@ async def main() -> None:
         client,
         task_queue=_TASK_QUEUE,
         activities=[
-            # install-server
+            # add-server-to-mce
             check_infra_env,
             acquire_servers,
             lookup_install_candidate,
@@ -103,12 +103,12 @@ async def main() -> None:
             reserve_server,
             release_server,
             teardown_bmh_resources,
-            # remove-server
+            # remove-server-from-mce
             inspect_inventory_host,
             set_host_online,
             delete_agents,
             remove_host_pxe_entries,
-            # uninstall-server (plus reserve_server and get_baremetal_host above)
+            # uninstall-server-from-hc (plus reserve_server and get_baremetal_host above)
             lookup_server_membership,
             inspect_bound_host,
             ensure_machine_deleting,
@@ -116,7 +116,7 @@ async def main() -> None:
             get_agent_machine_state,
             get_agent_binding,
             check_hosted_node,
-            # uninstall-server: what a broken HyperShift deletion left behind
+            # uninstall-server-from-hc: what a broken HyperShift deletion left behind
             find_hosted_nodes,
             drain_hosted_node,
             delete_hosted_node,

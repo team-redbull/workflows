@@ -46,13 +46,13 @@
       queue: "server-lifecycle-activity-<mce>",
       workflows: [
         {
-          name: "install-server",
-          href: "/server-lifecycle/install-server.html",
+          name: "add-server-to-mce",
+          href: "/server-lifecycle/add-server-to-mce.html",
           blurb: "put a physical server into an MCE InfraEnv"
         },
         {
-          name: "uninstall-server",
-          href: "/server-lifecycle/uninstall-server.html",
+          name: "uninstall-server-from-hc",
+          href: "/server-lifecycle/uninstall-server-from-hc.html",
           blurb: "take a server out of its hosted cluster and the MCE"
         }
       ]

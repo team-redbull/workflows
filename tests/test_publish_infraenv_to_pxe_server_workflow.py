@@ -1,6 +1,6 @@
-"""publish-infraenv-boot: real PublishInfraEnvBootWorkflow, mock activities, time-skipping env.
+"""publish-infraenv-to-pxe-server: real PublishInfraEnvToPxeServerWorkflow, mock activities, time-skipping env.
 
-Two activity queues, as for install-server: the site comes from the
+Two activity queues, as for add-server-to-mce: the site comes from the
 segment-lifecycle limb, everything else from the target MCE's worker. The
 time-skipping environment collapses the publish poll's durable timers.
 """
@@ -19,7 +19,7 @@ from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
 from shared.consts import (
-    PUBLISH_INFRAENV_BOOT_WORKFLOW_QUEUE,
+    PUBLISH_INFRAENV_TO_PXE_SERVER_WORKFLOW_QUEUE,
     SEGMENT_LIFECYCLE_ACTIVITY_QUEUE,
     server_lifecycle_activity_queue,
 )
@@ -30,18 +30,18 @@ from shared.models.server_lifecycle import (
     InfraEnvBootState,
     InfraEnvRef,
     InfraEnvState,
-    PublishInfraEnvBootInput,
-    PublishInfraEnvBootRunArgs,
+    PublishInfraEnvToPxeServerInput,
+    PublishInfraEnvToPxeServerRunArgs,
 )
-from workflow_domains.server_lifecycle.publish_infraenv_boot import (
-    PublishInfraEnvBootWorkflow,
+from workflow_domains.server_lifecycle.publish_infraenv_to_pxe_server import (
+    PublishInfraEnvToPxeServerWorkflow,
 )
 
 MCE = "ocp4-mce-bat-yam-01"
 QUEUE = server_lifecycle_activity_queue(MCE)
 INFRA_ENV = "cisco-m6-bat-yam-64c-512gb"
 NS = "inventory"
-INPUT = PublishInfraEnvBootInput(mce_cluster=MCE, infra_env=INFRA_ENV, namespace=NS)
+INPUT = PublishInfraEnvToPxeServerInput(mce_cluster=MCE, infra_env=INFRA_ENV, namespace=NS)
 SEGMENT = SegmentEntry(
     segment="10.20.90.0/24",
     site="bat-yam",
@@ -109,8 +109,8 @@ class _Harness:
         self._workers = [
             Worker(
                 client,
-                task_queue=PUBLISH_INFRAENV_BOOT_WORKFLOW_QUEUE,
-                workflows=[PublishInfraEnvBootWorkflow],
+                task_queue=PUBLISH_INFRAENV_TO_PXE_SERVER_WORKFLOW_QUEUE,
+                workflows=[PublishInfraEnvToPxeServerWorkflow],
             ),
             Worker(client, task_queue=QUEUE, activities=self._server_activities),
             Worker(
@@ -132,10 +132,10 @@ class _Harness:
 async def _execute(client: Client):
     return await asyncio.wait_for(
         client.execute_workflow(
-            PublishInfraEnvBootWorkflow.run,
-            PublishInfraEnvBootRunArgs(input=INPUT),
+            PublishInfraEnvToPxeServerWorkflow.run,
+            PublishInfraEnvToPxeServerRunArgs(input=INPUT),
             id=f"test-{uuid.uuid4()}",
-            task_queue=PUBLISH_INFRAENV_BOOT_WORKFLOW_QUEUE,
+            task_queue=PUBLISH_INFRAENV_TO_PXE_SERVER_WORKFLOW_QUEUE,
         ),
         timeout=60,
     )

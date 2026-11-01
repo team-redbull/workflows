@@ -36,10 +36,10 @@ _WORKERS = {
 # the workflow modules that dispatch activities, and the interface module each
 # activity name must come from
 _WORKFLOW_MODULES = [
-    "workflow_domains/server_lifecycle/install_server.py",
-    "workflow_domains/server_lifecycle/remove_server.py",
-    "workflow_domains/server_lifecycle/uninstall_server.py",
-    "workflow_domains/server_lifecycle/publish_infraenv_boot.py",
+    "workflow_domains/server_lifecycle/add_server_to_mce.py",
+    "workflow_domains/server_lifecycle/remove_server_from_mce.py",
+    "workflow_domains/server_lifecycle/uninstall_server_from_hc.py",
+    "workflow_domains/server_lifecycle/publish_infraenv_to_pxe_server.py",
     "workflow_domains/segment_lifecycle/allocate_segment.py",
     "workflow_domains/segment_lifecycle/initialize_segment.py",
     "workflow_domains/server_provisioning/provision_dell_server.py",
@@ -217,8 +217,8 @@ def test_every_dispatched_activity_is_registered_on_its_queues_worker(workflow_m
         )
 
 
-def test_the_install_server_workflow_reaches_both_queues():
-    """Guards the premise of the test above: install-server really does span two limbs."""
+def test_the_add_server_to_mce_workflow_reaches_both_queues():
+    """Guards the premise of the test above: add-server-to-mce really does span two limbs."""
     queues = {queue for _, queue in _dispatched(_WORKFLOW_MODULES[0])}
     assert queues == {
         # The Segments Manager credential lives on the segment-lifecycle limb,
@@ -326,9 +326,9 @@ def test_the_cluster_upgrade_mce_worker_registers_its_whole_interface():
     assert _registered_activities("activities/cluster_upgrade/worker_init.py") == interface
 
 
-def test_uninstall_server_dispatches_everything_to_the_mces_own_worker():
-    """No Segments Manager read of its own: the site lookup is remove-server's, in the child."""
-    dispatched = _dispatched("workflow_domains/server_lifecycle/uninstall_server.py")
+def test_uninstall_server_from_hc_dispatches_everything_to_the_mces_own_worker():
+    """No Segments Manager read of its own: the site lookup is remove-server-from-mce's, in the child."""
+    dispatched = _dispatched("workflow_domains/server_lifecycle/uninstall_server_from_hc.py")
     assert {queue for _, queue in dispatched} == {"server_lifecycle_activity_queue"}
     assert {name for name, _ in dispatched} >= {
         "lookup_server_membership", "inspect_bound_host", "reserve_server",
@@ -385,3 +385,37 @@ def test_every_activity_sent_to_the_hub_is_registered_on_the_hub_worker():
         name for name, value in vars(hub_interface).items() if hasattr(value, "__temporal_activity_definition")
     }
     assert registered == interface
+
+
+def test_runs_started_under_the_old_names_still_have_a_worker():
+    """The four server-lifecycle workflows were renamed on 2026-11-01. A run
+    started before replays ONLY as its old workflow type on its old queue, so
+    the brain must keep exactly those pairs until no such run is open —
+    registered anywhere else, the run would sit RUNNING with nothing to replay
+    it."""
+    import shared.consts as consts
+
+    registry = next(
+        node.value
+        for node in ast.walk(_tree("workflow_domains/main_worker_init.py"))
+        if isinstance(node, ast.AnnAssign)
+        and getattr(node.target, "id", None) == "_WORKER_SPECS"
+    )
+    pairs = {
+        (spec.elts[0].id, element.id)
+        for spec in registry.elts
+        for element in spec.elts[1].elts
+        if isinstance(element, ast.Name)
+    }
+    legacy = {
+        "LEGACY_INSTALL_SERVER_WORKFLOW_QUEUE": ("InstallServerWorkflow", "install-server-workflow"),
+        "LEGACY_REMOVE_SERVER_WORKFLOW_QUEUE": ("RemoveServerWorkflow", "remove-server-workflow"),
+        "LEGACY_UNINSTALL_SERVER_WORKFLOW_QUEUE": ("UninstallServerWorkflow", "uninstall-server-workflow"),
+        "LEGACY_PUBLISH_INFRAENV_BOOT_WORKFLOW_QUEUE": (
+            "PublishInfraEnvBootWorkflow", "publish-infraenv-boot-workflow",
+        ),
+    }
+    for const, (workflow_type, queue) in legacy.items():
+        assert (const, workflow_type) in pairs, f"{workflow_type} is not polled on {const}"
+        # The names every in-flight run's history points at: never to be "tidied".
+        assert getattr(consts, const) == queue

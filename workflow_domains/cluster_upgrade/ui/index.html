@@ -112,7 +112,7 @@ main { display: grid; grid-template-columns: 320px minmax(0, 1fr); gap: 16px; pa
 .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
 
 .track { display: flex; align-items: stretch; gap: 0; overflow-x: auto; padding: 4px 2px 8px; }
-.node { min-width: 150px; flex: 0 0 auto; }
+.node { min-width: 150px; max-width: 250px; flex: 0 0 auto; }
 .node .box { border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; background: var(--panel); height: 100%; }
 .node .kind { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
 .node .ver { font-size: 16px; font-weight: 700; margin-top: 2px; }
@@ -172,7 +172,7 @@ dialog .buttons { display: flex; justify-content: flex-end; gap: 8px; margin-top
 <main>
   <section class="panel" aria-label="Upgrade runs">
     <div class="list-head"><h2>Runs</h2><button type="button" class="primary" id="new-run">New upgrade</button></div>
-    <ul class="runs" id="runs"></ul>
+    <ul class="runs" id="runs"><li class="empty">Loading runs…</li></ul>
   </section>
   <section class="detail" id="detail" aria-live="polite"></section>
 </main>
@@ -249,8 +249,22 @@ async function getJSON(url) {
   return response.json();
 }
 
+// Temporal lists every execution under a workflow id: each continue-as-new segment of a
+// run, and earlier upgrades of the same cluster. The per-run route reads only the newest,
+// so keep one row per id, dated from the start of its continue-as-new chain.
+function oneRowPerRun(executions) {
+  const rows = new Map();
+  const newestFirst = executions.slice().sort((a, b) => String(b.start_time).localeCompare(String(a.start_time)));
+  for (const e of newestFirst) {
+    const row = rows.get(e.workflow_id);
+    if (!row) rows.set(e.workflow_id, { ...e });
+    else if (e.status === "CONTINUED_AS_NEW" && e.close_time === row.start_time) row.start_time = e.start_time;
+  }
+  return [...rows.values()];
+}
+
 async function loadLive() {
-  state.list = await getJSON(`${RUNS}?workflow_type=UpgradeClusterWorkflow&limit=50`);
+  state.list = oneRowPerRun(await getJSON(`${RUNS}?workflow_type=UpgradeClusterWorkflow&limit=50`));
   const ids = state.list.slice(0, 25).map((r) => r.workflow_id);
   const results = await Promise.allSettled(ids.map((id) => getJSON(`${RUNS}/${encodeURIComponent(id)}`)));
   const runs = {};
@@ -296,6 +310,13 @@ const tone = (id) => phaseInfo(view(id))[1];
 
 function chip(v) { const [label, t] = phaseInfo(v); return `<span class="chip t-${t}">${esc(label)}</span>`; }
 
+// The phase in words, with the NodePool when one is rolling or being checked.
+function doing(v) {
+  const words = PHASES[v.phase]?.[0] || v.phase || "";
+  const pool = ["nodepool-roll", "nodepool-gate"].includes(v.phase) && v.p && v.p.current_nodepool;
+  return pool ? `${words}: ${pool}` : words;
+}
+
 function stepStates(v) {
   const steps = v.plan ? v.plan.steps : [];
   if (v.r) return steps.map((s, i) => (i < v.r.steps_completed ? "done" : "pending"));
@@ -324,7 +345,16 @@ function poolState(v, stepState, name, next) {
 
 // --- rendering -----------------------------------------------------------------------------
 
-function render() { renderList(); renderDetail(); }
+function render() { renderList(); renderDetail(); showCurrentStep(); }
+
+// The plan scrolls sideways when it is wider than the panel; keep the step under way in view.
+function showCurrentStep() {
+  const track = document.querySelector(".track");
+  const step = track && track.querySelector(".node.s-current, .node.s-alert");
+  if (!step) return;
+  const overflow = step.getBoundingClientRect().right - track.getBoundingClientRect().right;
+  if (overflow > 0) track.scrollLeft += overflow + 8;
+}
 
 function renderList() {
   const ul = $("runs");
@@ -334,7 +364,7 @@ function renderList() {
   }
   ul.innerHTML = state.list.map((item) => {
     const v = view(item.workflow_id);
-    const sub = v.p ? (v.p.waiting_for || PHASES[v.phase]?.[0] || "") : v.r ? `${v.r.control_plane_version || ""} reached` : item.status;
+    const sub = v.p ? (v.p.waiting_for || doing(v)) : v.r ? `${v.r.control_plane_version || ""} reached` : item.status;
     return `<li><button type="button" class="run" data-id="${esc(item.workflow_id)}" aria-current="${item.workflow_id === state.selected}">
       <div class="name"><span>${esc(cluster(item.workflow_id))}</span><span class="muted" style="color:var(--muted);font-weight:400;font-size:12px">${esc(ago(item.start_time))}</span></div>
       <div style="margin-top:5px">${chip(v)}</div>
@@ -386,7 +416,11 @@ function renderWaiting(v, t, label) {
   if (!v.p) return "";
   const decisions = (DECISIONS[v.phase] || []);
   const kind = t === "person" ? "" : t === "alert" ? "alert" : "machine";
-  const what = v.p.waiting_for || (t === "machine" ? `${label}: nothing to do, the run is working.` : label);
+  // Paused mid-phase: what is under way finishes; the run holds before its next act.
+  const inFlight = v.p.paused && v.phase !== "paused" && ACTIVE(v.phase);
+  const what = v.p.waiting_for || (inFlight
+    ? `Paused. Still under way: ${doing(v)}. It finishes; then the run holds before its next act (a commit, a sync, an agent call) until someone resumes it.`
+    : t === "machine" ? `${label}: nothing to do, the run is working.` : label);
   const buttons = decisions.map((d, i) => `<button type="button" class="${d.primary ? "primary" : ""}" data-decide="${i}">${esc(d.label)}</button>`);
   if (ACTIVE(v.phase)) {
     buttons.push(v.p.paused || v.phase === "paused"
@@ -424,6 +458,10 @@ function renderAgent(v) {
   const p = v.p;
   if (!p || (!p.last_verdict && !(p.pending_actions || []).length)) return "";
   const verdict = p.last_verdict;
+  // The last verdict stays in progress after the run goes on; say when it was.
+  const lastCall = (p.log || []).filter((e) => e.event === "agent").pop();
+  const past = !["needs-human", "agent-invocation"].includes(v.phase);
+  const when = lastCall ? `<p style="color:var(--muted);margin:-4px 0 8px">Last call ${esc(clock(lastCall.at))}${past ? ". The run has gone on since; this is history, not a current problem." : ""}</p>` : "";
   const rows = (p.pending_actions || []).map((a) => {
     const canDecide = a.decision === "pending" && v.phase === "needs-human";
     const status = a.decision === "pending" ? "waiting for a person" : `${a.decision} by ${a.decided_by || "?"}${a.result ? `: ${a.result}` : ""}`;
@@ -431,7 +469,7 @@ function renderAgent(v) {
       <td>${esc(status)}</td><td style="white-space:nowrap">${canDecide ? `<button type="button" class="primary" data-action="approve" data-aid="${esc(a.action.action_id)}">Approve</button>
       <button type="button" data-action="reject" data-aid="${esc(a.action.action_id)}">Reject</button>` : ""}</td></tr>`;
   }).join("");
-  return `<div class="panel card verdict"><h2>The agent</h2>
+  return `<div class="panel card verdict"><h2>The agent</h2>${when}
     ${verdict ? `<p><b>${esc(verdict.verdict.replace(/_/g, " "))}</b> <span style="color:var(--muted)">(${esc(verdict.confidence)})</span></p><p>${esc(verdict.diagnosis)}</p>` : ""}
     ${rows ? `<table><thead><tr><th>Proposed</th><th>On</th><th>Status</th><th></th></tr></thead><tbody>${rows}</tbody></table>
       <p style="color:var(--muted);margin-top:10px">Approved actions run with the workflow's identity, then use Retry.</p>` : ""}</div>`;

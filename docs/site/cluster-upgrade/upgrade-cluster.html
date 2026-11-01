@@ -114,6 +114,14 @@
         (the lab model did not answer, so a person retried); the run gave the 4.19 admin ack itself; the control
         plane and then the NodePool moved by a day1 commit and an Argo CD sync each, nobody touching the
         HostedCluster or the NodePool.</p>
+        <p><b>And again (2026-11-01), zoned and hands-off:</b> a cluster with three single-node zones went
+        4.19.53 &rarr; 4.20.44 &rarr; 4.21.40 in one wave-0 run with <code>auto_approve</code>: two control-plane
+        commits, no <code>confirm-day2</code> (no day2 Application), then zones a, b and c in order, each gated
+        and soaked, each jumping two minors in one in-place roll. A pause during zone b&rsquo;s roll let it
+        finish and held the run before zone c; an abort in an earlier run committed and synced
+        <code>pausedUntil</code> in 17 seconds. The faults on the way (stalls under emulation, a CVO guard, the
+        image pruner) all stopped at a person: on CPU-served models the agent either did not answer in time or
+        named the cause without proposing a fix it could hand over.</p>
         <p><b>To see it:</b> the workflows API serves a temporary page at <code>/ui/cluster-upgrade</code>, until the
         ClickCluster Platform UI exists. It starts a run, lists the runs, draws each plan, says what a run waits
         for and offers its decisions.</p>

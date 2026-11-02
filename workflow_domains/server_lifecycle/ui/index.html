@@ -11,6 +11,7 @@
     GET  /workflows/runs/{workflow_id}                  one run's progress, result or error
     POST /workflows/server-lifecycle/add-server-to-mce     start installs (a pool draw or named servers)
     POST /workflows/server-lifecycle/remove-server-from-mce      start a removal
+    POST /workflows/server-lifecycle/uninstall-server-from-hc    start uninstalls (named servers)
   Self-contained on purpose: production is air-gapped, so nothing loads from another host.
   It shows what the runs on this API report and nothing more; the page invents no field.
 -->
@@ -238,6 +239,7 @@ fieldset.choice input { width: auto; }
 const RUNS = "/workflows/runs";
 const INSTALL = "/workflows/server-lifecycle/add-server-to-mce";
 const REMOVE = "/workflows/server-lifecycle/remove-server-from-mce";
+const UNINSTALL = "/workflows/server-lifecycle/uninstall-server-from-hc";
 const POLL_MS = 10000;
 const DETAILS_PER_REFRESH = 20;
 const QUEUE_PREFIX = "server-lifecycle-activity-";
@@ -679,7 +681,8 @@ function renderTabs() {
   $("list-title").textContent = "Runs";
   $("list-title").title = `${FLOWS[state.tab].noun} runs`;
   $("start-slot").innerHTML = state.tab === "install" ? `<button type="button" class="primary" id="new-install">Install servers</button>`
-    : state.tab === "remove" ? `<button type="button" class="danger" id="new-remove">Remove a server</button>` : "";
+    : state.tab === "remove" ? `<button type="button" class="danger" id="new-remove">Remove a server</button>`
+    : state.tab === "uninstall" ? `<button type="button" class="danger" id="new-uninstall">Uninstall servers</button>` : "";
 }
 
 // Under the chip: where the run is, and for a failed one why it ended.
@@ -914,6 +917,8 @@ function collect(form, route) {
   form.querySelectorAll(`[data-send^="${route}:"]`).forEach((el) => {
     if (el.disabled || el.closest("[hidden]")) return;
     const field = el.dataset.send.slice(route.length + 1);
+    // A checkbox is a flag the route defaults to false: sent only when ticked.
+    if (el.type === "checkbox") { if (el.checked) out[field] = true; return; }
     const raw = el.value.trim();
     if (!raw) return;
     if (field === "count") out[field] = Number(raw);
@@ -925,9 +930,9 @@ function collect(form, route) {
   return out;
 }
 
-function openDialog({ title, explain, path, route, fields, ready = () => true, danger = false, sent }) {
+function openDialog({ title, explain, path, route, fields, ready = () => true, danger = false, action, sent }) {
   const form = $("dialog-form");
-  const label = danger ? "Remove it" : "Start";
+  const label = action || (danger ? "Remove it" : "Start");
   form.innerHTML = `<h3>${esc(title)}</h3>${explain ? `<p class="explain">${esc(explain)}</p>` : ""}
     ${fields}
     <details style="margin-top:12px"><summary>The request</summary><pre id="f-preview"></pre></details>
@@ -999,13 +1004,47 @@ function installDialog() {
       $("f-names").required = named;
       return true;
     },
-    sent: (body) => {
-      if (body.workflow_id) { toast(`Started ${body.workflow_id}`); return body.workflow_id; }
-      const failed = (body.results || []).filter((i) => i.status === "failed");
-      toast([`Started ${body.started}, already running ${body.already_running}, failed ${body.failed}.`,
-        ...failed.map((i) => `${i.server_name || `slot ${i.slot}`}: ${i.error}`)].join("\n"), failed.length ? 12000 : 6000);
-      return ((body.results || []).find((i) => i.status === "started") || {}).workflow_id || null;
+    sent: reportStarted,
+  });
+}
+
+// The answer to a start: one name is {workflow_id, run_id}; a list or a count is a per-run report.
+function reportStarted(body) {
+  if (body.workflow_id) { toast(`Started ${body.workflow_id}`); return body.workflow_id; }
+  const failed = (body.results || []).filter((i) => i.status === "failed");
+  toast([`Started ${body.started}, already running ${body.already_running}, failed ${body.failed}.`,
+    ...failed.map((i) => `${i.server_name || `slot ${i.slot}`}: ${i.error}`)].join("\n"), failed.length ? 12000 : 6000);
+  return ((body.results || []).find((i) => i.status === "started") || {}).workflow_id || null;
+}
+
+function uninstallDialog() {
+  const names = (form) => form.querySelector("#f-names").value.split(/[\s,]+/).filter(Boolean);
+  openDialog({
+    title: "Uninstall servers", path: UNINSTALL, route: "uninstall-server-from-hc", danger: true, action: "Uninstall",
+    explain: "Whatever state each server is in, and nothing has to be done first. A hosted cluster's node leaves its cluster: the run deletes its Machine, CAPI drains the Node, and the NodePool backfills a replacement from another free Agent (replicas are never touched). Then the server leaves the MCE through remove-server-from-mce. Every server is its own run.",
+    fields: `
+      <label for="f-names">Server names <span class="hint">server-scan's names, one per line, up to 20</span></label>
+      <textarea id="f-names" rows="4" required spellcheck="false" data-send="uninstall-server-from-hc:server_names"></textarea>
+      <label for="f-mce">MCE <span class="hint">with or without its ocp4- prefix</span></label>
+      <input id="f-mce" data-send="uninstall-server-from-hc:mce_cluster" required autocomplete="off" spellcheck="false">
+      <label style="display:flex;gap:8px;align-items:center;font-weight:400;margin-top:12px">
+        <input type="checkbox" id="f-keep" data-send="uninstall-server-from-hc:keep_inventory" style="width:auto">
+        Keep it in the MCE's inventory: leave the hosted cluster only</label>
+      <div class="confirm"><p id="f-what"></p>
+        <label for="f-confirm" id="f-confirm-label">Type the server name again to confirm</label>
+        <input id="f-confirm" autocomplete="off" spellcheck="false"></div>`,
+    ready: (form) => {
+      const list = names(form);
+      const keep = form.querySelector("#f-keep").checked;
+      form.querySelector("#f-what").innerHTML = keep
+        ? "<b>A node leaves its hosted cluster.</b> The server stays on the MCE as a free Agent, powered on in discovery."
+        : "<b>This cannot be undone.</b> A node leaves its hosted cluster; then the host is powered off, its BareMetalHost, NMStateConfig and Agent are deleted and its MACs cleared from the site's PXE VM.";
+      const expected = list.length === 1 ? list[0] : String(list.length);
+      form.querySelector("#f-confirm-label").textContent = list.length > 1
+        ? `Type the number of servers (${list.length}) to confirm` : "Type the server name again to confirm";
+      return list.length > 0 && form.querySelector("#f-confirm").value.trim() === expected;
     },
+    sent: reportStarted,
   });
 }
 
@@ -1062,6 +1101,7 @@ document.addEventListener("click", async (event) => {
   if (!t) return;
   if (t.id === "new-install") installDialog();
   else if (t.id === "new-remove") removeDialog();
+  else if (t.id === "new-uninstall") uninstallDialog();
   else if (t.dataset.copy) navigator.clipboard?.writeText(t.dataset.copy).then(() => toast("Copied."), () => toast(t.dataset.copy));
 });
 $("tabs").addEventListener("keydown", (event) => {

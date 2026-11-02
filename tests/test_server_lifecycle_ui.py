@@ -26,7 +26,11 @@ from workflow_domains.server_lifecycle import (
     ui,
     uninstall_server_from_hc,
 )
-from workflow_domains.server_lifecycle.router import AddServerToMceRequest, RemoveServerFromMceRequest
+from workflow_domains.server_lifecycle.router import (
+    AddServerToMceRequest,
+    RemoveServerFromMceRequest,
+    UninstallServerFromHcRequest,
+)
 
 PAGE = ui.UI_DIR / "index.html"
 
@@ -58,7 +62,8 @@ def test_the_page_is_served_whole_with_nothing_from_outside(client):
     assert "http://" not in page and "https://" not in page
     # It calls the API it is served by, on the routes the routers really have.
     for path in ("/workflows/runs", "/workflows/server-lifecycle/add-server-to-mce",
-                 "/workflows/server-lifecycle/remove-server-from-mce"):
+                 "/workflows/server-lifecycle/remove-server-from-mce",
+                 "/workflows/server-lifecycle/uninstall-server-from-hc"):
         assert path in page
     # It lists each workflow by its real class name (the runs list's `workflow_type`).
     for workflow_type in WORKFLOWS:
@@ -97,9 +102,11 @@ def test_the_start_forms_send_only_the_fields_offered_today():
     assert sent == {
         "add-server-to-mce": {"infra_env", "mce_cluster", "count", "server_names"},
         "remove-server-from-mce": {"server_name", "mce_cluster"},
+        "uninstall-server-from-hc": {"server_names", "mce_cluster", "keep_inventory"},
     }
     assert sent["add-server-to-mce"] <= set(AddServerToMceRequest.model_fields)
     assert sent["remove-server-from-mce"] <= set(RemoveServerFromMceRequest.model_fields)
+    assert sent["uninstall-server-from-hc"] <= set(UninstallServerFromHcRequest.model_fields)
 
 
 def test_the_skip_reasons_are_add_server_to_mces_own():

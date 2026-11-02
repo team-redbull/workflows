@@ -407,11 +407,13 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   queue `uninstall-server-from-hc-workflow`, id `uninstall-server-from-hc-<server lowercased>`,
   API `POST /workflows/server-lifecycle/uninstall-server-from-hc` — `server_names` ONLY,
   a string or a list of 1-20, each once case-insensitively, plus `mce_cluster`
-  canonicalised and `namespace` defaulting to `inventory`, and `keep_inventory`
-  (default false; the operator, 2026-10-24) which STOPS after the hosted half and
-  the day-long hold — no remove-server-from-mce child, the server left in the InfraEnv as
-  a free Agent, `kept_in_inventory: true`; on an inventory host that is a no-op
-  with NO lock. Absent from recorded runs = false, so no patch gate. NO `count`, NodePool or
+  canonicalised and `namespace` defaulting to `inventory`. EVERY UNINSTALL ENDS IN
+  remove-server-from-mce: `keep_inventory` (added 2026-10-24 — stop after the hosted
+  half, the server left in the InfraEnv as a free Agent) was REMOVED by the
+  operator on 2026-11-02; do not re-add it. The request answers it with a 422
+  saying so; a run started since `uninstall-server-from-hc-always-removes` ignores it
+  in its input; a run recorded before still ends as it began (`_keep_inventory`,
+  `kept_in_inventory: true`, the `keep-inventory` goldens). NO `count`, NodePool or
   HostedCluster field: server-scan and the Agent's binding say where it is. A
   string is `{workflow_id, run_id}` and a 409 while it runs, a list the per-run
   report add-server-to-mce's named list uses (`ServerRunItem`); `UninstallServerFromHcRequest`
@@ -489,8 +491,8 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   nothing on the MCE), the run RELEASES ITS OWN lock (`releasing-server`, gated
   `uninstall-server-release-after-removal`; the operator's decision,
   2026-10-31 — an uninstalled server could not be installed anywhere for a
-  day). Kept: with `keep_inventory` (still in the InfraEnv) and on a PXE
-  failure (its MACs may still chain to this MCE's discovery image); a child
+  day). Kept on a PXE failure (its MACs may still chain to this MCE's
+  discovery image), and on an old run kept in the inventory; a child
   failure never reaches it; a refused release is named in `skipped`, never a
   failure. `lock_released` on the result.
   HOSTED-CLUSTER ACCESS: `HostedCluster.status.kubeconfig.name` in the

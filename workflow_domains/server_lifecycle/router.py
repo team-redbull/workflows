@@ -143,6 +143,18 @@ def _refuse_server_name(data: Any) -> Any:
     return data
 
 
+def _refuse_keep_inventory(data: Any) -> Any:
+    """`keep_inventory` was removed on 2026-11-02: every uninstall also takes the
+    server out of the MCE. A caller still sending it is told so, whatever its
+    value, rather than given a bare "extra field"."""
+    if isinstance(data, dict) and "keep_inventory" in data:
+        raise ValueError(
+            "`keep_inventory` was removed: every uninstall now also takes the server out "
+            "of the MCE, through remove-server-from-mce — drop the field"
+        )
+    return data
+
+
 # Deterministic ids come from shared/workflow_ids.py — the ONE definition per
 # scheme, so the id this route builds and the id anything else builds for the
 # same target can never drift apart: a pool run is on a slot of its InfraEnv on
@@ -658,21 +670,11 @@ class UninstallServerFromHcRequest(BaseModel):
             f"InfraEnv's). Defaults to `{_DEFAULT_NAMESPACE}`."
         ),
     )
-    keep_inventory: bool = Field(
-        default=False,
-        description=(
-            "Keep the server in the MCE's inventory: take it out of its hosted cluster "
-            "and stop there. Its BareMetalHost, NMStateConfig, Agent and PXE mapping "
-            "stay, and the host is left powered on in discovery — a free Agent of the "
-            "InfraEnv. For a server already only in the inventory there is then nothing "
-            "to do. Default false: the server also leaves the MCE, through remove-server-from-mce."
-        ),
-    )
-
     @model_validator(mode="before")
     @classmethod
-    def _server_names_not_server_name(cls, data: Any) -> Any:
-        return _refuse_server_name(data)
+    def _retired_fields(cls, data: Any) -> Any:
+        # `server_name` became `server_names`; `keep_inventory` is gone.
+        return _refuse_keep_inventory(_refuse_server_name(data))
 
     @field_validator("mce_cluster")
     @classmethod
@@ -697,7 +699,6 @@ class UninstallServerFromHcRequest(BaseModel):
             server_name=server_name,
             mce_cluster=self.mce_cluster,
             namespace=self.namespace,
-            keep_inventory=self.keep_inventory,
         )
 
 
@@ -748,9 +749,8 @@ async def start_uninstall_server_from_hc(
     replacement takes it back and the run stops (AgentRetakenError) without
     writing anything more.
 
-    `keep_inventory: true` stops after the hosted cluster: no remove-server-from-mce, so
-    the server stays in the MCE's inventory as a free Agent (on an inventory
-    host there is then nothing to do). Default false.
+    Every uninstall ends there: there is no option to keep the server in the
+    MCE's inventory (`keep_inventory` was removed on 2026-11-02 and is a 422).
 
     The reply follows what was sent: one name is `{workflow_id, run_id}` on
     `uninstall-server-from-hc-<server>` and a 409 while that server is uninstalling;

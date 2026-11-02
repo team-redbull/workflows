@@ -1056,11 +1056,53 @@ class TestAnInventoryHost:
         assert result.remove_server.found
 
 
+# A run's input carrying keep_inventory. The API no longer starts one (the field
+# was removed on 2026-11-02); only runs recorded before then carry it.
 KEEP = INPUT.model_copy(update={"keep_inventory": True})
 
 
-class TestKeepInventory:
-    """keep_inventory: out of the hosted cluster, and no further — no remove-server-from-mce."""
+class TestEveryUninstallLeavesTheMce:
+    """keep_inventory was removed (the operator, 2026-11-02): every run ends in
+    remove-server-from-mce, even one whose input still carries the flag."""
+
+    async def test_a_hosted_node_given_keep_inventory_still_leaves_the_mce(self):
+        calls, acts = make_mocks()
+        async with _Harness(acts) as client:
+            result = await _execute(client, KEEP)
+
+        assert calls["order"] == ["lookup", "inspect", "find-nodes", "reserve", *HOSTED_HALF,
+                                  "hold", *CHILD]
+        assert not result.kept_in_inventory and result.remove_server.found
+        assert result.lock_released
+
+    async def test_an_inventory_host_given_keep_inventory_is_removed_too(self):
+        # Not the old early exit with no lock: locked, checked fresh, removed.
+        calls, acts = make_mocks(membership=IN_INVENTORY, host=INVENTORY_HOST)
+        async with _Harness(acts) as client:
+            result = await _execute(client, KEEP)
+
+        assert calls["order"] == ["lookup", "inspect", "reserve", "verify-inventory", "hold", *CHILD]
+        assert not result.kept_in_inventory and result.remove_server.found
+
+    async def test_the_default_takes_it_out_of_the_mce(self):
+        _calls, acts = make_mocks()
+        async with _Harness(acts) as client:
+            result = await _execute(client)
+        assert not result.kept_in_inventory and result.remove_server.found
+
+
+class TestARunRecordedWithKeepInventory:
+    """A run started before 2026-11-02 with keep_inventory still ends as it began:
+    out of the hosted cluster and no further — no remove-server-from-mce. (Its
+    history has no `uninstall-server-from-hc-always-removes` marker; the goldens
+    `keep-inventory.json` replay that shape.)"""
+
+    @pytest.fixture(autouse=True)
+    def _recorded_before_the_removal(self, monkeypatch):
+        monkeypatch.setattr(
+            workflow, "patched",
+            lambda patch_id: patch_id != uninstall_server_from_hc._ALWAYS_REMOVE_PATCH,
+        )
 
     async def test_a_hosted_node_leaves_its_cluster_and_stays_in_the_inventory(self):
         calls, acts = make_mocks()
@@ -1092,12 +1134,6 @@ class TestKeepInventory:
         assert [s.split(":")[0] for s in result.skipped] == [
             "checking-hosted-node", "hosted-cluster half", "removing-from-inventory",
         ]
-
-    async def test_the_default_still_takes_it_out_of_the_mce(self):
-        _calls, acts = make_mocks()
-        async with _Harness(acts) as client:
-            result = await _execute(client)
-        assert not result.kept_in_inventory and result.remove_server.found
 
 
 class TestRefusedBeforeAnyWrite:

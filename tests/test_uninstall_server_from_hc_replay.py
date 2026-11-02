@@ -105,8 +105,12 @@ SCENARIOS: dict[str, Callable[[], Scenario]] = {
     "inventory-host": lambda: Scenario(
         mocks={"membership": IN_INVENTORY, "host": INVENTORY_HOST}
     ),
-    # keep_inventory: out of the hosted cluster, held a day, no remove-server-from-mce.
+    # keep_inventory, recorded before its removal (2026-11-02): out of the hosted
+    # cluster, held a day, no remove-server-from-mce. Its goldens keep that
+    # shape; recorded today, the same input removes the server like any other.
     "keep-inventory": lambda: Scenario(input=KEEP),
+    # Since 2026-11-02: keep_inventory ignored — remove-server-from-mce all the same.
+    "keep-inventory-ignored": lambda: Scenario(input=KEEP),
     # Nothing on the MCE: completes through the child's found=false.
     "nothing-on-the-mce": lambda: Scenario(
         mocks={

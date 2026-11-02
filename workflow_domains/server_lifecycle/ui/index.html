@@ -1027,18 +1027,11 @@ function uninstallDialog() {
       <textarea id="f-names" rows="4" required spellcheck="false" data-send="uninstall-server-from-hc:server_names"></textarea>
       <label for="f-mce">MCE <span class="hint">with or without its ocp4- prefix</span></label>
       <input id="f-mce" data-send="uninstall-server-from-hc:mce_cluster" required autocomplete="off" spellcheck="false">
-      <label style="display:flex;gap:8px;align-items:center;font-weight:400;margin-top:12px">
-        <input type="checkbox" id="f-keep" data-send="uninstall-server-from-hc:keep_inventory" style="width:auto">
-        Keep it in the MCE's inventory: leave the hosted cluster only</label>
-      <div class="confirm"><p id="f-what"></p>
+      <div class="confirm"><p><b>This cannot be undone.</b> A node leaves its hosted cluster; then the host is powered off, its BareMetalHost, NMStateConfig and Agent are deleted and its MACs cleared from the site's PXE VM.</p>
         <label for="f-confirm" id="f-confirm-label">Type the server name again to confirm</label>
         <input id="f-confirm" autocomplete="off" spellcheck="false"></div>`,
     ready: (form) => {
       const list = names(form);
-      const keep = form.querySelector("#f-keep").checked;
-      form.querySelector("#f-what").innerHTML = keep
-        ? "<b>A node leaves its hosted cluster.</b> The server stays on the MCE as a free Agent, powered on in discovery."
-        : "<b>This cannot be undone.</b> A node leaves its hosted cluster; then the host is powered off, its BareMetalHost, NMStateConfig and Agent are deleted and its MACs cleared from the site's PXE VM.";
       const expected = list.length === 1 ? list[0] : String(list.length);
       form.querySelector("#f-confirm-label").textContent = list.length > 1
         ? `Type the number of servers (${list.length}) to confirm` : "Type the server name again to confirm";

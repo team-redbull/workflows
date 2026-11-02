@@ -529,13 +529,10 @@ Either way it then runs **remove-server-from-mce as an awaited child**
 last, the PXE map of the MCE's own site. A server with nothing on the MCE ends
 there as a no-op (`found: false`). Every skipped step is named in `skipped`.
 
-**`"keep_inventory": true`** (default `false`) stops after the hosted-cluster
-half and the day-long hold: no remove-server-from-mce, so the server stays in the
-InfraEnv as a free Agent — powered on in discovery, its BareMetalHost,
-NMStateConfig, Agent and PXE mapping untouched (`kept_in_inventory: true`,
-`remove_server: null`). The console's *Remove from the cluster* without
-*Remove host*. On an inventory host there is nothing to do: the run completes
-after its reads, with no lock.
+**Every uninstall ends in remove-server-from-mce.** The `keep_inventory` option
+(stop after the hosted cluster and leave the server a free Agent) was removed
+on 2026-11-02: sending it is a 422. A run started before then with it still
+ends as it began, and its result says `kept_in_inventory: true`.
 
 > **Nothing has to be done first: the run deletes the node's Machine itself.**
 > NodePool replicas are never changed (who owns them is not decided), so the
@@ -562,8 +559,8 @@ MCE's agents job re-claims it only every 15 min, so in between it can read
 the child starts and left to its TTL on a failure. Once remove-server-from-mce completed
 with nothing left on the MCE and no PXE cleanup failure, the run **releases**
 it (**releasing-server**, `lock_released: true`; the operator's decision,
-2026-10-31), so the server can be installed again at once. With
-`keep_inventory`, or when the PXE cleanup failed, the day-long hold stays. A
+2026-10-31), so the server can be installed again at once. When the PXE
+cleanup failed, the day-long hold stays. A
 lock another run holds —
 add-server-to-mce's day-long hold after it installed the machine, typically —
 fails the run (`ServerReservedError`); release it in server-scan and re-run.

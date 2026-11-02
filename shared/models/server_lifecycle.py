@@ -1251,9 +1251,11 @@ class UninstallServerFromHcInput(BaseModel):
     server_name: str = Field(min_length=1)
     mce_cluster: str = Field(min_length=1)
     namespace: str = Field(min_length=1)
-    # Take the server out of its hosted cluster and STOP: no remove-server-from-mce, so it
-    # stays in this MCE's inventory as a free Agent. False — also for every run
-    # recorded before the field — takes it out of the MCE too.
+    # REMOVED as an option on 2026-11-02: every uninstall ends in
+    # remove-server-from-mce. Kept on this model only because runs recorded
+    # before then carry it — one of those started with True still stops after
+    # the hosted cluster and keeps the server in the inventory. The API refuses
+    # the field, and a run started since ignores it.
     keep_inventory: bool = False
 
 
@@ -1317,11 +1319,13 @@ class UninstallServerFromHcResult(BaseModel):
     reservation_expires_at: str | None = None
     # The run's own install lock was given back once remove-server-from-mce completed
     # with nothing left on the MCE and no PXE cleanup failure, so the server can
-    # be installed again at once. False otherwise (keep_inventory, a PXE
-    # failure, a release server-scan refused — `skipped` says which) and on runs
+    # be installed again at once. False otherwise (a PXE failure, a release
+    # server-scan refused, an old run kept in the inventory — `skipped` says
+    # which) and on runs
     # recorded before the release: the hold then runs to `reservation_expires_at`.
     lock_released: bool = False
-    # keep_inventory was asked: the server was left in the MCE's inventory, and
+    # Only on a run recorded before 2026-11-02 that was started with
+    # keep_inventory: the server was left in the MCE's inventory, and
     # remove-server-from-mce never started (remove_server* stay None).
     kept_in_inventory: bool = False
     remove_server_workflow_id: str | None = None

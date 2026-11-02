@@ -102,7 +102,7 @@ def test_the_start_forms_send_only_the_fields_offered_today():
     assert sent == {
         "add-server-to-mce": {"infra_env", "mce_cluster", "count", "server_names"},
         "remove-server-from-mce": {"server_name", "mce_cluster"},
-        "uninstall-server-from-hc": {"server_names", "mce_cluster", "keep_inventory"},
+        "uninstall-server-from-hc": {"server_names", "mce_cluster"},
     }
     assert sent["add-server-to-mce"] <= set(AddServerToMceRequest.model_fields)
     assert sent["remove-server-from-mce"] <= set(RemoveServerFromMceRequest.model_fields)

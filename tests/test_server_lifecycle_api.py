@@ -643,19 +643,27 @@ class TestUninstallServer:
         assert words in response.text
         assert fake.started == []
 
-    def test_keep_inventory_reaches_every_run_and_defaults_to_false(self):
+    @pytest.mark.parametrize("keep", [True, False])
+    @pytest.mark.parametrize("names", [NAMES[0], NAMES])
+    def test_keep_inventory_was_removed_and_says_so(self, keep, names):
+        # Removed 2026-11-02: every uninstall ends in remove-server-from-mce.
+        # Refused whatever its value, with what to do, and nothing started.
         fake = _FakeUninstallClient()
         response = _uninstall_client(fake).post(
-            UNINSTALL, json={**UNINSTALL_BODY, "server_names": NAMES, "keep_inventory": True}
+            UNINSTALL, json={**UNINSTALL_BODY, "server_names": names, "keep_inventory": keep}
         )
-        assert response.status_code == 202
-        assert [run_input.keep_inventory for _, _, run_input in fake.started] == [True, True]
+        assert response.status_code == 422
+        assert "`keep_inventory` was removed" in response.text
+        assert "remove-server-from-mce" in response.text
+        assert fake.started == []
 
+    def test_no_run_is_ever_started_to_stay_in_the_inventory(self):
         fake = _FakeUninstallClient()
-        _uninstall_client(fake).post(UNINSTALL, json={**UNINSTALL_BODY, "server_names": NAMES[0]})
-        assert [run_input.keep_inventory for _, _, run_input in fake.started] == [False]
+        response = _uninstall_client(fake).post(UNINSTALL, json={**UNINSTALL_BODY, "server_names": NAMES})
+        assert response.status_code == 202
+        assert [run_input.keep_inventory for _, _, run_input in fake.started] == [False, False]
 
-    def test_a_mistyped_keep_inventory_is_422_never_ignored(self):
+    def test_a_mistyped_field_is_422_never_ignored(self):
         fake = _FakeUninstallClient()
         response = _uninstall_client(fake).post(
             UNINSTALL, json={**UNINSTALL_BODY, "server_names": NAMES[0], "keep_inventry": True}
@@ -665,9 +673,10 @@ class TestUninstallServer:
     def test_every_run_field_can_be_sent(self):
         # Its own model, not a subclass of the run's input: a field added to
         # UninstallServerFromHcInput must be added to the request too.
+        # `keep_inventory` is retired: on the run's input only for recorded runs.
         from shared.models.server_lifecycle import UninstallServerFromHcInput
 
-        run_fields = set(UninstallServerFromHcInput.model_fields) - {"server_name"}
+        run_fields = set(UninstallServerFromHcInput.model_fields) - {"server_name", "keep_inventory"}
         assert run_fields <= set(router_module.UninstallServerFromHcRequest.model_fields)
 
 

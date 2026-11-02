@@ -109,9 +109,15 @@ Shape of the run (the `progress` query exposes the phase and the MCE's queue):
                            cleanup failure (`lock_released`). Kept — to its
                            expiry, and named in `skipped` — when the PXE
                            cleanup failed (the host's MACs may still chain to
-                           this MCE's discovery image), and never reached with
-                           keep_inventory (the server stays in the InfraEnv) or
-                           when the child failed.
+                           this MCE's discovery image), and never reached when
+                           the child failed.
+
+EVERY RUN ENDS IN remove-server-from-mce (the operator, 2026-11-02). The
+`keep_inventory` option — stop after the hosted cluster and leave the server a
+free Agent — was removed: the API refuses it, and a run started since
+`uninstall-server-from-hc-always-removes` ignores it. A run recorded before
+that with `keep_inventory: true` still ends as it began, kept in the
+inventory with its lock left to expire (`_keep_inventory`).
 
 Every skipped step is named in the result's `skipped`; what HyperShift had
 left is in `leftovers_at_start`, and every write the run made on a
@@ -152,9 +158,9 @@ half (add-server-to-mce's `_INSTALLED_HOLD`); on failure it is left to its TTL,
 because the host may still be half-way out. Once remove-server-from-mce has taken the
 host off the MCE the window is closed for good, so the run RELEASES it (the
 operator's decision, 2026-10-31: a server just uninstalled could not be
-installed anywhere for a day) — unless the PXE cleanup failed, or with
-keep_inventory, where the server is still in this InfraEnv and the day-long
-hold stays. Runs recorded before `uninstall-server-release-after-removal`
+installed anywhere for a day) — unless the PXE cleanup failed, where the
+host may still boot this MCE's image and the day-long hold stays. Runs
+recorded before `uninstall-server-release-after-removal`
 keep the hold. A lock another run holds — add-server-to-mce's day-long hold
 after it installed the machine, typically — fails the run before anything is
 written.
@@ -357,6 +363,9 @@ _INVENTORY_VERIFY_PATCH = "uninstall-server-inventory-verify"
 # The run's own lock is released once remove-server-from-mce took the host off the MCE.
 # Runs recorded before it end at the child and keep the day-long hold.
 _RELEASE_PATCH = "uninstall-server-release-after-removal"
+# Every run removes the server from the MCE: `keep_inventory` is ignored. A run
+# recorded before it honours the keep_inventory it was started with.
+_ALWAYS_REMOVE_PATCH = "uninstall-server-from-hc-always-removes"
 # The leftover flow can drain a lost Node AND wait out a Machine drain, and
 # verifies three things after the unbind instead of two.
 _LEFTOVERS_RESERVATION_TTL = (
@@ -453,6 +462,7 @@ class UninstallServerFromHcWorkflow:
         self._sub_phase: str | None = None
         self._activity_queue: str | None = None
         self._agent_state: str | None = None
+        self._keep_inventory = False
 
     @workflow.query
     def progress(self) -> UninstallServerFromHcProgress:
@@ -468,6 +478,11 @@ class UninstallServerFromHcWorkflow:
         request = run_args.input
         activity_queue = server_lifecycle_activity_queue(request.mce_cluster)
         self._activity_queue = activity_queue
+        # Only a run recorded before the option was removed still keeps the
+        # server in the inventory; every other run ends in remove-server-from-mce.
+        self._keep_inventory = request.keep_inventory and not workflow.patched(
+            _ALWAYS_REMOVE_PATCH
+        )
         skipped: list[str] = []
 
         # Step 1 — where server-scan says the server is.
@@ -514,7 +529,7 @@ class UninstallServerFromHcWorkflow:
             )
             result.leftovers_at_start = self._leftovers(host, hosted_agent, nodes)
 
-            if request.keep_inventory and hosted_agent is None and not nodes:
+            if self._keep_inventory and hosted_agent is None and not nodes:
                 # Already only inventory, and asked to stay there: nothing to
                 # write, so no lock either.
                 skipped.append(
@@ -634,7 +649,7 @@ class UninstallServerFromHcWorkflow:
         self._phase = "holding-server"
         result.reservation_expires_at = await self._hold(request, membership, host, activity_queue)
 
-        if request.keep_inventory:
+        if self._keep_inventory:
             skipped.append(self._kept_note(request, host))
             skipped.append(
                 "releasing-server: keep_inventory was asked — the server is still in this "

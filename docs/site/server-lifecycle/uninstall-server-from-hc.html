@@ -52,9 +52,8 @@
     hosted-cluster half. Then, for both, <b>remove-server-from-mce</b> runs as an awaited child: power off, then
     delete the NMStateConfig, the BareMetalHost with its BMC Secret, and the Agent.
     <a href="#cases">Both cases, step by step</a>.</p>
-    <p class="lede">With <code>"keep_inventory": true</code> it stops after the hosted cluster: the
-    server stays in the MCE&rsquo;s inventory as a free Agent, as the console&rsquo;s <b>Remove from the
-    cluster</b> leaves it. <a href="#keep-inventory">How</a>.</p>
+    <p class="lede"><b>Every uninstall ends in remove-server-from-mce</b>: there is no option to leave the
+    server in the MCE&rsquo;s inventory. <a href="#keep-inventory">Why</a>.</p>
     <p class="lede">When a HyperShift deletion broke half-way &mdash; an AgentMachine with no Machine, a
     Machine with no AgentMachine, a Node with neither &mdash; it <b>finishes what the controllers could
     not</b>, and checks that every one of them is gone before the server leaves the MCE.
@@ -188,17 +187,15 @@
     </div>
 
     <div class="panel" id="keep-inventory" style="margin-top:18px">
-      <h3><code>"keep_inventory": true</code> &mdash; out of the hosted cluster, still in the inventory</h3>
-      <p>Everything up to the end of the hosted-cluster half runs exactly as above &mdash; Machine deleted,
-      Agent released and back in discovery, Machine, AgentMachine and Node verified gone, the Agent verified
-      <code>known-unbound</code> and approved &mdash; and the lock is held for a day, and <b>kept</b>: the
-      server is still in this InfraEnv. Then the run <b>stops</b>: no remove-server-from-mce. The host stays <b>powered on in discovery</b>, a free Agent of the
-      InfraEnv; its BareMetalHost, NMStateConfig, Agent and PXE mapping are left as they are. The result
-      says <code>kept_in_inventory: true</code>, with <code>remove_server: null</code>.</p>
-      <p class="note">On a server that is already only inventory there is nothing to do: the run completes
-      after its reads, with no lock and nothing written. Being a free Agent, a kept server is one any
-      NodePool may take next &mdash; including the replacement for the Machine just deleted, when it is the
-      only one. The default, <code>false</code>, takes the server out of the MCE too.</p>
+      <h3>No &ldquo;keep it in the inventory&rdquo; &mdash; removed on 2026-11-02</h3>
+      <p>Until 2026-11-02, <code>"keep_inventory": true</code> stopped the run after the hosted-cluster
+      half, leaving the server a free Agent of the InfraEnv. The operator removed it: <b>every uninstall now
+      ends in remove-server-from-mce</b>. A request still sending <code>keep_inventory</code> &mdash; true or
+      false &mdash; is refused with a <b>422</b> saying so, and nothing starts.</p>
+      <p class="note">A run started <em>before</em> the removal with <code>keep_inventory: true</code> still
+      ends as it began: out of the hosted cluster, the lock held a day, no remove-server-from-mce, and its
+      result says <code>kept_in_inventory: true</code> with <code>remove_server: null</code>. To take such a
+      server out of the MCE afterwards, run remove-server-from-mce on it.</p>
     </div>
 
     <div class="grid-2" style="margin-top:18px">
@@ -500,9 +497,9 @@
           <p class="note">Refused now (the lock lapsed and another run took the machine), the run logs it,
           reports <code>reservation_expires_at: null</code> and still removes the host: it must not stay in
           this InfraEnv either way.</p>
-          <p class="note">Held with <code>keep_inventory</code> too: the server stays in this InfraEnv, and
-          server-scan may read it AVAILABLE until the MCE&rsquo;s agents job reports it
-          <code>INSTALLED_TO_INVENTORY</code>. With it, the run <b>ends here</b>.</p>
+          <p class="note">A run started before 2026-11-02 with <code>keep_inventory</code> <b>ends here</b>,
+          the hold kept: the server stays in this InfraEnv, and server-scan may read it AVAILABLE until the
+          MCE&rsquo;s agents job reports it <code>INSTALLED_TO_INVENTORY</code>. Every other run goes on.</p>
         </div>
       </div>
 
@@ -544,7 +541,8 @@
             <div class="call sm"><span class="verb">DELETE</span><span class="path">/pxe-map/&lt;mac&gt;?mce_cluster=&lt;mce&gt; <em>&middot; on the site&rsquo;s PXE VM</em></span></div>
           </div>
           <p class="note">Nothing of the server on the MCE is its <code>found: false</code>, and this run
-          completes. Never started with <code>keep_inventory</code>.</p>
+          completes. Every run reaches this step, except one started before 2026-11-02 with
+          <code>keep_inventory</code>.</p>
           <p class="note">Parent-close policy <code>ABANDON</code>: closing this run never cuts the child off
           between its power-off and its deletes. A remove-server-from-mce already running on that id fails this run
           (<code>RemoveServerFromMceAlreadyRunningError</code>, naming it); a child that fails fails it too
@@ -570,8 +568,7 @@
           </div>
           <p class="note"><b>Kept</b>, to its expiry, when remove-server-from-mce&rsquo;s PXE cleanup failed (the
           host&rsquo;s MACs may still chain to this MCE&rsquo;s discovery image) &mdash; named in
-          <code>skipped</code>. Never reached with <code>keep_inventory</code> (the server is still in the
-          InfraEnv) or when the child failed. A release server-scan refuses is named in
+          <code>skipped</code>. Never reached when the child failed. A release server-scan refuses is named in
           <code>skipped</code>, and the run still completes.</p>
         </div>
       </div>
@@ -654,8 +651,8 @@
         because the host may still be half-way out.</p>
         <p class="note">The operator&rsquo;s decision, 2026-10-31: before it, a machine just uninstalled
         was not drawable by add-server-to-mce for a day. The day-long hold now stays only where the server is
-        still tied to this MCE: <code>keep_inventory</code>, or a PXE cleanup that failed. Runs started
-        before it keep the hold.</p>
+        still tied to this MCE: a PXE cleanup that failed (or an old run kept in the inventory). Runs
+        started before it keep the hold.</p>
       </div>
     </div>
   </section>
@@ -748,7 +745,7 @@
       <h2>How you start it and how you watch it</h2>
       <p class="lede">Served by <code>workflows-orchestrator-api</code> (Swagger at <code>/docs</code>).
       Async throughout: the POST hands back the workflow id at once and you poll it. To watch runs without curl, the same API serves a temporary page at <code>/ui/server-lifecycle</code>, until
-      the ClickCluster Platform UI exists: each run&rsquo;s steps and what it did. Its Uninstall tab also starts them (server names, the MCE, <code>keep_inventory</code>), after you type the server name, or the number of servers, again.</p>
+      the ClickCluster Platform UI exists: each run&rsquo;s steps and what it did. Its Uninstall tab also starts them (server names and the MCE), after you type the server name, or the number of servers, again.</p>
     </div>
 
     <div class="api">
@@ -764,8 +761,8 @@
           a list of 1&ndash;20, each once (case-insensitively); <code>mce_cluster</code> is accepted with or
           without <code>ocp4-</code> and is needed because it names the activity queue of the worker inside
           that MCE; <code>namespace</code> (the InfraEnv&rsquo;s, where the BMH and Agent live) defaults to
-          <code>inventory</code>; <code>keep_inventory</code> (default <code>false</code>) stops the run
-          after the hosted cluster, leaving the server in the inventory (<a href="#keep-inventory">above</a>). The reply follows what was sent: one name is
+          <code>inventory</code>. Every run ends in remove-server-from-mce; <code>keep_inventory</code> was
+          removed and is a <b>422</b> (<a href="#keep-inventory">above</a>). The reply follows what was sent: one name is
           <code>{workflow_id, run_id}</code>, a list is a per-run report &mdash; even a list of one.</p>
           <pre><span class="c">// request — one server</span>
 {
@@ -776,13 +773,12 @@
 <span class="c">// 202 response</span>
 { "workflow_id": "uninstall-server-from-hc-ocp-cisco-m6-bat-yam-64c-512gb-wzp12345", "run_id": "…" }
 
-<span class="c">// request — several, one run each, kept in the inventory</span>
+<span class="c">// request — several, one run each</span>
 {
-  "server_names":   [ "ocp-cisco-m6-bat-yam-64c-512gb-WZP12345",
-                      "ocp-cisco-m6-bat-yam-64c-512gb-WZP67890" ],
-  "mce_cluster":    "ocp4-mce-bat-yam-01",
-  "namespace":      "inventory",
-  "keep_inventory": true                       <span class="c">// default false</span>
+  "server_names": [ "ocp-cisco-m6-bat-yam-64c-512gb-WZP12345",
+                    "ocp-cisco-m6-bat-yam-64c-512gb-WZP67890" ],
+  "mce_cluster":  "ocp4-mce-bat-yam-01",
+  "namespace":    "inventory"
 }
 
 <span class="c">// 202 response — a server already uninstalling is "already_running"</span>
@@ -844,7 +840,7 @@
     "cleaned_up": [],                             <span class="c">// every write made on a controller's behalf, and why</span>
     "reservation_expires_at": "2026-10-25T09:00:00Z",
     "lock_released": true,                        <span class="c">// false: why is the releasing-server entry in skipped</span>
-    "kept_in_inventory": false,                   <span class="c">// true: remove_server* are null</span>
+    "kept_in_inventory": false,                   <span class="c">// true only on a run from before 2026-11-02 with keep_inventory</span>
     "remove_server_workflow_id": "remove-server-from-mce-ocp-cisco-m6-bat-yam-64c-512gb-wzp12345",
     "remove_server": { "found": true, "powered_off": true, "agents_removed": [ "…" ],
                        "lock_released": false, "lock_detail": "left to uninstall-server-from-hc: …", … }
@@ -891,7 +887,7 @@
           <tr><td class="k">verifying-node</td><td class="muted">No Node of the hosted cluster is the server; a stale (NotReady) one deleted</td><td class="muted">&le; 5 min</td></tr>
           <tr><td class="k">verifying-agent</td><td class="muted">Hosted nodes: the Agent is a clean inventory host</td><td class="muted">&le; 5 min</td></tr>
           <tr><td class="k">holding-server</td><td class="muted">The lock extended to 24 h</td><td class="muted">instant</td></tr>
-          <tr><td class="k">removing-from-inventory</td><td class="muted">remove-server-from-mce, awaited (its own phases are on its own id); never with <code>keep_inventory</code></td><td class="muted">minutes &mdash; remove-server-from-mce&rsquo;s bounds</td></tr>
+          <tr><td class="k">removing-from-inventory</td><td class="muted">remove-server-from-mce, awaited (its own phases are on its own id); every run</td><td class="muted">minutes &mdash; remove-server-from-mce&rsquo;s bounds</td></tr>
           <tr><td class="k">releasing-server</td><td class="muted">The run&rsquo;s own lock given back, once remove-server-from-mce completed with no PXE cleanup failure</td><td class="muted">instant</td></tr>
           <tr><td class="k">completed</td><td class="muted">The server is off the hosted cluster and out of the MCE</td><td class="muted">&mdash;</td></tr>
         </tbody>

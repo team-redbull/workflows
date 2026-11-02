@@ -9,6 +9,7 @@ makes drift a loud CI failure instead.
 
 from __future__ import annotations
 
+import pathlib
 import typing
 
 import pytest
@@ -67,3 +68,12 @@ def test_interface_signatures_match_implementations(interface_module, impl_modul
         assert typing.get_type_hints(stub) == typing.get_type_hints(impl), (
             f"activity {name!r}: interface and implementation signatures differ"
         )
+
+
+def test_every_limb_is_in_domains():
+    """A limb missing from _DOMAINS is never contract-checked: a new
+    activities/<limb>/activities.py must be added above in the same change."""
+    repo = pathlib.Path(__file__).resolve().parent.parent
+    limbs = {p.parent.name for p in (repo / "activities").glob("*/activities.py")}
+    listed = {param.id for param in _DOMAINS}
+    assert limbs == listed, f"limbs not in _DOMAINS: {sorted(limbs - listed)}; stale: {sorted(listed - limbs)}"

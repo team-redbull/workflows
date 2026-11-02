@@ -3,6 +3,38 @@
 Guidance for a Temporal-based OpenShift cluster-lifecycle orchestrator — architectural decisions,
 Temporal SDK gotchas, coding preferences. Read before generating code.
 
+## 0. How this file is kept true — the layers, and where a rule lives
+
+This file is the RATIONALE. Three committed layers make it hold for every session and
+every teammate; use them in this order and keep them in step:
+
+- **`.claude/rules/*.md`** — path-scoped INVARIANTS (workflow-side code, routers and UI
+  pages, activities, `shared/`, tests, delivery), loaded automatically when a matching
+  file is read or edited. Terse checklists citing the section here and the checker rule id.
+- **`.claude/skills/redbull-workflows/`** — the PROCEDURE for adding a workflow, a domain
+  or a limb (with its chart), changing an activity, changing or renaming a workflow with
+  runs in flight, and the definition-of-done gate. Its step 3 makes DOCS part of every
+  change: a table maps each kind of change to the page sections, README tables, chart
+  READMEs and sections here it must update, in the same change. Invoke
+  `/redbull-workflows`; it auto-activates on `workflow_domains/`, `activities/`,
+  `shared/`, `deploy/`, `docs/`. It composes with **`temporal-developer`** (vendored in
+  `.agents/skills/`, symlinked into `.claude/skills/`): that skill owns SDK mechanics,
+  THIS repo's rules win where the two differ (the skill lists the divergences).
+- **`scripts/check_conventions.py`** — the ENFORCEMENT: AST checks of every rule that
+  can be checked from source (sandbox imports, activity-call options, unbounded retries
+  named through exception classes, `ApplicationError` from workflow code, one `run()`
+  argument, `connect_temporal` only, interface ↔ implementation ↔ worker registration,
+  `_WORKER_SPECS`, router paths and 202s, Dockerfile CMDs, CI jobs, a docs page per
+  started workflow). It runs on every Edit/Write through the PostToolUse hook in
+  `.claude/settings.json` (which also names the docs pages describing the edited file),
+  as `tests/test_conventions.py`, and in CI's `test` job, which every image build needs.
+
+A rule that can be checked belongs in the checker; one that cannot belongs here AND in
+the matching rules file. When a rule changes, all three move in ONE commit. The checker
+is the tie-breaker: an edit it flags is wrong until the rule itself is changed. A
+documented exception is marked where it lives, `# conventions: allow <RULE> — <reason>`
+(the agent call's bounded retry in `dispatch.py` is the one today), and recorded here.
+
 ## 1. Domain-driven monorepo: three layers, strictly separated
 
 ```

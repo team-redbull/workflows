@@ -129,6 +129,7 @@ RETRY_POLICY = RetryPolicy(
 # problem, and the gate goes to needs-human rather than waiting forever. The
 # invocation id makes the retry safe: the tool server keeps the budget and the
 # executed calls per id.
+# conventions: allow WF007 — the one bounded retry, CLAUDE.md §5 (the LLM agent call).
 AGENT_RETRY_POLICY = RetryPolicy(
     initial_interval=timedelta(seconds=5),
     maximum_interval=timedelta(minutes=1),

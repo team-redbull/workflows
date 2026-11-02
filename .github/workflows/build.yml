@@ -109,8 +109,30 @@ jobs:
             echo "docs=$(match "^(docs/|${SELF})")"
           } | tee -a "${GITHUB_OUTPUT}"
 
+  # The suite runs on EVERY push, and every image job needs it: a red test never
+  # becomes an image, and never reaches redbull-platform's main (which deploys). It
+  # includes tests/test_conventions.py, the mechanical half of CLAUDE.md, so a
+  # convention slip is a red run here, not a workflow stuck RUNNING in production.
+  # A couple of minutes, so not worth a path filter: a docs-only push pays it too.
+  test:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"        # what the Python images run
+          cache: pip
+          cache-dependency-path: '**/requirements*.txt'
+      - run: pip install -r requirements-dev.txt
+      - run: python -m pytest -q
+
   build-workflow-brain:
-    needs: changes
+    # `test` gates the whole chain: a failing suite skips this job, and the
+    # `!failure()` guards behind it then skip every job that follows.
+    needs: [changes, test]
     if: ${{ needs.changes.outputs.brain == 'true' }}
     uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
     with:
@@ -211,7 +233,7 @@ jobs:
     # ghcr.io/<owner>/upgrade-agent-worker:<branch-slug>-<short sha> and the tag is set by hand;
     # then switch it to the reusable workflow like the other limbs. Outside the sequential
     # chain on purpose: it pushes nothing to redbull-platform, so it races with nothing.
-    needs: changes
+    needs: [changes, test]
     if: ${{ needs.changes.outputs.limb == 'true' }}
     runs-on: ubuntu-latest
     permissions:
@@ -243,7 +265,7 @@ jobs:
     # ghcr.io/<owner>/cluster-upgrade-worker:<branch-slug>-<short sha>; the chart's image.tag is
     # set by hand. Once the chart is vendored as gitops/charts/cluster-upgrade-worker/, switch it
     # to the reusable workflow, last in the sequential chain, with helm-image-path: image.
-    needs: changes
+    needs: [changes, test]
     if: ${{ needs.changes.outputs.limb == 'true' }}
     runs-on: ubuntu-latest
     permissions:
@@ -274,7 +296,7 @@ jobs:
     # redbull-platform, so the shared workflow's bump would fail. Publishes
     # ghcr.io/<owner>/upgrade-gitops-worker:<branch-slug>-<short sha>; the tag is set by
     # hand until the chart moves there, then this joins the reusable workflow's chain.
-    needs: changes
+    needs: [changes, test]
     if: ${{ needs.changes.outputs.limb == 'true' }}
     runs-on: ubuntu-latest
     permissions:

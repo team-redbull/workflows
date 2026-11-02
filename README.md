@@ -886,3 +886,27 @@ helm install segment-lifecycle-worker \
 
 Edit `config.dhcpExclusionOctetRanges` in the chart's `values.yaml` (then restart
 the activity workers) to change the DHCP policy without a rebuild.
+
+## Working on this repo with Claude Code
+
+Nothing to install: clone, open the folder, and trust it when Claude Code asks (the
+committed hook waits on that). Everything below is in git.
+
+| piece | role |
+| --- | --- |
+| `CLAUDE.md` | the rationale: why the architecture and every rule are the way they are; always loaded |
+| `.claude/rules/*.md` | path-scoped checklists, loaded when you touch workflow code, routers, activities, `shared/`, tests, CI, charts or docs |
+| `.claude/skills/redbull-workflows/` | the procedure: new workflow, new domain or limb (with its chart), activities, changing or renaming a running workflow, docs, definition of done (`/redbull-workflows`) |
+| `.claude/skills/temporal-developer` | Temporal's own SDK skill, vendored at `.agents/skills/temporal-developer/` (`skills-lock.json` pins it); SDK mechanics, the repo's rules win where they differ |
+| `scripts/check_conventions.py` | the mechanical checks: run on every edit by the hook in `.claude/settings.json` (which also names the docs pages to update), in `pytest` (`tests/test_conventions.py`) and in CI's `test` job, which every image build needs |
+
+Run the checks yourself at any time; the checker needs only a system `python3`:
+
+```bash
+python3 scripts/check_conventions.py                       # whole repo, cross-file rules too
+python3 scripts/check_conventions.py --file path/to/x.py   # one file, what the hook sees
+.venv/bin/python -m pytest -q                              # the suite, conventions included
+```
+
+Personal settings go in `.claude/settings.local.json` (gitignored); `.claude/settings.json`
+is shared and holds only the hook.

@@ -1,5 +1,8 @@
 .venv/
 __pycache__/
 *.pyc
-.claude/
 .env
+.env.bak
+# Personal Claude Code settings only — .claude/settings.json, rules, skills and
+# hooks are shared with the team and committed.
+.claude/settings.local.json

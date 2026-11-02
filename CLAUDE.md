@@ -1042,10 +1042,14 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   copy, moved from `deploy/charts/` on 2026-11-02). This repo ships the PER-MCE limbs' charts, written to be copied into
   redbull-platform for Argo CD (example ApplicationSet in `deploy/argocd/`):
   `deploy/charts/server-lifecycle-worker/`, `deploy/charts/cluster-upgrade-worker/` and
-  `deploy/charts/upgrade-agent-worker/` — the last two copied verbatim as redbull-platform's
-  `gitops/charts/<same name>/`, so a change to either lands in both repos together. On a
+  `deploy/charts/upgrade-agent-worker/` — the last two copied into redbull-platform's
+  `gitops/charts/<same name>/` BY CI (`sync-upgrade-charts`, `scripts/sync_platform_charts.sh`,
+  the operator's request 2026-11-02): on every `main` push that changes them, the whole chart,
+  keeping the image tag and chart version the build jobs wrote there, rendered, committed and
+  pushed before the image jobs run. Edit them HERE only; a hand edit there is overwritten.
+  server-lifecycle-worker's redbull-platform chart is its own reshaped chart, not synced. On a
   remote MCE each renders its own Temporal endpoint, since no brain ConfigMap exists there;
-  `deploy/` is in `.dockerignore` and triggers no image build. The server-lifecycle limb is the first to need real RBAC: it creates
+  `deploy/` is in `.dockerignore` and triggers no image build (those two charts trigger the sync). The server-lifecycle limb is the first to need real RBAC: it creates
   secrets, metal3.io/baremetalhosts and agent-install.openshift.io/nmstateconfigs in the target
   namespace, where segment-lifecycle only makes HTTP and git calls — and, for uninstall-server-from-hc,
   a ClusterRole over CAPI Machines, AgentMachines, HostedClusters and Secrets (§4).

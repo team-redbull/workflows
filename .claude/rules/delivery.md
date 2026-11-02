@@ -29,7 +29,9 @@ Checker ids in brackets.
   the image needs it and drops one only after the image stopped needing it; the brain
   release installs before any hub limb.
 - **Charts**: per-MCE limbs in `deploy/charts/<limb>-worker/` (README with config and
-  RBAC tables); the brain and hub limbs in redbull-platform `gitops/charts/`. Each renders
+  RBAC tables), cluster-upgrade's two copied into redbull-platform by CI's
+  `sync-upgrade-charts` (edit them here only); the brain and hub limbs in redbull-platform
+  `gitops/charts/`. Each renders
   every REQUIRED settings key of its limb (a field without a default); none templates a
   Namespace. [DL005]
 - **Requirements**: `shared/` adds nothing beyond temporalio + pydantic; each limb's deps in

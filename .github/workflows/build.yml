@@ -45,6 +45,7 @@ jobs:
       brain: ${{ steps.filter.outputs.brain }}
       limb:  ${{ steps.filter.outputs.limb }}
       docs:  ${{ steps.filter.outputs.docs }}
+      charts: ${{ steps.filter.outputs.charts }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -102,11 +103,14 @@ jobs:
           #   · EACH limb copies the WHOLE activities/ tree, not just its own
           #     domain — which is why one `limb` flag drives all six limb jobs;
           #   · this file changes what gets built, so it triggers everything.
+          # `charts` is no image: the per-MCE charts sync-upgrade-charts copies
+          # into redbull-platform, and the script that copies them.
           SELF='\.github/workflows/build\.yml$'
           {
             echo "brain=$(match "^(workflow_domains/|shared/|${SELF})")"
             echo "limb=$(match "^(activities/|shared/|${SELF})")"
             echo "docs=$(match "^(docs/|${SELF})")"
+            echo "charts=$(match "^(deploy/charts/(cluster-upgrade-worker|upgrade-agent-worker)/|scripts/sync_platform_charts\.sh$|${SELF})")"
           } | tee -a "${GITHUB_OUTPUT}"
 
   # The suite runs on EVERY push, and every image job needs it: a red test never
@@ -226,14 +230,73 @@ jobs:
 
   # cluster-upgrade's three limbs. Their charts are in redbull-platform since 2026-11-02:
   # cluster-upgrade-worker and upgrade-agent-worker (per MCE) as copies of deploy/charts/
-  # here, upgrade-gitops-worker (hub) only there. Each main build gets a vX.Y.Z tag, the
-  # bump of image.tag in that chart's values.yaml and a <chart>/vX.Y.Z tag there, like
-  # every other image; a branch build stays <branch-slug>-<short sha>. None of the three
-  # has a gitops/services/ entry yet, so their bumps deploy nothing. Sequential, at the
-  # end, for the reason build-segment-lifecycle-worker gives.
+  # here that sync-upgrade-charts keeps equal, upgrade-gitops-worker (hub) only there.
+  # Each main build gets a vX.Y.Z tag, the bump of image.tag in that chart's values.yaml
+  # and a <chart>/vX.Y.Z tag there, like every other image; a branch build stays
+  # <branch-slug>-<short sha>. None of the three has a gitops/services/ entry yet, so
+  # their bumps deploy nothing. Sequential, at the end, for the reason
+  # build-segment-lifecycle-worker gives.
+  sync-upgrade-charts:
+    # Copies deploy/charts/{cluster-upgrade-worker,upgrade-agent-worker} into
+    # redbull-platform on a main push that changes them, so nobody keeps the two
+    # copies equal by hand (scripts/sync_platform_charts.sh: the whole chart, keeping
+    # the image tag and chart version the build jobs wrote there). Renders both the way
+    # Argo would, then commits and pushes. BEFORE the image jobs, so a push that changes
+    # a chart and the code ships the chart first: a new key before the image that needs
+    # it (CLAUDE.md §8). Same token and same rebase-and-retry push as ghcr-build-push.yml.
+    needs: [changes, build-server-provisioning-worker]
+    if: ${{ !cancelled() && !failure() && github.ref_name == 'main' && needs.changes.outputs.charts == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: team-redbull/redbull-platform
+          token: ${{ secrets.REDBULL_WRITE_TOKEN }}
+          path: _platform
+          fetch-depth: 0
+      - name: Copy the charts
+        run: bash scripts/sync_platform_charts.sh _platform
+      # Offline: a runner cannot reach a cluster, so lint and template, with the
+      # values the charts require (redbull-platform's CLAUDE.md: a server dry-run is
+      # the full check, done by hand before an Application points at them).
+      - name: Render them
+        run: |
+          set -euo pipefail
+          cd _platform/gitops/charts
+          common=(--set mceCluster=ocp4-ci --set temporal.host=temporal-frontend:7233)
+          helm lint cluster-upgrade-worker "${common[@]}"
+          helm template cluster-upgrade-worker cluster-upgrade-worker "${common[@]}" >/dev/null
+          helm lint upgrade-agent-worker "${common[@]}" --set upgradeAgent.url=http://upgrade-agent:8080
+          helm template upgrade-agent-worker upgrade-agent-worker "${common[@]}" --set upgradeAgent.url=http://upgrade-agent:8080 >/dev/null
+      - name: Commit and push
+        run: |
+          set -euo pipefail
+          cd _platform
+          git add gitops/charts/cluster-upgrade-worker gitops/charts/upgrade-agent-worker
+          if git diff --cached --quiet; then
+            echo "redbull-platform's copies already match ${GITHUB_SHA::7}"
+            exit 0
+          fi
+          git diff --cached --stat
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore: sync cluster-upgrade per-MCE charts from workflows@${GITHUB_SHA::7}"
+          for attempt in 1 2 3 4 5; do
+            if git push origin HEAD:main; then exit 0; fi
+            echo "push rejected (attempt ${attempt}) — rebasing onto origin/main and retrying"
+            git fetch origin main
+            git rebase origin/main || { echo "rebase failed; a human needs to look"; exit 1; }
+            sleep $((RANDOM % 5 + 2))
+          done
+          echo "could not push after 5 attempts"
+          exit 1
+
   build-cluster-upgrade-worker:
     # The per-MCE limb (activities/cluster_upgrade/), the workflow ServiceAccount.
-    needs: [changes, build-server-provisioning-worker]
+    needs: [changes, sync-upgrade-charts]
     if: ${{ !cancelled() && !failure() && needs.changes.outputs.limb == 'true' }}
     uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
     with:

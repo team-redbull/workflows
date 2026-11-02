@@ -67,7 +67,9 @@ temporal task-queue describe --task-queue cluster-upgrade-activity-<mceCluster> 
 
 The chart is copied into redbull-platform as `gitops/charts/cluster-upgrade-worker/`
 (2026-11-02), where CI bumps its tag; it has no `gitops/services/` entry there yet, so Argo CD
-deploys nothing from it. Change the chart here and copy it there in the same change. To deploy
+deploys nothing from it. CI's `sync-upgrade-charts` copies this chart there on every push to
+`main` that changes it (`scripts/sync_platform_charts.sh`, keeping the tag CI wrote), so edit it
+here, never there. To deploy
 it with Argo CD, add `gitops/services/cluster-upgrade-worker-<mce>/app.yaml` per MCE, as
 `gitops/services/server-lifecycle-worker/app.yaml` there describes. For many MCEs, the workflows
 repo's `deploy/argocd/server-lifecycle-worker-applicationset.yaml` is the shape, with this

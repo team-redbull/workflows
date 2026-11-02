@@ -131,6 +131,21 @@ main { display: grid; grid-template-columns: 320px minmax(0, 1fr); gap: 16px; pa
 .pool.alert { background: var(--alert-bg); color: var(--alert); font-weight: 600; }
 .pool.next { background: var(--person-bg); color: var(--person); font-weight: 600; }
 .legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--muted); margin-top: 6px; }
+.pool .mu { font-weight: 400; opacity: .85; }
+
+/* The New upgrade form's NodePools: roll order (top first) and maxUnavailable each. */
+.pools-edit { list-style: none; margin: 0; padding: 0; border: 1px solid var(--line); border-radius: 10px; }
+.pools-edit li { display: grid; grid-template-columns: 18px minmax(0, 1fr) 76px auto; gap: 8px; align-items: center;
+  padding: 7px 10px; border-top: 1px solid var(--line); }
+.pools-edit li:first-child { border-top: none; }
+.pools-edit .pos { color: var(--muted); font-size: 12px; text-align: right; }
+.pools-edit .nm { overflow-wrap: anywhere; font-weight: 600; }
+.pools-edit .nm small { display: block; color: var(--muted); font-size: 12px; font-weight: 400; }
+.pools-edit input { padding: 4px 7px; }
+.pools-edit input:invalid { border-color: var(--alert); }
+.pools-edit .move { display: flex; gap: 4px; }
+.pools-edit .move button { padding: 2px 9px; }
+.pools-edit .move button:disabled { opacity: .35; cursor: default; }
 
 .verdict p { margin: 4px 0 10px; }
 table { width: 100%; border-collapse: collapse; }
@@ -387,6 +402,8 @@ function renderDetail() {
     plan && ["Path", `${plan.control_plane} → ${plan.target}`],
     data.profile && ["Profile", data.profile],
     v.p && v.p.control_plane_version && ["Control plane", v.p.control_plane_version],
+    v.p && Object.keys(v.p.max_unavailable || {}).length && ["maxUnavailable set",
+      Object.entries(v.p.max_unavailable).map(([n, m]) => `${n} ${m}`).join(", ")],
     (v.p || v.r) && data.verified_against_graph && ["Ladder checked", data.verified_against_graph],
   ].filter(Boolean);
   el.innerHTML = [
@@ -443,8 +460,11 @@ function renderPlan(v) {
   plan.steps.forEach((step, i) => {
     const s = states[i];
     nodes.push(`<div class="link-line ${s === "done" ? "done" : ""}"></div>`);
+    const limits = (v.p && v.p.max_unavailable) || {};
     const pools = step.kind === "workers"
-      ? `<div class="pools">${step.nodepools.map((n) => `<span class="pool ${v.p ? poolState(v, s, n, next) : s === "done" ? "done" : ""}">${esc(n)}</span>`).join("")}</div>` : "";
+      ? `<div class="pools">${step.nodepools.map((n) => `<span class="pool ${v.p ? poolState(v, s, n, next) : s === "done" ? "done" : ""}"${
+        limits[n] ? ` title="maxUnavailable ${esc(limits[n])}, written with this NodePool's commit"` : ""}>${esc(n)}${
+        limits[n] ? ` <span class="mu">· max ${esc(limits[n])}</span>` : ""}</span>`).join("")}</div>` : "";
     nodes.push(`<div class="node s-${s}"><div class="box">
       <div class="kind">${step.kind === "workers" ? "Workers" : "Control plane"}</div>
       <div class="ver">${esc(step.version)}</div><div class="why">${esc(step.reason)}</div>${pools}</div></div>`);
@@ -570,7 +590,64 @@ function knownClusters() {
   return [...new Set(state.list.map((r) => cluster(r.workflow_id)))].sort();
 }
 
+// What the NodePools list adds to the request: only what differs from the cluster file (D28).
+// The order when it is not the one the run would use anyway; maxUnavailable for each NodePool
+// whose value is not the file's. An empty field keeps the file's.
+function poolChoices(form) {
+  const rows = [...form.querySelectorAll("#f-pools li")];
+  const wrap = form.querySelector("#f-pools-wrap");
+  if (!rows.length || wrap.hidden) return {};
+  const out = {};
+  const order = rows.map((li) => li.dataset.name);
+  if (order.join("\n") !== (wrap.dataset.order || "")) out.nodepool_order = order;
+  const limits = {};
+  rows.forEach((li) => {
+    const value = li.querySelector("input").value.trim();
+    if (value && value !== (li.dataset.file || "")) limits[li.dataset.name] = /^\d+$/.test(value) ? Number(value) : value;
+  });
+  if (Object.keys(limits).length) out.max_unavailable = limits;
+  return out;
+}
+
+function renderPools(form, targets) {
+  const wrap = form.querySelector("#f-pools-wrap"), list = form.querySelector("#f-pools");
+  const byName = Object.fromEntries((targets?.nodepools || []).map((np) => [np.name, np]));
+  const order = (targets?.nodepool_order || []).filter((n) => byName[n]);
+  wrap.hidden = order.length === 0;
+  wrap.dataset.order = order.join("\n");
+  list.innerHTML = order.map((name) => {
+    const np = byName[name];
+    const about = [np.zone && `zone ${np.zone}`, np.replicas != null && `${np.replicas} node${np.replicas === 1 ? "" : "s"}`,
+      `file: ${np.max_unavailable ?? "unset (1)"}`].filter(Boolean).join(" · ");
+    return `<li data-name="${esc(name)}" data-file="${esc(np.max_unavailable ?? "")}"><span class="pos"></span>
+      <span class="nm">${esc(name)}<small>${esc(about)}</small></span>
+      <input value="${esc(np.max_unavailable ?? "")}" placeholder="1" aria-label="maxUnavailable for ${esc(name)}"
+        pattern="[1-9][0-9]*|([1-9][0-9]?|100)%" title="a whole number of nodes (1 or more) or a percentage (1% to 100%)" autocomplete="off" spellcheck="false">
+      <span class="move"><button type="button" data-move="-1" aria-label="Move ${esc(name)} up">↑</button><button type="button" data-move="1" aria-label="Move ${esc(name)} down">↓</button></span></li>`;
+  }).join("");
+  numberPools(list);
+}
+
+function numberPools(list) {
+  const rows = [...list.children];
+  rows.forEach((li, i) => {
+    li.querySelector(".pos").textContent = String(i + 1);
+    li.querySelector('[data-move="-1"]').disabled = i === 0;
+    li.querySelector('[data-move="1"]').disabled = i === rows.length - 1;
+  });
+}
+
 function wireTargets(form, preview) {
+  form.querySelector("#f-pools").addEventListener("click", (event) => {
+    const button = event.target.closest("[data-move]");
+    if (!button) return;
+    const li = button.closest("li"), list = li.parentElement;
+    if (button.dataset.move === "-1" && li.previousElementSibling) list.insertBefore(li, li.previousElementSibling);
+    else if (button.dataset.move === "1" && li.nextElementSibling) list.insertBefore(li.nextElementSibling, li);
+    numberPools(list);
+    button.disabled ? li.querySelector("[data-move]:not(:disabled)")?.focus() : button.focus();
+    preview();
+  });
   const input = form.querySelector("#f-cluster"), select = form.querySelector("#f-target"),
     text = form.querySelector("#f-target-text"), note = form.querySelector("#f-target-note");
   let asked = "";
@@ -592,11 +669,13 @@ function wireTargets(form, preview) {
         o.control_plane_steps} control-plane step${o.control_plane_steps === 1 ? "" : "s"}, ${o.steps} in all${o.newest_in_minor ? ` · newest ${esc(o.minor)} rung` : ""}</option>`);
       select.innerHTML = pick.join("") || `<option value="">nothing newer to offer</option>`;
       select.disabled = !pick.length;
+      renderPools(form, t);
       note.textContent = `Runs ${t.control_plane_version || "?"} (day1). Its MCE ${t.mce_cluster} (${t.mce_version}) supports ${
         t.supported_minors.join(", ")}. Only ladder rungs are offered: the releases mirrored and verified.`
         + (pick.length ? "" : " It is already at the newest one its MCE supports.");
     } catch (err) {
       if (asked !== name) return;
+      renderPools(form, null);
       typed(true, `Could not read the choices (${err.message}). Type the target instead.`);
     }
     preview();
@@ -618,7 +697,10 @@ function newRun() {
       `<label for="f-target">Target</label><select id="f-target" required disabled><option value="">pick a cluster first</option></select>
        <input id="f-target-text" hidden disabled pattern="\\d+\\.\\d+(\\.\\d+(-x86_64)?)?" placeholder="a release (4.21.40) or a minor (4.21)">
        <p id="f-target-note" class="explain" style="margin:6px 0 0;font-size:12.5px"></p>`,
-      `<label for="f-mode">NodePools</label><select id="f-mode"><option value="manual">Manual: the customer checks and continues before each NodePool</option><option value="auto">Auto: lab and canary clusters only (upgrade.wave 0 or 1)</option></select>`,
+      `<div id="f-pools-wrap" hidden><label>NodePools <span class="hint">the top one rolls first · maxUnavailable: its nodes down at once</span></label>
+       <ol class="pools-edit" id="f-pools"></ol>
+       <p class="explain" style="margin:6px 0 0;font-size:12.5px">A whole number of nodes or a percentage (1% to 100%). A changed one is written into the cluster file with that NodePool's commit, and stays there.</p></div>`,
+      `<label for="f-mode">Who starts each NodePool</label><select id="f-mode"><option value="manual">Manual: the customer checks and continues before each NodePool</option><option value="auto">Auto: lab and canary clusters only (upgrade.wave 0 or 1)</option></select>`,
       `<label style="display:flex;gap:8px;align-items:center;font-weight:400"><input type="checkbox" id="f-auto" style="width:auto"> Approve automatically (lab and canary clusters only)</label>`,
     ],
     body: (form) => {
@@ -627,6 +709,7 @@ function newRun() {
       const out = { cluster: form.querySelector("#f-cluster").value.trim(), requested_by: form.querySelector("#f-by").value.trim(),
         nodepool_mode: form.querySelector("#f-mode").value, auto_approve: form.querySelector("#f-auto").checked };
       if (/^\d+\.\d+$/.test(target)) out.target_minor = target; else out.target_version = target;
+      Object.assign(out, poolChoices(form));
       return out;
     },
   });

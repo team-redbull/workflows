@@ -596,6 +596,42 @@ class TestNodePoolCommits:
         commit = await _commit(origin, _request(Day1ChangeKind.NODEPOOL, nodepool="alpha-zone-a", version="4.18.56"))
         assert not commit.changed
 
+    async def test_max_unavailable_rides_on_the_nodepools_own_commit(self, origin, tmp_path):
+        """D28: the line under inPlace moves with the workertag, in one commit, and nothing else does."""
+        before = _main_file(origin, tmp_path, PROD_PATH, "before")
+        await _commit(origin, _request(Day1ChangeKind.NODEPOOL, nodepool="alpha-zone-a", version="4.19.53",
+                                       max_unavailable="2"))
+        after = _main_file(origin, tmp_path, PROD_PATH, "after")
+        assert _changed_lines(before, after) == (
+            ["    maxUnavailable: 1", "  workertag: 4.18.56-x86_64"],
+            ["    maxUnavailable: 2", "  workertag: 4.19.53-x86_64"],
+        )
+        log = _git("log", "-1", "--format=%s", cwd=origin)
+        assert "maxUnavailable 1 → 2" in log
+
+    async def test_a_nodepool_with_no_in_place_block_gets_one(self, origin, tmp_path):
+        await _commit(origin, _request(Day1ChangeKind.NODEPOOL, nodepool="alpha-zone-b", version="4.19.53",
+                                       max_unavailable="33%"))
+        after = _main_file(origin, tmp_path, PROD_PATH)
+        assert ('  workertag: 4.19.53-x86_64 # pinned for the upgrade\n'
+                '  inPlace:\n    maxUnavailable: "33%"\n\n# === Added by CI ===') in after
+        cluster = day1_values.read_cluster(tmp_path / "check", PROD_PATH, revision="r", blob="b")
+        assert {np.name: np.max_unavailable for np in cluster.nodepools} == {
+            "alpha-zone-a": "1", "alpha-zone-b": "33%",
+        }
+
+    async def test_a_new_limit_alone_is_still_a_commit_and_the_same_one_is_not(self, origin, tmp_path):
+        """A retry after a push that landed must read its own commit as already so (both values)."""
+        before = _main_file(origin, tmp_path, PROD_PATH, "before")
+        first = await _commit(origin, _request(Day1ChangeKind.NODEPOOL, nodepool="alpha-zone-a", version="4.18.56",
+                                               max_unavailable="3"))
+        after = _main_file(origin, tmp_path, PROD_PATH, "after")
+        assert first.changed
+        assert _changed_lines(before, after) == (["    maxUnavailable: 1"], ["    maxUnavailable: 3"])
+        again = await _commit(origin, _request(Day1ChangeKind.NODEPOOL, nodepool="alpha-zone-a", version="4.18.56",
+                                               max_unavailable="3"))
+        assert not again.changed
+
     async def test_an_inherited_nodepool_list_cannot_be_edited(self, origin, tmp_path):
         checkout = tmp_path / "inherit"
         _git("clone", "-q", str(origin), str(checkout), cwd=tmp_path)
@@ -659,6 +695,19 @@ class TestTheEditRefusesWhatItCannotDoByLines:
         with pytest.raises(Day1ChangeRejectedError, match="flow style"):
             self._plan(tmp_path, "mastertag: 4.18.56\nnodepool: [{name: a, infraEnvName: x}]\n",
                        _request(Day1ChangeKind.NODEPOOL, nodepool="a", version="4.19.53"))
+
+    def test_an_in_place_block_in_flow_style(self, tmp_path):
+        text = "mastertag: 4.18.56\nnodepool:\n- name: a\n  infraEnvName: x\n  inPlace: {maxUnavailable: 1}\n"
+        with pytest.raises(Day1ChangeRejectedError, match="not written as a block mapping"):
+            self._plan(tmp_path, text, _request(Day1ChangeKind.NODEPOOL, nodepool="a", version="4.19.53",
+                                                max_unavailable="2"))
+
+    def test_an_empty_in_place_block_gets_its_line_under_it(self, tmp_path):
+        text = "mastertag: 4.18.56\nnodepool:\n- name: a\n  inPlace:\n    # set per upgrade\n  infraEnvName: x\n"
+        edit = self._plan(tmp_path, text, _request(Day1ChangeKind.NODEPOOL, nodepool="a", version="4.18.56",
+                                                   max_unavailable="100%"))
+        assert edit.changed
+        assert '  inPlace:\n    maxUnavailable: "100%"\n    # set per upgrade\n  infraEnvName: x\n' in edit.text
 
     def test_mastertag_written_twice(self, tmp_path):
         with pytest.raises(Day1ChangeRejectedError, match="mastertag is written 2 times"):

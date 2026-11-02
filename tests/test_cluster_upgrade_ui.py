@@ -95,3 +95,22 @@ def test_the_run_list_is_one_workflow_type_newest_first():
     # The type goes into the visibility query, so it must be a class name and nothing else.
     bad = client.get("/workflows/runs", params={"workflow_type": "X' OR WorkflowType != '"})
     assert bad.status_code == 422 and len(fake.queries) == 1
+
+
+def test_the_start_form_sends_only_fields_the_route_takes():
+    """Every key the New upgrade form puts in its request is one UpgradeClusterRequest has.
+
+    The form's own fields, and what its NodePools list adds (D28): an order and a
+    maxUnavailable per NodePool, each only when it differs from the cluster file.
+    """
+    from workflow_domains.cluster_upgrade.router import UpgradeClusterRequest
+
+    page = PAGE.read_text()
+    form = page[page.index("function poolChoices"):page.index("function wireTargets")]
+    form += page[page.index("function newRun"):page.index("\n}\n", page.index("function newRun"))]
+    sent = set(re.findall(r"\bout\.([a-z_]+)\s*=", form)) | set(re.findall(r"\b([a-z_]+): form\.querySelector", form))
+    assert sent == {
+        "cluster", "requested_by", "nodepool_mode", "auto_approve", "target_minor", "target_version",
+        "nodepool_order", "max_unavailable",
+    }
+    assert sent <= set(UpgradeClusterRequest.model_fields)

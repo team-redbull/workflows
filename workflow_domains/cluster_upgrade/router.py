@@ -61,6 +61,7 @@ from shared.models.cluster_upgrade import (
 )
 from shared.ocp_version import parse_minor, release_version
 from shared.workflow_ids import upgrade_cluster_workflow_id, upgrade_targets_workflow_id
+from workflow_domains.cluster_upgrade import gates
 from workflow_domains.cluster_upgrade.upgrade_cluster import UpgradeClusterWorkflow
 from workflow_domains.cluster_upgrade.upgrade_targets import UpgradeTargetsWorkflow
 from workflow_domains.routers.deps import get_temporal_client
@@ -115,6 +116,16 @@ class UpgradeClusterRequest(UpgradeClusterInput):
         description=(
             "The order NodePools roll in; each exactly once. Default: the cluster "
             "file's `upgrade.nodePoolOrder`, else by zone, else file order."
+        ),
+    )
+    max_unavailable: dict[str, int | str] | None = Field(
+        default=None,
+        description=(
+            "Per NodePool, how many of its nodes an InPlace roll takes down at once: a whole number "
+            "(1 or more) or a percentage (`\"33%\"`, 1% to 100%), e.g. `{\"zone-a\": 2}`. The run "
+            "writes it into the cluster file's `nodepool[].inPlace.maxUnavailable` in the same commit "
+            "as that NodePool's workertag, and it stays there after the upgrade. A NodePool not named "
+            "keeps the file's own. Each name must be a NodePool this plan rolls, else planning fails."
         ),
     )
     # The three modes (docs: upgrade-cluster.html#modes). The two automatic ones are
@@ -178,6 +189,32 @@ class UpgradeClusterRequest(UpgradeClusterInput):
         if value is not None and len(set(value)) != len(value):
             raise ValueError("`nodepool_order` names a NodePool more than once")
         return value
+
+    @field_validator("max_unavailable", mode="before")
+    @classmethod
+    def _no_true_or_false(cls, value: Any) -> Any:
+        """Before pydantic reads `true` as the int 1."""
+        if isinstance(value, dict):
+            for name, raw in value.items():
+                if isinstance(raw, bool):
+                    raise ValueError(f"NodePool {name}: maxUnavailable {raw!r} is not a number of nodes or a percentage")
+        return value
+
+    @field_validator("max_unavailable")
+    @classmethod
+    def _max_unavailable(cls, value: dict[str, int | str] | None) -> dict[str, str] | None:
+        """Each value as the text the cluster file gets, or a 422 naming the NodePool."""
+        if value is None:
+            return None
+        if not value:
+            raise ValueError("`max_unavailable` is empty: leave it out to keep every NodePool's own")
+        checked: dict[str, str] = {}
+        for name, raw in value.items():
+            try:
+                checked[name] = gates.max_unavailable_value(raw)
+            except ValueError as err:
+                raise ValueError(f"NodePool {name}: {err}") from None
+        return checked
 
     @model_validator(mode="after")
     def _one_target(self) -> UpgradeClusterRequest:

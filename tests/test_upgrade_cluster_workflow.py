@@ -164,6 +164,29 @@ class TestTheHappyPath:
         # The happy path is boring: no agent, no incident.
         assert fleet.agent_requests == [] and fleet.incidents == []
 
+    async def test_the_requests_order_and_max_unavailable_ride_on_each_nodepools_commit(self):
+        """D28: chosen at start, shown at approval, written with that NodePool's workertag only."""
+        fleet = Fleet()
+        async with Harness(fleet) as h:
+            await h.start(request(nodepool_order=["np-b", "np-a"], max_unavailable={"np-b": "50%"}))
+            approval = await h.until(UpgradePhase.AWAITING_APPROVAL)
+            assert approval.plan.steps[-1].nodepools == ["np-b", "np-a"]
+            assert approval.max_unavailable == {"np-b": "50%"}
+            planned = next(e.detail for e in approval.log if e.event == "planned")
+            assert planned.endswith("; maxUnavailable np-b 50%")
+            await _approve_through_control_plane(h)
+            await h.until(UpgradePhase.AWAITING_CONTINUE)
+            await h.decide(Run.continue_nodepool, ContinueNodePool(by="alice"))
+            await h.until(UpgradePhase.AWAITING_CONTINUE)
+            await h.decide(Run.continue_nodepool, ContinueNodePool(by="bob"))
+            result = await h.result()
+        assert result.outcome is UpgradeOutcome.DONE
+        assert [(c.change, c.nodepool, c.max_unavailable) for c in fleet.commits] == [
+            (Day1ChangeKind.CONTROL_PLANE, None, None), (Day1ChangeKind.CONTROL_PLANE, None, None),
+            (Day1ChangeKind.NODEPOOL, "np-b", "50%"), (Day1ChangeKind.NODEPOOL, "np-a", None),
+            (Day1ChangeKind.FINISH, None, None),
+        ]
+
     async def test_day2_must_confirm_after_every_control_plane_step(self):
         fleet = Fleet()
         async with Harness(fleet) as h:
@@ -319,6 +342,15 @@ class TestPlanningRefusals:
             await h.start(request(nodepool_order=["np-b"]))
             failure = await _fails(h)
         assert "name each one exactly once" in failure.message
+
+    async def test_max_unavailable_for_a_nodepool_the_plan_does_not_roll_fails(self):
+        """Written with the NodePool's own commit (D28): one never rolled would never get it."""
+        fleet = Fleet()
+        async with Harness(fleet) as h:
+            await h.start(request(workers_to_target=False, max_unavailable={"np-a": "2"}))
+            failure = await _fails(h)
+        assert "max_unavailable names np-a, which this plan does not roll" in failure.message
+        assert fleet.commits == []
 
 
 class TestPreflight:
@@ -1342,6 +1374,9 @@ class TestUpgradeTargets:
             targets = await self._targets(h)
         assert (targets.mce_cluster, targets.control_plane_version) == (MCE, "4.18.56")
         assert [t.version for t in targets.targets] == ["4.21.40", "4.20.44", "4.19.53"]
+        # The form's order and maxUnavailable fields start from the file (D28).
+        assert [(np.name, np.max_unavailable) for np in targets.nodepools] == [("np-a", "1"), ("np-b", "1")]
+        assert targets.nodepool_order == ["np-a", "np-b"]
         # Two git reads on the hub; nothing on the MCE or the cluster.
         assert fleet.calls == ["read_day1_cluster", "read_upgrade_rules"]
 

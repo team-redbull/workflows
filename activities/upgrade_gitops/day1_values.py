@@ -553,6 +553,50 @@ class _Text:
             return
         self.lines.insert(_entry_insert_at(self.lines, span), f"{' ' * span.key_indent}{key}: {value}\n")
 
+    def set_entry_child(self, index: int, key: str, child: str, value: str, *, quoted: bool = False) -> None:
+        """`nodepool[index].key.child: value`, `key` a block mapping, written or added by its lines.
+
+        A `key:` written in flow style (`inPlace: {maxUnavailable: 1}`) is
+        refused: only a block mapping's child line can be set or added.
+        """
+        rendered = f'"{value}"' if quoted else value
+        span = nodepool_spans(self.lines)[index]
+        found = _entry_key_lines(self.lines, span, key)
+        if len(found) > 1:
+            raise Day1ChangeRejectedError(f"nodepool[{index}] writes {key} {len(found)} times")
+        if not found:
+            pad = " " * span.key_indent
+            self.lines.insert(_entry_insert_at(self.lines, span), f"{pad}{key}:\n{pad}  {child}: {rendered}\n")
+            return
+        head = found[0]
+        after_colon = _strip_eol(self.lines[head])[0].split(":", 1)[1].split("#", 1)[0].strip()
+        if after_colon:
+            raise Day1ChangeRejectedError(
+                f"nodepool[{index}].{key} is not written as a block mapping ({after_colon}): edit it by hand"
+            )
+        child_indent: int | None = None
+        children: list[int] = []
+        last = head
+        for line_index in range(head + 1, span.end):
+            body = _strip_eol(self.lines[line_index])[0]
+            stripped = body.lstrip(" ")
+            if not stripped or stripped.startswith("#"):
+                continue
+            indent = len(body) - len(stripped)
+            if indent <= span.key_indent:
+                break
+            child_indent = indent if child_indent is None else child_indent
+            if indent == child_indent and re.match(rf"{re.escape(child)}\s*:(?:\s|$)", stripped):
+                children.append(line_index)
+            last = line_index
+        if len(children) > 1:
+            raise Day1ChangeRejectedError(f"nodepool[{index}].{key} writes {child} {len(children)} times")
+        if children:
+            self.lines[children[0]] = set_scalar(self.lines[children[0]], child, value, quoted=quoted)
+            return
+        pad = " " * (child_indent if child_indent is not None else span.key_indent + 2)
+        self.lines.insert(last + 1, f"{pad}{child}: {rendered}\n")
+
 
 def _require_editable_entries(text: _Text, values: ClusterValues, entries: list[NodePoolEntry]) -> None:
     """The cluster file's own nodepool list, block style, one text span per parsed entry."""
@@ -601,10 +645,19 @@ def plan_edit(root: Path, request: Day1ChangeRequest, current: str) -> Edit:
         summary = f"NodePool {name} → {version}"
         if name not in versions_before:
             raise Day1ChangeRejectedError(f"{path} lists no NodePool {name}")
-        if versions_before[name] == version:
+        entry = next(entry for entry in entries if entry.name == name)
+        limit_before = max_unavailable_of(entry)
+        new_limit = request.max_unavailable is not None and limit_before != request.max_unavailable
+        if new_limit:
+            summary += f", maxUnavailable {limit_before or 'unset'} → {request.max_unavailable}"
+        if versions_before[name] == version and not new_limit:
             return Edit(text=current, changed=False, summary=summary)
         _require_editable_entries(text, before, entries)
-        text.set_entry(next(entry.index for entry in entries if entry.name == name), "workertag", release_tag(version))
+        if versions_before[name] != version:
+            text.set_entry(entry.index, "workertag", release_tag(version))
+        if new_limit:
+            value = request.max_unavailable or ""
+            text.set_entry_child(entry.index, "inPlace", "maxUnavailable", value, quoted=value.endswith("%"))
     elif request.change is Day1ChangeKind.PAUSE:
         summary = 'pausedUntil "true" (abort)'
         if before.own.get("pausedUntil") == _PAUSED:
@@ -621,6 +674,13 @@ def plan_edit(root: Path, request: Day1ChangeRequest, current: str) -> Edit:
     edited = text.render()
     _verify(root, request, before, current, edited, versions_before)
     return Edit(text=edited, changed=edited != current, summary=summary)
+
+
+def max_unavailable_of(entry: NodePoolEntry) -> str | None:
+    """A NodePool entry's own `inPlace.maxUnavailable`, as text ("1", "33%"); None when unset."""
+    in_place = entry.entry.get("inPlace")
+    value = in_place.get("maxUnavailable") if isinstance(in_place, dict) else None
+    return None if value is None else str(value)
 
 
 def _require_version(request: Day1ChangeRequest) -> str:
@@ -722,7 +782,18 @@ def _verify(
             f"the edited {request.path} does not parse cleanly: {'; '.join(after.problems) or 'empty'}"
         )
     allowed = _allowed_paths(request.change)
-    moved = sorted(path for path in _changed_paths(before.own, after.own) if not allowed(path))
+    # D28: a NodePool commit may also set that one NodePool's inPlace.maxUnavailable.
+    limited = (
+        next((entry.index for entry in nodepool_entries(before, []) if entry.name == request.nodepool), None)
+        if request.change is Day1ChangeKind.NODEPOOL and request.max_unavailable is not None else None
+    )
+
+    def allowed_here(path: tuple) -> bool:
+        if limited is not None and path[:3] == ("nodepool", limited, "inPlace") and len(path) <= 4:
+            return len(path) == 3 or path[3] == "maxUnavailable"
+        return allowed(path)
+
+    moved = sorted(path for path in _changed_paths(before.own, after.own) if not allowed_here(path))
     if moved:
         raise Day1ChangeRejectedError(
             f"the edit of {request.path} would also change {', '.join(_dotted(path) for path in moved)}; "
@@ -743,6 +814,11 @@ def _verify(
             want = version if name == request.nodepool else was
             if versions_after.get(name) != want:
                 wrong.append(f"NodePool {name} would run {versions_after.get(name)}, not {want}")
+        if request.max_unavailable is not None:
+            entry = next((e for e in nodepool_entries(after, []) if e.name == request.nodepool), None)
+            limit = max_unavailable_of(entry) if entry else None
+            if limit != request.max_unavailable:
+                wrong.append(f"NodePool {request.nodepool}'s maxUnavailable would be {limit}, not {request.max_unavailable}")
     elif request.change is Day1ChangeKind.PAUSE:
         if after.own.get("pausedUntil") != _PAUSED:
             wrong.append('pausedUntil is not "true"')

@@ -548,7 +548,10 @@
           </div>
           <p>The order is <code>nodepool_order</code> from the request, else the file&rsquo;s
           <code>upgrade.nodePoolOrder</code>, else by zone (<code>a</code>, <code>b</code>, <code>c</code>)
-          when every NodePool has one, else file order. For each NodePool:</p>
+          when every NodePool has one, else file order. A request may also set a NodePool&rsquo;s
+          <code>maxUnavailable</code> (<code>max_unavailable</code>, D28): it rides on that NodePool&rsquo;s own
+          commit and stays in the file after the upgrade. Both are fixed at start and shown at approval. For each
+          NodePool:</p>
           <ol>
             <li><b>Wait</b> (manual mode, the default) for <code>continue</code>, which may name the next
               NodePool. <b>This is the customer&rsquo;s turn:</b> they run their own readiness checks on their
@@ -558,7 +561,8 @@
               canary clusters only</b> (<code>upgrade.wave</code> 0 or 1): elsewhere planning fails, saying why
               (<a href="#modes">modes</a>).</li>
             <li><b>Pre-flight 5&ndash;10</b>, scoped to this NodePool, and the digest re-checked.</li>
-            <li><b>Commit</b> <code>nodepool[&lt;name&gt;].workertag</code> and <b>sync</b>, refused if anything but
+            <li><b>Commit</b> <code>nodepool[&lt;name&gt;].workertag</code> (with its
+              <code>inPlace.maxUnavailable</code> when the request set one) and <b>sync</b>, refused if anything but
               <code>NodePool/&lt;name&gt;</code> is out of sync. A sync refused after the commit landed is retried
               alone.</li>
             <li><b>Watch</b> until <code>NodePool.status.version</code> is the version, <code>UpdatingVersion</code>
@@ -727,8 +731,9 @@
         </tbody>
       </table>
     </div>
-    <p class="note" style="margin-top:14px">The temporary page at <code>/ui/cluster-upgrade</code> offers <code>nodepool_mode</code> and
-    <code>auto_approve</code> on its start form. <code>workers_to_target</code> is API only. The rules are in
+    <p class="note" style="margin-top:14px">The temporary page at <code>/ui/cluster-upgrade</code> offers <code>nodepool_mode</code>,
+    <code>auto_approve</code>, the NodePool order and each NodePool&rsquo;s <code>maxUnavailable</code> on its start
+    form (the last two sent only when changed from the cluster file). <code>workers_to_target</code> is API only. The rules are in
     <code>workflow_domains/cluster_upgrade/gates.py</code> (<code>_UNATTENDED_WAVES</code>,
     <code>tier1_enabled</code>): one rule for all three.</p>
   </section>
@@ -958,6 +963,7 @@ or retry to check again (the count covers 24 hours)</pre>
   "target_minor":      "4.21",               <span class="c">// or "target_version": "4.21.40"</span>
   "nodepool_mode":     "manual",             <span class="c">// default; "auto" rolls on after each soak, upgrade.wave 0 or 1 only</span>
   "nodepool_order":    null,                 <span class="c">// default: upgrade.nodePoolOrder, else zone, else file order</span>
+  "max_unavailable":   null,                 <span class="c">// {"&lt;nodepool&gt;": 2 or "33%"}: written with its commit, and kept</span>
   "workers_to_target": true,                 <span class="c">// default; false = control plane only, NodePools where the path forces them</span>
   "auto_approve":      false,                <span class="c">// default; planning fails unless upgrade.wave is 0 or 1</span>
   "requested_by":      "&lt;you&gt;"

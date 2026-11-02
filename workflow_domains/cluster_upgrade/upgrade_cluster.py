@@ -48,7 +48,8 @@ says what a person has to do next):
                                sign-off (D19). Auto mode goes on once the
                                previous gate held for the soak;
        preflight             — checks 5–10, then the digest re-checked, the
-                               commit and the sync;
+                               commit (its workertag, and its maxUnavailable
+                               when the request set one, D28) and the sync;
        nodepool-roll         — the roll watched;
        nodepool-gate         — nodes, workloads, the soak.
   5. postflight            — the top-level workertag the run added is dropped;
@@ -377,6 +378,7 @@ class UpgradeClusterWorkflow:
             nodepools_done=list(self._nodepools_done),
             control_plane_version=self._cp_version,
             nodepool_versions=dict(self._np_versions),
+            max_unavailable=dict(context.max_unavailable) if context else {},
             paused=self._paused is not None,
             control_plane_workflow_id=self._cp_workflow_id,
             pending_actions=list(self._pending_actions),
@@ -592,12 +594,17 @@ class UpgradeClusterWorkflow:
             max_worker_skew=rules.max_worker_skew,
             workers_to_target=request.workers_to_target,
         )
+        try:
+            max_unavailable = gates.max_unavailable_overrides(request.max_unavailable, plan)
+        except ValueError as err:
+            self._fail_planning(str(err))
         self._cp_version = plan.control_plane
         self._np_versions = dict(plan.nodepools)
         context = UpgradeContext(
             plan=plan,
             profile=profile,
             nodepool_order=order,
+            max_unavailable=max_unavailable,
             soak_minutes=gates.soak_minutes(profile, day1),
             max_concurrent_control_planes=rules.max_concurrent_control_planes,
             release=rules.release,
@@ -1208,6 +1215,11 @@ class UpgradeClusterWorkflow:
                     change=change,
                     version=version,
                     nodepool=nodepool,
+                    # D28: the NodePool's maxUnavailable rides on its own commit.
+                    max_unavailable=(
+                        context.max_unavailable.get(nodepool)
+                        if change is Day1ChangeKind.NODEPOOL and nodepool else None
+                    ),
                 ),
             )
         except ActivityError as err:
@@ -1689,7 +1701,10 @@ class UpgradeClusterWorkflow:
             f"{'control plane' if s.kind is StepKind.CONTROL_PLANE else 'workers'} → {s.version}"
             for s in plan.steps
         )
-        return f"{plan.control_plane} → {plan.target} in {len(plan.steps)} steps ({steps})"
+        limits = "; maxUnavailable " + ", ".join(
+            f"{name} {value}" for name, value in self._ctx.max_unavailable.items()
+        ) if self._ctx.max_unavailable else ""
+        return f"{plan.control_plane} → {plan.target} in {len(plan.steps)} steps ({steps}){limits}"
 
     def _log(self, event: str, by: str | None = None, detail: str = "") -> None:
         """One milestone: into the run's log (progress, result), and the worker's (not on replay)."""

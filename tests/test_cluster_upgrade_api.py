@@ -122,6 +122,16 @@ class TestStart:
         assert client.post(PATH, json={**BODY, "target_version": "4.20.44-x86_64"}).status_code == 202
         assert fake.starts[0][1].input.target_version == "4.20.44"
 
+    def test_max_unavailable_reaches_the_run_as_the_text_the_file_gets(self, client, fake):
+        body = {**BODY, "max_unavailable": {"np-a": 2, "np-b": " 33% ", "np-c": "100%"}}
+        assert client.post(PATH, json=body).status_code == 202
+        assert fake.starts[0][1].input.max_unavailable == {"np-a": "2", "np-b": "33%", "np-c": "100%"}
+
+    def test_a_bad_max_unavailable_names_its_nodepool(self, client, fake):
+        response = client.post(PATH, json={**BODY, "max_unavailable": {"zone-b": "0"}})
+        assert response.status_code == 422
+        assert "NodePool zone-b" in response.text and "1% to 100%" in response.text
+
     def test_a_minor_alone_is_a_target(self, client, fake):
         body = {**BODY, "target_minor": "4.21"}
         del body["target_version"]
@@ -138,6 +148,15 @@ class TestStart:
             {"target_version": None, "target_minor": "4.x"},
             {"nodepool_order": ["np-a", "np-a"]},
             {"nodepool_order": []},
+            # maxUnavailable: 1 or more nodes, or 1% to 100% (D28).
+            {"max_unavailable": {}},
+            {"max_unavailable": {"np-a": 0}},
+            {"max_unavailable": {"np-a": "0%"}},
+            {"max_unavailable": {"np-a": "101%"}},
+            {"max_unavailable": {"np-a": "33.5%"}},
+            {"max_unavailable": {"np-a": "-1"}},
+            {"max_unavailable": {"np-a": "all"}},
+            {"max_unavailable": {"np-a": True}},
             {"requested_by": ""},
             {"server_names": ["x"]},  # unknown fields are refused, not ignored
             # The day1 file's name, held to the same rule as upgrade-targets'.

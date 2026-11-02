@@ -9,6 +9,9 @@ ladder rung newer than the control plane, of a minor the MCE supports, to which
 a path resolves. The ladder is what the team mirrored and verified, so a minor
 missing from the internal registry is never offered.
 
+It also hands back the file's NodePools and the order a run would roll them in,
+for the form's order and maxUnavailable fields (D28).
+
 Nothing is written, and no cluster is read: planning still checks git against
 the cluster and pins every release in the mirror. A file the parser refused
 (`problems`), a mastertag or a ladder that is no version FAILS the run with
@@ -68,6 +71,13 @@ class UpgradeTargetsWorkflow:
                 raise ApplicationError(
                     f"no upgrade targets for {cluster}: {err}", type=UpgradePathRefusedError.__name__
                 ) from None
+        names = [np.name for np in day1.nodepools]
+        try:
+            order = gates.nodepool_order(requested=None, day1=day1, names=names)
+        except ValueError:
+            # upgrade.nodePoolOrder does not name each NodePool once: planning
+            # fails on it unless the request orders them, so offer file order.
+            order = names
         workflow.logger.info(
             "cluster=%s on %s at %s: %d upgrade targets (%s)",
             cluster,
@@ -85,4 +95,6 @@ class UpgradeTargetsWorkflow:
             ladder_revision=rules.revision,
             verified_against_graph=rules.verified_against_graph,
             targets=targets,
+            nodepools=day1.nodepools,
+            nodepool_order=order,
         )

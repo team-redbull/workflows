@@ -131,6 +131,10 @@ class UpgradeClusterInput(BaseModel):
     nodepool_mode: NodePoolMode = NodePoolMode.MANUAL
     # Default: the cluster file's `upgrade.nodePoolOrder`, else zone order.
     nodepool_order: list[str] | None = None
+    # NodePool → InPlace maxUnavailable ("2", "33%"), written into the cluster
+    # file with that NodePool's workertag and kept there (D28). A NodePool not
+    # named keeps the file's own. None in runs started before the field.
+    max_unavailable: dict[str, str] | None = None
     # False: control plane only; NodePools move only where the path forces them.
     workers_to_target: bool = True
     # True: the run approves its own plan after pre-flight.
@@ -189,6 +193,9 @@ class UpgradeContext(BaseModel):
     plan: UpgradePlan
     profile: ClusterProfile
     nodepool_order: list[str]
+    # The request's maxUnavailable per NodePool, checked against the plan (D28):
+    # each NodePool commit writes its own. Empty in runs planned before it.
+    max_unavailable: dict[str, str] = Field(default_factory=dict)
     soak_minutes: int
     max_concurrent_control_planes: int
     release: ReleaseLayout
@@ -341,6 +348,10 @@ class UpgradeTargets(BaseModel):
     ladder_revision: str
     verified_against_graph: str | None = None
     targets: list[UpgradeTarget] = Field(default_factory=list)
+    # The file's NodePools, for the form's order and maxUnavailable (D28), and
+    # the order a run would roll them in when the request names none.
+    nodepools: list[Day1NodePool] = Field(default_factory=list)
+    nodepool_order: list[str] = Field(default_factory=list)
 
 
 class UpgradeClusterRunArgs(BaseModel):
@@ -363,6 +374,9 @@ class UpgradeClusterProgress(BaseModel):
     nodepools_done: list[str] = Field(default_factory=list)
     control_plane_version: str | None = None
     nodepool_versions: dict[str, str] = Field(default_factory=dict)
+    # The maxUnavailable this run writes per NodePool (D28); a NodePool not
+    # named keeps the cluster file's own.
+    max_unavailable: dict[str, str] = Field(default_factory=dict)
     paused: bool = False
     control_plane_workflow_id: str | None = None
     pending_actions: list[PendingAction] = Field(default_factory=list)
@@ -561,6 +575,9 @@ class Day1ChangeRequest(BaseModel):
     # CONTROL_PLANE: the release every NodePool stays on, written explicitly so
     # moving mastertag never moves a worker.
     nodepool_versions: dict[str, str] = Field(default_factory=dict)
+    # NODEPOOL: also the NodePool's `inPlace.maxUnavailable`, in the same
+    # commit as its workertag (D28). None leaves the file's own.
+    max_unavailable: str | None = None
 
 
 class Day1Commit(BaseModel):

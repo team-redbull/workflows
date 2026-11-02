@@ -172,6 +172,53 @@ def nodepool_order(
     return file_order
 
 
+_WHOLE_NUMBER = re.compile(r"^[0-9]+$")
+_PERCENTAGE = re.compile(r"^([0-9]+)%$")
+
+
+def max_unavailable_value(value: int | str) -> str:
+    """A maxUnavailable a person may ask for, as the text the cluster file gets (D28).
+
+    A whole number of nodes, 1 or more, or a whole percentage, 1% to 100%.
+    HyperShift would take 0 and raise it to 1 (`_batch_size`), so 0 is refused
+    rather than written. Raises ValueError with the reason.
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"maxUnavailable {value!r} is not a number of nodes or a percentage")
+    text = str(value).strip()
+    if _WHOLE_NUMBER.match(text) and int(text) >= 1:
+        return str(int(text))
+    percentage = _PERCENTAGE.match(text)
+    if percentage and 1 <= int(percentage.group(1)) <= 100:
+        return f"{int(percentage.group(1))}%"
+    raise ValueError(
+        f"maxUnavailable {value!r} must be a whole number of nodes (1 or more) or a percentage (1% to 100%)"
+    )
+
+
+def max_unavailable_overrides(requested: dict[str, str] | None, plan: UpgradePlan) -> dict[str, str]:
+    """The request's maxUnavailable per NodePool, for the NodePools this plan rolls (D28).
+
+    Each is written with that NodePool's workertag commit, so a NodePool the
+    plan never rolls would never get it: naming one is refused, as is a value
+    `max_unavailable_value` refuses. Raises ValueError with the reason, which
+    the caller reports as a failed planning check.
+    """
+    if not requested:
+        return {}
+    # A NodePool may roll in two steps (a skew step, then the final one): once is enough here.
+    rolled = list(dict.fromkeys(
+        name for step in plan.steps if step.kind is StepKind.WORKERS for name in step.nodepools
+    ))
+    not_rolled = sorted(set(requested) - set(rolled))
+    if not_rolled:
+        raise ValueError(
+            f"max_unavailable names {', '.join(not_rolled)}, which this plan does not roll "
+            f"(it rolls {', '.join(rolled) or 'no NodePool'}): its maxUnavailable would never be written"
+        )
+    return {name: max_unavailable_value(requested[name]) for name in rolled if name in requested}
+
+
 def _batch_size(replicas: int, max_unavailable: str | None) -> int:
     """How many nodes an InPlace roll takes down at once.
 

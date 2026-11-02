@@ -409,8 +409,8 @@ class UpgradeGitopsActivitySettings(BaseSettings):
     The day1 and day2 repos, the release registry, Brain: everything the
     upgrade reads or writes in git or a registry. The brain never reads these.
 
-    Keep aligned with deploy/charts/upgrade-gitops-worker/ (upgrade-gitops-config
-    and the Secrets it names).
+    Keep aligned with redbull-platform's gitops/charts/upgrade-gitops-worker/
+    (upgrade-gitops-config and the Secrets it names).
     """
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")

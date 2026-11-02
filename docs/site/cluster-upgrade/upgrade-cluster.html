@@ -101,8 +101,9 @@
           <li>The agent&rsquo;s <b>judge</b> and <b>tier-1</b> tools: every fix is a proposal a person approves, in
             every wave (<a href="#modes">modes</a>).</li>
           <li>The <b>RBAC and admission policies</b> that fence the agent&rsquo;s identities.</li>
-          <li>The three workers&rsquo; charts in redbull-platform: CI builds their images, and they are installed
-            from <code>deploy/charts/</code> by hand.</li>
+          <li>Argo CD apps for the three workers. Their charts are in redbull-platform and CI tags each
+            <code>main</code> build <code>vX.Y.Z</code> there, but nothing deploys them yet: they are
+            installed by hand.</li>
           <li>Fleet waves and their circuit breaker.</li>
         </ul>
       </div>

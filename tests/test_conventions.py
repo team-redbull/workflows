@@ -202,6 +202,30 @@ async def approve(workflow_id: str, client):
     assert "RT007" not in _rules(checker.run_source("workflow_domains/probe/router.py", source))
 
 
+def test_a_limb_image_is_version_tagged_never_built_image_only(checker):
+    reusable = """
+  build-probe-worker:
+    uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
+    with:
+      image-name: probe-worker
+      dockerfile: activities/probe/Dockerfile
+      chart-repo: team-redbull/redbull-platform
+      helm-values-path: gitops/charts/probe-worker/values.yaml
+"""
+    image_only = """
+  build-probe-worker:
+    steps:
+      - uses: docker/build-push-action@v5
+        with:
+          file: activities/probe/Dockerfile
+          tags: ghcr.io/${{ github.repository_owner }}/probe-worker:${{ steps.tag.outputs.tag }}
+"""
+    assert checker.limb_build_problems("probe", reusable) == []
+    problems = checker.limb_build_problems("probe", image_only)
+    assert len(problems) == 1 and "image-only" in problems[0] and "vX.Y.Z" in problems[0]
+    assert "no build job" in checker.limb_build_problems("probe", "")[0]
+
+
 def test_the_hook_names_the_docs_pages_of_the_edited_code(checker):
     reminder = checker.docs_reminder(REPO_ROOT / "workflow_domains/segment_lifecycle/allocate_segment.py")
     assert reminder is not None

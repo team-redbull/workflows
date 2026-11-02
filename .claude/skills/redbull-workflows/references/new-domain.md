@@ -31,10 +31,10 @@ settings class (`<Limb>ActivitySettings`) and the chart name from them.
    guard test fails until you do) and its queue to `tests/test_worker_registration.py`'s
    `_WORKERS`; activity tests per [testing.md](testing.md).
 5. **CI** — `.github/workflows/build.yml`: a `build-<limb>-worker` job that `needs` the
-   `test` job. With its chart in redbull-platform, use the reusable
-   `ghcr-build-push.yml` in the sequential chain (`helm-values-path:
-   gitops/charts/<limb>-worker/values.yaml`); until then, an IMAGE-ONLY job like
-   `build-cluster-upgrade-worker` (tag `<branch-slug>-<sha>`, set by hand in the chart).
+   `test` job: the reusable `ghcr-build-push.yml` at the end of the sequential chain
+   (`helm-values-path: gitops/charts/<limb>-worker/values.yaml`), so `main` builds get
+   `vX.Y.Z` tags. Put the chart into redbull-platform first (step 6), or the bump fails;
+   no image-only job with a `<branch-slug>-<sha>` tag (removed 2026-11-02).
    Add a `cleanup-<limb>-worker-on-delete` job. Every limb rebuilds on any change under
    `activities/` or `shared/`; say so if that matters.
 6. **Chart** — per-MCE limb: `deploy/charts/<limb>-worker/` here, with a README whose

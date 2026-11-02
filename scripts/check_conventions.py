@@ -1084,15 +1084,8 @@ def check_delivery(report: _Report) -> None:
             report.error(REPO_ROOT / ACTIVITIES_DIR / domain / "requirements.txt", 1, "DL001", f"activities/{domain}/ has no requirements.txt — the limb owns its dependency set (§2)")
         if not build_text:
             continue
-        reusable = re.search(rf"dockerfile:\s*{ACTIVITIES_DIR}/{domain}/Dockerfile\b", build_text)
-        image_only = re.search(rf"\bfile:\s*{ACTIVITIES_DIR}/{domain}/Dockerfile\b", build_text)
-        if not (reusable or image_only):
-            report.error(build_yml, 1, "DL002", f"no build job for activities/{domain}/Dockerfile — add `build-{kebab}-worker` (§1, §9)")
-            continue
-        if not re.search(rf"(image-name:\s*{kebab}-worker\b|/{kebab}-worker:)", build_text):
-            report.error(build_yml, 1, "DL002", f"the {domain} limb image is named `{kebab}-worker` (§2)")
-        if reusable and f"helm-values-path: gitops/charts/{kebab}-worker/values.yaml" not in build_text:
-            report.error(build_yml, 1, "DL002", f"the reusable build bumps the tag into redbull-platform `gitops/charts/{kebab}-worker/values.yaml` (§1)")
+        for message in limb_build_problems(domain, build_text):
+            report.error(build_yml, 1, "DL002", message)
 
     nav = REPO_ROOT / "docs" / "site" / "assets" / "nav.js"
     nav_text = _read(nav) or ""
@@ -1112,6 +1105,29 @@ def check_delivery(report: _Report) -> None:
                             report.warning(env_example, 1, "DL004", f"`{key}` ({node.name}) is not documented in .env.example (§8)")
 
     _check_charts(report)
+
+
+def limb_build_problems(domain: str, build_text: str) -> list[str]:
+    """DL002 for one limb, from build.yml's text: a job on the reusable workflow, so a
+    main build gets a vX.Y.Z tag and its redbull-platform bump (§9). An image-only job
+    (`docker/build-push-action` straight on the Dockerfile, tagged by commit sha) is
+    refused: the operator's rule since 2026-11-02 is version tags, never commit shas."""
+    kebab = _kebab(domain)
+    reusable = re.search(rf"dockerfile:\s*{ACTIVITIES_DIR}/{domain}/Dockerfile\b", build_text)
+    image_only = re.search(rf"\bfile:\s*{ACTIVITIES_DIR}/{domain}/Dockerfile\b", build_text)
+    if not (reusable or image_only):
+        return [f"no build job for activities/{domain}/Dockerfile — add `build-{kebab}-worker` (§1, §9)"]
+    problems = []
+    if image_only:
+        problems.append(
+            f"activities/{domain}/Dockerfile is built image-only (a commit-sha tag) — use the reusable "
+            f"ghcr-build-push.yml so main builds are tagged vX.Y.Z; vendor its chart in redbull-platform first (§9)"
+        )
+    if not re.search(rf"(image-name:\s*{kebab}-worker\b|/{kebab}-worker:)", build_text):
+        problems.append(f"the {domain} limb image is named `{kebab}-worker` (§2)")
+    if reusable and f"helm-values-path: gitops/charts/{kebab}-worker/values.yaml" not in build_text:
+        problems.append(f"the reusable build bumps the tag into redbull-platform `gitops/charts/{kebab}-worker/values.yaml` (§1)")
+    return problems
 
 
 def _check_workflow_docs(module_path: Path, domain: str, cls: ast.ClassDef, nav: Path, nav_text: str, report: _Report) -> None:

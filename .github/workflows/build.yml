@@ -209,11 +209,10 @@ jobs:
     secrets: inherit
 
   build-server-provisioning-worker:
-    # The provision-dell-server limb. LAST in the chain on purpose: its chart
-    # (gitops/charts/server-provisioning-worker/ in redbull-platform) does not
-    # exist yet, so the image-tag bump fails until it is added — and a failure
-    # here must not stop the docs, which it would if it sat ahead of them.
-    # Move it back beside the other limbs once the chart lands.
+    # The provision-dell-server limb. It went LAST in the chain while its chart
+    # (gitops/charts/server-provisioning-worker/ in redbull-platform) did not exist, so
+    # the failing bump could not stop the docs. The chart exists now; the job could move
+    # back beside the other limbs.
     needs: [changes, build-workflows-docs]
     if: ${{ !cancelled() && !failure() && needs.changes.outputs.limb == 'true' }}
     uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
@@ -225,100 +224,51 @@ jobs:
       helm-image-path: activityWorker.image
     secrets: inherit
 
-  build-upgrade-agent-worker:
-    # The cluster-upgrade agent limb (activities/upgrade_agent/). IMAGE ONLY, NO CHART BUMP:
-    # its chart does not exist in redbull-platform yet (it is deploy/charts/upgrade-agent-worker/
-    # here), and the shared ghcr-build-push workflow always bumps the chart on main, so that
-    # bump would fail. Until the chart is vendored there, this job publishes
-    # ghcr.io/<owner>/upgrade-agent-worker:<branch-slug>-<short sha> and the tag is set by hand;
-    # then switch it to the reusable workflow like the other limbs. Outside the sequential
-    # chain on purpose: it pushes nothing to redbull-platform, so it races with nothing.
-    needs: [changes, test]
-    if: ${{ needs.changes.outputs.limb == 'true' }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v4
-      - id: tag
-        run: |
-          slug="$(echo "${GITHUB_REF_NAME}" | tr -c 'a-zA-Z0-9' '-' | tr 'A-Z' 'a-z' | sed 's/-\+/-/g; s/^-//; s/-$//')"
-          echo "tag=${slug}-$(git rev-parse --short HEAD)" >> "${GITHUB_OUTPUT}"
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: activities/upgrade_agent/Dockerfile
-          push: true
-          tags: ghcr.io/${{ github.repository_owner }}/upgrade-agent-worker:${{ steps.tag.outputs.tag }}
-
+  # cluster-upgrade's three limbs. Their charts are in redbull-platform since 2026-11-02:
+  # cluster-upgrade-worker and upgrade-agent-worker (per MCE) as copies of deploy/charts/
+  # here, upgrade-gitops-worker (hub) only there. Each main build gets a vX.Y.Z tag, the
+  # bump of image.tag in that chart's values.yaml and a <chart>/vX.Y.Z tag there, like
+  # every other image; a branch build stays <branch-slug>-<short sha>. None of the three
+  # has a gitops/services/ entry yet, so their bumps deploy nothing. Sequential, at the
+  # end, for the reason build-segment-lifecycle-worker gives.
   build-cluster-upgrade-worker:
-    # The cluster-upgrade per-MCE limb (activities/cluster_upgrade/). IMAGE ONLY, NO CHART BUMP,
-    # like build-upgrade-agent-worker above and for the same reason: its chart is
-    # deploy/charts/cluster-upgrade-worker/ here and not yet in redbull-platform, so the shared
-    # workflow's bump on main would fail. Publishes
-    # ghcr.io/<owner>/cluster-upgrade-worker:<branch-slug>-<short sha>; the chart's image.tag is
-    # set by hand. Once the chart is vendored as gitops/charts/cluster-upgrade-worker/, switch it
-    # to the reusable workflow, last in the sequential chain, with helm-image-path: image.
-    needs: [changes, test]
-    if: ${{ needs.changes.outputs.limb == 'true' }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v4
-      - id: tag
-        run: |
-          slug="$(echo "${GITHUB_REF_NAME}" | tr -c 'a-zA-Z0-9' '-' | tr 'A-Z' 'a-z' | sed 's/-\+/-/g; s/^-//; s/-$//')"
-          echo "tag=${slug}-$(git rev-parse --short HEAD)" >> "${GITHUB_OUTPUT}"
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: activities/cluster_upgrade/Dockerfile
-          push: true
-          tags: ghcr.io/${{ github.repository_owner }}/cluster-upgrade-worker:${{ steps.tag.outputs.tag }}
+    # The per-MCE limb (activities/cluster_upgrade/), the workflow ServiceAccount.
+    needs: [changes, build-server-provisioning-worker]
+    if: ${{ !cancelled() && !failure() && needs.changes.outputs.limb == 'true' }}
+    uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
+    with:
+      image-name: cluster-upgrade-worker
+      dockerfile: activities/cluster_upgrade/Dockerfile
+      chart-repo: team-redbull/redbull-platform
+      helm-values-path: gitops/charts/cluster-upgrade-worker/values.yaml
+      helm-image-path: image
+    secrets: inherit
+
+  build-upgrade-agent-worker:
+    # The per-MCE agent limb (activities/upgrade_agent/): calls the upgrade agent service.
+    needs: [changes, build-cluster-upgrade-worker]
+    if: ${{ !cancelled() && !failure() && needs.changes.outputs.limb == 'true' }}
+    uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
+    with:
+      image-name: upgrade-agent-worker
+      dockerfile: activities/upgrade_agent/Dockerfile
+      chart-repo: team-redbull/redbull-platform
+      helm-values-path: gitops/charts/upgrade-agent-worker/values.yaml
+      helm-image-path: image
+    secrets: inherit
 
   build-upgrade-gitops-worker:
-    # The cluster-upgrade HUB limb (activities/upgrade_gitops/: git, oc, the registry).
-    # IMAGE ONLY, NO CHART BUMP, for the reason the upgrade-agent job above gives: its
-    # chart is deploy/charts/upgrade-gitops-worker/ here, not yet vendored in
-    # redbull-platform, so the shared workflow's bump would fail. Publishes
-    # ghcr.io/<owner>/upgrade-gitops-worker:<branch-slug>-<short sha>; the tag is set by
-    # hand until the chart moves there, then this joins the reusable workflow's chain.
-    needs: [changes, test]
-    if: ${{ needs.changes.outputs.limb == 'true' }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v4
-      - id: tag
-        run: |
-          slug="$(echo "${GITHUB_REF_NAME}" | tr -c 'a-zA-Z0-9' '-' | tr 'A-Z' 'a-z' | sed 's/-\+/-/g; s/^-//; s/-$//')"
-          echo "tag=${slug}-$(git rev-parse --short HEAD)" >> "${GITHUB_OUTPUT}"
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: activities/upgrade_gitops/Dockerfile
-          push: true
-          tags: ghcr.io/${{ github.repository_owner }}/upgrade-gitops-worker:${{ steps.tag.outputs.tag }}
+    # The hub limb (activities/upgrade_gitops/: git, oc, the registry).
+    needs: [changes, build-upgrade-agent-worker]
+    if: ${{ !cancelled() && !failure() && needs.changes.outputs.limb == 'true' }}
+    uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
+    with:
+      image-name: upgrade-gitops-worker
+      dockerfile: activities/upgrade_gitops/Dockerfile
+      chart-repo: team-redbull/redbull-platform
+      helm-values-path: gitops/charts/upgrade-gitops-worker/values.yaml
+      helm-image-path: image
+    secrets: inherit
 
   cleanup-workflow-brain-on-delete:
     if: github.event_name == 'delete'

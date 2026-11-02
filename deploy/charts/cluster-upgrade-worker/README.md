@@ -30,22 +30,29 @@ activity queue. On the sandbox the MCE is the hub itself (local-cluster hosts th
 hosted clusters), so Temporal is the in-cluster Service, plain gRPC:
 
 ```bash
-helm upgrade --install cluster-upgrade-worker deploy/charts/cluster-upgrade-worker \
+helm upgrade --install cluster-upgrade-worker <chart dir> \
   -n redbull-workflows \
   --set mceCluster=ocp4-mce-workflow-test \
   --set temporal.host=temporal-frontend.temporal.svc.cluster.local:7233 \
-  --set image.tag=<tag> \
+  --set image.tag=<vX.Y.Z> \
   --set replicaCount=1
 ```
 
-`<tag>`: CI publishes `ghcr.io/team-redbull/cluster-upgrade-worker:<branch-slug>-<short sha>`
-on every push that touches `activities/` or `shared/` (`build-cluster-upgrade-worker`), e.g.
-`main-1a2b3c4` for main's commit `1a2b3c4`. Image only: the chart is not in redbull-platform
-yet, so nothing bumps the tag for you.
+`<chart dir>`: this chart, in the workflows repo at `deploy/charts/cluster-upgrade-worker/` or
+its copy in redbull-platform at `gitops/charts/cluster-upgrade-worker/`.
+
+`<vX.Y.Z>`: a version tag. Every push to `main` that touches `activities/` or `shared/`
+publishes `ghcr.io/team-redbull/cluster-upgrade-worker:vX.Y.Z` (`build-cluster-upgrade-worker`,
+the shared build workflow), writes that tag into redbull-platform's copy
+(`gitops/charts/cluster-upgrade-worker/values.yaml`, `image.tag`) and tags redbull-platform
+`cluster-upgrade-worker/vX.Y.Z`. Installed from redbull-platform's copy, leave `image.tag`
+unset to get the newest. A branch build is tagged `<branch-slug>-<short sha>` and written
+nowhere; deploy those only to try a branch.
 
 On a remote MCE, Temporal is reached through the hub's TLS Route: set
 `temporal.host` to `<route-host>:443`, `temporal.tls.enabled: true` and the CA, exactly
-as `deploy/charts/server-lifecycle-worker/README.md` describes (steps 1–6 there).
+as the workflows repo's `deploy/charts/server-lifecycle-worker/README.md` describes (steps
+1–6 there).
 
 `mceCluster` must be the MCE's folder in day1, `sites/<site>/mces/<mceCluster>/`:
 an upgrade run takes its MCE from where the cluster's file is (D18) and dispatches to
@@ -58,12 +65,13 @@ Check the worker polls its queue:
 temporal task-queue describe --task-queue cluster-upgrade-activity-<mceCluster> --task-queue-type activity
 ```
 
-For Argo CD, copy the chart into redbull-platform as `gitops/charts/cluster-upgrade-worker/`
-with a `gitops/services/cluster-upgrade-worker/app.yaml`, then move CI's
-`build-cluster-upgrade-worker` to the reusable workflow (`helm-image-path: image`), which bumps
-the tag there on every push to main (`.github/workflows/build.yml`). For many MCEs, the
-ApplicationSet in `deploy/argocd/server-lifecycle-worker-applicationset.yaml` is the
-shape, with this chart's name.
+The chart is copied into redbull-platform as `gitops/charts/cluster-upgrade-worker/`
+(2026-11-02), where CI bumps its tag; it has no `gitops/services/` entry there yet, so Argo CD
+deploys nothing from it. Change the chart here and copy it there in the same change. To deploy
+it with Argo CD, add `gitops/services/cluster-upgrade-worker-<mce>/app.yaml` per MCE, as
+`gitops/services/server-lifecycle-worker/app.yaml` there describes. For many MCEs, the workflows
+repo's `deploy/argocd/server-lifecycle-worker-applicationset.yaml` is the shape, with this
+chart's name.
 
 ## Configuration
 

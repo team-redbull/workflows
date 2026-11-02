@@ -4,8 +4,11 @@ Two homes for charts, decided by where the limb runs:
 
 | limb | chart lives | deployed by |
 | --- | --- | --- |
-| the brain (`workflows-orchestrator`) and HUB limbs (`segment-lifecycle-worker`, `server-provisioning-worker`, ...) | redbull-platform `gitops/charts/<service>/` | Argo CD: one ApplicationSet over `gitops/services/<service>/app.yaml`; pushing redbull-platform `main` DEPLOYS |
-| PER-MCE limbs (`server-lifecycle-worker`, `cluster-upgrade-worker`, `upgrade-agent-worker`) and hub limbs not vendored yet (`upgrade-gitops-worker`) | this repo, `deploy/charts/<limb>-worker/` | copied into redbull-platform for Argo CD (example ApplicationSet in `deploy/argocd/`); `deploy/` triggers no image build |
+| the brain (`workflows-orchestrator`) and HUB limbs (`segment-lifecycle-worker`, `server-provisioning-worker`, `upgrade-gitops-worker`, ...) | redbull-platform `gitops/charts/<service>/` | Argo CD: one ApplicationSet over `gitops/services/<service>/app.yaml`; pushing redbull-platform `main` DEPLOYS |
+| PER-MCE limbs (`server-lifecycle-worker`, `cluster-upgrade-worker`, `upgrade-agent-worker`) | this repo, `deploy/charts/<limb>-worker/` | copied into redbull-platform as `gitops/charts/<limb>-worker/` (where CI bumps the tag) and deployed per MCE from there (example ApplicationSet in `deploy/argocd/`); `deploy/` triggers no image build |
+
+A chart in redbull-platform with no `gitops/services/` entry deploys nothing; CI still bumps
+its tag. `server-provisioning-worker` and cluster-upgrade's three are like that today.
 
 redbull-platform is assumed checked out at `../redbull-platform`; verify the path before
 editing, and if it is absent hand the chart change over as a diff in the reply. Its
@@ -52,6 +55,10 @@ server dry-run runs the admission webhooks the sync will.
 
 - Brain release first (it owns the global ConfigMap), then Secrets, then limb charts.
 - A new chart references a tag that exists: merge it after CI pushed the first image.
-- Reusable-workflow limbs: CI bumps `values.yaml` on redbull-platform `main` (that
-  commit deploys). Image-only limbs: the tag is `<branch-slug>-<short sha>`, set by hand
-  in the chart until the chart is vendored and the job joins the reusable workflow.
+- Deploy and document images by VERSION TAG, never by commit sha (the operator,
+  2026-11-02). Every limb's job uses the reusable workflow: a `main` build publishes
+  `vX.Y.Z`, bumps `values.yaml` on redbull-platform `main` (that commit deploys, when
+  the chart has a `gitops/services/` entry) and tags `<chart>/vX.Y.Z` there. A branch
+  build is `<branch-slug>-<short sha>`, written nowhere; set it by hand only to try a branch.
+- So a new limb's chart goes into redbull-platform BEFORE its build job: the bump fails
+  on a missing `values.yaml`. Image-only jobs were the stopgap for that and are gone.

@@ -75,7 +75,9 @@ docs/                             The static documentation site (its own image, 
 Prod charts are VENDORED into the Argo CD repo, at
 `redbull-platform/gitops/charts/<service>/`: `workflows-orchestrator` (brain: ONE release for
 all domains), `segment-lifecycle-worker`, `server-lifecycle-worker` and `server-provisioning-worker`
-(limbs: one per domain — the last NOT YET CREATED there, so CI's bump of it fails until it is). One generic ApplicationSet
+(limbs: one per domain), and cluster-upgrade's `cluster-upgrade-worker`, `upgrade-agent-worker`
+and `upgrade-gitops-worker` (since 2026-11-02; with `server-provisioning-worker`, these have no
+`gitops/services/` entry yet, so CI bumps their tags and Argo CD deploys nothing). One generic ApplicationSet
 sweeps `gitops/services/<service>/app.yaml`, so the service FOLDER NAME is the Argo app name,
 the chart path and the release name at once. There is no per-environment values layer — a
 chart's own `values.yaml` is exactly what the cluster runs — and pushing redbull-platform's
@@ -1030,16 +1032,18 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
 
 ## 9. Deploy & run (local)
 
-- Four charts, NONE creates a Namespace (each deploys into whichever namespace the release targets —
+- NO chart creates a Namespace (each deploys into whichever namespace the release targets —
   `helm install -n <ns> [--create-namespace]`, or redbull-platform's `namespaces` release pre-creates
   it): redbull-platform's `gitops/charts/workflows-orchestrator/` (ConfigMap + brain + SA),
-  `gitops/charts/segment-lifecycle-worker/`, `gitops/charts/server-lifecycle-worker/` and the
-  still-to-be-written `gitops/charts/server-provisioning-worker/` (each: ConfigMap + Secrets + limb +
+  `gitops/charts/segment-lifecycle-worker/`, `gitops/charts/server-lifecycle-worker/`,
+  `gitops/charts/server-provisioning-worker/` (each: ConfigMap + Secrets + limb +
   SA; the provisioning one needs no RBAC, only egress to the iDRACs, OME, the naming service and
-  server-scan). This repo ships the PER-MCE limbs' charts, written to be copied into
+  server-scan) and `gitops/charts/upgrade-gitops-worker/` (the cluster-upgrade hub limb; its only
+  copy, moved from `deploy/charts/` on 2026-11-02). This repo ships the PER-MCE limbs' charts, written to be copied into
   redbull-platform for Argo CD (example ApplicationSet in `deploy/argocd/`):
   `deploy/charts/server-lifecycle-worker/`, `deploy/charts/cluster-upgrade-worker/` and
-  `deploy/charts/upgrade-agent-worker/`. On a
+  `deploy/charts/upgrade-agent-worker/` — the last two copied verbatim as redbull-platform's
+  `gitops/charts/<same name>/`, so a change to either lands in both repos together. On a
   remote MCE each renders its own Temporal endpoint, since no brain ConfigMap exists there;
   `deploy/` is in `.dockerignore` and triggers no image build. The server-lifecycle limb is the first to need real RBAC: it creates
   secrets, metal3.io/baremetalhosts and agent-install.openshift.io/nmstateconfigs in the target
@@ -1051,10 +1055,15 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   (the admin kubeconfig) and deleting pods (`delete_hcp_pod`), a Role in `ARGO_NAMESPACE`
   (applications get/list/patch — list for a lab cluster's day2 Applications, D27) and one on ConfigMap
   `hypershift/supported-versions`. Never a write to a
-  HostedCluster or NodePool (DESIGN D1). Its chart is NOT in redbull-platform yet, so CI's
-  `build-cluster-upgrade-worker` builds the IMAGE ONLY (`<branch-slug>-<short sha>`, the chart's
-  `image.tag` set by hand), like upgrade-agent-worker's; once the chart is vendored it moves to
-  the reusable workflow with its cross-repo bump.
+  HostedCluster or NodePool (DESIGN D1). **The three cluster-upgrade images are VERSION-TAGGED like
+  every other** (the operator, 2026-11-02: "use tags and not commit sha"): `build-cluster-upgrade-worker`,
+  `build-upgrade-agent-worker` and `build-upgrade-gitops-worker` run the reusable workflow at the
+  end of the sequential chain, so a `main` build publishes `vX.Y.Z`, bumps `image.tag` in
+  redbull-platform's `gitops/charts/<limb>-worker/values.yaml` and tags `<limb>-worker/vX.Y.Z`
+  there. Until 2026-11-02 they were image-only jobs tagged `<branch-slug>-<short sha>` with the tag
+  set by hand; do not go back to that. None of the three has a `gitops/services/` entry yet, so
+  their bumps deploy nothing; deploy them by adding one (per MCE for the two per-MCE limbs). The
+  domain keeps THREE images, one per limb (§2): the operator confirmed it the same day.
 - Assumed already running: a Temporal server and the Segments Manager (via OpenShift routes or
   localhost — no port assumptions in code).
 - Trigger via the unified API: `uvicorn workflow_domains.api:app --port 8080`, Swagger at `/docs`.

@@ -9,15 +9,24 @@ kubernetes-sigs agent-sandbox `Sandbox` (`agents.x-k8s.io/v1beta1`) behind a Ser
 model endpoint and the agent's own read-only identities. Install it first, then this:
 
 ```bash
-helm install upgrade-agent-worker deploy/charts/upgrade-agent-worker -n upgrade-agent \
+helm install upgrade-agent-worker <chart dir> -n upgrade-agent \
   --set mceCluster=<mce> \
   --set temporal.host=<temporal frontend host:port, as reachable from this MCE> \
+  --set image.tag=<vX.Y.Z> \
   --set upgradeAgent.url=http://upgrade-agent.upgrade-agent.svc:8080 \
   --set upgradeAgent.tokenSecret.name=upgrade-agent-token   # the same Secret the agent's apiToken names
 ```
 
-For TLS to the hub's Temporal (a passthrough Route), set `temporal.tls.*` as in
-`deploy/charts/server-lifecycle-worker/README.md`.
+`<chart dir>`: this chart, in the workflows repo at `deploy/charts/upgrade-agent-worker/` or its
+copy in redbull-platform at `gitops/charts/upgrade-agent-worker/` (no `gitops/services/` entry
+yet, so Argo CD deploys nothing from it; change the chart here and copy it there in the same
+change). `<vX.Y.Z>`: every push to `main` that touches `activities/` or `shared/` publishes
+`ghcr.io/team-redbull/upgrade-agent-worker:vX.Y.Z` (`build-upgrade-agent-worker`, the shared
+build workflow) and writes that tag into redbull-platform's copy, so installed from there
+`image.tag` can be left unset. A branch build is tagged `<branch-slug>-<short sha>`.
+
+For TLS to the hub's Temporal (a passthrough Route), set `temporal.tls.*` as in the workflows
+repo's `deploy/charts/server-lifecycle-worker/README.md`.
 
 What it holds: no Kubernetes credential and no RBAC (its ServiceAccount mounts no token), only the
 agent service's URL and, optionally, its bearer token. The URL and the Temporal endpoint are in

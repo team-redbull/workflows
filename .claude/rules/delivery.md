@@ -19,10 +19,12 @@ Checker ids in brackets.
   site (`docs/Dockerfile`). [DL001]
 - **`build.yml`**: the `test` job runs the whole suite on every push and every image job
   needs it, so a red test builds nothing and bumps nothing. `changes` decides which images
-  a push touches. Reusable-workflow jobs (which bump redbull-platform `main`, which
-  deploys) form one sequential chain guarded by `!cancelled() && !failure()`; image-only
-  jobs (charts not vendored yet) stand outside it. A new limb adds `build-<limb>-worker`
-  and `cleanup-<limb>-worker-on-delete`. [DL002]
+  a push touches. Every image job uses the reusable `ghcr-build-push.yml` (it bumps
+  redbull-platform `main`, which deploys) and they form one sequential chain guarded by
+  `!cancelled() && !failure()`. So a `main` build is tagged `vX.Y.Z`, never by commit sha:
+  no image-only job (the operator, 2026-11-02); vendor a new limb's chart in
+  redbull-platform first. A new limb adds `build-<limb>-worker` and
+  `cleanup-<limb>-worker-on-delete`. [DL002]
 - **Order that keeps prod up**: brain image before limbs; a chart ships a new key before
   the image needs it and drops one only after the image stopped needing it; the brain
   release installs before any hub limb.

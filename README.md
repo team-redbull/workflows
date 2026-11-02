@@ -95,7 +95,12 @@ The prod charts are vendored into the Argo CD repo, not this one:
 | `redbull-platform/gitops/charts/workflows-orchestrator/` | the brain — ONE release, shared by every domain |
 | `redbull-platform/gitops/charts/segment-lifecycle-worker/` | the `segment-lifecycle-worker` limb |
 | `redbull-platform/gitops/charts/server-lifecycle-worker/` | the `server-lifecycle-worker` limb |
-| `redbull-platform/gitops/charts/server-provisioning-worker/` | the `server-provisioning-worker` limb — **not created yet**; CI's image bump fails until it exists |
+| `redbull-platform/gitops/charts/server-provisioning-worker/` | the `server-provisioning-worker` limb — no `gitops/services/` entry yet, so nothing deploys it |
+| `redbull-platform/gitops/charts/cluster-upgrade-worker/`, `.../upgrade-agent-worker/` | cluster-upgrade's per-MCE limbs, copies of `deploy/charts/` here — no `gitops/services/` entry yet |
+| `redbull-platform/gitops/charts/upgrade-gitops-worker/` | cluster-upgrade's hub limb (its only copy) — no `gitops/services/` entry yet |
+
+Every image built on `main` is tagged `vX.Y.Z` by the shared build workflow, which writes the
+tag into that chart's `values.yaml`; a branch build is tagged `<branch-slug>-<short sha>`.
 
 Worker-file naming convention: the workflow (brain) worker is
 `workflow_domains/main_worker_init.py`; each activity domain's worker is

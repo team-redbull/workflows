@@ -1,0 +1,495 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>publish-infraenv-to-pxe-server — Redbull Workflows</title>
+<meta name="description" content="The publish-infraenv-to-pxe-server workflow: write one InfraEnv's current iPXE boot entry onto the PXE VM of its MCE's site, on demand and tied to no host — the same publish add-server-to-mce makes per IPMI blade.">
+<link rel="icon" href="/assets/favicon.svg?v=__DOC_VERSION__" type="image/svg+xml">
+<link rel="stylesheet" href="/assets/site.css?v=__DOC_VERSION__">
+</head>
+<body data-page="/server-lifecycle/publish-infraenv-to-pxe-server.html">
+
+<a class="skip-link" href="#main">Skip to content</a>
+
+<!-- Topbar: identical on every page. Brand + deployed version upper-left; the
+     "Workflows" menu is built from the catalogue in assets/nav.js. -->
+<header class="topbar">
+  <a class="brand" href="/">
+    <img class="brand-mark" src="/assets/redbull-logo.png?v=__DOC_VERSION__" alt="" aria-hidden="true"
+         width="480" height="179">
+    <span class="brand-name">Redbull Workflows</span>
+    <span class="brand-ver" title="deployed image tag of this documentation site">__DOC_VERSION__</span>
+  </a>
+  <nav class="topnav" aria-label="Site">
+    <a class="topnav-link" href="/">Orchestrator guide</a>
+    <div class="wfmenu">
+      <button class="wfmenu-btn" id="wfmenu-btn" type="button"
+              aria-expanded="false" aria-haspopup="true" aria-controls="wfmenu-panel">
+        Workflows <span class="caret" aria-hidden="true">&#9662;</span>
+      </button>
+      <div class="wfmenu-panel" id="wfmenu-panel" role="menu" aria-label="Workflows by domain" hidden></div>
+    </div>
+    <noscript>
+      <a class="topnav-link" href="/server-lifecycle/publish-infraenv-to-pxe-server.html">publish-infraenv-to-pxe-server</a>
+    </noscript>
+  </nav>
+</header>
+
+<main id="main">
+<header class="masthead">
+  <div class="masthead-inner">
+    <div class="eyebrow">Temporal workflow &middot; domain: server-lifecycle</div>
+    <h1>publish-infraenv-to-pxe-server<span class="dim"> &mdash; what actually happens</span></h1>
+    <p class="lede">
+      One request writes an InfraEnv&rsquo;s <b>boot entry</b>,
+      <code>/var/www/pxe-map/&lt;mce_cluster&gt;/&lt;infra_env&gt;.ipxe</code>, onto the <b>PXE VM</b> of
+      the MCE&rsquo;s site. It holds the InfraEnv&rsquo;s current iPXE script URL, and every IPMI blade that
+      <a href="/server-lifecycle/add-server-to-mce.html">add-server-to-mce</a> mapped to that InfraEnv
+      chains to it when it boots from the network.
+    </p>
+    <p class="lede">add-server-to-mce already makes this same publish itself, once per IPMI host. This
+    workflow is that publish <b>on demand, tied to no host</b>: to seed the entry before the first
+    install, to repair one deleted or corrupted on the VM, or to point it at a regenerated discovery
+    image without installing anything. It writes nothing on the MCE, maps no MAC, deletes no entry, and
+    can never roll an entry back to an older image.</p>
+    <div class="facts">
+      <div class="fact"><span class="k">Trigger</span><span class="v">POST /workflows/server-lifecycle/publish-infraenv-to-pxe-server</span></div>
+      <div class="fact"><span class="k">Workflow id</span><span class="v">publish-infraenv-to-pxe-server-&lt;mce_cluster&gt;-&lt;infra_env&gt;</span></div>
+      <div class="fact"><span class="k">Workflow queue</span><span class="v">publish-infraenv-to-pxe-server-workflow</span></div>
+      <div class="fact"><span class="k">Activity queues</span><span class="v">segment-lifecycle-activity (step 1) &middot; server-lifecycle-activity-&lt;mce_cluster&gt; (steps 2&ndash;3)</span></div>
+    </div>
+    <p class="note">Named <b>publish-infraenv-boot</b> until 2026-11-01. <code>POST
+    /workflows/server-lifecycle/publish-infraenv-boot</code> now answers <b>410</b> naming this route and
+    starts nothing &mdash; send the same body here. Runs started before the rename finish as they began:
+    workflow type <code>PublishInfraEnvBootWorkflow</code> on the queue
+    <code>publish-infraenv-boot-workflow</code>, under their <code>publish-infraenv-boot-&hellip;</code> ids.</p>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <!-- ======================================================= WALKTHROUGH -->
+  <section id="walkthrough">
+    <div class="sec-head">
+      <div class="eyebrow">Read this first</div>
+      <h2>One InfraEnv, one file, one PXE VM</h2>
+      <p class="lede">An IPMI (UCS) blade has no virtual media, so it boots from the network. The site&rsquo;s
+      PXE VM answers its boot MAC with a small per-MAC file that chains to the InfraEnv&rsquo;s boot entry.
+      That boot entry is <b>one file per (MCE, InfraEnv)</b>, shared by every host mapped to the
+      InfraEnv &mdash; so pointing all of them at a new image is one write.</p>
+    </div>
+
+    <div class="grid-2">
+      <div class="panel">
+        <h3>When to run it</h3>
+        <ul>
+          <li><b>Seed</b> the entry before the first install into an InfraEnv.</li>
+          <li><b>Repair</b> an entry that was deleted or corrupted on the PXE VM.</li>
+          <li><b>Refresh</b> the entry after the InfraEnv&rsquo;s discovery image was regenerated,
+            without installing a server.</li>
+        </ul>
+        <p class="note">You do <em>not</em> need it for a normal install: add-server-to-mce publishes the
+        entry itself for every IPMI blade, in its phase <b>publishing-pxe-boot</b>
+        (<a href="/server-lifecycle/add-server-to-mce.html#reference">its phases</a>).</p>
+      </div>
+      <div class="panel">
+        <h3>What it never does</h3>
+        <ul>
+          <li>It writes <b>nothing on the MCE</b>: it only reads the InfraEnv.</li>
+          <li>It reads <b>no NMStateConfig</b>: it publishes the InfraEnv&rsquo;s <em>current</em> image as
+            soon as that image is ready.</li>
+          <li>It maps <b>no MAC</b> and removes no entry.</li>
+          <li>It can never <b>roll an entry back</b>: the PXE VM keeps a newer image if it already holds
+            one.</li>
+        </ul>
+        <p class="note">The iPXE script URL is read and written inside the activity, so it never enters
+        Temporal history or the run&rsquo;s result.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================== FLOW -->
+  <section id="flow">
+    <div class="sec-head">
+      <div class="eyebrow">Three phases, in order</div>
+      <h2>What the run does</h2>
+      <p class="lede" style="margin-bottom:24px">Each card carries a <code>phase</code> &mdash; read live off a
+      running workflow through a Temporal <b>query</b>, which is how
+      <code>GET /workflows/runs/{workflow_id}</code> can tell you where inside the run it currently is. A
+      run that has not started its first step reports <b>pending</b>.</p>
+    </div>
+
+    <div class="flow">
+
+      <!-- 1 -->
+      <div class="step">
+        <div class="marker">1</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>get_inventory_segment</h3>
+            <span class="phase">phase <b>resolving-site</b></span>
+          </div>
+          <p>The MCE&rsquo;s <code>INVENTORY</code> segment in the Segments Manager, found by <b>cluster
+          name</b>. Its <code>site</code> decides which PXE VM is written to &mdash; the same rule
+          add-server-to-mce maps hosts by, so this run always writes to the VM those hosts boot from.</p>
+          <div class="calls">
+            <div class="call sm"><span class="verb">GET</span><span class="path">/api/segments?type=INVENTORY <em>&middot; once per run, on the SEGMENT-LIFECYCLE queue</em></span></div>
+          </div>
+          <p class="note">On the segment-lifecycle queue because the Segments Manager token lives on
+          <code>segment-lifecycle-worker</code>. The cluster match is made client-side, so the workflow
+          checks it again: a segment allocated to another cluster would publish to another site&rsquo;s PXE
+          VM, and fails the run with <code>InventorySegmentMismatchError</code> before anything else
+          happens.</p>
+        </div>
+      </div>
+
+      <!-- 2 -->
+      <div class="step">
+        <div class="marker">2</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>check_infra_env</h3>
+            <span class="phase">phase <b>validating-infraenv</b></span>
+          </div>
+          <p>The InfraEnv must exist on the MCE, in <code>namespace</code>. A missing one fails the run with
+          <code>InfraEnvNotFoundError</code>, before anything is published.</p>
+          <div class="calls">
+            <div class="call sm"><span class="verb">GET</span><span class="path">infraenvs/&lt;infra_env&gt; <em>&middot; on the MCE&rsquo;s queue, server-lifecycle-activity-&lt;mce_cluster&gt;</em></span></div>
+          </div>
+          <p class="note">Steps 2 and 3 run on the <code>server-lifecycle-worker</code> inside that MCE.
+          The hub never talks to the MCE&rsquo;s API server; the worker in the MCE polls its own queue.</p>
+        </div>
+      </div>
+
+      <!-- 3 -->
+      <div class="step">
+        <div class="marker">3</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>publish_infra_env_boot</h3>
+            <span class="phase">phase <b>publishing</b></span>
+          </div>
+          <p>The activity reads the InfraEnv and checks that it has a <b>ready</b> discovery image &mdash;
+          all three of:</p>
+          <ol>
+            <li>its <code>ImageCreated</code> condition is <code>True</code>;</li>
+            <li>it publishes <code>status.bootArtifacts.ipxeScript</code>;</li>
+            <li>it has a <code>status.createdTime</code>.</li>
+          </ol>
+          <p>If not, it writes nothing and answers &ldquo;not yet&rdquo;, with the reason. The workflow waits
+          10 s on a durable timer and asks again. Once the image is ready, the activity writes the iPXE
+          script URL to the PXE VM, with the image&rsquo;s <code>createdTime</code> as its version.</p>
+          <div class="calls">
+            <div class="call sm"><span class="verb">PUT</span><span class="path">/pxe-map/&lt;mce_cluster&gt;/&lt;infra_env&gt; <em>&middot; {"ipxe_url", "image_created_at"} to PXE_MAP_URLS[site]</em></span></div>
+          </div>
+          <p class="note"><b>Bounded at 10 minutes</b>, counted from the first attempt in this phase. No
+          ready image by then fails the run with <code>InfraEnvImageNotUpdatedError</code>, quoting what was
+          still awaited &mdash; for example &ldquo;InfraEnv condition ImageCreated is not True: &hellip;&rdquo;
+          with assisted-service&rsquo;s own message. <code>ImageCreated</code> False means the last image
+          generation <em>failed</em>, so check that condition and the assisted-service log. Nothing was
+          written to the PXE VM.</p>
+          <p class="note">The PXE VM compares <code>image_created_at</code> before it writes. If it already
+          holds a <b>newer</b> image it keeps it and answers 409. The activity treats that as success and
+          the run completes with <code>superseded: true</code>: the entry is current either way.</p>
+        </div>
+      </div>
+
+      <!-- done -->
+      <div class="step done">
+        <div class="marker">&#10003;</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>Result</h3>
+            <span class="phase">phase <b>completed</b></span>
+          </div>
+          <p>The MCE, InfraEnv and namespace that were published, the <code>site</code> whose PXE VM was
+          written, <code>image_created_at</code> (the <code>createdTime</code> of the image this run read)
+          and <code>superseded</code>. With <code>superseded: false</code> the entry now holds that image.
+          With <code>superseded: true</code> the VM kept a newer one and this run wrote nothing.</p>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ========================================================== FAILURES -->
+  <section id="failures">
+    <div class="sec-head">
+      <div class="eyebrow">When it stops</div>
+      <h2>Classified errors fail the run; everything else is out-waited</h2>
+      <p class="lede">Every error below is a <b>FAILED run</b> on the status endpoint, never a 4xx on the
+      trigger, and fails after one attempt &mdash; a retry would get the same answer. Nothing is undone,
+      because nothing before the final PUT writes anything.</p>
+    </div>
+
+    <h3 style="margin:0 0 10px">Raised by the workflow itself</h3>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>error</th><th>when</th></tr></thead>
+        <tbody>
+          <tr><td class="k">InventorySegmentMismatchError</td><td class="muted"><b>resolving-site</b>: the segment returned is allocated to another cluster than the requested MCE.</td></tr>
+          <tr><td class="k">InfraEnvImageNotUpdatedError</td><td class="muted"><b>publishing</b>: the InfraEnv showed no ready image (<code>ImageCreated</code> True, an <code>ipxeScript</code>, a <code>createdTime</code>) within 10 min. The message names what was still awaited and says nothing was written to the PXE VM.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 style="margin:24px 0 10px">Raised by an activity, non-retryable</h3>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>error</th><th>when</th></tr></thead>
+        <tbody>
+          <tr><td class="k">InventorySegmentNotFoundError</td><td class="muted">The MCE has no <code>INVENTORY</code> segment allocated in the Segments Manager. An operator allocates one.</td></tr>
+          <tr><td class="k">AmbiguousInventorySegmentError</td><td class="muted">More than one <code>INVENTORY</code> segment is allocated to the MCE. A human resolves the duplicate.</td></tr>
+          <tr><td class="k">SegmentsManagerAuthError</td><td class="muted">The Segments Manager rejected the token (401/403).</td></tr>
+          <tr><td class="k">InfraEnvNotFoundError</td><td class="muted">No InfraEnv of that name in <code>namespace</code> on the MCE.</td></tr>
+          <tr><td class="k">BmhPrerequisiteMissingError</td><td class="muted">The MCE cannot answer the read at all: the worker&rsquo;s ServiceAccount lacks <code>get</code> on <code>infraenvs</code> (403), or the Assisted Installer or the namespace is missing (404).</td></tr>
+          <tr><td class="k">PxeSiteNotConfiguredError</td><td class="muted"><code>PXE_MAP_URLS</code> on this MCE&rsquo;s worker has no entry for the segment&rsquo;s site. An operator adds it. <b>This fails the run</b> &mdash; unlike add-server-to-mce, where it is a skip, because there it only rules out one candidate.</td></tr>
+          <tr><td class="k">PxeMapAuthError</td><td class="muted">The PXE VM rejected <code>PXE_MAP_TOKEN</code> (401/403).</td></tr>
+          <tr><td class="k">PxeMapRequestRejectedError</td><td class="muted">The PXE VM refused the PUT (400/404/422). A 404 here most likely means that PXE VM&rsquo;s pxe-map-api predates InfraEnv boot entries and must be upgraded.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p class="note" style="margin-top:10px">Everything else is <b>retried without bound</b>, backing off from
+    1 s to at most 1 min between attempts: the Segments Manager, the MCE&rsquo;s API or the PXE VM
+    unreachable or answering a server error (for the PXE VM that is <code>PxeMapError</code>). The run stays RUNNING in its phase
+    and the failure shows on the activity in the Temporal UI.</p>
+    <p class="note">Steps 2 and 3 also carry a 5-minute schedule-to-start timeout. If no worker polls
+    <code>server-lifecycle-activity-&lt;mce_cluster&gt;</code>, the run does not fail: it stays in
+    <b>validating-infraenv</b> with repeated timeouts in its history, and its progress names the queue it
+    is waiting on.</p>
+  </section>
+
+  <!-- ======================================================= IDEMPOTENCY -->
+  <section id="idempotency">
+    <div class="sec-head">
+      <div class="eyebrow">Running it twice</div>
+      <h2>Safe to repeat, and never a step backwards</h2>
+      <p class="lede">Temporal retries activities and operators re-POST things. Both are safe here.</p>
+    </div>
+
+    <div class="grid-2">
+      <div class="panel">
+        <h3>The PXE VM compares-and-sets on the image time</h3>
+        <p>Every write carries the image&rsquo;s <code>createdTime</code> as <code>image_created_at</code>.
+        The PXE VM writes when that time is the same as or newer than what it holds, and refuses an older
+        one with 409.</p>
+        <ul>
+          <li><b>Same time</b>: overwritten with the same content &mdash; so a retried activity or a second
+            run converges.</li>
+          <li><b>Newer on the VM</b>: kept. The run completes with <code>superseded: true</code>. This is
+            the case where an install of the same InfraEnv published a later image first.</li>
+        </ul>
+        <p class="note">So running it again is always safe, and it can never replace a newer image with an
+        older one.</p>
+      </div>
+      <div class="panel">
+        <h3>The id is the file it writes</h3>
+        <p><code>publish-infraenv-to-pxe-server-&lt;mce_cluster&gt;-&lt;infra_env&gt;</code> &mdash; one
+        boot entry per (MCE, InfraEnv). A second trigger for the same entry while a run is in flight gets
+        <b>409</b>. Once that run has closed, the same id can be started again.</p>
+        <p class="note">The same InfraEnv name on two MCEs is two different files, so those runs do not
+        block each other. The id is dedup, not a safety lock: two runs racing would still be harmless,
+        because of the compare-and-set on the left.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- =============================================================== API -->
+  <section id="api">
+    <div class="sec-head">
+      <div class="eyebrow">HTTP surface</div>
+      <h2>How you start it and how you watch it</h2>
+      <p class="lede">Served by <code>workflows-orchestrator-api</code> (Swagger at <code>/docs</code>).
+      Async: the POST hands back the workflow id at once and you poll it. The API has no auth of its own
+      &mdash; anyone who can reach it can start a run.</p>
+    </div>
+
+    <div class="api">
+
+      <div class="endpoint">
+        <div class="endpoint-head">
+          <span class="method">POST</span>
+          <span class="path">/workflows/server-lifecycle/publish-infraenv-to-pxe-server</span>
+          <span class="ret">202 &middot; 409 if a run for that entry is in flight</span>
+        </div>
+        <div class="endpoint-body">
+          <p>Two fields are required: the MCE and the InfraEnv. <code>namespace</code> defaults to
+          <code>inventory</code>. <code>mce_cluster</code> is accepted with or without its
+          <code>ocp4-</code> prefix and always becomes the prefixed name before the run starts &mdash; it
+          finds the site, names the MCE&rsquo;s queue and is the entry&rsquo;s directory on the PXE VM, so
+          both spellings must land on the same file.</p>
+          <pre><span class="c">// request</span>
+{
+  "mce_cluster": "mce-bat-yam-01",
+  "infra_env":   "cisco-m6-bat-yam-64c-512gb"
+}
+
+<span class="c">// request — the InfraEnv lives in another namespace</span>
+{
+  "mce_cluster": "ocp4-mce-bat-yam-01",
+  "infra_env":   "cisco-m6-bat-yam-64c-512gb",
+  "namespace":   "multicluster-engine"
+}
+
+<span class="c">// 202 response — both requests above get this id</span>
+{ "workflow_id": "publish-infraenv-to-pxe-server-ocp4-mce-bat-yam-01-cisco-m6-bat-yam-64c-512gb", "run_id": "…" }
+
+<span class="c">// 409 response — the same entry is already being published</span>
+{ "detail": "A publish-infraenv-to-pxe-server run is already in flight for ocp4-mce-bat-yam-01/cisco-m6-bat-yam-64c-512gb" }</pre>
+          <p class="note">The body <b>forbids unknown fields</b>: anything besides <code>mce_cluster</code>,
+          <code>infra_env</code> and <code>namespace</code> is a 422. Each field must be non-empty.</p>
+          <p class="note">The old path, <code>POST /workflows/server-lifecycle/publish-infraenv-boot</code>,
+          answers <b>410</b> whatever the body, and starts nothing:
+          <code>"publish-infraenv-boot was renamed to publish-infraenv-to-pxe-server — POST
+          /workflows/server-lifecycle/publish-infraenv-to-pxe-server with the same body"</code>.</p>
+        </div>
+      </div>
+
+      <div class="endpoint">
+        <div class="endpoint-head">
+          <span class="method">GET</span>
+          <span class="path">/workflows/runs/{workflow_id}</span>
+          <span class="ret">200</span>
+        </div>
+        <div class="endpoint-body">
+          <p>Domain-agnostic: workflow ids are globally unique, so one route serves every domain. It
+          addresses the <code>progress</code> query by name, so the response carries the live phase and the
+          MCE activity queue this run dispatches to. A completed run carries the result instead; a failed
+          one carries its <code>error</code>.</p>
+          <pre><span class="c">// 200 while running</span>
+{
+  "workflow_id":   "publish-infraenv-to-pxe-server-ocp4-mce-bat-yam-01-cisco-m6-bat-yam-64c-512gb",
+  "workflow_type": "PublishInfraEnvToPxeServerWorkflow",
+  "status":        "RUNNING",
+  "progress": {
+    "phase":          "publishing",
+    "activity_queue": "server-lifecycle-activity-ocp4-mce-bat-yam-01"
+  }
+}
+
+<span class="c">// 200 when completed</span>
+{
+  "status": "COMPLETED",
+  "result": {
+    "mce_cluster":      "ocp4-mce-bat-yam-01",
+    "infra_env":        "cisco-m6-bat-yam-64c-512gb",
+    "namespace":        "inventory",
+    "site":             "bat-yam",
+    "image_created_at": "2026-10-19T10:00:05Z",
+    "superseded":       false
+  }, …
+}</pre>
+          <p class="note">A phase that does not advance past <b>validating-infraenv</b> usually means nothing
+          is polling <code>activity_queue</code>: that MCE has no <code>server-lifecycle-worker</code>
+          deployed, or it cannot reach Temporal.</p>
+        </div>
+      </div>
+
+    </div>
+
+    <p class="note" style="margin-top:18px">A missing InfraEnv, a site with no PXE VM configured and an
+    image that never becomes ready are all <b>FAILED runs</b> on the status endpoint &mdash; not 4xx on the
+    trigger. Everything the outcome depends on happens inside the run, as a retried activity.</p>
+  </section>
+
+  <!-- ========================================================= REFERENCE -->
+  <section id="reference">
+    <div class="sec-head">
+      <div class="eyebrow">Reference</div>
+      <h2>Inputs, result, phases, and what the limb needs configured</h2>
+    </div>
+
+    <h3 style="margin-bottom:10px">Request body &mdash; <code>PublishInfraEnvToPxeServerRequest</code></h3>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>Field</th><th>Type</th><th>Rules</th><th>What it&rsquo;s for</th></tr></thead>
+        <tbody>
+          <tr><td class="k">mce_cluster</td><td class="k">str</td><td class="muted">required, non-empty; <code>ocp4-</code> added if missing</td><td class="muted">Which MCE. Finds the <code>INVENTORY</code> segment (and so the site and PXE VM), names the activity queue, and is the entry&rsquo;s directory on the PXE VM.</td></tr>
+          <tr><td class="k">infra_env</td><td class="k">str</td><td class="muted">required, non-empty</td><td class="muted">The InfraEnv whose boot entry is written. Must already exist on the MCE, in <code>namespace</code>.</td></tr>
+          <tr><td class="k">namespace</td><td class="k">str</td><td class="muted">non-empty, default <code>inventory</code></td><td class="muted">The InfraEnv&rsquo;s namespace on the MCE.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note" style="margin-top:10px">The run is started with a
+    <code>PublishInfraEnvToPxeServerRunArgs</code> wrapping a <code>PublishInfraEnvToPxeServerInput</code>
+    with the same three fields. There <code>namespace</code> is required, so a recorded run always carries
+    the namespace it read.</p>
+
+    <h3 style="margin:28px 0 10px">Result &mdash; <code>PublishInfraEnvToPxeServerResult</code></h3>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td class="k">mce_cluster</td><td class="k">str</td><td class="muted">The MCE, in its <code>ocp4-</code> form.</td></tr>
+          <tr><td class="k">infra_env</td><td class="k">str</td><td class="muted">The InfraEnv published.</td></tr>
+          <tr><td class="k">namespace</td><td class="k">str</td><td class="muted">Its namespace.</td></tr>
+          <tr><td class="k">site</td><td class="k">str</td><td class="muted">The site of the MCE&rsquo;s inventory segment &mdash; whose PXE VM was written.</td></tr>
+          <tr><td class="k">image_created_at</td><td class="k">str | null</td><td class="muted">The <code>status.createdTime</code> of the image this run read and sent.</td></tr>
+          <tr><td class="k">superseded</td><td class="k">bool</td><td class="muted"><code>true</code> when the PXE VM already held a newer image and kept it (its 409). The entry is current either way.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 style="margin:28px 0 10px">Phases you&rsquo;ll see on the status endpoint</h3>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>phase</th><th>Meaning</th><th>Normal duration</th></tr></thead>
+        <tbody>
+          <tr><td class="k">pending</td><td class="muted">Run accepted, nothing read yet</td><td class="muted">instant</td></tr>
+          <tr><td class="k">resolving-site</td><td class="muted">Reading the MCE&rsquo;s <code>INVENTORY</code> segment from the Segments Manager, for its site</td><td class="muted">instant</td></tr>
+          <tr><td class="k">validating-infraenv</td><td class="muted">Checking the InfraEnv exists on the MCE</td><td class="muted">instant</td></tr>
+          <tr><td class="k">publishing</td><td class="muted">Waiting for a ready image, polled every 10 s, then writing the boot entry &mdash; <b>bounded, &le; 10 min</b>, else <code>InfraEnvImageNotUpdatedError</code></td><td class="muted">seconds</td></tr>
+          <tr><td class="k">completed</td><td class="muted">The boot entry is current on the site&rsquo;s PXE VM</td><td class="muted">&mdash;</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 style="margin:28px 0 10px">Where it runs</h3>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>queue</th><th>polled by</th><th>used for</th></tr></thead>
+        <tbody>
+          <tr><td class="k">publish-infraenv-to-pxe-server-workflow</td><td class="muted">the brain, <code>workflows-orchestrator</code></td><td class="muted">the workflow itself</td></tr>
+          <tr><td class="k">segment-lifecycle-activity</td><td class="muted"><code>segment-lifecycle-worker</code></td><td class="muted"><code>get_inventory_segment</code> (step 1)</td></tr>
+          <tr><td class="k">server-lifecycle-activity-&lt;mce_cluster&gt;</td><td class="muted">the <code>server-lifecycle-worker</code> in that MCE</td><td class="muted"><code>check_infra_env</code>, <code>publish_infra_env_boot</code> (steps 2&ndash;3)</td></tr>
+          <tr><td class="k">publish-infraenv-boot-workflow</td><td class="muted">the brain, until no run of the old name is open</td><td class="muted">runs started before the 2026-11-01 rename, as <code>PublishInfraEnvBootWorkflow</code></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note" style="margin-top:10px">Every activity call has a 90 s start-to-close timeout. The
+    activity kept its old name, <code>publish_infra_env_boot</code>: activities were not renamed.</p>
+
+    <h3 style="margin:28px 0 10px">What <code>server-lifecycle-worker</code> needs for this run</h3>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>key</th><th>where</th><th>notes</th></tr></thead>
+        <tbody>
+          <tr><td class="k">MCE_CLUSTER</td><td class="muted"><code>server-lifecycle-config</code></td><td class="muted">Names the queue this worker polls, so it must equal callers&rsquo; <code>mce_cluster</code>.</td></tr>
+          <tr><td class="k">PXE_MAP_URLS</td><td class="muted">chart value <code>pxeMap.urls</code></td><td class="muted">Site &rarr; PXE VM base URL (<code>http://</code> or <code>https://</code>, checked at startup). The segment&rsquo;s site must be listed, else <code>PxeSiteNotConfiguredError</code>.</td></tr>
+          <tr><td class="k">PXE_MAP_TOKEN</td><td class="muted"><code>server-lifecycle-credentials</code></td><td class="muted">Bearer token for the PXE VM&rsquo;s pxe-map-api. Rejected &rarr; <code>PxeMapAuthError</code>.</td></tr>
+          <tr><td class="k">RBAC</td><td class="muted">the chart&rsquo;s Role</td><td class="muted"><code>get</code> on <code>agent-install.openshift.io/infraenvs</code>. Missing &rarr; <code>BmhPrerequisiteMissingError</code>.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note" style="margin-top:10px">The Segments Manager token is not needed here: step 1 runs on
+    <code>segment-lifecycle-worker</code>, which already holds it.</p>
+  </section>
+
+  <footer>
+    <span>workflow_domains/server_lifecycle/publish_infraenv_to_pxe_server.py</span>
+    <span>workflow_domains/server_lifecycle/router.py</span>
+    <span>activities/server_lifecycle/activities.py</span>
+    <span>activities/server_lifecycle/pxe_map.py</span>
+    <span>activities/server_lifecycle/bmh_resources.py</span>
+    <span>shared/models/server_lifecycle.py</span>
+    <span>shared/workflow_ids.py</span>
+  </footer>
+
+</div>
+</main>
+
+<script src="/assets/nav.js?v=__DOC_VERSION__" defer></script>
+</body>
+</html>

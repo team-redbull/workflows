@@ -708,11 +708,12 @@ class PublishInfraEnvToPxeServerProgress(BaseModel):
 
 
 class PublishInfraEnvToPxeServerResult(BaseModel):
-    """What the PXE VM of the MCE's site now serves as the InfraEnv's boot entry.
+    """The boot entry this run published to the PXE VM of the MCE's site.
 
-    `superseded` means the VM already held a NEWER image than the one read
-    (another publish got there first) and kept it — the entry is current
-    either way.
+    `image_created_at` is the discovery image THIS run read and sent.
+    `superseded` means the VM already held a NEWER image (another publish got
+    there first) and kept it, so the VM serves that newer one, not the time
+    reported here; the entry is current either way.
     """
 
     mce_cluster: str

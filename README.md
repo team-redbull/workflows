@@ -183,7 +183,9 @@ machine. The 24 h hold after success writes nothing to any cluster — it only
 keeps S1 out of other draws until server-scan can see it in a cluster itself.
 A server taken out of that MCE within the day gets it back early: remove-server-from-mce
 releases add-server-to-mce's lock for its MCE once nothing of the server is left
-there (the operator's decision, 2026-10-31).
+there and its PXE cleanup did not fail (the operator's decision, 2026-10-31; a failed
+cleanup may leave the host able to boot this MCE's discovery image, so the lock then
+runs to its expiry).
 
 **Who checks what.** server-scan: unclaimed, not in maintenance, BMC
 reachable, health tier, the **network category HEALTHY — at least two links

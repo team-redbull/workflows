@@ -32,8 +32,10 @@ every teammate; use them in this order and keep them in step:
 A rule that can be checked belongs in the checker; one that cannot belongs here AND in
 the matching rules file. When a rule changes, all three move in ONE commit. The checker
 is the tie-breaker: an edit it flags is wrong until the rule itself is changed. A
-documented exception is marked where it lives, `# conventions: allow <RULE> — <reason>`
-(the agent call's bounded retry in `dispatch.py` is the one today), and recorded here.
+documented exception is marked where it lives, `# conventions: allow <RULE> — <reason>`,
+and recorded here. Two today: the agent call's bounded retry in `cluster_upgrade/dispatch.py`
+(WF007, §5) and upgrade-targets' missing progress query (WF014: a synchronous question
+answered in the response, §2, so nothing polls it).
 
 ## 1. Domain-driven monorepo: three layers, strictly separated
 
@@ -374,8 +376,9 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   `PXE_MAP_URLS` and failed there: the worker has ONE `PXE_MAP_TOKEN`, each
   site's VM its own, so every other site answered 401 — install worked, remove
   failed. BEST EFFORT since: no segment, a rejected token/request, or a VM
-  unreachable for 10 min (`schedule_to_close_timeout`, the one bounded call in
-  the domain — nothing about the removal depends on the PXE VM) goes into
+  unreachable for 10 min (`schedule_to_close_timeout` on both of the step's calls, the
+  segment lookup and the delete: the one bounded step in the domain, up to about 20 min,
+  because nothing about the removal depends on the PXE VM) goes into
   `pxe_failed` and the run still completes. The PXE
   VM refuses (409, reported in `pxe_kept`, not a failure) a MAC chaining to
   ANOTHER MCE's boot entry and removes anything else — this MCE's entry, a

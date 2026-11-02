@@ -21,10 +21,11 @@ TWO KINDS live here, and the difference is which side may RAISE them:
     `non_retryable_error_types` would be inert, because workflow failures are
     never retried. Each is marked WORKFLOW-RAISED below.
 
-initialize-segment and allocate-segment still spell their own workflow-raised
-types as literals (`UnknownSite`, `AllocationNotConfirmed`, ...). Those have no
-class yet; the rule above is what a new one follows — release-segment does, and
-`UnsupportedSegmentType`, which it shares with allocate-segment, now has one.
+Four workflow-raised types predate the `Error` suffix and keep their names:
+`UnsupportedSegmentType`, `ValuesBranchMissing`, `UnknownSite` and
+`AllocationNotConfirmed`. The type name is what a failed run reports on the
+status endpoint, what the day1 pipeline and the docs show, and what tests pin,
+so the class takes the existing name rather than renaming the failure.
 """
 
 
@@ -193,8 +194,38 @@ class UnsupportedSegmentType(OrchestratorError):
     allocate-segment and release-segment both take HC only (allocate-segment
     allocates nothing else, so no other allocation was made by this system).
     Named without the Error suffix because it owns a type name that predates
-    the class: allocate-segment still spells it as a literal, and both
-    workflows must fail under the SAME name for the same condition.
+    the class, and both workflows must fail under the SAME name for the same
+    condition.
+    """
+
+
+class ValuesBranchMissing(OrchestratorError):
+    """WORKFLOW-RAISED. An allocate-segment run carries no `values_branch`.
+
+    The branch is a per-run input with no fallback (a fallback would push to
+    main by omission), and the API requires it, so only a run started some
+    other way can lack it. Also raised by the segment-lifecycle activities that
+    clone the values repo, as `ApplicationError(..., non_retryable=True)` under
+    this same name, for a request that reaches them without one.
+    """
+
+
+class UnknownSite(OrchestratorError):
+    """WORKFLOW-RAISED. The cluster's values file sits under a site the
+    Segments Manager does not know.
+
+    The site is derived from the file's path in the day1 repo
+    (sites/<site>/...) and cross-checked against `GET /api/sites` before
+    anything is allocated, so a repo layout mistake fails loudly here.
+    """
+
+
+class AllocationNotConfirmed(OrchestratorError):
+    """WORKFLOW-RAISED. allocate-segment's read-back of the segment it was just
+    allocated does not match the allocation (status, cluster, vlan or type).
+
+    Raised BEFORE the git write, so the values repo never records a vlan the
+    Segments Manager does not confirm. The message lists every mismatch.
     """
 
 
@@ -501,7 +532,8 @@ class PxeSiteNotConfiguredError(OrchestratorError):
     MACs. PXE_MAP_URLS on this MCE's worker has no entry for that site, so
     there is nobody to tell. Deterministic — an operator adds the entry.
     add-server-to-mce treats it as a SKIP: a Redfish candidate in the same draw
-    needs no PXE map and may still be installable.
+    needs no PXE map and may still be installable. publish-infraenv-to-pxe-server
+    has nothing else to do, so there it FAILS the run (non-retryable).
     """
 
 

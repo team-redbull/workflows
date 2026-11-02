@@ -148,7 +148,8 @@ class _Report:
             return False
         candidates = [lines[line - 1]]
         index = line - 2
-        while index >= 0 and lines[index].lstrip().startswith("#"):
+        # The comment block may sit above a decorated class or function.
+        while index >= 0 and lines[index].lstrip().startswith(("#", "@")):
             candidates.append(lines[index])
             index -= 1
         for text in candidates:
@@ -1167,10 +1168,13 @@ def _check_charts(report: _Report) -> None:
         for node in settings_tree.body:
             if isinstance(node, ast.ClassDef) and node.name == class_name:
                 for item in node.body:
-                    if isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name) and item.target.id != "model_config":
+                    # Only REQUIRED keys (no default): a field with a default runs
+                    # without the chart rendering it (IDRAC_USERNAME is "root").
+                    if (isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name)
+                            and item.target.id != "model_config" and item.value is None):
                         key = item.target.id.upper()
                         if key not in GLOBAL_CONFIGMAP_KEYS and key not in rendered:
-                            report.warning(marker, 1, "DL005", f"`{key}` is a {class_name} field but no `{kebab}-worker` chart renders it — the chart ships a key BEFORE the image that requires it (§8)")
+                            report.warning(marker, 1, "DL005", f"`{key}` is a REQUIRED {class_name} field but no `{kebab}-worker` chart renders it — the worker crash-loops; the chart ships the key BEFORE the image that requires it (§8)")
 
 
 def run_full(root: Path | None = None) -> list[Violation]:

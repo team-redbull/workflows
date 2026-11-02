@@ -23,10 +23,14 @@ docs/
       release-segment.html
     server-lifecycle/
       add-server-to-mce.html
+      publish-infraenv-to-pxe-server.html
+      remove-server-from-mce.html
+      uninstall-server-from-hc.html
     server-provisioning/
       provision-dell-server.html
     cluster-upgrade/
       upgrade-cluster.html
+      upgrade-targets.html
     assets/
       site.css                     every page's styling
       nav.js                       THE workflow catalogue + topbar menu behaviour
@@ -45,9 +49,9 @@ docs/
 A workflow that has no page yet gets `href: null`. It renders as a non-clickable
 *planned* row in both places — visible, but never a dead link.
 
-Domains and workflows in the catalogue that are not built yet (`uninstall-server-from-hc`)
-are there to show the shape the catalogue takes as it grows; delete them once real ones
-replace them.
+Every workflow the API starts has its page and its entry; a child workflow is described on
+its parent's page. `python3 scripts/check_conventions.py` warns (DL003) about a started
+workflow with no page or no catalogue entry.
 
 ## Local preview
 

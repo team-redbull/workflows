@@ -997,12 +997,15 @@ or retry to check again (the count covers 24 hours)</pre>
   "control_plane_version": "4.19.53",           <span class="c">// day1 mastertag: intent, checked against the cluster at planning</span>
   "supported_minors": ["4.21", "4.20", "4.19"], "ladder_revision": "…", "verified_against_graph": "2026-10-31",
   "targets": [
-    { "version": "4.21.40", "minor": "4.21", "steps": 4, "control_plane_steps": 2, "newest_in_minor": true, "must": false },
+    { "version": "4.21.40", "minor": "4.21", "steps": 3, "control_plane_steps": 2, "newest_in_minor": true, "must": true },
     …
-  ]
+  ],
+  "nodepools": [ { "name": "zone-a", "zone": "a", "replicas": 1, "max_unavailable": "1", … }, … ],
+  "nodepool_order": [ … ]                       <span class="c">// the order a run rolls them in unless its request names one</span>
 }</pre>
           <p class="note">404: day1 has no such cluster file. 409: its file or the rules cannot be used, the
-          detail says why. 504: no answer in 60 s &mdash; is the upgrade-gitops limb running?</p>
+          detail says why. 504: no answer in 60 s &mdash; is the upgrade-gitops limb running?
+          Every field, the path rules and every answer: <a href="/cluster-upgrade/upgrade-targets.html">upgrade-targets</a>.</p>
         </div>
       </div>
 

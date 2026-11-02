@@ -1,0 +1,634 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>remove-server-from-mce — Redbull Workflows</title>
+<meta name="description" content="The remove-server-from-mce workflow: take one server out of an MCE's inventory — power it off, then delete its NMStateConfig, BareMetalHost and Agent and clear its MACs from its site's PXE VM. Never a server whose Agent is bound to a cluster.">
+<link rel="icon" href="/assets/favicon.svg?v=__DOC_VERSION__" type="image/svg+xml">
+<link rel="stylesheet" href="/assets/site.css?v=__DOC_VERSION__">
+</head>
+<body data-page="/server-lifecycle/remove-server-from-mce.html">
+
+<a class="skip-link" href="#main">Skip to content</a>
+
+<!-- Topbar: identical on every page. Brand + deployed version upper-left; the
+     "Workflows" menu is built from the catalogue in assets/nav.js. -->
+<header class="topbar">
+  <a class="brand" href="/">
+    <img class="brand-mark" src="/assets/redbull-logo.png?v=__DOC_VERSION__" alt="" aria-hidden="true"
+         width="480" height="179">
+    <span class="brand-name">Redbull Workflows</span>
+    <span class="brand-ver" title="deployed image tag of this documentation site">__DOC_VERSION__</span>
+  </a>
+  <nav class="topnav" aria-label="Site">
+    <a class="topnav-link" href="/">Orchestrator guide</a>
+    <div class="wfmenu">
+      <button class="wfmenu-btn" id="wfmenu-btn" type="button"
+              aria-expanded="false" aria-haspopup="true" aria-controls="wfmenu-panel">
+        Workflows <span class="caret" aria-hidden="true">&#9662;</span>
+      </button>
+      <div class="wfmenu-panel" id="wfmenu-panel" role="menu" aria-label="Workflows by domain" hidden></div>
+    </div>
+    <noscript>
+      <a class="topnav-link" href="/server-lifecycle/remove-server-from-mce.html">remove-server-from-mce</a>
+    </noscript>
+  </nav>
+</header>
+
+<main id="main">
+<header class="masthead">
+  <div class="masthead-inner">
+    <div class="eyebrow">Temporal workflow &middot; domain: server-lifecycle</div>
+    <h1>remove-server-from-mce<span class="dim"> &mdash; what actually happens</span></h1>
+    <p class="lede">
+      One request takes <b>one named server out of an MCE&rsquo;s inventory</b>. The run powers the host
+      off, then deletes its NMStateConfig, its BareMetalHost (with its BMC Secret) and its Agent, and clears
+      its MACs from its site&rsquo;s PXE VM. Afterwards the machine is no longer in that MCE&rsquo;s InfraEnv.
+    </p>
+    <p class="lede"><b>Only inventory.</b> If any Agent of the host is bound to a cluster
+    (<code>spec.clusterDeploymentName</code> set), the run fails with <code>AgentBoundToClusterError</code>
+    and <b>changes nothing</b>. It never touches a hosted cluster, a Machine or a Node. To take a node out of
+    a hosted cluster as well, use <a href="/server-lifecycle/uninstall-server-from-hc.html">uninstall-server-from-hc</a>,
+    which runs this workflow as its last step.</p>
+    <p class="lede">A server with <b>nothing</b> on the MCE is not an error: the run completes at once with
+    <code>found: false</code> and touches nothing else.</p>
+    <div class="facts">
+      <div class="fact"><span class="k">Trigger</span><span class="v">POST /workflows/server-lifecycle/remove-server-from-mce</span></div>
+      <div class="fact"><span class="k">Workflow id</span><span class="v">one per server: remove-server-from-mce-&lt;server, lowercased&gt;</span></div>
+      <div class="fact"><span class="k">Also run as</span><span class="v">uninstall-server-from-hc&rsquo;s awaited child, same id</span></div>
+      <div class="fact"><span class="k">Workflow queue</span><span class="v">remove-server-from-mce-workflow</span></div>
+      <div class="fact"><span class="k">Activity queue</span><span class="v">server-lifecycle-activity-&lt;mce_cluster&gt; (one lookup on segment-lifecycle-activity)</span></div>
+    </div>
+    <p class="note">Named <b>remove-server</b> until 2026-11-01. <code>POST
+    /workflows/server-lifecycle/remove-server</code> now answers <b>410</b> naming this route and starts
+    nothing &mdash; send the same body here. Runs started before the rename finish as they began: as
+    <code>RemoveServerWorkflow</code> on the queue <code>remove-server-workflow</code>, under their
+    <code>remove-server-&hellip;</code> ids.</p>
+    <p class="note">The reverse of <a href="/server-lifecycle/add-server-to-mce.html">add-server-to-mce</a>:
+    it removes exactly what that workflow creates.</p>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <!-- ============================================================== FLOW -->
+  <section id="flow">
+    <div class="sec-head">
+      <div class="eyebrow">Eight steps, in order</div>
+      <h2>What the run does</h2>
+      <p class="lede" style="margin-bottom:24px">Each card carries a <code>phase</code>, read live off the
+      running workflow through its <code>progress</code> query, together with <code>activity_queue</code>,
+      the MCE queue it is working on. A step with nothing to act on is skipped, and its phase never
+      appears.</p>
+    </div>
+
+    <div class="flow">
+
+      <!-- 1 -->
+      <div class="step">
+        <div class="marker">1</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>inspect_inventory_host</h3>
+            <span class="phase">phase <b>inspecting</b></span>
+          </div>
+          <p>Reads only. The BareMetalHost <code>&lt;server&gt;</code> and the NMStateConfig
+          <code>nmstate-config-&lt;server&gt;</code> (both lowercased) in <code>namespace</code>, and the
+          host&rsquo;s <b>Agents</b>. An Agent is matched by BMAC&rsquo;s
+          <code>agent-install.openshift.io/bmh</code> label, or by <b>any MAC</b> of the machine: the
+          BMH&rsquo;s, the NMStateConfig&rsquo;s, and every MAC server-scan holds for the server&rsquo;s name.
+          server-scan&rsquo;s MACs are what still find an Agent whose BMH is already gone.</p>
+          <div class="calls">
+            <div class="call sm"><span class="verb">GET</span><span class="path">baremetalhosts/&lt;server&gt;</span></div>
+            <div class="call sm"><span class="verb">GET</span><span class="path">nmstateconfigs/nmstate-config-&lt;server&gt;</span></div>
+            <div class="call sm"><span class="verb">LIST</span><span class="path">agents <em>&middot; matched by bmh label or MAC</em></span></div>
+            <div class="call sm"><span class="verb">GET</span><span class="path">/servers?search=&lt;name&gt; <em>&middot; server-scan, confirmed by exact name</em></span></div>
+          </div>
+          <p class="note">Any of the three may be missing. <b>None of them found</b>: the run completes here
+          with <code>found: false</code> &mdash; no PXE cleanup and no lock read, because nothing then ties the
+          machine&rsquo;s MACs to this MCE.</p>
+        </div>
+      </div>
+
+      <!-- 2 -->
+      <div class="step">
+        <div class="marker">2</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>Only inventory may be removed</h3>
+            <span class="phase">still <b>inspecting</b></span>
+          </div>
+          <p>If any Agent found is bound to a cluster (<code>spec.clusterDeploymentName</code>), the run fails
+          with <code>AgentBoundToClusterError</code>, naming each bound Agent and its cluster. <b>Nothing has
+          been touched yet.</b> Take the server out of that cluster first &mdash;
+          <a href="/server-lifecycle/uninstall-server-from-hc.html">uninstall-server-from-hc</a> does both
+          halves.</p>
+        </div>
+      </div>
+
+      <!-- 3 -->
+      <div class="step">
+        <div class="marker">3</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>set_host_online &middot; get_baremetal_host</h3>
+            <span class="phase">phase <b>powering-off</b></span>
+          </div>
+          <p>Only when a BareMetalHost was found. Sets <code>spec.online: false</code>, then reads the BMH every
+          <b>15 s</b> until metal3 reports <code>status.poweredOn: false</code> (or the BMH is gone), for up to
+          <b>10 minutes</b>. Right before it writes, the activity re-reads every Agent found in step 1 and
+          refuses with <code>AgentBoundToClusterError</code> if one has been bound since.</p>
+          <div class="calls">
+            <div class="call sm"><span class="verb">PATCH</span><span class="path">baremetalhosts/&lt;server&gt; <em>&middot; spec.online: false</em></span></div>
+            <div class="call sm"><span class="verb">GET</span><span class="path">baremetalhosts/&lt;server&gt; <em>&middot; status.poweredOn, every 15 s</em></span></div>
+          </div>
+          <p class="note"><b>Why first.</b> The host is still running the discovery image. Its agent
+          re-registers with assisted-service when its Agent disappears &mdash; a fresh Agent would be back
+          within a minute. Powered off, nothing can bring it back. Not off within 10 minutes:
+          <code>HostPowerOffTimeoutError</code>. The BMH is left with <code>online: false</code> and
+          <b>nothing is deleted</b> &mdash; check its BMC, then re-run.</p>
+        </div>
+      </div>
+
+      <!-- 4 -->
+      <div class="step">
+        <div class="marker">4</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>teardown_bmh_resources</h3>
+            <span class="phase">phase <b>removing-host</b></span>
+          </div>
+          <p>Only when a BMH or an NMStateConfig was found. The same teardown add-server-to-mce uses to roll a
+          candidate back, in this order:</p>
+          <ol>
+            <li>annotate the BareMetalHost <code>baremetalhost.metal3.io/detached</code>, so metal3 does not
+              try to deprovision it through the BMC (the host is already off, so there is nothing for a
+              deprovision to do);</li>
+            <li>delete the NMStateConfig;</li>
+            <li>delete the BareMetalHost and wait for it to go; if metal3&rsquo;s finalizer still holds it,
+              drop that finalizer;</li>
+            <li>delete the <b>BMC Secret</b> if it outlives the host (normally it goes with the BMH through its
+              ownerReference).</li>
+          </ol>
+          <div class="calls">
+            <div class="call sm"><span class="verb">PATCH</span><span class="path">baremetalhosts/&lt;server&gt; <em>&middot; annotation detached</em></span></div>
+            <div class="call sm"><span class="verb">DELETE</span><span class="path">nmstateconfigs/nmstate-config-&lt;server&gt;</span></div>
+            <div class="call sm"><span class="verb">DELETE</span><span class="path">baremetalhosts/&lt;server&gt;</span></div>
+            <div class="call sm"><span class="verb">DELETE</span><span class="path">secrets/&lt;bmc secret&gt; <em>&middot; only if it outlives the host</em></span></div>
+          </div>
+          <p class="note">What was actually deleted is reported in <code>resources_removed</code>, as
+          <code>Kind/name</code>. A resource already gone is success.</p>
+        </div>
+      </div>
+
+      <!-- 5 -->
+      <div class="step">
+        <div class="marker">5</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>delete_agents</h3>
+            <span class="phase">phase <b>removing-agent</b></span>
+          </div>
+          <p>Only when Agents were found. Each Agent is deleted <b>last</b>, once nothing can boot the host
+          into discovery to re-register it. Each one is re-checked as still unbound right before its delete;
+          a bound one raises <code>AgentBoundToClusterError</code> and is left alone. An Agent already gone
+          counts as success.</p>
+          <div class="calls">
+            <div class="call sm"><span class="verb">DELETE</span><span class="path">agents/&lt;agent&gt;</span></div>
+          </div>
+          <p class="note">An Agent with no BareMetalHost (found only through server-scan&rsquo;s MACs) is
+          deleted too, but there was nothing to power the host off through &mdash; see step 7 for what
+          happens if it comes back.</p>
+        </div>
+      </div>
+
+      <!-- 6 -->
+      <div class="step">
+        <div class="marker">6</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>get_inventory_segment &middot; remove_host_pxe_entries</h3>
+            <span class="phase">phase <b>removing-pxe-boot</b></span>
+          </div>
+          <p>Only when the host is known by at least one MAC. A host left mapped on the PXE VM would
+          network-boot this MCE&rsquo;s discovery image on its next power-on and re-register its Agent. So
+          every MAC the host is known by (the BMH&rsquo;s boot MAC, the NMStateConfig&rsquo;s and
+          server-scan&rsquo;s) is cleared from the PXE VM of the MCE&rsquo;s <b>own site</b>:</p>
+          <ol>
+            <li>the MCE&rsquo;s inventory segment is read from the Segments Manager, on the
+              <code>segment-lifecycle-activity</code> queue, and its cluster is checked to be this MCE. Its
+              site is the one add-server-to-mce mapped the host on;</li>
+            <li>on that site&rsquo;s PXE VM, each MAC is deleted <b>on condition</b> of this MCE.</li>
+          </ol>
+          <div class="calls">
+            <div class="call sm"><span class="verb">GET</span><span class="path">the MCE&rsquo;s INVENTORY segment <em>&middot; Segments Manager</em></span></div>
+            <div class="call sm"><span class="verb">DELETE</span><span class="path">/pxe-map/&lt;mac&gt;?mce_cluster=&lt;mce&gt; <em>&middot; on the site&rsquo;s PXE VM</em></span></div>
+          </div>
+          <p class="note">The PXE VM <b>keeps</b> a MAC that chains to <b>another</b> MCE&rsquo;s boot entry
+          (answered 409): the machine was mapped by that MCE since, and its boot is not this run&rsquo;s to
+          take. Those are reported in <code>pxe_kept</code>. Everything else is removed and reported in
+          <code>pxe_cleared</code> as <code>&lt;site&gt;/&lt;mac key&gt;</code>.</p>
+          <p class="note"><b>Best effort.</b> The host is already off the MCE by now, so nothing about the
+          removal depends on this step. No inventory segment, a segment of another cluster, a rejected token
+          or request, or a PXE VM unreachable for <b>10 minutes</b> is written to <code>pxe_failed</code> and
+          logged &mdash; the run carries on. The segment lookup and the PXE call are each bounded to
+          10 minutes; these are the only calls in the run that are not retried without limit.</p>
+        </div>
+      </div>
+
+      <!-- 7 -->
+      <div class="step">
+        <div class="marker">7</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>inspect_inventory_host, again</h3>
+            <span class="phase">phase <b>verifying</b></span>
+          </div>
+          <p>The same read as step 1, every <b>10 s</b>, until no BareMetalHost, NMStateConfig or Agent of the
+          server is left. An Agent&rsquo;s finalizer holds it for seconds after the delete, so this normally
+          passes on the first or second look.</p>
+          <p class="note">Anything still there after <b>5 minutes</b> fails the run with
+          <code>ServerStillPresentError</code>, naming what is left. It is never reported as removed. The
+          usual cause is an <b>Agent that re-registered</b> because the host had no BMH to power it off
+          through; the message then says to power it off through its BMC and re-run.</p>
+        </div>
+      </div>
+
+      <!-- 8 -->
+      <div class="step">
+        <div class="marker">8</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>lookup_server_membership &middot; release_server</h3>
+            <span class="phase">phase <b>releasing-server</b></span>
+          </div>
+          <p>Nothing of the host is left on this MCE, so add-server-to-mce&rsquo;s day-long hold on it for
+          <b>this</b> MCE protects nothing any more. The run reads server-scan&rsquo;s install lock and gives
+          it back &mdash; but only when it is that lock (<a href="#lock">the rules</a>). The machine can then
+          be drawn again at once. The operator&rsquo;s decision, 2026-10-31.</p>
+          <div class="calls">
+            <div class="call sm"><span class="verb">GET</span><span class="path">/servers?search=&lt;name&gt; &middot; /servers/{id} <em>&middot; the lock</em></span></div>
+            <div class="call sm"><span class="verb">DELETE</span><span class="path">/servers/{id}/reservation <em>&middot; {holder, workflow_id} as read</em></span></div>
+          </div>
+          <p class="note"><b>Never fails the run</b> &mdash; the removal is done, and the lock expires on its
+          own. <code>lock_released</code> and <code>lock_detail</code> say what was found. Skipped entirely
+          (not even read) when the PXE cleanup failed: the host&rsquo;s MACs may still chain to this
+          MCE&rsquo;s discovery image, so the hold stays.</p>
+        </div>
+      </div>
+
+      <!-- done -->
+      <div class="step done">
+        <div class="marker">&#10003;</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>Result</h3>
+            <span class="phase">phase <b>completed</b></span>
+          </div>
+          <p><code>found</code>, <code>powered_off</code> (false when there was no BMH to power off through),
+          <code>agents_removed</code>, <code>resources_removed</code>, <code>pxe_cleared</code>,
+          <code>pxe_kept</code>, <code>pxe_failed</code>, <code>lock_released</code> and
+          <code>lock_detail</code> &mdash; <a href="#api">example below</a>.</p>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ============================================================ SCOPE -->
+  <section id="scope">
+    <div class="sec-head">
+      <div class="eyebrow">Exactly what goes</div>
+      <h2>What it removes, and what it leaves alone</h2>
+    </div>
+
+    <div class="grid-2">
+      <div class="panel">
+        <h3>Removed</h3>
+        <ul>
+          <li>the BareMetalHost <code>&lt;server&gt;</code>, after it is powered off;</li>
+          <li>its BMC <b>Secret</b> &mdash; with the BMH, or explicitly if it outlives it;</li>
+          <li>the NMStateConfig <code>nmstate-config-&lt;server&gt;</code>;</li>
+          <li>every <b>unbound</b> Agent of the host;</li>
+          <li>the host&rsquo;s MACs on its own site&rsquo;s PXE VM, where they chain to this MCE (best
+            effort);</li>
+          <li>add-server-to-mce&rsquo;s install lock in server-scan, when it is for this MCE.</li>
+        </ul>
+      </div>
+      <div class="panel">
+        <h3>Left alone</h3>
+        <ul>
+          <li>a <b>bound</b> Agent &mdash; the whole run is refused, nothing changed;</li>
+          <li>the InfraEnv&rsquo;s boot entry on the PXE VM (<code>&lt;mce&gt;/&lt;infraenv&gt;.ipxe</code>),
+            which every other host of the InfraEnv chains through;</li>
+          <li>a MAC on the PXE VM that chains to <b>another</b> MCE (<code>pxe_kept</code>);</li>
+          <li>PXE VMs of other sites;</li>
+          <li>another MCE&rsquo;s lock, uninstall-server-from-hc&rsquo;s lock, and any other holder&rsquo;s;</li>
+          <li>everything when nothing of the server is on the MCE (<code>found: false</code>): no PXE write,
+            no lock read;</li>
+          <li>hosted clusters, Machines, Nodes and NodePools &mdash; never read or written.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================= LOCK -->
+  <section id="lock">
+    <div class="sec-head">
+      <div class="eyebrow">server-scan&rsquo;s install lock</div>
+      <h2>Which lock is given back, and which is not</h2>
+      <p class="lede">add-server-to-mce holds its lock for a day after a success, until server-scan sees the
+      machine in a cluster. A machine removed within that day used to stay undrawable for the rest of it.
+      Now this run releases that lock &mdash; and only that one. It releases with the holder and workflow id
+      it just read, so server-scan compares and deletes exactly that lock.</p>
+    </div>
+
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>what the run finds</th><th>what it does</th><th><code>lock_detail</code> starts with</th></tr></thead>
+        <tbody>
+          <tr><td class="k">the PXE cleanup failed</td><td class="muted">does not read the lock; the hold stays to its expiry</td><td class="muted">kept: the PXE cleanup failed&hellip;</td></tr>
+          <tr><td class="k">server-scan unreadable</td><td class="muted">nothing released (e.g. <code>AmbiguousServerNameError</code>, a rejected token)</td><td class="muted">not read: &hellip;</td></tr>
+          <tr><td class="k">no server of that name</td><td class="muted">nothing to release</td><td class="muted">server-scan has no server named &hellip;</td></tr>
+          <tr><td class="k">no live lock</td><td class="muted">nothing to release</td><td class="muted">no live lock in server-scan&hellip;</td></tr>
+          <tr><td class="k">held by uninstall-server-from-hc</td><td class="muted">left: this run is then its child, and the parent releases its own lock once this run completes</td><td class="muted">left to uninstall-server-from-hc&hellip;</td></tr>
+          <tr><td class="k">held by anyone but add-server-to-mce</td><td class="muted">left alone</td><td class="muted">left alone: &hellip; not an add-server-to-mce run</td></tr>
+          <tr><td class="k">add-server-to-mce&rsquo;s, for another MCE</td><td class="muted">left alone: nothing here says that install is over (MCE names compared with or without <code>ocp4-</code>)</td><td class="muted">left alone: &hellip; an install into another MCE</td></tr>
+          <tr><td class="k">add-server-to-mce&rsquo;s, for this MCE</td><td class="muted"><b>released</b>, <code>lock_released: true</code></td><td class="muted">released &hellip;</td></tr>
+          <tr><td class="k">taken by another run since the read</td><td class="muted">server-scan answers 409 and keeps it; reported</td><td class="muted">not released: &hellip;</td></tr>
+          <tr><td class="k">server-scan refuses the release</td><td class="muted">reported; the lock runs to its expiry</td><td class="muted">release refused: &hellip;</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note" style="margin-top:10px">Holders are recognised under both spellings, old and new:
+    <code>add-server-to-mce</code> / <code>install-server</code> and <code>uninstall-server-from-hc</code> /
+    <code>uninstall-server</code>. A server-lifecycle worker too old to return the lock releases nothing
+    (<code>not read: the server-lifecycle worker predates the lock read</code>).</p>
+  </section>
+
+  <!-- ========================================================= FAILURES -->
+  <section id="failures">
+    <div class="sec-head">
+      <div class="eyebrow">When it stops</div>
+      <h2>Refused before anything is deleted, or stopped after</h2>
+      <p class="lede">Every one is a <b>FAILED run</b> on the status endpoint, never a 4xx on the trigger.
+      Nothing is ever undone: a failure leaves things as they are, and a re-run carries on from there.</p>
+    </div>
+
+    <h3 style="margin:0 0 10px">Nothing deleted</h3>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>error</th><th>when</th></tr></thead>
+        <tbody>
+          <tr><td class="k">AgentBoundToClusterError</td><td class="muted">An Agent of the host is bound to a cluster &mdash; found at <code>inspecting</code>, or bound since and caught by the re-check right before the power-off. Nothing was changed. Remove the server from that cluster first (uninstall-server-from-hc does both).</td></tr>
+          <tr><td class="k">HostPowerOffTimeoutError</td><td class="muted">The BMH did not report <code>poweredOn: false</code> within 10 min. It is left with <code>online: false</code>; nothing was deleted. Usually an unreachable BMC: check it, then re-run.</td></tr>
+          <tr><td class="k">ServerScanAuthError</td><td class="muted">server-scan rejected the worker&rsquo;s token during the inspection, which reads server-scan&rsquo;s MACs. (At <code>releasing-server</code> the same error is only recorded in <code>lock_detail</code>.)</td></tr>
+          <tr><td class="k">InvalidServerNameError</td><td class="muted">The server name cannot be a Kubernetes resource name, even lowercased.</td></tr>
+          <tr><td class="k">BmhPrerequisiteMissingError</td><td class="muted">The MCE refused a read or the power-off with 403 (the worker&rsquo;s ServiceAccount lacks the verb) or a 404 meaning the resource type is not installed. Fix the worker&rsquo;s RBAC or the MCE, then re-run.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 style="margin:24px 0 10px">Stopped after the deletes began &mdash; a re-run carries on</h3>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>error</th><th>when</th></tr></thead>
+        <tbody>
+          <tr><td class="k">AgentBoundToClusterError</td><td class="muted">An Agent was bound between the power-off and its delete. The BMH and NMStateConfig are gone; the bound Agent is left alone.</td></tr>
+          <tr><td class="k">BmhPrerequisiteMissingError</td><td class="muted">A delete refused with 403 &mdash; typically the Agent delete, when the worker has no <code>delete</code> on agents. The BMH and NMStateConfig are already gone; grant the verb, then re-run.</td></tr>
+          <tr><td class="k">ServerStillPresentError</td><td class="muted">After the deletes, a BMH, NMStateConfig or Agent of the server was still there 5 min on; the message names it. An Agent that came back on a host with no BMH: power the host off through its BMC, then re-run.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="grid-2" style="margin-top:18px">
+      <div class="panel">
+        <h3>Out-waited, never failed</h3>
+        <p>Every call to the MCE and to server-scan retries <b>without limit</b>, backing off to once a
+        minute: an MCE API server or server-scan that is down, or a BMH still deleting
+        (<code>BmhTeardownError</code>). The run sits RUNNING on that phase, with the failure visible on the
+        activity in the Temporal UI.</p>
+        <p class="note">No worker polling the MCE&rsquo;s queue shows the same way: the call times out after
+        5 minutes waiting to be picked up and is tried again. The <code>progress</code> query names the queue
+        it is waiting on (<code>activity_queue</code>).</p>
+      </div>
+      <div class="panel">
+        <h3>Best effort &mdash; recorded, never failed</h3>
+        <ul>
+          <li><b>The PXE cleanup</b>: every failure goes into <code>pxe_failed</code>, and the run completes.
+            A PXE VM unreachable for 10 min is given up on.</li>
+          <li><b>The lock release</b>: every refusal goes into <code>lock_detail</code>, with
+            <code>lock_released: false</code>; the lock then expires on its own.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ========================================================== RE-RUNS -->
+  <section id="rerun">
+    <div class="sec-head">
+      <div class="eyebrow">Idempotency</div>
+      <h2>Running it again</h2>
+      <p class="lede">Every delete treats &ldquo;already gone&rdquo; as success, and the run decides what to
+      do from what it finds on the MCE each time. So re-running is always safe.</p>
+    </div>
+
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>situation</th><th>what a re-run does</th></tr></thead>
+        <tbody>
+          <tr><td class="k">a removal of that server is still running</td><td class="muted">refused with <b>409</b> &mdash; the id is one per server</td></tr>
+          <tr><td class="k">the last run completed</td><td class="muted">finds nothing and completes with <code>found: false</code></td></tr>
+          <tr><td class="k">after <code>HostPowerOffTimeoutError</code></td><td class="muted">sets <code>online: false</code> again and waits again; once the BMC answers, removes the host</td></tr>
+          <tr><td class="k">after <code>ServerStillPresentError</code></td><td class="muted">removes what it finds now &mdash; power a re-registering host off through its BMC first, or the Agent comes back again</td></tr>
+          <tr><td class="k">after <code>AgentBoundToClusterError</code></td><td class="muted">refused again while the Agent is bound</td></tr>
+          <tr><td class="k">after a PXE cleanup failure</td><td class="muted">the host is gone from the MCE, so it is <code>found: false</code> and the PXE map is <b>not</b> retried &mdash; clear the entries on the PXE VM by hand if needed</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ============================================================== API -->
+  <section id="api">
+    <div class="sec-head">
+      <div class="eyebrow">HTTP surface</div>
+      <h2>How you start it and how you watch it</h2>
+      <p class="lede">Served by <code>workflows-orchestrator-api</code> (Swagger at <code>/docs</code>).
+      Async: the POST hands back the workflow id at once and you poll it. The same API serves a temporary
+      page at <code>/ui/server-lifecycle</code>, until the ClickCluster Platform UI exists; its Remove tab
+      lists these runs and also starts one, after you type the server name a second time. The API has no auth
+      of its own: anyone who can reach it can start a removal.</p>
+    </div>
+
+    <div class="api">
+
+      <div class="endpoint">
+        <div class="endpoint-head">
+          <span class="method">POST</span>
+          <span class="path">/workflows/server-lifecycle/remove-server-from-mce</span>
+          <span class="ret">202 &middot; 409 if that server is already being removed &middot; 422 on a bad body</span>
+        </div>
+        <div class="endpoint-body">
+          <p>One server, on one MCE. <code>server_name</code> is the server&rsquo;s name;
+          <code>mce_cluster</code> is accepted with or without <code>ocp4-</code> (the run always uses the
+          prefixed name) and is needed because it names the activity queue of the worker inside that MCE;
+          <code>namespace</code>, where the BMH, NMStateConfig and Agent live, defaults to
+          <code>inventory</code>.</p>
+          <pre><span class="c">// request</span>
+{
+  "server_name": "ocp-cisco-m6-bat-yam-64c-512gb-WZP12345",
+  "mce_cluster": "mce-bat-yam-01",
+  "namespace":   "inventory"                    <span class="c">// optional, default "inventory"</span>
+}
+
+<span class="c">// 202 response</span>
+{ "workflow_id": "remove-server-from-mce-ocp-cisco-m6-bat-yam-64c-512gb-wzp12345", "run_id": "…" }
+
+<span class="c">// 409 response — a removal of that server is still running</span>
+{ "detail": "A remove-server-from-mce run is already in flight for ocp-cisco-m6-bat-yam-64c-512gb-WZP12345" }</pre>
+          <p class="note">The body <b>forbids unknown fields</b> (422), and every field must be non-empty.
+          The id is the machine, lowercased, so one server is one removal however its serial was typed &mdash;
+          and the same id whether it was started here or as uninstall-server-from-hc&rsquo;s child.</p>
+          <p class="note"><code>POST /workflows/server-lifecycle/remove-server</code>, the name before
+          2026-11-01, answers <b>410</b> naming this route, whatever the body, and starts nothing.</p>
+        </div>
+      </div>
+
+      <div class="endpoint">
+        <div class="endpoint-head">
+          <span class="method">GET</span>
+          <span class="path">/workflows/runs/{workflow_id}</span>
+          <span class="ret">200 &middot; 404 for an unknown id</span>
+        </div>
+        <div class="endpoint-body">
+          <p>The domain-agnostic status route. <code>progress</code> while running (and after a failure),
+          <code>result</code> once completed, <code>error</code> once failed.</p>
+          <pre><span class="c">// 200 while running</span>
+{
+  "status":   "RUNNING",
+  "progress": {
+    "phase":          "powering-off",
+    "activity_queue": "server-lifecycle-activity-ocp4-mce-bat-yam-01"
+  }
+}
+
+<span class="c">// 200 once completed</span>
+{
+  "status": "COMPLETED",
+  "result": {
+    "server_name": "ocp-cisco-m6-bat-yam-64c-512gb-WZP12345",
+    "namespace": "inventory", "mce_cluster": "ocp4-mce-bat-yam-01",
+    "found": true,                                <span class="c">// false: nothing of it was on the MCE</span>
+    "powered_off": true,
+    "agents_removed": [ "…" ],
+    "resources_removed": [ "NMStateConfig/nmstate-config-ocp-cisco-m6-bat-yam-64c-512gb-wzp12345",
+                           "BareMetalHost/ocp-cisco-m6-bat-yam-64c-512gb-wzp12345" ],
+    "pxe_cleared": [ "bat-yam/0025b5000001", "bat-yam/0025b5000002" ],
+    "pxe_kept":    [],                            <span class="c">// MACs that chain to another MCE</span>
+    "pxe_failed":  [],                            <span class="c">// why the PXE cleanup could not be done</span>
+    "lock_released": true,
+    "lock_detail": "released 'add-server-to-mce' (run '…', MCE 'ocp4-mce-bat-yam-01')"
+  }
+}</pre>
+          <p class="note">Run as uninstall-server-from-hc&rsquo;s child, this whole result is embedded in the
+          parent&rsquo;s result as <code>remove_server</code>, and <code>lock_detail</code> reads
+          <code>left to uninstall-server-from-hc: &hellip;</code>.</p>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ========================================================= REFERENCE -->
+  <section id="reference">
+    <div class="sec-head">
+      <div class="eyebrow">Reference</div>
+      <h2>Inputs, phases, and where it runs</h2>
+    </div>
+
+    <h3 style="margin:0 0 10px">Inputs</h3>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>field</th><th>required</th><th>meaning</th></tr></thead>
+        <tbody>
+          <tr><td class="k">server_name</td><td class="muted">yes</td><td class="muted">The server&rsquo;s name. Lowercased for the BMH name, the NMStateConfig name and the workflow id.</td></tr>
+          <tr><td class="k">mce_cluster</td><td class="muted">yes</td><td class="muted">The MCE, with or without <code>ocp4-</code>. Picks the queue <code>server-lifecycle-activity-&lt;mce_cluster&gt;</code>.</td></tr>
+          <tr><td class="k">namespace</td><td class="muted">no &mdash; <code>inventory</code></td><td class="muted">The InfraEnv&rsquo;s namespace on the MCE. The recorded run always carries it.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 style="margin:28px 0 10px">Phases</h3>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>phase</th><th>Meaning</th><th>Bound</th></tr></thead>
+        <tbody>
+          <tr><td class="k">pending</td><td class="muted">Run accepted, nothing read yet</td><td class="muted">&mdash;</td></tr>
+          <tr><td class="k">inspecting</td><td class="muted">BMH, NMStateConfig and Agents &mdash; reads only; a bound Agent stops the run here</td><td class="muted">seconds</td></tr>
+          <tr><td class="k">powering-off</td><td class="muted"><code>spec.online: false</code>, then <code>status.poweredOn</code> every 15 s &mdash; only with a BMH</td><td class="muted">&le; 10 min</td></tr>
+          <tr><td class="k">removing-host</td><td class="muted">Detach, NMStateConfig, BMH, BMC Secret &mdash; only with a BMH or NMStateConfig</td><td class="muted">minutes</td></tr>
+          <tr><td class="k">removing-agent</td><td class="muted">The Agents, each re-checked unbound &mdash; only with Agents</td><td class="muted">seconds</td></tr>
+          <tr><td class="k">removing-pxe-boot</td><td class="muted">The host&rsquo;s MACs off its own site&rsquo;s PXE VM &mdash; only with known MACs; best effort</td><td class="muted">&le; 10 min per call</td></tr>
+          <tr><td class="k">verifying</td><td class="muted">Re-inspect every 10 s until nothing is left</td><td class="muted">&le; 5 min</td></tr>
+          <tr><td class="k">releasing-server</td><td class="muted">server-scan&rsquo;s lock, released only when it is add-server-to-mce&rsquo;s for this MCE; skipped after a PXE failure</td><td class="muted">seconds</td></tr>
+          <tr><td class="k">completed</td><td class="muted">Nothing of the server is left on the MCE (or nothing was there)</td><td class="muted">&mdash;</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 style="margin:28px 0 10px">Where it runs</h3>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>what</th><th>where</th></tr></thead>
+        <tbody>
+          <tr><td class="k">workflow</td><td class="muted"><code>RemoveServerFromMceWorkflow</code> on <code>remove-server-from-mce-workflow</code>, in the <code>workflows-orchestrator</code> brain</td></tr>
+          <tr><td class="k">cluster and server-scan calls</td><td class="muted"><code>server-lifecycle-activity-&lt;mce_cluster&gt;</code>, polled by the <code>server-lifecycle-worker</code> running inside that MCE</td></tr>
+          <tr><td class="k">inventory-segment lookup</td><td class="muted"><code>segment-lifecycle-activity</code>, the segment-lifecycle worker</td></tr>
+          <tr><td class="k">runs from before 2026-11-01</td><td class="muted"><code>RemoveServerWorkflow</code> on <code>remove-server-workflow</code>, ids <code>remove-server-&lt;server&gt;</code> &mdash; kept only until no such run is open</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="panel warn" style="margin-top:20px">
+      <h3>Two things to have in place</h3>
+      <p><b>The PXE VMs&rsquo; pxe-map-api must understand <code>?mce_cluster</code>.</b> An older one ignores
+      the parameter and deletes the MAC unconditionally &mdash; including one that now chains to another
+      MCE. Upgrade the PXE VMs first.</p>
+      <p><b>The worker needs <code>delete</code> on agents</b> (<code>agents.agent-install.openshift.io</code>)
+      in its RBAC; without it the Agent delete fails with <code>BmhPrerequisiteMissingError</code>.</p>
+    </div>
+
+    <h3 style="margin:28px 0 10px">Runs recorded before a change</h3>
+    <p class="note">Three changes are gated so runs already in flight replay unchanged:
+    <code>remove-server-pxe-cleanup</code> (before it, no PXE cleanup),
+    <code>remove-server-pxe-own-site</code> (before it, every PXE VM the worker knows was swept, and the first
+    refusal failed the run) and <code>remove-server-release-own-mce-lock</code> (before it, the run ended at
+    <code>verifying</code> and left the lock to its expiry).</p>
+
+    <h3 style="margin:28px 0 10px">What it never does</h3>
+    <ul>
+      <li>No removal of a bound Agent, and no power-off under a cluster &mdash; refused, nothing changed.</li>
+      <li>No hosted-cluster work &mdash; that is <a href="/server-lifecycle/uninstall-server-from-hc.html">uninstall-server-from-hc</a>&rsquo;s.</li>
+      <li>No removal of the InfraEnv&rsquo;s shared boot entry, or of another MCE&rsquo;s PXE entry.</li>
+      <li>No release of a lock that is not add-server-to-mce&rsquo;s for this MCE.</li>
+      <li>No undo &mdash; a failure leaves everything as it is, and a re-run carries on.</li>
+    </ul>
+  </section>
+
+  <footer>
+    <span>workflow_domains/server_lifecycle/remove_server_from_mce.py</span>
+    <span>workflow_domains/server_lifecycle/router.py</span>
+    <span>activities/server_lifecycle/activities.py</span>
+    <span>activities/server_lifecycle/pxe_map.py</span>
+    <span>activities/server_lifecycle/server_scan.py</span>
+    <span>shared/models/server_lifecycle.py</span>
+    <span>shared/workflow_ids.py</span>
+  </footer>
+
+</div>
+</main>
+
+<script src="/assets/nav.js?v=__DOC_VERSION__" defer></script>
+</body>
+</html>

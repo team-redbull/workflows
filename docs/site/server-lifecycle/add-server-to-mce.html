@@ -168,7 +168,7 @@
         <b>24 h hold</b> after success writes nothing to any cluster. It only keeps S1 out of every
         other run&rsquo;s draw until server-scan can see it in a cluster for itself.</p>
         <p class="note">Taken out of MCE-A within that day, S1 gets its lock back early:
-        remove-server-from-mce releases add-server-to-mce&rsquo;s lock for <em>its</em> MCE once nothing of S1 is left there (the operator&rsquo;s decision,
+        remove-server-from-mce releases add-server-to-mce&rsquo;s lock for <em>its</em> MCE once nothing of S1 is left there and its PXE cleanup did not fail (the operator&rsquo;s decision,
         2026-10-31). Another MCE&rsquo;s lock it leaves alone.</p>
       </div>
       <div class="panel">
@@ -200,7 +200,7 @@
           <tr><td>A candidate fails a check</td><td class="muted">Skips it, tries the next</td><td class="muted">never taken</td></tr>
           <tr><td>Another run holds the candidate</td><td class="muted">Skips it, tries the next</td><td class="muted">theirs, untouched</td></tr>
           <tr><td>The Agent appears</td><td class="muted">Succeeds</td><td class="muted">held 24 h for this run</td></tr>
-          <tr><td>The server is removed from this MCE within that day (remove-server-from-mce)</td><td class="muted">&mdash;</td><td class="muted">released by remove-server-from-mce once nothing of it is left on the MCE</td></tr>
+          <tr><td>The server is removed from this MCE within that day (remove-server-from-mce)</td><td class="muted">&mdash;</td><td class="muted">released by remove-server-from-mce once nothing of it is left on the MCE and its PXE cleanup did not fail; otherwise it runs to expiry</td></tr>
           <tr><td>No Agent within 1 h</td><td class="muted">Deletes the candidate&rsquo;s resources, tries the next</td><td class="muted">released at once</td></tr>
           <tr><td>The lock lapsed mid-install and another run took the machine</td><td class="muted">Deletes <em>its own</em> resources, tries the next</td><td class="muted">the other run&rsquo;s, untouched</td></tr>
           <tr><td>Every candidate skipped or tried</td><td class="muted">Fails, reasons grouped</td><td class="muted">none left held</td></tr>
@@ -871,7 +871,7 @@
           <tr><td class="k">SERVER_SCAN_URL</td><td class="muted"><code>server-lifecycle-config</code></td><td class="muted">Inventory API base, <b>including</b> <code>/api/v1</code>.</td></tr>
           <tr><td class="k">SERVER_SCAN_API_TOKEN</td><td class="muted"><code>server-lifecycle-credentials</code></td><td class="muted">An <b>admin</b> token &mdash; the install lock is taken and released through server-scan&rsquo;s mutation endpoints, and a viewer token fails every run with <code>ServerScanAuthError</code>. May be empty where server-scan runs with auth disabled.</td></tr>
           <tr><td class="k">{HP,DELL,CISCO,INTERSIGHT}_BMC_USERNAME / _PASSWORD</td><td class="muted"><code>server-lifecycle-credentials</code></td><td class="muted">What Ironic uses to drive the BMC. server-scan never holds these. A vendor with no pair fails its run with <code>BmcCredentialsMissingError</code>.</td></tr>
-          <tr><td class="k">RBAC</td><td class="muted">the chart&rsquo;s Role</td><td class="muted">Namespace-scoped. <code>get</code>,<code>create</code>,<code>delete</code> on <code>secrets</code>; <code>get</code>,<code>create</code>,<code>delete</code>,<code>patch</code> on <code>metal3.io/baremetalhosts</code>; <code>get</code>,<code>create</code>,<code>delete</code> on <code>agent-install.openshift.io/nmstateconfigs</code>; <code>get</code>,<code>list</code> on <code>agent-install.openshift.io/agents</code>. <code>delete</code>+<code>patch</code> are the rollback (detach, then the finalizer); <code>list</code> on agents cannot be a <code>get</code>, because an Agent is matched by MAC. Still no <code>update</code> &mdash; nothing here overwrites an existing resource. A missing verb is a non-retryable <code>BmhPrerequisiteMissingError</code>, not a silent retry loop.</td></tr>
+          <tr><td class="k">RBAC</td><td class="muted">the chart&rsquo;s Role</td><td class="muted">Namespace-scoped. <code>get</code>,<code>create</code>,<code>delete</code> on <code>secrets</code>; <code>get</code>,<code>create</code>,<code>delete</code>,<code>patch</code> on <code>metal3.io/baremetalhosts</code>; <code>get</code>,<code>create</code>,<code>delete</code> on <code>agent-install.openshift.io/nmstateconfigs</code>; <code>get</code>,<code>list</code> on <code>agent-install.openshift.io/agents</code>; <code>get</code> on <code>agent-install.openshift.io/infraenvs</code> (an IPMI server&rsquo;s network boot reads its InfraEnv). <code>delete</code>+<code>patch</code> are the rollback (detach, then the finalizer); <code>list</code> on agents cannot be a <code>get</code>, because an Agent is matched by MAC. Still no <code>update</code> &mdash; nothing here overwrites an existing resource. A missing verb is a non-retryable <code>BmhPrerequisiteMissingError</code>, not a silent retry loop.</td></tr>
         </tbody>
       </table>
     </div>

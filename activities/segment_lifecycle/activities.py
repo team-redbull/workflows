@@ -47,6 +47,7 @@ from shared.exceptions import (
     SegmentsManagerError,
     SegmentNotFoundError,
     SegmentValidationError,
+    ValuesBranchMissing,
 )
 from shared.models.segment_lifecycle import (
     ClusterAllocationLookup,
@@ -254,7 +255,7 @@ def _require_values_branch(values_branch: str | None) -> str:
         raise ApplicationError(
             "No values_branch on the request — the values-repo branch to clone "
             "and push is a per-run input, and this request carries none",
-            type="ValuesBranchMissing",
+            type=ValuesBranchMissing.__name__,
             non_retryable=True,
         )
     return values_branch

@@ -146,7 +146,7 @@ async def release_server(request: ReleaseServerRequest) -> ServerReservation:
     add-server-to-mce's after a rolled-back candidate; uninstall-server-from-hc's own once
     its remove-server-from-mce child took the host off the MCE; and remove-server-from-mce's
     release of add-server-to-mce's lock for ITS MCE once the host is gone from it
-    (the holder + workflow id it read). Not needed for correctness — the lock
+    and its PXE cleanup did not fail (the holder + workflow id it read). Not needed for correctness — the lock
     expires on its own — but without it the machine stays undrawable for the
     rest of its TTL, a day after an install. Never a failure when there is
     nothing to release: an expired lock, a server gone from the inventory
@@ -183,7 +183,7 @@ async def inspect_inventory_host(ref: BmhRef) -> InventoryHostState:
 async def remove_host_pxe_entries(ref: PxeHostEntriesRef) -> PxeHostEntriesRemoval:
     """remove-server-from-mce: clear the host's MACs from the site PXE VMs.
 
-    For every PXE VM in this worker's PXE_MAP_URLS and every MAC in `ref.macs`:
+    On the PXE VM of `ref.site` (see below), for every MAC in `ref.macs`:
     `DELETE /pxe-map/<mac>?mce_cluster=<ref.mce_cluster>`. The PXE VM refuses
     (409) a MAC that chains to ANOTHER MCE's boot entry — the machine was
     mapped by that MCE since, and its boot is not this removal's to take — and

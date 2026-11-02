@@ -37,8 +37,8 @@ Shape of the run:
                         in `pxe_kept`). BEST EFFORT: no segment, a rejected
                         token or request, or a VM unreachable for 10 min is
                         reported in `pxe_failed` and logged — the removal still
-                        completes. Runs for every server — a Redfish one simply
-                        has no entries.
+                        completes. Skipped when no MAC is known for the host:
+                        there is nothing to clear.
   6. verifying        — inspect again until no Agent, BMH or NMStateConfig is
                         left (an Agent's finalizer takes seconds). Anything
                         still there after a bounded wait fails the run with

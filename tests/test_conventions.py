@@ -207,3 +207,19 @@ def test_the_hook_names_the_docs_pages_of_the_edited_code(checker):
     assert reminder is not None
     assert "docs/site/segment-lifecycle/allocate-segment.html" in reminder
     assert checker.docs_reminder(REPO_ROOT / "tests/test_api.py") is None
+
+
+def test_a_documented_exception_may_sit_above_a_decorated_class(checker):
+    source = '''
+from temporalio import workflow
+
+
+# conventions: allow WF014 — a synchronous question answered in the response
+@workflow.defn
+class ProbeWorkflow:
+    @workflow.run
+    async def run(self, run_args):
+        return None
+'''
+    warnings = {v.rule for v in checker.run_source("workflow_domains/probe/probe.py", source)}
+    assert "WF014" not in warnings

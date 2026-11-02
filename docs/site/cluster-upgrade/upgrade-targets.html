@@ -1,0 +1,303 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>upgrade-targets — Redbull Workflows</title>
+<meta name="description" content="The upgrade-targets workflow: which releases one HyperShift HostedCluster can be upgraded to, read from day1 git and answered in the HTTP response — the one synchronous route, a question rather than a job, that changes nothing.">
+<link rel="icon" href="/assets/favicon.svg?v=__DOC_VERSION__" type="image/svg+xml">
+<link rel="stylesheet" href="/assets/site.css?v=__DOC_VERSION__">
+</head>
+<body data-page="/cluster-upgrade/upgrade-targets.html">
+
+<a class="skip-link" href="#main">Skip to content</a>
+
+<!-- Topbar: identical on every page. Brand + deployed version upper-left; the
+     "Workflows" menu is built from the catalogue in assets/nav.js. -->
+<header class="topbar">
+  <a class="brand" href="/">
+    <img class="brand-mark" src="/assets/redbull-logo.png?v=__DOC_VERSION__" alt="" aria-hidden="true"
+         width="480" height="179">
+    <span class="brand-name">Redbull Workflows</span>
+    <span class="brand-ver" title="deployed image tag of this documentation site">__DOC_VERSION__</span>
+  </a>
+  <nav class="topnav" aria-label="Site">
+    <a class="topnav-link" href="/">Orchestrator guide</a>
+    <div class="wfmenu">
+      <button class="wfmenu-btn" id="wfmenu-btn" type="button"
+              aria-expanded="false" aria-haspopup="true" aria-controls="wfmenu-panel">
+        Workflows <span class="caret" aria-hidden="true">&#9662;</span>
+      </button>
+      <div class="wfmenu-panel" id="wfmenu-panel" role="menu" aria-label="Workflows by domain" hidden></div>
+    </div>
+    <noscript>
+      <a class="topnav-link" href="/cluster-upgrade/upgrade-targets.html">upgrade-cluster</a>
+    </noscript>
+  </nav>
+</header>
+
+<main id="main">
+<header class="masthead">
+  <div class="masthead-inner">
+    <div class="eyebrow">Temporal workflow &middot; domain: cluster-upgrade</div>
+    <h1>upgrade-targets<span class="dim"> &mdash; what can this cluster go to?</span></h1>
+    <p class="lede">
+      One question about <b>one HyperShift HostedCluster</b>: which releases may a person pick as the target
+      of an <a href="/cluster-upgrade/upgrade-cluster.html">upgrade-cluster</a> run? The answer is every
+      <b>ladder rung newer than the cluster&rsquo;s <code>mastertag</code></b>, of a minor its MCE supports,
+      to which an upgrade path resolves &mdash; newest first. It is what the &ldquo;New upgrade&rdquo; form
+      draws its target list from.
+    </p>
+    <p class="lede">It is the <b>one synchronous route</b> in the API. Every route that starts work answers 202
+    with a workflow id to poll. This one is a <b>question, not a job</b>: it runs a short,
+    read-only workflow, waits up to <b>60 s</b> for it, and returns the answer in the HTTP response. There is
+    no run to poll. It <b>changes nothing</b>: two reads of day1 git, no commit, nothing read or written on
+    an MCE or a cluster.</p>
+    <div class="facts">
+      <div class="fact"><span class="k">Trigger</span><span class="v">GET /workflows/cluster-upgrade/upgrade-targets?cluster=&lt;cluster&gt;</span></div>
+      <div class="fact"><span class="k">Workflow id</span><span class="v">one per cluster: upgrade-targets-&lt;cluster&gt;</span></div>
+      <div class="fact"><span class="k">Workflow queue</span><span class="v">upgrade-targets-workflow</span></div>
+      <div class="fact"><span class="k">Activity queue</span><span class="v">upgrade-gitops-activity (hub)</span></div>
+      <div class="fact"><span class="k">Answer</span><span class="v">in the response, within 60 s</span></div>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <!-- ============================================================= READS -->
+  <section id="reads">
+    <div class="sec-head">
+      <div class="eyebrow">What it reads</div>
+      <h2>Two reads of day1 git, on the hub limb</h2>
+      <p class="lede">Both reads are activities on <code>upgrade-gitops-activity</code>, served by
+      <code>upgrade-gitops-worker</code> on the hub. Both read day1 at <code>main</code>. Nothing else is
+      called: no MCE limb, no mirror, no agent.</p>
+    </div>
+
+    <div class="grid-2">
+      <div class="panel">
+        <h3>1 &middot; The cluster&rsquo;s day1 file</h3>
+        <p><code>read_day1_cluster</code> finds <code>&lt;cluster&gt;.yaml</code> under
+        <code>sites/&lt;site&gt;/mces/&lt;mce&gt;/hostedClusters/</code>. The folder names the <b>hosting
+        MCE</b>, so the caller never gives one. The file gives the <code>mastertag</code> (the control
+        plane&rsquo;s release), each NodePool&rsquo;s <code>workertag</code> (else the file&rsquo;s, else the
+        <code>mastertag</code>), and the NodePools themselves.</p>
+        <p class="note">A file outside that layout names no MCE: the run fails
+        (<code>UpgradePlanningFailedError</code>, &ldquo;no MCE to run on&rdquo;). A file the parser refused
+        &mdash; a duplicate key, a NodePool named twice &mdash; fails it too, listing every
+        <code>problems</code> line, before the rules are read. A wrongly read file would offer wrong
+        targets.</p>
+      </div>
+      <div class="panel">
+        <h3>2 &middot; The upgrade rules for that MCE</h3>
+        <p><code>read_upgrade_rules</code> reads day1&rsquo;s <code>upgrade/ladder.yaml</code> and
+        <code>upgrade/mces/&lt;mce&gt;.yaml</code>, after day1&rsquo;s own
+        <code>scripts/validate_upgrade_rules.py</code> passed them. From them: the <b>ladder</b> (the releases
+        the team mirrored and verified), <code>maxWorkerSkew</code>, the MCE&rsquo;s version and its
+        <code>supportedHostedVersions</code>, and the date the ladder was last checked against the upgrade
+        graph.</p>
+        <p class="note">Missing or invalid rules fail the run (<code>UpgradeRulesInvalidError</code>).</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ DECIDE -->
+  <section id="decide">
+    <div class="sec-head">
+      <div class="eyebrow">How it decides</div>
+      <h2>Ladder rungs only, and only those a path reaches</h2>
+      <p class="lede">The choice is pure code (<code>target_options</code> in <code>upgrade_path.py</code>),
+      the same resolver an <a href="/cluster-upgrade/upgrade-cluster.html#path">upgrade-cluster run plans
+      with</a>. For each candidate it works out the whole path, exactly as a run would, and keeps the
+      candidate only if a path exists.</p>
+    </div>
+
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>#</th><th>rule</th><th>why</th></tr></thead>
+        <tbody>
+          <tr><td class="k">1</td><td class="muted">Only <b>ladder rungs</b> are candidates.</td><td class="muted">The ladder is what the team mirrored and verified. A release in the registry that is not a rung is never offered, so a minor missing from the mirror never is either.</td></tr>
+          <tr><td class="k">2</td><td class="muted">Only rungs <b>newer than the <code>mastertag</code></b>.</td><td class="muted">There is no downgrade, and the current release is nothing to upgrade to.</td></tr>
+          <tr><td class="k">3</td><td class="muted">Only rungs of a minor in the MCE&rsquo;s <code>supportedHostedVersions</code>.</td><td class="muted">A minor the MCE cannot host is no target. An entry that does not read as a minor is ignored.</td></tr>
+          <tr><td class="k">4</td><td class="muted">Only rungs <b>a path resolves to</b>.</td><td class="muted">The control plane through every minor, no <code>must</code> rung skipped, no NodePool more than <code>maxWorkerSkew</code> minors behind: the <a href="/cluster-upgrade/upgrade-cluster.html#path">path rules</a>. A rung the rules refuse is dropped, not reported.</td></tr>
+          <tr><td class="k">5</td><td class="muted">Newest first.</td><td class="muted">The first entry is the furthest the cluster can go.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="grid-2" style="margin-top:18px">
+      <div class="panel">
+        <h3>What each target says</h3>
+        <ul>
+          <li><code>version</code>, <code>minor</code> &mdash; the rung, and its minor (<code>"4.21"</code>).</li>
+          <li><code>control_plane_steps</code> &mdash; how many of those steps move the control plane: at least
+            one per minor it crosses.</li>
+          <li><code>steps</code> &mdash; every step of that path, control plane and workers. A worker step
+            counts once, however many NodePools it rolls. Counted with <code>workers_to_target</code> on, the
+            run&rsquo;s default.</li>
+          <li><code>newest_in_minor</code> &mdash; the newest rung of its minor: the pick for that minor.</li>
+          <li><code>must</code> &mdash; the rung is a <code>must</code> rung on the ladder.</li>
+        </ul>
+      </div>
+      <div class="panel warn">
+        <h3>An empty list is an answer, not an error</h3>
+        <p><code>targets</code> comes back empty when:</p>
+        <ul>
+          <li>the cluster is already at the newest rung its MCE supports;</li>
+          <li>the file has no <code>mastertag</code> (<code>control_plane_version</code> is then
+            <code>null</code>);</li>
+          <li>no path reaches any rung &mdash; a NodePool newer than its control plane, a NodePool already
+            beyond <code>maxWorkerSkew</code>, or a <code>workertag</code> that is no release.</li>
+        </ul>
+        <p class="note">The response does not say which. To find out, start an upgrade-cluster run toward the
+        target you expected: its planning fails naming the rule that refused, with nothing committed.</p>
+      </div>
+    </div>
+
+    <div class="panel" style="margin-top:18px">
+      <h3>The NodePools, for the form&rsquo;s order and maxUnavailable fields</h3>
+      <p>The answer also carries the file&rsquo;s <code>nodepools</code> (name, <code>workertag</code>, zone,
+      replicas, <code>max_unavailable</code>, as written) and <code>nodepool_order</code>: the order a run
+      would roll them in when its request names none &mdash; the file&rsquo;s
+      <code>upgrade.nodePoolOrder</code>, else by zone when every NodePool has one, else file order.</p>
+      <p class="note">One difference from a run: when <code>upgrade.nodePoolOrder</code> does not name each
+      NodePool exactly once, this answer offers file order instead of failing. An upgrade-cluster run fails
+      planning on that file unless its request gives <code>nodepool_order</code>.</p>
+    </div>
+  </section>
+
+  <!-- ================================================================ API -->
+  <section id="api">
+    <div class="sec-head">
+      <div class="eyebrow">HTTP surface</div>
+      <h2>How you call it</h2>
+      <p class="lede">Served by <code>workflows-orchestrator-api</code>. The route starts an
+      <code>upgrade-targets</code> run with a 60 s execution timeout and waits for its result. Two asks for
+      the same cluster at the same time share one run: the id is <code>upgrade-targets-&lt;cluster&gt;</code>,
+      and a second ask joins the run already under way.</p>
+    </div>
+
+    <div class="api">
+      <div class="endpoint">
+        <div class="endpoint-head">
+          <span class="method">GET</span>
+          <span class="path">/workflows/cluster-upgrade/upgrade-targets?cluster=&lt;cluster&gt;</span>
+          <span class="ret">200 &middot; 404 &middot; 409 &middot; 422 &middot; 504</span>
+        </div>
+        <div class="endpoint-body">
+          <p><code>cluster</code> is the <b>day1 cluster file&rsquo;s name</b> (also its Argo CD Application),
+          without <code>.yaml</code> &mdash; not the HostedCluster&rsquo;s name, which the chart derives from
+          the file. It must match <code>^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$</code>, the same rule the
+          upgrade-cluster start applies, and is checked before anything runs. No MCE: the run finds it.</p>
+          <pre><span class="c">// 200 &mdash; a cluster at 4.19.53 with three zoned NodePools, on today&rsquo;s ladder</span>
+{
+  "cluster":               "&lt;cluster&gt;",
+  "mce_cluster":           "&lt;mce&gt;",             <span class="c">// from the folder the day1 file is in</span>
+  "mce_version":           "2.17.3",            <span class="c">// from upgrade/mces/&lt;mce&gt;.yaml</span>
+  "control_plane_version": "4.19.53",           <span class="c">// day1 mastertag; null when the file has none</span>
+  "supported_minors":      ["4.21", "4.20", "4.19"],
+  "ladder_revision":       "…",                 <span class="c">// the day1 commit the rules were read at</span>
+  "verified_against_graph": "2026-10-31",       <span class="c">// ladder last checked against the upgrade graph</span>
+  "targets": [
+    { "version": "4.21.40", "minor": "4.21", "steps": 3, "control_plane_steps": 2, "newest_in_minor": true, "must": true },
+    { "version": "4.20.44", "minor": "4.20", "steps": 2, "control_plane_steps": 1, "newest_in_minor": true, "must": true }
+  ],
+  "nodepools": [
+    { "name": "zone-a", "workertag": null, "upgrade_type": null, "zone": "a", "replicas": 1, "max_unavailable": "1" },
+    { "name": "zone-b", "workertag": null, "upgrade_type": null, "zone": "b", "replicas": 1, "max_unavailable": "1" },
+    { "name": "zone-c", "workertag": null, "upgrade_type": null, "zone": "c", "replicas": 1, "max_unavailable": "1" }
+  ],
+  "nodepool_order": ["zone-a", "zone-b", "zone-c"]
+}</pre>
+          <p class="note">4.21.40 is three steps: control plane &rarr; 4.20.44, control plane &rarr; 4.21.40,
+          then one worker step to 4.21.40. No 4.19 rung is offered: 4.19.53 is the cluster&rsquo;s own.</p>
+
+          <div class="table-scroll" style="margin-top:6px">
+            <table>
+              <thead><tr><th>answer</th><th>means</th></tr></thead>
+              <tbody>
+                <tr><td class="k">200</td><td class="muted">the answer, as above. <code>targets</code> may be empty (<a href="#decide">why</a>)</td></tr>
+                <tr><td class="k">404</td><td class="muted">day1 has no <code>&lt;cluster&gt;.yaml</code> under any MCE (<code>ClusterFileNotFoundError</code>)</td></tr>
+                <tr><td class="k">409</td><td class="muted">the run failed on something it cannot use; the detail is its reason. Among them: more than one <code>&lt;cluster&gt;.yaml</code> in day1 (<code>AmbiguousClusterFileError</code>); rules missing or invalid (<code>UpgradeRulesInvalidError</code>); a file outside <code>sites/&lt;site&gt;/mces/&lt;mce&gt;/hostedClusters/</code> or one the parser refused (<code>UpgradePlanningFailedError</code>); a <code>mastertag</code> or a ladder rung that is no release, or a rung listed twice (<code>UpgradePathRefusedError</code>)</td></tr>
+                <tr><td class="k">422</td><td class="muted"><code>cluster</code> missing or not a valid name; nothing ran</td></tr>
+                <tr><td class="k">504</td><td class="muted">no answer in 60 s: &ldquo;is the upgrade-gitops limb running?&rdquo; A read that keeps failing for a passing reason (git unreachable) is retried until then and ends here too</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="note">The 60 s is the run&rsquo;s own execution timeout, so a read that hangs ends on its own:
+          nothing is left running after a 504.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel" style="margin-top:18px">
+      <h3>No progress query, on purpose</h3>
+      <p>An upgrade-targets run has no <code>@workflow.query def progress</code>. Nothing polls it: the caller
+      already holds the HTTP request open and gets the result in the response. The run still shows in Temporal
+      and on <code>GET /workflows/runs/{workflow_id}</code>, status only.</p>
+    </div>
+  </section>
+
+  <!-- ========================================================= NEXT -->
+  <section id="next">
+    <div class="sec-head">
+      <div class="eyebrow">What happens with the answer</div>
+      <h2>A choice for a person, then an upgrade-cluster run</h2>
+      <p class="lede">The person picks a <code>version</code> from <code>targets</code> and starts an
+      <a href="/cluster-upgrade/upgrade-cluster.html#api">upgrade-cluster</a> run with it as
+      <code>target_version</code>. The NodePool list seeds the request&rsquo;s <code>nodepool_order</code> and
+      <code>max_unavailable</code>; the form sends them only where the person changed them.</p>
+    </div>
+
+    <div class="grid-2">
+      <div class="panel accent">
+        <h3>The answer is git&rsquo;s intent, not a promise</h3>
+        <p>It is read from day1 only. The run that follows still does its own planning: it checks git
+        against the HostedCluster and its NodePools, pins every release to a digest in the mirror, and checks
+        the rules against the MCE. A target offered here can still fail there &mdash; a cluster that does not
+        run what its file says, a release missing from the mirror.</p>
+      </div>
+      <div class="panel">
+        <h3>Nothing to undo</h3>
+        <p>Asking is free. The answer is not stored, nothing is reserved, and the next ask reads day1 again.
+        To see the full plan for one target, start the upgrade-cluster run: starting it is the dry run, and an
+        <code>abort</code> before <code>approve</code> ends it CANCELLED with nothing committed.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ========================================================= REFERENCE -->
+  <section id="reference">
+    <div class="sec-head">
+      <div class="eyebrow">Reference</div>
+      <h2>What it never does</h2>
+    </div>
+    <ul>
+      <li>No commit to day1, no push, no Argo CD sync.</li>
+      <li>No read or write on an MCE, a HostedCluster or a NodePool &mdash; only day1 git, on the hub limb.</li>
+      <li>No mirror lookup and no digest pinned: a target is a ladder rung, whatever the registry holds.</li>
+      <li>No release outside the ladder, no minor the MCE does not support, no downgrade.</li>
+      <li>No LLM call.</li>
+      <li>No run left to poll, and no run left running after its 60 s.</li>
+    </ul>
+  </section>
+
+  <footer>
+    <span>workflow_domains/cluster_upgrade/upgrade_targets.py</span>
+    <span>workflow_domains/cluster_upgrade/upgrade_path.py</span>
+    <span>workflow_domains/cluster_upgrade/gates.py</span>
+    <span>workflow_domains/cluster_upgrade/dispatch.py</span>
+    <span>workflow_domains/cluster_upgrade/router.py</span>
+    <span>shared/models/cluster_upgrade.py</span>
+    <span>shared/interfaces/upgrade_gitops.py</span>
+    <span>day1: upgrade/ladder.yaml</span>
+    <span>day1: upgrade/mces/&lt;mce&gt;.yaml</span>
+  </footer>
+
+</div>
+</main>
+
+<script src="/assets/nav.js?v=__DOC_VERSION__" defer></script>
+</body>
+</html>

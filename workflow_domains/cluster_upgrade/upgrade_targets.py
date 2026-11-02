@@ -39,6 +39,8 @@ with workflow.unsafe.imports_passed_through():
     from workflow_domains.cluster_upgrade.dispatch import hosting_mce, on_hub
 
 
+# conventions: allow WF014 — a synchronous 60 s question answered in the HTTP response
+# (CLAUDE.md §2, DESIGN D22): there is no run to poll, so no progress query.
 @workflow.defn
 class UpgradeTargetsWorkflow:
     @workflow.run

@@ -70,6 +70,12 @@ from temporalio.exceptions import ApplicationError
 
 with workflow.unsafe.imports_passed_through():
     from shared.consts import SEGMENT_LIFECYCLE_ACTIVITY_QUEUE
+    from shared.exceptions import (
+        AllocationNotConfirmed,
+        UnknownSite,
+        UnsupportedSegmentType,
+        ValuesBranchMissing,
+    )
     from shared.interfaces.segment_lifecycle import (
         allocate_segment,
         append_allocation_to_cluster_values,
@@ -142,7 +148,7 @@ class AllocateSegmentWorkflow:
                 f"allocate-segment supports type=HC only (got "
                 f"{allocate_input.type.value}); future segment types get "
                 "their own functions when they arrive",
-                type="UnsupportedSegmentType",
+                type=UnsupportedSegmentType.__name__,
             )
         # The API requires the branch (AllocateSegmentRequest); the boundary
         # model defaults it to None only so history recorded before the field
@@ -154,7 +160,7 @@ class AllocateSegmentWorkflow:
                 "allocate-segment needs the values-repo branch to record the "
                 "allocation on (values_branch) — the API requires it, so this "
                 "run was not started through the router",
-                type="ValuesBranchMissing",
+                type=ValuesBranchMissing.__name__,
             )
 
         # Step 1 — resolve the site from the values repo, cross-checked
@@ -180,7 +186,7 @@ class AllocateSegmentWorkflow:
                 f"Cluster {cluster}'s values file sits under site "
                 f"{location.site!r} ({location.relative_path}), which the "
                 f"Segments Manager does not know (valid: {sorted(valid_sites)})",
-                type="UnknownSite",
+                type=UnknownSite.__name__,
             )
 
         # Step 2 — reserve the segment (idempotent per cluster/site/type).
@@ -230,7 +236,7 @@ class AllocateSegmentWorkflow:
             raise ApplicationError(
                 f"Allocation of {allocation.segment} did not verify: "
                 + "; ".join(mismatches),
-                type="AllocationNotConfirmed",
+                type=AllocationNotConfirmed.__name__,
             )
 
         # Step 4 — record the allocation in the values repo (idempotent: a

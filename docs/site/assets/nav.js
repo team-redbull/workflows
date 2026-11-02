@@ -51,6 +51,16 @@
           blurb: "put a physical server into an MCE InfraEnv"
         },
         {
+          name: "publish-infraenv-to-pxe-server",
+          href: "/server-lifecycle/publish-infraenv-to-pxe-server.html",
+          blurb: "an InfraEnv's boot entry onto its PXE VM"
+        },
+        {
+          name: "remove-server-from-mce",
+          href: "/server-lifecycle/remove-server-from-mce.html",
+          blurb: "take a server out of an MCE's inventory"
+        },
+        {
           name: "uninstall-server-from-hc",
           href: "/server-lifecycle/uninstall-server-from-hc.html",
           blurb: "take a server out of its hosted cluster and the MCE"
@@ -82,7 +92,12 @@
         {
           name: "upgrade-cluster",
           href: "/cluster-upgrade/upgrade-cluster.html",
-          blurb: "a HostedCluster to a newer release, via day1 git · not runnable yet"
+          blurb: "a HostedCluster to a newer release, via day1 git · sandbox only"
+        },
+        {
+          name: "upgrade-targets",
+          href: "/cluster-upgrade/upgrade-targets.html",
+          blurb: "which releases a cluster can go to · one GET"
         }
       ]
     }

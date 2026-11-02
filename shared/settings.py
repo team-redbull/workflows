@@ -279,7 +279,8 @@ class ServerLifecycleActivitySettings(BaseSettings):
     # Defaulted EMPTY, unlike most keys: only an IPMI install needs it, and a
     # required key would crash-loop every MCE's worker until its chart shipped
     # one. An IPMI candidate at a site that is not listed is skipped with
-    # PxeSiteNotConfiguredError; Redfish candidates never read this.
+    # PxeSiteNotConfiguredError (add-server-to-mce; publish-infraenv-to-pxe-server
+    # fails on it, having nothing else to do); Redfish candidates never read this.
     pxe_map_urls: dict[str, str] = {}
     pxe_map_token: str = ""
 

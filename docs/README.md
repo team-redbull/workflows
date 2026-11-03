@@ -26,6 +26,7 @@ docs/
       publish-infraenv-to-pxe-server.html
       remove-server-from-mce.html
       uninstall-server-from-hc.html
+      update-nodepool.html
     server-provisioning/
       provision-dell-server.html
     cluster-upgrade/

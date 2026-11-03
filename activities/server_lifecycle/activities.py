@@ -17,6 +17,9 @@ parameters, which is what makes them testable without a Temporal environment:
                         AgentMachines and HostedClusters, as pure functions.
   * hosted_cluster_api.py — the one read of a HOSTED cluster's own API server
                         (its Node), through its admin kubeconfig.
+  * machine_selection.py — what scale-down-nodepool reads off a NodePool's
+                        Machines, Nodes and Pods, and its delete-mark patch,
+                        as pure functions.
 
 This module owns what only an activity can: the settings instance (read once at
 import, so a missing key crash-loops the worker instead of failing a run) and
@@ -30,6 +33,7 @@ as the operator's did.
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime, timedelta
 
 from temporalio import activity
 
@@ -37,6 +41,7 @@ from activities.server_lifecycle import (
     cluster_api,
     hosted_cluster_api,
     hosted_resources,
+    machine_selection,
     pxe_map,
     server_scan,
 )
@@ -80,6 +85,8 @@ from shared.exceptions import (
     HostedClusterAccessError,
     InfraEnvNotFoundError,
     InfraEnvNotReadyError,
+    MachineMarkConflictError,
+    NodeMetricsPendingError,
     PxeSiteNotConfiguredError,
 )
 from shared.models.server_lifecycle import (
@@ -122,8 +129,13 @@ from shared.models.server_lifecycle import (
     InventoryHostState,
     MachineDeletion,
     MachineHookRelease,
+    MachineMarkRequest,
+    MachineMarks,
     MachineRef,
     MachineState,
+    MarkedMachinesOutcome,
+    MarkedMachinesWatch,
+    MarkedMachinesWatchRequest,
     NmStateConfigReplacement,
     NmStateConfigReplaceRequest,
     PxeBootRegistration,
@@ -134,6 +146,9 @@ from shared.models.server_lifecycle import (
     PxeUnregistration,
     ReleaseServerRequest,
     ReserveServerRequest,
+    ScaleDownCandidates,
+    ScaleDownCandidatesRequest,
+    ScaleDownPolicy,
     ServerMembership,
     ServerMembershipRequest,
     ServerReservation,
@@ -1626,3 +1641,210 @@ async def clean_up_agent_machines(request: AgentMachineCleanupRequest) -> AgentM
         result.machines,
     )
     return result
+
+
+# --- scale-down-nodepool: the servers that leave ----------------------------------------
+
+# A watch looks this often, and heartbeats each time (the workflow sets the
+# heartbeat_timeout well above it).
+_MACHINE_WATCH_POLL_SECONDS = 15
+# The CAPI version every Machine here is listed and patched by (as _list_machines).
+_MACHINE_VERSION = "v1beta1"
+
+
+async def _machines_in(namespace: str) -> list[dict]:
+    return await cluster_api.list_custom_objects(
+        group=hosted_resources.MACHINE_GROUP,
+        version=_MACHINE_VERSION,
+        plural=hosted_resources.MACHINE_PLURAL,
+        kind=hosted_resources.MACHINE_KIND,
+        namespace=namespace,
+    )
+
+
+async def _machine(namespace: str, name: str) -> dict | None:
+    return await _read_machine(MachineRef(namespace=namespace, name=name))
+
+
+async def _patch_mark(namespace: str, machine: dict, mark: str | None) -> bool:
+    """Set (`mark`) or remove (None) the delete mark at the resourceVersion read; False when gone."""
+    metadata = machine.get("metadata") or {}
+    return await cluster_api.patch_custom_object(
+        group=hosted_resources.MACHINE_GROUP,
+        version=_MACHINE_VERSION,
+        plural=hosted_resources.MACHINE_PLURAL,
+        kind=hosted_resources.MACHINE_KIND,
+        namespace=namespace,
+        name=metadata.get("name") or "",
+        body=machine_selection.mark_patch(metadata.get("resourceVersion"), mark),
+    )
+
+
+@activity.defn
+async def read_scale_down_candidates(request: ScaleDownCandidatesRequest) -> ScaleDownCandidates:
+    """Every Machine of these NodePools, with what their policies rank by. Reads only."""
+    cluster = HostedClusterRef(
+        namespace=request.hosted_cluster_namespace,
+        name=request.hosted_cluster,
+        hcp_namespace=hosted_resources.hosted_control_plane_namespace(
+            request.hosted_cluster_namespace, request.hosted_cluster
+        ),
+    )
+    label = f"{cluster.namespace}/{cluster.name}"
+    machines = await _machines_in(cluster.hcp_namespace)
+    kubeconfig = await _hosted_kubeconfig(cluster)
+    if kubeconfig is None:
+        raise HostedClusterAccessError(
+            f"HostedCluster {label} is not on this MCE, so its Nodes cannot be ranked"
+        )
+    with_metrics = any(np.policy is ScaleDownPolicy.LEAST_UTILIZED for np in request.nodepools)
+    objects = await hosted_cluster_api.read_scale_down_objects(
+        kubeconfig, hosted_cluster_api.kas_service_url(cluster.hcp_namespace), label, with_metrics
+    )
+    nodes = {(n.get("metadata") or {}).get("name"): n for n in objects["nodes"]}
+    metrics = (
+        None if objects["metrics"] is None
+        else {(m.get("metadata") or {}).get("name"): m for m in objects["metrics"]}
+    )
+    found = []
+    for nodepool in request.nodepools:
+        uses_metrics = nodepool.policy is ScaleDownPolicy.LEAST_UTILIZED
+        for machine in machine_selection.machines_of(machines, f"{cluster.namespace}/{nodepool.name}"):
+            state = machine_selection.candidate(
+                machine, nodepool.name, nodes, objects["pods"], metrics if uses_metrics else None
+            )
+            # A Node with no Machine-side problem must be ranked by its use; one
+            # with no metrics yet (it just joined) is waited for, not guessed.
+            if uses_metrics and state.node_found and state.ready and not state.unschedulable and (
+                state.used_permille is None
+            ):
+                raise NodeMetricsPendingError(
+                    f"Node {state.node} of NodePool {nodepool.name} in hosted cluster {label} has no "
+                    "metrics.k8s.io NodeMetrics yet; read again on the next attempt"
+                )
+            found.append(state)
+    activity.logger.info(
+        "Scale-down candidates in %s: %s",
+        label,
+        [
+            f"{m.nodepool}/{m.name} node={m.node} ready={m.ready} pods={m.workload_pods} "
+            f"requested={m.requested_permille} used={m.used_permille} mark={m.delete_mark!r} "
+            f"deleting={m.deleting}"
+            for m in found
+        ],
+    )
+    return ScaleDownCandidates(hcp_namespace=cluster.hcp_namespace, machines=found)
+
+
+@activity.defn
+async def mark_machines_for_deletion(request: MachineMarkRequest) -> MachineMarks:
+    """`cluster.x-k8s.io/delete-machine: <mark>` on each Machine, read back."""
+    result = MachineMarks()
+    for name in request.machines:
+        where = f"{request.namespace}/{name}"
+        machine = await _machine(request.namespace, name)
+        if machine is None:
+            raise MachineMarkConflictError(
+                f"Machine {where} is gone: it is no longer the server the scale-down chose"
+            )
+        mark = machine_selection.delete_mark(machine)
+        if mark == request.mark:
+            result.unchanged.append(name)
+            continue
+        if machine_selection.machine_deleting(machine):
+            raise MachineMarkConflictError(
+                f"Machine {where} is already deleting: something else is removing it, so it is "
+                "not the server the scale-down chose"
+            )
+        if mark is not None:
+            raise MachineMarkConflictError(
+                f"Machine {where} carries another delete mark ({mark!r}): CAPI would delete it "
+                "first, so the scale-down will not mark it as well"
+            )
+        if not await _patch_mark(request.namespace, machine, request.mark):
+            raise MachineMarkConflictError(f"Machine {where} went while it was being marked")
+        if machine_selection.delete_mark(await _machine(request.namespace, name)) != request.mark:
+            # Accepted but not there on the read just after: rewritten in between.
+            raise BmhResourceError(f"the delete mark on Machine {where} did not read back")
+        result.changed.append(name)
+    activity.logger.info(
+        "Delete mark %s in %s: marked %s, already marked %s",
+        request.mark, request.namespace, result.changed, result.unchanged,
+    )
+    return result
+
+
+@activity.defn
+async def unmark_machines(request: MachineMarkRequest) -> MachineMarks:
+    """THIS run's delete mark off each Machine — any other mark is left alone."""
+    result = MachineMarks()
+    for name in request.machines:
+        where = f"{request.namespace}/{name}"
+        machine = await _machine(request.namespace, name)
+        if machine is None or machine_selection.delete_mark(machine) != request.mark:
+            result.unchanged.append(name)
+            continue
+        if not await _patch_mark(request.namespace, machine, None):
+            result.unchanged.append(name)
+            continue
+        back = await _machine(request.namespace, name)
+        if back is not None and machine_selection.delete_mark(back) == request.mark:
+            raise BmhResourceError(f"the delete mark on Machine {where} is still there after removing it")
+        result.changed.append(name)
+    activity.logger.info(
+        "Delete mark %s in %s: removed from %s, not on %s",
+        request.mark, request.namespace, result.changed, result.unchanged,
+    )
+    return result
+
+
+def _watch_started() -> datetime:
+    """When this watch began: the last heartbeat's, when this attempt retries one."""
+    details = activity.info().heartbeat_details
+    if details:
+        try:
+            return datetime.fromisoformat(str(details[0]))
+        except ValueError:
+            pass
+    return datetime.now(UTC)
+
+
+@activity.defn
+async def watch_marked_machines(request: MarkedMachinesWatchRequest) -> MarkedMachinesWatch:
+    """Until every marked Machine is deleting or gone, an unmarked one deletes, or the deadline."""
+    started = _watch_started()
+    deadline = started + timedelta(minutes=request.deadline_minutes)
+    marked = set(request.marked)
+    keys = {f"{request.hosted_cluster_namespace}/{name}" for name in request.nodepools}
+    while True:
+        machines = {
+            (m.get("metadata") or {}).get("name"): m
+            for m in await _machines_in(request.hcp_namespace)
+            if machine_selection.machine_nodepool(m) in keys
+        }
+        deleting = sorted(
+            name for name in marked
+            if name not in machines or machine_selection.machine_deleting(machines[name])
+        )
+        watch = MarkedMachinesWatch(
+            result=MarkedMachinesOutcome.DONE,
+            deleting=deleting,
+            pending=sorted(marked - set(deleting)),
+            unexpected=sorted(
+                name for name, machine in machines.items()
+                if name not in marked and machine_selection.machine_deleting(machine)
+            ),
+        )
+        activity.heartbeat(started.isoformat())
+        if watch.unexpected:
+            watch.result = MarkedMachinesOutcome.WRONG_MACHINE
+        elif watch.pending and datetime.now(UTC) >= deadline:
+            watch.result = MarkedMachinesOutcome.DEADLINE
+        elif watch.pending:
+            await asyncio.sleep(_MACHINE_WATCH_POLL_SECONDS)
+            continue
+        activity.logger.info(
+            "Marked Machines in %s: %s (deleting %s, pending %s, unexpected %s)",
+            request.hcp_namespace, watch.result.value, watch.deleting, watch.pending, watch.unexpected,
+        )
+        return watch

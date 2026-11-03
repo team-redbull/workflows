@@ -30,7 +30,7 @@ from shared.exceptions import (
     Day1FileChangedError,
     UpgradeRulesInvalidError,
 )
-from shared.models.cluster_upgrade import Day1ChangeRequest, Day1Cluster, Day1Commit, UpgradeRules
+from shared.models.cluster_upgrade import Day1ChangeKind, Day1ChangeRequest, Day1Cluster, Day1Commit, UpgradeRules
 
 # A validator gets this long, inside the git activities' 180s.
 VALIDATOR_TIMEOUT_SECONDS = 90.0
@@ -121,7 +121,9 @@ async def read_cluster(*, repo_url: str, token: str, cluster: str) -> Day1Cluste
 
 
 def commit_message(request: Day1ChangeRequest, summary: str) -> str:
-    return f"upgrade({request.cluster}): {summary} [{request.workflow_id}]"
+    # A replicas change is server-lifecycle's update-nodepool, not an upgrade.
+    scope = "nodepool" if request.change is Day1ChangeKind.REPLICAS else "upgrade"
+    return f"{scope}({request.cluster}): {summary} [{request.workflow_id}]"
 
 
 def _changed(request: Day1ChangeRequest, current_blob: str) -> Day1FileChangedError:

@@ -529,6 +529,102 @@ class TestPublishInfraEnvBoot:
         assert client.post(self.PATH, json={**self.BODY, "ipxe_url": "http://x"}).status_code == 422
 
 
+# --- update-nodepool ------------------------------------------------------------------------
+
+
+class _FakeNodePoolClient:
+    """Temporal, as the update-nodepool route meets it: runs by id, each RUNNING or closed."""
+
+    def __init__(self, statuses: dict | None = None) -> None:
+        self.statuses = statuses or {}
+        self.started: list[tuple[str, str, object]] = []
+
+    def get_workflow_handle(self, workflow_id: str):
+        client = self
+
+        class _Handle:
+            async def describe(self):
+                from temporalio.service import RPCError, RPCStatusCode
+
+                if workflow_id not in client.statuses:
+                    raise RPCError("not found", RPCStatusCode.NOT_FOUND, b"")
+                return type("Description", (), {"status": client.statuses[workflow_id]})()
+
+        return _Handle()
+
+    async def start_workflow(self, _run, args, *, id: str, task_queue: str):
+        from temporalio.client import WorkflowExecutionStatus
+
+        if self.statuses.get(id) == WorkflowExecutionStatus.RUNNING:
+            raise WorkflowAlreadyStartedError(id, "UpdateNodePoolWorkflow")
+        self.started.append((id, task_queue, args.input))
+        return _FakeHandle(id)
+
+
+class TestUpdateNodePool:
+    PATH = "/workflows/server-lifecycle/update-nodepool"
+    BODY = {"mce_cluster": "mce-a", "cluster": "ocp4-prod-alpha", "replicas": 9,
+            "infra_env_kind": "dell-r660-128c"}
+
+    def _client(self, fake: _FakeNodePoolClient) -> TestClient:
+        app = FastAPI()
+        app.include_router(router_module.router)
+        app.dependency_overrides[get_temporal_client] = lambda: fake
+        return TestClient(app)
+
+    def test_it_starts_one_run_per_cluster_with_the_canonical_mce(self):
+        from shared.consts import UPDATE_NODEPOOL_WORKFLOW_QUEUE
+
+        fake = _FakeNodePoolClient()
+        response = self._client(fake).post(self.PATH, json=self.BODY)
+        assert response.status_code == 202
+        assert response.json()["workflow_id"] == "update-nodepool-ocp4-prod-alpha"
+        [(workflow_id, queue, run_input)] = fake.started
+        assert queue == UPDATE_NODEPOOL_WORKFLOW_QUEUE
+        assert (run_input.mce_cluster, run_input.cluster, run_input.replicas, run_input.infra_env_kind) == (
+            "ocp4-mce-a", "ocp4-prod-alpha", 9, "dell-r660-128c",
+        )
+
+    def test_zero_replicas_is_allowed(self):
+        fake = _FakeNodePoolClient()
+        assert self._client(fake).post(self.PATH, json={**self.BODY, "replicas": 0}).status_code == 202
+
+    def test_a_run_already_in_flight_for_the_cluster_is_a_409(self):
+        from temporalio.client import WorkflowExecutionStatus
+
+        fake = _FakeNodePoolClient({"update-nodepool-ocp4-prod-alpha": WorkflowExecutionStatus.RUNNING})
+        response = self._client(fake).post(self.PATH, json=self.BODY)
+        assert response.status_code == 409 and "already in flight" in response.json()["detail"]
+
+    def test_a_running_upgrade_of_the_cluster_is_a_409_and_starts_nothing(self):
+        from temporalio.client import WorkflowExecutionStatus
+
+        fake = _FakeNodePoolClient({"upgrade-cluster-ocp4-prod-alpha": WorkflowExecutionStatus.RUNNING})
+        response = self._client(fake).post(self.PATH, json=self.BODY)
+        assert response.status_code == 409 and "upgrade-cluster-ocp4-prod-alpha is running" in response.json()["detail"]
+        assert fake.started == []
+
+    def test_a_finished_upgrade_is_no_reason_to_wait(self):
+        from temporalio.client import WorkflowExecutionStatus
+
+        fake = _FakeNodePoolClient({"upgrade-cluster-ocp4-prod-alpha": WorkflowExecutionStatus.COMPLETED})
+        assert self._client(fake).post(self.PATH, json=self.BODY).status_code == 202
+
+    @pytest.mark.parametrize(
+        "change",
+        [{"replicas": -1}, {"infra_env_kind": "Dell_R660"}, {"cluster": "ocp4/prod"}, {"force": True}],
+    )
+    def test_what_the_edge_refuses(self, change):
+        fake = _FakeNodePoolClient()
+        assert self._client(fake).post(self.PATH, json={**self.BODY, **change}).status_code == 422
+        assert fake.started == []
+
+    @pytest.mark.parametrize("missing", ["mce_cluster", "cluster", "replicas", "infra_env_kind"])
+    def test_every_field_is_required(self, missing):
+        body = {k: v for k, v in self.BODY.items() if k != missing}
+        assert self._client(_FakeNodePoolClient()).post(self.PATH, json=body).status_code == 422
+
+
 # --- uninstall-server-from-hc -----------------------------------------------------------------
 
 UNINSTALL = "/workflows/server-lifecycle/uninstall-server-from-hc"

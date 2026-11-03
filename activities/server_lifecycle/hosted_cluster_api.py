@@ -24,6 +24,9 @@ kubeconfig is ever handled, and it handles one per call:
     verbatim in Temporal history; messages here name only the hosted cluster
     and what was wrong, never a value read from the file.
 
+scale-down-nodepool READS here too: every Node, every running Pod and, for a
+`least-utilized` NodePool, the `metrics.k8s.io` NodeMetrics its policy ranks by.
+
 The WRITES — a cordon, Pod evictions, a Node delete — are only ever for a Node
 HyperShift lost track of (no Machine behind it), the one case where CAPI will
 not drain and delete it itself. Which Node is the server's and which Pods a
@@ -47,7 +50,11 @@ import yaml
 from kubernetes import client as k8s_client
 
 from activities.server_lifecycle import hosted_resources
-from shared.exceptions import HostedClusterAccessError, HostedClusterUnreachableError
+from shared.exceptions import (
+    HostedClusterAccessError,
+    HostedClusterUnreachableError,
+    NodeMetricsUnavailableError,
+)
 
 _NOT_FOUND = 404
 _UNAUTHORIZED = 401
@@ -414,6 +421,62 @@ async def delete_node(
     was matched with (`matches` False).
     """
     return await asyncio.to_thread(_delete_node, kubeconfig, server, node_name, provider_id, cluster)
+
+
+# --- scale-down-nodepool: what ranks the servers that leave ----------------------
+
+_METRICS_GROUP = "metrics.k8s.io"
+_METRICS_VERSION = "v1beta1"
+
+
+def _read_scale_down_objects(
+    kubeconfig: str, server: str, cluster: str, with_metrics: bool
+) -> dict[str, Any]:
+    with _hosted_api(kubeconfig, server, cluster) as (api_client, core):
+        nodes = _call(lambda: core.list_node(_request_timeout=_REQUEST_TIMEOUT), cluster, "a list of Nodes")
+        pods = _call(
+            lambda: core.list_pod_for_all_namespaces(
+                field_selector="status.phase!=Succeeded,status.phase!=Failed",
+                _request_timeout=_REQUEST_TIMEOUT,
+            ),
+            cluster,
+            "a list of the running Pods",
+        )
+        metrics = None
+        if with_metrics:
+            custom = k8s_client.CustomObjectsApi(api_client)
+            found = _call(
+                lambda: custom.list_cluster_custom_object(
+                    group=_METRICS_GROUP, version=_METRICS_VERSION, plural="nodes",
+                    _request_timeout=_REQUEST_TIMEOUT,
+                ),
+                cluster,
+                "a list of NodeMetrics",
+                absent=None,
+            )
+            if found is None:
+                raise NodeMetricsUnavailableError(
+                    f"hosted cluster {cluster} serves no {_METRICS_GROUP}/{_METRICS_VERSION} API, so a "
+                    "least-utilized scale-down cannot rank its Nodes; nothing was marked or written"
+                )
+            metrics = list((found if isinstance(found, dict) else {}).get("items") or [])
+        return {
+            "nodes": list(_plain(api_client, nodes).get("items") or []),
+            "pods": list(_plain(api_client, pods).get("items") or []),
+            "metrics": metrics,
+        }
+
+
+async def read_scale_down_objects(
+    kubeconfig: str, server: str, cluster: str, with_metrics: bool
+) -> dict[str, Any]:
+    """{nodes, pods, metrics}: every Node, every Pod not finished, and — `with_metrics` —
+    every NodeMetrics of the hosted cluster (None otherwise).
+
+    NodeMetricsUnavailableError when `with_metrics` and the hosted cluster has
+    no metrics API (a 404); every other failure classified as the module's.
+    """
+    return await asyncio.to_thread(_read_scale_down_objects, kubeconfig, server, cluster, with_metrics)
 
 
 # --- shared with the cluster-upgrade limb ---------------------------------------

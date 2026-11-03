@@ -459,6 +459,10 @@ class Day1NodePool(BaseModel):
     zone: str | None = None  # nodeLabels topology.kubernetes.io/zone
     replicas: int | None = None
     max_unavailable: str | None = None  # "1", "33%" — as the chart passes it on
+    # The InfraEnv it takes Agents from: `infraEnvName`, else
+    # `agentLabelSelector.nodeLabelValue` (update-nodepool's kind). The hub
+    # limb always reports it; None from one that predates the field.
+    infra_env: str | None = None
 
 
 class ClusterUpgradeSettings(BaseModel):
@@ -553,6 +557,9 @@ class Day1ChangeKind(str, Enum):
     NODEPOOL = "nodepool"  # one nodepool[].workertag
     PAUSE = "pause"  # pausedUntil, for an abort
     FINISH = "finish"  # drop the top-level workertag the run added
+    # nodepool[].replicas of the NodePools in `nodepool_replicas` — server-lifecycle's
+    # update-nodepool, which commits through this limb (it holds the day1 token).
+    REPLICAS = "replicas"
 
 
 class Day1ChangeRequest(BaseModel):
@@ -578,6 +585,8 @@ class Day1ChangeRequest(BaseModel):
     # NODEPOOL: also the NodePool's `inPlace.maxUnavailable`, in the same
     # commit as its workertag (D28). None leaves the file's own.
     max_unavailable: str | None = None
+    # REPLICAS: NodePool name -> replicas, every other NodePool left as it is.
+    nodepool_replicas: dict[str, int] = Field(default_factory=dict)
 
 
 class Day1Commit(BaseModel):
@@ -649,6 +658,12 @@ class NodePoolState(BaseModel):
     max_unavailable: str | None = None
     zone: str | None = None
     conditions: dict[str, str] = Field(default_factory=dict)  # type -> status
+    # For server-lifecycle's update-nodepool; the limb always sends both keys
+    # (a None included), so a payload without them is an older limb's.
+    # The InfraEnv its agentLabelSelector's matchLabels name (INFRAENV_LABEL).
+    infra_env: str | None = None
+    # Its `redbull.io/scale-down-policy` label, else annotation, as written.
+    scale_down_policy: str | None = None
 
 
 class HostedClusterState(BaseModel):

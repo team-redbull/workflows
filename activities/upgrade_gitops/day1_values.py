@@ -261,6 +261,7 @@ def _nodepool(entry: NodePoolEntry, where: str, problems: list[str]) -> Day1Node
     zone = labels.get(_ZONE_LABEL)
     in_place = raw.get("inPlace") if isinstance(raw.get("inPlace"), dict) else {}
     max_unavailable = in_place.get("maxUnavailable")
+    infra_env = entry_infra_env(raw)
     return Day1NodePool(
         name=entry.name,
         workertag=_bare(raw.get("workertag"), f"{at}: workertag", problems),
@@ -268,7 +269,36 @@ def _nodepool(entry: NodePoolEntry, where: str, problems: list[str]) -> Day1Node
         zone=None if _unset(zone) else str(zone),
         replicas=replicas,
         max_unavailable=None if max_unavailable is None else str(max_unavailable),
+        # Always passed, a None included: update-nodepool tells this limb from
+        # one predating the field by the key's presence.
+        infra_env=infra_env,
     )
+
+
+def entry_infra_env(entry: dict) -> str | None:
+    """The InfraEnv a `nodepool[]` entry takes Agents from: `infraEnvName`, else
+    `agentLabelSelector.nodeLabelValue` (`templates/nodepool.yaml:14-22`)."""
+    selector = entry.get("agentLabelSelector") if isinstance(entry.get("agentLabelSelector"), dict) else {}
+    infra_env = entry.get("infraEnvName") if not _unset(entry.get("infraEnvName")) else selector.get("nodeLabelValue")
+    return None if _unset(infra_env) else str(infra_env)
+
+
+def entry_replicas(entry: dict) -> int | None:
+    """A `nodepool[]` entry's replicas as the chart renders them: its own, else 1; None when not a number."""
+    if "replicas" not in entry:
+        return 1  # the chart's default
+    value = entry["replicas"]
+    if isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def nodepool_replicas(values: ClusterValues) -> dict[str, int | None]:
+    """Each NodePool's replicas, by the chart's name for it."""
+    return {entry.name: entry_replicas(entry.entry) for entry in nodepool_entries(values, [])}
 
 
 _UPGRADE_KEYS = {"profile", "nodePoolOrder", "soakMinutes", "wave"}
@@ -604,7 +634,7 @@ def _require_editable_entries(text: _Text, values: ClusterValues, entries: list[
     if not isinstance(own, list):
         raise Day1ChangeRejectedError(
             f"{values.path} has no nodepool list of its own (it inherits one): a NodePool's workertag "
-            "cannot be written into it"
+            "or replicas cannot be written into it"
         )
     spans = nodepool_spans(text.lines)
     if len(spans) != len(own):
@@ -668,6 +698,32 @@ def plan_edit(root: Path, request: Day1ChangeRequest, current: str) -> Edit:
         if "workertag" not in before.own:
             return Edit(text=current, changed=False, summary=summary)
         _finish(text, root, path, entries, versions_before)
+    elif request.change is Day1ChangeKind.REPLICAS:
+        wanted = request.nodepool_replicas
+        if not wanted:
+            raise Day1ChangeRejectedError("a replicas change names no NodePool")
+        replicas_before = nodepool_replicas(before)
+        unknown = sorted(set(wanted) - set(replicas_before))
+        if unknown:
+            raise Day1ChangeRejectedError(f"{path} lists no NodePool {', '.join(unknown)}")
+        negative = sorted(name for name, count in wanted.items() if count < 0)
+        if negative:
+            raise Day1ChangeRejectedError(f"replicas below 0 for NodePool {', '.join(negative)}")
+        unreadable = sorted(name for name in wanted if replicas_before[name] is None)
+        if unreadable:
+            raise Day1ChangeRejectedError(
+                f"{path}: the replicas of NodePool {', '.join(unreadable)} are not a number; edit it by hand"
+            )
+        summary = "replicas " + ", ".join(
+            f"{name} {replicas_before[name]}→{count}" for name, count in sorted(wanted.items())
+        )
+        if all(replicas_before[name] == count for name, count in wanted.items()):
+            return Edit(text=current, changed=False, summary=summary)
+        _require_editable_entries(text, before, entries)
+        by_name = {entry.name: entry for entry in entries}
+        for name, count in sorted(wanted.items()):
+            if replicas_before[name] != count:
+                text.set_entry(by_name[name].index, "replicas", str(count))
     else:  # pragma: no cover - a kind added to the model without an edit here
         raise Day1ChangeRejectedError(f"no edit for change {request.change!r}")
 
@@ -827,6 +883,13 @@ def _verify(
             wrong.append("the top-level workertag is still there")
         if versions_after != versions_before:
             wrong.append("a NodePool's release would change")
+    elif request.change is Day1ChangeKind.REPLICAS:
+        replicas_after = nodepool_replicas(after)
+        for name, count in sorted(request.nodepool_replicas.items()):
+            if replicas_after.get(name) != count:
+                wrong.append(f"NodePool {name} would have {replicas_after.get(name)} replicas, not {count}")
+        if versions_after != versions_before:
+            wrong.append("a NodePool's release would change")
     if wrong:
         raise Day1ChangeRejectedError(f"the edit of {request.path} did not come out as asked: {'; '.join(wrong)}")
 
@@ -837,14 +900,16 @@ def _duplicated_key(problem: str) -> str:
 
 
 def _allowed_paths(change: Day1ChangeKind):
-    def nodepool_workertag(path: tuple) -> bool:
-        return len(path) == 3 and path[0] == "nodepool" and isinstance(path[1], int) and path[2] == "workertag"
+    def nodepool_key(key: str):
+        return lambda path: len(path) == 3 and path[0] == "nodepool" and isinstance(path[1], int) and path[2] == key
 
+    nodepool_workertag = nodepool_key("workertag")
     rules = {
         Day1ChangeKind.CONTROL_PLANE: lambda p: p in (("mastertag",), ("workertag",)) or nodepool_workertag(p),
         Day1ChangeKind.NODEPOOL: nodepool_workertag,
         Day1ChangeKind.PAUSE: lambda p: p == ("pausedUntil",),
         Day1ChangeKind.FINISH: lambda p: p == ("workertag",) or nodepool_workertag(p),
+        Day1ChangeKind.REPLICAS: nodepool_key("replicas"),
     }
     return rules[change]
 

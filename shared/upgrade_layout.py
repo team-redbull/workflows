@@ -17,6 +17,9 @@ sandbox on every replay.
     absent one.
   * IN_PLACE, ZONE_LABEL, ADMIN_ACK_REQUIRED — values HyperShift and the CVO
     write, which a limb reads and the brain decides on.
+  * INFRAENV_LABEL, SCALE_DOWN_POLICY — what a NodePool says about itself
+    that server-lifecycle's update-nodepool decides on: the InfraEnv its
+    agentLabelSelector takes Agents from, and how a scale-down picks its servers.
 """
 
 from __future__ import annotations
@@ -39,6 +42,17 @@ IN_PLACE = "InPlace"
 # The node label a NodePool's zone is read from (`nodeLabels` in day1, the
 # NodePool's spec.nodeLabels on the MCE): what makes a cluster zoned (D7).
 ZONE_LABEL = "topology.kubernetes.io/zone"
+
+# The NodePool's `spec.platform.agent.agentLabelSelector.matchLabels` key whose
+# value is the InfraEnv it takes Agents from — the label assisted-service puts
+# on every Agent of that InfraEnv. update-nodepool's InfraEnv kind is matched
+# against it.
+INFRAENV_LABEL = "infraenvs.agent-install.openshift.io"
+
+# A NodePool label OR annotation naming how a scale-down picks the servers that
+# leave (`fewest-pods`, `least-requested`, `least-utilized`); absent, CAPI picks
+# at random. Decided with the operator, 2026-11-03: per NodePool, never per request.
+SCALE_DOWN_POLICY = "redbull.io/scale-down-policy"
 
 # The CVO's Upgradeable=False reason, and its UpgradeableAdminAckRequired
 # condition's, while an admin gate of the current minor has no ack

@@ -51,8 +51,12 @@ from shared.models.server_lifecycle import (
     InventoryHostState,
     MachineDeletion,
     MachineHookRelease,
+    MachineMarkRequest,
+    MachineMarks,
     MachineRef,
     MachineState,
+    MarkedMachinesWatch,
+    MarkedMachinesWatchRequest,
     NmStateConfigReplacement,
     NmStateConfigReplaceRequest,
     PxeBootRegistration,
@@ -63,6 +67,8 @@ from shared.models.server_lifecycle import (
     PxeUnregistration,
     ReleaseServerRequest,
     ReserveServerRequest,
+    ScaleDownCandidates,
+    ScaleDownCandidatesRequest,
     ServerMembership,
     ServerMembershipRequest,
     ServerReservation,
@@ -735,5 +741,71 @@ async def clean_up_agent_machines(request: AgentMachineCleanupRequest) -> AgentM
     it only through a Machine, so without one it would hold for ever. Also
     reports every Machine still linked to the Agent (`machines`). Needs list,
     delete and patch on agentmachines, list on machines.
+    """
+    ...
+
+
+# --- scale-down-nodepool: the servers that leave ---------------------------------------
+
+
+@activity.defn
+async def read_scale_down_candidates(request: ScaleDownCandidatesRequest) -> ScaleDownCandidates:
+    """scale-down-nodepool: every Machine of these NodePools, with what their policies rank by. Reads only.
+
+    A NodePool's Machines are those in the HostedCluster's control-plane
+    namespace whose `hypershift.openshift.io/nodePool` annotation is
+    `<hc namespace>/<nodepool>` — HyperShift's own link. For each: created,
+    deleting, its `cluster.x-k8s.io/delete-machine` mark, its nodeRef. Through
+    the admin kubeconfig (as check_hosted_node reaches it): each Node's Ready,
+    unschedulable and allocatable, the Pods on it — the workload ones a drain
+    would move, and every running Pod's requests — and, only for a
+    `least-utilized` NodePool, the Node's live use from `metrics.k8s.io`.
+
+    Returns data, never a decision. Raises HostedClusterUnreachableError
+    (retried) and HostedClusterAccessError (non-retryable) as
+    check_hosted_node; NodeMetricsUnavailableError (non-retryable) when a
+    `least-utilized` NodePool's cluster serves no metrics API, and
+    NodeMetricsPendingError (retried) for a Node with no metrics yet. Needs
+    list on machines.cluster.x-k8s.io.
+    """
+    ...
+
+
+@activity.defn
+async def mark_machines_for_deletion(request: MachineMarkRequest) -> MachineMarks:
+    """scale-down-nodepool: put `cluster.x-k8s.io/delete-machine: <mark>` on each Machine, and read it back.
+
+    CAPI's MachineSet deletes a Machine carrying that annotation before any
+    other, whatever its delete policy, so the replicas commit that follows
+    removes exactly these. A merge patch carrying the resourceVersion read (a
+    concurrent change is a 409, retried after a re-read). Already carrying
+    THIS mark is unchanged — a retry, or a re-run of the same cluster. Gone,
+    deleting, or carrying another mark raises MachineMarkConflictError
+    (non-retryable): it is no longer the server the policy chose. Needs get
+    and patch on machines.
+    """
+    ...
+
+
+@activity.defn
+async def unmark_machines(request: MachineMarkRequest) -> MachineMarks:
+    """scale-down-nodepool: take THIS run's delete mark off each Machine — the rollback before the commit.
+
+    Only where the annotation's value is `request.mark`: another value is
+    someone else's and is left alone. A Machine gone, or with no mark, is
+    unchanged. Read back after the patch. Needs get and patch on machines.
+    """
+    ...
+
+
+@activity.defn
+async def watch_marked_machines(request: MarkedMachinesWatchRequest) -> MarkedMachinesWatch:
+    """scale-down-nodepool: until every marked Machine is deleting or gone — one heartbeating watch.
+
+    Polls the NodePools' Machines every 15 s, heartbeating each time, its
+    clock in the heartbeat details so a retry keeps it. `done` when every
+    marked Machine has a deletionTimestamp or is gone; `wrong-machine` as soon
+    as an UNMARKED Machine of these NodePools is deleting; `deadline` when
+    `deadline_minutes` pass first. Needs list on machines.
     """
     ...

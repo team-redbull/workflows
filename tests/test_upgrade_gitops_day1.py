@@ -645,6 +645,86 @@ class TestNodePoolCommits:
                                            nodepool="shared", version="4.19.53"))
 
 
+class TestReplicasCommits:
+    """server-lifecycle's update-nodepool commits through this limb: Day1ChangeKind.REPLICAS."""
+
+    def _replicas(self, **counts: int) -> Day1ChangeRequest:
+        return _request(Day1ChangeKind.REPLICAS, nodepool_replicas=counts).model_copy(
+            update={"workflow_id": f"scale-up-nodepool-{PROD}"}
+        )
+
+    async def test_each_nodepool_read_says_which_infraenv_it_takes(self, origin):
+        prod = await day1_repo.read_cluster(repo_url=str(origin), token="", cluster=PROD)
+        assert {np.name: np.infra_env for np in prod.nodepools} == {
+            "alpha-zone-a": "dell-r660-128c", "alpha-zone-b": "dell-r660-128c",
+        }
+        slim = await day1_repo.read_cluster(repo_url=str(origin), token="", cluster=SLIM)
+        assert {np.name: (np.infra_env, np.replicas) for np in slim.nodepools} == {
+            "lab-beta-site1-kv-small": ("kv-small", 2), "lab-beta-site1-kv-large": ("kv-large", 1),
+        }
+        # Always reported, so update-nodepool can tell this limb from an older one.
+        assert all("infra_env" in np.model_fields_set for np in prod.nodepools + slim.nodepools)
+
+    async def test_the_replicas_lines_move_and_nothing_else(self, origin, tmp_path):
+        before = _main_file(origin, tmp_path, PROD_PATH, "before")
+        commit = await _commit(origin, self._replicas(**{"alpha-zone-a": 4, "alpha-zone-b": 4}))
+        after = _main_file(origin, tmp_path, PROD_PATH, "after")
+        assert commit.changed
+        assert _changed_lines(before, after) == (["  replicas: 3"] * 2, ["  replicas: 4"] * 2)
+        assert _git("log", "-1", "--format=%s", cwd=origin).strip() == (
+            f"nodepool({PROD}): replicas alpha-zone-a 3→4, alpha-zone-b 3→4 [scale-up-nodepool-{PROD}]"
+        )
+
+    async def test_only_the_named_nodepool_moves(self, origin, tmp_path):
+        await _commit(origin, self._replicas(**{"alpha-zone-b": 0}))
+        _main_file(origin, tmp_path, PROD_PATH)  # clones main into tmp_path / "check"
+        cluster = day1_values.read_cluster(tmp_path / "check", PROD_PATH, revision="r", blob="b")
+        assert {np.name: np.replicas for np in cluster.nodepools} == {"alpha-zone-a": 3, "alpha-zone-b": 0}
+
+    async def test_a_nodepool_on_the_charts_default_gets_a_line_of_its_own(self, origin, tmp_path):
+        await _commit(origin, _request(Day1ChangeKind.REPLICAS, path=SLIM_PATH, cluster=SLIM,
+                                       nodepool_replicas={"lab-beta-site1-kv-large": 3}))
+        after = _main_file(origin, tmp_path, SLIM_PATH)
+        assert after.endswith("  - infraEnvName: kv-large\n    replicas: 3\n")
+
+    async def test_a_comment_on_the_line_survives(self, origin, tmp_path):
+        _edit_by_hand(origin, tmp_path, PROD_PATH,
+                      lambda text: text.replace("replicas: 3", "replicas: 3 # zone a, sized by capacity", 1))
+        await _commit(origin, self._replicas(**{"alpha-zone-a": 2}))
+        assert "  replicas: 2 # zone a, sized by capacity\n" in _main_file(origin, tmp_path, PROD_PATH)
+
+    async def test_already_so_is_success_with_nothing_pushed(self, origin):
+        head = _git("rev-parse", "main", cwd=origin).strip()
+        commit = await _commit(origin, self._replicas(**{"alpha-zone-a": 3}))
+        assert not commit.changed and commit.revision == head
+
+    async def test_a_nodepool_the_file_does_not_name_is_refused(self, origin):
+        with pytest.raises(Day1ChangeRejectedError, match="lists no NodePool alpha-zone-c"):
+            await _commit(origin, self._replicas(**{"alpha-zone-c": 1}))
+
+    async def test_no_nodepool_at_all_is_refused(self, origin):
+        with pytest.raises(Day1ChangeRejectedError, match="names no NodePool"):
+            await _commit(origin, self._replicas())
+
+    async def test_someone_elses_edit_is_never_committed_over(self, origin, tmp_path):
+        blob = _blob(origin, PROD_PATH)
+        _edit_by_hand(origin, tmp_path, PROD_PATH, lambda text: text.replace("mastertag: 4.18.56", "mastertag: 4.18.57"))
+        with pytest.raises(Day1FileChangedError):
+            await _commit(origin, self._replicas(**{"alpha-zone-a": 4}), blob=blob)
+
+    async def test_an_inherited_nodepool_list_cannot_be_edited(self, origin, tmp_path):
+        checkout = tmp_path / "inherit"
+        _git("clone", "-q", str(origin), str(checkout), cwd=tmp_path)
+        (checkout / f"sites/{SITE}/mces/{MCE}/values.yaml").write_text(
+            "imagePath: quay.io/openshift-release-dev\nnodepool:\n- name: shared\n  infraEnvName: x\n"
+        )
+        (checkout / SLIM_PATH).write_text("mastertag: 4.18.56\n")
+        _commit_all(checkout, "inherit the NodePools")
+        with pytest.raises(Day1ChangeRejectedError, match="no nodepool list of its own"):
+            await _commit(origin, _request(Day1ChangeKind.REPLICAS, path=SLIM_PATH, cluster=SLIM,
+                                           nodepool_replicas={"shared": 2}))
+
+
 class TestPauseAndFinish:
     async def test_pause_lands_whatever_the_file_holds(self, origin, tmp_path):
         _edit_by_hand(origin, tmp_path, PROD_PATH, lambda text: text.replace("replicas: 3", "replicas: 5", 1))

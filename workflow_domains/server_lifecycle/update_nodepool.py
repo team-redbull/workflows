@@ -1,0 +1,310 @@
+"""update-nodepool — set how many workers of one InfraEnv kind a hosted cluster runs.
+
+The request names the MCE, the cluster (its day1 file), the TOTAL replicas
+wanted and the InfraEnv kind. A NodePool is of kind K when the InfraEnv its
+agentLabelSelector names is `K` or `K-<anything>` (`K-zone-a`, …). Only the
+cluster's OWN NodePools count — never the rest of the MCE.
+
+Replicas are owned by the day1 file and changed only here (decided with the
+operator, 2026-11-03): the change is a commit to day1 `main`, which Argo CD
+applies. Nothing on the MCE is written directly.
+
+Phases:
+
+  1. reading-day1       — the cluster file on the hub limb: its path (whose MCE
+                          folder must be the request's), blob, HostedCluster,
+                          and every NodePool's replicas and InfraEnv. A file
+                          with `problems` is refused.
+  2. reading-nodepools  — the HostedCluster's NodePools on the MCE (the
+                          cluster-upgrade limb), the kind's selected by their
+                          matchLabel. Live and git must agree BOTH ways — same
+                          NodePools, InfraEnvs and replicas — else
+                          NodePoolReplicasDriftError, nothing written.
+  3. planning           — the kind's NodePools more than one replica apart are
+                          refused (NodePoolsUnbalancedError); the total already
+                          the request completes with direction `none`; else
+                          nodepool_replicas.plan spreads the new total.
+  4. scaling-up / scaling-down — the child of that direction, awaited, on its
+                          own id and queue (ABANDON on close: it writes git and
+                          marks Machines in an order that must not be cut).
+
+A re-run RESUMES: when day1 already holds a balanced plan for the requested
+total but the MCE does not show it yet (a child that committed and never
+synced), the run hands that plan to the child instead of failing on the
+difference — its commit is then a no-op and it carries on from the sync.
+"""
+
+from __future__ import annotations
+
+from temporalio import workflow
+from temporalio.exceptions import ApplicationError, ChildWorkflowError, WorkflowAlreadyStartedError
+from temporalio.workflow import ParentClosePolicy
+
+with workflow.unsafe.imports_passed_through():
+    from shared.consts import SCALE_DOWN_NODEPOOL_WORKFLOW_QUEUE, SCALE_UP_NODEPOOL_WORKFLOW_QUEUE
+    from shared.exceptions import (
+        ClusterNotOnMceError,
+        Day1ClusterProblemsError,
+        NodePoolKindNotFoundError,
+        NodePoolReplicasDriftError,
+        NodePoolsUnbalancedError,
+        ScaleNodePoolAlreadyRunningError,
+        ScaleNodePoolFailedError,
+    )
+    from shared.interfaces.cluster_upgrade import read_hosted_cluster
+    from shared.interfaces.upgrade_gitops import read_day1_cluster
+    from shared.models.cluster_upgrade import (
+        Day1Cluster,
+        Day1ClusterRequest,
+        Day1NodePool,
+        HostedClusterRequest,
+        HostedClusterState,
+        NodePoolState,
+    )
+    from shared.models.server_lifecycle import (
+        NodePoolProgress,
+        NodePoolReplicasChange,
+        NodePoolScalePlan,
+        NodePoolScaleResult,
+        ScaleDownNodePoolRunArgs,
+        ScaleUpNodePoolRunArgs,
+        UpdateNodePoolInput,
+        UpdateNodePoolResult,
+        UpdateNodePoolRunArgs,
+    )
+    from shared.upgrade_layout import DAY1_CLUSTER_FILE
+    from shared.workflow_ids import scale_down_nodepool_workflow_id, scale_up_nodepool_workflow_id
+    from workflow_domains.server_lifecycle import nodepool_replicas, nodepool_scaling
+
+from workflow_domains.server_lifecycle.scale_down_nodepool import ScaleDownNodePoolWorkflow
+from workflow_domains.server_lifecycle.scale_up_nodepool import ScaleUpNodePoolWorkflow
+
+
+def _fail(message: str, error: type[Exception]) -> ApplicationError:
+    return ApplicationError(message, type=error.__name__)
+
+
+@workflow.defn
+class UpdateNodePoolWorkflow:
+    def __init__(self) -> None:
+        self._phase = "pending"
+        self._direction: str | None = None
+        self._child: str | None = None
+
+    @workflow.query
+    def progress(self) -> NodePoolProgress:
+        return NodePoolProgress(phase=self._phase, direction=self._direction, child_workflow_id=self._child)
+
+    @workflow.run
+    async def run(self, run_args: UpdateNodePoolRunArgs) -> UpdateNodePoolResult:
+        request = run_args.input
+        self._phase = "reading-day1"
+        day1: Day1Cluster = await nodepool_scaling.on_hub(read_day1_cluster, Day1ClusterRequest(cluster=request.cluster))
+        self._check_day1(request, day1)
+
+        self._phase = "reading-nodepools"
+        state: HostedClusterState = await nodepool_scaling.on_mce(
+            request.mce_cluster,
+            read_hosted_cluster,
+            HostedClusterRequest(
+                mce_cluster=request.mce_cluster,
+                cluster=request.cluster,
+                hosted_cluster=day1.hosted_cluster,
+                hosted_cluster_namespace=day1.hosted_cluster_namespace,
+            ),
+        )
+        live, git = self._kind_nodepools(request, day1, state)
+
+        self._phase = "planning"
+        changes = self._plan(request, live, git)
+        result = UpdateNodePoolResult(
+            mce_cluster=request.mce_cluster,
+            cluster=request.cluster,
+            infra_env_kind=request.infra_env_kind,
+            day1_path=day1.path,
+            hosted_cluster=day1.hosted_cluster or "",
+            hosted_cluster_namespace=day1.hosted_cluster_namespace or "",
+            direction="none",
+            total_before=sum(np.before for np in changes),
+            total_after=sum(np.after for np in changes),
+            nodepools=changes,
+        )
+        if all(np.before == np.after for np in changes):
+            self._direction = "none"
+            self._phase = "completed"
+            return result
+
+        down = any(np.after < np.before for np in changes)
+        self._direction = result.direction = "down" if down else "up"
+        plan = NodePoolScalePlan(
+            mce_cluster=request.mce_cluster,
+            cluster=request.cluster,
+            infra_env_kind=request.infra_env_kind,
+            path=day1.path,
+            expected_blob=day1.blob,
+            hosted_cluster=result.hosted_cluster,
+            hosted_cluster_namespace=result.hosted_cluster_namespace,
+            nodepools=changes,
+        )
+        result.child_workflow_id = self._child = (
+            scale_down_nodepool_workflow_id(request.cluster) if down else scale_up_nodepool_workflow_id(request.cluster)
+        )
+        self._phase = "scaling-down" if down else "scaling-up"
+        result.scale = await self._scale(plan, down, self._child)
+        self._phase = "completed"
+        return result
+
+    def _check_day1(self, request: UpdateNodePoolInput, day1: Day1Cluster) -> None:
+        match = DAY1_CLUSTER_FILE.fullmatch(day1.path)
+        if match is None or match.group("mce") != request.mce_cluster:
+            raise _fail(
+                f"day1 keeps {request.cluster} at {day1.path}, not under sites/<site>/mces/"
+                f"{request.mce_cluster}/: it does not run on MCE {request.mce_cluster}. Nothing was read there",
+                ClusterNotOnMceError,
+            )
+        if day1.problems:
+            raise _fail(
+                f"{day1.path} holds what the chart would refuse, so no edit of it can be verified: "
+                + "; ".join(day1.problems),
+                Day1ClusterProblemsError,
+            )
+        if not day1.hosted_cluster or not day1.hosted_cluster_namespace or any(
+            "infra_env" not in np.model_fields_set for np in day1.nodepools
+        ):
+            raise _fail(
+                "the upgrade-gitops-worker on the hub predates update-nodepool: it reports no HostedCluster "
+                "or no InfraEnv per NodePool. Upgrade it, then run again",
+                NodePoolKindNotFoundError,
+            )
+
+    def _kind_nodepools(
+        self, request: UpdateNodePoolInput, day1: Day1Cluster, state: HostedClusterState
+    ) -> tuple[dict[str, NodePoolState], dict[str, Day1NodePool]]:
+        """The kind's NodePools live and in git, by name — refused unless they agree both ways."""
+        where = f"HostedCluster {day1.hosted_cluster_namespace}/{day1.hosted_cluster}"
+        if not state.found:
+            raise _fail(
+                f"{where}, which {day1.path} renders, is not on MCE {request.mce_cluster}. Nothing was written",
+                NodePoolReplicasDriftError,
+            )
+        if any(
+            "infra_env" not in np.model_fields_set or "scale_down_policy" not in np.model_fields_set
+            for np in state.nodepools
+        ):
+            raise _fail(
+                f"the cluster-upgrade-worker on MCE {request.mce_cluster} predates update-nodepool: it "
+                "reports no InfraEnv per NodePool. Upgrade it, then run again",
+                NodePoolKindNotFoundError,
+            )
+        kind = request.infra_env_kind
+        live = {np.name: np for np in state.nodepools if nodepool_replicas.belongs_to_kind(np.infra_env, kind)}
+        git = {np.name: np for np in day1.nodepools if nodepool_replicas.belongs_to_kind(np.infra_env, kind)}
+        if not live and not git:
+            seen = sorted({np.infra_env or "none" for np in state.nodepools})
+            raise _fail(
+                f"no NodePool of {where} takes Agents from InfraEnv {kind} or {kind}-*: its NodePools' "
+                f"InfraEnvs are {', '.join(seen) or 'none (it has no NodePool)'}. Nothing was written",
+                NodePoolKindNotFoundError,
+            )
+        problems = []
+        for name, nodepool in sorted(live.items()):
+            entry = next((np for np in day1.nodepools if np.name == name), None)
+            if entry is None:
+                problems.append(f"{name} is on the MCE but not in {day1.path}")
+            elif entry.infra_env != nodepool.infra_env:
+                problems.append(f"{name} takes InfraEnv {nodepool.infra_env} on the MCE, {entry.infra_env} in day1")
+        for name in sorted(set(git) - set(live)):
+            problems.append(f"{name} is in {day1.path} but not on the MCE")
+        if problems:
+            raise _fail(
+                f"the NodePools of kind {kind} on the MCE and in day1 disagree: " + "; ".join(problems)
+                + ". Nothing was written",
+                NodePoolReplicasDriftError,
+            )
+        return live, git
+
+    def _plan(
+        self, request: UpdateNodePoolInput, live: dict[str, NodePoolState], git: dict[str, Day1NodePool]
+    ) -> list[NodePoolReplicasChange]:
+        names = sorted(git)
+        git_replicas = {name: git[name].replicas for name in names}
+        live_replicas = {name: live[name].replicas for name in names}
+        unreadable = sorted(name for name, count in git_replicas.items() if count is None)
+        if unreadable:
+            raise _fail(
+                f"the replicas of NodePool {', '.join(unreadable)} in day1 are not a number",
+                Day1ClusterProblemsError,
+            )
+        counts = {name: int(git_replicas[name] or 0) for name in names}
+        drifted = sorted(name for name in names if live_replicas[name] != counts[name])
+
+        def change(name: str, before: int, after: int) -> NodePoolReplicasChange:
+            return NodePoolReplicasChange(
+                name=name, infra_env=git[name].infra_env or "", before=before, after=after,
+                scale_down_policy=live[name].scale_down_policy,
+            )
+
+        if drifted:
+            # The resume: day1 already holds a balanced plan for this total, and
+            # only the MCE has not caught up — an earlier child committed and
+            # never synced. Anything else is someone else's difference.
+            resumable = (
+                sum(counts.values()) == request.replicas
+                and nodepool_replicas.balanced(list(counts.values()))
+                and all(live_replicas[name] is not None for name in names)
+            )
+            if not resumable:
+                raise _fail(
+                    "the NodePools on the MCE and in day1 disagree on replicas: "
+                    + "; ".join(f"{name} {live_replicas[name]} on the MCE, {counts[name]} in day1" for name in drifted)
+                    + ". Someone scaled one by hand, or Argo CD has not synced day1 yet. Nothing was written",
+                    NodePoolReplicasDriftError,
+                )
+            workflow.logger.info(
+                "update-nodepool %s resumes: day1 already holds %s, the MCE shows %s",
+                request.cluster, counts, live_replicas,
+            )
+            return [change(name, int(live_replicas[name] or 0), counts[name]) for name in names]
+
+        if not nodepool_replicas.balanced(list(counts.values())):
+            raise _fail(
+                f"the NodePools of kind {request.infra_env_kind} are more than one replica apart: "
+                + ", ".join(f"{name} {counts[name]}" for name in names)
+                + ". Balance them in day1 first; nothing was written",
+                NodePoolsUnbalancedError,
+            )
+        planned = nodepool_replicas.plan(
+            [(name, git[name].infra_env or "", counts[name]) for name in names], request.replicas
+        )
+        return [change(name, counts[name], planned[name]) for name in names]
+
+    async def _scale(self, plan: NodePoolScalePlan, down: bool, child_id: str) -> NodePoolScaleResult:
+        """The child of this direction, awaited on its own id and queue."""
+        try:
+            if down:
+                return await workflow.execute_child_workflow(
+                    ScaleDownNodePoolWorkflow.run,
+                    ScaleDownNodePoolRunArgs(input=plan),
+                    id=child_id,
+                    task_queue=SCALE_DOWN_NODEPOOL_WORKFLOW_QUEUE,
+                    parent_close_policy=ParentClosePolicy.ABANDON,
+                )
+            return await workflow.execute_child_workflow(
+                ScaleUpNodePoolWorkflow.run,
+                ScaleUpNodePoolRunArgs(input=plan),
+                id=child_id,
+                task_queue=SCALE_UP_NODEPOOL_WORKFLOW_QUEUE,
+                parent_close_policy=ParentClosePolicy.ABANDON,
+            )
+        except WorkflowAlreadyStartedError:
+            raise _fail(
+                f"{child_id} is already running for {plan.cluster}: let it finish, then run "
+                "update-nodepool again",
+                ScaleNodePoolAlreadyRunningError,
+            ) from None
+        except ChildWorkflowError as err:
+            raise _fail(
+                f"{child_id} failed — {nodepool_scaling.error_detail(err)}. Its history has the detail; "
+                "running update-nodepool again carries on from what it left",
+                ScaleNodePoolFailedError,
+            ) from err

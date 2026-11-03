@@ -1330,3 +1330,257 @@ class UninstallServerFromHcResult(BaseModel):
     kept_in_inventory: bool = False
     remove_server_workflow_id: str | None = None
     remove_server: RemoveServerFromMceResult | None = None
+
+
+# --- update-nodepool, scale-up-nodepool, scale-down-nodepool -----------------------------
+
+
+class ScaleDownPolicy(str, Enum):
+    """How a scale-down picks a NodePool's leaving servers — its `redbull.io/scale-down-policy`.
+
+    Absent from the NodePool means no policy: the run marks nothing, and
+    CAPI's MachineSet picks at random. Under every policy a Machine with no
+    Node, then a Node that is NotReady or cordoned, goes first.
+    """
+
+    FEWEST_PODS = "fewest-pods"  # the least for the drain to move
+    LEAST_REQUESTED = "least-requested"  # the lowest share of CPU / memory its pods request
+    LEAST_UTILIZED = "least-utilized"  # the lowest live CPU / memory use (metrics.k8s.io)
+
+
+class UpdateNodePoolInput(BaseModel):
+    """Input to UpdateNodePoolWorkflow: how many workers of one InfraEnv kind a hosted cluster runs.
+
+    `cluster` is the day1 cluster file's name without `.yaml` (also its Argo
+    CD Application), as upgrade-cluster takes it. `replicas` is the TOTAL over
+    the cluster's NodePools of the kind; 0 is allowed. A NodePool is of kind
+    K when the InfraEnv its agentLabelSelector names is `K` or starts with `K-`.
+    """
+
+    mce_cluster: str = Field(min_length=1)
+    cluster: str = Field(min_length=1)
+    replicas: int = Field(ge=0)
+    infra_env_kind: str = Field(min_length=1)
+
+
+class UpdateNodePoolRunArgs(BaseModel):
+    """The workflow's single argument (see AddServerToMceRunArgs for why a wrapper)."""
+
+    input: UpdateNodePoolInput
+
+
+class NodePoolProgress(BaseModel):
+    """Returned by the `progress` query of all three NodePool workflows.
+
+    `direction` (`up`, `down`, `none`) once the parent has planned;
+    `child_workflow_id` while its scale-up / scale-down child runs.
+    """
+
+    phase: str
+    direction: str | None = None
+    child_workflow_id: str | None = None
+
+
+class NodePoolReplicasChange(BaseModel):
+    """One NodePool of the kind: its replicas before and after the run, as planned.
+
+    `scale_down_policy` is the NodePool's own `redbull.io/scale-down-policy`
+    as written (None: none) — what a scale-down picks its servers by.
+    """
+
+    name: str
+    infra_env: str
+    before: int
+    after: int
+    scale_down_policy: str | None = None
+
+
+class NodePoolScalePlan(BaseModel):
+    """What update-nodepool hands its child: the file, the HostedCluster, every NodePool of the kind.
+
+    `expected_blob` is the day1 file's git blob the parent read: the commit is
+    compare-and-set on it. `hosted_cluster` / `hosted_cluster_namespace` are
+    the HostedCluster as day1 renders it (`openshift-<clusterName>` in
+    `hcp-<clusterName>`), its NodePools in that namespace.
+    """
+
+    mce_cluster: str
+    cluster: str
+    infra_env_kind: str
+    path: str
+    expected_blob: str
+    hosted_cluster: str
+    hosted_cluster_namespace: str
+    nodepools: list[NodePoolReplicasChange]
+
+
+class ScaleUpNodePoolRunArgs(BaseModel):
+    """The workflow's single argument (see AddServerToMceRunArgs for why a wrapper)."""
+
+    input: NodePoolScalePlan
+
+
+class ScaleDownNodePoolRunArgs(BaseModel):
+    """The workflow's single argument (see AddServerToMceRunArgs for why a wrapper)."""
+
+    input: NodePoolScalePlan
+
+
+class NodePoolLiveReplicas(BaseModel):
+    """One NodePool on the MCE as read back after the sync: `spec.replicas` and `status.replicas`."""
+
+    name: str
+    replicas: int | None = None
+    ready_replicas: int | None = None
+
+
+class ScaleDownChoice(BaseModel):
+    """One server a scale-down chose to leave, and what put it first.
+
+    `reason` is the policy's reading, e.g. `no Node`, `NotReady`,
+    `3 workload pods`, `requested 41%`, `used 12%`.
+    """
+
+    nodepool: str
+    machine: str
+    node: str | None = None
+    policy: str
+    reason: str
+
+
+class NodePoolScaleResult(BaseModel):
+    """What a scale-up-nodepool or scale-down-nodepool child did.
+
+    `committed` False: day1 already held the replicas (a re-run), and
+    `revision` is then main's HEAD. `chosen` and `deleting` only on a
+    scale-down whose NodePools name a policy: the servers it marked, and the
+    marked Machines it saw deleting.
+    """
+
+    revision: str
+    committed: bool
+    nodepools: list[NodePoolLiveReplicas] = Field(default_factory=list)
+    chosen: list[ScaleDownChoice] = Field(default_factory=list)
+    deleting: list[str] = Field(default_factory=list)
+
+
+class UpdateNodePoolResult(BaseModel):
+    """What update-nodepool did: the kind's NodePools before and after, and its child's own result.
+
+    `direction` is `up`, `down` or `none` (the total was already the request:
+    nothing written, no child). `scale` is the child's result, on
+    `child_workflow_id`.
+    """
+
+    mce_cluster: str
+    cluster: str
+    infra_env_kind: str
+    day1_path: str
+    hosted_cluster: str
+    hosted_cluster_namespace: str
+    direction: str
+    total_before: int
+    total_after: int
+    nodepools: list[NodePoolReplicasChange] = Field(default_factory=list)
+    child_workflow_id: str | None = None
+    scale: NodePoolScaleResult | None = None
+
+
+# --- scale-down-nodepool: choosing and marking the servers that leave --------------------
+
+
+class ScaleDownNodePoolRef(BaseModel):
+    """One NodePool a scale-down shrinks by a policy (`name` in the HostedCluster's namespace)."""
+
+    name: str = Field(min_length=1)
+    policy: ScaleDownPolicy
+
+
+class ScaleDownCandidatesRequest(BaseModel):
+    """read_scale_down_candidates: the Machines of these NodePools, with what each policy ranks by.
+
+    The HostedCluster by its namespace and name, as day1 renders it; the limb
+    derives its control-plane namespace (HyperShift's rule) and reports it.
+    """
+
+    hosted_cluster_namespace: str = Field(min_length=1)
+    hosted_cluster: str = Field(min_length=1)
+    nodepools: list[ScaleDownNodePoolRef]
+
+
+class ScaleDownMachine(BaseModel):
+    """One Machine of a NodePool, as a scale-down candidate. Data only: the brain decides.
+
+    `delete_mark` is its `cluster.x-k8s.io/delete-machine` annotation's value
+    (None: unmarked). `node` is its `status.nodeRef`; `node_found` whether the
+    hosted cluster has that Node. `workload_pods` counts the Pods a drain
+    would move that are still running (not DaemonSet, not mirror, not
+    finished). `requested_permille` / `used_permille` are the larger of CPU
+    and memory, requested by its Pods / used now, per thousand of the Node's
+    allocatable — `used_permille` only for a `least-utilized` NodePool.
+    """
+
+    nodepool: str
+    namespace: str
+    name: str
+    created: str | None = None
+    deleting: bool = False
+    delete_mark: str | None = None
+    node: str | None = None
+    node_found: bool = False
+    ready: bool = False
+    unschedulable: bool = False
+    workload_pods: int = 0
+    requested_permille: int | None = None
+    used_permille: int | None = None
+
+
+class ScaleDownCandidates(BaseModel):
+    """The HostedCluster's control-plane namespace (where its Machines live), and every candidate."""
+
+    hcp_namespace: str
+    machines: list[ScaleDownMachine] = Field(default_factory=list)
+
+
+class MachineMarkRequest(BaseModel):
+    """mark / unmark: these Machines in the control-plane namespace, with this run's mark value."""
+
+    namespace: str = Field(min_length=1)
+    machines: list[str]
+    mark: str = Field(min_length=1)
+
+
+class MachineMarks(BaseModel):
+    """What one mark / unmark call did: `changed` it wrote, `unchanged` were already so (or gone, on unmark)."""
+
+    changed: list[str] = Field(default_factory=list)
+    unchanged: list[str] = Field(default_factory=list)
+
+
+class MarkedMachinesWatchRequest(BaseModel):
+    """watch_marked_machines: until every marked Machine is deleting or gone, or the deadline.
+
+    `nodepools` (in `hosted_cluster_namespace`) are the NodePools whose other
+    Machines must NOT start deleting; the Machines are in `hcp_namespace`.
+    """
+
+    hcp_namespace: str = Field(min_length=1)
+    hosted_cluster_namespace: str = Field(min_length=1)
+    nodepools: list[str]
+    marked: list[str]
+    deadline_minutes: int = Field(ge=1)
+
+
+class MarkedMachinesOutcome(str, Enum):
+    DONE = "done"
+    WRONG_MACHINE = "wrong-machine"  # an UNMARKED Machine of those NodePools is deleting
+    DEADLINE = "deadline"
+
+
+class MarkedMachinesWatch(BaseModel):
+    """watch_marked_machines' answer: `deleting` marked Machines deleting or gone, `pending` not yet."""
+
+    result: MarkedMachinesOutcome
+    deleting: list[str] = Field(default_factory=list)
+    pending: list[str] = Field(default_factory=list)
+    unexpected: list[str] = Field(default_factory=list)

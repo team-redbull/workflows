@@ -535,9 +535,10 @@ on 2026-11-02: sending it is a 422. A run started before then with it still
 ends as it began, and its result says `kept_in_inventory: true`.
 
 > **Nothing has to be done first: the run deletes the node's Machine itself.**
-> NodePool replicas are never changed (who owns them is not decided), so the
-> NodePool backfills a new Machine from another free Agent it matches — the
-> node is REPLACED, the cluster keeps its size. If this server is the only
+> NodePool replicas are never changed here (they are the day1 file's, changed
+> only by `update-nodepool`), so the NodePool backfills a new Machine from
+> another free Agent it matches — the node is REPLACED, the cluster keeps its
+> size. To shrink the cluster instead, use `update-nodepool`. If this server is the only
 > free Agent, the replacement takes it back: the run stops with
 > `AgentRetakenError` and writes nothing more. A Machine someone else already
 > started deleting is waited on, not deleted again.
@@ -585,6 +586,52 @@ needs a **ClusterRole** on the limb — Machines and AgentMachines
 get/list/delete/patch, HostedClusters get/list, Secrets get cluster-wide — and
 `patch` on Agents in the InfraEnv Role; see
 [the chart README](deploy/charts/server-lifecycle-worker/README.md).
+
+### `update-nodepool` — how many workers of one InfraEnv kind a hosted cluster runs
+
+`POST /workflows/server-lifecycle/update-nodepool` with `mce_cluster`, `cluster`
+(the day1 file's name), `replicas` (the TOTAL wanted, 0 allowed) and
+`infra_env_kind`. One run per cluster at a time (`update-nodepool-<cluster>`,
+409), and none while an `upgrade-cluster` run of the cluster is running (409):
+both commit to the same day1 file.
+
+A NodePool is of kind `K` when the InfraEnv its
+`agentLabelSelector.matchLabels["infraenvs.agent-install.openshift.io"]` names
+is `K`, or `K-` followed by anything (`K-zone-a`, …). Only the cluster's OWN
+NodePools count, never the rest of the MCE.
+
+**The day1 file owns replicas** (the operator, 2026-11-03), and this is the one
+place that changes them:
+
+1. It reads the cluster file (hub `upgrade-gitops-worker`) and the
+   HostedCluster's NodePools (the MCE's `cluster-upgrade-worker`). They must
+   agree both ways — same NodePools, InfraEnvs and replicas — else
+   `NodePoolReplicasDriftError`, nothing written.
+2. NodePools of the kind already more than one replica apart are refused
+   (`NodePoolsUnbalancedError`). Otherwise the new total is spread one replica
+   at a time — up to the fewest, down from the most, ties by InfraEnv then
+   NodePool name — so no two end more than one replica apart.
+3. A child, **scale-up-nodepool** or **scale-down-nodepool**, commits the new
+   replicas to day1 `main` (compare-and-set on the file's blob, so a person's
+   edit is never committed over), syncs the cluster's Argo CD Application to
+   exactly that commit, and reads the NodePools back. Done is the NodePools
+   showing the new replicas — not new nodes Ready.
+
+**On a scale-down, which servers leave is the NodePool's own choice**, never the
+request's: a label or annotation `redbull.io/scale-down-policy` on the NodePool
+— `fewest-pods`, `least-requested` (CPU/memory requested out of allocatable) or
+`least-utilized` (live use, from `metrics.k8s.io`). Broken ones go first under
+every policy (no Node, NotReady, cordoned). The run marks the chosen Machines
+`cluster.x-k8s.io/delete-machine` (the MCE's `server-lifecycle-worker`) **before
+it pushes**, so CAPI removes exactly those, then watches that they are the ones
+deleting (`ScaleDownWrongMachineError` otherwise). A refused commit takes the
+marks off again. Without the key nothing is marked and CAPI picks at random.
+The servers that leave stay in the MCE's inventory as free Agents.
+
+No new worker, credential or RBAC: the hub worker already holds the day1 push
+token, the cluster-upgrade worker reads NodePools and syncs Argo CD, and the
+server-lifecycle worker's existing `rbac.hostedClusters` covers the Machines and
+the hosted cluster. See [the page](docs/site/server-lifecycle/update-nodepool.html).
 
 ### `publish-infraenv-to-pxe-server` — an InfraEnv's current iPXE script onto its PXE VM
 
@@ -727,6 +774,7 @@ result.
 | `POST /workflows/server-lifecycle/remove-server-from-mce` | one server out of an MCE's inventory |
 | `POST /workflows/server-lifecycle/uninstall-server-from-hc` | one workflow PER server in `server_names`: out of its hosted cluster (if a node), then out of the MCE (remove-server-from-mce, as a child) |
 | `POST /workflows/server-lifecycle/publish-infraenv-to-pxe-server` | an InfraEnv's current iPXE script onto its site's PXE VM |
+| `POST /workflows/server-lifecycle/update-nodepool` | one replicas change of a hosted cluster's NodePools of one InfraEnv kind (a scale-up or scale-down child) |
 | `POST /workflows/server-provisioning/provision-dell-server` | one Dell server, by iDRAC IP |
 | `POST /workflows/server-provisioning/provision-dell-server/bulk` | one workflow PER iDRAC IP |
 | `GET  /workflows/runs/{workflow_id}` | (status, every domain) |
@@ -783,7 +831,7 @@ would hide which segments actually got a workflow.
   Workflow ids are deterministic (`initialize-segment-<network>`,
   `allocate-segment-<TYPE>-<cluster>`, `release-segment-<TYPE>-<cluster>`,
   `add-server-to-mce-<mce>_<server>`, `remove-server-from-mce-<server>`,
-  `uninstall-server-from-hc-<server>`), so a duplicate trigger while running gets
+  `uninstall-server-from-hc-<server>`, `update-nodepool-<cluster>`), so a duplicate trigger while running gets
   HTTP 409. add-server-to-mce's pool draws are the exception on purpose: each takes
   a free slot (`add-server-to-mce-<mce>_<infraEnv>_<slot>`), and the install lock keeps
   them on different machines.

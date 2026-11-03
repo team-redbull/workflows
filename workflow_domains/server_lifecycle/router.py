@@ -10,8 +10,9 @@ registration wait that can take minutes.
 PATHS ARE `/workflows/<domain>/<workflow>`. The domain prefix lives here and
 every workflow in the domain adds its own path under it — a domain holds many
 workflows, so it can never be the endpoint of one of them: add-server-to-mce,
-remove-server-from-mce, uninstall-server-from-hc and
-publish-infraenv-to-pxe-server each add a path.
+remove-server-from-mce, uninstall-server-from-hc, publish-infraenv-to-pxe-server
+and update-nodepool each add a path (update-nodepool's two children,
+scale-up-nodepool and scale-down-nodepool, have none: the parent plans them).
 
 Their paths before 2026-11-01 — install-server, remove-server, uninstall-server
 and publish-infraenv-boot — answer 410 naming the new one, whatever the body
@@ -29,8 +30,9 @@ from typing import Annotated, Any, Literal, TypeVar
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic.json_schema import SkipJsonSchema
-from temporalio.client import Client
+from temporalio.client import Client, WorkflowExecutionStatus
 from temporalio.exceptions import WorkflowAlreadyStartedError
+from temporalio.service import RPCError, RPCStatusCode
 
 from shared.cluster_names import canonical_mce_cluster
 from shared.consts import (
@@ -38,6 +40,7 @@ from shared.consts import (
     PUBLISH_INFRAENV_TO_PXE_SERVER_WORKFLOW_QUEUE,
     REMOVE_SERVER_FROM_MCE_WORKFLOW_QUEUE,
     UNINSTALL_SERVER_FROM_HC_WORKFLOW_QUEUE,
+    UPDATE_NODEPOOL_WORKFLOW_QUEUE,
 )
 from shared.models.server_lifecycle import (
     AddServerToMceInput,
@@ -48,6 +51,8 @@ from shared.models.server_lifecycle import (
     RemoveServerFromMceRunArgs,
     UninstallServerFromHcInput,
     UninstallServerFromHcRunArgs,
+    UpdateNodePoolInput,
+    UpdateNodePoolRunArgs,
 )
 from shared.workflow_ids import (
     add_server_to_mce_name_workflow_id,
@@ -55,6 +60,8 @@ from shared.workflow_ids import (
     publish_infraenv_to_pxe_server_workflow_id,
     remove_server_from_mce_workflow_id,
     uninstall_server_from_hc_workflow_id,
+    update_nodepool_workflow_id,
+    upgrade_cluster_workflow_id,
 )
 from workflow_domains.routers.deps import get_temporal_client
 from workflow_domains.routers.models import StartWorkflowResponse
@@ -64,6 +71,7 @@ from workflow_domains.server_lifecycle.publish_infraenv_to_pxe_server import (
 )
 from workflow_domains.server_lifecycle.remove_server_from_mce import RemoveServerFromMceWorkflow
 from workflow_domains.server_lifecycle.uninstall_server_from_hc import UninstallServerFromHcWorkflow
+from workflow_domains.server_lifecycle.update_nodepool import UpdateNodePoolWorkflow
 
 router = APIRouter(prefix="/workflows/server-lifecycle", tags=["server-lifecycle"])
 
@@ -71,6 +79,7 @@ _ADD_SERVER_TO_MCE_PATH = "/add-server-to-mce"
 _REMOVE_SERVER_FROM_MCE_PATH = "/remove-server-from-mce"
 _UNINSTALL_SERVER_FROM_HC_PATH = "/uninstall-server-from-hc"
 _PUBLISH_INFRAENV_TO_PXE_SERVER_PATH = "/publish-infraenv-to-pxe-server"
+_UPDATE_NODEPOOL_PATH = "/update-nodepool"
 
 # Where the inventory InfraEnvs live on an MCE unless the caller says otherwise.
 _DEFAULT_NAMESPACE = "inventory"
@@ -831,6 +840,101 @@ async def start_publish_infraenv_to_pxe_server(
                 "A publish-infraenv-to-pxe-server run is already in flight for "
                 f"{publish_input.mce_cluster}/{publish_input.infra_env}"
             ),
+        )
+    return StartWorkflowResponse(workflow_id=handle.id, run_id=handle.result_run_id or "")
+
+
+# A day1 cluster file's name, which is also its Argo CD Application's: a DNS
+# subdomain, as upgrade-cluster's routes take it. An InfraEnv kind is the start
+# of a Kubernetes name the same way.
+_KUBERNETES_NAME = r"^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$"
+
+
+class UpdateNodePoolRequest(UpdateNodePoolInput):
+    """The update-nodepool request body: strict at the edge, the MCE canonicalised here."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    mce_cluster: str = Field(min_length=1, description=_MCE_CLUSTER_DESCRIPTION)
+    cluster: str = Field(
+        pattern=_KUBERNETES_NAME,
+        description=(
+            "The day1 cluster file's name (also its Argo CD Application), without `.yaml`. Its "
+            "folder must be the MCE's: `sites/<site>/mces/<mce_cluster>/hostedClusters/<cluster>.yaml`."
+        ),
+    )
+    replicas: int = Field(
+        ge=0,
+        description=(
+            "The TOTAL replicas wanted over the cluster's NodePools of the kind, 0 allowed. The run "
+            "spreads it so no two of those NodePools are more than one replica apart."
+        ),
+    )
+    infra_env_kind: str = Field(
+        pattern=_KUBERNETES_NAME,
+        description=(
+            "The InfraEnv kind: a NodePool is of it when the InfraEnv its agentLabelSelector names "
+            "is exactly this, or this followed by `-` (`<kind>-zone-a`, …)."
+        ),
+    )
+
+    @field_validator("mce_cluster")
+    @classmethod
+    def _canonical_mce_cluster(cls, value: str) -> str:
+        """Canonical before the run starts: it builds the MCE's queues and is
+        compared with the MCE folder day1 keeps the cluster in."""
+        return canonical_mce_cluster(value)
+
+
+async def _upgrade_running(client: Client, cluster: str) -> bool:
+    """Whether an upgrade-cluster run of this cluster is RUNNING (none ever started: no)."""
+    try:
+        description = await client.get_workflow_handle(upgrade_cluster_workflow_id(cluster)).describe()
+    except RPCError as exc:
+        if exc.status == RPCStatusCode.NOT_FOUND:
+            return False
+        raise
+    return description.status == WorkflowExecutionStatus.RUNNING
+
+
+@router.post(_UPDATE_NODEPOOL_PATH, response_model=StartWorkflowResponse, status_code=202)
+async def start_update_nodepool(
+    update_request: UpdateNodePoolRequest,
+    client: Client = Depends(get_temporal_client),
+) -> StartWorkflowResponse:
+    """Set how many workers of one InfraEnv kind a hosted cluster runs — returns immediately (202).
+
+    Reads the cluster's NodePools of the kind in day1 and on the MCE (they must
+    agree), spreads `replicas` over them within one replica of each other,
+    commits that to day1 `main` and syncs the cluster's Argo CD Application. On
+    a scale-down, a NodePool labelled or annotated `redbull.io/scale-down-policy`
+    has the servers that leave chosen by that policy and marked first; without
+    one, CAPI picks.
+
+    Poll GET /workflows/runs/{workflow_id}. One run per cluster at a time (409
+    while one runs), and none while an upgrade-cluster run of the cluster is
+    running (409): both commit to the same day1 file.
+    """
+    if await _upgrade_running(client, update_request.cluster):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{upgrade_cluster_workflow_id(update_request.cluster)} is running: a replicas commit "
+                "now would change the file under the upgrade, which would stop for a person at its "
+                "next commit. Run update-nodepool once the upgrade has finished"
+            ),
+        )
+    try:
+        handle = await client.start_workflow(
+            UpdateNodePoolWorkflow.run,
+            UpdateNodePoolRunArgs(input=update_request),
+            id=update_nodepool_workflow_id(update_request.cluster),
+            task_queue=UPDATE_NODEPOOL_WORKFLOW_QUEUE,
+        )
+    except WorkflowAlreadyStartedError:
+        raise HTTPException(
+            status_code=409,
+            detail=f"An update-nodepool run is already in flight for cluster {update_request.cluster}",
         )
     return StartWorkflowResponse(workflow_id=handle.id, run_id=handle.result_run_id or "")
 

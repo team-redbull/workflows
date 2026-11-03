@@ -137,7 +137,8 @@ that (`uninstall-server-hosted-leftovers` unpatched) keep the old flow.
 
 IT REPLACES A NODE; IT NEVER SHRINKS THE CLUSTER. The run deletes the Machine
 itself — nothing has to happen first. NodePool replicas are NOT this
-workflow's business (who owns them is not decided, 2026-10-24), so the NodePool
+workflow's business (they are the day1 file's, changed only by update-nodepool
+— the operator, 2026-11-03; a shrink is its scale-down), so the NodePool
 still wants the same number of nodes: its MachineSet creates a replacement
 Machine and the Agent provider binds ANOTHER free Agent the NodePool matches —
 the hosted cluster keeps its size, on a different server. The provider takes

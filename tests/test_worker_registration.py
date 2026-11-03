@@ -262,6 +262,7 @@ def test_every_workflow_is_registered_in_the_brain():
         for element in spec.elts[1].elts
         if isinstance(element, ast.Name)
     }
+    assert {"UpdateNodePoolWorkflow", "ScaleUpNodePoolWorkflow", "ScaleDownNodePoolWorkflow"} <= registered
     for module in sorted(str(path.relative_to(REPO)) for path in (REPO / "workflow_domains").rglob("*.py")):
         for name in _workflow_classes(module):
             assert name in registered, f"{module}: {name} is not in _WORKER_SPECS"
@@ -315,6 +316,86 @@ def test_every_cluster_upgrade_dispatch_lands_on_a_worker_registering_it(helper)
         f"cluster-upgrade sends {sorted(missing)} through {helper} to {queue_builder}(<mce>), but "
         f"{worker_module} does not register them: the run would sit RUNNING on them"
     )
+
+
+# update-nodepool and its two children dispatch through
+# workflow_domains/server_lifecycle/nodepool_scaling.py: one helper per limb,
+# the activity its second argument (`on_mce(mce, activity, request)`) or, for
+# the hub, its first. Helper -> (the queue its body routes to, the interface
+# its activities must come from, the worker module polling that queue).
+_NODEPOOL_SCALING = "workflow_domains/server_lifecycle/nodepool_scaling.py"
+_NODEPOOL_MODULES = (
+    _NODEPOOL_SCALING,
+    "workflow_domains/server_lifecycle/update_nodepool.py",
+    "workflow_domains/server_lifecycle/scale_up_nodepool.py",
+    "workflow_domains/server_lifecycle/scale_down_nodepool.py",
+)
+_NODEPOOL_ROUTES = {
+    "on_hub": (0, "UPGRADE_GITOPS_ACTIVITY_QUEUE", "shared.interfaces.upgrade_gitops",
+               "activities/upgrade_gitops/worker_init.py"),
+    "on_mce": (1, "cluster_upgrade_activity_queue", "shared.interfaces.cluster_upgrade",
+               "activities/cluster_upgrade/worker_init.py"),
+    "on_server_lifecycle": (1, "server_lifecycle_activity_queue", "shared.interfaces.server_lifecycle",
+                            "activities/server_lifecycle/worker_init.py"),
+}
+
+
+def _imported_from(tree: ast.Module, module: str) -> set[str]:
+    return {
+        alias.asname or alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module == module
+        for alias in node.names
+    }
+
+
+@pytest.mark.parametrize("helper", sorted(_NODEPOOL_ROUTES))
+def test_every_nodepool_dispatch_lands_on_a_worker_registering_it(helper):
+    position, queue, interface, worker_module = _NODEPOOL_ROUTES[helper]
+    # The premise: the helper really routes to that limb's queue.
+    function = next(
+        node for node in ast.walk(_tree(_NODEPOOL_SCALING))
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == helper
+    )
+    queues = {
+        keyword.value.func.id if isinstance(keyword.value, ast.Call) else keyword.value.id
+        for call in ast.walk(function) if isinstance(call, ast.Call)
+        for keyword in call.keywords if keyword.arg == "task_queue"
+    }
+    assert queues == {queue}, f"nodepool_scaling.{helper} routes to {queues}, not {queue}"
+    sent: set[str] = set()
+    for module in _NODEPOOL_MODULES:
+        tree = _tree(module)
+        every_activity = {
+            alias.asname or alias.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom) and (node.module or "").startswith("shared.interfaces")
+            for alias in node.names
+        }
+        own = _imported_from(tree, interface)
+        for node in ast.walk(tree):
+            called = getattr(node, "func", None)
+            if not isinstance(node, ast.Call) or getattr(called, "id", getattr(called, "attr", None)) != helper:
+                continue
+            argument = node.args[position] if len(node.args) > position else None
+            if isinstance(argument, ast.Name) and argument.id in every_activity:
+                assert argument.id in own, f"{module} sends {argument.id} through {helper}, not its limb's"
+                sent.add(argument.id)
+    assert sent, f"no NodePool workflow calls {helper}: the scan is broken"
+    missing = sent - _registered_activities(worker_module)
+    assert not missing, f"{sorted(missing)} go through {helper} but {worker_module} does not register them"
+
+
+def test_the_nodepool_workflows_dispatch_only_through_their_helpers():
+    """Only nodepool_scaling calls execute_activity: the others go through its routes, checked above."""
+    for module in _NODEPOOL_MODULES:
+        tree = _tree(module)
+        direct = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and getattr(node.func, "attr", None) == "execute_activity"
+        ]
+        if module != _NODEPOOL_SCALING:
+            assert not direct, f"{module} calls execute_activity itself instead of nodepool_scaling"
 
 
 def test_the_cluster_upgrade_mce_worker_registers_its_whole_interface():

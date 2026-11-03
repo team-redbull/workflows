@@ -401,10 +401,10 @@ further, so `rbac.hostedClusters` (default `true`) adds a **ClusterRole** —
 
 | group / resource | verbs | why |
 |---|---|---|
-| `cluster.x-k8s.io` machines | get, list, delete, patch | the Machine behind a hosted node's Agent, found by owner, infrastructureRef or providerID; patch removes the Agent provider's pre-terminate hook from one whose AgentMachine is gone (the provider never can) |
+| `cluster.x-k8s.io` machines | get, list, delete, patch | the Machine behind a hosted node's Agent, found by owner, infrastructureRef or providerID; patch removes the Agent provider's pre-terminate hook from one whose AgentMachine is gone (the provider never can). update-nodepool's scale-down lists a NodePool's Machines (by `hypershift.openshift.io/nodePool`) and patches `cluster.x-k8s.io/delete-machine` onto the ones its policy chose |
 | `capi-provider.agent-install.openshift.io` agentmachines | get, list, delete, patch | found by its `status.agentRef` — the only link once the Agent provider starts unbinding; delete one left with no Machine, patch to drop the provider's finalizer it only drops through a Machine |
 | `hypershift.openshift.io` hostedclusters | get, list | found by its control-plane namespace; its `status.kubeconfig` |
-| `""` secrets | get | the HostedCluster's admin kubeconfig — **every Secret on the MCE** |
+| `""` secrets | get | the HostedCluster's admin kubeconfig — **every Secret on the MCE**; through it update-nodepool's scale-down also reads the hosted cluster's Nodes, Pods and `metrics.k8s.io` NodeMetrics |
 
 They are cluster-wide because a hosted cluster's Machines live in its
 control-plane namespace (`<hc-ns>-<hc>`) and its kubeconfig in the

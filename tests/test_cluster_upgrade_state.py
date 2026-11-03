@@ -161,6 +161,25 @@ class TestHostedCluster:
         other = {**self.NODEPOOL, "spec": {**self.NODEPOOL["spec"], "clusterName": "someone-else"}}
         assert upgrade_state.hosted_cluster_state(self.HC, [other]).nodepools == []
 
+    def test_update_nodepool_reads_the_infraenv_and_the_scale_down_policy(self):
+        """server-lifecycle's update-nodepool: the InfraEnv its kind is matched on, and how a scale-down picks."""
+        labelled = {
+            "metadata": {"name": "np", "labels": {"redbull.io/scale-down-policy": "fewest-pods"}},
+            "spec": {**self.NODEPOOL["spec"], "platform": {"type": "Agent", "agent": {"agentLabelSelector": {
+                "matchLabels": {"infraenvs.agent-install.openshift.io": "dell-r660-128c-zone-a"}}}}},
+        }
+        annotated = {**labelled, "metadata": {
+            "name": "np", "annotations": {"redbull.io/scale-down-policy": "least-utilized"}}}
+        for nodepool, policy in ((labelled, "fewest-pods"), (annotated, "least-utilized")):
+            (state,) = upgrade_state.hosted_cluster_state(self.HC, [nodepool]).nodepools
+            assert (state.infra_env, state.scale_down_policy) == ("dell-r660-128c-zone-a", policy)
+
+    def test_without_them_both_are_none_and_still_reported(self):
+        (state,) = upgrade_state.hosted_cluster_state(self.HC, [self.NODEPOOL]).nodepools
+        assert (state.infra_env, state.scale_down_policy) == (None, None)
+        # The key is always there, so update-nodepool tells this limb from an older one.
+        assert {"infra_env", "scale_down_policy"} <= state.model_fields_set
+
     def test_absent(self):
         assert upgrade_state.hosted_cluster_state(None, []).found is False
 

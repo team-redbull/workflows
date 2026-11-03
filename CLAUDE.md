@@ -470,8 +470,9 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   `result.skipped`. NOTHING IS UNDONE after the Machine delete — it cannot be —
   and a re-run of the same id RESUMES. NODEPOOL REPLICAS ARE NOT ITS BUSINESS:
   the run deletes the Machine ITSELF (no prerequisite) and the NodePool backfills
-  = REPLACE. Who owns `NodePool.spec.replicas` (a shrink) is NOT DECIDED — the
-  operator is taking it to the team (2026-10-24); never change them here. The
+  = REPLACE. `NodePool.spec.replicas` belong to the day1 file and change ONLY
+  through update-nodepool (decided with the operator 2026-11-03, next bullets);
+  never change them here — a shrink is update-nodepool's scale-down. The
   provider's `findAgent` takes ANY free Agent the NodePool matches, so with no
   other free Agent the replacement takes THIS server back: every wait pass checks
   the Agent's `agentMachineRef` label (+ namespace annotation) against the
@@ -561,6 +562,73 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   discovery) and fails on one still Ready. Writes go in `result.cleaned_up`, each
   with why the owner could not; the shape found in `leftovers_at_start`. Needs
   the new limb (new activities) AND the widened RBAC — ship the RBAC first.
+- **update-nodepool owns a hosted cluster's NodePool replicas, through day1**
+  (`workflow_domains/server_lifecycle/update_nodepool.py`, own queue
+  `update-nodepool-workflow`, id `update-nodepool-<cluster>` — per CLUSTER, not
+  per kind: every kind shares one day1 file and one Argo CD Application — API
+  `POST /workflows/server-lifecycle/update-nodepool` with `mce_cluster`
+  (canonicalised), `cluster` (the day1 file's name), `replicas` (the TOTAL, 0
+  allowed) and `infra_env_kind`; a 409 too while `upgrade-cluster-<cluster>` is
+  RUNNING, since a replicas commit under an upgrade stops it at its next
+  commit.) Designed with the operator 2026-11-03. The pieces that are
+  decisions:
+  - **The KIND is the live NodePool's selector**:
+    `spec.platform.agent.agentLabelSelector.matchLabels["infraenvs.agent-install.openshift.io"]`
+    is `K`, or `K-` followed by ANYTHING (`nodepool_replicas.belongs_to_kind`).
+    Nothing after the dash is read and no zone label is assumed — so a shorter
+    kind takes the longer ones that start with it; the result lists what was
+    selected. ONLY the cluster's own NodePools (`upgrade_state.nodepools_of`,
+    by `spec.clusterName`), never the rest of the MCE.
+  - **Live and day1 must agree BOTH WAYS** (same NodePools, InfraEnvs, replicas)
+    or `NodePoolReplicasDriftError` with nothing written. The one exception is
+    the RESUME: day1 already holding a balanced plan for the requested total
+    while the MCE lags (a child that committed and never synced) goes to the
+    child, whose commit is then "already so".
+  - **No two NodePools of a kind more than ONE replica apart.** A start that
+    breaks it is REFUSED (`NodePoolsUnbalancedError`), never repaired. The new
+    total moves one replica at a time — up to the fewest, down from the most,
+    ties by InfraEnv then NodePool name (ascending up, descending down) — so a
+    scale never moves a NodePool the other way (`nodepool_replicas.plan`).
+  - **The change is ONE day1 commit, then an Argo CD sync — never a NodePool
+    write.** The children, scale-up-nodepool / scale-down-nodepool (own queues,
+    ids `scale-{up,down}-nodepool-<cluster>`, awaited, ABANDON, NO route),
+    reuse the cluster-upgrade domain's limbs rather than a new credential:
+    `commit_day1_change` with `Day1ChangeKind.REPLICAS` on the hub
+    upgrade-gitops worker (compare-and-set on the blob read; only
+    `nodepool[i].replicas` may change; message `nodepool(<cluster>): …`),
+    `sync_argo_application` to exactly that revision with only the moved
+    NodePools allowed out of sync, and `read_hosted_cluster` read back on the
+    MCE's cluster-upgrade worker. DONE = the NodePools show the new
+    `spec.replicas` — NOT new nodes Ready (the operator: "when it sees the
+    nodepools in the MCE configured to the desired state").
+  - **Which servers leave a scale-down is the NodePool's, never the request's**:
+    a label OR annotation `redbull.io/scale-down-policy` — `fewest-pods`,
+    `least-requested` (pod requests / allocatable), `least-utilized`
+    (`metrics.k8s.io`; no API = `NodeMetricsUnavailableError`, a Node without
+    metrics yet is retried). Absent = nothing marked, CAPI picks at random;
+    unknown = `ScaleDownPolicyInvalidError`. Broken first under every policy (no
+    Node, NotReady, cordoned); this run's own mark before those, so a re-run keeps
+    its choice. The mechanism is CAPI's own `cluster.x-k8s.io/delete-machine`
+    (`mustDelete` under every delete policy), value = the scale-down's workflow
+    id, set and read back on the chosen Machines BEFORE the commit (the
+    operator: "put the label … on the machine and just then push to git");
+    Machines found by HyperShift's `hypershift.openshift.io/nodePool:
+    <ns>/<name>` annotation. Refused with nothing written: a Machine of a
+    shrinking NodePool already deleting, a mark this run did not write
+    (`ScaleDownMarkConflictError`), Machines ≠ replicas. A commit that pushed
+    nothing (`Day1FileChangedError`, `Day1ChangeRejectedError`, file not found)
+    takes the marks off again; after the commit landed they are NEVER removed.
+    Then one heartbeating watch (10 min) that the marked Machines are the ones
+    deleting — an unmarked one is `ScaleDownWrongMachineError`.
+  - **The servers that leave stay in the MCE** as free Agents (the operator,
+    2026-11-03) — no remove-server-from-mce child.
+  - Needs no new RBAC: the server-lifecycle limb's `rbac.hostedClusters`
+    already grants machines list/patch and the admin kubeconfig; the
+    cluster-upgrade limb already reads NodePools. Needs the NEW
+    cluster-upgrade-worker (it reports `infra_env` / `scale_down_policy`; an
+    older one fails the run by name, gated on the key's presence) and the new
+    upgrade-gitops-worker (REPLICAS; an older one cannot decode it and the
+    commit is retried until it is up).
 - **Select bond members from `interfaces[]`, NEVER from `nic_macs`.**
   server-scan reduces Dell NPAR partitions to one entry per physical port in
   `interfaces` but leaves `nic_macs` whole on purpose, so a 4-port partitioned
@@ -1054,7 +1122,8 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   `deploy/` is in `.dockerignore` and triggers no image build (those two charts trigger the sync). The server-lifecycle limb is the first to need real RBAC: it creates
   secrets, metal3.io/baremetalhosts and agent-install.openshift.io/nmstateconfigs in the target
   namespace, where segment-lifecycle only makes HTTP and git calls — and, for uninstall-server-from-hc,
-  a ClusterRole over CAPI Machines, AgentMachines, HostedClusters and Secrets (§4).
+  a ClusterRole over CAPI Machines, AgentMachines, HostedClusters and Secrets (§4) — the same
+  grant update-nodepool's scale-down uses to read and mark Machines.
   cluster-upgrade-worker holds NO credential Secret — its ServiceAccount is the whole identity —
   and its RBAC is derived call by call from `activities/cluster_upgrade/activities.py` (its
   README's table): a ClusterRole reading HostedClusters, NodePools, MachineSets, IDMS and Secrets

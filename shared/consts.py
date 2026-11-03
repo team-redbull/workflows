@@ -13,8 +13,11 @@ SEGMENT_LIFECYCLE_ACTIVITY_QUEUE = "segment-lifecycle-activity"
 # -- Server-lifecycle domain --
 # Same split as above for the WORKFLOW queue — each workflow gets its own, and
 # every one of them (add-server-to-mce, remove-server-from-mce,
-# uninstall-server-from-hc, publish-infraenv-to-pxe-server) runs its activities
-# on the same per-MCE limb.
+# uninstall-server-from-hc, publish-infraenv-to-pxe-server, update-nodepool,
+# scale-up-nodepool, scale-down-nodepool) runs its activities on the same
+# per-MCE limb. The three NodePool workflows also call the cluster-upgrade
+# domain's limbs — the hub one for the day1 commit, the per-MCE one for the
+# NodePool reads and the Argo CD sync — which already hold that access.
 #
 # The ACTIVITY queue is NOT the same, and this is the one place the pattern
 # differs. It is scoped to the domain AND to one MCE cluster, because these
@@ -38,6 +41,9 @@ ADD_SERVER_TO_MCE_WORKFLOW_QUEUE = "add-server-to-mce-workflow"
 REMOVE_SERVER_FROM_MCE_WORKFLOW_QUEUE = "remove-server-from-mce-workflow"
 UNINSTALL_SERVER_FROM_HC_WORKFLOW_QUEUE = "uninstall-server-from-hc-workflow"
 PUBLISH_INFRAENV_TO_PXE_SERVER_WORKFLOW_QUEUE = "publish-infraenv-to-pxe-server-workflow"
+UPDATE_NODEPOOL_WORKFLOW_QUEUE = "update-nodepool-workflow"
+SCALE_UP_NODEPOOL_WORKFLOW_QUEUE = "scale-up-nodepool-workflow"
+SCALE_DOWN_NODEPOOL_WORKFLOW_QUEUE = "scale-down-nodepool-workflow"
 # The four were install-server, remove-server, uninstall-server and
 # publish-infraenv-boot until 2026-11-01. A run started before the renames is
 # its OLD workflow type on its OLD queue and replays only there, so the brain

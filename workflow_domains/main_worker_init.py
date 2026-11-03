@@ -34,7 +34,10 @@ from shared.consts import (
     PUBLISH_INFRAENV_TO_PXE_SERVER_WORKFLOW_QUEUE,
     RELEASE_SEGMENT_WORKFLOW_QUEUE,
     REMOVE_SERVER_FROM_MCE_WORKFLOW_QUEUE,
+    SCALE_DOWN_NODEPOOL_WORKFLOW_QUEUE,
+    SCALE_UP_NODEPOOL_WORKFLOW_QUEUE,
     UNINSTALL_SERVER_FROM_HC_WORKFLOW_QUEUE,
+    UPDATE_NODEPOOL_WORKFLOW_QUEUE,
     UPGRADE_CLUSTER_WORKFLOW_QUEUE,
     UPGRADE_CONTROL_PLANE_WORKFLOW_QUEUE,
     UPGRADE_TARGETS_WORKFLOW_QUEUE,
@@ -69,10 +72,13 @@ from workflow_domains.server_lifecycle.remove_server_from_mce import (
     RemoveServerFromMceWorkflow,
     RemoveServerWorkflow,
 )
+from workflow_domains.server_lifecycle.scale_down_nodepool import ScaleDownNodePoolWorkflow
+from workflow_domains.server_lifecycle.scale_up_nodepool import ScaleUpNodePoolWorkflow
 from workflow_domains.server_lifecycle.uninstall_server_from_hc import (
     UninstallServerFromHcWorkflow,
     UninstallServerWorkflow,
 )
+from workflow_domains.server_lifecycle.update_nodepool import UpdateNodePoolWorkflow
 from workflow_domains.server_provisioning.provision_dell_server import (
     ProvisionDellServerWorkflow,
 )
@@ -91,7 +97,10 @@ _WORKER_SPECS: list[tuple[str, list[type]]] = [
     (PUBLISH_INFRAENV_TO_PXE_SERVER_WORKFLOW_QUEUE, [PublishInfraEnvToPxeServerWorkflow]),
     (RELEASE_SEGMENT_WORKFLOW_QUEUE, [ReleaseSegmentWorkflow]),
     (REMOVE_SERVER_FROM_MCE_WORKFLOW_QUEUE, [RemoveServerFromMceWorkflow]),
+    (SCALE_DOWN_NODEPOOL_WORKFLOW_QUEUE, [ScaleDownNodePoolWorkflow]),
+    (SCALE_UP_NODEPOOL_WORKFLOW_QUEUE, [ScaleUpNodePoolWorkflow]),
     (UNINSTALL_SERVER_FROM_HC_WORKFLOW_QUEUE, [UninstallServerFromHcWorkflow]),
+    (UPDATE_NODEPOOL_WORKFLOW_QUEUE, [UpdateNodePoolWorkflow]),
     (UPGRADE_CLUSTER_WORKFLOW_QUEUE, [UpgradeClusterWorkflow]),
     (UPGRADE_CONTROL_PLANE_WORKFLOW_QUEUE, [UpgradeControlPlaneWorkflow]),
     (UPGRADE_TARGETS_WORKFLOW_QUEUE, [UpgradeTargetsWorkflow]),

@@ -31,6 +31,8 @@ from shared.models.cluster_upgrade import (
 )
 from shared.ocp_version import release_version
 from shared.upgrade_layout import ADMIN_ACK_REQUIRED as _ADMIN_ACK_REQUIRED
+from shared.upgrade_layout import INFRAENV_LABEL as _INFRAENV_LABEL
+from shared.upgrade_layout import SCALE_DOWN_POLICY as _SCALE_DOWN_POLICY
 from shared.upgrade_layout import ZONE_LABEL as _ZONE_LABEL
 
 # The hosted CVO's admin-ack check writes this condition when it fails and
@@ -91,7 +93,29 @@ def nodepool_state(nodepool: dict[str, Any]) -> NodePoolState:
         max_unavailable=None if max_unavailable is None else str(max_unavailable),
         zone=(spec.get("nodeLabels") or {}).get(_ZONE_LABEL),
         conditions={c["type"]: str(c.get("status")) for c in _conditions(nodepool) if c.get("type")},
+        # Both always passed, a None included: update-nodepool tells this limb
+        # from one predating them by the key's presence.
+        infra_env=nodepool_infra_env(nodepool),
+        scale_down_policy=nodepool_scale_down_policy(nodepool),
     )
+
+
+def nodepool_infra_env(nodepool: dict[str, Any]) -> str | None:
+    """The InfraEnv the NodePool takes Agents from: its agentLabelSelector's INFRAENV_LABEL matchLabel."""
+    selector = ((((nodepool.get("spec") or {}).get("platform") or {}).get("agent") or {})
+                .get("agentLabelSelector") or {})
+    value = (selector.get("matchLabels") or {}).get(_INFRAENV_LABEL)
+    return str(value) if value else None
+
+
+def nodepool_scale_down_policy(nodepool: dict[str, Any]) -> str | None:
+    """The NodePool's `redbull.io/scale-down-policy`: its label, else its annotation, as written."""
+    metadata = nodepool.get("metadata") or {}
+    for where in ("labels", "annotations"):
+        value = (metadata.get(where) or {}).get(_SCALE_DOWN_POLICY)
+        if value is not None:
+            return str(value)
+    return None
 
 
 def nodepools_of(

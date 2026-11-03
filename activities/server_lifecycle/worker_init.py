@@ -56,7 +56,9 @@ from activities.server_lifecycle.activities import (
     inspect_inventory_host,
     lookup_install_candidate,
     lookup_server_membership,
+    mark_machines_for_deletion,
     publish_infra_env_boot,
+    read_scale_down_candidates,
     register_pxe_boot,
     release_agent,
     release_machine_hook,
@@ -66,7 +68,9 @@ from activities.server_lifecycle.activities import (
     reserve_server,
     set_host_online,
     teardown_bmh_resources,
+    unmark_machines,
     unregister_pxe_boot,
+    watch_marked_machines,
 )
 from shared.consts import server_lifecycle_activity_queue
 from shared.logging_config import configure_logging
@@ -123,6 +127,11 @@ async def main() -> None:
             release_agent,
             release_machine_hook,
             clean_up_agent_machines,
+            # scale-down-nodepool
+            read_scale_down_candidates,
+            mark_machines_for_deletion,
+            unmark_machines,
+            watch_marked_machines,
         ],
         # In-flight activities get this long to finish after shutdown starts
         # before being cancelled — keep it below the pod's

@@ -1,0 +1,494 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>update-nodepool — Redbull Workflows</title>
+<meta name="description" content="The update-nodepool workflow: set how many workers of one InfraEnv kind a hosted cluster runs. It spreads the total over the cluster's NodePools of that kind, at most one replica apart, commits it to day1 and syncs Argo CD; on a scale-down a NodePool's own policy picks the servers that leave.">
+<link rel="icon" href="/assets/favicon.svg?v=__DOC_VERSION__" type="image/svg+xml">
+<link rel="stylesheet" href="/assets/site.css?v=__DOC_VERSION__">
+</head>
+<body data-page="/server-lifecycle/update-nodepool.html">
+
+<a class="skip-link" href="#main">Skip to content</a>
+
+<!-- Topbar: identical on every page. Brand + deployed version upper-left; the
+     "Workflows" menu is built from the catalogue in assets/nav.js. -->
+<header class="topbar">
+  <a class="brand" href="/">
+    <img class="brand-mark" src="/assets/redbull-logo.png?v=__DOC_VERSION__" alt="" aria-hidden="true"
+         width="480" height="179">
+    <span class="brand-name">Redbull Workflows</span>
+    <span class="brand-ver" title="deployed image tag of this documentation site">__DOC_VERSION__</span>
+  </a>
+  <nav class="topnav" aria-label="Site">
+    <a class="topnav-link" href="/">Orchestrator guide</a>
+    <div class="wfmenu">
+      <button class="wfmenu-btn" id="wfmenu-btn" type="button"
+              aria-expanded="false" aria-haspopup="true" aria-controls="wfmenu-panel">
+        Workflows <span class="caret" aria-hidden="true">&#9662;</span>
+      </button>
+      <div class="wfmenu-panel" id="wfmenu-panel" role="menu" aria-label="Workflows by domain" hidden></div>
+    </div>
+    <noscript>
+      <a class="topnav-link" href="/server-lifecycle/update-nodepool.html">update-nodepool</a>
+    </noscript>
+  </nav>
+</header>
+
+<main id="main">
+<header class="masthead">
+  <div class="masthead-inner">
+    <div class="eyebrow">Temporal workflow &middot; domain: server-lifecycle</div>
+    <h1>update-nodepool<span class="dim"> &mdash; what actually happens</span></h1>
+    <p class="lede">
+      One request sets <b>how many workers of one hardware kind a hosted cluster runs</b>. You give the
+      <b>total</b>; the run spreads it over the cluster&rsquo;s NodePools of that kind so that <b>no two are
+      more than one replica apart</b>, writes the new replicas into the cluster&rsquo;s day1 file, has
+      Argo CD apply that commit, and checks that the NodePools on the MCE show it.
+    </p>
+    <p class="lede"><b>The day1 file owns replicas.</b> Nothing on the MCE is written directly: the change is
+    one commit to day1 <code>main</code>, synced by Argo CD. The run scales up or down through a child workflow
+    &mdash; <b>scale-up-nodepool</b> or <b>scale-down-nodepool</b> &mdash; and on a scale-down a NodePool that
+    names a <a href="#policy">scale-down policy</a> has the servers that leave <b>chosen and marked first</b>.
+    Without one, CAPI picks at random, as it always has.</p>
+    <div class="facts">
+      <div class="fact"><span class="k">Trigger</span><span class="v">POST /workflows/server-lifecycle/update-nodepool</span></div>
+      <div class="fact"><span class="k">Workflow id</span><span class="v">one per cluster: update-nodepool-&lt;cluster&gt;</span></div>
+      <div class="fact"><span class="k">Children</span><span class="v">scale-up-nodepool-&lt;cluster&gt; &middot; scale-down-nodepool-&lt;cluster&gt;</span></div>
+      <div class="fact"><span class="k">Workflow queues</span><span class="v">update-nodepool-workflow &middot; scale-up-nodepool-workflow &middot; scale-down-nodepool-workflow</span></div>
+      <div class="fact"><span class="k">Activity queues</span><span class="v">upgrade-gitops-activity (day1) &middot; cluster-upgrade-activity-&lt;mce&gt; &middot; server-lifecycle-activity-&lt;mce&gt;</span></div>
+    </div>
+    <p class="note">Done means the NodePools <b>show the new replicas</b>, not that new nodes are Ready
+    (decided with the operator, 2026-11-03). After a scale-up HyperShift creates the Machines, and each one
+    takes a free Agent of its InfraEnv when there is one. The servers a scale-down removes <b>stay in the
+    MCE&rsquo;s inventory</b>, free Agents again.</p>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <!-- ============================================================= KIND -->
+  <section id="kind">
+    <div class="sec-head">
+      <div class="eyebrow">Which NodePools</div>
+      <h2>The InfraEnv kind, and only this cluster&rsquo;s NodePools</h2>
+    </div>
+    <p>A NodePool takes Agents from the InfraEnv its selector names:
+    <code>spec.platform.agent.agentLabelSelector.matchLabels["infraenvs.agent-install.openshift.io"]</code>.
+    It is of kind <code>K</code> when that InfraEnv is <b>exactly <code>K</code></b>, or <code>K</code>
+    <b>followed by <code>-</code> and anything</b>. Nothing after the dash is read, and no zone label is
+    needed.</p>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>infra_env_kind <code>cisco-m6-bat-yam-64c-512gb</code></th><th>its kind?</th></tr></thead>
+        <tbody>
+          <tr><td class="k">cisco-m6-bat-yam-64c-512gb</td><td class="muted">yes</td></tr>
+          <tr><td class="k">cisco-m6-bat-yam-64c-512gb-zone-a</td><td class="muted">yes</td></tr>
+          <tr><td class="k">cisco-m6-bat-yam-64c-512gb-b2</td><td class="muted">yes</td></tr>
+          <tr><td class="k">cisco-m6-bat-yam-64c-512gbx</td><td class="muted">no &mdash; no dash after the kind</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note">A <b>shorter</b> kind also takes the longer kinds that start with it: <code>cisco-m6</code>
+    would select every <code>cisco-m6-*</code> NodePool. The result lists every NodePool selected with its
+    InfraEnv, so a kind that is too wide shows there.</p>
+    <p>Only the NodePools <b>of the cluster you name</b> count: those in its HostedCluster&rsquo;s namespace whose
+    <code>spec.clusterName</code> is that HostedCluster. Another cluster&rsquo;s NodePools of the same kind, on
+    the same MCE, are never counted and never changed.</p>
+  </section>
+
+  <!-- ============================================================== FLOW -->
+  <section id="flow">
+    <div class="sec-head">
+      <div class="eyebrow">update-nodepool, then its child</div>
+      <h2>What the run does</h2>
+      <p class="lede" style="margin-bottom:24px">Each card carries a <code>phase</code>, read live through the
+      <code>progress</code> query of the run it belongs to. The parent also reports <code>direction</code>
+      and, while its child runs, <code>child_workflow_id</code>.</p>
+    </div>
+
+    <div class="flow">
+
+      <div class="step">
+        <div class="marker">1</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>read_day1_cluster</h3>
+            <span class="phase">phase <b>reading-day1</b></span>
+          </div>
+          <p>The cluster&rsquo;s file in day1 <code>main</code>, read by the hub&rsquo;s upgrade-gitops worker:
+          its path, its git blob, the HostedCluster it renders (<code>openshift-&lt;clusterName&gt;</code> in
+          <code>hcp-&lt;clusterName&gt;</code>), and each <code>nodepool[]</code> entry&rsquo;s name, replicas
+          (the chart&rsquo;s default 1 when absent) and InfraEnv (<code>infraEnvName</code>, else
+          <code>agentLabelSelector.nodeLabelValue</code>).</p>
+          <p class="note">The file must sit under <code>sites/&lt;site&gt;/mces/&lt;mce_cluster&gt;/</code>, or the
+          run stops with <code>ClusterNotOnMceError</code> before reading anything on the MCE. A file the chart
+          would refuse (a key written twice, a NodePool named twice) stops it with
+          <code>Day1ClusterProblemsError</code>.</p>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="marker">2</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>read_hosted_cluster</h3>
+            <span class="phase">phase <b>reading-nodepools</b></span>
+          </div>
+          <p>The HostedCluster&rsquo;s NodePools on the MCE, read by the MCE&rsquo;s cluster-upgrade worker:
+          <code>spec.replicas</code>, the InfraEnv of the selector, and the
+          <code>redbull.io/scale-down-policy</code> label or annotation. The kind&rsquo;s NodePools are selected
+          here.</p>
+          <p><b>Live and day1 must agree, both ways</b>: every NodePool of the kind on the MCE is in day1 under
+          its name with the same replicas and InfraEnv, and every one of the kind in day1 is on the MCE.
+          Anything else stops the run with <code>NodePoolReplicasDriftError</code>, naming each NodePool, before
+          anything is written &mdash; a NodePool made by hand, one Argo CD has not created yet, replicas
+          someone changed on the cluster.</p>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="marker">3</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>The plan</h3>
+            <span class="phase">phase <b>planning</b></span>
+          </div>
+          <p>NodePools of the kind already <b>more than one replica apart</b> are refused
+          (<code>NodePoolsUnbalancedError</code>): balancing them is a person&rsquo;s edit, never a side effect.
+          A total already equal to the request completes here, <code>direction: "none"</code>, nothing written.
+          Otherwise the new total is spread <a href="#spread">one replica at a time</a>.</p>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="marker">4</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>The child</h3>
+            <span class="phase">phase <b>scaling-up</b> &middot; <b>scaling-down</b></span>
+          </div>
+          <p>scale-up-nodepool or scale-down-nodepool, awaited, on its own id and queue. Its result is the
+          parent&rsquo;s <code>scale</code>. It is <b>abandoned, never cancelled</b>, if the parent is closed: it
+          marks Machines and writes git in an order that must not be cut.</p>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="marker">5</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>read_scale_down_candidates &middot; mark_machines_for_deletion</h3>
+            <span class="phase">phases <b>selecting-servers</b> &middot; <b>marking-machines</b> &mdash; scale-down, with a policy</span>
+          </div>
+          <p>Only when a NodePool that loses replicas names a <a href="#policy">policy</a>. The MCE&rsquo;s
+          server-lifecycle worker reads that NodePool&rsquo;s Machines (by HyperShift&rsquo;s
+          <code>hypershift.openshift.io/nodePool</code> annotation), and through the hosted cluster&rsquo;s admin
+          kubeconfig their Nodes, Pods and &mdash; for <code>least-utilized</code> &mdash; NodeMetrics. The run
+          ranks them, then puts <code>cluster.x-k8s.io/delete-machine: scale-down-nodepool-&lt;cluster&gt;</code>
+          on each chosen Machine and reads it back. CAPI deletes a marked Machine before any other, so the
+          commit that follows removes exactly those.</p>
+          <p class="note">Refused with nothing written: an unknown policy value, a Machine already deleting, a
+          delete mark this run did not write, a Machine count that is not the replicas. A mark an earlier
+          attempt of this run left on a Machine not chosen now comes off first.</p>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="marker">6</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>commit_day1_change</h3>
+            <span class="phase">phase <b>committing-day1</b></span>
+          </div>
+          <p>The new replicas of every NodePool that moves, in <b>one commit</b> to day1 <code>main</code>,
+          <code>nodepool(&lt;cluster&gt;): replicas a 3&rarr;4, &hellip; [&lt;run id&gt;]</code>. Only those
+          <code>replicas:</code> lines change; comments and quoting stay. <b>Compare-and-set</b> on the blob read
+          in step 1: a file someone else changed since is never committed over
+          (<code>Day1FileChangedError</code>). day1&rsquo;s validator runs first when one is configured.</p>
+          <p class="note">On a scale-down, a refused commit takes the run&rsquo;s marks off again
+          (<code>unmarking-machines</code>) before it fails.</p>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="marker">7</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>sync_argo_application &middot; read_hosted_cluster</h3>
+            <span class="phase">phases <b>syncing-argo</b> &middot; <b>verifying-nodepools</b></span>
+          </div>
+          <p>The cluster&rsquo;s Argo CD Application synced to <b>exactly that commit</b>. Only the moved
+          NodePools may be out of sync; anything else pending is someone else&rsquo;s change and the sync is
+          refused (<code>ArgoSyncRefusedError</code>). Then the NodePools are read back: each must show its
+          planned <code>spec.replicas</code>, or <code>NodePoolsNotReconciledError</code>.</p>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="marker">8</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>watch_marked_machines</h3>
+            <span class="phase">phase <b>verifying-machines</b> &mdash; scale-down, with marks</span>
+          </div>
+          <p>One heartbeating watch, every 15 s for up to <b>10 minutes</b>, until every marked Machine is
+          deleting or gone. An <b>unmarked</b> Machine of those NodePools deleting instead is
+          <code>ScaleDownWrongMachineError</code> &mdash; named, and it cannot be undone. The run does not wait
+          for the drain or for the Agent to come free.</p>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ============================================================ SPREAD -->
+  <section id="spread">
+    <div class="sec-head">
+      <div class="eyebrow">The rule a scale keeps</div>
+      <h2>How the total is spread</h2>
+    </div>
+    <p>One replica at a time. <b>Up</b>: to the NodePool with the fewest. <b>Down</b>: from the one with the
+    most. Ties go by InfraEnv name, then NodePool name &mdash; ascending going up, descending going down &mdash;
+    so the first NodePool in that order keeps the extra one. From a balanced start every step stays
+    balanced, and no NodePool ever moves the other way.</p>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>zone-a, zone-b, zone-c</th><th>replicas asked</th><th>after</th></tr></thead>
+        <tbody>
+          <tr><td class="k">3, 3, 2</td><td class="muted">10</td><td class="muted">4, 3, 3</td></tr>
+          <tr><td class="k">3, 3, 3</td><td class="muted">7</td><td class="muted">3, 2, 2</td></tr>
+          <tr><td class="k">1, 1, 1</td><td class="muted">2</td><td class="muted">1, 1, 0</td></tr>
+          <tr><td class="k">2, 2, 1</td><td class="muted">0</td><td class="muted">0, 0, 0</td></tr>
+          <tr><td class="k">5, 2, 2</td><td class="muted">any</td><td class="muted">refused: <code>NodePoolsUnbalancedError</code></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ============================================================ POLICY -->
+  <section id="policy">
+    <div class="sec-head">
+      <div class="eyebrow">scale-down-nodepool</div>
+      <h2>Which servers leave: the NodePool&rsquo;s own policy</h2>
+      <p class="lede">Set <b>on the NodePool, never in the request</b>: a label or an annotation
+      <code>redbull.io/scale-down-policy</code>. The run reads it off the NodePool on the MCE, which is what
+      Argo CD rendered from day1 (or what a person set there). The spread rule decides how many each NodePool
+      loses; the policy decides which of its Machines.</p>
+    </div>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>value</th><th>which servers leave first</th></tr></thead>
+        <tbody>
+          <tr><td class="k">absent</td><td class="muted">Nothing is marked. CAPI&rsquo;s MachineSet picks &mdash; at random, HyperShift&rsquo;s default.</td></tr>
+          <tr><td class="k">fewest-pods</td><td class="muted">The fewest workload pods: the least for the drain to move. Workload means not a DaemonSet&rsquo;s, not a mirror pod, not finished &mdash; the drain&rsquo;s own rules.</td></tr>
+          <tr><td class="k">least-requested</td><td class="muted">The lowest share of the Node&rsquo;s allocatable its pods request, the larger of CPU and memory. From the pods&rsquo; requests, as the scheduler counts them; no metrics needed.</td></tr>
+          <tr><td class="k">least-utilized</td><td class="muted">The lowest live use of allocatable, the larger of CPU and memory, from <code>metrics.k8s.io</code> on the hosted cluster. A cluster with no metrics API fails the run (<code>NodeMetricsUnavailableError</code>); a Node that just joined is waited for until its metrics appear.</td></tr>
+          <tr><td class="k">anything else</td><td class="muted">Refused before anything is marked or written: <code>ScaleDownPolicyInvalidError</code>.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>Under <b>every</b> policy a Machine with no Node goes first, then a Node that is NotReady or cordoned
+    &mdash; losing one costs nothing, and CAPI&rsquo;s own priority does the same. A Machine already carrying
+    this run&rsquo;s mark comes before those, so a re-run keeps the choice it made. Ties go by Machine name.
+    Different NodePools of one kind may name different policies, or none.</p>
+    <p class="note">For the key to come from day1, the hostedclusters-setup chart must pass an entry&rsquo;s
+    labels or annotations onto the NodePool. Where it does not, set it on the NodePool directly.</p>
+  </section>
+
+  <!-- ========================================================= FAILURES -->
+  <section id="failures">
+    <div class="sec-head">
+      <div class="eyebrow">When it stops</div>
+      <h2>Refused before anything is written, or stopped after</h2>
+      <p class="lede">Every one is a <b>FAILED run</b> on the status endpoint. A child&rsquo;s failure fails
+      the parent with <code>ScaleNodePoolFailedError</code>, whose message carries the child&rsquo;s own type
+      and message.</p>
+    </div>
+
+    <h3 style="margin:0 0 10px">Nothing written</h3>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>error</th><th>when</th></tr></thead>
+        <tbody>
+          <tr><td class="k">ClusterNotOnMceError</td><td class="muted">day1 keeps the cluster under another MCE&rsquo;s folder.</td></tr>
+          <tr><td class="k">Day1ClusterProblemsError</td><td class="muted">The cluster file holds what the chart would refuse, or replicas that are not a number.</td></tr>
+          <tr><td class="k">NodePoolKindNotFoundError</td><td class="muted">No NodePool of the cluster is of the kind (the message lists the InfraEnvs it has) &mdash; or the hub&rsquo;s upgrade-gitops worker or the MCE&rsquo;s cluster-upgrade worker predates update-nodepool, which the message names.</td></tr>
+          <tr><td class="k">NodePoolReplicasDriftError</td><td class="muted">Live and day1 disagree; or, on a scale-down by policy, a Machine is already deleting or the Machines are not the replicas.</td></tr>
+          <tr><td class="k">NodePoolsUnbalancedError</td><td class="muted">The kind&rsquo;s NodePools are already more than one replica apart.</td></tr>
+          <tr><td class="k">ScaleNodePoolAlreadyRunningError</td><td class="muted">A scale-up / scale-down of the cluster is already running on the child&rsquo;s id.</td></tr>
+          <tr><td class="k">ScaleDownPolicyInvalidError</td><td class="muted">A shrinking NodePool names a policy that does not exist.</td></tr>
+          <tr><td class="k">ScaleDownMarkConflictError</td><td class="muted">A Machine of a shrinking NodePool carries a delete mark this run did not write.</td></tr>
+          <tr><td class="k">MachineMarkConflictError</td><td class="muted">A chosen Machine went, started deleting, or got another mark between the choice and the write; the marks already written come off.</td></tr>
+          <tr><td class="k">NodeMetricsUnavailableError</td><td class="muted"><code>least-utilized</code> on a hosted cluster with no metrics API.</td></tr>
+          <tr><td class="k">Day1FileChangedError &middot; Day1ChangeRejectedError</td><td class="muted">Someone changed the file since it was read, or day1&rsquo;s validator refused the edit. The marks come off; nothing was pushed.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 style="margin:24px 0 10px">After the commit &mdash; the commit stays in day1</h3>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>error</th><th>when</th></tr></thead>
+        <tbody>
+          <tr><td class="k">ArgoSyncRefusedError</td><td class="muted">Something else in the Application is out of sync. The marks stay: when the commit is applied, CAPI removes the marked Machines first.</td></tr>
+          <tr><td class="k">NodePoolsNotReconciledError</td><td class="muted">After the sync a NodePool does not show its planned replicas, or a marked Machine is not deleting 10 minutes on.</td></tr>
+          <tr><td class="k">ScaleDownWrongMachineError</td><td class="muted">CAPI is deleting a Machine the run did not mark. Named; it cannot be undone.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="panel" style="margin-top:18px">
+      <h3>Out-waited, never failed</h3>
+      <p>Every call retries <b>without limit</b>, backing off to once a minute: day1 unreachable or a push
+      that lost a race with another commit, an MCE or hosted API server that is down, an Argo CD sync that
+      failed or found another operation in progress. The run sits RUNNING with the failure on the activity. A
+      call no worker picks up within 5 minutes &mdash; that worker not deployed, or not on this MCE &mdash;
+      fails the run instead.</p>
+    </div>
+  </section>
+
+  <!-- ========================================================== RE-RUNS -->
+  <section id="rerun">
+    <div class="sec-head">
+      <div class="eyebrow">Idempotency</div>
+      <h2>Running it again</h2>
+    </div>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>situation</th><th>what a re-run does</th></tr></thead>
+        <tbody>
+          <tr><td class="k">a run of that cluster is still running</td><td class="muted">refused with <b>409</b> &mdash; one per cluster, whatever the kind</td></tr>
+          <tr><td class="k">an upgrade-cluster run of that cluster is running</td><td class="muted">refused with <b>409</b>: both commit to the same file, and the upgrade would stop for a person at its next commit</td></tr>
+          <tr><td class="k">the last run completed</td><td class="muted">finds the total already there and completes with <code>direction: "none"</code></td></tr>
+          <tr><td class="k">the commit landed, the sync did not</td><td class="muted"><b>resumes</b>: day1 already holds a balanced plan for the requested total, so the run hands it to the child, whose commit is then a no-op, and syncs</td></tr>
+          <tr><td class="k">after a refusal</td><td class="muted">refused again until what it named is fixed</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ============================================================== API -->
+  <section id="api">
+    <div class="sec-head">
+      <div class="eyebrow">HTTP surface</div>
+      <h2>How you start it and how you watch it</h2>
+      <p class="lede">Served by <code>workflows-orchestrator-api</code> (Swagger at <code>/docs</code>). Async:
+      the POST hands back the workflow id at once and you poll it. The children have no route of their own.
+      The API has no auth of its own: anyone who can reach it can change a cluster&rsquo;s workers.</p>
+    </div>
+
+    <div class="api">
+      <div class="endpoint">
+        <div class="endpoint-head">
+          <span class="method">POST</span>
+          <span class="path">/workflows/server-lifecycle/update-nodepool</span>
+          <span class="ret">202 &middot; 409 while a run or an upgrade of the cluster runs &middot; 422 on a bad body</span>
+        </div>
+        <div class="endpoint-body">
+          <pre><span class="c">// request — every field required</span>
+{
+  "mce_cluster":    "mce-bat-yam-01",              <span class="c">// with or without ocp4-</span>
+  "cluster":        "ocp4-prod-alpha",             <span class="c">// the day1 file's name, without .yaml</span>
+  "replicas":       10,                            <span class="c">// the TOTAL over the kind's NodePools, 0 allowed</span>
+  "infra_env_kind": "cisco-m6-bat-yam-64c-512gb"
+}
+
+<span class="c">// 202 response</span>
+{ "workflow_id": "update-nodepool-ocp4-prod-alpha", "run_id": "…" }</pre>
+          <p class="note">The body <b>forbids unknown fields</b>; <code>cluster</code> and
+          <code>infra_env_kind</code> must be Kubernetes names, <code>replicas</code> 0 or more.</p>
+        </div>
+      </div>
+
+      <div class="endpoint">
+        <div class="endpoint-head">
+          <span class="method">GET</span>
+          <span class="path">/workflows/runs/{workflow_id}</span>
+          <span class="ret">200 &middot; 404 for an unknown id</span>
+        </div>
+        <div class="endpoint-body">
+          <pre><span class="c">// 200 once completed — a scale-down by fewest-pods</span>
+{
+  "status": "COMPLETED",
+  "result": {
+    "mce_cluster": "ocp4-mce-bat-yam-01", "cluster": "ocp4-prod-alpha",
+    "infra_env_kind": "cisco-m6-bat-yam-64c-512gb",
+    "day1_path": "sites/bat-yam/mces/ocp4-mce-bat-yam-01/hostedClusters/ocp4-prod-alpha.yaml",
+    "hosted_cluster": "openshift-prod-alpha", "hosted_cluster_namespace": "hcp-prod-alpha",
+    "direction": "down", "total_before": 9, "total_after": 8,
+    "nodepools": [
+      { "name": "prod-alpha-zone-a", "infra_env": "cisco-m6-bat-yam-64c-512gb-zone-a", "before": 3, "after": 3 },
+      { "name": "prod-alpha-zone-c", "infra_env": "cisco-m6-bat-yam-64c-512gb-zone-c", "before": 3, "after": 2,
+        "scale_down_policy": "fewest-pods" }
+    ],
+    "child_workflow_id": "scale-down-nodepool-ocp4-prod-alpha",
+    "scale": {
+      "revision": "9f2c…", "committed": true,
+      "nodepools": [ { "name": "prod-alpha-zone-c", "replicas": 2, "ready_replicas": 3 } ],
+      "chosen":   [ { "nodepool": "prod-alpha-zone-c", "machine": "prod-alpha-zone-c-7xk2p",
+                      "node": "worker-7", "policy": "fewest-pods", "reason": "1 workload pods" } ],
+      "deleting": [ "prod-alpha-zone-c-7xk2p" ]
+    }
+  }
+}</pre>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ========================================================= REFERENCE -->
+  <section id="reference">
+    <div class="sec-head">
+      <div class="eyebrow">Reference</div>
+      <h2>Phases, and where it runs</h2>
+    </div>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>run</th><th>phases, in order</th></tr></thead>
+        <tbody>
+          <tr><td class="k">update-nodepool</td><td class="muted">pending &rarr; reading-day1 &rarr; reading-nodepools &rarr; planning &rarr; scaling-up | scaling-down &rarr; completed</td></tr>
+          <tr><td class="k">scale-up-nodepool</td><td class="muted">pending &rarr; committing-day1 &rarr; syncing-argo &rarr; verifying-nodepools &rarr; completed</td></tr>
+          <tr><td class="k">scale-down-nodepool</td><td class="muted">pending &rarr; [selecting-servers &rarr; marking-machines] &rarr; committing-day1 [&rarr; unmarking-machines] &rarr; syncing-argo &rarr; verifying-nodepools [&rarr; verifying-machines] &rarr; completed</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="table-scroll" style="margin-top:20px">
+      <table>
+        <thead><tr><th>what</th><th>where</th></tr></thead>
+        <tbody>
+          <tr><td class="k">the three workflows</td><td class="muted">the <code>workflows-orchestrator</code> brain, each on its own queue</td></tr>
+          <tr><td class="k">day1 read and commit</td><td class="muted"><code>upgrade-gitops-activity</code>, the hub&rsquo;s <code>upgrade-gitops-worker</code> (it holds the day1 push token)</td></tr>
+          <tr><td class="k">NodePools, Argo CD sync</td><td class="muted"><code>cluster-upgrade-activity-&lt;mce&gt;</code>, the <code>cluster-upgrade-worker</code> inside that MCE (get/list on NodePools)</td></tr>
+          <tr><td class="k">Machines, hosted Nodes and Pods, the marks</td><td class="muted"><code>server-lifecycle-activity-&lt;mce&gt;</code>, the <code>server-lifecycle-worker</code> inside that MCE (list/patch on Machines, its existing <code>rbac.hostedClusters</code> grant)</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 style="margin:28px 0 10px">What it never does</h3>
+    <ul>
+      <li>No write to a NodePool, HostedCluster or Node on the MCE &mdash; the change is day1&rsquo;s, applied by Argo CD.</li>
+      <li>No commit over someone else&rsquo;s edit, and no sync of someone else&rsquo;s pending change.</li>
+      <li>No balancing of NodePools that are already more than one replica apart.</li>
+      <li>No removal of a server from the MCE: the servers a scale-down frees stay in the inventory.</li>
+      <li>No wait for new nodes to be Ready, or for a drain to finish.</li>
+    </ul>
+  </section>
+
+  <footer>
+    <span>workflow_domains/server_lifecycle/update_nodepool.py</span>
+    <span>workflow_domains/server_lifecycle/scale_up_nodepool.py</span>
+    <span>workflow_domains/server_lifecycle/scale_down_nodepool.py</span>
+    <span>workflow_domains/server_lifecycle/nodepool_replicas.py</span>
+    <span>workflow_domains/server_lifecycle/scale_down_selection.py</span>
+    <span>activities/server_lifecycle/machine_selection.py</span>
+    <span>activities/upgrade_gitops/day1_values.py</span>
+  </footer>
+
+</div>
+</main>
+
+<script src="/assets/nav.js?v=__DOC_VERSION__" defer></script>
+</body>
+</html>

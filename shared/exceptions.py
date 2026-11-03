@@ -824,6 +824,154 @@ class RemoveServerFromMceFailedError(OrchestratorError):
     """
 
 
+# -- Server-lifecycle: update-nodepool, scale-up-nodepool, scale-down-nodepool --
+
+
+class ClusterNotOnMceError(OrchestratorError):
+    """WORKFLOW-RAISED. The cluster's day1 file is not under the MCE the request named.
+
+    Day1 keeps a hosted cluster at `sites/<site>/mces/<mce>/hostedClusters/
+    <cluster>.yaml`, and that folder is the MCE the cluster runs on. A request
+    naming another MCE would read NodePools on the wrong MCE and sync the wrong
+    Application, so the run stops before reading anything there. The message
+    names the file.
+    """
+
+
+class Day1ClusterProblemsError(OrchestratorError):
+    """WORKFLOW-RAISED. The cluster's day1 file holds something the chart would refuse.
+
+    A key written twice, a NodePool named twice, an entry the chart cannot
+    name: every line `read_day1_cluster` reports in `problems`. Editing such a
+    file could not be verified, so nothing is written; a person fixes the file.
+    """
+
+
+class NodePoolKindNotFoundError(OrchestratorError):
+    """WORKFLOW-RAISED. No NodePool of this cluster belongs to the requested InfraEnv kind.
+
+    A NodePool belongs to kind K when its agentLabelSelector's
+    `infraenvs.agent-install.openshift.io` matchLabel is `K` or starts with
+    `K-`. None does — or the cluster-upgrade worker on the MCE is too old to
+    report that label at all, which the message says instead. Nothing was
+    written.
+    """
+
+
+class NodePoolReplicasDriftError(OrchestratorError):
+    """WORKFLOW-RAISED. The NodePools on the MCE and the day1 file disagree.
+
+    Every live NodePool of the kind must be in day1 under its name with the
+    same replicas and InfraEnv, and every day1 NodePool of the kind must be
+    live. Anything else — a NodePool made by hand, one Argo CD has not created
+    yet, replicas someone changed on the cluster, a scale-down already in
+    flight — is refused before anything is written; the message names each
+    NodePool. Also a HostedCluster that is not on the MCE at all.
+    """
+
+
+class NodePoolsUnbalancedError(OrchestratorError):
+    """WORKFLOW-RAISED. The kind's NodePools already differ by more than one replica.
+
+    Scaling keeps every NodePool of a kind within one replica of every other,
+    and a start that already breaks that rule is a person's to fix (decided
+    with the operator, 2026-11-03): nothing was written. The message lists the
+    replicas.
+    """
+
+
+class NodePoolsNotReconciledError(OrchestratorError):
+    """WORKFLOW-RAISED. After the commit and the sync, the MCE does not show the new replicas.
+
+    Read back once the Argo CD sync of the commit succeeded: a NodePool whose
+    `spec.replicas` is not the planned number, or — on a scale-down that
+    marked servers — a marked Machine that did not start deleting within the
+    watch's deadline. The commit is in day1 `main` and stays there; the
+    message names each NodePool or Machine.
+    """
+
+
+class ScaleNodePoolAlreadyRunningError(OrchestratorError):
+    """WORKFLOW-RAISED. A scale-up-nodepool or scale-down-nodepool run of this cluster is already running.
+
+    update-nodepool starts its child on the cluster's own id; one already
+    running there was started by an earlier run that did not wait for it. The
+    message names the id: let it finish, then run update-nodepool again.
+    """
+
+
+class ScaleNodePoolFailedError(OrchestratorError):
+    """WORKFLOW-RAISED. The scale-up-nodepool or scale-down-nodepool child failed.
+
+    The message carries the child's own failure type and message, and its id;
+    the child's history has the detail. A re-run of update-nodepool re-reads
+    day1 and the MCE and carries on from what the child left.
+    """
+
+
+class ScaleDownPolicyInvalidError(OrchestratorError):
+    """WORKFLOW-RAISED. A NodePool names a scale-down policy that does not exist.
+
+    The NodePool's `redbull.io/scale-down-policy` label or annotation must be
+    `fewest-pods`, `least-requested` or `least-utilized` — or absent, when
+    CAPI picks the servers at random. Any other value is refused before
+    anything is marked or written; the message names the NodePool and value.
+    """
+
+
+class ScaleDownMarkConflictError(OrchestratorError):
+    """WORKFLOW-RAISED. A Machine of a NodePool to shrink already carries someone else's delete mark.
+
+    CAPI deletes a Machine annotated `cluster.x-k8s.io/delete-machine` before
+    any other, so a mark this run did not write would remove THAT server
+    instead of the one the policy chose. Nothing was marked or written; the
+    message names the Machine and the mark — a person removes it, or it is a
+    leftover of a run that failed.
+    """
+
+
+class ScaleDownWrongMachineError(OrchestratorError):
+    """WORKFLOW-RAISED. CAPI is deleting a Machine the run did not mark.
+
+    The run marked the servers its policy chose, then lowered replicas; an
+    UNMARKED Machine of the same NodePool started deleting instead. It cannot
+    be undone — the drain has begun — so the run says so and names it. Seen
+    when something else removed a Machine at the same time.
+    """
+
+
+class MachineMarkConflictError(OrchestratorError):
+    """A Machine to mark for deletion is no longer as the run chose it. Deterministic.
+
+    mark_machines_for_deletion found the Machine gone, already deleting, or
+    carrying another run's (or a person's) `cluster.x-k8s.io/delete-machine`
+    mark between the selection and the write. Non-retryable: marking it anyway
+    would remove a server the policy did not choose. Nothing past the marks
+    already written is done, and the run removes those before it fails.
+    """
+
+
+class NodeMetricsUnavailableError(OrchestratorError):
+    """The hosted cluster serves no `metrics.k8s.io` API. Deterministic.
+
+    A NodePool whose scale-down policy is `least-utilized` is ranked by its
+    Nodes' live CPU and memory use, which only the metrics API reports. A 404
+    for it means none is installed there: non-retryable, since no retry
+    installs one. Change the NodePool's policy, or install metrics. Nothing
+    was marked or written.
+    """
+
+
+class NodeMetricsPendingError(OrchestratorError):
+    """A candidate Node has no metrics yet, though the metrics API answers. Transient.
+
+    A Node that just joined is missing from `metrics.k8s.io` for its first
+    scrape. RETRYABLE, so not in the workflow's non-retryable list: the next
+    attempt reads again, and a Node that never appears shows on the pending
+    activity, named.
+    """
+
+
 # -- Server-provisioning domain (provision-dell-server) -----------------------
 
 

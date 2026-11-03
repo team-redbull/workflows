@@ -205,16 +205,17 @@
         as the old one is deleted, and the Agent provider binds it to <b>another free Agent</b> the
         NodePool matches. The hosted cluster keeps its size, on a different server; this one leaves the
         MCE.</p>
-        <p class="note">Shrinking a hosted cluster needs someone to own <code>NodePool.spec.replicas</code>.
-        That is not decided, so this run never touches them.</p>
+        <p class="note">Replicas belong to the cluster&rsquo;s day1 file and change only through
+        <a href="/server-lifecycle/update-nodepool.html">update-nodepool</a>, so this run never touches them.
+        To shrink a hosted cluster, use update-nodepool: its scale-down can pick the servers that leave.</p>
       </div>
       <div class="panel">
         <h3>When this server is the only free Agent</h3>
         <p>The new Machine takes <b>any</b> free Agent the NodePool matches &mdash; this server&rsquo;s
         too, once it is released. The run then stops with <code>AgentRetakenError</code>, naming the new
         AgentMachine, and <b>writes nothing more</b>: releasing the Agent again would pull out a node the
-        provider is installing. Free another Agent the NodePool matches, or lower its replicas, then
-        re-run.</p>
+        provider is installing. Free another Agent the NodePool matches, or lower its replicas with
+        update-nodepool, then re-run.</p>
         <p class="note">A Machine someone else already started deleting is not deleted again: the run
         waits for it and records the no-op in <code>skipped</code>.</p>
       </div>
@@ -923,7 +924,7 @@
 
     <h3 style="margin:28px 0 10px">What it never does</h3>
     <ul>
-      <li>No NodePool or replicas change &mdash; who owns replicas is not decided (<a href="#cases">above</a>).</li>
+      <li>No NodePool or replicas change &mdash; replicas are update-nodepool&rsquo;s (<a href="#cases">above</a>).</li>
       <li>No fight with the NodePool &mdash; an Agent its replacement Machine took is left to it.</li>
       <li>No drain or Node delete where CAPI can still do it &mdash; only for a Node no Machine stands
         behind, and a Node is deleted only once NotReady.</li>

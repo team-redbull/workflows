@@ -190,6 +190,34 @@ def publish_infraenv_to_pxe_server_workflow_id(mce_cluster: str, infra_env: str)
     return f"publish-infraenv-to-pxe-server-{mce_cluster}-{infra_env}"
 
 
+def update_nodepool_workflow_id(cluster: str) -> str:
+    """`update-nodepool-<cluster>`: one replicas change per hosted cluster at a time.
+
+    Keyed on the CLUSTER, not on (cluster, InfraEnv kind): every kind's
+    NodePools are in the one day1 file and the one Argo CD Application, so two
+    kinds scaled at once would race on the file's compare-and-set and the
+    sync would refuse the other's pending NodePools. A second request for the
+    cluster while one runs is a 409. No MCE in it, for the reason
+    upgrade_cluster_workflow_id gives: day1 names a cluster once.
+    """
+    return f"update-nodepool-{cluster}"
+
+
+def scale_up_nodepool_workflow_id(cluster: str) -> str:
+    """`scale-up-nodepool-<cluster>`: update-nodepool's child when the total goes up."""
+    return f"scale-up-nodepool-{cluster}"
+
+
+def scale_down_nodepool_workflow_id(cluster: str) -> str:
+    """`scale-down-nodepool-<cluster>`: update-nodepool's child when the total goes down.
+
+    Also the value of the `cluster.x-k8s.io/delete-machine` mark the run puts
+    on the Machines it chose, so a re-run of the same cluster recognises its
+    own marks and resumes, and any other value is someone else's.
+    """
+    return f"scale-down-nodepool-{cluster}"
+
+
 def provision_dell_server_workflow_id(idrac_ip: str) -> str:
     """`provision-dell-server-<idrac ip>`: natural dedup per machine at the rack.
 

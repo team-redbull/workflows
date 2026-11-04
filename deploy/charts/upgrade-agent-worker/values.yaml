@@ -1,6 +1,6 @@
 # upgrade-agent-worker — one release per MCE, installed in that MCE.
 #
-# It calls the upgrade agent service (the k8s-agent folder's `upgrade-agent`
+# It calls the upgrade agent service (team-redbull/k8s-agent's `upgrade-agent`
 # chart: an agent-sandbox Sandbox and its Service) in the same MCE. Install
 # that first; this worker only carries requests there and verdicts back.
 

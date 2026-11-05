@@ -500,6 +500,12 @@ class TestScalingDownByAPolicy:
         assert "ScaleDownMarkConflictError" in error.message
         assert "mark_machines_for_deletion" not in fleet.names() and "commit_day1_change" not in fleet.names()
 
+    async def test_a_nodepool_mid_rollout_is_refused_before_anything_is_marked(self):
+        fleet = _policy_fleet(c1={"machine_set": "alpha-zone-c-old"}, c2={"machine_set": "alpha-zone-c-new"})
+        error = await _failure(fleet, 8)
+        assert "ScaleDownRolloutInProgressError" in error.message
+        assert "mark_machines_for_deletion" not in fleet.names() and "commit_day1_change" not in fleet.names()
+
     async def test_a_rerun_keeps_the_machine_it_marked_before(self):
         fleet = _policy_fleet(c1={"delete_mark": DOWN_ID, "workload_pods": 9})
         result = await _run(fleet, 8)

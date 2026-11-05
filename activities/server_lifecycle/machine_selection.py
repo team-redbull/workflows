@@ -14,10 +14,21 @@ The shapes, from the code that writes them:
     (`nodePoolAnnotation`, `client.ObjectKeyFromObject(nodePool).String()`),
     in the HostedCluster's control-plane namespace. That annotation is how a
     Machine is found to be the NodePool's.
-  * CAPI's MachineSet deletes a Machine carrying `cluster.x-k8s.io/delete-machine`
-    (any value) before any other, under every delete policy
-    (`machineset_delete_policy.go`: DeleteMachineAnnotation -> mustDelete).
-    That is the whole mechanism by which a scale-down chooses its servers.
+  * CAPI's MachineSet ranks the Machines it removes on a scale-down and takes
+    the top ones; ties go by Machine NAME. HyperShift sets no delete policy,
+    so it is Random: a Machine annotated `cluster.x-k8s.io/delete-machine`
+    (any value) ranks above every healthy one in every CAPI version, and above
+    an UNHEALTHY one from CAPI 1.9 on (kubernetes-sigs/cluster-api#11431;
+    openshift/cluster-api release-4.19 and later). In 4.18's CAPI a marked and
+    an unhealthy Machine rank the SAME, so the brain takes CAPI-unhealthy
+    Machines first, in name order — `capi_healthy` here is CAPI's own
+    `isMachineHealthy`, read off the Machine, so the two always agree.
+    (machineset_delete_policy.go, machineset_deletion_order.go from 1.12.)
+  * HyperShift backs an InPlace NodePool with ONE MachineSet and a Replace one
+    with a MachineDeployment (`hypershift-operator/controllers/nodepool/capi.go`).
+    A MachineDeployment mid-rollout has two MachineSets and may scale down the
+    one the marks are not in (the CAPI book: "the label only affects MachineSet
+    scale-down"), so each Machine's owning MachineSet is reported.
   * A Machine's Node is `status.nodeRef.name`.
   * The Pods a drain moves are hosted_resources.pod_to_evict's (CAPI's drain
     rules); one that has finished (Succeeded / Failed) holds nothing.
@@ -68,6 +79,37 @@ def machine_deleting(machine: dict[str, Any]) -> bool:
 
 def machine_node(machine: dict[str, Any]) -> str | None:
     return (((machine.get("status") or {}).get("nodeRef")) or {}).get("name") or None
+
+
+# The v1beta1 conditions CAPI's isMachineHealthy reads (a v1beta1 read of a
+# v1beta2-stored Machine converts them back to these).
+_UNHEALTHY_WHEN_FALSE = ("NodeHealthy", "HealthCheckSucceeded")
+
+
+def capi_healthy(machine: dict[str, Any]) -> bool:
+    """CAPI's own `isMachineHealthy`, so the brain ranks unhealthy Machines exactly as CAPI does.
+
+    Unhealthy: no nodeRef, a failureReason or failureMessage, or NodeHealthy /
+    HealthCheckSucceeded False. Unknown is not unhealthy, as in CAPI.
+    """
+    status = machine.get("status") or {}
+    if not (status.get("nodeRef") or {}).get("name"):
+        return False
+    if status.get("failureReason") or status.get("failureMessage"):
+        return False
+    for condition in status.get("conditions") or []:
+        if isinstance(condition, dict) and condition.get("type") in _UNHEALTHY_WHEN_FALSE:
+            if condition.get("status") == "False":
+                return False
+    return True
+
+
+def machine_set(machine: dict[str, Any]) -> str | None:
+    """The MachineSet that owns this Machine (its controller ownerReference), by name."""
+    for owner in _metadata(machine).get("ownerReferences") or []:
+        if isinstance(owner, dict) and owner.get("kind") == "MachineSet":
+            return owner.get("name") or None
+    return None
 
 
 def machines_of(machines: list[dict[str, Any]], nodepool_key: str) -> list[dict[str, Any]]:
@@ -180,6 +222,8 @@ def candidate(
         created=metadata.get("creationTimestamp"),
         deleting=machine_deleting(machine),
         delete_mark=delete_mark(machine),
+        capi_healthy=capi_healthy(machine),
+        machine_set=machine_set(machine),
         node=node_name,
         node_found=node is not None,
     )

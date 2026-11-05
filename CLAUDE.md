@@ -607,16 +607,30 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
     `least-requested` (pod requests / allocatable), `least-utilized`
     (`metrics.k8s.io`; no API = `NodeMetricsUnavailableError`, a Node without
     metrics yet is retried). Absent = nothing marked, CAPI picks at random;
-    unknown = `ScaleDownPolicyInvalidError`. Broken first under every policy (no
-    Node, NotReady, cordoned); this run's own mark before those, so a re-run keeps
-    its choice. The mechanism is CAPI's own `cluster.x-k8s.io/delete-machine`
-    (`mustDelete` under every delete policy), value = the scale-down's workflow
-    id, set and read back on the chosen Machines BEFORE the commit (the
-    operator: "put the label … on the machine and just then push to git");
-    Machines found by HyperShift's `hypershift.openshift.io/nodePool:
-    <ns>/<name>` annotation. Refused with nothing written: a Machine of a
-    shrinking NodePool already deleting, a mark this run did not write
-    (`ScaleDownMarkConflictError`), Machines ≠ replicas. A commit that pushed
+    unknown = `ScaleDownPolicyInvalidError`. The mechanism is CAPI's own
+    `cluster.x-k8s.io/delete-machine` ANNOTATION (not a label — the CAPI book's
+    scaling page says "label", its code and its annotations reference say
+    annotation), value = the scale-down's workflow id, set and read back on the
+    chosen Machines BEFORE the commit (the operator: "put the label … on the
+    machine and just then push to git"); Machines found by HyperShift's
+    `hypershift.openshift.io/nodePool: <ns>/<name>` annotation. VERIFIED against
+    the sources (2026-11-05), because the ORDER depends on it: HyperShift
+    (`nodepool/capi.go`) backs InPlace with one MachineSet and Replace with a
+    MachineDeployment and sets NO delete policy, so CAPI's Random applies;
+    Random ranks the mark above every healthy Machine everywhere but only TIES
+    it with an unhealthy one in 4.18's CAPI (openshift/cluster-api release-4.18,
+    upstream ≤1.8; fixed by kubernetes-sigs/cluster-api#11431: 75 in
+    release-4.19/4.20, 80 in 1.12), ties by name. So CAPI-UNHEALTHY Machines
+    (`machine_selection.capi_healthy` = CAPI's `isMachineHealthy`) go FIRST, by
+    NAME, then this run's own mark, then a Node our hosted read sees broken,
+    then the policy — and `test_capi_removes_exactly_the_marked_machines_in_every_version`
+    simulates CAPI's ranking at 50, 75 and 80 to prove the marked set IS what
+    CAPI removes. Do not reorder those tiers. The mark only orders Machines
+    inside ONE MachineSet ("only affects MachineSet scale-down"), so a NodePool
+    whose Machines span two MachineSets (a Replace rollout) is refused
+    (`ScaleDownRolloutInProgressError`). Refused with nothing written too: a
+    Machine of a shrinking NodePool already deleting, a mark this run did not
+    write (`ScaleDownMarkConflictError`), Machines ≠ replicas. A commit that pushed
     nothing (`Day1FileChangedError`, `Day1ChangeRejectedError`, file not found)
     takes the marks off again; after the commit landed they are NEVER removed.
     Then one heartbeating watch (10 min) that the marked Machines are the ones

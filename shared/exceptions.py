@@ -930,6 +930,17 @@ class ScaleDownMarkConflictError(OrchestratorError):
     """
 
 
+class ScaleDownRolloutInProgressError(OrchestratorError):
+    """WORKFLOW-RAISED. A NodePool to shrink by its policy is mid-rollout: its Machines span two MachineSets.
+
+    HyperShift backs a Replace NodePool with a MachineDeployment, and during a
+    rollout that has an old and a new MachineSet. The delete mark only orders
+    Machines WITHIN the MachineSet being scaled down, and the MachineDeployment
+    may pick the other one, so the marked servers could be passed by. Nothing
+    was marked or written; run again once the rollout has finished.
+    """
+
+
 class ScaleDownWrongMachineError(OrchestratorError):
     """WORKFLOW-RAISED. CAPI is deleting a Machine the run did not mark.
 

@@ -1526,6 +1526,11 @@ class ScaleDownMachine(BaseModel):
     created: str | None = None
     deleting: bool = False
     delete_mark: str | None = None
+    # CAPI's own isMachineHealthy (no nodeRef, a failure, NodeHealthy or
+    # HealthCheckSucceeded False): what CAPI ranks a Machine by, besides the mark.
+    capi_healthy: bool = True
+    # The MachineSet that owns it. Two in one NodePool = a rollout in progress.
+    machine_set: str | None = None
     node: str | None = None
     node_found: bool = False
     ready: bool = False

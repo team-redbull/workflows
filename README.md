@@ -620,8 +620,11 @@ place that changes them:
 **On a scale-down, which servers leave is the NodePool's own choice**, never the
 request's: a label or annotation `redbull.io/scale-down-policy` on the NodePool
 — `fewest-pods`, `least-requested` (CPU/memory requested out of allocatable) or
-`least-utilized` (live use, from `metrics.k8s.io`). Broken ones go first under
-every policy (no Node, NotReady, cordoned). The run marks the chosen Machines
+`least-utilized` (live use, from `metrics.k8s.io`). Under every policy the
+Machines CAPI counts unhealthy go first, by name — CAPI's own order, which is
+what makes the mark decide in 4.18's CAPI as in later ones — then a broken or
+cordoned Node. A NodePool mid-rollout (Machines in two MachineSets) is refused.
+The run marks the chosen Machines
 `cluster.x-k8s.io/delete-machine` (the MCE's `server-lifecycle-worker`) **before
 it pushes**, so CAPI removes exactly those, then watches that they are the ones
 deleting (`ScaleDownWrongMachineError` otherwise). A refused commit takes the

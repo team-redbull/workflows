@@ -121,6 +121,29 @@ class TestTheReadings:
             "m0", "m1",
         ]
 
+    @pytest.mark.parametrize(
+        ("status", "healthy"),
+        [
+            ({"nodeRef": {"name": "n1"}}, True),
+            ({}, False),  # no nodeRef
+            ({"nodeRef": {"name": "n1"}, "failureReason": "CreateError"}, False),
+            ({"nodeRef": {"name": "n1"}, "failureMessage": "boom"}, False),
+            ({"nodeRef": {"name": "n1"}, "conditions": [{"type": "NodeHealthy", "status": "False"}]}, False),
+            ({"nodeRef": {"name": "n1"}, "conditions": [{"type": "HealthCheckSucceeded", "status": "False"}]}, False),
+            # Unknown is not unhealthy, as in CAPI's isMachineHealthy.
+            ({"nodeRef": {"name": "n1"}, "conditions": [{"type": "NodeHealthy", "status": "Unknown"}]}, True),
+            ({"nodeRef": {"name": "n1"}, "conditions": [{"type": "Ready", "status": "False"}]}, True),
+        ],
+    )
+    def test_capi_healthy_is_capis_own_is_machine_healthy(self, status, healthy):
+        assert machine_selection.capi_healthy({"metadata": {"name": "m"}, "status": status}) is healthy
+
+    def test_the_owning_machineset_is_read_from_the_owner_reference(self):
+        machine = _machine("m1")
+        machine["metadata"]["ownerReferences"] = [{"kind": "MachineSet", "name": "np-a-6f9c", "controller": True}]
+        assert machine_selection.machine_set(machine) == "np-a-6f9c"
+        assert machine_selection.machine_set(_machine("m2")) is None
+
     def test_an_empty_mark_is_still_a_mark(self):
         assert machine_selection.delete_mark(_machine("m1", mark="")) == ""
         assert machine_selection.delete_mark(_machine("m1")) is None
@@ -223,6 +246,8 @@ class TestTheCandidates:
         assert by_name["m1"].requested_permille == 500 and by_name["m1"].used_permille is None
         assert by_name["m2"].delete_mark == MARK and not by_name["m2"].ready
         assert (by_name["m3"].node, by_name["m3"].node_found) == (None, False)
+        # CAPI's own reading of the Machine: no nodeRef is unhealthy for it.
+        assert by_name["m1"].capi_healthy and not by_name["m3"].capi_healthy
 
     async def test_least_utilized_reads_the_metrics_and_ranks_by_use(self, mce, hosted):
         mce(_FakeMce([_machine("m1", node="n1")]))

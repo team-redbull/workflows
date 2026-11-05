@@ -190,8 +190,9 @@
           on each chosen Machine and reads it back. CAPI deletes a marked Machine before any other, so the
           commit that follows removes exactly those.</p>
           <p class="note">Refused with nothing written: an unknown policy value, a Machine already deleting, a
-          delete mark this run did not write, a Machine count that is not the replicas. A mark an earlier
-          attempt of this run left on a Machine not chosen now comes off first.</p>
+          delete mark this run did not write, a Machine count that is not the replicas, Machines in two
+          MachineSets (a rollout). A mark an earlier attempt of this run left on a Machine not chosen now comes
+          off first.</p>
         </div>
       </div>
 
@@ -289,10 +290,35 @@
         </tbody>
       </table>
     </div>
-    <p>Under <b>every</b> policy a Machine with no Node goes first, then a Node that is NotReady or cordoned
-    &mdash; losing one costs nothing, and CAPI&rsquo;s own priority does the same. A Machine already carrying
-    this run&rsquo;s mark comes before those, so a re-run keeps the choice it made. Ties go by Machine name.
-    Different NodePools of one kind may name different policies, or none.</p>
+    <p>Under <b>every</b> policy the order is:</p>
+    <ol>
+      <li>Machines <b>CAPI counts unhealthy</b> &mdash; no nodeRef, a failure, or <code>NodeHealthy</code> /
+      <code>HealthCheckSucceeded</code> False, read off the Machine exactly as CAPI&rsquo;s
+      <code>isMachineHealthy</code> does &mdash; <b>by name</b>;</li>
+      <li>a Machine already carrying this run&rsquo;s mark, so a re-run keeps its choice;</li>
+      <li>a Node the hosted cluster does not have, or has NotReady or cordoned, while CAPI still counts the
+      Machine healthy;</li>
+      <li>the policy&rsquo;s reading. Ties go by Machine name.</li>
+    </ol>
+    <p>Different NodePools of one kind may name different policies, or none.</p>
+
+    <div class="panel" style="margin-top:18px">
+      <h3>Why the mark decides which servers go</h3>
+      <p>HyperShift backs an <b>InPlace</b> NodePool with one CAPI <b>MachineSet</b> and a <b>Replace</b> one
+      with a MachineDeployment, sets their replicas from the NodePool, and sets <b>no delete policy</b> &mdash;
+      so CAPI&rsquo;s default, Random, applies. On a scale-down the MachineSet ranks its Machines and removes
+      the top ones, ties by name. Under Random a Machine annotated <code>cluster.x-k8s.io/delete-machine</code>
+      outranks every healthy one in every CAPI version, and an unhealthy one from CAPI 1.9 on (OpenShift
+      4.19 and later). In 4.18&rsquo;s CAPI a marked and an unhealthy Machine rank the same, which is why
+      CAPI-unhealthy Machines come first, in CAPI&rsquo;s own order: the Machines CAPI removes are then
+      exactly the marked ones in every version.</p>
+      <p class="note">The mark only orders Machines <b>inside one MachineSet</b>. A Replace NodePool in the
+      middle of a rollout has two, and its MachineDeployment may scale down the other one: a NodePool whose
+      Machines span two MachineSets is refused (<code>ScaleDownRolloutInProgressError</code>). HyperShift
+      leaves annotations on Machines alone; its own docs annotate them with another CAPI annotation
+      (<code>machine.cluster.x-k8s.io/exclude-node-draining</code>). The watch after the sync still checks
+      that the marked Machines are the ones deleting.</p>
+    </div>
     <p class="note">For the key to come from day1, the hostedclusters-setup chart must pass an entry&rsquo;s
     labels or annotations onto the NodePool. Where it does not, set it on the NodePool directly.</p>
   </section>
@@ -320,6 +346,7 @@
           <tr><td class="k">ScaleNodePoolAlreadyRunningError</td><td class="muted">A scale-up / scale-down of the cluster is already running on the child&rsquo;s id.</td></tr>
           <tr><td class="k">ScaleDownPolicyInvalidError</td><td class="muted">A shrinking NodePool names a policy that does not exist.</td></tr>
           <tr><td class="k">ScaleDownMarkConflictError</td><td class="muted">A Machine of a shrinking NodePool carries a delete mark this run did not write.</td></tr>
+          <tr><td class="k">ScaleDownRolloutInProgressError</td><td class="muted">A shrinking NodePool&rsquo;s Machines span two MachineSets: a Replace NodePool mid-rollout, where the mark could be passed by. Run again once the rollout has finished.</td></tr>
           <tr><td class="k">MachineMarkConflictError</td><td class="muted">A chosen Machine went, started deleting, or got another mark between the choice and the write; the marks already written come off.</td></tr>
           <tr><td class="k">NodeMetricsUnavailableError</td><td class="muted"><code>least-utilized</code> on a hosted cluster with no metrics API.</td></tr>
           <tr><td class="k">Day1FileChangedError &middot; Day1ChangeRejectedError</td><td class="muted">Someone changed the file since it was read, or day1&rsquo;s validator refused the edit. The marks come off; nothing was pushed.</td></tr>

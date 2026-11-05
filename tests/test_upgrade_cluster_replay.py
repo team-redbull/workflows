@@ -73,7 +73,7 @@ async def _happy_path(h: Harness) -> None:
         await h.decide(Run.confirm_day2, HumanDecision(by="day2-team"))
     for _ in range(2):
         await h.until(UpgradePhase.AWAITING_CONTINUE)
-        await h.env.sleep(SEVEN_DAYS)
+        await h.skip_time(SEVEN_DAYS)
         await h.decide(Run.continue_nodepool, ContinueNodePool(by="alice"))
     await h.result()
 

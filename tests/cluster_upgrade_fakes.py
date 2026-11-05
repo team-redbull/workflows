@@ -23,6 +23,7 @@ from typing import Any
 from temporalio import activity, workflow
 from temporalio.client import Client, WorkflowExecutionStatus, WorkflowHandle, WorkflowHistory
 from temporalio.contrib.pydantic import pydantic_data_converter
+from temporalio.service import RPCError
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import UnsandboxedWorkflowRunner, Worker
 
@@ -233,6 +234,7 @@ class Fleet:
         # A step's own re-pin (one version), not planning's: holds it in flight.
         self.block_step_pin = False
         self.block_evidence = False
+        self.block_sync = False
         self.block_agent = False
         self.block_incident = False
         # Errors for the reads of the day1 file after planning's (a re-read on a retry).
@@ -462,6 +464,8 @@ class Fleet:
         @activity.defn(name="sync_argo_application")
         async def sync_argo_application(request: ArgoSyncRequest) -> ArgoSyncResult:
             fleet.calls.append(f"sync:{request.revision}")
+            while fleet.block_sync:
+                await asyncio.sleep(0.01)
             error = fleet.sync_errors.pop(0) if fleet.sync_errors else None
             if error is not None:
                 raise error
@@ -561,6 +565,14 @@ class SlotBlocker:
         await workflow.wait_condition(lambda: False)
 
 
+# On a busy CI runner the time-skipping test server occasionally stalls for about 30 s, the
+# server's own query deadline: queries and clock jumps hang, then it recovers. So one hung
+# call is given up on quickly and asked again, and a wait outlasts the stall.
+_POLL_QUERY_TIMEOUT = timedelta(seconds=5)
+_SKIP_TIME_ATTEMPT_SECONDS = 8
+_WAIT_SECONDS = 60
+
+
 class Harness:
     """A time-skipping Temporal with the real workflows and the fleet's mocks on their own queues."""
 
@@ -594,6 +606,7 @@ class Harness:
         self.fleet.block_control_plane_watch = False
         self.fleet.block_step_pin = False
         self.fleet.block_evidence = False
+        self.fleet.block_sync = False
         self.fleet.block_agent = False
         self.fleet.block_incident = False
         for worker in reversed(self._workers):
@@ -619,23 +632,29 @@ class Harness:
     async def progress(self, workflow_id: str = WORKFLOW_ID) -> UpgradeClusterProgress:
         return await self.run(workflow_id).query(UpgradeClusterWorkflow.progress)
 
-    async def until(self, phase: UpgradePhase, workflow_id: str = WORKFLOW_ID, timeout: float = 30) -> UpgradeClusterProgress:
+    async def _poll_progress(self, workflow_id: str) -> UpgradeClusterProgress:
+        """One poll: a query that hangs is given up on quickly, so the next poll can ask again."""
+        return await self.run(workflow_id).query(UpgradeClusterWorkflow.progress, rpc_timeout=_POLL_QUERY_TIMEOUT)
+
+    async def until(self, phase: UpgradePhase, workflow_id: str = WORKFLOW_ID, timeout: float = _WAIT_SECONDS) -> UpgradeClusterProgress:
         """Poll the progress query until the run reaches `phase`."""
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
         last: UpgradeClusterProgress | None = None
+        error: Exception | None = None
         while loop.time() < deadline:
             try:
-                last = await self.progress(workflow_id)
-            except Exception:  # noqa: BLE001 — between two runs of a continue-as-new
-                last = None
+                last = await self._poll_progress(workflow_id)
+                error = None
+            except Exception as err:  # noqa: BLE001 — between two runs of a continue-as-new, or a hung query
+                last, error = None, err
             if last is not None and last.phase is phase:
                 return last
             await asyncio.sleep(0.02)
-        raise AssertionError(f"never reached {phase.value}; last progress: {last}")
+        raise AssertionError(f"never reached {phase.value}; last progress: {last}; last query error: {error!r}")
 
     async def next_stop(
-        self, *phases: UpgradePhase, workflow_id: str = WORKFLOW_ID, timeout: float = 30
+        self, *phases: UpgradePhase, workflow_id: str = WORKFLOW_ID, timeout: float = _WAIT_SECONDS
     ) -> UpgradeClusterProgress | None:
         """Poll until the run reaches one of `phases`, or None once it has closed (a failure included).
 
@@ -648,15 +667,33 @@ class Harness:
             if (await self.run(workflow_id).describe()).status is not WorkflowExecutionStatus.RUNNING:
                 return None
             try:
-                last = await self.progress(workflow_id)
-            except Exception:  # noqa: BLE001 — between two runs of a continue-as-new
+                last = await self._poll_progress(workflow_id)
+            except Exception:  # noqa: BLE001 — between two runs of a continue-as-new, or a hung query
                 last = None
             if last is not None and last.phase in phases:
                 return last
             await asyncio.sleep(0.02)
         raise AssertionError(f"never reached any of {[p.value for p in phases]}")
 
-    async def called(self, name: str, times: int = 1, timeout: float = 30) -> None:
+    async def skip_time(self, duration: timedelta, timeout: float = _WAIT_SECONDS) -> None:
+        """Jump the test server's clock by `duration`, asking again if the call hangs.
+
+        The clock is read before asking again, so a jump that did land is not repeated.
+        """
+        target = await self.env.get_current_time() + duration
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while True:
+            try:
+                await asyncio.wait_for(self.env.sleep(duration), _SKIP_TIME_ATTEMPT_SECONDS)
+                return
+            except (TimeoutError, RPCError) as err:
+                if await self.env.get_current_time() >= target:
+                    return
+                if loop.time() >= deadline:
+                    raise AssertionError(f"the test server's clock never reached {target}") from err
+
+    async def called(self, name: str, times: int = 1, timeout: float = _WAIT_SECONDS) -> None:
         """Wait until the fleet has seen `name` called `times` times."""
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout

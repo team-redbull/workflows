@@ -4,7 +4,7 @@ The cluster-upgrade agent limb (`activities/upgrade_agent/`), one release per MC
 `upgrade-agent-activity-<mceCluster>` and runs `invoke_upgrade_agent`: a POST of the
 `AgentRequest` to the upgrade agent service, heartbeating until the `AgentVerdict` comes back.
 
-The agent service is not in this repo. It is the `upgrade-agent` chart of the k8s-agent folder: a
+The agent service is not in this repo. It is the `upgrade-agent` chart of `team-redbull/k8s-agent`: a
 kubernetes-sigs agent-sandbox `Sandbox` (`agents.x-k8s.io/v1beta1`) behind a Service, holding the
 model endpoint and the agent's own read-only identities. Install it first, then this:
 

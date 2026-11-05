@@ -111,8 +111,9 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   above, applied. cluster-upgrade has three: `upgrade-gitops` on the hub (day1 push, mirror pull,
   Brain push tokens), and per MCE `cluster-upgrade` (the workflow ServiceAccount) and
   `upgrade-agent` (no Kubernetes credential at all: it POSTs to the upgrade agent service, our own
-  service in its own repo, run as a kubernetes-sigs agent-sandbox `Sandbox` in the MCE; the
-  service vendors the agent contract, `tests/test_upgrade_agent_contract.py` keeps the two equal).
+  service in its own repo, `team-redbull/k8s-agent`, run as a kubernetes-sigs agent-sandbox
+  `Sandbox` in the MCE; the service vendors the agent contract,
+  `tests/test_upgrade_agent_contract.py` keeps the two equal).
   The hub limb, `activities/upgrade_gitops/`, holds no Kubernetes credential either (§4). Each limb gets its OWN interface module
   (`shared/interfaces/{upgrade_gitops,cluster_upgrade,upgrade_agent}.py`), so the contract test
   still pairs one interface module with one `activities/<limb>/activities.py`; the domain keeps

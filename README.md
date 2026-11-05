@@ -58,6 +58,8 @@ shared/                           Contract layer (temporalio + pydantic only)
   models/<domain>.py              Typed state across the workflow/activity boundary
   interfaces/<domain>.py          Activity signatures (no bodies)
   bmc_address.py                  Pure naming/address logic BOTH sides need
+  infraenv_names.py               The naming convention: an InfraEnv's zone and VM size
+  cluster_names.py                Canonical MCE names; site, seed and KV-cluster names
   settings.py / exceptions.py / consts.py / workflow_ids.py / logging_config.py
 workflow_domains/                 The brain — one folder per domain, plus main_worker_init.py + api.py
   segment_lifecycle/              initialize_segment.py, allocate_segment.py, router.py
@@ -71,7 +73,9 @@ workflow_domains/                 The brain — one folder per domain, plus main
                                     per-MCE slot child), upgrade_path.py and gates.py
                                     (its pure rules), dispatch.py, router.py (not
                                     mounted yet)
-  routers/                        What no domain owns: deps, shared models, runs.py (status)
+  vm_lifecycle/                   create_vm.py, router.py
+  routers/                        What no domain owns: deps, shared models, runs.py
+                                    (status), slots.py (the free-slot walk)
 activities/<domain>/              The limbs
   activities.py                   The @activity.defn surface ONLY — thin
   <technology>.py                 One module per dependency, plain parameters, no
@@ -83,7 +87,12 @@ activities/<domain>/              The limbs
                                     idempotency rule and error classification),
                                     bmh_resources.py (the resource bodies),
                                     idrac.py (Redfish), ome.py (OpenManage),
-                                    server_namer.py (the naming service)
+                                    server_namer.py (the naming service),
+                                    vm_lifecycle/day1_repo.py (a zone's KubeVirt
+                                    clusters from the seed folder),
+                                    kv_capacity_api.py + kv_vm_api.py (the
+                                    KubeVirt clusters' agents), placement.py
+                                    (best-fit under the buffer)
   worker_init.py                  Registers this domain's activities, polls its queue
 docs/                             The static documentation site (its own image)
 ```
@@ -96,6 +105,7 @@ The prod charts are vendored into the Argo CD repo, not this one:
 | `redbull-platform/gitops/charts/segment-lifecycle-worker/` | the `segment-lifecycle-worker` limb |
 | `redbull-platform/gitops/charts/server-lifecycle-worker/` | the `server-lifecycle-worker` limb |
 | `redbull-platform/gitops/charts/server-provisioning-worker/` | the `server-provisioning-worker` limb — no `gitops/services/` entry yet, so nothing deploys it |
+| `redbull-platform/gitops/charts/vm-lifecycle-worker/` | the `vm-lifecycle-worker` limb (create-vm) — ONE release on the hub for every zone; needs the `kv-capacity-token` and `kv-vm-api-token` Secrets and mounts the segment-lifecycle chart's `day1-git-token` — not on redbull-platform's `main` yet, so CI's image bump fails until it is |
 | `redbull-platform/gitops/charts/cluster-upgrade-worker/`, `.../upgrade-agent-worker/` | cluster-upgrade's per-MCE limbs, copied from `deploy/charts/` here by CI (`sync-upgrade-charts`) on every `main` push that changes them — no `gitops/services/` entry yet |
 | `redbull-platform/gitops/charts/upgrade-gitops-worker/` | cluster-upgrade's hub limb (its only copy) — no `gitops/services/` entry yet |
 
@@ -663,6 +673,48 @@ against a Dell simulator built from them (`tests/dell_simulator.py`).
 > (Dell's own sample does), which wipes the controller when it is deployed —
 > and the storage layout is this workflow's job, done after the template.
 
+### `create-vm` — one VirtualMachine for a KubeVirt InfraEnv
+
+Under the naming convention an InfraEnv `<conf>[-<letter>]-zone-<zone>-<cpu>`
+(`x201-zone-a-8`) holds VMs of `<cpu>` vCPUs and `<cpu> × 8` GiB on one of the
+zone's KubeVirt hosted clusters; a `-metal` InfraEnv holds physical servers. A
+KubeVirt InfraEnv has nothing to install until a VM exists, and `create-vm` is
+that step. Full page: `docs/site/vm-lifecycle/create-vm.html`.
+
+Input: `mce_cluster` (named `ocp4-<env>-mce-<site>-<letter>`: the **site** comes
+from it), `infra_env` (the **zone** and the **size** come from it), `namespace`
+(default `inventory` — the VM's namespace on the KubeVirt cluster, verbatim, a
+kubevirt-redfish chassis namespace the platform created) and an optional
+`count`. The API derives site, zone, cpu and memory once; the run carries them.
+
+1. **listing-kv-clusters** — the zone's KubeVirt clusters from the day1 repo's
+   seed folder `sites/<site>/mces/ocp4-seed-<site>-<zone>/hostedClusters/`
+   (read at `main` by the vm-lifecycle limb itself). None: `NoKvClusterError`.
+2. **ranking-kv-clusters** — every cluster's **kv-capacity** agent read at once;
+   best-fit bin packing under `HEADROOM_BUFFER_PERCENT`
+   (`docs/design/kubevirt-vm-placement.md`): fit per node, buffer per cluster,
+   our Halted not-yet-started VMs counted. Nothing fits: `NoKvClusterFitsError`
+   with the table summarised per reason.
+3. **creating-vm** — a six-hex suffix drawn by the run, skipped while its MAC
+   tail is any VM's in the zone, then ONE PUT on the chosen cluster's
+   **kv-vm-api**: `ocp-<infraenv>-<suffix>`, MAC `<VM_MAC_PREFIX>:xx:xx:xx`,
+   Halted, labelled `redfish-enabled: "true"`. A 409 redraws (3 draws, then
+   `VmNameExhaustedError`). Out-waited on the chosen cluster, never moved.
+4. **awaiting-root-disk** — one heartbeating activity, every 8 s, until the root
+   disk is bound and the VM admitted; bounded, 10 min.
+5. **removing-vm** — only on that deadline: the run deletes ITS OWN VM (by name
+   and MAC), then fails with `VmRootDiskNotBoundError`. A re-run draws a new
+   suffix, so an orphan would only multiply.
+
+The result carries the VM's name and MAC, the chosen cluster and the whole
+ranking table. Every run is a **slot** of its InfraEnv on its MCE
+(`create-vm-<mce>_<infraEnv>_<slot>`): asking again starts one more VM, never a
+409; `count` fills N free slots with a per-run report. The limb holds **no
+Kubernetes credential**: each KubeVirt cluster is reached through the two
+agents the platform deploys there behind Routes (`kv-capacity`, `kv-vm-api`;
+their contract is `docs/design/kv-agents-api.md`), one fleet token each. Until
+they are up, a run waits with every cluster `no-agent`.
+
 ### `allocate-segment` — give a cluster a segment
 
 Takes the cluster, the **values-repo branch** to record on, and the **type** to
@@ -729,6 +781,7 @@ result.
 | `POST /workflows/server-lifecycle/publish-infraenv-to-pxe-server` | an InfraEnv's current iPXE script onto its site's PXE VM |
 | `POST /workflows/server-provisioning/provision-dell-server` | one Dell server, by iDRAC IP |
 | `POST /workflows/server-provisioning/provision-dell-server/bulk` | one workflow PER iDRAC IP |
+| `POST /workflows/vm-lifecycle/create-vm` | one workflow PER VM for a KubeVirt InfraEnv: one in the first free slot, or `count` in parallel |
 | `GET  /workflows/runs/{workflow_id}` | (status, every domain) |
 
 ### Paths: `/workflows/<domain>/<workflow>`, status on `/workflows/runs`
@@ -813,6 +866,13 @@ would hide which segments actually got a workflow.
 | `SERVER_NAMER_URL` | `server-provisioning-config` | the naming service |
 | `SERVER_NAMER_API_TOKEN` | Secret | optional bearer token |
 | `SERVER_SCAN_URL`/`_API_TOKEN` | as above | the provisioning worker reads it too (a viewer token) |
+| `DAY1_REPO_URL` | `vm-lifecycle-config` | create-vm lists a zone's KubeVirt clusters from it (read only) |
+| `DAY1_GIT_TOKEN` | Secret `day1-git-token` | the same Secret, mounted by the vm-lifecycle worker too — one Secret, three consumers |
+| `KV_CAPACITY_URL_TEMPLATE`, `KV_VM_API_URL_TEMPLATE` | `vm-lifecycle-config` | the agents' Routes per KubeVirt cluster: `{cluster}`, `{name}`, `{hosted_cluster}`, `{site}`, `{zone}` |
+| `KV_CAPACITY_TOKEN`, `KV_VM_API_TOKEN` | Secrets `kv-capacity-token`, `kv-vm-api-token` | the agents' fleet tokens; rotate each with its agents |
+| `KV_AGENT_CA` | chart value `kvAgentCa` | PEM CA for the agents' Routes; empty = **not verified** (the operator's decision) |
+| `HEADROOM_BUFFER_PERCENT` | `vm-lifecycle-config` | our placement policy: the share of each cluster kept free after placing, 0–90 |
+| `VM_MAC_PREFIX` | `vm-lifecycle-config` | `xx:xx:xx`, locally administered unicast; the run draws the last three octets |
 
 server-scan holds no BMC credentials by design, so those live here; a vendor
 with none configured fails that server's install rather than writing a Secret

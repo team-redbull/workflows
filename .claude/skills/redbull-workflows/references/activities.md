@@ -57,7 +57,9 @@ retries every minute forever with the run RUNNING.
 - git and other binaries: `asyncio.create_subprocess_exec` with a per-command timeout, a
   fresh `TemporaryDirectory` per attempt, the token in memory only and SCRUBBED from
   every message before the exception is built (history records it verbatim);
-  `activities/git_repo.py` holds the shared pieces.
+  `activities/git_repo.py` holds the shared pieces, `activities/day1_repo.py` the day1 reader
+  on top of it — code two limbs need lives there, in no domain, never in one limb for the
+  other to import.
 - `activity.logger.info` for each call's outcome, with the identifiers an operator searches for.
 
 ## Settings for a new endpoint, credential or knob

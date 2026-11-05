@@ -111,3 +111,14 @@ def cluster_upgrade_activity_queue(mce_cluster: str) -> str:
 def upgrade_agent_activity_queue(mce_cluster: str) -> str:
     """The upgrade-agent activity queue for ONE MCE: the agent runs where its tools read."""
     return f"{UPGRADE_AGENT_ACTIVITY_QUEUE}-{mce_cluster}"
+
+# -- VM-lifecycle domain --
+# ONE workflow today, create-vm, on its own queue as everywhere above; ONE
+# activity queue, on the hub: the limb holds no Kubernetes credential at all.
+# It reaches each KubeVirt cluster through that cluster's two agents
+# (kv-capacity, kv-vm-api), behind Routes, with one fleet bearer token each,
+# and reads the zone's cluster list from the day1 repo with the same token
+# segment-lifecycle pushes with. So there is nothing to run per MCE and
+# nothing to run per KubeVirt cluster — one deployment serves every zone.
+CREATE_VM_WORKFLOW_QUEUE = "create-vm-workflow"
+VM_LIFECYCLE_ACTIVITY_QUEUE = "vm-lifecycle-activity"

@@ -1,10 +1,10 @@
 name: Build and Push
 
-# Eight images from this one repo: the workflow "brain" (workflow_domains/Dockerfile),
-# six activity worker "limbs" (activities/<limb>/Dockerfile) — segment-lifecycle,
-# server-lifecycle and server-provisioning, one per domain, and cluster-upgrade's
-# three: cluster-upgrade and upgrade-agent per MCE, upgrade-gitops on the hub —
-# and the documentation site (docs/Dockerfile), which carries no code at all.
+# Nine images from this one repo: the workflow "brain" (workflow_domains/Dockerfile),
+# seven activity worker "limbs" (activities/<limb>/Dockerfile) — segment-lifecycle,
+# server-lifecycle, server-provisioning and vm-lifecycle, one per domain, and
+# cluster-upgrade's three: cluster-upgrade and upgrade-agent per MCE, upgrade-gitops
+# on the hub — and the documentation site (docs/Dockerfile), which carries no code at all.
 
 # A commit message containing "[skip ci]" (or "[ci skip]", "[no ci]", "[skip actions]")
 # makes GitHub skip this WHOLE workflow, the `changes` job included, and the next push
@@ -101,7 +101,7 @@ jobs:
           # happens to share the image's name:
           #   · every Python image bakes in shared/, so it triggers them all;
           #   · EACH limb copies the WHOLE activities/ tree, not just its own
-          #     domain — which is why one `limb` flag drives all six limb jobs;
+          #     domain — which is why one `limb` flag drives all seven limb jobs;
           #   · this file changes what gets built, so it triggers everything.
           # `charts` is no image: the per-MCE charts sync-upgrade-charts copies
           # into redbull-platform, and the script that copies them.
@@ -333,6 +333,22 @@ jobs:
       helm-image-path: image
     secrets: inherit
 
+  build-vm-lifecycle-worker:
+    # The create-vm limb (activities/vm_lifecycle/). LAST in the chain on purpose: its chart
+    # (gitops/charts/vm-lifecycle-worker/ in redbull-platform) is not on that repo's main
+    # yet, so the image-tag bump fails until it lands, and a failure here must not stop any
+    # other image. It could move beside the other hub limbs once the chart is there.
+    needs: [changes, build-upgrade-gitops-worker]
+    if: ${{ !cancelled() && !failure() && needs.changes.outputs.limb == 'true' }}
+    uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
+    with:
+      image-name: vm-lifecycle-worker
+      dockerfile: activities/vm_lifecycle/Dockerfile
+      chart-repo: team-redbull/redbull-platform
+      helm-values-path: gitops/charts/vm-lifecycle-worker/values.yaml
+      helm-image-path: activityWorker.image
+    secrets: inherit
+
   cleanup-workflow-brain-on-delete:
     if: github.event_name == 'delete'
     uses: team-redbull/.github/.github/workflows/ghcr-cleanup-on-delete.yml@main
@@ -387,4 +403,11 @@ jobs:
     uses: team-redbull/.github/.github/workflows/ghcr-cleanup-on-delete.yml@main
     with:
       image-name: cluster-upgrade-worker
+    secrets: inherit
+
+  cleanup-vm-lifecycle-worker-on-delete:
+    if: github.event_name == 'delete'
+    uses: team-redbull/.github/.github/workflows/ghcr-cleanup-on-delete.yml@main
+    with:
+      image-name: vm-lifecycle-worker
     secrets: inherit

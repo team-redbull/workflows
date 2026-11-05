@@ -24,6 +24,7 @@ from shared.settings import (
     TemporalSettings,
     UpgradeAgentActivitySettings,
     UpgradeGitopsActivitySettings,
+    VmLifecycleActivitySettings,
 )
 
 for _settings_class in (
@@ -34,6 +35,7 @@ for _settings_class in (
     TemporalSettings,
     UpgradeAgentActivitySettings,
     UpgradeGitopsActivitySettings,
+    VmLifecycleActivitySettings,
 ):
     _settings_class.model_config["env_file"] = None
 
@@ -74,5 +76,13 @@ os.environ.update(
         # --- cluster-upgrade: the upgrade agent service ---
         "UPGRADE_AGENT_URL": "http://upgrade-agent.test:8080",
         "UPGRADE_AGENT_TOKEN": "test-agent-token",
+        # --- create-vm: the KubeVirt clusters' agents and the placement policy ---
+        # DAY1_REPO_URL / DAY1_GIT_TOKEN above serve the vm-lifecycle limb too.
+        "KV_CAPACITY_URL_TEMPLATE": "https://kv-capacity.apps.{cluster}.test",
+        "KV_VM_API_URL_TEMPLATE": "https://kv-vm-api.apps.{cluster}.test",
+        "KV_CAPACITY_TOKEN": "test-kv-capacity-token",
+        "KV_VM_API_TOKEN": "test-kv-vm-api-token",
+        "HEADROOM_BUFFER_PERCENT": "30",
+        "VM_MAC_PREFIX": "02:a1:b2",
     }
 )

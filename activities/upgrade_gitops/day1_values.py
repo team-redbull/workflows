@@ -1,21 +1,12 @@
-"""A day1 cluster file as the hostedclusters-setup chart sees it, and the upgrade's edits to it — pure.
+"""A day1 cluster file as the upgrade sees it, and the upgrade's edits to it — pure.
 
 No git, no settings, no Temporal: day1_repo.py clones and pushes, this module
 reads text and returns text, so every rule here is a plain unit test.
 
-READING (`read_cluster`) follows the production derivation in stack-export:
-  * the value layers, in Argo CD's order (`hcAppset.yaml` valueFiles):
-    `sites/configValues.yaml` → `sites/<site>/values.yaml` →
-    `sites/<site>/mces/<mce>/values.yaml` → the cluster file; a missing layer
-    is skipped (`ignoreMissingValueFiles: true`). Helm merges them: maps deep,
-    lists and scalars replaced, a null deletes the key.
-  * clusterName: the cluster FILE's own `clusterName`, else the file name
-    without `.yaml` and `clusterFilePrefix` (`hcAppset.yaml:35`, a parameter,
-    so it outranks every layer). The prefix is argocd-platform's
-    `hostedClusters/values.yaml` (`ocp4-`), which configValues.yaml may
-    override because the `<site>-mces` ApplicationSet passes it as a value file.
-  * the HostedCluster is `openshift-<clusterName>` in `hcp-<clusterName>`
-    (`templates/hc.yaml:34-35`).
+READING (`read_cluster`) starts from activities/day1_repo.py's
+`load_cluster_values` — the monorepo's one reader of a cluster file with its
+value layers and its clusterName, shared with vm-lifecycle — and adds what
+only the upgrade reads:
   * a NodePool is `.name`, else `<clusterName>-<infraEnv>` with infraEnv =
     `.infraEnvName`, else `.agentLabelSelector.nodeLabelValue`
     (`templates/nodepool.yaml:14-22`); its release is its own `workertag`, else
@@ -35,12 +26,22 @@ with Day1ChangeRejectedError: a person edits it.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import yaml
-
+# The monorepo's day1 reader (shared with vm-lifecycle). The names not used
+# below are re-exported on purpose: upgrade_rules.py reads load_yaml from here.
+from activities.day1_repo import (  # noqa: F401
+    CONFIG_VALUES,
+    DEFAULT_CLUSTER_FILE_PREFIX,
+    ClusterValues,
+    layer_paths,
+    load_cluster_values,
+    load_yaml,
+    merge_values,
+)
+from activities.day1_repo import unset as _unset
 from shared.exceptions import Day1ChangeRejectedError
 from shared.models.cluster_upgrade import (
     ClusterProfile,
@@ -51,83 +52,15 @@ from shared.models.cluster_upgrade import (
     Day1NodePool,
 )
 from shared.ocp_version import release_tag, release_version
-from shared.upgrade_layout import DAY1_CLUSTER_FILE as CLUSTER_FILE
+from shared.upgrade_layout import DAY1_CLUSTER_FILE as CLUSTER_FILE  # noqa: F401 — day1_repo.py reads it here
 from shared.upgrade_layout import IN_PLACE as _IN_PLACE
 from shared.upgrade_layout import ZONE_LABEL as _ZONE_LABEL
 
-CONFIG_VALUES = "sites/configValues.yaml"
-# argocd-platform hostedClusters/values.yaml `clusterFilePrefix` (stack-export).
-DEFAULT_CLUSTER_FILE_PREFIX = "ocp4-"
 # The chart's repositories under imagePath when a file names none: production's
 # one full mirror (stack-export hc.yaml:30,46; the port's hc.releaseRepo, hc.yaml:37).
 DEFAULT_RELEASE_REPO = "openshift/release-images"
 DEFAULT_CPO_REPO = "openshift/release"
 _PAUSED = "true"
-
-
-# --- YAML ---------------------------------------------------------------------
-
-
-def load_yaml(text: str, where: str) -> tuple[Any, list[str]]:
-    """The document, last key winning as Helm's YAML parser does, and every key written twice.
-
-    A document that does not parse is (None, [the reason]).
-    """
-    problems: list[str] = []
-
-    class _Loader(yaml.SafeLoader):
-        pass
-
-    def construct_mapping(loader: yaml.SafeLoader, node: yaml.MappingNode, deep: bool = False) -> dict:
-        seen: dict[Any, int] = {}
-        for key_node, _ in node.value:
-            if key_node.tag == "tag:yaml.org,2002:merge":
-                continue
-            key = loader.construct_object(key_node, deep=True)
-            line = key_node.start_mark.line + 1
-            try:
-                first = seen.get(key)
-            except TypeError:  # an unhashable key: the constructor below reports it
-                continue
-            if first is not None:
-                problems.append(
-                    f"{where}:{line}: key {key!r} is written twice (first at line {first}); "
-                    "only the last one counts"
-                )
-            else:
-                seen[key] = line
-        return loader.construct_mapping(node, deep=deep)
-
-    _Loader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, construct_mapping)
-    try:
-        return yaml.load(text, Loader=_Loader), problems  # noqa: S506 - a SafeLoader subclass
-    except yaml.YAMLError as err:
-        return None, [f"{where}: not valid YAML: {err}"]
-
-
-def merge_values(layers: list[dict]) -> dict:
-    """Helm's merge of value files: maps deep, everything else replaced, a null deletes."""
-    merged: dict = {}
-    for layer in layers:
-        merged = _coalesce(merged, layer)
-    return merged
-
-
-def _coalesce(base: dict, over: dict) -> dict:
-    result = dict(base)
-    for key, value in over.items():
-        if value is None:
-            result.pop(key, None)
-        elif isinstance(value, dict) and isinstance(result.get(key), dict):
-            result[key] = _coalesce(result[key], value)
-        else:
-            result[key] = value
-    return result
-
-
-def _unset(value: Any) -> bool:
-    """Sprig's `default`: nil, "", 0, false and empty collections count as unset."""
-    return value is None or value is False or value == "" or value == 0 or value == [] or value == {}
 
 
 def _bare(value: Any, what: str, problems: list[str]) -> str | None:
@@ -142,60 +75,6 @@ def _bare(value: Any, what: str, problems: list[str]) -> str | None:
 
 
 # --- reading --------------------------------------------------------------------
-
-
-@dataclass
-class ClusterValues:
-    """Everything read about one cluster file: each layer, the merge, and what is wrong."""
-
-    path: str
-    own: dict  # the cluster file alone
-    merged: dict
-    cluster_name: str
-    problems: list[str] = field(default_factory=list)
-
-
-def layer_paths(path: str) -> list[str]:
-    """The value files Argo CD renders this cluster file with, in order, the file itself last."""
-    match = CLUSTER_FILE.fullmatch(path)
-    if match is None:
-        raise ValueError(f"{path} is not a day1 cluster file (sites/<site>/mces/<mce>/hostedClusters/<name>.yaml)")
-    site, mce = match.group("site"), match.group("mce")
-    return [CONFIG_VALUES, f"sites/{site}/values.yaml", f"sites/{site}/mces/{mce}/values.yaml", path]
-
-
-def load_cluster_values(root: Path, path: str, *, text: str | None = None) -> ClusterValues:
-    """The cluster file at `path` under `root` with its layers; `text` stands in for the file's content."""
-    problems: list[str] = []
-    layers: list[dict] = []
-    own: dict = {}
-    config_values: dict = {}
-    for layer in layer_paths(path):
-        is_cluster_file = layer == path
-        if is_cluster_file and text is not None:
-            content = text
-        else:
-            file = root / layer
-            if not file.is_file():
-                continue
-            content = file.read_text(encoding="utf-8")
-        data, found = load_yaml(content, layer)
-        problems += found
-        if data is None:
-            data = {}
-        if not isinstance(data, dict):
-            problems.append(f"{layer}: must be a mapping of values, not {type(data).__name__}")
-            data = {}
-        layers.append(data)
-        if is_cluster_file:
-            own = data
-        if layer == CONFIG_VALUES:
-            config_values = data
-    prefix = config_values.get("clusterFilePrefix")
-    prefix = DEFAULT_CLUSTER_FILE_PREFIX if prefix is None else str(prefix)
-    name = CLUSTER_FILE.fullmatch(path).group("name")  # type: ignore[union-attr]
-    cluster_name = str(own["clusterName"]) if not _unset(own.get("clusterName")) else name.removeprefix(prefix)
-    return ClusterValues(path=path, own=own, merged=merge_values(layers), cluster_name=cluster_name, problems=problems)
 
 
 @dataclass

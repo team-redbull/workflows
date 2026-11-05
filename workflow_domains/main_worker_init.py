@@ -25,6 +25,7 @@ from temporalio.worker import Worker
 from shared.consts import (
     ADD_SERVER_TO_MCE_WORKFLOW_QUEUE,
     ALLOCATE_SEGMENT_WORKFLOW_QUEUE,
+    CREATE_VM_WORKFLOW_QUEUE,
     INITIALIZE_SEGMENT_WORKFLOW_QUEUE,
     LEGACY_INSTALL_SERVER_WORKFLOW_QUEUE,
     LEGACY_PUBLISH_INFRAENV_BOOT_WORKFLOW_QUEUE,
@@ -76,6 +77,7 @@ from workflow_domains.server_lifecycle.uninstall_server_from_hc import (
 from workflow_domains.server_provisioning.provision_dell_server import (
     ProvisionDellServerWorkflow,
 )
+from workflow_domains.vm_lifecycle.create_vm import CreateVmWorkflow
 
 _settings = TemporalSettings()
 
@@ -86,6 +88,7 @@ _settings = TemporalSettings()
 _WORKER_SPECS: list[tuple[str, list[type]]] = [
     (ADD_SERVER_TO_MCE_WORKFLOW_QUEUE, [AddServerToMceWorkflow]),
     (ALLOCATE_SEGMENT_WORKFLOW_QUEUE, [AllocateSegmentWorkflow]),
+    (CREATE_VM_WORKFLOW_QUEUE, [CreateVmWorkflow]),
     (INITIALIZE_SEGMENT_WORKFLOW_QUEUE, [InitializeSegmentWorkflow]),
     (PROVISION_DELL_SERVER_WORKFLOW_QUEUE, [ProvisionDellServerWorkflow]),
     (PUBLISH_INFRAENV_TO_PXE_SERVER_WORKFLOW_QUEUE, [PublishInfraEnvToPxeServerWorkflow]),

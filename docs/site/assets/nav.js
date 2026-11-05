@@ -100,6 +100,20 @@
           blurb: "which releases a cluster can go to · one GET"
         }
       ]
+    },
+    {
+      domain: "vm-lifecycle",
+      // One hub limb for every zone: it holds no Kubernetes credential and
+      // reaches each KubeVirt cluster through the two agents the platform
+      // deploys there (kv-capacity, kv-vm-api), behind Routes.
+      queue: "vm-lifecycle-activity",
+      workflows: [
+        {
+          name: "create-vm",
+          href: "/vm-lifecycle/create-vm.html",
+          blurb: "one Halted VM, fixed MAC, on the best-fitting KubeVirt cluster of a zone"
+        }
+      ]
     }
   ];
 

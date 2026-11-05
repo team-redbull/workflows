@@ -241,3 +241,23 @@ def upgrade_control_plane_workflow_id(mce_cluster: str, slot: int) -> str:
     add-server-to-mce slot precedent.
     """
     return f"upgrade-control-plane-{mce_cluster}_{slot}"
+
+
+def create_vm_slot_workflow_id(mce_cluster: str, infra_env: str, slot: int) -> str:
+    """`create-vm-<mce>_<infraEnv>_<slot>`: one of the PARALLEL creates for an InfraEnv.
+
+    The mirror of add_server_to_mce_slot_workflow_id, for the same reason: the
+    VM's name is drawn INSIDE the run (the random suffix that also makes its
+    MAC), so nothing known at the API edge identifies the VM. A run is a slot
+    of the InfraEnv on its MCE instead: `count: N` fills N free ones, a request
+    without `count` fills one, a finished slot is free again, and two requests
+    at once cannot start one slot twice (Temporal allows one running workflow
+    per id). `_` follows the MCE for the reason add_server_to_mce_name_workflow_id
+    gives: a Kubernetes name cannot contain it, so where the MCE ends is
+    unambiguous.
+
+    A re-run of a slot is a NEW execution with a NEW suffix — it never resumes
+    a VM an earlier run left behind, which is why an unbound root disk is
+    rolled back before the run fails (CLAUDE.md §4).
+    """
+    return f"create-vm-{mce_cluster}_{infra_env}_{slot}"

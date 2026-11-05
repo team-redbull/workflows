@@ -1,0 +1,454 @@
+{
+ "KvApiError": {
+  "properties": {
+   "detail": {
+    "default": "",
+    "title": "Detail",
+    "type": "string"
+   },
+   "error": {
+    "title": "Error",
+    "type": "string"
+   }
+  },
+  "required": [
+   "error"
+  ],
+  "title": "KvApiError",
+  "type": "object"
+ },
+ "KvCapacityReport": {
+  "$defs": {
+   "KvHaltedReservation": {
+    "properties": {
+     "cpu_millicores": {
+      "title": "Cpu Millicores",
+      "type": "integer"
+     },
+     "memory_bytes": {
+      "title": "Memory Bytes",
+      "type": "integer"
+     },
+     "name": {
+      "title": "Name",
+      "type": "string"
+     },
+     "namespace": {
+      "title": "Namespace",
+      "type": "string"
+     }
+    },
+    "required": [
+     "namespace",
+     "name",
+     "cpu_millicores",
+     "memory_bytes"
+    ],
+    "title": "KvHaltedReservation",
+    "type": "object"
+   },
+   "KvNodeCapacity": {
+    "properties": {
+     "allocatable_cpu_millicores": {
+      "title": "Allocatable Cpu Millicores",
+      "type": "integer"
+     },
+     "allocatable_memory_bytes": {
+      "title": "Allocatable Memory Bytes",
+      "type": "integer"
+     },
+     "name": {
+      "title": "Name",
+      "type": "string"
+     },
+     "requested_cpu_millicores": {
+      "title": "Requested Cpu Millicores",
+      "type": "integer"
+     },
+     "requested_memory_bytes": {
+      "title": "Requested Memory Bytes",
+      "type": "integer"
+     },
+     "schedulable": {
+      "title": "Schedulable",
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "name",
+     "schedulable",
+     "allocatable_cpu_millicores",
+     "allocatable_memory_bytes",
+     "requested_cpu_millicores",
+     "requested_memory_bytes"
+    ],
+    "title": "KvNodeCapacity",
+    "type": "object"
+   },
+   "KvVmIdentity": {
+    "properties": {
+     "mac": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Mac"
+     },
+     "name": {
+      "title": "Name",
+      "type": "string"
+     },
+     "namespace": {
+      "title": "Namespace",
+      "type": "string"
+     }
+    },
+    "required": [
+     "namespace",
+     "name"
+    ],
+    "title": "KvVmIdentity",
+    "type": "object"
+   }
+  },
+  "properties": {
+   "cluster": {
+    "title": "Cluster",
+    "type": "string"
+   },
+   "halted_reservations": {
+    "items": {
+     "$ref": "#/$defs/KvHaltedReservation"
+    },
+    "title": "Halted Reservations",
+    "type": "array"
+   },
+   "nodes": {
+    "items": {
+     "$ref": "#/$defs/KvNodeCapacity"
+    },
+    "title": "Nodes",
+    "type": "array"
+   },
+   "observed_at": {
+    "title": "Observed At",
+    "type": "string"
+   },
+   "vms": {
+    "items": {
+     "$ref": "#/$defs/KvVmIdentity"
+    },
+    "title": "Vms",
+    "type": "array"
+   }
+  },
+  "required": [
+   "cluster",
+   "observed_at"
+  ],
+  "title": "KvCapacityReport",
+  "type": "object"
+ },
+ "KvVmConflict": {
+  "$defs": {
+   "KvRootDisk": {
+    "properties": {
+     "bound": {
+      "default": false,
+      "title": "Bound",
+      "type": "boolean"
+     },
+     "name": {
+      "title": "Name",
+      "type": "string"
+     },
+     "phase": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Phase"
+     }
+    },
+    "required": [
+     "name"
+    ],
+    "title": "KvRootDisk",
+    "type": "object"
+   },
+   "KvVmState": {
+    "properties": {
+     "admitted": {
+      "default": false,
+      "title": "Admitted",
+      "type": "boolean"
+     },
+     "cpu": {
+      "title": "Cpu",
+      "type": "integer"
+     },
+     "mac": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Mac"
+     },
+     "memory_gib": {
+      "title": "Memory Gib",
+      "type": "integer"
+     },
+     "name": {
+      "title": "Name",
+      "type": "string"
+     },
+     "namespace": {
+      "title": "Namespace",
+      "type": "string"
+     },
+     "root_disk": {
+      "anyOf": [
+       {
+        "$ref": "#/$defs/KvRootDisk"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null
+     },
+     "run_strategy": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Run Strategy"
+     }
+    },
+    "required": [
+     "name",
+     "namespace",
+     "cpu",
+     "memory_gib"
+    ],
+    "title": "KvVmState",
+    "type": "object"
+   }
+  },
+  "properties": {
+   "existing": {
+    "anyOf": [
+     {
+      "$ref": "#/$defs/KvVmState"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null
+   },
+   "reason": {
+    "title": "Reason",
+    "type": "string"
+   }
+  },
+  "required": [
+   "reason"
+  ],
+  "title": "KvVmConflict",
+  "type": "object"
+ },
+ "KvVmCreateRequest": {
+  "properties": {
+   "cpu": {
+    "title": "Cpu",
+    "type": "integer"
+   },
+   "labels": {
+    "additionalProperties": {
+     "type": "string"
+    },
+    "title": "Labels",
+    "type": "object"
+   },
+   "mac": {
+    "title": "Mac",
+    "type": "string"
+   },
+   "memory_gib": {
+    "title": "Memory Gib",
+    "type": "integer"
+   },
+   "namespace": {
+    "title": "Namespace",
+    "type": "string"
+   }
+  },
+  "required": [
+   "namespace",
+   "cpu",
+   "memory_gib",
+   "mac"
+  ],
+  "title": "KvVmCreateRequest",
+  "type": "object"
+ },
+ "KvVmCreateResponse": {
+  "properties": {
+   "cpu": {
+    "title": "Cpu",
+    "type": "integer"
+   },
+   "created": {
+    "title": "Created",
+    "type": "boolean"
+   },
+   "mac": {
+    "title": "Mac",
+    "type": "string"
+   },
+   "memory_gib": {
+    "title": "Memory Gib",
+    "type": "integer"
+   },
+   "name": {
+    "title": "Name",
+    "type": "string"
+   },
+   "namespace": {
+    "title": "Namespace",
+    "type": "string"
+   }
+  },
+  "required": [
+   "name",
+   "namespace",
+   "mac",
+   "cpu",
+   "memory_gib",
+   "created"
+  ],
+  "title": "KvVmCreateResponse",
+  "type": "object"
+ },
+ "KvVmState": {
+  "$defs": {
+   "KvRootDisk": {
+    "properties": {
+     "bound": {
+      "default": false,
+      "title": "Bound",
+      "type": "boolean"
+     },
+     "name": {
+      "title": "Name",
+      "type": "string"
+     },
+     "phase": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Phase"
+     }
+    },
+    "required": [
+     "name"
+    ],
+    "title": "KvRootDisk",
+    "type": "object"
+   }
+  },
+  "properties": {
+   "admitted": {
+    "default": false,
+    "title": "Admitted",
+    "type": "boolean"
+   },
+   "cpu": {
+    "title": "Cpu",
+    "type": "integer"
+   },
+   "mac": {
+    "anyOf": [
+     {
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "title": "Mac"
+   },
+   "memory_gib": {
+    "title": "Memory Gib",
+    "type": "integer"
+   },
+   "name": {
+    "title": "Name",
+    "type": "string"
+   },
+   "namespace": {
+    "title": "Namespace",
+    "type": "string"
+   },
+   "root_disk": {
+    "anyOf": [
+     {
+      "$ref": "#/$defs/KvRootDisk"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null
+   },
+   "run_strategy": {
+    "anyOf": [
+     {
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "title": "Run Strategy"
+   }
+  },
+  "required": [
+   "name",
+   "namespace",
+   "cpu",
+   "memory_gib"
+  ],
+  "title": "KvVmState",
+  "type": "object"
+ }
+}

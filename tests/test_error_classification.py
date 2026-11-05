@@ -314,3 +314,64 @@ class TestTheUpgradeHubLimbsErrors:
             "UpgradeRulesInvalidError", "ClusterFileNotFoundError", "AmbiguousClusterFileError",
             "Day1FileChangedError", "Day1ChangeRejectedError",
         } <= {error.__name__ for error in PERMANENT_ACTIVITY_ERRORS}
+
+
+class TestCreateVmClassification:
+    """The same invariants for create-vm (workflow_domains/vm_lifecycle/create_vm.py) and its limb."""
+
+    _CREATE_VM = pathlib.Path(__file__).resolve().parent.parent / "workflow_domains/vm_lifecycle/create_vm.py"
+    # Retried by design: an agent outage, a day1 clone that fails (unreachable is not missing).
+    RETRIED = {"KvCapacityUnavailableError", "KvVmApiUnavailableError", "ValuesRepoGitError", "ValuesBranchNotFoundError"}
+
+    def test_every_entry_names_a_real_error_class_and_none_is_workflow_raised(self):
+        from workflow_domains.vm_lifecycle.create_vm import _RETRY_POLICY as policy
+
+        listed = set(policy.non_retryable_error_types or [])
+        assert listed, "create-vm lists no permanent error"
+        for name in listed:
+            assert isinstance(getattr(exceptions, name, None), type), name
+        assert not _workflow_raised_errors() & listed
+
+    def test_the_list_is_derived_from_classes_and_every_type_is_a_class(self):
+        tree = ast.parse(self._CREATE_VM.read_text())
+        listed = next(
+            node.value for node in ast.walk(tree)
+            if isinstance(node, ast.keyword) and node.arg == "non_retryable_error_types"
+        )
+        assert not isinstance(listed, ast.List)
+        literals = [
+            keyword for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "ApplicationError"
+            for keyword in node.keywords if keyword.arg == "type" and isinstance(keyword.value, ast.Constant)
+        ]
+        assert literals == []
+        used = {
+            keyword.value.value.id for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "ApplicationError"
+            for keyword in node.keywords
+            if keyword.arg == "type" and isinstance(keyword.value, ast.Attribute) and keyword.value.attr == "__name__"
+        }
+        assert used == {"NoKvClusterError", "NoKvClusterFitsError", "VmNameExhaustedError", "VmRootDiskNotBoundError"}
+        assert used <= _workflow_raised_errors()
+
+    def _raised_by_the_limb(self) -> set[str]:
+        root = pathlib.Path(__file__).resolve().parent.parent / "activities"
+        modules = [*sorted((root / "vm_lifecycle").glob("*.py")), root / "git_repo.py"]
+        names = set()
+        for module in modules:
+            for node in ast.walk(ast.parse(module.read_text())):
+                call = node.exc if isinstance(node, ast.Raise) else None
+                if isinstance(call, ast.Call) and isinstance(call.func, ast.Name):
+                    names.add(call.func.id)
+        return {name for name in names if isinstance(getattr(exceptions, name, None), type)}
+
+    def test_every_error_the_limb_raises_is_permanent_or_retried_on_purpose(self):
+        from workflow_domains.vm_lifecycle.create_vm import _PERMANENT_ACTIVITY_ERRORS
+
+        permanent = {error.__name__ for error in _PERMANENT_ACTIVITY_ERRORS}
+        raised = self._raised_by_the_limb()
+        assert raised, "the scan found no shared error raised by the vm-lifecycle limb"
+        assert raised <= permanent | self.RETRIED, sorted(raised - permanent - self.RETRIED)
+        assert not self.RETRIED & permanent
+        assert {"KvAgentAuthError", "VmIdentityConflictError", "VmNamespaceNotFoundError", "VmRequestRejectedError",
+                "VmDisappearedError"} <= permanent

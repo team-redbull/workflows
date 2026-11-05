@@ -162,3 +162,55 @@ class TestClusterUpgradeActivitySettings:
         monkeypatch.setenv(key, value)
         with pytest.raises(ValidationError, match=key.lower()):
             ClusterUpgradeActivitySettings()
+
+
+class TestVmLifecycleSettings:
+    """The vm-lifecycle limb's knobs fail at worker start, never on the first run."""
+
+    def _settings(self, monkeypatch, **env):
+        from shared.settings import VmLifecycleActivitySettings
+
+        for key, value in env.items():
+            monkeypatch.setenv(key, value)
+        return VmLifecycleActivitySettings()
+
+    def test_the_url_templates_render_every_placeholder(self, monkeypatch):
+        from shared.models.vm_lifecycle import KvClusterRef
+
+        s = self._settings(
+            monkeypatch,
+            KV_CAPACITY_URL_TEMPLATE="https://kv-capacity.apps.{hosted_cluster}.{site}-{zone}.example/",
+            KV_VM_API_URL_TEMPLATE="http://{name}.example",
+        )
+        ref = KvClusterRef(name="ocp4-kubevirt-s-a1", cluster_name="kubevirt-s-a1", hosted_cluster="openshift-kubevirt-s-a1",
+                           site="s", zone="a")
+        assert s.kv_capacity_url(ref) == "https://kv-capacity.apps.openshift-kubevirt-s-a1.s-a.example"
+        assert s.kv_vm_api_url(ref) == "http://ocp4-kubevirt-s-a1.example"
+
+    @pytest.mark.parametrize(
+        "template",
+        ["https://kv.{clustr}.example", "https://kv.{}.example", "kv-capacity.apps.{cluster}.example", "https://kv.{cluster.name}.x",
+         "https://kv.{0}.example"],
+    )
+    def test_a_template_with_an_unknown_placeholder_or_no_scheme_is_refused(self, monkeypatch, template):
+        with pytest.raises(ValidationError):
+            self._settings(monkeypatch, KV_CAPACITY_URL_TEMPLATE=template)
+
+    @pytest.mark.parametrize("value", ["-1", "91", "x"])
+    def test_the_buffer_is_a_percentage_up_to_90(self, monkeypatch, value):
+        with pytest.raises(ValidationError):
+            self._settings(monkeypatch, HEADROOM_BUFFER_PERCENT=value)
+        assert self._settings(monkeypatch, HEADROOM_BUFFER_PERCENT="0").headroom_buffer_percent == 0
+
+    @pytest.mark.parametrize("prefix", ["00:a1:b2", "01:a1:b2", "03:a1:b2", "02:a1", "02-a1-b2", "zz:a1:b2", "02:a1:b2:00"])
+    def test_the_mac_prefix_is_three_locally_administered_unicast_octets(self, monkeypatch, prefix):
+        with pytest.raises(ValidationError):
+            self._settings(monkeypatch, VM_MAC_PREFIX=prefix)
+
+    @pytest.mark.parametrize("prefix", ["02:A1:B2", " 0a:00:00 ", "fe:00:01"])
+    def test_a_valid_prefix_is_lowercased(self, monkeypatch, prefix):
+        assert self._settings(monkeypatch, VM_MAC_PREFIX=prefix).vm_mac_prefix == prefix.strip().lower()
+
+    def test_the_day1_url_must_be_https(self, monkeypatch):
+        with pytest.raises(ValidationError, match="https://"):
+            self._settings(monkeypatch, DAY1_REPO_URL="git@x:y.git")

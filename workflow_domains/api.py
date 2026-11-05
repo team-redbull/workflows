@@ -34,6 +34,7 @@ from workflow_domains.server_lifecycle.ui import router as server_lifecycle_ui_r
 from workflow_domains.server_provisioning.router import (
     router as server_provisioning_router,
 )
+from workflow_domains.vm_lifecycle.router import router as vm_lifecycle_router
 
 _settings = TemporalSettings()
 
@@ -51,6 +52,9 @@ app.include_router(server_provisioning_router)
 # upgrade-cluster and upgrade-targets: a started run's activities wait,
 # visible as pending, on any limb not deployed yet (DESIGN O18).
 app.include_router(cluster_upgrade_router)
+# create-vm: a run's activities wait, visible as pending, on the vm-lifecycle
+# limb and on the KubeVirt clusters' agents until both are deployed.
+app.include_router(vm_lifecycle_router)
 app.include_router(runs_router)
 # The temporary cluster-upgrade page, on the routes above.
 app.include_router(cluster_upgrade_ui_router)

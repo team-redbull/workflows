@@ -1,11 +1,13 @@
 """The day1 values repo for the upgrade: read the rules and a cluster file, commit one change — at `main`.
 
-Plain parameters, no settings and no Temporal (CLAUDE.md §1); the git client
-is activities/git_repo.py, the one segment-lifecycle uses, so the token is
-injected in memory only, scrubbed from every error, kept out of every file of
-the clone, and every clone is a fresh TemporaryDirectory — ONE per activity
-attempt. `main` only: Argo CD renders main and nothing else (hcAppset.yaml
-pins it), and this limb has no branch input to check.
+Plain parameters, no settings and no Temporal (CLAUDE.md §1). The clone and
+the generic cluster-file reader are activities/day1_repo.py's — the monorepo's
+one day1 reader, shared with vm-lifecycle and owned by neither limb — on
+activities/git_repo.py:
+the token injected in memory only, scrubbed from every error, kept out of
+every file of the clone, every clone a fresh TemporaryDirectory — ONE per
+activity attempt. `main` only: Argo CD renders main and nothing else
+(hcAppset.yaml pins it), and this limb has no branch input to check.
 
 What the YAML means is day1_values.py and upgrade_rules.py; this module only
 moves files between git and them, and runs day1's own validators
@@ -23,6 +25,7 @@ from pathlib import Path
 
 from activities import git_repo
 from activities.upgrade_gitops import day1_values, upgrade_rules
+from activities.day1_repo import blob, clone_main, head  # the monorepo's day1 reader
 from shared.exceptions import (
     AmbiguousClusterFileError,
     ClusterFileNotFoundError,
@@ -34,19 +37,6 @@ from shared.models.cluster_upgrade import Day1ChangeRequest, Day1Cluster, Day1Co
 
 # A validator gets this long, inside the git activities' 180s.
 VALIDATOR_TIMEOUT_SECONDS = 90.0
-
-
-async def clone_main(*, repo_url: str, token: str, dest: Path) -> None:
-    await git_repo.clone_main(repo_url=repo_url, token=token, dest=dest, repo="day1")
-
-
-async def head(clone: Path, *, token: str) -> str:
-    return (await git_repo.run_git(["rev-parse", "HEAD"], cwd=clone, secrets=[token])).strip()
-
-
-async def blob(clone: Path, path: str, *, token: str) -> str:
-    """The git blob id of `path` at HEAD: what compare-and-set compares."""
-    return (await git_repo.run_git(["rev-parse", f"HEAD:{path}"], cwd=clone, secrets=[token])).strip()
 
 
 # --- read_upgrade_rules ---------------------------------------------------------------

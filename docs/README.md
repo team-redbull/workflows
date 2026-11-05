@@ -31,10 +31,15 @@ docs/
     cluster-upgrade/
       upgrade-cluster.html
       upgrade-targets.html
+    vm-lifecycle/
+      create-vm.html
     assets/
       site.css                     every page's styling
       nav.js                       THE workflow catalogue + topbar menu behaviour
       favicon.svg
+  design/                          designs and contracts not (yet) built, in Markdown
+  lab/
+    create-vm/                     the create-vm lab on one CNV cluster: mock day1, lab.sh, what it showed
 ```
 
 ## Adding a workflow page

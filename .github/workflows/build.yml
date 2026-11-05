@@ -12,6 +12,10 @@ name: Build and Push
 # until a later push touches their paths, which can ship a new brain against an old
 # limb. Never quote the marker in a commit message; if it happens anyway, re-trigger by
 # pushing a change to this file, which rebuilds every image.
+#
+# The same holds for a push whose `test` job failed: re-running it builds that push's images,
+# but a later commit that only fixes tests builds nothing, because its own range touched no
+# image. Re-trigger the same way.
 
 on:
   push:

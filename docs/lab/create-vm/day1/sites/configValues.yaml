@@ -1,0 +1,4 @@
+# Global defaults for every hosted cluster, merged first (hcAppset.yaml valueFiles order).
+dhcp_values:
+  subnetMask: "255.255.255.0"
+  leaseDurationDays: 8

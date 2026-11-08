@@ -1,0 +1,2 @@
+# Site layer: nothing create-vm reads; here so the layer merge has a site file to skip over.
+site: lab

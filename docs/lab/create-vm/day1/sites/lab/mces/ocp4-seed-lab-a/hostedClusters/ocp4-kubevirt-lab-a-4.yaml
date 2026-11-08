@@ -1,0 +1,4 @@
+# KubeVirt cluster 4 of zone a, naming its clusterName itself (the chart's rule: the file's own wins).
+clusterName: kubevirt-lab-a-4
+platform: agent
+nodepool: []

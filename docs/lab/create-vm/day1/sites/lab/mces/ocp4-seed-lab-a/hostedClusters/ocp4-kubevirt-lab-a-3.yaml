@@ -1,0 +1,4 @@
+# KubeVirt cluster 3 of zone a. `platform` is written twice: a problems line, not a failure.
+platform: agent
+platform: agent
+nodepool: []

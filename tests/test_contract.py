@@ -20,12 +20,14 @@ import activities.server_lifecycle.activities as server_impl
 import activities.server_provisioning.activities as provisioning_impl
 import activities.upgrade_agent.activities as upgrade_agent_impl
 import activities.upgrade_gitops.activities as upgrade_gitops_impl
+import activities.vm_lifecycle.activities as vm_lifecycle_impl
 import shared.interfaces.cluster_upgrade as cluster_upgrade_interface
 import shared.interfaces.segment_lifecycle as segment_interface
 import shared.interfaces.server_lifecycle as server_interface
 import shared.interfaces.server_provisioning as provisioning_interface
 import shared.interfaces.upgrade_agent as upgrade_agent_interface
 import shared.interfaces.upgrade_gitops as upgrade_gitops_interface
+import shared.interfaces.vm_lifecycle as vm_lifecycle_interface
 
 # Every domain, not just the first one written: an activity whose stub and
 # implementation disagree converts payloads silently rather than raising.
@@ -36,6 +38,7 @@ _DOMAINS = [
     pytest.param(cluster_upgrade_interface, cluster_upgrade_impl, id="cluster_upgrade"),
     pytest.param(upgrade_agent_interface, upgrade_agent_impl, id="upgrade_agent"),
     pytest.param(upgrade_gitops_interface, upgrade_gitops_impl, id="upgrade_gitops"),
+    pytest.param(vm_lifecycle_interface, vm_lifecycle_impl, id="vm_lifecycle"),
 ]
 
 

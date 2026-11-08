@@ -134,7 +134,7 @@ class TestTheHappyPath:
             assert waiting.nodepools_done == ["np-a"]
             assert "readiness checks after NodePool np-a pass: rolls the next NodePool to 4.20.44" in waiting.waiting_for
             # The week a person takes between two NodePools costs the run nothing.
-            await h.env.sleep(SEVEN_DAYS)
+            await h.skip_time(SEVEN_DAYS)
             await h.decide(Run.continue_nodepool, ContinueNodePool(by="bob"))
             result = await h.result()
 
@@ -613,12 +613,13 @@ class TestPauseAndAbortReachEveryAct:
             await h.until(UpgradePhase.AWAITING_APPROVAL)
             await h.decide(Run.approve, ALICE)
             await h.until(UpgradePhase.NEEDS_HUMAN)
+            # The sync is held, or its second refusal could reach the run first, and the
+            # double click would then be a legitimate retry of that one.
+            fleet.block_sync = True
             await h.decide(Run.retry, ALICE)
             # A retry the run is no longer waiting for is refused, never saved up.
-            try:
-                await h.decide(Run.retry, HumanDecision(by="alice", reason="double click"))
-            except WorkflowUpdateFailedError:
-                pass
+            await _refused(h, Run.retry, HumanDecision(by="alice", reason="double click"))
+            fleet.block_sync = False
             await h.called("sync:rev-2", times=2)
             second = await h.until(UpgradePhase.NEEDS_HUMAN)
             await h.env.sleep(timedelta(minutes=5))

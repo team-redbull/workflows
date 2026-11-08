@@ -9,6 +9,8 @@ identical model under its own name.
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel
 
 
@@ -21,3 +23,18 @@ class StartWorkflowResponse(BaseModel):
 
     workflow_id: str
     run_id: str
+
+
+class SlotStart(BaseModel):
+    """One slot a pool request looked at, for a per-run report (workflow_domains/routers/slots.py).
+
+    `started`: a new run on `workflow_id` (`run_id` set); `already_running`: the
+    slot's run is still going and was stepped over; `failed`: Temporal refused
+    the start (`error`), which ends the scan.
+    """
+
+    slot: int
+    workflow_id: str
+    status: Literal["started", "already_running", "failed"]
+    run_id: str | None = None
+    error: str | None = None

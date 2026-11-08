@@ -1,0 +1,3 @@
+# Zone b's one KubeVirt cluster: its kv-vm-api renders a WaitForFirstConsumer root disk (rollback lab).
+platform: agent
+nodepool: []

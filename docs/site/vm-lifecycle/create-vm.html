@@ -1,0 +1,607 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>create-vm — Redbull Workflows</title>
+<meta name="description" content="The create-vm workflow: one Halted VirtualMachine with a fixed MAC for a KubeVirt InfraEnv, on the best-fitting KubeVirt cluster of its zone, ready for add-server-to-mce.">
+<link rel="icon" href="/assets/favicon.svg?v=__DOC_VERSION__" type="image/svg+xml">
+<link rel="stylesheet" href="/assets/site.css?v=__DOC_VERSION__">
+</head>
+<body data-page="/vm-lifecycle/create-vm.html">
+
+<a class="skip-link" href="#main">Skip to content</a>
+
+<!-- Topbar: identical on every page. Brand + deployed version upper-left; the
+     "Workflows" menu is built from the catalogue in assets/nav.js. -->
+<header class="topbar">
+  <a class="brand" href="/">
+    <img class="brand-mark" src="/assets/redbull-logo.png?v=__DOC_VERSION__" alt="" aria-hidden="true"
+         width="480" height="179">
+    <span class="brand-name">Redbull Workflows</span>
+    <span class="brand-ver" title="deployed image tag of this documentation site">__DOC_VERSION__</span>
+  </a>
+  <nav class="topnav" aria-label="Site">
+    <a class="topnav-link" href="/">Orchestrator guide</a>
+    <div class="wfmenu">
+      <button class="wfmenu-btn" id="wfmenu-btn" type="button"
+              aria-expanded="false" aria-haspopup="true" aria-controls="wfmenu-panel">
+        Workflows <span class="caret" aria-hidden="true">&#9662;</span>
+      </button>
+      <div class="wfmenu-panel" id="wfmenu-panel" role="menu" aria-label="Workflows by domain" hidden></div>
+    </div>
+    <noscript>
+      <a class="topnav-link" href="/vm-lifecycle/create-vm.html">create-vm</a>
+    </noscript>
+  </nav>
+</header>
+
+<main id="main">
+<header class="masthead">
+  <div class="masthead-inner">
+    <div class="eyebrow">Temporal workflow &middot; domain: vm-lifecycle</div>
+    <h1>create-vm<span class="dim"> &mdash; what actually happens</span></h1>
+    <p class="lede">
+      One request creates <b>one VirtualMachine</b> for a <b>KubeVirt InfraEnv</b>, on the KubeVirt
+      cluster of the InfraEnv&rsquo;s zone where it packs best under the headroom buffer. The VM is
+      created <b>Halted</b>, with a <b>fixed MAC</b> and the label kubevirt-redfish exposes it by, so
+      server-scan lists it as a server named <code>ocp-&lt;infraenv&gt;-&lt;suffix&gt;</code> and
+      <a href="/server-lifecycle/add-server-to-mce.html">add-server-to-mce</a> installs it through Ironic
+      like any physical machine.
+    </p>
+    <p class="lede">A bare-metal InfraEnv has servers to draw. A KubeVirt one &mdash; named
+    <code>&lt;conf&gt;[-&lt;letter&gt;]-zone-&lt;zone&gt;-&lt;cpu&gt;</code>, say <code>x201-zone-a-8</code>
+    &mdash; has nothing until a VM of <code>&lt;cpu&gt;</code> vCPUs and <code>&lt;cpu&gt; &times; 8</code> GiB
+    exists. This run is that step. It never starts the VM (Ironic does, later), never creates a namespace,
+    and writes nothing on the MCE.</p>
+    <div class="facts">
+      <div class="fact"><span class="k">Trigger</span><span class="v">POST /workflows/vm-lifecycle/create-vm</span></div>
+      <div class="fact"><span class="k">Workflow id</span><span class="v">create-vm-&lt;mce_cluster&gt;_&lt;infra_env&gt;_&lt;slot&gt;</span></div>
+      <div class="fact"><span class="k">Workflow queue</span><span class="v">create-vm-workflow</span></div>
+      <div class="fact"><span class="k">Activity queue</span><span class="v">vm-lifecycle-activity (one hub limb, every zone)</span></div>
+    </div>
+    <p class="note">The limb holds <b>no Kubernetes credential</b>. It reaches each KubeVirt cluster through
+    two small agents the platform deploys there behind Routes &mdash; <b>kv-capacity</b> (read-only
+    facts) and <b>kv-vm-api</b> (the idempotent VM create, read and delete) &mdash; and reads the zone&rsquo;s
+    cluster list from the day1 repo. Until the agents are up on a zone&rsquo;s clusters, a run there
+    waits (RUNNING, every cluster <code>no-agent</code>).</p>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <!-- ======================================================= WALKTHROUGH -->
+  <section id="walkthrough">
+    <div class="sec-head">
+      <div class="eyebrow">Read this first</div>
+      <h2>Names carry everything: site, zone, size</h2>
+      <p class="lede">Nothing is looked up to decide <em>what</em> to create; the two names say it, and
+      the API derives it once (the run carries the derived values and never re-derives them).</p>
+    </div>
+
+    <div class="grid-2">
+      <div class="panel">
+        <h3>What the names say</h3>
+        <ul>
+          <li><b>MCE</b> <code>ocp4-&lt;env&gt;-mce-&lt;site&gt;-&lt;letter&gt;</code> &rarr; the <b>site</b>
+            (<code>ocp4-prod-mce-bat-yam-a</code> &rarr; <code>bat-yam</code>).</li>
+          <li><b>InfraEnv</b> <code>&lt;conf&gt;[-&lt;letter&gt;]-zone-&lt;zone&gt;-&lt;cpu&gt;</code> &rarr; the
+            <b>zone</b> and the VM&rsquo;s <b>size</b> (<code>x201-zone-a-8</code> &rarr; zone <code>a</code>,
+            8 vCPU, 64 GiB). A <code>-metal</code> InfraEnv is refused: it takes servers, not VMs.</li>
+          <li><b>(site, zone)</b> &rarr; the <b>seed cluster</b> <code>ocp4-seed-&lt;site&gt;-&lt;zone&gt;</code>,
+            whose day1 folder lists the zone&rsquo;s KubeVirt clusters,
+            <code>ocp4-kubevirt-&lt;site&gt;-&lt;zone&gt;&hellip;</code>.</li>
+          <li><b>VM</b> <code>ocp-&lt;infraenv&gt;-&lt;6 hex&gt;</code>, MAC
+            <code>&lt;VM_MAC_PREFIX&gt;:xx:xx:xx</code> from the <em>same</em> six hex digits &mdash; name and
+            MAC agree by construction.</li>
+        </ul>
+      </div>
+      <div class="panel">
+        <h3>What it never does</h3>
+        <ul>
+          <li>It never <b>starts</b> the VM: it is created <code>runStrategy: Halted</code>, and
+            kubevirt-redfish powers it on when Ironic asks.</li>
+          <li>It never <b>moves</b> a create to another cluster: the PUT on the chosen cluster is
+            out-waited. Halted, the scheduler is not consulted, and a move after an ambiguous failure
+            could leave two VMs.</li>
+          <li>It never leaves a VM whose <b>root disk did not bind</b>: that VM is deleted again before
+            the run fails. A re-run draws a new suffix and could never resume the old one.</li>
+          <li>It never <b>creates a namespace</b> and never touches the MCE.</li>
+        </ul>
+        <p class="note">The agents&rsquo; URLs and tokens are limb settings; neither enters history.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================== FLOW -->
+  <section id="flow">
+    <div class="sec-head">
+      <div class="eyebrow">Four phases, a fifth only on failure</div>
+      <h2>What the run does</h2>
+      <p class="lede" style="margin-bottom:24px">Each card carries a <code>phase</code> &mdash; read live off a
+      running workflow through a Temporal <b>query</b>, which is how
+      <code>GET /workflows/runs/{workflow_id}</code> can tell you where inside the run it currently is. A
+      run that has not started its first step reports <b>pending</b>.</p>
+    </div>
+
+    <div class="flow">
+
+      <!-- 1 -->
+      <div class="step">
+        <div class="marker">1</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>list_kv_clusters</h3>
+            <span class="phase">phase <b>listing-kv-clusters</b></span>
+          </div>
+          <p>A fresh clone of the day1 repo at <code>main</code>, and every file of the seed folder
+          <code>sites/&lt;site&gt;/mces/ocp4-seed-&lt;site&gt;-&lt;zone&gt;/hostedClusters/</code> is one
+          candidate: its day1 name, its chart <code>clusterName</code> (the file&rsquo;s own, else the name
+          minus <code>ocp4-</code>) and its HostedCluster. A missing folder is an empty list.</p>
+          <div class="calls">
+            <div class="call sm"><span class="verb">git</span><span class="path">clone main &middot; DAY1_REPO_URL, read only, one clone per attempt</span></div>
+          </div>
+          <p class="note">No candidate at all fails the run with <code>NoKvClusterError</code> naming the
+          folder and the prefix looked for. A file in the folder not named
+          <code>ocp4-kubevirt-&lt;site&gt;-&lt;zone&gt;&hellip;</code> is ignored. Nothing filters on day1&rsquo;s
+          <code>platform: kubevirt</code> &mdash; that key means a cluster whose <em>nodes</em> are VMs.</p>
+        </div>
+      </div>
+
+      <!-- 2 -->
+      <div class="step">
+        <div class="marker">2</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>rank_kv_clusters</h3>
+            <span class="phase">phase <b>ranking-kv-clusters</b></span>
+          </div>
+          <p>Every candidate&rsquo;s <b>kv-capacity</b> agent is read at once (10 s each, 45 s for the zone):
+          its schedulable nodes with their allocatable and the requests of their Pending|Running pods
+          (the kube-scheduler&rsquo;s own view), our <b>Halted, not-yet-started VMs</b> as reservations, and
+          every VM&rsquo;s MAC. Then the rule of
+          <code>docs/design/kubevirt-vm-placement.md</code>:</p>
+          <ol>
+            <li><b>Fit is per node</b>: one schedulable node must have the headroom for the launcher pod
+              &mdash; CPU <code>cpu &times; 15 / 16</code> cores, at least one (what the agents&rsquo;
+              <code>vm.yaml.j2</code> requests), memory the guest&rsquo;s plus 1 GiB.</li>
+            <li><b>The buffer is per cluster</b>: the fill after placing &mdash; active requests + Halted
+              reservations + this VM, over the schedulable allocatable &mdash; stays at or under
+              <code>1 &minus; HEADROOM_BUFFER_PERCENT</code> on CPU <em>and</em> on memory.</li>
+            <li><b>Best-fit</b> among the survivors: the cluster <em>fullest after</em> on its dominant
+              resource, ties by name. Never first-fit.</li>
+          </ol>
+          <div class="calls">
+            <div class="call sm"><span class="verb">GET</span><span class="path">/v1/capacity <em>&middot; on every candidate&rsquo;s kv-capacity Route, bearer KV_CAPACITY_TOKEN</em></span></div>
+          </div>
+          <p class="note">A cluster that cannot be read is a <b>row with a reason</b>, never an exception:
+          <code>unreachable</code>, <code>no-agent</code> (nothing behind the Route yet),
+          <code>refused-token</code>, <code>malformed</code>. Only when <em>no</em> cluster could be read
+          is the step retried (<code>KvCapacityUnavailableError</code>), and only when <em>every</em>
+          reachable one refused the token does the run fail (<code>KvAgentAuthError</code>). Nothing
+          fitting fails with <code>NoKvClusterFitsError</code>, the table summarised per reason. The
+          whole ranked table is in progress and in the result, so you can see why B was chosen over A.</p>
+        </div>
+      </div>
+
+      <!-- 3 -->
+      <div class="step">
+        <div class="marker">3</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>create_vm_on_cluster</h3>
+            <span class="phase">phase <b>creating-vm</b></span>
+          </div>
+          <p>The run draws six hex digits from its own random (replay-safe). A draw whose MAC tail is
+          already any VM&rsquo;s in the zone is dropped without a call. Then ONE <b>PUT</b> on the chosen
+          cluster&rsquo;s <b>kv-vm-api</b>: name <code>ocp-&lt;infraenv&gt;-&lt;suffix&gt;</code>, the namespace,
+          the size, the MAC. The agent renders the platform&rsquo;s <code>vm.yaml</code> (storage class,
+          network and node selector are its own per-cluster values) and creates the VM Halted, labelled
+          <code>redfish-enabled: "true"</code>.</p>
+          <div class="calls">
+            <div class="call sm"><span class="verb">PUT</span><span class="path">/v1/vms/&lt;name&gt; <em>&middot; {"namespace", "cpu", "memory_gib", "mac", "labels"} &middot; 201 created, 200 same identity already there</em></span></div>
+          </div>
+          <p class="note"><b>Idempotent by name and identity</b>: a retry after a lost answer gets 200 for its
+          own VM (<code>created: false</code> in the result &mdash; a retry artifact, never something a re-run
+          relies on). A <b>409</b> means the name holds <em>another</em> identity, born between the capacity
+          read and the PUT: the run redraws. At most <b>3 draws</b> (a taken MAC and a 409 each spend one),
+          then <code>VmNameExhaustedError</code>. The create is <b>out-waited</b> on this cluster &mdash; an
+          agent outage is retried without bound, never answered by moving to another cluster.</p>
+        </div>
+      </div>
+
+      <!-- 4 -->
+      <div class="step">
+        <div class="marker">4</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>await_vm_ready</h3>
+            <span class="phase">phase <b>awaiting-root-disk</b></span>
+          </div>
+          <p>ONE heartbeating activity polls the VM every <b>8 s</b> until its root disk&rsquo;s DataVolume
+          is <code>Succeeded</code> with its PVC bound and KubeVirt has admitted the VM. Its clock lives in
+          the heartbeat, so a retry on another worker pod resumes it rather than starting over.</p>
+          <div class="calls">
+            <div class="call sm"><span class="verb">GET</span><span class="path">/v1/vms/&lt;name&gt;?namespace= <em>&middot; every 8 s, heartbeat each poll</em></span></div>
+          </div>
+          <p class="note"><b>Bounded at 10 minutes</b> on the activity&rsquo;s own clock. The VM vanishing
+          meanwhile fails the run with <code>VmDisappearedError</code> (someone else deleted it; creating
+          it again would be a second VM under a name the run no longer owns).</p>
+        </div>
+      </div>
+
+      <!-- 5 -->
+      <div class="step">
+        <div class="marker">5</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>delete_vm_on_cluster</h3>
+            <span class="phase">phase <b>removing-vm</b> &middot; only on the deadline</span>
+          </div>
+          <p>No bound root disk after 10 minutes: the run deletes <b>its own</b> VM and its DataVolume
+          &mdash; by name <em>and</em> by the MAC it gave it, so the agent deletes nothing else &mdash; then
+          fails with <code>VmRootDiskNotBoundError</code> quoting the last phase seen.</p>
+          <div class="calls">
+            <div class="call sm"><span class="verb">DELETE</span><span class="path">/v1/vms/&lt;name&gt;?namespace=&amp;mac= <em>&middot; 204 deleted, 404 already gone (both success), 409 not this MAC</em></span></div>
+          </div>
+          <p class="note">Why delete rather than leave it: a re-run of the slot is a <em>new</em> execution
+          with a <em>new</em> suffix. It cannot converge on the orphan; it would add one VM per attempt.
+          The usual cause is a <b>WaitForFirstConsumer</b> storage class, which never binds a Halted
+          VM&rsquo;s disk: the VM&rsquo;s storage class must bind <b>Immediately</b>. A 409 on the delete means
+          someone replaced the VM under that name; the run leaves it and fails with
+          <code>VmIdentityConflictError</code>.</p>
+        </div>
+      </div>
+
+      <!-- done -->
+      <div class="step done">
+        <div class="marker">&#10003;</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>Result</h3>
+            <span class="phase">phase <b>completed</b></span>
+          </div>
+          <p>The VM&rsquo;s <code>vm_name</code> and <code>mac</code>, its namespace and size, the
+          <code>kv_cluster</code> it is on (day1 name, chart <code>clusterName</code>, HostedCluster, the
+          agent host used), the full <code>placement</code> table, <code>redraws</code>,
+          <code>root_disk_phase</code>, and the request echoed back (<code>infra_env</code>,
+          <code>mce_cluster</code>, <code>site</code>, <code>zone</code>). The VM is Halted, waiting for
+          server-scan to list it and add-server-to-mce to install it.</p>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ========================================================== FAILURES -->
+  <section id="failures">
+    <div class="sec-head">
+      <div class="eyebrow">When it stops</div>
+      <h2>Classified errors fail the run; everything else is out-waited</h2>
+      <p class="lede">Every error below is a <b>FAILED run</b> on the status endpoint, never a 4xx on the
+      trigger, and fails after one attempt &mdash; a retry would get the same answer. Only one of them
+      leaves the run having written anything, and that one undoes it first.</p>
+    </div>
+
+    <h3 style="margin:0 0 10px">Raised by the workflow itself</h3>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>error</th><th>when</th></tr></thead>
+        <tbody>
+          <tr><td class="k">NoKvClusterError</td><td class="muted"><b>listing-kv-clusters</b>: the seed folder lists no <code>ocp4-kubevirt-&lt;site&gt;-&lt;zone&gt;&hellip;</code> cluster. The message names the folder and the prefix. Nothing was read from or written to any cluster.</td></tr>
+          <tr><td class="k">NoKvClusterFitsError</td><td class="muted"><b>ranking-kv-clusters</b>: no cluster takes the VM under the buffer. The message groups the clusters by reason (no node with the headroom, past the buffer, unreachable, no agent, token refused, malformed). Nothing was written.</td></tr>
+          <tr><td class="k">VmNameExhaustedError</td><td class="muted"><b>creating-vm</b>: three draws, each a MAC already in the zone or a 409. Nothing of this run survives on the cluster; run it again for a fresh draw.</td></tr>
+          <tr><td class="k">VmRootDiskNotBoundError</td><td class="muted"><b>removing-vm</b>: the root disk did not bind within 10 min; the VM was deleted again. Check the storage class binds Immediately, then the DataVolume and the CDI log on that cluster.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 style="margin:24px 0 10px">Raised by an activity, non-retryable</h3>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>error</th><th>when</th></tr></thead>
+        <tbody>
+          <tr><td class="k">KvAgentAuthError</td><td class="muted">Every reachable cluster&rsquo;s kv-capacity refused <code>KV_CAPACITY_TOKEN</code>, or the chosen cluster&rsquo;s kv-vm-api refused <code>KV_VM_API_TOKEN</code> (401/403). Rotate the Secret with the agents.</td></tr>
+          <tr><td class="k">VmNamespaceNotFoundError</td><td class="muted">The VM&rsquo;s <code>namespace</code> does not exist on the chosen cluster (404 on the PUT). The platform creates chassis namespaces; this run never does.</td></tr>
+          <tr><td class="k">VmRequestRejectedError</td><td class="muted">kv-vm-api refused the request (422): a shape its template cannot render, or one the cluster&rsquo;s API server / an admission webhook refused. The agent&rsquo;s (or the cluster&rsquo;s) own wording is carried.</td></tr>
+          <tr><td class="k">VmDisappearedError</td><td class="muted"><b>awaiting-root-disk</b>: the VM is gone before its disk bound (404). Something else deleted it.</td></tr>
+          <tr><td class="k">VmIdentityConflictError</td><td class="muted">On the <b>delete</b> only: the VM under that name no longer carries this run&rsquo;s MAC (409) &mdash; replaced by someone else, so the run leaves it. On the <b>create</b> a 409 is a redraw, not a failure.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p class="note" style="margin-top:10px">Everything else is <b>retried without bound</b>, backing off from
+    1 s to at most 1 min between attempts: the day1 repo unreachable or without <code>main</code>
+    (<code>ValuesRepoGitError</code>, <code>ValuesBranchNotFoundError</code>), <em>no</em> cluster of the zone
+    readable (<code>KvCapacityUnavailableError</code> &mdash; typically the agents not deployed yet), the chosen
+    cluster&rsquo;s kv-vm-api unreachable or answering 5xx (<code>KvVmApiUnavailableError</code>). The run stays
+    RUNNING in its phase and the failure shows on the activity in the Temporal UI.</p>
+    <p class="note">The two <b>reads</b> (steps 1&ndash;2) carry a 5-minute schedule-to-start timeout: with no
+    <code>vm-lifecycle-worker</code> polling, they fail the run saying so, before anything exists. The
+    create, the wait and the delete carry <b>none</b> on purpose &mdash; Temporal never retries that timeout,
+    and a limb pod away for five minutes after the PUT must not fail the run, or its rollback, and leave
+    the VM behind. Those wait for a worker, visible as a pending activity.</p>
+  </section>
+
+  <!-- ======================================================= IDEMPOTENCY -->
+  <section id="idempotency">
+    <div class="sec-head">
+      <div class="eyebrow">Running it twice</div>
+      <h2>A re-run is a new VM; a retry is the same one</h2>
+      <p class="lede">Temporal retries activities and operators re-POST things. The two are different
+      here, on purpose.</p>
+    </div>
+
+    <div class="grid-2">
+      <div class="panel">
+        <h3>Inside one run: idempotent by identity</h3>
+        <p>The PUT carries the VM&rsquo;s whole identity (namespace, size, MAC, labels). Retried after a
+        lost answer, it finds its own VM and gets 200: <code>created: false</code> in the result, nothing
+        duplicated. The delete carries the MAC, so a retried delete after a 204 gets 404 &mdash; success.
+        The ready wait resumes its clock from its last heartbeat.</p>
+      </div>
+      <div class="panel">
+        <h3>Across runs: a slot, and a fresh draw</h3>
+        <p>The id is <code>create-vm-&lt;mce&gt;_&lt;infra_env&gt;_&lt;slot&gt;</code>. Asking again while a run is
+        in flight fills the <em>next</em> free slot &mdash; it is asking for one more VM, so it is never a
+        409 (only when all 100 slots are busy). A finished slot is free again. Every run draws its own
+        suffix, so a re-run never resumes an earlier VM &mdash; which is why a failed run leaves nothing
+        behind: there would be no way back to it.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- =============================================================== API -->
+  <section id="api">
+    <div class="sec-head">
+      <div class="eyebrow">HTTP surface</div>
+      <h2>How you start it and how you watch it</h2>
+      <p class="lede">Served by <code>workflows-orchestrator-api</code> (Swagger at <code>/docs</code>).
+      Async: the POST hands back the workflow id at once and you poll it. The API has no auth of its own
+      &mdash; anyone who can reach it can start a run.</p>
+    </div>
+
+    <div class="api">
+
+      <div class="endpoint">
+        <div class="endpoint-head">
+          <span class="method">POST</span>
+          <span class="path">/workflows/vm-lifecycle/create-vm</span>
+          <span class="ret">202 &middot; 409 only when all 100 slots are busy &middot; 502 when Temporal refuses</span>
+        </div>
+        <div class="endpoint-body">
+          <p>Two fields are required: the MCE and the InfraEnv. <code>namespace</code> defaults to
+          <code>inventory</code>; <code>count</code> asks for several VMs. <code>mce_cluster</code> is
+          accepted with or without its <code>ocp4-</code> prefix and must be named
+          <code>ocp4-&lt;env&gt;-mce-&lt;site&gt;-&lt;letter&gt;</code>; <code>infra_env</code> must be a KubeVirt
+          InfraEnv of the convention.</p>
+          <pre><span class="c">// request — one VM</span>
+{
+  "mce_cluster": "prod-mce-bat-yam-a",
+  "infra_env":   "x201-zone-a-8"
+}
+
+<span class="c">// 202 response — the first free slot</span>
+{ "workflow_id": "create-vm-ocp4-prod-mce-bat-yam-a_x201-zone-a-8_1", "run_id": "…" }
+
+<span class="c">// request — three VMs, in another chassis namespace</span>
+{
+  "mce_cluster": "ocp4-prod-mce-bat-yam-a",
+  "infra_env":   "x201-zone-a-8",
+  "namespace":   "redfish-vms",
+  "count":       3
+}
+
+<span class="c">// 202 response — one item per slot looked at</span>
+{
+  "started": 2, "already_running": 1, "failed": 0,
+  "results": [
+    { "slot": 1, "workflow_id": "create-vm-ocp4-prod-mce-bat-yam-a_x201-zone-a-8_1", "status": "already_running" },
+    { "slot": 2, "workflow_id": "create-vm-ocp4-prod-mce-bat-yam-a_x201-zone-a-8_2", "status": "started", "run_id": "…" },
+    { "slot": 3, "workflow_id": "create-vm-ocp4-prod-mce-bat-yam-a_x201-zone-a-8_3", "status": "started", "run_id": "…" }
+  ]
+}</pre>
+          <p class="note">The body <b>forbids unknown fields</b>: anything besides <code>mce_cluster</code>,
+          <code>infra_env</code>, <code>namespace</code> and <code>count</code> is a 422, as is a
+          <code>-metal</code> InfraEnv, a name outside the convention, or a <code>count</code> outside
+          1&ndash;20.</p>
+        </div>
+      </div>
+
+      <div class="endpoint">
+        <div class="endpoint-head">
+          <span class="method">GET</span>
+          <span class="path">/workflows/runs/{workflow_id}</span>
+          <span class="ret">200</span>
+        </div>
+        <div class="endpoint-body">
+          <p>Domain-agnostic: workflow ids are globally unique, so one route serves every domain. It
+          addresses the <code>progress</code> query by name, so the response carries the live phase, the
+          candidates, the ranking table once read, and the chosen cluster, name and MAC once drawn. A
+          completed run carries the result instead; a failed one carries its <code>error</code>.</p>
+          <pre><span class="c">// 200 while running</span>
+{
+  "workflow_id":   "create-vm-ocp4-prod-mce-bat-yam-a_x201-zone-a-8_1",
+  "workflow_type": "CreateVmWorkflow",
+  "status":        "RUNNING",
+  "progress": {
+    "phase":         "awaiting-root-disk",
+    "kv_candidates": ["ocp4-kubevirt-bat-yam-a1", "ocp4-kubevirt-bat-yam-a2"],
+    "placement":     { "chosen": "ocp4-kubevirt-bat-yam-a2", "ranked": [ … ], "buffer_percent": 30, … },
+    "kv_cluster":    "ocp4-kubevirt-bat-yam-a2",
+    "vm_name":       "ocp-x201-zone-a-8-3f9c1a",
+    "mac":           "02:a1:b2:3f:9c:1a",
+    "redraws":       0
+  }
+}
+
+<span class="c">// 200 when completed</span>
+{
+  "status": "COMPLETED",
+  "result": {
+    "vm_name":    "ocp-x201-zone-a-8-3f9c1a",
+    "mac":        "02:a1:b2:3f:9c:1a",
+    "namespace":  "inventory",
+    "cpu": 8, "memory_gib": 64,
+    "kv_cluster": { "name": "ocp4-kubevirt-bat-yam-a2", "cluster_name": "kubevirt-bat-yam-a2",
+                    "hosted_cluster": "openshift-kubevirt-bat-yam-a2", "site": "bat-yam", "zone": "a",
+                    "agent_host": "kv-capacity.apps.kubevirt-bat-yam-a2.example.net" },
+    "placement":  { "chosen": "ocp4-kubevirt-bat-yam-a2", "ranked": [ … ], "buffer_percent": 30,
+                    "pod_cpu_millicores": 7000, "pod_memory_bytes": 69793218560, "known_macs": [ … ] },
+    "redraws": 0, "root_disk_phase": "Succeeded", "created": true,
+    "infra_env": "x201-zone-a-8", "mce_cluster": "ocp4-prod-mce-bat-yam-a", "site": "bat-yam", "zone": "a"
+  }, …
+}</pre>
+          <p class="note">A phase that does not advance past <b>listing-kv-clusters</b> usually means nothing is
+          polling <code>vm-lifecycle-activity</code>: no <code>vm-lifecycle-worker</code> is deployed, or it
+          cannot reach Temporal. One stuck in <b>ranking-kv-clusters</b> with every row <code>no-agent</code>
+          means the agents are not up on that zone&rsquo;s clusters yet.</p>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ========================================================= REFERENCE -->
+  <section id="reference">
+    <div class="sec-head">
+      <div class="eyebrow">Reference</div>
+      <h2>Inputs, result, phases, the agents, and what the limb needs configured</h2>
+    </div>
+
+    <h3 style="margin-bottom:10px">Request body &mdash; <code>CreateVmRequest</code></h3>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>Field</th><th>Type</th><th>Rules</th><th>What it&rsquo;s for</th></tr></thead>
+        <tbody>
+          <tr><td class="k">mce_cluster</td><td class="k">str</td><td class="muted">required; <code>ocp4-</code> added if missing; must be <code>ocp4-&lt;env&gt;-mce-&lt;site&gt;-&lt;letter&gt;</code></td><td class="muted">Which MCE the InfraEnv belongs to. Its name gives the <b>site</b>, and with the zone the seed cluster whose folder lists the KubeVirt clusters.</td></tr>
+          <tr><td class="k">infra_env</td><td class="k">str</td><td class="muted">required; <code>&lt;conf&gt;[-&lt;letter&gt;]-zone-&lt;zone&gt;-&lt;cpu&gt;</code>, 1&ndash;256 vCPU; <code>-metal</code> refused</td><td class="muted">Gives the <b>zone</b> and the VM&rsquo;s size (memory = cpu &times; 8 GiB), and names the VM.</td></tr>
+          <tr><td class="k">namespace</td><td class="k">str</td><td class="muted">non-empty, default <code>inventory</code></td><td class="muted">The VM&rsquo;s namespace on the KubeVirt cluster &mdash; the InfraEnv&rsquo;s namespace on the MCE, verbatim. Must exist there as a kubevirt-redfish chassis namespace.</td></tr>
+          <tr><td class="k">count</td><td class="k">int | null</td><td class="muted">1&ndash;20</td><td class="muted">That many runs, one per free slot, with a per-run report. Without it one run and <code>{workflow_id, run_id}</code>.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note" style="margin-top:10px">The run is started with a <code>CreateVmRunArgs</code> wrapping a
+    <code>CreateVmInput</code>: the three fields above plus <code>site</code>, <code>zone</code>, <code>cpu</code>
+    and <code>memory_gib</code>, derived here once and carried, never re-derived on replay.</p>
+
+    <h3 style="margin:28px 0 10px">Result &mdash; <code>CreateVmResult</code></h3>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td class="k">vm_name</td><td class="k">str</td><td class="muted"><code>ocp-&lt;infraenv&gt;-&lt;6 hex&gt;</code> &mdash; the VM, and the server name server-scan will list.</td></tr>
+          <tr><td class="k">mac</td><td class="k">str</td><td class="muted"><code>&lt;VM_MAC_PREFIX&gt;:xx:xx:xx</code>, the same six hex digits as the name. The BareMetalHost&rsquo;s boot MAC.</td></tr>
+          <tr><td class="k">namespace</td><td class="k">str</td><td class="muted">Where the VM is.</td></tr>
+          <tr><td class="k">cpu</td><td class="k">int</td><td class="muted">vCPUs.</td></tr>
+          <tr><td class="k">memory_gib</td><td class="k">int</td><td class="muted">Guest memory, GiB.</td></tr>
+          <tr><td class="k">kv_cluster</td><td class="k">KvClusterRef</td><td class="muted">The cluster chosen: day1 <code>name</code>, chart <code>cluster_name</code>, <code>hosted_cluster</code>, <code>site</code>, <code>zone</code>, <code>agent_host</code>.</td></tr>
+          <tr><td class="k">placement</td><td class="k">KvPlacement</td><td class="muted">The ranked table: every candidate with <code>fits</code>, <code>skip_reason</code>/<code>skip_detail</code>, fill before/after on CPU and memory, the largest node headroom, <code>halted_reservations</code>; plus <code>chosen</code>, <code>buffer_percent</code>, the pod request (<code>pod_cpu_millicores</code>, <code>pod_memory_bytes</code>) and <code>known_macs</code>.</td></tr>
+          <tr><td class="k">redraws</td><td class="k">int</td><td class="muted">Suffixes given up: MACs already in the zone, and 409s.</td></tr>
+          <tr><td class="k">root_disk_phase</td><td class="k">str | null</td><td class="muted">The DataVolume phase when the wait ended (<code>Succeeded</code>).</td></tr>
+          <tr><td class="k">created</td><td class="k">bool</td><td class="muted"><code>false</code> only when an activity retry inside this run found its earlier PUT had landed.</td></tr>
+          <tr><td class="k">infra_env, mce_cluster, site, zone</td><td class="k">str</td><td class="muted">The request, echoed.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 style="margin:28px 0 10px">Phases you&rsquo;ll see on the status endpoint</h3>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>phase</th><th>Meaning</th><th>Normal duration</th></tr></thead>
+        <tbody>
+          <tr><td class="k">pending</td><td class="muted">Run accepted, nothing read yet</td><td class="muted">instant</td></tr>
+          <tr><td class="k">listing-kv-clusters</td><td class="muted">Cloning day1 and listing the zone&rsquo;s seed folder</td><td class="muted">seconds</td></tr>
+          <tr><td class="k">ranking-kv-clusters</td><td class="muted">Reading every cluster&rsquo;s kv-capacity at once and ranking</td><td class="muted">seconds, &le; 45 s</td></tr>
+          <tr><td class="k">creating-vm</td><td class="muted">The PUT on the chosen cluster, redrawing on a 409 (&le; 3 draws)</td><td class="muted">seconds</td></tr>
+          <tr><td class="k">awaiting-root-disk</td><td class="muted">Polling every 8 s until the root disk is bound and the VM admitted &mdash; <b>bounded, &le; 10 min</b></td><td class="muted">seconds to minutes (the blank 120Gi DataVolume)</td></tr>
+          <tr><td class="k">removing-vm</td><td class="muted">Only after that deadline: deleting the run&rsquo;s own VM, then <code>VmRootDiskNotBoundError</code></td><td class="muted">seconds</td></tr>
+          <tr><td class="k">completed</td><td class="muted">The VM is Halted on its cluster with its disk bound</td><td class="muted">&mdash;</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 style="margin:28px 0 10px">The agents on each KubeVirt cluster</h3>
+    <p class="note" style="margin-top:0">Two services per cluster, their own repo (<code>kv-agents</code>),
+    deployed by the platform behind Routes, one fleet bearer token each; the contract is
+    <code>docs/design/kv-agents-api.md</code> and the models&rsquo; vendored copy is pinned by
+    <code>tests/test_kv_agents_contract.py</code>.</p>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>agent</th><th>call</th><th>answers</th><th>RBAC it holds</th></tr></thead>
+        <tbody>
+          <tr><td class="k">kv-capacity</td><td class="muted"><code>GET /v1/capacity</code></td><td class="muted">nodes (schedulable, allocatable, Pending|Running requests), Halted launcher-less VMs of ours with their would-be requests, every VM&rsquo;s MAC</td><td class="muted">get/list nodes, pods, virtualmachines, virtualmachineinstances</td></tr>
+          <tr><td class="k">kv-vm-api</td><td class="muted"><code>PUT /v1/vms/{name}</code></td><td class="muted">201 created &middot; 200 same identity &middot; 409 another identity &middot; 404 no namespace &middot; 422 &middot; 401</td><td class="muted" rowspan="3">create/get/delete virtualmachines, get/delete datavolumes, get namespaces</td></tr>
+          <tr><td class="k"></td><td class="muted"><code>GET /v1/vms/{name}?namespace=</code></td><td class="muted">the VM&rsquo;s MAC, size, runStrategy, admitted, root disk phase/bound &middot; 404</td></tr>
+          <tr><td class="k"></td><td class="muted"><code>DELETE /v1/vms/{name}?namespace=&amp;mac=</code></td><td class="muted">204 deleted (VM + DataVolume) &middot; 404 already gone &middot; 409 not that MAC</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 style="margin:28px 0 10px">Where it runs</h3>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>queue</th><th>polled by</th><th>used for</th></tr></thead>
+        <tbody>
+          <tr><td class="k">create-vm-workflow</td><td class="muted">the brain, <code>workflows-orchestrator</code></td><td class="muted">the workflow itself</td></tr>
+          <tr><td class="k">vm-lifecycle-activity</td><td class="muted"><code>vm-lifecycle-worker</code>, one release on the hub</td><td class="muted">all five activities, for every zone</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note" style="margin-top:10px">Timeouts: the list 180 s (a git clone), the rank 60 s, the
+    create and the delete 90 s, the ready wait 12 min with a 2 min heartbeat timeout; retries unbounded
+    with the classes above as the only stops.</p>
+    <p class="note" style="margin-top:10px"><b>Proven end to end</b> on 2026-11-05 against a real
+    OpenShift Virtualization cluster (nine simulated KubeVirt clusters, the brain and the limb from
+    source): the create, best-fit on real numbers, a Halted reservation tipping the next create,
+    every skip reason, the three placement failures, the wrong-token failure and the 10 min
+    rollback &mdash; <code>docs/lab/create-vm/</code> in the repo rebuilds it. Two things it found:
+    the root disk is <code>ReadWriteMany</code> + <code>Filesystem</code>, which ceph-rbd refuses
+    (the cluster&rsquo;s storage class must allow that pair, or every run rolls back); and
+    <code>count</code> runs rank before any of them creates, so they all land on the same cluster
+    &mdash; reservations protect sequential creates only. The same scenarios run on every
+    <code>pytest</code> against a simulated fleet (<code>tests/test_create_vm_e2e.py</code>).</p>
+
+    <h3 style="margin:28px 0 10px">What <code>vm-lifecycle-worker</code> needs for this run</h3>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>key</th><th>where</th><th>notes</th></tr></thead>
+        <tbody>
+          <tr><td class="k">DAY1_REPO_URL</td><td class="muted"><code>vm-lifecycle-config</code></td><td class="muted">The day1 values repo, <code>https://</code>, read at <code>main</code>.</td></tr>
+          <tr><td class="k">DAY1_GIT_TOKEN</td><td class="muted">Secret <code>day1-git-token</code></td><td class="muted">The SAME Secret segment-lifecycle and upgrade-gitops mount &mdash; one Secret, three consumers. Never logged.</td></tr>
+          <tr><td class="k">KV_CAPACITY_URL_TEMPLATE, KV_VM_API_URL_TEMPLATE</td><td class="muted"><code>vm-lifecycle-config</code></td><td class="muted">The agents&rsquo; Routes, rendered per cluster. The apps domain is <code>apps.&lt;clusterName&gt;.&lt;base&gt;</code>, so the templates use <code>{cluster}</code> (chart clusterName); <code>{name}</code> (day1 file stem), <code>{hosted_cluster}</code>, <code>{site}</code> and <code>{zone}</code> are available too. Checked at startup.</td></tr>
+          <tr><td class="k">KV_CAPACITY_TOKEN, KV_VM_API_TOKEN</td><td class="muted">Secrets <code>kv-capacity-token</code>, <code>kv-vm-api-token</code></td><td class="muted">The agents&rsquo; fleet tokens. Rejected &rarr; <code>KvAgentAuthError</code>.</td></tr>
+          <tr><td class="k">KV_AGENT_CA</td><td class="muted">chart value <code>kvAgentCa</code></td><td class="muted">A PEM CA to verify the Routes&rsquo; certificates. <b>Empty = not verified</b> (the operator&rsquo;s decision: the Routes carry the ingress wildcard certificate).</td></tr>
+          <tr><td class="k">HEADROOM_BUFFER_PERCENT</td><td class="muted"><code>vm-lifecycle-config</code></td><td class="muted">Our policy: the share of every cluster&rsquo;s schedulable allocatable kept free after placing, per cluster, 0&ndash;90.</td></tr>
+          <tr><td class="k">VM_MAC_PREFIX</td><td class="muted"><code>vm-lifecycle-config</code></td><td class="muted"><code>xx:xx:xx</code>, locally administered and unicast (first octet&rsquo;s low bits <code>10</code>). The run draws the other three octets.</td></tr>
+          <tr><td class="k">RBAC</td><td class="muted">&mdash;</td><td class="muted">None. The limb holds no Kubernetes credential; the agents hold theirs.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note" style="margin-top:10px">Prerequisites on the platform side: the agents deployed on every
+    KubeVirt cluster of the zone with their Routes up; <code>vm.yaml.j2</code> rendered by kv-vm-api with a
+    <code>macAddress</code> and a storage class that binds <b>Immediately</b>; the chassis namespace existing
+    on each cluster and listed in kubevirt-redfish; kubevirt-redfish on <code>systemIdConvention: legacy</code>,
+    so the Redfish system id is the bare VM name &mdash; the same <code>ocp-&lt;infraenv&gt;-&lt;suffix&gt;</code>
+    server-scan lists and add-server-to-mce matches.</p>
+  </section>
+
+  <footer>
+    <span>workflow_domains/vm_lifecycle/create_vm.py</span>
+    <span>workflow_domains/vm_lifecycle/router.py</span>
+    <span>workflow_domains/routers/slots.py</span>
+    <span>activities/vm_lifecycle/activities.py</span>
+    <span>activities/vm_lifecycle/placement.py</span>
+    <span>activities/vm_lifecycle/day1_repo.py</span>
+    <span>activities/day1_repo.py</span>
+    <span>shared/models/vm_lifecycle.py</span>
+    <span>shared/infraenv_names.py</span>
+    <span>docs/design/kubevirt-vm-placement.md</span>
+  </footer>
+
+</div>
+</main>
+
+<script src="/assets/nav.js?v=__DOC_VERSION__" defer></script>
+</body>
+</html>

@@ -633,8 +633,9 @@ place that changes them:
    showing the new replicas — not new nodes Ready.
 
 **On a scale-down, which servers leave is the NodePool's own choice**, never the
-request's: a label or annotation `redbull.io/scale-down-policy` on the NodePool
-— `fewest-pods`, `least-requested` (CPU/memory requested out of allocatable) or
+request's: an annotation `redbull.io/scale-down-policy` on the NodePool, written
+under the day1 entry's `annotations:` (a label of that key, set by hand, is read
+too) — `fewest-pods`, `least-requested` (CPU/memory requested out of allocatable) or
 `least-utilized` (live use, from `metrics.k8s.io`). Under every policy the
 Machines CAPI counts unhealthy go first, by name — CAPI's own order, which is
 what makes the mark decide in 4.18's CAPI as in later ones — then a broken or

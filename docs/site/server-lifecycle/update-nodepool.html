@@ -331,19 +331,21 @@
       (<code>machine.cluster.x-k8s.io/exclude-node-draining</code>). The watch after the sync still checks
       that the marked Machines are the ones deleting.</p>
     </div>
-    <p><b>Setting it in day1.</b> Under the NodePool&rsquo;s <code>nodepool[]</code> entry, as a label or an
-    annotation. The hostedclusters-setup chart passes every label of an entry and its
-    <code>annotations</code> onto the NodePool (since 2026-11-08, GitHub copy):</p>
+    <p><b>Setting it in day1.</b> As an <b>annotation</b> of the NodePool&rsquo;s <code>nodepool[]</code> entry.
+    The hostedclusters-setup chart renders an entry&rsquo;s <code>annotations</code> onto the NodePool (since
+    2026-11-08, GitHub copy); its labels stay <code>allowDeletion</code>, <code>maxReplicas</code> and
+    <code>minReplicas</code>:</p>
     <pre><code>nodepool:
   - infraEnvName: dell-r660-128c-1024gb
     replicas: 3
     labels:
       allowDeletion: false
+    annotations:
       redbull.io/scale-down-policy: fewest-pods</code></pre>
-    <p class="note">The air-gapped GitLab copy of the chart renders only <code>allowDeletion</code>,
-    <code>maxReplicas</code> and <code>minReplicas</code> until it gets the same change. There, set the key on the
-    NodePool directly (<code>oc label nodepool &lt;name&gt; -n hcp-&lt;cluster&gt;
-    redbull.io/scale-down-policy=fewest-pods</code>); Argo CD leaves a label it never set alone.</p>
+    <p class="note">The air-gapped GitLab copy of the chart renders no entry annotations until it gets the
+    same change. There, set the key on the NodePool directly (<code>oc annotate nodepool &lt;name&gt; -n
+    hcp-&lt;cluster&gt; redbull.io/scale-down-policy=fewest-pods</code>); Argo CD leaves an annotation it never
+    set alone. The run reads a label of that key too, for one set by hand.</p>
     <p class="note"><b>The <code>maxReplicas</code> / <code>minReplicas</code> labels are not the run&rsquo;s</b>
     (the operator, 2026-11-08). The commit changes <code>replicas</code> only. Left unwritten, the chart derives
     them from <code>replicas</code> (<code>replicas</code> and <code>replicas &minus; 1</code>), so they follow;

@@ -670,11 +670,13 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
     takes the marks off again; after the commit landed they are NEVER removed.
     Then one heartbeating watch (10 min) that the marked Machines are the ones
     deleting — an unmarked one is `ScaleDownWrongMachineError`. The key is
-    written in day1 under the entry's `labels:` or `annotations:`: the
-    hostedclusters-setup chart passes both onto the NodePool since 2026-11-08
-    (GitHub copy; the air-gapped GitLab copy renders only `allowDeletion` /
-    `maxReplicas` / `minReplicas` until it gets the same change — set the key
-    on the NodePool by hand there).
+    written in day1 as an ANNOTATION of the entry (`annotations:`): the
+    hostedclusters-setup chart renders those onto the NodePool since 2026-11-08
+    (GitHub copy). Not a label — the operator kept the chart's labels to its
+    three (`allowDeletion` / `maxReplicas` / `minReplicas`); the run still
+    reads a label of the key, for one set by hand. The air-gapped GitLab copy
+    renders no entry annotations until it gets the same change — annotate the
+    NodePool by hand there.
   - **`maxReplicas` / `minReplicas` are NOT the run's** (the operator,
     2026-11-08): the commit changes `replicas` only. Unwritten, the chart
     derives them from `replicas` on every render, so they follow; written in

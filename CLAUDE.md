@@ -82,8 +82,10 @@ Prod charts are VENDORED into the Argo CD repo, at
 `redbull-platform/gitops/charts/<service>/`: `workflows-orchestrator` (brain: ONE release for
 all domains), `segment-lifecycle-worker`, `server-lifecycle-worker` and `server-provisioning-worker`
 (limbs: one per domain), cluster-upgrade's `cluster-upgrade-worker`, `upgrade-agent-worker`
-and `upgrade-gitops-worker` (since 2026-11-02; with `server-provisioning-worker`, these have no
-`gitops/services/` entry yet, so CI bumps their tags and Argo CD deploys nothing), and
+and `upgrade-gitops-worker` (since 2026-11-02; `upgrade-gitops-worker` and `cluster-upgrade-worker`
+have a `gitops/services/` entry since 2026-11-08, for update-nodepool (§4) — the latter for the
+sandbox MCE `ocp4-mce-workflow-test`; `upgrade-agent-worker` and `server-provisioning-worker` still
+have none, so CI bumps their tags and Argo CD deploys nothing), and
 `vm-lifecycle-worker` (written 2026-11-05, in redbull-platform's working tree until pushed: CI's
 bump of it fails until then, so its job is LAST in the chain). One generic ApplicationSet
 sweeps `gitops/services/<service>/app.yaml`, so the service FOLDER NAME is the Argo app name,
@@ -609,7 +611,10 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
     Nothing after the dash is read and no zone label is assumed — so a shorter
     kind takes the longer ones that start with it; the result lists what was
     selected. ONLY the cluster's own NodePools (`upgrade_state.nodepools_of`,
-    by `spec.clusterName`), never the rest of the MCE.
+    by `spec.clusterName`), never the rest of the MCE. A kind exists on the
+    AGENT platform only: a KubeVirt NodePool (the sandbox's
+    `ocp4-upgrade-demo`, the only day1 cluster on GitHub with NodePools) has no
+    InfraEnv, so it is set by name.
   - **Live and day1 must agree BOTH WAYS** (same NodePools, InfraEnvs, replicas)
     or `NodePoolReplicasDriftError` with nothing written. The one exception is
     the RESUME: day1 already holding a balanced plan for the requested total
@@ -664,7 +669,17 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
     nothing (`Day1FileChangedError`, `Day1ChangeRejectedError`, file not found)
     takes the marks off again; after the commit landed they are NEVER removed.
     Then one heartbeating watch (10 min) that the marked Machines are the ones
-    deleting — an unmarked one is `ScaleDownWrongMachineError`.
+    deleting — an unmarked one is `ScaleDownWrongMachineError`. The key is
+    written in day1 under the entry's `labels:` or `annotations:`: the
+    hostedclusters-setup chart passes both onto the NodePool since 2026-11-08
+    (GitHub copy; the air-gapped GitLab copy renders only `allowDeletion` /
+    `maxReplicas` / `minReplicas` until it gets the same change — set the key
+    on the NodePool by hand there).
+  - **`maxReplicas` / `minReplicas` are NOT the run's** (the operator,
+    2026-11-08): the commit changes `replicas` only. Unwritten, the chart
+    derives them from `replicas` on every render, so they follow; written in
+    the entry (the pre-slim style), they keep their value. Nothing we know of
+    reads them. Do not add them to the REPLICAS edit.
   - **The servers that leave stay in the MCE** as free Agents (the operator,
     2026-11-03) — no remove-server-from-mce child.
   - Needs no new RBAC: the server-lifecycle limb's `rbac.hostedClusters`
@@ -673,7 +688,12 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
     cluster-upgrade-worker (it reports `infra_env` / `scale_down_policy`; an
     older one fails the run by name, gated on the key's presence) and the new
     upgrade-gitops-worker (REPLICAS; an older one cannot decode it and the
-    commit is retried until it is up).
+    commit is retried until it is up) — both RUNNING, which neither was through
+    Argo CD before 2026-11-08: no worker on a queue fails the run at its first
+    call to it after the 5-min `schedule_to_start_timeout`, nothing written.
+    The sandbox's services: `gitops/services/upgrade-gitops-worker/` and
+    `gitops/services/cluster-upgrade-worker/` (MCE `ocp4-mce-workflow-test`) in
+    redbull-platform.
 - **create-vm (domain `vm-lifecycle`) makes ONE Halted VirtualMachine for a KubeVirt InfraEnv, on the
   best-fitting KubeVirt cluster of the InfraEnv's zone — the step before add-server-to-mce for an
   InfraEnv whose hosts are VMs.** Designed with the operator 2026-11-04/05 (plan file
@@ -1308,8 +1328,11 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   end of the sequential chain, so a `main` build publishes `vX.Y.Z`, bumps `image.tag` in
   redbull-platform's `gitops/charts/<limb>-worker/values.yaml` and tags `<limb>-worker/vX.Y.Z`
   there. Until 2026-11-02 they were image-only jobs tagged `<branch-slug>-<short sha>` with the tag
-  set by hand; do not go back to that. None of the three has a `gitops/services/` entry yet, so
-  their bumps deploy nothing; deploy them by adding one (per MCE for the two per-MCE limbs). The
+  set by hand; do not go back to that. Since 2026-11-08 `upgrade-gitops-worker` and
+  `cluster-upgrade-worker` (sandbox MCE `ocp4-mce-workflow-test`, its values as helm parameters in
+  its app.yaml, because `sync-upgrade-charts` overwrites the chart's values.yaml) have a
+  `gitops/services/` entry; `upgrade-agent-worker` has none yet, so its bumps deploy nothing —
+  deploy it by adding one per MCE. The
   domain keeps THREE images, one per limb (§2): the operator confirmed it the same day.
 - Assumed already running: a Temporal server and the Segments Manager (via OpenShift routes or
   localhost — no port assumptions in code).

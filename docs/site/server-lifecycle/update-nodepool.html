@@ -96,6 +96,10 @@
     <p class="note">A <b>shorter</b> kind also takes the longer kinds that start with it: <code>cisco-m6</code>
     would select every <code>cisco-m6-*</code> NodePool. The result lists every NodePool selected with its
     InfraEnv, so a kind that is too wide shows there.</p>
+    <p class="note">A kind exists only on the <b>Agent platform</b>. A KubeVirt NodePool
+    (<code>platform: kubevirt</code>, the sandbox&rsquo;s <code>ocp4-upgrade-demo</code>) takes VMs, not
+    Agents: it has no InfraEnv, so no kind selects it (<code>NodePoolKindNotFoundError</code>). Set such a
+    NodePool by name.</p>
     <p>Only the NodePools <b>of the cluster you name</b> count: those in its HostedCluster&rsquo;s namespace whose
     <code>spec.clusterName</code> is that HostedCluster. Another cluster&rsquo;s NodePools of the same kind, on
     the same MCE, are never counted and never changed.</p>
@@ -327,8 +331,23 @@
       (<code>machine.cluster.x-k8s.io/exclude-node-draining</code>). The watch after the sync still checks
       that the marked Machines are the ones deleting.</p>
     </div>
-    <p class="note">For the key to come from day1, the hostedclusters-setup chart must pass an entry&rsquo;s
-    labels or annotations onto the NodePool. Where it does not, set it on the NodePool directly.</p>
+    <p><b>Setting it in day1.</b> Under the NodePool&rsquo;s <code>nodepool[]</code> entry, as a label or an
+    annotation. The hostedclusters-setup chart passes every label of an entry and its
+    <code>annotations</code> onto the NodePool (since 2026-11-08, GitHub copy):</p>
+    <pre><code>nodepool:
+  - infraEnvName: dell-r660-128c-1024gb
+    replicas: 3
+    labels:
+      allowDeletion: false
+      redbull.io/scale-down-policy: fewest-pods</code></pre>
+    <p class="note">The air-gapped GitLab copy of the chart renders only <code>allowDeletion</code>,
+    <code>maxReplicas</code> and <code>minReplicas</code> until it gets the same change. There, set the key on the
+    NodePool directly (<code>oc label nodepool &lt;name&gt; -n hcp-&lt;cluster&gt;
+    redbull.io/scale-down-policy=fewest-pods</code>); Argo CD leaves a label it never set alone.</p>
+    <p class="note"><b>The <code>maxReplicas</code> / <code>minReplicas</code> labels are not the run&rsquo;s</b>
+    (the operator, 2026-11-08). The commit changes <code>replicas</code> only. Left unwritten, the chart derives
+    them from <code>replicas</code> (<code>replicas</code> and <code>replicas &minus; 1</code>), so they follow;
+    written in the entry, they keep the value written.</p>
   </section>
 
   <!-- ========================================================= FAILURES -->

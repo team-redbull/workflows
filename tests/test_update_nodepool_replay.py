@@ -64,6 +64,8 @@ class Scenario:
     # Which child the run starts: "up", "down" or None.
     child: str | None
     fails: bool = False
+    # One NodePool by name instead of the kind (since 2026-11-08).
+    nodepool: str | None = None
 
 
 SCENARIOS: dict[str, Scenario] = {
@@ -75,6 +77,9 @@ SCENARIOS: dict[str, Scenario] = {
     "drift": Scenario(lambda: _Fleet((3, 3, 2), live=(4, 3, 2)), 10, None, fails=True),
     "commit-refused-marks-come-off": Scenario(_failing_commit, 8, "down", fails=True),
     "sync-refused": Scenario(_refused_sync, 10, "up", fails=True),
+    "one-nodepool-up": Scenario(lambda: _Fleet((3, 3, 2)), 5, "up", nodepool="alpha-zone-c"),
+    "one-nodepool-down-by-policy": Scenario(_policy_fleet, 1, "down", nodepool="alpha-zone-c"),
+    "one-nodepool-not-found": Scenario(lambda: _Fleet((3, 3, 2)), 4, None, fails=True, nodepool="alpha-zone-x"),
 }
 
 
@@ -90,7 +95,7 @@ async def _record(name: str) -> dict[str, WorkflowHistory]:
     async with _Harness(scenario.fleet()) as client:
         client: Client
         handle = await client.start_workflow(
-            UpdateNodePoolWorkflow.run, run_args(scenario.replicas),
+            UpdateNodePoolWorkflow.run, run_args(scenario.replicas, nodepool=scenario.nodepool),
             id=f"update-nodepool-replay-{name}", task_queue=UPDATE_NODEPOOL_WORKFLOW_QUEUE,
         )
         if scenario.fails:

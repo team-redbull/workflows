@@ -851,7 +851,11 @@ _KUBERNETES_NAME = r"^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$"
 
 
 class UpdateNodePoolRequest(UpdateNodePoolInput):
-    """The update-nodepool request body: strict at the edge, the MCE canonicalised here."""
+    """The update-nodepool request body: strict at the edge, the MCE canonicalised here.
+
+    Exactly one target: `infra_env_kind` (a total spread over that kind's
+    NodePools) or `nodepool` (one NodePool, set exactly). Both or neither is a 422.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -866,15 +870,25 @@ class UpdateNodePoolRequest(UpdateNodePoolInput):
     replicas: int = Field(
         ge=0,
         description=(
-            "The TOTAL replicas wanted over the cluster's NodePools of the kind, 0 allowed. The run "
-            "spreads it so no two of those NodePools are more than one replica apart."
+            "0 allowed. With `infra_env_kind`: the TOTAL over the cluster's NodePools of the kind, spread "
+            "so no two are more than one replica apart. With `nodepool`: that NodePool's replicas, set "
+            "exactly — the other NodePools are left as they are."
         ),
     )
-    infra_env_kind: str = Field(
+    infra_env_kind: str | None = Field(
+        default=None,
         pattern=_KUBERNETES_NAME,
         description=(
             "The InfraEnv kind: a NodePool is of it when the InfraEnv its agentLabelSelector names "
-            "is exactly this, or this followed by `-` (`<kind>-zone-a`, …)."
+            "is exactly this, or this followed by `-` (`<kind>-zone-a`, …). Or send `nodepool` instead."
+        ),
+    )
+    nodepool: str | None = Field(
+        default=None,
+        pattern=_KUBERNETES_NAME,
+        description=(
+            "One NodePool of the cluster, by name (`oc get nodepool -n <hc namespace>`): `replicas` is "
+            "then its own, and no balance rule applies. Or send `infra_env_kind` instead."
         ),
     )
 
@@ -884,6 +898,15 @@ class UpdateNodePoolRequest(UpdateNodePoolInput):
         """Canonical before the run starts: it builds the MCE's queues and is
         compared with the MCE folder day1 keeps the cluster in."""
         return canonical_mce_cluster(value)
+
+    @model_validator(mode="after")
+    def _one_target(self) -> UpdateNodePoolRequest:
+        if (self.nodepool is None) == (self.infra_env_kind is None):
+            raise ValueError(
+                "send exactly one of `nodepool` (that NodePool's replicas) and `infra_env_kind` "
+                "(a total over the kind's NodePools)"
+            )
+        return self
 
 
 async def _upgrade_running(client: Client, cluster: str) -> bool:
@@ -902,11 +925,12 @@ async def start_update_nodepool(
     update_request: UpdateNodePoolRequest,
     client: Client = Depends(get_temporal_client),
 ) -> StartWorkflowResponse:
-    """Set how many workers of one InfraEnv kind a hosted cluster runs — returns immediately (202).
+    """Set how many workers a hosted cluster runs, by InfraEnv kind or on one NodePool — returns immediately (202).
 
-    Reads the cluster's NodePools of the kind in day1 and on the MCE (they must
-    agree), spreads `replicas` over them within one replica of each other,
-    commits that to day1 `main` and syncs the cluster's Argo CD Application. On
+    Reads the cluster's NodePools of the kind — or the one named — in day1 and
+    on the MCE (they must agree). By kind, `replicas` is a total spread within
+    one replica of each other; by `nodepool`, that NodePool's own number, set
+    exactly. Commits that to day1 `main` and syncs the cluster's Argo CD Application. On
     a scale-down, a NodePool labelled or annotated `redbull.io/scale-down-policy`
     has the servers that leave chosen by that policy and marked first; without
     one, CAPI picks.

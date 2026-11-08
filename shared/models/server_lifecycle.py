@@ -1349,18 +1349,27 @@ class ScaleDownPolicy(str, Enum):
 
 
 class UpdateNodePoolInput(BaseModel):
-    """Input to UpdateNodePoolWorkflow: how many workers of one InfraEnv kind a hosted cluster runs.
+    """Input to UpdateNodePoolWorkflow: how many workers a hosted cluster runs, by kind or for one NodePool.
 
     `cluster` is the day1 cluster file's name without `.yaml` (also its Argo
-    CD Application), as upgrade-cluster takes it. `replicas` is the TOTAL over
-    the cluster's NodePools of the kind; 0 is allowed. A NodePool is of kind
-    K when the InfraEnv its agentLabelSelector names is `K` or starts with `K-`.
+    CD Application), as upgrade-cluster takes it. EXACTLY ONE target:
+
+      * `infra_env_kind` — `replicas` is the TOTAL over the cluster's
+        NodePools of that kind, spread so none are more than one apart. A
+        NodePool is of kind K when the InfraEnv its agentLabelSelector names is
+        `K` or starts with `K-`;
+      * `nodepool` — `replicas` is that ONE NodePool's, set exactly as asked,
+        whatever its siblings hold (the operator, 2026-11-08).
+
+    Both optional HERE (the API edge requires exactly one): `nodepool` came
+    after the first runs were recorded. 0 replicas is allowed.
     """
 
     mce_cluster: str = Field(min_length=1)
     cluster: str = Field(min_length=1)
     replicas: int = Field(ge=0)
-    infra_env_kind: str = Field(min_length=1)
+    infra_env_kind: str | None = None
+    nodepool: str | None = None
 
 
 class UpdateNodePoolRunArgs(BaseModel):
@@ -1406,7 +1415,7 @@ class NodePoolScalePlan(BaseModel):
 
     mce_cluster: str
     cluster: str
-    infra_env_kind: str
+    infra_env_kind: str | None = None  # None when the run names one NodePool
     path: str
     expected_blob: str
     hosted_cluster: str
@@ -1467,14 +1476,16 @@ class NodePoolScaleResult(BaseModel):
 class UpdateNodePoolResult(BaseModel):
     """What update-nodepool did: the kind's NodePools before and after, and its child's own result.
 
-    `direction` is `up`, `down` or `none` (the total was already the request:
-    nothing written, no child). `scale` is the child's result, on
-    `child_workflow_id`.
+    `direction` is `up`, `down` or `none` (the replicas were already the
+    request: nothing written, no child). `scale` is the child's result, on
+    `child_workflow_id`. Exactly one of `infra_env_kind` / `nodepool` is set,
+    as in the request; `nodepools` is then that kind's, or the one NodePool.
     """
 
     mce_cluster: str
     cluster: str
-    infra_env_kind: str
+    infra_env_kind: str | None = None
+    nodepool: str | None = None
     day1_path: str
     hosted_cluster: str
     hosted_cluster_namespace: str

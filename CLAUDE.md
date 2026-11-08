@@ -593,6 +593,16 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   RUNNING, since a replicas commit under an upgrade stops it at its next
   commit.) Designed with the operator 2026-11-03. The pieces that are
   decisions:
+  - **Two targets, EXACTLY ONE per request** (a 422 otherwise; the workflow
+    guards it too, `NodePoolTargetInvalidError`): `infra_env_kind` — `replicas`
+    is a TOTAL spread over that kind's NodePools (below) — or `nodepool` (the
+    operator, 2026-11-08) — `replicas` is that ONE NodePool's, set EXACTLY, NO
+    balance rule, whatever its kind, the others untouched (a later run by kind
+    is then refused as unbalanced until they are evened out). A name on neither
+    side is `NodePoolNotFoundError`; on one side only, drift. Both fields are
+    optional on `UpdateNodePoolInput` (history), exactly-one on the request
+    model. Everything after the selection — drift, resume, the child, the
+    scale-down policy — is the same for both.
   - **The KIND is the live NodePool's selector**:
     `spec.platform.agent.agentLabelSelector.matchLabels["infraenvs.agent-install.openshift.io"]`
     is `K`, or `K-` followed by ANYTHING (`nodepool_replicas.belongs_to_kind`).

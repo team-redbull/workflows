@@ -1,9 +1,16 @@
-"""update-nodepool — set how many workers of one InfraEnv kind a hosted cluster runs.
+"""update-nodepool — set how many workers a hosted cluster runs: by InfraEnv kind, or on one NodePool.
 
-The request names the MCE, the cluster (its day1 file), the TOTAL replicas
-wanted and the InfraEnv kind. A NodePool is of kind K when the InfraEnv its
-agentLabelSelector names is `K` or `K-<anything>` (`K-zone-a`, …). Only the
-cluster's OWN NodePools count — never the rest of the MCE.
+The request names the MCE, the cluster (its day1 file), the replicas wanted
+and EXACTLY ONE target:
+
+  * `infra_env_kind` — the replicas are the TOTAL over the cluster's
+    NodePools of that kind, spread so no two are more than one apart. A
+    NodePool is of kind K when the InfraEnv its agentLabelSelector names is
+    `K` or `K-<anything>` (`K-zone-a`, …);
+  * `nodepool` — the replicas are that ONE NodePool's, set EXACTLY as asked,
+    whatever its siblings hold: no balance rule (the operator, 2026-11-08).
+
+Only the cluster's OWN NodePools count — never the rest of the MCE.
 
 Replicas are owned by the day1 file and changed only here (decided with the
 operator, 2026-11-03): the change is a commit to day1 `main`, which Argo CD
@@ -16,22 +23,25 @@ Phases:
                           and every NodePool's replicas and InfraEnv. A file
                           with `problems` is refused.
   2. reading-nodepools  — the HostedCluster's NodePools on the MCE (the
-                          cluster-upgrade limb), the kind's selected by their
-                          matchLabel. Live and git must agree BOTH ways — same
-                          NodePools, InfraEnvs and replicas — else
-                          NodePoolReplicasDriftError, nothing written.
-  3. planning           — the kind's NodePools more than one replica apart are
-                          refused (NodePoolsUnbalancedError); the total already
-                          the request completes with direction `none`; else
-                          nodepool_replicas.plan spreads the new total.
+                          cluster-upgrade limb): the kind's, selected by their
+                          matchLabel, or the one named. Live and git must agree
+                          BOTH ways — same NodePools, InfraEnvs and replicas —
+                          else NodePoolReplicasDriftError, nothing written. A
+                          named NodePool on neither side is NodePoolNotFoundError.
+  3. planning           — by kind: NodePools more than one replica apart are
+                          refused (NodePoolsUnbalancedError) and
+                          nodepool_replicas.plan spreads the new total; by
+                          name: the one NodePool takes the number asked. Already
+                          so completes with direction `none`.
   4. scaling-up / scaling-down — the child of that direction, awaited, on its
                           own id and queue (ABANDON on close: it writes git and
                           marks Machines in an order that must not be cut).
 
-A re-run RESUMES: when day1 already holds a balanced plan for the requested
-total but the MCE does not show it yet (a child that committed and never
-synced), the run hands that plan to the child instead of failing on the
-difference — its commit is then a no-op and it carries on from the sync.
+A re-run RESUMES: when day1 already holds what was asked — a balanced plan for
+the total, or the named NodePool's number — but the MCE does not show it yet (a
+child that committed and never synced), the run hands that plan to the child
+instead of failing on the difference: its commit is then a no-op and it
+carries on from the sync.
 """
 
 from __future__ import annotations
@@ -46,8 +56,10 @@ with workflow.unsafe.imports_passed_through():
         ClusterNotOnMceError,
         Day1ClusterProblemsError,
         NodePoolKindNotFoundError,
+        NodePoolNotFoundError,
         NodePoolReplicasDriftError,
         NodePoolsUnbalancedError,
+        NodePoolTargetInvalidError,
         ScaleNodePoolAlreadyRunningError,
         ScaleNodePoolFailedError,
     )
@@ -98,6 +110,13 @@ class UpdateNodePoolWorkflow:
     @workflow.run
     async def run(self, run_args: UpdateNodePoolRunArgs) -> UpdateNodePoolResult:
         request = run_args.input
+        if (request.nodepool is None) == (request.infra_env_kind is None):
+            raise _fail(
+                "update-nodepool takes exactly one of `nodepool` (one NodePool's replicas) and "
+                "`infra_env_kind` (a total over that kind's NodePools); nothing was read",
+                NodePoolTargetInvalidError,
+            )
+
         self._phase = "reading-day1"
         day1: Day1Cluster = await nodepool_scaling.on_hub(read_day1_cluster, Day1ClusterRequest(cluster=request.cluster))
         self._check_day1(request, day1)
@@ -113,7 +132,7 @@ class UpdateNodePoolWorkflow:
                 hosted_cluster_namespace=day1.hosted_cluster_namespace,
             ),
         )
-        live, git = self._kind_nodepools(request, day1, state)
+        live, git = self._selected_nodepools(request, day1, state)
 
         self._phase = "planning"
         changes = self._plan(request, live, git)
@@ -121,6 +140,7 @@ class UpdateNodePoolWorkflow:
             mce_cluster=request.mce_cluster,
             cluster=request.cluster,
             infra_env_kind=request.infra_env_kind,
+            nodepool=request.nodepool,
             day1_path=day1.path,
             hosted_cluster=day1.hosted_cluster or "",
             hosted_cluster_namespace=day1.hosted_cluster_namespace or "",
@@ -177,10 +197,10 @@ class UpdateNodePoolWorkflow:
                 NodePoolKindNotFoundError,
             )
 
-    def _kind_nodepools(
+    def _selected_nodepools(
         self, request: UpdateNodePoolInput, day1: Day1Cluster, state: HostedClusterState
     ) -> tuple[dict[str, NodePoolState], dict[str, Day1NodePool]]:
-        """The kind's NodePools live and in git, by name — refused unless they agree both ways."""
+        """The NodePools the run is about, live and in git, by name — refused unless they agree both ways."""
         where = f"HostedCluster {day1.hosted_cluster_namespace}/{day1.hosted_cluster}"
         if not state.found:
             raise _fail(
@@ -196,16 +216,29 @@ class UpdateNodePoolWorkflow:
                 "reports no InfraEnv per NodePool. Upgrade it, then run again",
                 NodePoolKindNotFoundError,
             )
-        kind = request.infra_env_kind
-        live = {np.name: np for np in state.nodepools if nodepool_replicas.belongs_to_kind(np.infra_env, kind)}
-        git = {np.name: np for np in day1.nodepools if nodepool_replicas.belongs_to_kind(np.infra_env, kind)}
-        if not live and not git:
-            seen = sorted({np.infra_env or "none" for np in state.nodepools})
-            raise _fail(
-                f"no NodePool of {where} takes Agents from InfraEnv {kind} or {kind}-*: its NodePools' "
-                f"InfraEnvs are {', '.join(seen) or 'none (it has no NodePool)'}. Nothing was written",
-                NodePoolKindNotFoundError,
-            )
+        if request.nodepool is not None:
+            name = request.nodepool
+            live = {np.name: np for np in state.nodepools if np.name == name}
+            git = {np.name: np for np in day1.nodepools if np.name == name}
+            if not live and not git:
+                raise _fail(
+                    f"{where} has no NodePool {name}, on the MCE or in {day1.path}; its NodePools are "
+                    f"{', '.join(sorted(np.name for np in state.nodepools)) or 'none'}. Nothing was written",
+                    NodePoolNotFoundError,
+                )
+            what = f"NodePool {name}"
+        else:
+            kind = request.infra_env_kind or ""
+            live = {np.name: np for np in state.nodepools if nodepool_replicas.belongs_to_kind(np.infra_env, kind)}
+            git = {np.name: np for np in day1.nodepools if nodepool_replicas.belongs_to_kind(np.infra_env, kind)}
+            if not live and not git:
+                seen = sorted({np.infra_env or "none" for np in state.nodepools})
+                raise _fail(
+                    f"no NodePool of {where} takes Agents from InfraEnv {kind} or {kind}-*: its NodePools' "
+                    f"InfraEnvs are {', '.join(seen) or 'none (it has no NodePool)'}. Nothing was written",
+                    NodePoolKindNotFoundError,
+                )
+            what = f"the NodePools of kind {kind}"
         problems = []
         for name, nodepool in sorted(live.items()):
             entry = next((np for np in day1.nodepools if np.name == name), None)
@@ -217,8 +250,7 @@ class UpdateNodePoolWorkflow:
             problems.append(f"{name} is in {day1.path} but not on the MCE")
         if problems:
             raise _fail(
-                f"the NodePools of kind {kind} on the MCE and in day1 disagree: " + "; ".join(problems)
-                + ". Nothing was written",
+                f"{what} on the MCE and in day1 disagree: " + "; ".join(problems) + ". Nothing was written",
                 NodePoolReplicasDriftError,
             )
         return live, git
@@ -237,6 +269,7 @@ class UpdateNodePoolWorkflow:
             )
         counts = {name: int(git_replicas[name] or 0) for name in names}
         drifted = sorted(name for name in names if live_replicas[name] != counts[name])
+        by_kind = request.nodepool is None
 
         def change(name: str, before: int, after: int) -> NodePoolReplicasChange:
             return NodePoolReplicasChange(
@@ -245,15 +278,15 @@ class UpdateNodePoolWorkflow:
             )
 
         if drifted:
-            # The resume: day1 already holds a balanced plan for this total, and
-            # only the MCE has not caught up — an earlier child committed and
-            # never synced. Anything else is someone else's difference.
-            resumable = (
-                sum(counts.values()) == request.replicas
-                and nodepool_replicas.balanced(list(counts.values()))
-                and all(live_replicas[name] is not None for name in names)
+            # The resume: day1 already holds what was asked — a balanced plan for
+            # the total, or the named NodePool's number — and only the MCE has
+            # not caught up: an earlier child committed and never synced.
+            # Anything else is someone else's difference.
+            already_asked = (
+                sum(counts.values()) == request.replicas and nodepool_replicas.balanced(list(counts.values()))
+                if by_kind else counts[request.nodepool or ""] == request.replicas
             )
-            if not resumable:
+            if not already_asked or any(live_replicas[name] is None for name in names):
                 raise _fail(
                     "the NodePools on the MCE and in day1 disagree on replicas: "
                     + "; ".join(f"{name} {live_replicas[name]} on the MCE, {counts[name]} in day1" for name in drifted)
@@ -266,11 +299,14 @@ class UpdateNodePoolWorkflow:
             )
             return [change(name, int(live_replicas[name] or 0), counts[name]) for name in names]
 
+        if not by_kind:
+            # One NodePool, set exactly as asked: no balance rule (the operator, 2026-11-08).
+            return [change(name, counts[name], request.replicas) for name in names]
         if not nodepool_replicas.balanced(list(counts.values())):
             raise _fail(
                 f"the NodePools of kind {request.infra_env_kind} are more than one replica apart: "
                 + ", ".join(f"{name} {counts[name]}" for name in names)
-                + ". Balance them in day1 first; nothing was written",
+                + ". Balance them in day1 first, or set one NodePool by name; nothing was written",
                 NodePoolsUnbalancedError,
             )
         planned = nodepool_replicas.plan(

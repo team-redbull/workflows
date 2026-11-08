@@ -47,6 +47,9 @@
       more than one replica apart</b>, writes the new replicas into the cluster&rsquo;s day1 file, has
       Argo CD apply that commit, and checks that the NodePools on the MCE show it.
     </p>
+    <p class="lede"><b>Or one NodePool, by name.</b> Send <code>nodepool</code> instead of
+    <code>infra_env_kind</code> and <code>replicas</code> is that NodePool&rsquo;s own number, set
+    <b>exactly</b>: no spread and no balance rule, the other NodePools left as they are.</p>
     <p class="lede"><b>The day1 file owns replicas.</b> Nothing on the MCE is written directly: the change is
     one commit to day1 <code>main</code>, synced by Argo CD. The run scales up or down through a child workflow
     &mdash; <b>scale-up-nodepool</b> or <b>scale-down-nodepool</b> &mdash; and on a scale-down a NodePool that
@@ -140,6 +143,8 @@
           <code>spec.replicas</code>, the InfraEnv of the selector, and the
           <code>redbull.io/scale-down-policy</code> label or annotation. The kind&rsquo;s NodePools are selected
           here.</p>
+          <p>With <code>nodepool</code>, only that NodePool is selected, whatever its kind; one the cluster has
+          on neither side is <code>NodePoolNotFoundError</code>.</p>
           <p><b>Live and day1 must agree, both ways</b>: every NodePool of the kind on the MCE is in day1 under
           its name with the same replicas and InfraEnv, and every one of the kind in day1 is on the MCE.
           Anything else stops the run with <code>NodePoolReplicasDriftError</code>, naming each NodePool, before
@@ -155,10 +160,13 @@
             <h3>The plan</h3>
             <span class="phase">phase <b>planning</b></span>
           </div>
-          <p>NodePools of the kind already <b>more than one replica apart</b> are refused
+          <p><b>By kind:</b> NodePools already <b>more than one replica apart</b> are refused
           (<code>NodePoolsUnbalancedError</code>): balancing them is a person&rsquo;s edit, never a side effect.
-          A total already equal to the request completes here, <code>direction: "none"</code>, nothing written.
-          Otherwise the new total is spread <a href="#spread">one replica at a time</a>.</p>
+          Otherwise the new total is spread <a href="#spread">one replica at a time</a>.
+          <b>By name:</b> the NodePool takes exactly the number asked &mdash; no balance check, even if its kind
+          then ends more than one apart (a later run by kind is refused until they are evened out).</p>
+          <p class="note">Already what was asked: the run completes here, <code>direction: "none"</code>,
+          nothing written.</p>
         </div>
       </div>
 
@@ -340,6 +348,7 @@
         <tbody>
           <tr><td class="k">ClusterNotOnMceError</td><td class="muted">day1 keeps the cluster under another MCE&rsquo;s folder.</td></tr>
           <tr><td class="k">Day1ClusterProblemsError</td><td class="muted">The cluster file holds what the chart would refuse, or replicas that are not a number.</td></tr>
+          <tr><td class="k">NodePoolNotFoundError</td><td class="muted">The NodePool named in <code>nodepool</code> is the cluster&rsquo;s neither on the MCE nor in day1 (the message lists those it has).</td></tr>
           <tr><td class="k">NodePoolKindNotFoundError</td><td class="muted">No NodePool of the cluster is of the kind (the message lists the InfraEnvs it has) &mdash; or the hub&rsquo;s upgrade-gitops worker or the MCE&rsquo;s cluster-upgrade worker predates update-nodepool, which the message names.</td></tr>
           <tr><td class="k">NodePoolReplicasDriftError</td><td class="muted">Live and day1 disagree; or, on a scale-down by policy, a Machine is already deleting or the Machines are not the replicas.</td></tr>
           <tr><td class="k">NodePoolsUnbalancedError</td><td class="muted">The kind&rsquo;s NodePools are already more than one replica apart.</td></tr>
@@ -414,7 +423,7 @@
           <span class="ret">202 &middot; 409 while a run or an upgrade of the cluster runs &middot; 422 on a bad body</span>
         </div>
         <div class="endpoint-body">
-          <pre><span class="c">// request — every field required</span>
+          <pre><span class="c">// request — by kind</span>
 {
   "mce_cluster":    "mce-bat-yam-01",              <span class="c">// with or without ocp4-</span>
   "cluster":        "ocp4-prod-alpha",             <span class="c">// the day1 file's name, without .yaml</span>
@@ -422,10 +431,21 @@
   "infra_env_kind": "cisco-m6-bat-yam-64c-512gb"
 }
 
+<span class="c">// request — one NodePool</span>
+{
+  "mce_cluster": "mce-bat-yam-01",
+  "cluster":     "ocp4-prod-alpha",
+  "replicas":    5,                                <span class="c">// THAT NodePool's replicas, set exactly</span>
+  "nodepool":    "prod-alpha-zone-c"
+}
+
 <span class="c">// 202 response</span>
 { "workflow_id": "update-nodepool-ocp4-prod-alpha", "run_id": "…" }</pre>
-          <p class="note">The body <b>forbids unknown fields</b>; <code>cluster</code> and
-          <code>infra_env_kind</code> must be Kubernetes names, <code>replicas</code> 0 or more.</p>
+          <p class="note">Send <b>exactly one</b> of <code>infra_env_kind</code> and <code>nodepool</code>:
+          both or neither is a 422. The body <b>forbids unknown fields</b>; <code>cluster</code>,
+          <code>infra_env_kind</code> and <code>nodepool</code> must be Kubernetes names, <code>replicas</code>
+          0 or more. The id is the cluster&rsquo;s either way, so a run by kind and a run by name of one cluster
+          never overlap.</p>
         </div>
       </div>
 
@@ -441,7 +461,7 @@
   "status": "COMPLETED",
   "result": {
     "mce_cluster": "ocp4-mce-bat-yam-01", "cluster": "ocp4-prod-alpha",
-    "infra_env_kind": "cisco-m6-bat-yam-64c-512gb",
+    "infra_env_kind": "cisco-m6-bat-yam-64c-512gb", "nodepool": null,   <span class="c">// as in the request</span>
     "day1_path": "sites/bat-yam/mces/ocp4-mce-bat-yam-01/hostedClusters/ocp4-prod-alpha.yaml",
     "hosted_cluster": "openshift-prod-alpha", "hosted_cluster_namespace": "hcp-prod-alpha",
     "direction": "down", "total_before": 9, "total_after": 8,

@@ -858,6 +858,24 @@ class NodePoolKindNotFoundError(OrchestratorError):
     """
 
 
+class NodePoolNotFoundError(OrchestratorError):
+    """WORKFLOW-RAISED. The NodePool the request names is not the cluster's, on the MCE or in day1.
+
+    Neither the HostedCluster's NodePools on the MCE nor the cluster's day1
+    file have it; the message lists the NodePools they do have. (On one side
+    only is NodePoolReplicasDriftError.) Nothing was written.
+    """
+
+
+class NodePoolTargetInvalidError(OrchestratorError):
+    """WORKFLOW-RAISED. The run names neither a NodePool nor an InfraEnv kind, or both.
+
+    update-nodepool scales EITHER a kind's NodePools to a total OR one NodePool
+    to a number. The API refuses anything else with a 422; this guards a run
+    started some other way. Nothing was read or written.
+    """
+
+
 class NodePoolReplicasDriftError(OrchestratorError):
     """WORKFLOW-RAISED. The NodePools on the MCE and the day1 file disagree.
 

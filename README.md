@@ -610,6 +610,11 @@ A NodePool is of kind `K` when the InfraEnv its
 is `K`, or `K-` followed by anything (`K-zone-a`, …). Only the cluster's OWN
 NodePools count, never the rest of the MCE.
 
+**Or one NodePool by name**: send `nodepool` instead of `infra_env_kind`
+(exactly one of the two, else 422) and `replicas` is that NodePool's own,
+set exactly — no spread, no balance rule; the others are left alone. A name
+the cluster does not have is `NodePoolNotFoundError`.
+
 **The day1 file owns replicas** (the operator, 2026-11-03), and this is the one
 place that changes them:
 
@@ -829,7 +834,7 @@ result.
 | `POST /workflows/server-lifecycle/remove-server-from-mce` | one server out of an MCE's inventory |
 | `POST /workflows/server-lifecycle/uninstall-server-from-hc` | one workflow PER server in `server_names`: out of its hosted cluster (if a node), then out of the MCE (remove-server-from-mce, as a child) |
 | `POST /workflows/server-lifecycle/publish-infraenv-to-pxe-server` | an InfraEnv's current iPXE script onto its site's PXE VM |
-| `POST /workflows/server-lifecycle/update-nodepool` | one replicas change of a hosted cluster's NodePools of one InfraEnv kind (a scale-up or scale-down child) |
+| `POST /workflows/server-lifecycle/update-nodepool` | one replicas change of a hosted cluster: a total over its NodePools of one InfraEnv kind, or one NodePool by name (a scale-up or scale-down child) |
 | `POST /workflows/server-provisioning/provision-dell-server` | one Dell server, by iDRAC IP |
 | `POST /workflows/server-provisioning/provision-dell-server/bulk` | one workflow PER iDRAC IP |
 | `POST /workflows/vm-lifecycle/create-vm` | one workflow PER VM for a KubeVirt InfraEnv: one in the first free slot, or `count` in parallel |

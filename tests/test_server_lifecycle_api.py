@@ -624,6 +624,24 @@ class TestUpdateNodePool:
         body = {k: v for k, v in self.BODY.items() if k != missing}
         assert self._client(_FakeNodePoolClient()).post(self.PATH, json=body).status_code == 422
 
+    def test_one_nodepool_by_name_instead_of_a_kind(self):
+        fake = _FakeNodePoolClient()
+        body = {k: v for k, v in self.BODY.items() if k != "infra_env_kind"} | {"nodepool": "prod-alpha-zone-c"}
+        response = self._client(fake).post(self.PATH, json=body)
+        assert response.status_code == 202
+        [(_id, _queue, run_input)] = fake.started
+        assert (run_input.nodepool, run_input.infra_env_kind, run_input.replicas) == ("prod-alpha-zone-c", None, 9)
+
+    def test_both_targets_are_refused_saying_send_one(self):
+        fake = _FakeNodePoolClient()
+        response = self._client(fake).post(self.PATH, json=self.BODY | {"nodepool": "prod-alpha-zone-c"})
+        assert response.status_code == 422 and "exactly one of `nodepool`" in response.text
+        assert fake.started == []
+
+    def test_a_nodepool_name_that_is_not_a_kubernetes_name_is_refused(self):
+        body = {k: v for k, v in self.BODY.items() if k != "infra_env_kind"} | {"nodepool": "Zone_C"}
+        assert self._client(_FakeNodePoolClient()).post(self.PATH, json=body).status_code == 422
+
 
 # --- uninstall-server-from-hc -----------------------------------------------------------------
 

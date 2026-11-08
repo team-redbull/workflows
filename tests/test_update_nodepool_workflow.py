@@ -244,19 +244,27 @@ class _Harness:
         await self._env.shutdown()
 
 
-def run_args(replicas: int, *, kind: str = KIND, mce: str = MCE) -> UpdateNodePoolRunArgs:
+def run_args(
+    replicas: int, *, kind: str | None = KIND, mce: str = MCE, nodepool: str | None = None
+) -> UpdateNodePoolRunArgs:
+    """By kind (the default), or by `nodepool` — which drops the kind unless one is given too."""
+    if nodepool is not None and kind == KIND:
+        kind = None
     return UpdateNodePoolRunArgs(input=UpdateNodePoolInput(
-        mce_cluster=mce, cluster=CLUSTER, replicas=replicas, infra_env_kind=kind))
+        mce_cluster=mce, cluster=CLUSTER, replicas=replicas, infra_env_kind=kind, nodepool=nodepool))
 
 
-async def _run(fleet: _Fleet, replicas: int, *, kind: str = KIND, mce: str = MCE, before=None):
+async def _run(
+    fleet: _Fleet, replicas: int, *, kind: str | None = KIND, mce: str = MCE, nodepool: str | None = None,
+    before=None,
+):
     async with _Harness(fleet, mce) as client:
         if before is not None:
             await before(client)
         return await asyncio.wait_for(
             client.execute_workflow(
                 UpdateNodePoolWorkflow.run,
-                run_args(replicas, kind=kind, mce=mce),
+                run_args(replicas, kind=kind, mce=mce, nodepool=nodepool),
                 id=f"update-nodepool-{uuid.uuid4()}",
                 task_queue=UPDATE_NODEPOOL_WORKFLOW_QUEUE,
             ),
@@ -426,6 +434,82 @@ class TestARerun:
         fleet = _Fleet((4, 3, 3), live=(3, 3, 2))
         error = await _failure(fleet, 12)
         assert error.type == "NodePoolReplicasDriftError"
+
+
+# --- one NodePool, by name -----------------------------------------------------------------
+
+
+class TestOneNodePool:
+    """`nodepool` instead of `infra_env_kind`: that NodePool's replicas, set exactly (the operator, 2026-11-08)."""
+
+    async def test_only_the_named_nodepool_moves_to_exactly_the_number_asked(self):
+        fleet = _Fleet((3, 3, 2))
+        result = await _run(fleet, 5, nodepool="alpha-zone-c")
+        assert fleet.first("commit_day1_change").nodepool_replicas == {"alpha-zone-c": 5}
+        assert fleet.first("sync_argo_application").allowed_out_of_sync == ["NodePool/alpha-zone-c"]
+        # No balance rule: 3, 3, 5 is what was asked for.
+        assert fleet.day1 == {"alpha-zone-a": 3, "alpha-zone-b": 3, "alpha-zone-c": 5, "alpha-gpu": 1}
+        assert (result.nodepool, result.infra_env_kind, result.direction) == ("alpha-zone-c", None, "up")
+        assert [(np.name, np.before, np.after) for np in result.nodepools] == [("alpha-zone-c", 2, 5)]
+        assert (result.total_before, result.total_after) == (2, 5)
+
+    async def test_an_unbalanced_kind_is_no_reason_to_refuse(self):
+        fleet = _Fleet((5, 2, 2))
+        result = await _run(fleet, 3, nodepool="alpha-zone-b")
+        assert result.direction == "up" and fleet.day1["alpha-zone-b"] == 3
+
+    async def test_any_nodepool_of_the_cluster_whatever_its_kind(self):
+        fleet = _Fleet((3, 3, 2))
+        await _run(fleet, 2, nodepool="alpha-gpu")
+        assert fleet.first("commit_day1_change").nodepool_replicas == {"alpha-gpu": 2}
+
+    async def test_down_by_its_policy_marks_the_servers_first(self):
+        fleet = _policy_fleet()
+        result = await _run(fleet, 1, nodepool="alpha-zone-c")
+        assert fleet.first("mark_machines_for_deletion").machines == ["c2", "c3"]  # 1 and 3 pods
+        names = fleet.names()
+        assert names.index("mark_machines_for_deletion") < names.index("commit_day1_change")
+        assert [c.machine for c in result.scale.chosen] == ["c2", "c3"]
+
+    async def test_to_zero(self):
+        fleet = _Fleet((3, 3, 2))
+        result = await _run(fleet, 0, nodepool="alpha-zone-a")
+        assert result.direction == "down" and fleet.day1["alpha-zone-a"] == 0
+
+    async def test_already_the_number_writes_nothing(self):
+        fleet = _Fleet((3, 3, 2))
+        result = await _run(fleet, 3, nodepool="alpha-zone-a")
+        assert result.direction == "none" and fleet.names() == ["read_day1_cluster", "read_hosted_cluster"]
+
+    async def test_a_nodepool_the_cluster_does_not_have_is_named_and_nothing_written(self):
+        fleet = _Fleet((3, 3, 2))
+        error = await _failure(fleet, 4, nodepool="alpha-zone-x")
+        assert error.type == "NodePoolNotFoundError" and "alpha-zone-a, alpha-zone-b" in error.message
+        assert "commit_day1_change" not in fleet.names()
+
+    async def test_one_on_the_mce_only_is_drift(self):
+        fleet = _Fleet((3, 3, 2))
+        fleet.live["alpha-zone-d"] = 2
+        fleet.infra_envs["alpha-zone-d"] = f"{KIND}-zone-d"
+        error = await _failure(fleet, 4, nodepool="alpha-zone-d")
+        assert error.type == "NodePoolReplicasDriftError" and "not in" in error.message
+
+    async def test_its_replicas_disagreeing_is_drift(self):
+        fleet = _Fleet((3, 3, 2), live=(3, 3, 4))
+        error = await _failure(fleet, 6, nodepool="alpha-zone-c")
+        assert error.type == "NodePoolReplicasDriftError" and "alpha-zone-c 4 on the MCE, 2 in day1" in error.message
+
+    async def test_a_rerun_resumes_a_commit_that_never_synced(self):
+        fleet = _Fleet((3, 3, 5), live=(3, 3, 2))
+        result = await _run(fleet, 5, nodepool="alpha-zone-c")
+        assert result.direction == "up" and not result.scale.committed and fleet.live["alpha-zone-c"] == 5
+
+    # (run_args drops the DEFAULT kind when a NodePool is named, so "both" names another.)
+    @pytest.mark.parametrize("target", [{"kind": "gpu-a100", "nodepool": "alpha-zone-c"}, {"kind": None}])
+    async def test_both_targets_or_neither_is_refused_before_anything_is_read(self, target):
+        fleet = _Fleet((3, 3, 2))
+        error = await _failure(fleet, 4, **target)
+        assert error.type == "NodePoolTargetInvalidError" and fleet.names() == []
 
 
 # --- scale-down with a policy ---------------------------------------------------------------

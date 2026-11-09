@@ -69,6 +69,13 @@ subjects:
 #                         widest grant in the chart: get on EVERY Secret of the
 #                         MCE. Turn `rbac.hostedClusters` off on an MCE that
 #                         runs no hosted clusters.
+# update-nodepool uses the same grant: machines list + patch (find a NodePool's
+# Machines, set and take off the `cluster.x-k8s.io/delete-machine` mark),
+# hostedclusters get and the admin kubeconfig (rank the servers that leave), and:
+#   * nodepools           get + list a HostedCluster's, in its namespace
+#                         (read_hosted_cluster) — read only: a replicas change
+#                         reaches a NodePool as a day1 commit Argo CD applies
+# plus the Role below, on the Argo CD Applications that apply it.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -83,7 +90,7 @@ rules:
     resources: [agentmachines]
     verbs: [get, list, delete, patch]
   - apiGroups: [hypershift.openshift.io]
-    resources: [hostedclusters]
+    resources: [hostedclusters, nodepools]
     verbs: [get, list]
   - apiGroups: [""]
     resources: [secrets]
@@ -99,6 +106,37 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
   name: {{ include "slw.fullname" . }}-hosted-clusters
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "slw.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+---
+# update-nodepool's sync (sync_argo_application): read the cluster's Application
+# and sync it by patching its `operation` to exactly the day1 commit — only in
+# Argo CD's namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "slw.fullname" . }}-argo
+  namespace: {{ .Values.argo.namespace }}
+  labels:
+    {{- include "slw.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [argoproj.io]
+    resources: [applications]
+    verbs: [get, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "slw.fullname" . }}-argo
+  namespace: {{ .Values.argo.namespace }}
+  labels:
+    {{- include "slw.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "slw.fullname" . }}-argo
 subjects:
   - kind: ServiceAccount
     name: {{ include "slw.serviceAccountName" . }}

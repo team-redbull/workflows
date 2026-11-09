@@ -618,8 +618,7 @@ the cluster does not have is `NodePoolNotFoundError`.
 **The day1 file owns replicas** (the operator, 2026-11-03), and this is the one
 place that changes them:
 
-1. It reads the cluster file (hub `upgrade-gitops-worker`) and the
-   HostedCluster's NodePools (the MCE's `cluster-upgrade-worker`). They must
+1. It reads the cluster file and the HostedCluster's NodePools. They must
    agree both ways — same NodePools, InfraEnvs and replicas — else
    `NodePoolReplicasDriftError`, nothing written.
 2. NodePools of the kind already more than one replica apart are refused
@@ -641,16 +640,20 @@ Machines CAPI counts unhealthy go first, by name — CAPI's own order, which is
 what makes the mark decide in 4.18's CAPI as in later ones — then a broken or
 cordoned Node. A NodePool mid-rollout (Machines in two MachineSets) is refused.
 The run marks the chosen Machines
-`cluster.x-k8s.io/delete-machine` (the MCE's `server-lifecycle-worker`) **before
-it pushes**, so CAPI removes exactly those, then watches that they are the ones
+`cluster.x-k8s.io/delete-machine` **before it pushes**, so CAPI removes exactly those, then watches that they are the ones
 deleting (`ScaleDownWrongMachineError` otherwise). A refused commit takes the
 marks off again. Without the key nothing is marked and CAPI picks at random.
 The servers that leave stay in the MCE's inventory as free Agents.
 
-No new worker, credential or RBAC: the hub worker already holds the day1 push
-token, the cluster-upgrade worker reads NodePools and syncs Argo CD, and the
-server-lifecycle worker's existing `rbac.hostedClusters` covers the Machines and
-the hosted cluster. See [the page](docs/site/server-lifecycle/update-nodepool.html).
+**Everything runs on the MCE's `server-lifecycle-worker`** (the operator,
+2026-11-08) — no cluster-upgrade worker needs to run. It reads and commits day1
+with its own **optional** `DAY1_REPO_URL` / `DAY1_GIT_TOKEN` (unset: every other
+workflow is unaffected, update-nodepool fails with `Day1NotConfiguredError`), and
+reads NodePools and syncs Argo CD with cluster-upgrade's own two activities,
+registered on it too. Its chart grants NodePools get/list and Applications
+get/patch in `argo.namespace`, beside the `rbac.hostedClusters` grant the
+Machines and the hosted cluster already had. See
+[the page](docs/site/server-lifecycle/update-nodepool.html).
 
 ### `publish-infraenv-to-pxe-server` — an InfraEnv's current iPXE script onto its PXE VM
 
@@ -914,6 +917,9 @@ would hide which segments actually got a workflow.
 | `SERVER_SCAN_URL` | `server-lifecycle-config` | inventory API base, INCLUDING `/api/v1` |
 | `SERVER_SCAN_API_TOKEN` | Secret | an **admin** token — add-server-to-mce takes and releases the install lock |
 | `{HP,DELL,CISCO,INTERSIGHT}_BMC_USERNAME`/`_PASSWORD` | Secret | what Ironic drives the BMC with |
+| `DAY1_REPO_URL`, `DAY1_VALIDATE_COMMAND` | `server-lifecycle-config` | update-nodepool's day1 read and replicas commit, `https://`; OPTIONAL — unset, only update-nodepool is refused on that MCE |
+| `DAY1_GIT_TOKEN` | Secret (credentials, or `day1.tokenSecret`) | its push token; optional with the URL |
+| `ARGO_NAMESPACE`, `ARGO_VALUES_REF` | `server-lifecycle-config` | update-nodepool's Argo CD sync: the Applications' namespace (`openshift-gitops`) and the day1 source's `ref` (`values`) |
 | `OME_URL` | `server-provisioning-config` | the OpenManage Enterprise appliance, `https://` |
 | `OME_USERNAME`/`OME_PASSWORD` | Secret | discovers devices and deploys templates |
 | `IDRAC_USERNAME` | `server-provisioning-config` | default `root` — the only iDRAC account touched |

@@ -22,6 +22,14 @@ Segments Manager, whose credential lives on the segment-lifecycle limb, so the
 workflow routes that one activity to that queue instead of this deployment
 holding a second copy of the token.
 
+update-nodepool runs on this worker ALONE (the operator, 2026-11-08): its day1
+read and replicas commit are this limb's own activities, with this limb's
+OPTIONAL DAY1_* settings, and its NodePool read and Argo CD sync are the
+cluster-upgrade limb's `read_hosted_cluster` / `sync_argo_application`,
+registered here too (CLAUDE.md §2: an activity re-registered on another queue,
+its code not moved). Those two read ClusterUpgradeActivitySettings — MCE_CLUSTER,
+which this worker already has, and ARGO_NAMESPACE / ARGO_VALUES_REF, defaulted.
+
 Connects with the Pydantic data converter so that Pydantic models serialize
 correctly across the workflow boundary.
 """
@@ -34,11 +42,15 @@ from datetime import timedelta
 
 from temporalio.worker import Worker
 
+# update-nodepool's NodePool read and Argo CD sync: the cluster-upgrade limb's
+# activities, re-registered on this queue (see the module docstring).
+from activities.cluster_upgrade.activities import read_hosted_cluster, sync_argo_application
 from activities.server_lifecycle.activities import (
     acquire_servers,
     check_hosted_node,
     check_infra_env,
     clean_up_agent_machines,
+    commit_day1_replicas,
     create_baremetal_host,
     create_bmc_secret,
     create_nmstate_config,
@@ -58,6 +70,7 @@ from activities.server_lifecycle.activities import (
     lookup_server_membership,
     mark_machines_for_deletion,
     publish_infra_env_boot,
+    read_day1_nodepools,
     read_scale_down_candidates,
     register_pxe_boot,
     release_agent,
@@ -127,6 +140,11 @@ async def main() -> None:
             release_agent,
             release_machine_hook,
             clean_up_agent_machines,
+            # update-nodepool and its two children: day1, the NodePools, Argo CD
+            read_day1_nodepools,
+            commit_day1_replicas,
+            read_hosted_cluster,
+            sync_argo_application,
             # scale-down-nodepool
             read_scale_down_candidates,
             mark_machines_for_deletion,

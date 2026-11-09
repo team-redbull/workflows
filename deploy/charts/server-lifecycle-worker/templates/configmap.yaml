@@ -21,3 +21,11 @@ data:
   {{- with .Values.pxeMap.urls }}
   PXE_MAP_URLS: {{ toJson . | quote }}
   {{- end }}
+  {{- with .Values.day1.repoUrl }}
+  DAY1_REPO_URL: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.day1.validateCommand }}
+  DAY1_VALIDATE_COMMAND: {{ . | quote }}
+  {{- end }}
+  ARGO_NAMESPACE: {{ .Values.argo.namespace | quote }}
+  ARGO_VALUES_REF: {{ .Values.argo.valuesRef | quote }}

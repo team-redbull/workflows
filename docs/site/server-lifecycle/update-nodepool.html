@@ -60,7 +60,7 @@
       <div class="fact"><span class="k">Workflow id</span><span class="v">one per cluster: update-nodepool-&lt;cluster&gt;</span></div>
       <div class="fact"><span class="k">Children</span><span class="v">scale-up-nodepool-&lt;cluster&gt; &middot; scale-down-nodepool-&lt;cluster&gt;</span></div>
       <div class="fact"><span class="k">Workflow queues</span><span class="v">update-nodepool-workflow &middot; scale-up-nodepool-workflow &middot; scale-down-nodepool-workflow</span></div>
-      <div class="fact"><span class="k">Activity queues</span><span class="v">upgrade-gitops-activity (day1) &middot; cluster-upgrade-activity-&lt;mce&gt; &middot; server-lifecycle-activity-&lt;mce&gt;</span></div>
+      <div class="fact"><span class="k">Activity queues</span><span class="v">server-lifecycle-activity-&lt;mce&gt; &mdash; every call, on the MCE&rsquo;s server-lifecycle-worker</span></div>
     </div>
     <p class="note">Done means the NodePools <b>show the new replicas</b>, not that new nodes are Ready
     (decided with the operator, 2026-11-03). After a scale-up HyperShift creates the Machines, and each one
@@ -121,10 +121,10 @@
         <div class="marker">1</div>
         <div class="card">
           <div class="card-title">
-            <h3>read_day1_cluster</h3>
+            <h3>read_day1_nodepools</h3>
             <span class="phase">phase <b>reading-day1</b></span>
           </div>
-          <p>The cluster&rsquo;s file in day1 <code>main</code>, read by the hub&rsquo;s upgrade-gitops worker:
+          <p>The cluster&rsquo;s file in day1 <code>main</code>, read by the MCE&rsquo;s server-lifecycle worker:
           its path, its git blob, the HostedCluster it renders (<code>openshift-&lt;clusterName&gt;</code> in
           <code>hcp-&lt;clusterName&gt;</code>), and each <code>nodepool[]</code> entry&rsquo;s name, replicas
           (the chart&rsquo;s default 1 when absent) and InfraEnv (<code>infraEnvName</code>, else
@@ -143,7 +143,7 @@
             <h3>read_hosted_cluster</h3>
             <span class="phase">phase <b>reading-nodepools</b></span>
           </div>
-          <p>The HostedCluster&rsquo;s NodePools on the MCE, read by the MCE&rsquo;s cluster-upgrade worker:
+          <p>The HostedCluster&rsquo;s NodePools on the MCE, read by the same worker:
           <code>spec.replicas</code>, the InfraEnv of the selector, and the
           <code>redbull.io/scale-down-policy</code> label or annotation. The kind&rsquo;s NodePools are selected
           here.</p>
@@ -212,7 +212,7 @@
         <div class="marker">6</div>
         <div class="card">
           <div class="card-title">
-            <h3>commit_day1_change</h3>
+            <h3>commit_day1_replicas</h3>
             <span class="phase">phase <b>committing-day1</b></span>
           </div>
           <p>The new replicas of every NodePool that moves, in <b>one commit</b> to day1 <code>main</code>,
@@ -370,7 +370,8 @@
           <tr><td class="k">ClusterNotOnMceError</td><td class="muted">day1 keeps the cluster under another MCE&rsquo;s folder.</td></tr>
           <tr><td class="k">Day1ClusterProblemsError</td><td class="muted">The cluster file holds what the chart would refuse, or replicas that are not a number.</td></tr>
           <tr><td class="k">NodePoolNotFoundError</td><td class="muted">The NodePool named in <code>nodepool</code> is the cluster&rsquo;s neither on the MCE nor in day1 (the message lists those it has).</td></tr>
-          <tr><td class="k">NodePoolKindNotFoundError</td><td class="muted">No NodePool of the cluster is of the kind (the message lists the InfraEnvs it has) &mdash; or the hub&rsquo;s upgrade-gitops worker or the MCE&rsquo;s cluster-upgrade worker predates update-nodepool, which the message names.</td></tr>
+          <tr><td class="k">NodePoolKindNotFoundError</td><td class="muted">No NodePool of the cluster is of the kind (the message lists the InfraEnvs it has) &mdash; or the MCE&rsquo;s server-lifecycle worker predates update-nodepool, which the message names.</td></tr>
+          <tr><td class="k">Day1NotConfiguredError</td><td class="muted">The MCE&rsquo;s server-lifecycle worker has no <code>DAY1_REPO_URL</code> or <code>DAY1_GIT_TOKEN</code> (the message names which). Set the chart&rsquo;s <code>day1.*</code> values; nothing was read or written.</td></tr>
           <tr><td class="k">NodePoolReplicasDriftError</td><td class="muted">Live and day1 disagree; or, on a scale-down by policy, a Machine is already deleting or the Machines are not the replicas.</td></tr>
           <tr><td class="k">NodePoolsUnbalancedError</td><td class="muted">The kind&rsquo;s NodePools are already more than one replica apart.</td></tr>
           <tr><td class="k">ScaleNodePoolAlreadyRunningError</td><td class="muted">A scale-up / scale-down of the cluster is already running on the child&rsquo;s id.</td></tr>
@@ -527,12 +528,16 @@
         <thead><tr><th>what</th><th>where</th></tr></thead>
         <tbody>
           <tr><td class="k">the three workflows</td><td class="muted">the <code>workflows-orchestrator</code> brain, each on its own queue</td></tr>
-          <tr><td class="k">day1 read and commit</td><td class="muted"><code>upgrade-gitops-activity</code>, the hub&rsquo;s <code>upgrade-gitops-worker</code> (it holds the day1 push token)</td></tr>
-          <tr><td class="k">NodePools, Argo CD sync</td><td class="muted"><code>cluster-upgrade-activity-&lt;mce&gt;</code>, the <code>cluster-upgrade-worker</code> inside that MCE (get/list on NodePools)</td></tr>
-          <tr><td class="k">Machines, hosted Nodes and Pods, the marks</td><td class="muted"><code>server-lifecycle-activity-&lt;mce&gt;</code>, the <code>server-lifecycle-worker</code> inside that MCE (list/patch on Machines, its existing <code>rbac.hostedClusters</code> grant)</td></tr>
+          <tr><td class="k">every activity</td><td class="muted"><code>server-lifecycle-activity-&lt;mce&gt;</code>, the <code>server-lifecycle-worker</code> inside that MCE &mdash; no other worker (the operator, 2026-11-08)</td></tr>
+          <tr><td class="k">&nbsp;&nbsp;day1 read and commit</td><td class="muted"><code>read_day1_nodepools</code>, <code>commit_day1_replicas</code>: its optional <code>day1.*</code> chart values (<code>DAY1_REPO_URL</code>, <code>DAY1_GIT_TOKEN</code>); the commit changes replicas and nothing else</td></tr>
+          <tr><td class="k">&nbsp;&nbsp;NodePools, Argo CD sync</td><td class="muted"><code>read_hosted_cluster</code>, <code>sync_argo_application</code>: cluster-upgrade&rsquo;s activities, registered on this worker too; get/list on NodePools, get/patch on Applications in <code>argo.namespace</code></td></tr>
+          <tr><td class="k">&nbsp;&nbsp;Machines, hosted Nodes and Pods, the marks</td><td class="muted">list/patch on Machines and the admin kubeconfig: the <code>rbac.hostedClusters</code> grant</td></tr>
         </tbody>
       </table>
     </div>
+    <p class="note">The day1 values are optional on the worker: without them every other workflow runs as before,
+    and update-nodepool fails at its first call with <code>Day1NotConfiguredError</code>, nothing read or written.
+    The worker needs network access to the day1 git host.</p>
 
     <h3 style="margin:28px 0 10px">What it never does</h3>
     <ul>

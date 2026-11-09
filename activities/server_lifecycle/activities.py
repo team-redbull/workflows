@@ -75,6 +75,9 @@ from activities.server_lifecycle.bmh_resources import (
     nmstate_config_differences,
 )
 from activities.server_lifecycle.server_scan import fetch_available_servers
+# update-nodepool's day1 reader and replicas editor: the cluster-upgrade hub limb's
+# technology module, called with this limb's own DAY1_* settings.
+from activities.upgrade_gitops import day1_repo
 from shared.bmc_address import k8s_resource_name, nmstate_config_name
 from shared.exceptions import (
     AgentBindingChangedError,
@@ -82,6 +85,8 @@ from shared.exceptions import (
     BmcCredentialsMissingError,
     BmhResourceError,
     BmhTeardownError,
+    Day1ChangeRejectedError,
+    Day1NotConfiguredError,
     HostedClusterAccessError,
     InfraEnvNotFoundError,
     InfraEnvNotReadyError,
@@ -89,6 +94,7 @@ from shared.exceptions import (
     NodeMetricsPendingError,
     PxeSiteNotConfiguredError,
 )
+from shared.models.cluster_upgrade import Day1ChangeKind, Day1ChangeRequest, Day1Cluster, Day1ClusterRequest, Day1Commit
 from shared.models.server_lifecycle import (
     AcquiredServer,
     AcquireServerRequest,
@@ -1678,6 +1684,51 @@ async def _patch_mark(namespace: str, machine: dict, mark: str | None) -> bool:
         name=metadata.get("name") or "",
         body=machine_selection.mark_patch(metadata.get("resourceVersion"), mark),
     )
+
+
+def _day1() -> tuple[str, str]:
+    """(repo URL, token) for update-nodepool's day1 calls; Day1NotConfiguredError while either is unset."""
+    if not _settings.day1_repo_url or not _settings.day1_git_token:
+        raise Day1NotConfiguredError(
+            f"the server-lifecycle-worker of {_settings.mce_cluster} has no "
+            f"{'DAY1_REPO_URL' if not _settings.day1_repo_url else 'DAY1_GIT_TOKEN'}: update-nodepool "
+            "reads and commits day1 through it. Set it in the chart; nothing was read or written"
+        )
+    return _settings.day1_repo_url, _settings.day1_git_token
+
+
+@activity.defn
+async def read_day1_nodepools(request: Day1ClusterRequest) -> Day1Cluster:
+    """The cluster's day1 file at main: path, blob, HostedCluster, NodePools, problems."""
+    repo_url, token = _day1()
+    cluster = await day1_repo.read_cluster(repo_url=repo_url, token=token, cluster=request.cluster)
+    activity.logger.info(
+        "day1 %s at %s: HostedCluster %s/%s, %d NodePools, %d problems",
+        cluster.path, cluster.revision, cluster.hosted_cluster_namespace, cluster.hosted_cluster,
+        len(cluster.nodepools), len(cluster.problems),
+    )
+    return cluster
+
+
+@activity.defn
+async def commit_day1_replicas(request: Day1ChangeRequest) -> Day1Commit:
+    """`nodepool[].replicas` in ONE commit to day1 main — a REPLICAS change and nothing else."""
+    if request.change is not Day1ChangeKind.REPLICAS:
+        raise Day1ChangeRejectedError(
+            f"the server-lifecycle limb commits NodePool replicas only, not a {request.change.value} change "
+            f"to {request.path}; nothing was written"
+        )
+    repo_url, token = _day1()
+    if not _settings.day1_validate_command:
+        activity.logger.warning("DAY1_VALIDATE_COMMAND is not set: %s is pushed without day1's validator", request.path)
+    commit = await day1_repo.commit_change(
+        repo_url=repo_url, token=token, request=request, validate_command=_settings.day1_validate_command,
+    )
+    activity.logger.info(
+        "day1 replicas %s for %s: %s at %s",
+        "committed" if commit.changed else "already so", request.cluster, request.path, commit.revision,
+    )
+    return commit
 
 
 @activity.defn

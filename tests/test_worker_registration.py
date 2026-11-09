@@ -321,10 +321,11 @@ def test_every_cluster_upgrade_dispatch_lands_on_a_worker_registering_it(helper)
 
 
 # update-nodepool and its two children dispatch through
-# workflow_domains/server_lifecycle/nodepool_scaling.py: one helper per limb,
-# the activity its second argument (`on_mce(mce, activity, request)`) or, for
-# the hub, its first. Helper -> (the queue its body routes to, the interface
-# its activities must come from, the worker module polling that queue).
+# workflow_domains/server_lifecycle/nodepool_scaling.py's ONE helper, to the
+# MCE's server-lifecycle worker (the operator, 2026-11-08), the activity its
+# second argument (`on_mce(mce, activity, request)`). Helper -> (the queue its
+# body routes to, the interfaces its activities may come from — this limb's,
+# and cluster-upgrade's two re-registered on it — the worker module polling).
 _NODEPOOL_SCALING = "workflow_domains/server_lifecycle/nodepool_scaling.py"
 _NODEPOOL_MODULES = (
     _NODEPOOL_SCALING,
@@ -333,12 +334,9 @@ _NODEPOOL_MODULES = (
     "workflow_domains/server_lifecycle/scale_down_nodepool.py",
 )
 _NODEPOOL_ROUTES = {
-    "on_hub": (0, "UPGRADE_GITOPS_ACTIVITY_QUEUE", "shared.interfaces.upgrade_gitops",
-               "activities/upgrade_gitops/worker_init.py"),
-    "on_mce": (1, "cluster_upgrade_activity_queue", "shared.interfaces.cluster_upgrade",
-               "activities/cluster_upgrade/worker_init.py"),
-    "on_server_lifecycle": (1, "server_lifecycle_activity_queue", "shared.interfaces.server_lifecycle",
-                            "activities/server_lifecycle/worker_init.py"),
+    "on_mce": (1, "server_lifecycle_activity_queue",
+               ("shared.interfaces.server_lifecycle", "shared.interfaces.cluster_upgrade"),
+               "activities/server_lifecycle/worker_init.py"),
 }
 
 
@@ -353,7 +351,7 @@ def _imported_from(tree: ast.Module, module: str) -> set[str]:
 
 @pytest.mark.parametrize("helper", sorted(_NODEPOOL_ROUTES))
 def test_every_nodepool_dispatch_lands_on_a_worker_registering_it(helper):
-    position, queue, interface, worker_module = _NODEPOOL_ROUTES[helper]
+    position, queue, interfaces, worker_module = _NODEPOOL_ROUTES[helper]
     # The premise: the helper really routes to that limb's queue.
     function = next(
         node for node in ast.walk(_tree(_NODEPOOL_SCALING))
@@ -374,7 +372,7 @@ def test_every_nodepool_dispatch_lands_on_a_worker_registering_it(helper):
             if isinstance(node, ast.ImportFrom) and (node.module or "").startswith("shared.interfaces")
             for alias in node.names
         }
-        own = _imported_from(tree, interface)
+        own = set().union(*(_imported_from(tree, interface) for interface in interfaces))
         for node in ast.walk(tree):
             called = getattr(node, "func", None)
             if not isinstance(node, ast.Call) or getattr(called, "id", getattr(called, "attr", None)) != helper:
@@ -386,6 +384,13 @@ def test_every_nodepool_dispatch_lands_on_a_worker_registering_it(helper):
     assert sent, f"no NodePool workflow calls {helper}: the scan is broken"
     missing = sent - _registered_activities(worker_module)
     assert not missing, f"{sorted(missing)} go through {helper} but {worker_module} does not register them"
+
+
+def test_the_server_lifecycle_worker_borrows_only_update_nodepools_two_cluster_upgrade_activities():
+    """Re-registering is §2's move for an activity another workflow needs; nothing more of cluster-upgrade's."""
+    tree = _tree("activities/server_lifecycle/worker_init.py")
+    assert _imported_from(tree, "activities.cluster_upgrade.activities") == {"read_hosted_cluster", "sync_argo_application"}
+    assert not _imported_from(tree, "activities.upgrade_gitops.activities")
 
 
 def test_the_nodepool_workflows_dispatch_only_through_their_helpers():

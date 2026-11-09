@@ -1,18 +1,16 @@
 """Where update-nodepool and its two children run each activity, and the steps both children share.
 
-Workflow code only: everything below runs in the workflow sandbox. Three limbs,
-three routes, and none of them new (CLAUDE.md §2: the deployment follows the
-credential set, and these already hold what a replicas change needs):
+Workflow code only: everything below runs in the workflow sandbox. ONE limb, one
+route (the operator, 2026-11-08): `on_mce` sends every call to
+server_lifecycle_activity_queue(mce), this domain's own per-MCE worker —
 
-  * on_hub — UPGRADE_GITOPS_ACTIVITY_QUEUE, the cluster-upgrade hub limb: it
-    holds the day1 push token and the day1 reader/editor (read_day1_cluster,
-    commit_day1_change);
-  * on_mce — cluster_upgrade_activity_queue(mce), the cluster-upgrade per-MCE
-    limb: NodePool get/list and the Argo CD sync (read_hosted_cluster,
-    sync_argo_application);
-  * on_server_lifecycle — server_lifecycle_activity_queue(mce), this domain's
-    own per-MCE limb: Machines and the hosted cluster's admin kubeconfig, for
-    the scale-down's choice of servers.
+  * the day1 file: read_day1_nodepools, commit_day1_replicas (this limb's, with
+    its optional DAY1_* settings);
+  * the NodePools and the Argo CD sync: read_hosted_cluster,
+    sync_argo_application — the cluster-upgrade limb's activities, registered
+    on this queue too (CLAUDE.md §2), so no cluster-upgrade worker has to run;
+  * the scale-down's servers: Machines and the hosted cluster's admin
+    kubeconfig.
 
 The shared steps are a scale's second half — commit, sync, read back — which
 scale-up-nodepool and scale-down-nodepool run the same way.
@@ -28,11 +26,7 @@ from temporalio.common import RetryPolicy
 from temporalio.exceptions import ActivityError, ApplicationError, ChildWorkflowError
 
 with workflow.unsafe.imports_passed_through():
-    from shared.consts import (
-        UPGRADE_GITOPS_ACTIVITY_QUEUE,
-        cluster_upgrade_activity_queue,
-        server_lifecycle_activity_queue,
-    )
+    from shared.consts import server_lifecycle_activity_queue
     from shared.exceptions import (
         AmbiguousClusterFileError,
         AmbiguousHostedClusterError,
@@ -42,13 +36,14 @@ with workflow.unsafe.imports_passed_through():
         ClusterFileNotFoundError,
         Day1ChangeRejectedError,
         Day1FileChangedError,
+        Day1NotConfiguredError,
         HostedClusterAccessError,
         MachineMarkConflictError,
         NodeMetricsUnavailableError,
         NodePoolsNotReconciledError,
     )
     from shared.interfaces.cluster_upgrade import read_hosted_cluster, sync_argo_application
-    from shared.interfaces.upgrade_gitops import commit_day1_change
+    from shared.interfaces.server_lifecycle import commit_day1_replicas
     from shared.models.cluster_upgrade import (
         ArgoSyncRequest,
         Day1ChangeKind,
@@ -75,6 +70,7 @@ SCHEDULE_TO_START_TIMEOUT = timedelta(minutes=5)
 # upgrade-cluster's list, the RBAC and admin-kubeconfig errors are here: a
 # replicas change is a short run that should fail loudly, as uninstall does.
 _PERMANENT_ACTIVITY_ERRORS: tuple[type[Exception], ...] = (
+    Day1NotConfiguredError,
     ClusterFileNotFoundError,
     AmbiguousClusterFileError,
     Day1FileChangedError,
@@ -111,29 +107,7 @@ def error_detail(error: BaseException) -> str:
     return f"{type(root).__name__}: {root}"
 
 
-async def on_hub(activity: Any, arg: Any, *, timeout: timedelta = GIT_TIMEOUT) -> Any:
-    return await workflow.execute_activity(
-        activity,
-        arg,
-        task_queue=UPGRADE_GITOPS_ACTIVITY_QUEUE,
-        start_to_close_timeout=timeout,
-        schedule_to_start_timeout=SCHEDULE_TO_START_TIMEOUT,
-        retry_policy=RETRY_POLICY,
-    )
-
-
-async def on_mce(mce_cluster: str, activity: Any, arg: Any, *, timeout: timedelta = READ_TIMEOUT) -> Any:
-    return await workflow.execute_activity(
-        activity,
-        arg,
-        task_queue=cluster_upgrade_activity_queue(mce_cluster),
-        start_to_close_timeout=timeout,
-        schedule_to_start_timeout=SCHEDULE_TO_START_TIMEOUT,
-        retry_policy=RETRY_POLICY,
-    )
-
-
-async def on_server_lifecycle(
+async def on_mce(
     mce_cluster: str,
     activity: Any,
     arg: Any,
@@ -173,8 +147,9 @@ async def commit(plan: NodePoolScalePlan, workflow_id: str) -> Day1Commit:
     conflict. Day1FileChangedError / Day1ChangeRejectedError propagate as the
     ActivityError: the caller decides what comes before failing.
     """
-    return await on_hub(
-        commit_day1_change,
+    return await on_mce(
+        plan.mce_cluster,
+        commit_day1_replicas,
         Day1ChangeRequest(
             workflow_id=workflow_id,
             mce_cluster=plan.mce_cluster,
@@ -184,6 +159,7 @@ async def commit(plan: NodePoolScalePlan, workflow_id: str) -> Day1Commit:
             change=Day1ChangeKind.REPLICAS,
             nodepool_replicas={np.name: np.after for np in plan.nodepools if np.before != np.after},
         ),
+        timeout=GIT_TIMEOUT,
     )
 
 

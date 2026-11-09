@@ -388,9 +388,19 @@ helm upgrade --install server-lifecycle-worker deploy/charts/server-lifecycle-wo
 
 The credentials Secret must exist in that namespace first. Its keys:
 `SERVER_SCAN_API_TOKEN` (server-scan ADMIN role), `<VENDOR>_BMC_USERNAME` /
-`<VENDOR>_BMC_PASSWORD` for HP, DELL, CISCO, INTERSIGHT, and `PXE_MAP_TOKEN`.
+`<VENDOR>_BMC_PASSWORD` for HP, DELL, CISCO, INTERSIGHT, `PXE_MAP_TOKEN`, and
+`DAY1_GIT_TOKEN` unless `day1.tokenSecret.name` names another Secret.
 
-### RBAC: one Role per InfraEnv namespace, plus one ClusterRole for uninstall-server-from-hc
+### update-nodepool: day1 and Argo CD (optional)
+
+update-nodepool runs on this worker alone: it reads the cluster's day1 file and
+commits its NodePools' `replicas` to day1 `main` (`day1.repoUrl`, the token),
+reads the NodePools, and syncs the cluster's Argo CD Application in
+`argo.namespace`. The day1 values are **optional**: without them every other
+workflow runs as before and update-nodepool fails at once on this MCE with
+`Day1NotConfiguredError`. The pods need network access to the day1 git host.
+
+### RBAC: one Role per InfraEnv namespace, plus one ClusterRole for hosted clusters
 
 `rbac.targetNamespaces` gets a Role each: everything add-server-to-mce and
 remove-server-from-mce do happens in an InfraEnv namespace — and uninstall-server-from-hc's
@@ -404,7 +414,14 @@ further, so `rbac.hostedClusters` (default `true`) adds a **ClusterRole** —
 | `cluster.x-k8s.io` machines | get, list, delete, patch | the Machine behind a hosted node's Agent, found by owner, infrastructureRef or providerID; patch removes the Agent provider's pre-terminate hook from one whose AgentMachine is gone (the provider never can). update-nodepool's scale-down lists a NodePool's Machines (by `hypershift.openshift.io/nodePool`) and patches `cluster.x-k8s.io/delete-machine` onto the ones its policy chose |
 | `capi-provider.agent-install.openshift.io` agentmachines | get, list, delete, patch | found by its `status.agentRef` — the only link once the Agent provider starts unbinding; delete one left with no Machine, patch to drop the provider's finalizer it only drops through a Machine |
 | `hypershift.openshift.io` hostedclusters | get, list | found by its control-plane namespace; its `status.kubeconfig` |
+| `hypershift.openshift.io` nodepools | get, list | update-nodepool reads a HostedCluster's NodePools: replicas, InfraEnv, scale-down policy. Never written: a replicas change reaches a NodePool as a day1 commit Argo CD applies |
 | `""` secrets | get | the HostedCluster's admin kubeconfig — **every Secret on the MCE**; through it update-nodepool's scale-down also reads the hosted cluster's Nodes, Pods and `metrics.k8s.io` NodeMetrics |
+
+With it, a **Role in `argo.namespace`** (default `openshift-gitops`):
+
+| group / resource | verbs | why |
+|---|---|---|
+| `argoproj.io` applications | get, patch | update-nodepool syncs the cluster's Application to exactly its day1 commit: read it, then patch its `operation` |
 
 They are cluster-wide because a hosted cluster's Machines live in its
 control-plane namespace (`<hc-ns>-<hc>`) and its kubeconfig in the
@@ -483,8 +500,12 @@ temporal task-queue describe \
 | `temporal.tls.serverName` | | Name verified and sent as SNI; defaults to the host part of `temporal.host` |
 | `serverScan.url` | yes | server-scan base URL including `/api/v1` |
 | `pxeMap.urls` | | Site → PXE VM base URL, for IPMI (UCS) servers |
-| `credentials.existingSecret` | | Secret with server-scan token, BMC credentials, PXE token |
+| `credentials.existingSecret` | | Secret with server-scan token, BMC credentials, PXE token, day1 token |
+| `day1.repoUrl` | | update-nodepool's day1 repo, `https://`; empty = update-nodepool refused on this MCE |
+| `day1.validateCommand` | | Run in the clone before the replicas push |
+| `day1.tokenSecret.name` / `.key` | | An existing Secret holding `DAY1_GIT_TOKEN`, instead of the credentials Secret |
+| `argo.namespace` / `argo.valuesRef` | | Where the hosted clusters' Applications live (`openshift-gitops`), and their day1 source's `ref` (`values`) |
 | `rbac.targetNamespaces` | | InfraEnv namespaces the worker may write to |
-| `rbac.hostedClusters` | | uninstall-server-from-hc's ClusterRole (Machines, AgentMachines, HostedClusters, Secrets get); default `true` |
+| `rbac.hostedClusters` | | The hosted-cluster ClusterRole (Machines, AgentMachines, HostedClusters, NodePools, Secrets get) and the Argo CD Role; default `true` |
 | `image.repository` / `image.tag` | | Mirror path and tag in a disconnected environment |
 | `replicaCount` | | Pods polling the same queue (load sharing + failover) |

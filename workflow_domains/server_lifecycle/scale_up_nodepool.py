@@ -5,7 +5,8 @@ planned each NodePool's replicas (nodepool_replicas.plan). This run makes the
 change and proves it landed:
 
   1. committing-day1      — the planned replicas of every NodePool that moves,
-                            ONE commit to day1 `main` through the hub limb,
+                            ONE commit to day1 `main` through the MCE's
+                            server-lifecycle worker,
                             compare-and-set on the blob the parent read. day1
                             already saying so (a re-run) is success.
   2. syncing-argo         — the cluster's Argo CD Application synced to exactly

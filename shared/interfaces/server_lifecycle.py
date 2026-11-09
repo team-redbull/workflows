@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from temporalio import activity
 
+from shared.models.cluster_upgrade import Day1ChangeRequest, Day1Cluster, Day1ClusterRequest, Day1Commit
 from shared.models.server_lifecycle import (
     AcquireServerRequest,
     AcquiredServer,
@@ -741,6 +742,44 @@ async def clean_up_agent_machines(request: AgentMachineCleanupRequest) -> AgentM
     it only through a Machine, so without one it would hold for ever. Also
     reports every Machine still linked to the Agent (`machines`). Needs list,
     delete and patch on agentmachines, list on machines.
+    """
+    ...
+
+
+# --- update-nodepool: the cluster's day1 file ---------------------------------------------
+#
+# The day1 half of a replicas change. The NodePool half — read_hosted_cluster and
+# sync_argo_application — is cluster-upgrade's own activities, registered on this
+# limb's queue too (CLAUDE.md §2), so update-nodepool runs on this worker alone.
+
+
+@activity.defn
+async def read_day1_nodepools(request: Day1ClusterRequest) -> Day1Cluster:
+    """update-nodepool: the cluster's day1 file at `main` — its path, blob, HostedCluster and NodePools.
+
+    The cluster-upgrade hub limb's read_day1_cluster, done here with this
+    limb's DAY1_* settings: the file found under any `sites/*/mces/*/`, its
+    value layers merged as the hostedclusters-setup chart does, each NodePool's
+    name, replicas and InfraEnv, and every reason the chart would refuse it in
+    `problems`. Reads only. Raises Day1NotConfiguredError (non-retryable) when
+    this worker has no DAY1_REPO_URL / DAY1_GIT_TOKEN, ClusterFileNotFoundError
+    and AmbiguousClusterFileError (non-retryable), ValuesRepoGitError (retried).
+    """
+    ...
+
+
+@activity.defn
+async def commit_day1_replicas(request: Day1ChangeRequest) -> Day1Commit:
+    """update-nodepool: `nodepool[].replicas` of the named NodePools, in ONE commit pushed to day1 `main`.
+
+    The cluster-upgrade hub limb's commit_day1_change, done here and for a
+    REPLICAS change only — any other kind raises Day1ChangeRejectedError
+    (non-retryable): this limb's day1 token changes replicas and nothing else.
+    Compare-and-set on `expected_blob`; the file already saying so is
+    `changed` False, checked before the compare-and-set. Raises
+    Day1NotConfiguredError, Day1FileChangedError and Day1ChangeRejectedError
+    (non-retryable), ValuesRepoGitError (retried; a push main moved past is
+    one, and the retry re-clones).
     """
     ...
 

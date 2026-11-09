@@ -54,9 +54,31 @@ pxeMap:
   urls: {}
   #  bat-yam: http://pxe-vm.bat-yam.example:8080
 
+# update-nodepool reads the cluster's day1 file and commits its NodePools'
+# replicas to day1 `main` through this worker. OPTIONAL: with no repoUrl or no
+# token, update-nodepool fails at once on this MCE (Day1NotConfiguredError) and
+# every other workflow is unaffected.
+day1:
+  repoUrl: ""        # https:// only (the token is injected into https URLs)
+  # Run in the clone before the push, e.g. "python3 scripts/validate_all_clusters.py".
+  validateCommand: ""
+  # The push token, DAY1_GIT_TOKEN: either a key of the credentials Secret
+  # below, or — set here — read from an existing Secret, such as the
+  # segment-lifecycle chart's `day1-git-token` where both run in one namespace.
+  tokenSecret:
+    name: ""
+    key: DAY1_GIT_TOKEN
+
+# Argo CD on THIS MCE, for update-nodepool's sync of the cluster's Application:
+# the namespace the hcAppset renders the Applications in (rbac.yaml grants
+# get/patch on Applications there), and the `ref` of their day1 values source.
+argo:
+  namespace: openshift-gitops
+  valuesRef: values
+
 # Secret keys the worker reads: SERVER_SCAN_API_TOKEN (ADMIN role),
 # <VENDOR>_BMC_USERNAME / <VENDOR>_BMC_PASSWORD for HP, DELL, CISCO, INTERSIGHT,
-# and PXE_MAP_TOKEN.
+# PXE_MAP_TOKEN, and DAY1_GIT_TOKEN unless day1.tokenSecret names another.
 #
 # With Argo CD keep credentials OUT of git: set existingSecret to a Secret made
 # by Sealed Secrets / External Secrets / Vault in the same namespace. `create`
@@ -74,12 +96,13 @@ credentials:
 # the InfraEnv namespaces. One Role + RoleBinding is rendered in each; the
 # namespaces themselves must already exist.
 #
-# hostedClusters: uninstall-server-from-hc's ClusterRole — get/list/delete on CAPI
-# Machines, get/list on AgentMachines and HostedClusters, and get on Secrets
-# CLUSTER-WIDE (the HostedCluster's admin kubeconfig). Turn it off on an MCE
-# that runs no hosted clusters: uninstall-server-from-hc then fails its inspection of
-# any host with an Agent (403, before anything is written) — use remove-server-from-mce
-# there instead.
+# hostedClusters: the hosted-cluster ClusterRole — uninstall-server-from-hc's and
+# update-nodepool's: CAPI Machines, AgentMachines, HostedClusters and NodePools,
+# and get on Secrets CLUSTER-WIDE (the HostedCluster's admin kubeconfig) — plus
+# the Role on Argo CD Applications in argo.namespace. Turn it off on an MCE that
+# runs no hosted clusters: uninstall-server-from-hc then fails its inspection of
+# any host with an Agent (403, before anything is written) — use
+# remove-server-from-mce there instead — and update-nodepool has nothing to scale.
 rbac:
   create: true
   targetNamespaces: []

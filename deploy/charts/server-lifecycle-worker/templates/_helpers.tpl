@@ -39,4 +39,6 @@ where a missing value is one edit away, instead of a crash-looping worker. */}}
 {{- if not .Values.temporal.host -}}{{- fail "temporal.host is required: the hub's Temporal frontend as reachable from this MCE" -}}{{- end -}}
 {{- if not .Values.serverScan.url -}}{{- fail "serverScan.url is required (base URL including /api/v1)" -}}{{- end -}}
 {{- if and .Values.credentials.existingSecret .Values.credentials.create -}}{{- fail "set credentials.existingSecret OR credentials.create, not both" -}}{{- end -}}
+{{- if and .Values.day1.repoUrl (not (hasPrefix "https://" .Values.day1.repoUrl)) -}}{{- fail "day1.repoUrl must be https:// (the token is injected into https URLs only; the worker refuses anything else at start)" -}}{{- end -}}
+{{- if not .Values.argo.namespace -}}{{- fail "argo.namespace is required: where the hosted clusters' Argo CD Applications live" -}}{{- end -}}
 {{- end -}}

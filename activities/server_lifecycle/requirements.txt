@@ -7,3 +7,6 @@ httpx>=0.27,<1
 # Synchronous SDK — every call is wrapped in asyncio.to_thread so it never
 # blocks this worker's event loop.
 kubernetes>=29,<32
+# update-nodepool's day1 cluster files (activities/upgrade_gitops/day1_repo.py,
+# day1_values.py). kubernetes brings it too; named here because we import it.
+PyYAML>=6,<7

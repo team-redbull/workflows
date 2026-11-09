@@ -82,10 +82,8 @@ Prod charts are VENDORED into the Argo CD repo, at
 `redbull-platform/gitops/charts/<service>/`: `workflows-orchestrator` (brain: ONE release for
 all domains), `segment-lifecycle-worker`, `server-lifecycle-worker` and `server-provisioning-worker`
 (limbs: one per domain), cluster-upgrade's `cluster-upgrade-worker`, `upgrade-agent-worker`
-and `upgrade-gitops-worker` (since 2026-11-02; `upgrade-gitops-worker` and `cluster-upgrade-worker`
-have a `gitops/services/` entry since 2026-11-08, for update-nodepool (§4) — the latter for the
-sandbox MCE `ocp4-mce-workflow-test`; `upgrade-agent-worker` and `server-provisioning-worker` still
-have none, so CI bumps their tags and Argo CD deploys nothing), and
+and `upgrade-gitops-worker` (since 2026-11-02; with `server-provisioning-worker`, these have no
+`gitops/services/` entry yet, so CI bumps their tags and Argo CD deploys nothing), and
 `vm-lifecycle-worker` (written 2026-11-05, in redbull-platform's working tree until pushed: CI's
 bump of it fails until then, so its job is LAST in the chain). One generic ApplicationSet
 sweeps `gitops/services/<service>/app.yaml`, so the service FOLDER NAME is the Argo app name,
@@ -116,7 +114,9 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   sub-workflow boundary. Segment-lifecycle activities live in `activities/segment_lifecycle/`
   (one dep+cred set: Segments Manager HTTP + bearer token, day1 git push token).
 - Keep `shared/interfaces/` signatures clean so an activity (e.g. "get segment") can be
-  re-registered on another queue by a future sub-workflow without moving code.
+  re-registered on another queue by a future sub-workflow without moving code. The
+  precedent: cluster-upgrade's `read_hosted_cluster` / `sync_argo_application`, also
+  registered by the server-lifecycle worker for update-nodepool (§4).
 - **One domain may need several limbs** when its work spans several credential sets — the rule
   above, applied. cluster-upgrade has three: `upgrade-gitops` on the hub (day1 push, mirror pull,
   Brain push tokens), and per MCE `cluster-upgrade` (the workflow ServiceAccount) and
@@ -627,14 +627,12 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
     scale never moves a NodePool the other way (`nodepool_replicas.plan`).
   - **The change is ONE day1 commit, then an Argo CD sync — never a NodePool
     write.** The children, scale-up-nodepool / scale-down-nodepool (own queues,
-    ids `scale-{up,down}-nodepool-<cluster>`, awaited, ABANDON, NO route),
-    reuse the cluster-upgrade domain's limbs rather than a new credential:
-    `commit_day1_change` with `Day1ChangeKind.REPLICAS` on the hub
-    upgrade-gitops worker (compare-and-set on the blob read; only
-    `nodepool[i].replicas` may change; message `nodepool(<cluster>): …`),
-    `sync_argo_application` to exactly that revision with only the moved
-    NodePools allowed out of sync, and `read_hosted_cluster` read back on the
-    MCE's cluster-upgrade worker. DONE = the NodePools show the new
+    ids `scale-{up,down}-nodepool-<cluster>`, awaited, ABANDON, NO route):
+    `commit_day1_replicas` (`Day1ChangeKind.REPLICAS`, compare-and-set on the
+    blob read; only `nodepool[i].replicas` may change; message
+    `nodepool(<cluster>): …`), `sync_argo_application` to exactly that
+    revision with only the moved NodePools allowed out of sync, and
+    `read_hosted_cluster` read back. DONE = the NodePools show the new
     `spec.replicas` — NOT new nodes Ready (the operator: "when it sees the
     nodepools in the MCE configured to the desired state").
   - **Which servers leave a scale-down is the NodePool's, never the request's**:
@@ -684,18 +682,31 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
     reads them. Do not add them to the REPLICAS edit.
   - **The servers that leave stay in the MCE** as free Agents (the operator,
     2026-11-03) — no remove-server-from-mce child.
-  - Needs no new RBAC: the server-lifecycle limb's `rbac.hostedClusters`
-    already grants machines list/patch and the admin kubeconfig; the
-    cluster-upgrade limb already reads NodePools. Needs the NEW
-    cluster-upgrade-worker (it reports `infra_env` / `scale_down_policy`; an
-    older one fails the run by name, gated on the key's presence) and the new
-    upgrade-gitops-worker (REPLICAS; an older one cannot decode it and the
-    commit is retried until it is up) — both RUNNING, which neither was through
-    Argo CD before 2026-11-08: no worker on a queue fails the run at its first
-    call to it after the 5-min `schedule_to_start_timeout`, nothing written.
-    The sandbox's services: `gitops/services/upgrade-gitops-worker/` and
-    `gitops/services/cluster-upgrade-worker/` (MCE `ocp4-mce-workflow-test`) in
-    redbull-platform.
+  - **EVERY call runs on the MCE's server-lifecycle worker** (the operator,
+    2026-11-08: "the update nodepool will be under the server lifecycle
+    worker"; `nodepool_scaling.on_mce`, one route). It first borrowed the
+    cluster-upgrade limbs — the hub upgrade-gitops worker for day1, the MCE's
+    cluster-upgrade worker for NodePools and Argo CD — which meant deploying
+    two workers that run nowhere (and upgrade-gitops "is not production",
+    above). Now: the day1 half is two server-lifecycle activities,
+    `read_day1_nodepools` / `commit_day1_replicas`, calling the hub limb's
+    TECHNOLOGY module (`activities/upgrade_gitops/day1_repo.py`) with this
+    limb's own settings — the commit refuses any kind but REPLICAS
+    (`Day1ChangeRejectedError`), so this token moves replicas and nothing else;
+    the NodePool half is cluster-upgrade's `read_hosted_cluster` /
+    `sync_argo_application` RE-REGISTERED on this queue (§2's move — their code
+    and their ClusterUpgradeActivitySettings, MCE_CLUSTER + ARGO_* defaults,
+    unchanged; `test_the_server_lifecycle_worker_borrows_only_…` pins that
+    nothing more is borrowed). `DAY1_REPO_URL` / `DAY1_GIT_TOKEN` are OPTIONAL
+    on this limb, unlike everywhere else: a worker without them keeps serving
+    every other workflow, and update-nodepool fails at its first call with
+    `Day1NotConfiguredError` (permanent), nothing read or written — never a
+    crash-loop of an MCE's installs over a feature it does not use. The chart
+    adds NodePools get/list to the `rbac.hostedClusters` ClusterRole, a Role
+    on Argo CD Applications (get/patch) in `argo.namespace`, the `day1.*`
+    values, and the image installs git. An older server-lifecycle worker lacks
+    the day1 activities (retried until the new one polls) and reports no
+    `infra_env` (the run fails naming it, gated on the key's presence).
 - **create-vm (domain `vm-lifecycle`) makes ONE Halted VirtualMachine for a KubeVirt InfraEnv, on the
   best-fitting KubeVirt cluster of the InfraEnv's zone — the step before add-server-to-mce for an
   InfraEnv whose hosts are VMs.** Designed with the operator 2026-11-04/05 (plan file
@@ -1244,7 +1255,10 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   `ServerProvisioningActivitySettings` and `VmLifecycleActivitySettings` (each that domain's activity
   worker only; the last: `DAY1_REPO_URL`/`DAY1_GIT_TOKEN` again, `KV_CAPACITY_URL_TEMPLATE` /
   `KV_VM_API_URL_TEMPLATE` with their placeholders checked at startup, the two tokens, `KV_AGENT_CA`,
-  `HEADROOM_BUFFER_PERCENT` 0..90 and `VM_MAC_PREFIX` — locally administered unicast, checked). Field names = Helm ConfigMap/Secret keys
+  `HEADROOM_BUFFER_PERCENT` 0..90 and `VM_MAC_PREFIX` — locally administered unicast, checked;
+  `ServerLifecycleActivitySettings` carries `DAY1_*` too, OPTIONAL there — update-nodepool's alone, §4 —
+  and the server-lifecycle worker also builds `ClusterUpgradeActivitySettings` for the two
+  cluster-upgrade activities it re-registers, from the same pod env). Field names = Helm ConfigMap/Secret keys
   lowercased — keep aligned with redbull-platform's `gitops/charts/workflows-orchestrator/templates/config.yaml`
   (global) and `gitops/charts/segment-lifecycle-worker/templates/config.yaml` (day1 URL + DHCP
   policy + DHCP API URL + the credential Secrets). Which ConfigMap
@@ -1317,7 +1331,8 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   secrets, metal3.io/baremetalhosts and agent-install.openshift.io/nmstateconfigs in the target
   namespace, where segment-lifecycle only makes HTTP and git calls — and, for uninstall-server-from-hc,
   a ClusterRole over CAPI Machines, AgentMachines, HostedClusters and Secrets (§4) — the same
-  grant update-nodepool's scale-down uses to read and mark Machines.
+  grant update-nodepool's scale-down uses to read and mark Machines, plus NodePools get/list and a
+  Role on Argo CD Applications (get/patch) in `argo.namespace` for update-nodepool's read and sync.
   cluster-upgrade-worker holds NO credential Secret — its ServiceAccount is the whole identity —
   and its RBAC is derived call by call from `activities/cluster_upgrade/activities.py` (its
   README's table): a ClusterRole reading HostedClusters, NodePools, MachineSets, IDMS and Secrets
@@ -1330,11 +1345,9 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   end of the sequential chain, so a `main` build publishes `vX.Y.Z`, bumps `image.tag` in
   redbull-platform's `gitops/charts/<limb>-worker/values.yaml` and tags `<limb>-worker/vX.Y.Z`
   there. Until 2026-11-02 they were image-only jobs tagged `<branch-slug>-<short sha>` with the tag
-  set by hand; do not go back to that. Since 2026-11-08 `upgrade-gitops-worker` and
-  `cluster-upgrade-worker` (sandbox MCE `ocp4-mce-workflow-test`, its values as helm parameters in
-  its app.yaml, because `sync-upgrade-charts` overwrites the chart's values.yaml) have a
-  `gitops/services/` entry; `upgrade-agent-worker` has none yet, so its bumps deploy nothing —
-  deploy it by adding one per MCE. The
+  set by hand; do not go back to that. None of the three has a `gitops/services/` entry yet, so
+  their bumps deploy nothing; deploy them by adding one (per MCE for the two per-MCE limbs).
+  update-nodepool does NOT need them: it runs on the server-lifecycle worker alone (§4). The
   domain keeps THREE images, one per limb (§2): the operator confirmed it the same day.
 - Assumed already running: a Temporal server and the Segments Manager (via OpenShift routes or
   localhost — no port assumptions in code).

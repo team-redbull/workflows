@@ -289,6 +289,26 @@ class ServerLifecycleActivitySettings(BaseSettings):
     pxe_map_urls: dict[str, str] = {}
     pxe_map_token: str = ""
 
+    # --- day1: update-nodepool's cluster file and its replicas commit --------
+    # The same repo and keys as the segment-lifecycle and upgrade-gitops limbs
+    # (one Secret may serve all). This limb reads a cluster file at `main` and
+    # commits only `nodepool[].replicas` there (read_day1_nodepools,
+    # commit_day1_replicas). OPTIONAL, unlike theirs: only update-nodepool
+    # needs them, so a worker without them serves every other workflow, and
+    # update-nodepool fails at once with Day1NotConfiguredError.
+    day1_repo_url: str = ""
+    day1_git_token: str = ""
+    # Run in the clone before the push, split like a shell line; empty = none.
+    day1_validate_command: str = ""
+
+    @field_validator("day1_repo_url")
+    @classmethod
+    def _require_https_day1_url(cls, url: str) -> str:
+        """The token is injected into https:// URLs only (git_repo.authenticated_url): fail at start, not per clone."""
+        if url and not url.startswith("https://"):
+            raise ValueError(f"day1_repo_url must be https:// (got {url.split('@')[-1]!r})")
+        return url
+
     @field_validator("pxe_map_urls")
     @classmethod
     def _validate_pxe_map_urls(cls, urls: dict[str, str]) -> dict[str, str]:

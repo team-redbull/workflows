@@ -52,6 +52,17 @@ spec:
                 # every BMC pair defaults empty and fails only the install that
                 # needs it, with BmcCredentialsMissingError.
                 optional: true
+          {{- with .Values.day1.tokenSecret.name }}
+          env:
+            # update-nodepool's day1 push token from a Secret shared with
+            # another limb; optional, as day1 is (Day1NotConfiguredError).
+            - name: DAY1_GIT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . }}
+                  key: {{ $.Values.day1.tokenSecret.key }}
+                  optional: true
+          {{- end }}
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:

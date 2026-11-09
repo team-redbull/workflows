@@ -14,17 +14,17 @@ Only the cluster's OWN NodePools count — never the rest of the MCE.
 
 Replicas are owned by the day1 file and changed only here (decided with the
 operator, 2026-11-03): the change is a commit to day1 `main`, which Argo CD
-applies. Nothing on the MCE is written directly.
+applies. Nothing on the MCE is written directly. Every call goes to the MCE's
+server-lifecycle worker (the operator, 2026-11-08; nodepool_scaling.on_mce).
 
 Phases:
 
-  1. reading-day1       — the cluster file on the hub limb: its path (whose MCE
-                          folder must be the request's), blob, HostedCluster,
-                          and every NodePool's replicas and InfraEnv. A file
-                          with `problems` is refused.
-  2. reading-nodepools  — the HostedCluster's NodePools on the MCE (the
-                          cluster-upgrade limb): the kind's, selected by their
-                          matchLabel, or the one named. Live and git must agree
+  1. reading-day1       — the cluster file: its path (whose MCE folder must be
+                          the request's), blob, HostedCluster, and every
+                          NodePool's replicas and InfraEnv. A file with
+                          `problems` is refused.
+  2. reading-nodepools  — the HostedCluster's NodePools on the MCE: the kind's,
+                          selected by their matchLabel, or the one named. Live and git must agree
                           BOTH ways — same NodePools, InfraEnvs and replicas —
                           else NodePoolReplicasDriftError, nothing written. A
                           named NodePool on neither side is NodePoolNotFoundError.
@@ -64,7 +64,7 @@ with workflow.unsafe.imports_passed_through():
         ScaleNodePoolFailedError,
     )
     from shared.interfaces.cluster_upgrade import read_hosted_cluster
-    from shared.interfaces.upgrade_gitops import read_day1_cluster
+    from shared.interfaces.server_lifecycle import read_day1_nodepools
     from shared.models.cluster_upgrade import (
         Day1Cluster,
         Day1ClusterRequest,
@@ -118,7 +118,10 @@ class UpdateNodePoolWorkflow:
             )
 
         self._phase = "reading-day1"
-        day1: Day1Cluster = await nodepool_scaling.on_hub(read_day1_cluster, Day1ClusterRequest(cluster=request.cluster))
+        day1: Day1Cluster = await nodepool_scaling.on_mce(
+            request.mce_cluster, read_day1_nodepools, Day1ClusterRequest(cluster=request.cluster),
+            timeout=nodepool_scaling.GIT_TIMEOUT,
+        )
         self._check_day1(request, day1)
 
         self._phase = "reading-nodepools"
@@ -192,8 +195,8 @@ class UpdateNodePoolWorkflow:
             "infra_env" not in np.model_fields_set for np in day1.nodepools
         ):
             raise _fail(
-                "the upgrade-gitops-worker on the hub predates update-nodepool: it reports no HostedCluster "
-                "or no InfraEnv per NodePool. Upgrade it, then run again",
+                f"the server-lifecycle-worker on MCE {request.mce_cluster} predates update-nodepool: its day1 "
+                "read reports no HostedCluster or no InfraEnv per NodePool. Upgrade it, then run again",
                 NodePoolKindNotFoundError,
             )
 
@@ -212,8 +215,8 @@ class UpdateNodePoolWorkflow:
             for np in state.nodepools
         ):
             raise _fail(
-                f"the cluster-upgrade-worker on MCE {request.mce_cluster} predates update-nodepool: it "
-                "reports no InfraEnv per NodePool. Upgrade it, then run again",
+                f"the server-lifecycle-worker on MCE {request.mce_cluster} predates update-nodepool: its "
+                "NodePool read reports no InfraEnv per NodePool. Upgrade it, then run again",
                 NodePoolKindNotFoundError,
             )
         if request.nodepool is not None:

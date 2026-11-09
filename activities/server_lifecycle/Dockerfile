@@ -2,8 +2,11 @@
 #   docker build -f activities/server_lifecycle/Dockerfile -t server-lifecycle-worker:dev .
 FROM python:3.12-slim
 
-# No git here, unlike the segment-lifecycle limb: this worker's dependencies
-# are HTTP (server-scan) and the Kubernetes API, both pure-Python.
+# git for update-nodepool's day1 read and replicas commit (activities/git_repo.py
+# runs the binary; no Python git dependency), as in the segment-lifecycle limb.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 
 COPY activities/server_lifecycle/requirements.txt /app/activities/server_lifecycle/requirements.txt

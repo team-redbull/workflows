@@ -991,6 +991,17 @@ class NodeMetricsUnavailableError(OrchestratorError):
     """
 
 
+class Day1NotConfiguredError(OrchestratorError):
+    """This MCE's server-lifecycle-worker has no day1 repo configured. Deterministic.
+
+    update-nodepool reads and commits the cluster's day1 file through the
+    server-lifecycle limb, which needs DAY1_REPO_URL and DAY1_GIT_TOKEN for
+    it. Both are optional, so a worker without them still serves every other
+    workflow; this is the one call that needs them. Non-retryable: set them in
+    the chart, then run again. Nothing was read or written.
+    """
+
+
 class NodeMetricsPendingError(OrchestratorError):
     """A candidate Node has no metrics yet, though the metrics API answers. Transient.
 

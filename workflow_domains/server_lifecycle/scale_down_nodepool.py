@@ -52,6 +52,7 @@ with workflow.unsafe.imports_passed_through():
         ClusterFileNotFoundError,
         Day1ChangeRejectedError,
         Day1FileChangedError,
+        Day1NotConfiguredError,
         NodePoolsNotReconciledError,
         ScaleDownWrongMachineError,
     )
@@ -87,7 +88,10 @@ _WATCH_MARGIN = timedelta(minutes=5)
 # A commit failing with one of these pushed nothing: the marks come off again.
 _NOTHING_PUSHED = frozenset(
     error.__name__
-    for error in (Day1FileChangedError, Day1ChangeRejectedError, ClusterFileNotFoundError, AmbiguousClusterFileError)
+    for error in (
+        Day1FileChangedError, Day1ChangeRejectedError, Day1NotConfiguredError,
+        ClusterFileNotFoundError, AmbiguousClusterFileError,
+    )
 )
 
 
@@ -112,7 +116,7 @@ class ScaleDownNodePoolWorkflow:
         )
         if marks is not None:
             self._phase = "marking-machines"
-            await nodepool_scaling.on_server_lifecycle(plan.mce_cluster, mark_machines_for_deletion, marks)
+            await nodepool_scaling.on_mce(plan.mce_cluster, mark_machines_for_deletion, marks)
 
         self._phase = "committing-day1"
         try:
@@ -120,7 +124,7 @@ class ScaleDownNodePoolWorkflow:
         except ActivityError as err:
             if marks is not None and nodepool_scaling.error_type(err) in _NOTHING_PUSHED:
                 self._phase = "unmarking-machines"
-                await nodepool_scaling.on_server_lifecycle(plan.mce_cluster, unmark_machines, marks)
+                await nodepool_scaling.on_mce(plan.mce_cluster, unmark_machines, marks)
             raise
 
         self._phase = "syncing-argo"
@@ -162,7 +166,7 @@ class ScaleDownNodePoolWorkflow:
             return [], ""
 
         self._phase = "selecting-servers"
-        candidates: ScaleDownCandidates = await nodepool_scaling.on_server_lifecycle(
+        candidates: ScaleDownCandidates = await nodepool_scaling.on_mce(
             plan.mce_cluster,
             read_scale_down_candidates,
             ScaleDownCandidatesRequest(
@@ -182,7 +186,7 @@ class ScaleDownNodePoolWorkflow:
         picked = {choice.machine for choice in chosen}
         stale = sorted(m.name for m in candidates.machines if m.delete_mark == mark and m.name not in picked)
         if stale:
-            await nodepool_scaling.on_server_lifecycle(
+            await nodepool_scaling.on_mce(
                 plan.mce_cluster, unmark_machines,
                 MachineMarkRequest(namespace=candidates.hcp_namespace, machines=stale, mark=mark),
             )
@@ -193,7 +197,7 @@ class ScaleDownNodePoolWorkflow:
     ) -> list[str]:
         """The marked Machines deleting or gone; a wrong one or the deadline fails the run."""
         plan = run_args.input
-        watch: MarkedMachinesWatch = await nodepool_scaling.on_server_lifecycle(
+        watch: MarkedMachinesWatch = await nodepool_scaling.on_mce(
             plan.mce_cluster,
             watch_marked_machines,
             MarkedMachinesWatchRequest(

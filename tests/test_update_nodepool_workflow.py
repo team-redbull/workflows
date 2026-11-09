@@ -1,10 +1,10 @@
 """update-nodepool and its two children: the real workflows, mock activities, time-skipping env.
 
-Three limbs, as in production: the hub's day1 reader and committer, the MCE's
-cluster-upgrade worker (NodePools, Argo CD), and the MCE's server-lifecycle
-worker (the scale-down's Machines). A small fake fleet holds day1, the MCE's
-NodePools and their Machines, so a commit followed by a sync is what moves
-the replicas the run reads back.
+One limb, as in production: the MCE's server-lifecycle worker answers every
+call — the day1 read and commit, the NodePool read and Argo CD sync it
+re-registers from cluster-upgrade, and the scale-down's Machines. A small fake
+fleet holds day1, the MCE's NodePools and their Machines, so a commit followed
+by a sync is what moves the replicas the run reads back.
 """
 
 from __future__ import annotations
@@ -25,11 +25,9 @@ from shared.consts import (
     SCALE_DOWN_NODEPOOL_WORKFLOW_QUEUE,
     SCALE_UP_NODEPOOL_WORKFLOW_QUEUE,
     UPDATE_NODEPOOL_WORKFLOW_QUEUE,
-    UPGRADE_GITOPS_ACTIVITY_QUEUE,
-    cluster_upgrade_activity_queue,
     server_lifecycle_activity_queue,
 )
-from shared.exceptions import ArgoSyncRefusedError, Day1FileChangedError
+from shared.exceptions import ArgoSyncRefusedError, Day1FileChangedError, Day1NotConfiguredError
 from shared.models.cluster_upgrade import (
     ArgoSyncRequest,
     ArgoSyncResult,
@@ -92,6 +90,7 @@ class _Fleet:
         self.problems = list(problems)
         self.revision = "rev-1"
         self.calls: list[tuple[str, object]] = []
+        self.read_error: Exception | None = None
         self.commit_error: Exception | None = None
         self.sync_error: Exception | None = None
         self.argo_applies = True
@@ -107,18 +106,20 @@ class _Fleet:
     def activities(self):
         fleet = self
 
-        @activity.defn(name="read_day1_cluster")
-        async def read_day1_cluster(request: Day1ClusterRequest) -> Day1Cluster:
-            fleet.calls.append(("read_day1_cluster", request))
+        @activity.defn(name="read_day1_nodepools")
+        async def read_day1_nodepools(request: Day1ClusterRequest) -> Day1Cluster:
+            fleet.calls.append(("read_day1_nodepools", request))
+            if fleet.read_error is not None:
+                raise fleet.read_error
             return Day1Cluster(
                 path=fleet.path, revision=fleet.revision, blob="blob-1", mastertag="4.18.56",
                 hosted_cluster=HC, hosted_cluster_namespace=HC_NS, problems=fleet.problems,
                 nodepools=[Day1NodePool(name=n, replicas=c, infra_env=fleet.infra_envs[n]) for n, c in fleet.day1.items()],
             )
 
-        @activity.defn(name="commit_day1_change")
-        async def commit_day1_change(request: Day1ChangeRequest) -> Day1Commit:
-            fleet.calls.append(("commit_day1_change", request))
+        @activity.defn(name="commit_day1_replicas")
+        async def commit_day1_replicas(request: Day1ChangeRequest) -> Day1Commit:
+            fleet.calls.append(("commit_day1_replicas", request))
             if fleet.commit_error is not None:
                 raise fleet.commit_error
             changed = any(fleet.day1[n] != c for n, c in request.nodepool_replicas.items())
@@ -186,13 +187,15 @@ class _Fleet:
                 unexpected=["alpha-zone-c-other"] if fleet.watch_result is MarkedMachinesOutcome.WRONG_MACHINE else [],
             )
 
-        mce = [read_hosted_cluster_old if self.only_old_mce_limb else read_hosted_cluster, sync_argo_application]
-        lifecycle = [read_scale_down_candidates, mark_machines_for_deletion, unmark_machines, watch_marked_machines]
-        return [read_day1_cluster, commit_day1_change], mce, lifecycle
+        return [
+            read_day1_nodepools, commit_day1_replicas,
+            read_hosted_cluster_old if self.only_old_mce_limb else read_hosted_cluster, sync_argo_application,
+            read_scale_down_candidates, mark_machines_for_deletion, unmark_machines, watch_marked_machines,
+        ]
 
 
 class _OldNodePoolState(BaseModel):
-    """A NodePoolState as a cluster-upgrade worker predating update-nodepool sends it."""
+    """A NodePoolState as a worker predating update-nodepool sends it."""
 
     name: str
     replicas: int | None = None
@@ -213,14 +216,14 @@ class _Blocker:
 
 
 class _Harness:
-    """The three workflows and the three limbs' mock activities, each on its own queue."""
+    """The three workflows, and every mock activity on the MCE's server-lifecycle queue."""
 
     def __init__(self, fleet: _Fleet, mce: str = MCE) -> None:
         self._fleet = fleet
         self._mce = mce
 
     async def __aenter__(self) -> Client:
-        hub, cluster_upgrade, lifecycle = self._fleet.activities()
+        activities = self._fleet.activities()
         self._env = await WorkflowEnvironment.start_time_skipping()
         config = self._env.client.config()
         config["data_converter"] = pydantic_data_converter
@@ -230,9 +233,7 @@ class _Harness:
             Worker(client, task_queue=SCALE_UP_NODEPOOL_WORKFLOW_QUEUE, workflows=[ScaleUpNodePoolWorkflow]),
             Worker(client, task_queue=SCALE_DOWN_NODEPOOL_WORKFLOW_QUEUE, workflows=[ScaleDownNodePoolWorkflow]),
             Worker(client, task_queue="blocker", workflows=[_Blocker]),
-            Worker(client, task_queue=UPGRADE_GITOPS_ACTIVITY_QUEUE, activities=hub),
-            Worker(client, task_queue=cluster_upgrade_activity_queue(self._mce), activities=cluster_upgrade),
-            Worker(client, task_queue=server_lifecycle_activity_queue(self._mce), activities=lifecycle),
+            Worker(client, task_queue=server_lifecycle_activity_queue(self._mce), activities=activities),
         ]
         for worker in self._workers:
             await worker.__aenter__()
@@ -289,13 +290,13 @@ class TestScalingUp:
         result = await _run(fleet, 10)
 
         assert fleet.names() == [
-            "read_day1_cluster", "read_hosted_cluster", "commit_day1_change", "sync_argo_application",
+            "read_day1_nodepools", "read_hosted_cluster", "commit_day1_replicas", "sync_argo_application",
             "read_hosted_cluster",
         ]
         # The NodePools are read as day1 names the HostedCluster, not by the file's name.
         read = fleet.first("read_hosted_cluster")
         assert (read.hosted_cluster, read.hosted_cluster_namespace) == (HC, HC_NS)
-        commit = fleet.first("commit_day1_change")
+        commit = fleet.first("commit_day1_replicas")
         assert commit.change is Day1ChangeKind.REPLICAS and commit.expected_blob == "blob-1"
         assert commit.nodepool_replicas == {"alpha-zone-a": 4, "alpha-zone-c": 3}
         assert commit.workflow_id == scale_up_nodepool_workflow_id(CLUSTER)
@@ -317,7 +318,7 @@ class TestScalingUp:
     async def test_the_total_already_asked_for_writes_nothing(self):
         fleet = _Fleet((3, 3, 2))
         result = await _run(fleet, 8)
-        assert fleet.names() == ["read_day1_cluster", "read_hosted_cluster"]
+        assert fleet.names() == ["read_day1_nodepools", "read_hosted_cluster"]
         assert result.direction == "none" and result.child_workflow_id is None and result.scale is None
 
 
@@ -326,7 +327,7 @@ class TestScalingDownWithoutAPolicy:
         fleet = _Fleet((3, 3, 2))
         result = await _run(fleet, 6)
         assert "read_scale_down_candidates" not in fleet.names() and "mark_machines_for_deletion" not in fleet.names()
-        assert fleet.first("commit_day1_change").nodepool_replicas == {"alpha-zone-a": 2, "alpha-zone-b": 2}
+        assert fleet.first("commit_day1_replicas").nodepool_replicas == {"alpha-zone-a": 2, "alpha-zone-b": 2}
         assert result.direction == "down" and result.child_workflow_id == DOWN_ID
         assert result.scale.chosen == [] and fleet.day1 == {
             "alpha-zone-a": 2, "alpha-zone-b": 2, "alpha-zone-c": 2, "alpha-gpu": 1,
@@ -344,7 +345,7 @@ class TestTheRefusals:
         error = await _failure(fleet, 10)
         assert error.type == "NodePoolReplicasDriftError"
         assert "alpha-zone-a 4 on the MCE, 3 in day1" in error.message
-        assert "commit_day1_change" not in fleet.names()
+        assert "commit_day1_replicas" not in fleet.names()
 
     async def test_a_nodepool_of_the_kind_only_on_the_mce_is_drift(self):
         fleet = _Fleet((3, 3, 2))
@@ -363,7 +364,7 @@ class TestTheRefusals:
         fleet = _Fleet((5, 2, 2))
         error = await _failure(fleet, 12)
         assert error.type == "NodePoolsUnbalancedError" and "alpha-zone-a 5" in error.message
-        assert "commit_day1_change" not in fleet.names()
+        assert "commit_day1_replicas" not in fleet.names()
 
     async def test_a_kind_no_nodepool_takes_is_refused_naming_the_infraenvs_seen(self):
         fleet = _Fleet()
@@ -374,18 +375,27 @@ class TestTheRefusals:
         fleet = _Fleet(path=f"sites/site1/mces/ocp4-mce-b/hostedClusters/{CLUSTER}.yaml")
         error = await _failure(fleet, 10)
         assert error.type == "ClusterNotOnMceError"
-        assert fleet.names() == ["read_day1_cluster"]
+        assert fleet.names() == ["read_day1_nodepools"]
 
     async def test_a_file_with_problems_is_refused(self):
         fleet = _Fleet(problems=["nodepool[1]: NodePool alpha-zone-b is named twice"])
         error = await _failure(fleet, 10)
         assert error.type == "Day1ClusterProblemsError" and "named twice" in error.message
 
-    async def test_a_cluster_upgrade_worker_predating_update_nodepool_is_named(self):
+    async def test_a_server_lifecycle_worker_predating_update_nodepool_is_named(self):
         fleet = _Fleet()
         fleet.only_old_mce_limb = True
         error = await _failure(fleet, 10)
-        assert error.type == "NodePoolKindNotFoundError" and "cluster-upgrade-worker" in error.message
+        assert error.type == "NodePoolKindNotFoundError" and f"server-lifecycle-worker on MCE {MCE}" in error.message
+
+    async def test_a_worker_without_day1_settings_fails_at_the_first_call_and_writes_nothing(self):
+        fleet = _Fleet()
+        fleet.read_error = Day1NotConfiguredError("no DAY1_REPO_URL")
+        with pytest.raises(WorkflowFailureError) as excinfo:
+            await _run(fleet, 10)
+        cause = excinfo.value.cause.cause
+        assert isinstance(cause, ApplicationError) and cause.type == "Day1NotConfiguredError"
+        assert fleet.names() == ["read_day1_nodepools"]  # non-retryable: one attempt
 
 
 class TestTheChildsFailures:
@@ -394,7 +404,7 @@ class TestTheChildsFailures:
         fleet.commit_error = Day1FileChangedError("someone else changed it")
         error = await _failure(fleet, 10)
         assert error.type == "ScaleNodePoolFailedError" and "Day1FileChangedError" in error.message
-        assert fleet.names().count("commit_day1_change") == 1
+        assert fleet.names().count("commit_day1_replicas") == 1
 
     async def test_a_refused_sync_fails_once(self):
         fleet = _Fleet((3, 3, 2))
@@ -418,7 +428,7 @@ class TestTheChildsFailures:
 
         error = await _failure(fleet, 10, before=_hold)
         assert error.type == "ScaleNodePoolAlreadyRunningError"
-        assert "commit_day1_change" not in fleet.names()
+        assert "commit_day1_replicas" not in fleet.names()
 
 
 class TestARerun:
@@ -427,7 +437,7 @@ class TestARerun:
         fleet = _Fleet((4, 3, 3), live=(3, 3, 2))
         result = await _run(fleet, 10)
         assert result.direction == "up" and not result.scale.committed
-        assert fleet.first("commit_day1_change").nodepool_replicas == {"alpha-zone-a": 4, "alpha-zone-c": 3}
+        assert fleet.first("commit_day1_replicas").nodepool_replicas == {"alpha-zone-a": 4, "alpha-zone-c": 3}
         assert fleet.live["alpha-zone-a"] == 4
 
     async def test_day1_holding_another_total_is_still_drift(self):
@@ -445,7 +455,7 @@ class TestOneNodePool:
     async def test_only_the_named_nodepool_moves_to_exactly_the_number_asked(self):
         fleet = _Fleet((3, 3, 2))
         result = await _run(fleet, 5, nodepool="alpha-zone-c")
-        assert fleet.first("commit_day1_change").nodepool_replicas == {"alpha-zone-c": 5}
+        assert fleet.first("commit_day1_replicas").nodepool_replicas == {"alpha-zone-c": 5}
         assert fleet.first("sync_argo_application").allowed_out_of_sync == ["NodePool/alpha-zone-c"]
         # No balance rule: 3, 3, 5 is what was asked for.
         assert fleet.day1 == {"alpha-zone-a": 3, "alpha-zone-b": 3, "alpha-zone-c": 5, "alpha-gpu": 1}
@@ -461,14 +471,14 @@ class TestOneNodePool:
     async def test_any_nodepool_of_the_cluster_whatever_its_kind(self):
         fleet = _Fleet((3, 3, 2))
         await _run(fleet, 2, nodepool="alpha-gpu")
-        assert fleet.first("commit_day1_change").nodepool_replicas == {"alpha-gpu": 2}
+        assert fleet.first("commit_day1_replicas").nodepool_replicas == {"alpha-gpu": 2}
 
     async def test_down_by_its_policy_marks_the_servers_first(self):
         fleet = _policy_fleet()
         result = await _run(fleet, 1, nodepool="alpha-zone-c")
         assert fleet.first("mark_machines_for_deletion").machines == ["c2", "c3"]  # 1 and 3 pods
         names = fleet.names()
-        assert names.index("mark_machines_for_deletion") < names.index("commit_day1_change")
+        assert names.index("mark_machines_for_deletion") < names.index("commit_day1_replicas")
         assert [c.machine for c in result.scale.chosen] == ["c2", "c3"]
 
     async def test_to_zero(self):
@@ -479,13 +489,13 @@ class TestOneNodePool:
     async def test_already_the_number_writes_nothing(self):
         fleet = _Fleet((3, 3, 2))
         result = await _run(fleet, 3, nodepool="alpha-zone-a")
-        assert result.direction == "none" and fleet.names() == ["read_day1_cluster", "read_hosted_cluster"]
+        assert result.direction == "none" and fleet.names() == ["read_day1_nodepools", "read_hosted_cluster"]
 
     async def test_a_nodepool_the_cluster_does_not_have_is_named_and_nothing_written(self):
         fleet = _Fleet((3, 3, 2))
         error = await _failure(fleet, 4, nodepool="alpha-zone-x")
         assert error.type == "NodePoolNotFoundError" and "alpha-zone-a, alpha-zone-b" in error.message
-        assert "commit_day1_change" not in fleet.names()
+        assert "commit_day1_replicas" not in fleet.names()
 
     async def test_one_on_the_mce_only_is_drift(self):
         fleet = _Fleet((3, 3, 2))
@@ -535,8 +545,8 @@ class TestScalingDownByAPolicy:
         result = await _run(fleet, 8)
 
         assert fleet.names() == [
-            "read_day1_cluster", "read_hosted_cluster", "read_scale_down_candidates",
-            "mark_machines_for_deletion", "commit_day1_change", "sync_argo_application",
+            "read_day1_nodepools", "read_hosted_cluster", "read_scale_down_candidates",
+            "mark_machines_for_deletion", "commit_day1_replicas", "sync_argo_application",
             "read_hosted_cluster", "watch_marked_machines",
         ]
         candidates = fleet.first("read_scale_down_candidates")
@@ -557,7 +567,7 @@ class TestScalingDownByAPolicy:
         fleet.commit_error = Day1FileChangedError("someone else changed it")
         error = await _failure(fleet, 8)
         assert "Day1FileChangedError" in error.message
-        assert fleet.names()[-2:] == ["commit_day1_change", "unmark_machines"]
+        assert fleet.names()[-2:] == ["commit_day1_replicas", "unmark_machines"]
         assert fleet.machines["c2"].delete_mark is None
 
     async def test_a_failed_sync_after_the_commit_keeps_the_marks(self):
@@ -582,13 +592,13 @@ class TestScalingDownByAPolicy:
         fleet = _policy_fleet(c3={"delete_mark": "yes"})
         error = await _failure(fleet, 8)
         assert "ScaleDownMarkConflictError" in error.message
-        assert "mark_machines_for_deletion" not in fleet.names() and "commit_day1_change" not in fleet.names()
+        assert "mark_machines_for_deletion" not in fleet.names() and "commit_day1_replicas" not in fleet.names()
 
     async def test_a_nodepool_mid_rollout_is_refused_before_anything_is_marked(self):
         fleet = _policy_fleet(c1={"machine_set": "alpha-zone-c-old"}, c2={"machine_set": "alpha-zone-c-new"})
         error = await _failure(fleet, 8)
         assert "ScaleDownRolloutInProgressError" in error.message
-        assert "mark_machines_for_deletion" not in fleet.names() and "commit_day1_change" not in fleet.names()
+        assert "mark_machines_for_deletion" not in fleet.names() and "commit_day1_replicas" not in fleet.names()
 
     async def test_a_rerun_keeps_the_machine_it_marked_before(self):
         fleet = _policy_fleet(c1={"delete_mark": DOWN_ID, "workload_pods": 9})

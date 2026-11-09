@@ -414,8 +414,9 @@
             <div class="call sm"><span class="verb">POST</span><span class="path">/servers/{id}/reservation</span></div>
           </div>
           <p class="note">A lock another run holds fails the run here (<code>ServerReservedError</code>),
-          nothing changed. The common case is <b>add-server-to-mce&rsquo;s day-long hold</b> after it installed
-          the machine: release that hold in server-scan, then re-run.</p>
+          nothing changed. The common case is <b>add-server-to-mce&rsquo;s hold</b> after it installed the
+          machine: since 2026-11-09 its run gives it back once server-scan shows the machine installed
+          (usually 15&ndash;30 min, at most a day). Wait for that, or release it in server-scan, then re-run.</p>
         </div>
       </div>
 
@@ -597,7 +598,7 @@
           <tr><td class="k">NotHostedClusterNodeError</td><td class="muted">An Agent bound into no HostedCluster&rsquo;s control plane with no AgentMachine or Machine behind it (ACM/ZTP); links into a namespace no HostedCluster uses; or an Agent bound to a ClusterDeployment other than its AgentMachine&rsquo;s or Machine&rsquo;s hosted cluster.</td></tr>
           <tr><td class="k">ConflictingHostedObjectsError</td><td class="muted">Two Machines linked to the Agent, two Nodes that are the server, or links into two control planes. The run cannot tell which is real.</td></tr>
           <tr><td class="k">HostedNodeStillPresentError</td><td class="muted">A <b>Ready</b> Node of the hosted cluster is the server, but nothing on the MCE links it any more &mdash; no Machine, AgentMachine or binding to take the host out through. Drain it and power the host off (or boot it into discovery), then re-run: the stale Node is deleted then.</td></tr>
-          <tr><td class="k">ServerReservedError</td><td class="muted">Another run holds server-scan&rsquo;s lock &mdash; typically add-server-to-mce&rsquo;s day-long hold. Release it in server-scan, then re-run.</td></tr>
+          <tr><td class="k">ServerReservedError</td><td class="muted">Another run holds server-scan&rsquo;s lock &mdash; typically add-server-to-mce&rsquo;s hold, which its run gives back once server-scan shows the machine installed (usually 15&ndash;30 min, at most a day). Wait for that, or release it in server-scan, then re-run.</td></tr>
           <tr><td class="k">AmbiguousServerNameError</td><td class="muted">Two server-scan documents carry the name.</td></tr>
         </tbody>
       </table>

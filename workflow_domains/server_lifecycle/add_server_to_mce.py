@@ -74,6 +74,13 @@ Shape of the run:
      holding-server      — on success the lock is extended to a day, so the
                            machine stays out of every other MCE's draw until
                            server-scan's membership jobs see it in a cluster.
+     awaiting-server-scan — then server-scan is read every 5 min, for up to
+     releasing-lock        that day, and the lock released as soon as it shows
+                           the machine INSTALLED_TO_INVENTORY or INSTALLED:
+                           server-scan hides a claimed machine from every draw
+                           itself. Not seen within the day, the lock is left to
+                           expire and the run still COMPLETES (the operator,
+                           2026-11-09).
   6. rolling-back        — no Agent by the deadline is that CANDIDATE's
      unregistering-pxe-boot failure, not the run's: the NMStateConfig and
      releasing-server      BareMetalHost are removed, an IPMI candidate's MACs
@@ -174,6 +181,7 @@ from temporalio.common import RetryPolicy
 from temporalio.exceptions import ActivityError, ApplicationError
 
 with workflow.unsafe.imports_passed_through():
+    from shared.cluster_names import canonical_mce_cluster
     from shared.bmc_address import (
         BMC_VENDORS,
         boots_from_network,
@@ -223,6 +231,7 @@ with workflow.unsafe.imports_passed_through():
         find_agent_for_host,
         get_baremetal_host,
         lookup_install_candidate,
+        lookup_server_membership,
         publish_infra_env_boot,
         register_pxe_boot,
         release_server,
@@ -361,6 +370,17 @@ _LEGACY_RESERVATION_HOLDER = "install-server"
 _LEGACY_WORKFLOW_TYPE = "InstallServerWorkflow"
 _RESERVATION_TTL = _AGENT_DEADLINE + timedelta(hours=1)
 _INSTALLED_HOLD = timedelta(hours=24)
+# After the hold, the run reads server-scan every 5 minutes until its
+# membership jobs report the machine — INSTALLED_TO_INVENTORY (the MCE's agents
+# job, every ~15 min) or INSTALLED (a cluster's nodes job) — and then gives the
+# lock back: server-scan hides a claimed machine from /servers/available by
+# itself, so the day-long hold is needed only until it knows (the operator,
+# 2026-11-09). Bounded by the hold: not seen within it, the lock is left to
+# expire and the run still COMPLETES — the Agent proved the install. Changing
+# any of these is a non-deterministic change for runs in flight.
+_SERVER_SCAN_POLL_INTERVAL = timedelta(minutes=5)
+_SERVER_SCAN_WAIT = _INSTALLED_HOLD
+_INSTALLED_STATES = frozenset({"INSTALLED_TO_INVENTORY", "INSTALLED"})
 # Gates every lock call, so a run started before the lock replays unchanged.
 _RESERVATION_PATCH = "server-scan-install-lock"
 # Gates the PXE map registration for IPMI servers, for the same reason: an
@@ -390,6 +410,9 @@ _NMSTATE_REPLACE_PATCH = "nmstateconfig-replace-unless-in-use"
 # recovers its own workflow id's leftover lock, and any other refusal says why.
 # A run recorded before it failed on the refusal as server-scan gave it.
 _OWN_LOCK_RERUN_PATCH = "named-install-own-lock-rerun"
+# Gates the wait for server-scan after success and the early release of the
+# lock. A run recorded before it completes at the hold, its lock left to expire.
+_RELEASE_ONCE_INSTALLED_PATCH = "add-server-release-once-installed"
 
 # assisted-service regenerates the discovery image within seconds of an
 # NMStateConfig change; ten minutes of no new image means it is not going to
@@ -619,6 +642,7 @@ class AddServerToMceWorkflow:
         self._pxe_boot_mac_only = False
         self._nmstate_replace = False
         self._own_lock_rerun = False
+        self._release_once_installed = False
         # The health refusals waived for the server being installed
         # (`allow_unhealthy`), each with what was observed.
         self._allowed_unhealthy: list[WaivedHealthCheck] = []
@@ -656,6 +680,7 @@ class AddServerToMceWorkflow:
         self._pxe_boot_mac_only = workflow.patched(_PXE_BOOT_MAC_ONLY_PATCH)
         self._nmstate_replace = workflow.patched(_NMSTATE_REPLACE_PATCH)
         self._own_lock_rerun = workflow.patched(_OWN_LOCK_RERUN_PATCH)
+        self._release_once_installed = workflow.patched(_RELEASE_ONCE_INSTALLED_PATCH)
         workflow.logger.info(
             "Installing a server into InfraEnv=%s for MCE=%s",
             infra_env,
@@ -911,12 +936,26 @@ class AddServerToMceWorkflow:
 
             if agent.found:
                 reservation_expires_at = None
+                held: ServerReservation | None = None
                 if self._reserving:
                     self._phase = "holding-server"
                     held = await self._reserve(
                         candidate, install_input, _INSTALLED_HOLD, activity_queue, None
                     )
                     reservation_expires_at = held.expires_at if held else None
+                # Then hold it only until server-scan knows the machine is taken.
+                # A refused hold means the lock is no longer this run's: nothing
+                # to give back, so nothing to wait for.
+                lock_released: bool | None = None
+                server_scan_state: str | None = None
+                lock_detail: str | None = None
+                if self._release_once_installed and held is not None:
+                    self._phase = "awaiting-server-scan"
+                    lock_released, server_scan_state, lock_detail = await self._release_once_seen_installed(
+                        candidate, install_input, activity_queue
+                    )
+                    if lock_released:
+                        reservation_expires_at = None
                 self._phase = "completed"
                 workflow.logger.info(
                     "Server %s installed into InfraEnv %s as Agent %s "
@@ -953,6 +992,9 @@ class AddServerToMceWorkflow:
                     pxe_registered=pxe_registered,
                     allowed_unhealthy=self._allowed_unhealthy,
                     nmstate_replaced=nmstate_replaced,
+                    lock_released=lock_released,
+                    server_scan_state=server_scan_state,
+                    lock_detail=lock_detail,
                 )
 
             # No Agent. Take the machine back out of this MCE before trying
@@ -1441,8 +1483,77 @@ class AddServerToMceWorkflow:
                 "PXE map cleanup of %s skipped: %s", candidate.name, result.detail
             )
 
-    async def _release(self, candidate: AcquiredServer, task_queue: str) -> None:
-        """Give the lock back once a teardown proved nothing still points at the machine."""
+    async def _release_once_seen_installed(
+        self, candidate: AcquiredServer, install_input: AddServerToMceInput, task_queue: str
+    ) -> tuple[bool, str | None, str]:
+        """Give the lock back once server-scan shows the machine installed: (released, state, why).
+
+        server-scan is read every _SERVER_SCAN_POLL_INTERVAL for up to
+        _SERVER_SCAN_WAIT (lookup_server_membership: the search and the
+        exact-name detail, never /servers/available). On INSTALLED_TO_INVENTORY
+        or INSTALLED the lock is released with this run's holder and workflow
+        id, which server-scan compares, so a lock someone took over meanwhile
+        is left alone. Every other ending keeps the lock — it then expires on
+        its own — and NONE fails the run, which the Agent already proved: not
+        seen within the wait, server-scan unreadable for the rest of it, or it
+        naming ANOTHER MCE (a contradiction for a person to look at).
+        """
+        started_at = workflow.now()
+        state: str | None = None
+        while True:
+            remaining = _SERVER_SCAN_WAIT - (workflow.now() - started_at)
+            if remaining <= timedelta(0):
+                hours = int(_SERVER_SCAN_WAIT.total_seconds() // 3600)
+                return False, state, (
+                    f"server-scan still shows {candidate.name} {state or 'not installed'} after "
+                    f"{hours} h: the install lock is left to expire on its own"
+                )
+            try:
+                membership = await workflow.execute_activity(
+                    lookup_server_membership,
+                    ServerMembershipRequest(server_name=candidate.name),
+                    task_queue=task_queue,
+                    start_to_close_timeout=_ACTIVITY_TIMEOUT,
+                    # Best effort, bounded by what is left of the wait: server-scan
+                    # or this MCE's worker away for the rest of it ends the wait,
+                    # never the run (caught below).
+                    schedule_to_close_timeout=remaining,
+                    retry_policy=_RETRY_POLICY,
+                )
+            except ActivityError as err:
+                cause = err.cause
+                why = f"{cause.type}: {cause.message}" if isinstance(cause, ApplicationError) else str(cause or err)
+                workflow.logger.warning("server-scan could not be read for %s: %s", candidate.name, why)
+                return False, state, (
+                    f"server-scan could not be read for {candidate.name} ({why}): the install "
+                    "lock is left to expire on its own"
+                )
+            state = membership.lifecycle_state if membership.found else None
+            if state in _INSTALLED_STATES:
+                if membership.mce_name and canonical_mce_cluster(membership.mce_name) != canonical_mce_cluster(
+                    install_input.mce_cluster
+                ):
+                    workflow.logger.warning(
+                        "server-scan shows %s %s in MCE %s, not %s: lock kept",
+                        candidate.name, state, membership.mce_name, install_input.mce_cluster,
+                    )
+                    return False, state, (
+                        f"server-scan shows {candidate.name} {state} in MCE {membership.mce_name}, not "
+                        f"{install_input.mce_cluster}: the install lock is left to expire on its own"
+                    )
+                self._phase = "releasing-lock"
+                released = await self._release(candidate, task_queue)
+                if released.detail:
+                    return False, state, (
+                        f"server-scan shows {candidate.name} {state}, but the install lock was not "
+                        f"released: {released.detail}"
+                    )
+                workflow.logger.info("server-scan shows %s %s: install lock released", candidate.name, state)
+                return True, state, f"server-scan shows {candidate.name} {state}: the install lock was released"
+            await workflow.sleep(_SERVER_SCAN_POLL_INTERVAL)  # durable, replay-safe
+
+    async def _release(self, candidate: AcquiredServer, task_queue: str) -> ServerReservation:
+        """Give the lock back: after a teardown proved nothing points at the machine, or once server-scan knows it."""
         released = await workflow.execute_activity(
             release_server,
             ReleaseServerRequest(
@@ -1460,6 +1571,7 @@ class AddServerToMceWorkflow:
             workflow.logger.info(
                 "Released %s in server-scan: %s", candidate.name, released.detail
             )
+        return released
 
     async def _inventory_segment(self, mce_cluster: str) -> SegmentEntry:
         """The MCE's inventory segment, the one thing the VLAN comes from.

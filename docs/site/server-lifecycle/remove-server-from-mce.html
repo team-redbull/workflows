@@ -338,8 +338,9 @@
     <div class="sec-head">
       <div class="eyebrow">server-scan&rsquo;s install lock</div>
       <h2>Which lock is given back, and which is not</h2>
-      <p class="lede">add-server-to-mce holds its lock for a day after a success, until server-scan sees the
-      machine in a cluster. A machine removed within that day used to stay undrawable for the rest of it.
+      <p class="lede">add-server-to-mce holds its lock after a success until server-scan sees the machine
+      installed &mdash; its run releases it then (since 2026-11-09), or the lock expires after a day. A
+      machine removed before that used to stay undrawable for the rest of the hold.
       Now this run releases that lock &mdash; and only that one. It releases with the holder and workflow id
       it just read, so server-scan compares and deletes exactly that lock.</p>
     </div>

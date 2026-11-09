@@ -278,9 +278,19 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   before any write; holder `add-server-to-mce` + the run's workflow id, so a retry
   or a renewal EXTENDS it (server-scan matches BOTH, so a run started as
   install-server keeps holder `install-server` to the end — `_reservation_holder`,
-  by workflow type); renewed as the Agent wait begins; held a day after
-  success, unless the server leaves the MCE first — remove-server-from-mce then releases
-  it (the operator's decision, 2026-10-31, below); add-server-to-mce itself
+  by workflow type); renewed as the Agent wait begins; extended to a day after
+  success, and then held ONLY until server-scan knows: the run reads
+  `lookup_server_membership` every 5 min (`awaiting-server-scan`, gated
+  `add-server-release-once-installed`; the operator, 2026-11-09) and releases its
+  lock (`releasing-lock`) once the server is INSTALLED_TO_INVENTORY or INSTALLED —
+  server-scan then hides it from every draw itself. Bounded by the day: not seen,
+  server-scan unreadable for the rest of it (the reads are best effort,
+  `schedule_to_close_timeout` = what is left), or it naming ANOTHER MCE, the lock
+  is KEPT to expire and the run still COMPLETES — the Agent proved the install;
+  `lock_released` / `server_scan_state` / `lock_detail` on the result. The run
+  stays RUNNING meanwhile (~15-30 min), so its slot and a named server's id are
+  busy until then. The server leaving the MCE first — remove-server-from-mce then releases
+  it (the operator's decision, 2026-10-31, below); add-server-to-mce otherwise
   releases it ONLY after a teardown (a failure elsewhere leaves it to its
   TTL, since half-created resources may still name the machine). A lock held
   elsewhere is a skip (`reserved`), like every candidate reason. A RE-RUN of the
@@ -509,8 +519,9 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   agents job re-claims it INSTALLED_TO_INVENTORY on its own 15-min cadence, so
   between them it can read AVAILABLE while still in this InfraEnv and be drawn by
   another MCE's install. Taken after the inspection, before any write; a lock
-  held elsewhere fails the run (add-server-to-mce's day-long `_INSTALLED_HOLD` on a
-  freshly installed machine does — release it in server-scan); on failure left
+  held elsewhere fails the run (add-server-to-mce's hold on a freshly installed
+  machine does, until its run sees server-scan report the machine — usually
+  15-30 min, at most a day — or release it in server-scan); on failure left
   to its TTL; a refused 24 h extension is logged and the child still runs.
   Once the child completed with `pxe_failed` empty (found=false included:
   nothing on the MCE), the run RELEASES ITS OWN lock (`releasing-server`, gated

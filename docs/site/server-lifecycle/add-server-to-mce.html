@@ -144,8 +144,11 @@
           &mdash; proof that the BMC, the bond, the VLAN and DHCP all worked. The lock is renewed for
           2 h as this wait starts.</li>
         <li>
-          <b>Agent appears</b> &rarr; extend S1&rsquo;s lock to <b>24 h</b> and finish. The run succeeded;
-          S2 and S3 were never touched.<br>
+          <b>Agent appears</b> &rarr; extend S1&rsquo;s lock to <b>24 h</b>: the install succeeded; S2 and
+          S3 were never touched. Then read server-scan <b>every 5 minutes</b> until it shows S1
+          <code>INSTALLED_TO_INVENTORY</code> or <code>INSTALLED</code>, <b>release</b> the lock, and finish
+          &mdash; usually 15&ndash;30 minutes. Not seen within the 24 h, the lock is left to expire and the
+          run still <b>completes</b>.<br>
           <b>No Agent after 1 h</b> &rarr; delete S1&rsquo;s resources from MCE-A, <b>release</b> its lock
           (S1 is immediately drawable again) and go back to step 1 with S2.
         </li>
@@ -166,7 +169,10 @@
         installed it, and two clusters would drive one BMC.</p>
         <p>The lock closes that gap: <code>/servers/available</code> never hands out a locked machine. The
         <b>24 h hold</b> after success writes nothing to any cluster. It only keeps S1 out of every
-        other run&rsquo;s draw until server-scan can see it in a cluster for itself.</p>
+        other run&rsquo;s draw until server-scan can see it in a cluster for itself &mdash; and the run
+        waits for exactly that (phase <b>awaiting-server-scan</b>): once server-scan shows S1
+        <code>INSTALLED_TO_INVENTORY</code> or <code>INSTALLED</code> it hides S1 from every draw itself,
+        so the run gives the lock back (phase <b>releasing-lock</b>; the operator, 2026-11-09).</p>
         <p class="note">Taken out of MCE-A within that day, S1 gets its lock back early:
         remove-server-from-mce releases add-server-to-mce&rsquo;s lock for <em>its</em> MCE once nothing of S1 is left there and its PXE cleanup did not fail (the operator&rsquo;s decision,
         2026-10-31). Another MCE&rsquo;s lock it leaves alone.</p>
@@ -199,7 +205,8 @@
         <tbody>
           <tr><td>A candidate fails a check</td><td class="muted">Skips it, tries the next</td><td class="muted">never taken</td></tr>
           <tr><td>Another run holds the candidate</td><td class="muted">Skips it, tries the next</td><td class="muted">theirs, untouched</td></tr>
-          <tr><td>The Agent appears</td><td class="muted">Succeeds</td><td class="muted">held 24 h for this run</td></tr>
+          <tr><td>The Agent appears</td><td class="muted">Installed; then waits (up to 24 h, server-scan read every 5 min) for server-scan to show it <code>INSTALLED_TO_INVENTORY</code> / <code>INSTALLED</code>, and completes</td><td class="muted">held 24 h, then <b>released</b> as soon as server-scan shows it installed (<code>lock_released: true</code>)</td></tr>
+          <tr><td>server-scan never shows it installed within the 24 h, cannot be read, or names another MCE</td><td class="muted"><b>Completes</b> all the same &mdash; the Agent proved the install; <code>lock_detail</code> says why</td><td class="muted">kept, expires on its own (<code>lock_released: false</code>)</td></tr>
           <tr><td>The server is removed from this MCE within that day (remove-server-from-mce)</td><td class="muted">&mdash;</td><td class="muted">released by remove-server-from-mce once nothing of it is left on the MCE and its PXE cleanup did not fail; otherwise it runs to expiry</td></tr>
           <tr><td>No Agent within 1 h</td><td class="muted">Deletes the candidate&rsquo;s resources, tries the next</td><td class="muted">released at once</td></tr>
           <tr><td>The lock lapsed mid-install and another run took the machine</td><td class="muted">Deletes <em>its own</em> resources, tries the next</td><td class="muted">the other run&rsquo;s, untouched</td></tr>
@@ -219,8 +226,10 @@
       runs the Agent stack (an InfraEnv and an <code>AgentServiceConfig</code>), and server-scan&rsquo;s
       <code>nodes-status</code> <code>agents</code> job runs there every 15 minutes: it marks a server
       with an unbound Agent <code>INSTALLED_TO_INVENTORY</code>, after which it is never drawn again. So
-      the hold only has to last ~15 minutes. An MCE without that job would read the machine as
-      <code>AVAILABLE</code> again once the 24 h &mdash; server-scan&rsquo;s ceiling &mdash; ran out.</p>
+      the hold only has to last ~15 minutes &mdash; which is what the run now waits for before it gives
+      the lock back. An MCE without that job would read the machine as <code>AVAILABLE</code> again once
+      the 24 h &mdash; server-scan&rsquo;s ceiling &mdash; ran out; the run then completes keeping the lock,
+      and says so.</p>
       <p><b>A crash mid-create strands resources.</b> The BareMetalHost stays on the MCE while the lock
       expires after 2 h, so after that the machine is drawable while still pointing at one cluster.
       Clean these up by hand, or re-run the same named install (<code>server_names</code> set to that
@@ -328,7 +337,8 @@
           without it a server installed into MCE-A is drawn again by a run for MCE-B, and both clusters
           drive one BMC (server-scan&rsquo;s ADR-0035). It is keyed on this run&rsquo;s workflow id, so a
           retry or a renewal <em>extends</em> it; it is renewed as the Agent wait begins, extended to a day
-          on success (phase <b>holding-server</b>), and released only after a rollback&rsquo;s teardown. A
+          on success (phase <b>holding-server</b>) and released once server-scan shows the server installed
+          (<b>awaiting-server-scan</b>, <b>releasing-lock</b>), or after a rollback&rsquo;s teardown. A
           failure anywhere else leaves it to expire, because half-created resources may still name the
           machine. A lock held elsewhere is a skip; a whole pool held elsewhere fails as
           <code>ServerReservedError</code>, naming the holder and its MCE.</p>
@@ -456,7 +466,10 @@
           <code>resources_changed</code> is <code>false</code> for a re-run that found all three resources
           already present &mdash; the run still succeeds, and the flag says nothing was written this time.
           <code>bmh_registered</code> is implied rather than separately observed: an Agent cannot exist
-          unless Ironic registered the host and drove it through a boot.</p>
+          unless Ironic registered the host and drove it through a boot. <code>lock_released</code> says
+          whether the install lock was given back once server-scan showed the server installed
+          (<code>server_scan_state</code>, the last state read), <code>lock_detail</code> what happened &mdash;
+          <code>false</code> keeps the lock to expire on its own and is still a success.</p>
           <p class="note">Everything between step 3 and the Agent is BMAC&rsquo;s, not this
           workflow&rsquo;s: it sees the <code>infraenvs.agent-install.openshift.io</code> label, finds the
           InfraEnv <b>in the same namespace</b>, and attaches its discovery ISO over virtual media. This
@@ -858,6 +871,8 @@
           <tr><td class="k">rolling-back</td><td class="muted">Removing a candidate that produced no Agent, then looping to step 3. An exhausted pool fails as <code>AgentNeverAppearedError</code></td><td class="muted">5&ndash;60 s</td></tr>
           <tr><td class="k">releasing-server</td><td class="muted">Giving the rolled-back candidate&rsquo;s install lock back</td><td class="muted">instant</td></tr>
           <tr><td class="k">holding-server</td><td class="muted">Extending the lock to a day on success, until server-scan sees the machine in a cluster</td><td class="muted">instant</td></tr>
+          <tr><td class="k">awaiting-server-scan</td><td class="muted">Installed: reading server-scan every 5 min until it shows the server <code>INSTALLED_TO_INVENTORY</code> or <code>INSTALLED</code> &mdash; <b>bounded, &le; 24 h</b>; not seen by then, the lock is kept to expire and the run still completes</td><td class="muted">15&ndash;30 min</td></tr>
+          <tr><td class="k">releasing-lock</td><td class="muted">Giving the install lock back now that server-scan hides the server from every draw itself</td><td class="muted">instant</td></tr>
           <tr><td class="k">completed</td><td class="muted">The server is installable in the InfraEnv</td><td class="muted">&mdash;</td></tr>
         </tbody>
       </table>

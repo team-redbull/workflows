@@ -182,7 +182,10 @@ and S3 stay free for everyone else meanwhile.
 4. **Wait up to 1 h for an Agent** — the machine phoning home from the
    discovery ISO, proof that the BMC, bond, VLAN and DHCP all worked. The lock
    is renewed for 2 h as the wait starts.
-5. **Agent** → extend S1's lock to **24 h** and finish; S2 and S3 never touched.
+5. **Agent** → extend S1's lock to **24 h** (installed; S2 and S3 never touched),
+   then read server-scan **every 5 min** until it shows S1 `INSTALLED_TO_INVENTORY`
+   or `INSTALLED`, **release** the lock and finish — usually 15–30 min. Not seen
+   within the 24 h, the lock is kept to expire and the run still **completes**.
    **No Agent after 1 h** → delete S1's resources, **release** its lock (S1 is
    drawable again at once), back to step 1 with S2.
 
@@ -195,7 +198,10 @@ enabled); until then it reads `AVAILABLE`. The "already has a BareMetalHost?"
 check sees only *this* MCE, so without the lock a run for MCE-B could draw S1
 minutes after MCE-A installed it. `/servers/available` never hands out a locked
 machine. The 24 h hold after success writes nothing to any cluster — it only
-keeps S1 out of other draws until server-scan can see it in a cluster itself.
+keeps S1 out of other draws until server-scan can see it in a cluster itself —
+and the run waits for exactly that, then releases it (`awaiting-server-scan`,
+`releasing-lock`; the operator, 2026-11-09): server-scan hides an
+`INSTALLED_TO_INVENTORY` / `INSTALLED` server from every draw on its own.
 A server taken out of that MCE within the day gets it back early: remove-server-from-mce
 releases add-server-to-mce's lock for its MCE once nothing of the server is left
 there and its PXE cleanup did not fail (the operator's decision, 2026-10-31; a failed
@@ -216,7 +222,8 @@ check before a cluster write. No NIC count is sent to server-scan
 | --- | --- | --- |
 | a candidate fails a check | skips it | never taken |
 | another run holds the candidate | skips it | theirs, untouched |
-| the Agent appears | succeeds | held 24 h |
+| the Agent appears | installed; waits ≤ 24 h for server-scan to show it installed, then completes | held 24 h, **released** once server-scan shows it (`lock_released: true`) |
+| server-scan never shows it in 24 h, is unreadable, or names another MCE | **completes** all the same | kept, expires (`lock_released: false`, `lock_detail` says why) |
 | no Agent within 1 h | deletes the candidate's resources, tries the next | released at once |
 | the lock lapsed and another run took the machine | deletes its *own* resources, tries the next | theirs, untouched |
 | every candidate skipped or tried | fails, reasons grouped | none held |
@@ -290,7 +297,11 @@ maintenance, its health — fails saying which.
    and another run took the machine, this candidate is torn down instead.
    On success (**holding-server**) the lock is extended to a day — the machine
    is taken, and server-scan keeps listing it `AVAILABLE` until a membership
-   job sees it in a cluster.
+   job sees it in a cluster. Then (**awaiting-server-scan**) server-scan is read
+   every 5 min, and once it shows the machine `INSTALLED_TO_INVENTORY` or
+   `INSTALLED` the lock is given back (**releasing-lock**). Not seen within the
+   day — or server-scan unreadable, or naming another MCE — the lock is kept to
+   expire and the run completes anyway.
 6. **rolling-back** — no Agent by the deadline is that **candidate's** failure,
    not the run's. The NMStateConfig and BareMetalHost are removed (the Secret
    cascades off the host's ownerReference) and then the lock is released
@@ -573,8 +584,10 @@ it (**releasing-server**, `lock_released: true`; the operator's decision,
 2026-10-31), so the server can be installed again at once. When the PXE
 cleanup failed, the day-long hold stays. A
 lock another run holds —
-add-server-to-mce's day-long hold after it installed the machine, typically —
-fails the run (`ServerReservedError`); release it in server-scan and re-run.
+add-server-to-mce's hold after it installed the machine, typically, until its
+run sees server-scan report the machine (usually 15–30 min, at most a day) —
+fails the run (`ServerReservedError`); wait for that, or release it in
+server-scan, and re-run.
 
 After the Machine delete nothing is undone (it cannot be) and a re-run of the
 same id resumes: `MachineDrainTimeoutError` names the Machine's deletion

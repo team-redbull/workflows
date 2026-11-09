@@ -51,6 +51,7 @@ from shared.exceptions import (
     BmhConflictError,
     ServerLooksInstalledError,
     ServerNotAvailableError,
+    ServerScanAuthError,
 )
 from shared.models.server_lifecycle import (
     AddServerToMceInput,
@@ -183,6 +184,15 @@ SCENARIOS: dict[str, Callable[[], Scenario]] = {
             ],
             "reserved_elsewhere": {"ocp-held"},
         },
+    ),
+    # After the Agent (2026-11-09): server-scan read every 5 min until it shows
+    # the server installed, then the lock released ...
+    "release-once-server-scan-sees-it": lambda: Scenario(
+        mocks={"scan_states": ["AVAILABLE", "AVAILABLE", "INSTALLED_TO_INVENTORY"]},
+    ),
+    # ... or, server-scan unreadable, the lock kept and the run completed.
+    "server-scan-unreadable-after-install": lambda: Scenario(
+        mocks={"scan_error": ServerScanAuthError("server-scan rejected our credentials (401)")},
     ),
 }
 

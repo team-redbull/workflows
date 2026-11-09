@@ -212,6 +212,9 @@ def make_mock_activities(
     in_use: dict[str, str] | None = None,
     nmstate_error_once: bool = False,
     scan_hides_locked: bool = False,
+    scan_states: list[str | None] | None = None,
+    scan_mce: str | None = None,
+    scan_error: Exception | None = None,
 ):
     """Build the full mock activity set + a call recorder.
 
@@ -254,6 +257,11 @@ def make_mock_activities(
     those differences), `in_use` servers an OLDER limb refuses because a
     BareMetalHost or Agent shows them in use (the current limb never does).
     Anyone else has no NMStateConfig yet.
+
+    `lookup_server_membership` is what server-scan reports after a success:
+    `scan_states` in turn, one per read, the last one repeated (None = server-
+    scan does not know the name; default: INSTALLED_TO_INVENTORY at once),
+    `scan_mce` the MCE its agents job names, `scan_error` raised every read.
     """
     calls: dict[str, list] = {
         name: []
@@ -274,6 +282,7 @@ def make_mock_activities(
             "check_infra_env",
             "lookup_install_candidate",
             "replace_conflicting_nmstate_config",
+            "lookup_server_membership",
             # Activity names in call order, for the ones whose ORDER matters.
             "order",
         )
@@ -526,8 +535,25 @@ def make_mock_activities(
             server_id=request.server_id, held=False, detail="not ours"
         )
 
+    states = list(scan_states) if scan_states is not None else ["INSTALLED_TO_INVENTORY"]
+
+    @activity.defn
+    async def lookup_server_membership(request: ServerMembershipRequest) -> ServerMembership:
+        calls["lookup_server_membership"].append(request)
+        calls["order"].append("lookup_server_membership")
+        if scan_error is not None:
+            raise scan_error
+        state = states.pop(0) if len(states) > 1 else states[0]
+        if state is None:
+            return ServerMembership(found=False)
+        return ServerMembership(
+            found=True, server_id="srv", server_name=request.server_name,
+            lifecycle_state=state, mce_name=scan_mce if state == "INSTALLED_TO_INVENTORY" else None,
+        )
+
     segment_activities = [get_inventory_segment]
     server_activities = [
+        lookup_server_membership,
         acquire_servers,
         lookup_install_candidate,
         replace_conflicting_nmstate_config,
@@ -1196,13 +1222,14 @@ class TestTheInstallLock:
     server installed into one MCE is drawn again by a run for another.
     """
 
-    async def test_the_chosen_machine_is_locked_renewed_and_held_after_success(self):
+    async def test_the_chosen_machine_is_locked_renewed_held_and_released_once_server_scan_sees_it(self):
         calls, segment_acts, server_acts = make_mock_activities()
         async with _Harness(segment_acts, server_acts) as client:
             result = await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
         claims = calls["reserve_server"]
-        # Taken, renewed as the Agent wait begins, then held for a day.
+        # Taken, renewed as the Agent wait begins, then held for a day — until
+        # server-scan shows it installed (the mock does at the first read).
         assert [c.ttl_seconds for c in claims] == [7200, 7200, 86_400]
         assert {c.server_id for c in claims} == {"srv_001"}
         assert {c.holder for c in claims} == {"add-server-to-mce"}
@@ -1213,8 +1240,12 @@ class TestTheInstallLock:
         assert claims[0].mce_cluster == MCE_CLUSTER
         assert claims[0].infra_env == INFRA_ENV
         assert claims[0].namespace == NAMESPACE
-        assert calls["release_server"] == []
-        assert result.reservation_expires_at == "in 86400s"
+        (released,) = calls["release_server"]
+        assert (released.server_id, released.holder, released.workflow_id) == (
+            "srv_001", "add-server-to-mce", claims[0].workflow_id,
+        )
+        assert result.lock_released is True and result.server_scan_state == "INSTALLED_TO_INVENTORY"
+        assert result.reservation_expires_at is None
 
     async def test_a_machine_another_run_holds_is_skipped_before_anything_is_written(self):
         held = bondable_server("srv_held", name="ocp-held", mac_prefix="11:22:33:44:55")
@@ -1276,7 +1307,9 @@ class TestTheInstallLock:
             await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
         released = calls["release_server"]
-        assert [r.server_id for r in released] == ["srv_doomed"]
+        # The doomed one after its teardown; the installed one at the end, once
+        # server-scan shows it installed.
+        assert [r.server_id for r in released] == ["srv_doomed", "srv_001"]
         assert released[0].holder == "add-server-to-mce"
         assert released[0].workflow_id == calls["reserve_server"][0].workflow_id
 
@@ -1291,7 +1324,9 @@ class TestTheInstallLock:
 
         assert result.server_name == SERVER_NAME
         assert [t.server_name for t in calls["teardown_bmh_resources"]] == ["ocp-lapsed"]
-        assert calls["release_server"] == []
+        # Never the lapsed one's — another run holds it now. Only the installed
+        # one's, at the end, once server-scan shows it installed.
+        assert [r.server_name for r in calls["release_server"]] == [SERVER_NAME]
         # Never watched for an Agent: the machine is someone else's now.
         assert all(
             "11:22:33:44:55:01" not in ref.macs for ref in calls["find_agent_for_host"]
@@ -1378,7 +1413,8 @@ class TestThePxeBootOfAnIpmiServer:
         # Nothing was written for the blade, and its lock went straight back.
         assert [c.server_name for c in calls["create_bmc_secret"]] == [SERVER_NAME]
         assert calls["teardown_bmh_resources"] == []
-        assert [r.server_id for r in calls["release_server"]] == ["srv_ucs"]
+        # The installed one's follows at the end, once server-scan shows it installed.
+        assert [r.server_id for r in calls["release_server"]] == ["srv_ucs", "srv_001"]
 
     async def test_a_pool_of_blades_at_an_unmapped_site_fails_naming_the_fix(self):
         calls, segment_acts, server_acts = make_mock_activities(
@@ -1647,13 +1683,16 @@ class TestThePxeMapIsCleanedOnRollback:
         ]
         assert calls["unregister_pxe_boot"][0].macs == calls["register_pxe_boot"][0].macs
         # Teardown first (Ironic lets go), then the PXE map, THEN the lock:
-        # after the release another run may map the same MACs.
+        # after the release another run may map the same MACs. (The last
+        # release is the installed server's, once server-scan shows it.)
         watched = {"teardown_bmh_resources", "unregister_pxe_boot", "release_server"}
         assert [name for name in calls["order"] if name in watched] == [
             "teardown_bmh_resources",
             "unregister_pxe_boot",
             "release_server",
+            "release_server",
         ]
+        assert [r.server_name for r in calls["release_server"]] == [blade.name, SERVER_NAME]
 
     async def test_a_redfish_server_rolled_back_never_touches_the_pxe_map(self):
         doomed = bondable_server("srv_doomed", name="ocp-doomed", mac_prefix="11:22:33:44:55")
@@ -2128,7 +2167,8 @@ class TestAnOlderLimbsInUseRefusal:
 
         assert result.server_name == SERVER_NAME
         assert result.attempts == 1
-        assert [r.server_name for r in calls["release_server"]] == ["ocp-busy"]
+        # The busy one's straight back; the installed one's once server-scan shows it.
+        assert [r.server_name for r in calls["release_server"]] == ["ocp-busy", SERVER_NAME]
         assert [c.server_name for c in calls["create_bmc_secret"]] == [SERVER_NAME]
 
     async def test_a_pool_all_in_use_fails_with_each_sign(self):
@@ -2190,9 +2230,11 @@ class TestARerunAfterAFailure:
 
         assert result.server_name == SERVER_NAME
         assert [r.server_name for r in calls["lookup_install_candidate"]] == [SERVER_NAME]
-        # Its lock, extended — never released and re-taken.
+        # Its lock, extended — never released and re-taken — and given back
+        # only at the end, once server-scan shows the server installed.
         assert {c.workflow_id for c in calls["reserve_server"]} == {_RERUN_ID}
-        assert calls["release_server"] == []
+        assert [(r.server_name, r.workflow_id) for r in calls["release_server"]] == [(SERVER_NAME, _RERUN_ID)]
+        assert calls["order"][-1] == "release_server"
         assert result.allowed_unhealthy == []
 
     async def test_another_runs_lock_fails_saying_whose_and_until_when(self):
@@ -2270,3 +2312,69 @@ class TestARerunAfterAFailure:
             with pytest.raises(WorkflowFailureError):
                 await _execute(client, AddServerToMceRunArgs(input=INPUT))
         assert calls["lookup_install_candidate"] == []
+
+
+# --- after success: the lock held only until server-scan sees the server --------
+
+
+class TestTheLockIsReleasedOnceServerScanSeesTheServer:
+    """The operator, 2026-11-09: after the Agent, read server-scan every 5 minutes;
+    when the server is INSTALLED_TO_INVENTORY or INSTALLED, give the lock back.
+    Not seen within the day the lock is held, keep it — it expires on its own —
+    and COMPLETE the run all the same: the Agent proved the install."""
+
+    async def test_it_waits_while_available_and_releases_once_installed_to_inventory(self):
+        calls, segment_acts, server_acts = make_mock_activities(
+            scan_states=["AVAILABLE", "AVAILABLE", "INSTALLED_TO_INVENTORY"], scan_mce="mce-bat-yam-01",
+        )
+        async with _Harness(segment_acts, server_acts) as client:
+            result = await _execute(client, AddServerToMceRunArgs(input=INPUT))
+
+        assert [r.server_name for r in calls["lookup_server_membership"]] == [SERVER_NAME] * 3
+        # Held for the day first, read, then released — once, with this run's id.
+        tail = [n for n in calls["order"] if n in ("lookup_server_membership", "release_server")]
+        assert tail == ["lookup_server_membership"] * 3 + ["release_server"]
+        assert calls["reserve_server"][-1].ttl_seconds == 86_400
+        (released,) = calls["release_server"]
+        assert released.workflow_id == calls["reserve_server"][-1].workflow_id
+        # The MCE named without its ocp4- prefix is still this MCE.
+        assert (result.lock_released, result.server_scan_state) == (True, "INSTALLED_TO_INVENTORY")
+        assert result.reservation_expires_at is None and "released" in (result.lock_detail or "")
+
+    async def test_installed_in_a_cluster_releases_too(self):
+        calls, segment_acts, server_acts = make_mock_activities(scan_states=["INSTALLED"])
+        async with _Harness(segment_acts, server_acts) as client:
+            result = await _execute(client, AddServerToMceRunArgs(input=INPUT))
+        assert len(calls["release_server"]) == 1
+        assert (result.lock_released, result.server_scan_state) == (True, "INSTALLED")
+
+    async def test_not_seen_within_the_day_completes_and_keeps_the_lock(self):
+        calls, segment_acts, server_acts = make_mock_activities(scan_states=["AVAILABLE"])
+        async with _Harness(segment_acts, server_acts) as client:
+            result = await _execute(client, AddServerToMceRunArgs(input=INPUT))
+
+        assert result.agent_name  # COMPLETED, not failed: the install worked
+        assert len(calls["lookup_server_membership"]) == 24 * 60 // 5
+        assert calls["release_server"] == []
+        assert (result.lock_released, result.server_scan_state) == (False, "AVAILABLE")
+        assert result.reservation_expires_at == "in 86400s"
+        assert "after 24 h" in (result.lock_detail or "")
+
+    async def test_another_mce_named_by_server_scan_keeps_the_lock(self):
+        calls, segment_acts, server_acts = make_mock_activities(
+            scan_states=["INSTALLED_TO_INVENTORY"], scan_mce="ocp4-mce-other",
+        )
+        async with _Harness(segment_acts, server_acts) as client:
+            result = await _execute(client, AddServerToMceRunArgs(input=INPUT))
+        assert calls["release_server"] == []
+        assert result.lock_released is False and "ocp4-mce-other" in (result.lock_detail or "")
+
+    async def test_server_scan_unreadable_completes_and_keeps_the_lock(self):
+        calls, segment_acts, server_acts = make_mock_activities(
+            scan_error=ServerScanAuthError("server-scan rejected our credentials (401)"),
+        )
+        async with _Harness(segment_acts, server_acts) as client:
+            result = await _execute(client, AddServerToMceRunArgs(input=INPUT))
+        assert len(calls["lookup_server_membership"]) == 1  # permanent: one read
+        assert calls["release_server"] == []
+        assert result.lock_released is False and "ServerScanAuthError" in (result.lock_detail or "")

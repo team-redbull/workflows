@@ -837,6 +837,14 @@ class AddServerToMceResult(_QuietDefaults):
     # and replaced. Empty when there was none or it matched, and in results
     # recorded before.
     nmstate_replaced: list[str] = Field(default_factory=list)
+    # The install lock after success, once the run waited for server-scan to
+    # show the machine INSTALLED_TO_INVENTORY / INSTALLED (up to a day): True =
+    # released then, False = kept to expire on its own (`lock_detail` says
+    # why). None for a run that did not wait — recorded before the step, or
+    # whose hold server-scan refused. `server_scan_state` is the last state read.
+    lock_released: bool | None = None
+    server_scan_state: str | None = None
+    lock_detail: str | None = None
 
 
 # --- uninstall-server-from-hc ---------------------------------------------------------

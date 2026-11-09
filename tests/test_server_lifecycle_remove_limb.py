@@ -12,7 +12,7 @@ import respx
 
 from activities.server_lifecycle import activities, cluster_api, server_scan
 from activities.server_lifecycle.bmh_resources import AGENT_BMH_LABEL
-from shared.exceptions import AgentBoundToClusterError, ServerScanAuthError
+from shared.exceptions import AgentBoundToClusterError, ServerScanAuthError, ServerScanError
 from shared.models.server_lifecycle import AgentDeleteRequest, BmhRef, HostPowerRequest
 
 SERVER = "ocp-cisco-m6-bat-yam-64c-512gb-FCH0001"
@@ -168,6 +168,16 @@ class TestServerScanMacsByName:
         respx.get(f"{SS}/servers").mock(return_value=httpx.Response(403))
         with pytest.raises(ServerScanAuthError):
             await server_scan.server_macs_by_name(SS, "bad", SERVER)
+
+    @respx.mock
+    async def test_a_huge_error_page_is_cut_before_it_becomes_the_error(self):
+        # A proxy's page in front of server-scan: the run sees its start, not
+        # megabytes that would fail it as "Failure exceeds size limit.".
+        respx.get(f"{SS}/servers").mock(return_value=httpx.Response(502, text="y" * (3 << 20)))
+        with pytest.raises(ServerScanError) as excinfo:
+            await server_scan.server_macs_by_name(SS, "t", SERVER)
+        assert len(str(excinfo.value)) < 1_000
+        assert "more characters cut" in str(excinfo.value)
 
 
 class TestPowerOff:

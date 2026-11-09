@@ -208,6 +208,7 @@
           <tr><td>An operator cancels the run</td><td class="muted">Stops; resources are <b>left</b>, so you can see how far it got</td><td class="muted">expires on its own</td></tr>
           <tr><td>No worker is running in that MCE</td><td class="muted">Waits; the <code>progress</code> query names the unserved queue</td><td class="muted">&mdash;</td></tr>
           <tr><td>The server-scan token lacks the admin role</td><td class="muted">Fails at the first lock, <code>ServerScanAuthError</code></td><td class="muted">never taken</td></tr>
+          <tr><td>server-scan is down or answers a 5xx &mdash; even a proxy&rsquo;s page megabytes long</td><td class="muted">Waits it out, retrying; the error shows the first 500 characters of the answer. A run from before that cap failed at once instead, as Temporal&rsquo;s <code>Failure exceeds size limit.</code> (any activity error over 2 MiB), the answer&rsquo;s start kept in its cause</td><td class="muted">never taken</td></tr>
         </tbody>
       </table>
     </div>

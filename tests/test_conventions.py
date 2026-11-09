@@ -101,6 +101,31 @@ async def no_timeout() -> None:
     assert {"AC001", "AC003", "AC005"} <= rules
 
 
+def test_checker_catches_a_whole_response_body_in_an_error(checker):
+    # 2026-11-09: a > 2 MiB body copied into an activity error failed a run as
+    # Temporal's non-retryable "Failure exceeds size limit.".
+    unbounded = '''
+def _detail(resp):
+    return resp.text
+
+
+def _fail(response):
+    raise RuntimeError(f"failed: {response.status_code} {response.text}")
+'''
+    violations = checker.run_source("activities/probe/client.py", unbounded)
+    assert sorted(v.line for v in violations if v.rule == "AC007") == [3, 7]
+
+    bounded = '''
+def _detail(resp):
+    return _bounded(resp.text)
+
+
+def _fail(response):
+    raise RuntimeError(f"failed: {response.status_code} {response.text[:500]}")
+'''
+    assert "AC007" not in _rules(checker.run_source("activities/probe/client.py", bounded))
+
+
 def test_checker_catches_router_slips(checker):
     source = '''
 from fastapi import APIRouter

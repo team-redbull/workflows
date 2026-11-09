@@ -194,6 +194,25 @@ async def test_create_segment_server_error_is_retryable_type(env):
         await env.run(create_segment, SEGMENT_INPUT)
 
 
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(503, text="<html>" + "x" * (3 << 20)),
+        httpx.Response(503, json={"detail": "x" * (3 << 20)}),
+    ],
+    ids=["proxy-page", "json-detail"],
+)
+@respx.mock
+async def test_create_segment_huge_answer_is_cut_before_it_becomes_the_error(env, response):
+    """History records an activity error verbatim, and Temporal turns one over
+    2 MiB into a non-retryable "Failure exceeds size limit." that fails the run."""
+    respx.post(f"{SM}/api/segments").mock(return_value=response)
+    with pytest.raises(SegmentsManagerError) as exc_info:
+        await env.run(create_segment, SEGMENT_INPUT)
+    assert len(str(exc_info.value)) < 1_000
+    assert "more characters cut" in str(exc_info.value)
+
+
 @respx.mock
 async def test_create_segment_unreadable_lookup_stays_retryable(env):
     """A conflict we cannot yet classify (the lookup itself failed) must retry,

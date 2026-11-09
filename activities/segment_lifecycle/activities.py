@@ -84,6 +84,18 @@ _HTTP_TIMEOUT = httpx.Timeout(60.0)
 # see values_repo._exec_git.
 _TLS_VERIFY = False
 
+# The most of an answer's text an error carries. Every activity error is
+# recorded verbatim in history, and Temporal turns one over 2 MiB into a
+# non-retryable "Failure exceeds size limit." that fails the run (CLAUDE.md §5).
+_MAX_DETAIL_CHARS = 500
+
+
+def _bounded(text: str) -> str:
+    """The start of `text` an operator reads, saying how much was cut."""
+    if len(text) <= _MAX_DETAIL_CHARS:
+        return text
+    return f"{text[:_MAX_DETAIL_CHARS]}… ({len(text) - _MAX_DETAIL_CHARS} more characters cut)"
+
 
 def _segments_manager_client() -> httpx.AsyncClient:
     """A fresh, per-invocation client for the Segments Manager."""
@@ -106,7 +118,7 @@ def _raise_segments_manager_error(action: str, resp: httpx.Response) -> None:
             f"{action} unauthorized ({resp.status_code}): check "
             "SEGMENTS_MANAGER_API_TOKEN"
         )
-    raise SegmentsManagerError(f"{action} failed: {resp.status_code} {resp.text}")
+    raise SegmentsManagerError(f"{action} failed: {resp.status_code} {_bounded(resp.text)}")
 
 
 # Fields compared when a create is rejected because the CIDR already exists,
@@ -125,14 +137,15 @@ _SEGMENT_IDENTITY_FIELDS = ("site", "vlan_id", "epg_name")
 def _segments_manager_detail(resp: httpx.Response) -> str:
     """The Segments Manager's own error text, which is what an operator has to
     act on. Falls back to the raw body for anything not shaped like its
-    {"detail": ...} error (a proxy's HTML, a bare list, ...)."""
+    {"detail": ...} error (a proxy's HTML, a bare list, ...). Bounded: the
+    answer's size is up to whatever replies, and it goes into an activity error."""
     try:
         body = resp.json()
     except ValueError:
-        return resp.text
+        return _bounded(resp.text)
     if isinstance(body, dict) and body.get("detail") is not None:
-        return str(body["detail"])
-    return resp.text
+        return _bounded(str(body["detail"]))
+    return _bounded(resp.text)
 
 
 async def _accept_existing_segment(
@@ -237,7 +250,9 @@ async def get_valid_sites() -> list[str]:
             _raise_segments_manager_error("List sites", resp)
         sites = resp.json().get("sites")
     if not isinstance(sites, list) or not sites:
-        raise SegmentsManagerError(f"GET /api/sites returned no site list: {resp.text}")
+        raise SegmentsManagerError(
+            f"GET /api/sites returned no site list: {_bounded(resp.text)}"
+        )
     activity.logger.info("Segments Manager knows %d site(s): %s", len(sites), sites)
     return sites
 
@@ -477,7 +492,7 @@ async def find_cluster_allocation(
         body = resp.json()
     if not isinstance(body, list):
         raise SegmentsManagerError(
-            f"GET /api/segments returned no segment list: {resp.text[:500]}"
+            f"GET /api/segments returned no segment list: {_bounded(resp.text)}"
         )
     matches = [
         row

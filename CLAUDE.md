@@ -22,7 +22,8 @@ every teammate; use them in this order and keep them in step:
   THIS repo's rules win where the two differ (the skill lists the divergences).
 - **`scripts/check_conventions.py`** — the ENFORCEMENT: AST checks of every rule that
   can be checked from source (sandbox imports, activity-call options, unbounded retries
-  named through exception classes, `ApplicationError` from workflow code, one `run()`
+  named through exception classes, no whole response body in an activity error,
+  `ApplicationError` from workflow code, one `run()`
   argument, `connect_temporal` only, interface ↔ implementation ↔ worker registration,
   `_WORKER_SPECS`, router paths and 202s, Dockerfile CMDs, CI jobs, a docs page per
   started workflow). It runs on every Edit/Write through the PostToolUse hook in
@@ -958,6 +959,16 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   and frees the worker before Temporal reaps the activity.
 - **Per-invocation HTTP client:** create `httpx.AsyncClient` INSIDE each activity via `async with` so
   auth tokens/cookies scope to one invocation and never leak across concurrent runs.
+- **External text in an activity error is BOUNDED** (checker AC007). History records an activity
+  error verbatim, and Temporal's frontend replaces any failure over `limit.blobSize.error` (2 MiB by
+  default) with a NON-RETRYABLE `Failure exceeds size limit.` — the original kept only as its
+  cause, cut to 512 KiB — so a 5xx that should have been out-waited FAILS the run instead. An HTTP
+  body or a dependency's message goes into an exception as its first few hundred characters: a
+  slice (`resp.text[:500]`) or a bounding helper (`_bounded` in `server_scan.py` and the
+  segment-lifecycle activities, which says how much was cut). Found 2026-11-09: an
+  add-server-to-mce run failed at `acquire_servers` because `server_scan._detail` copied an error
+  answer of more than 2 MiB whole (reproduced on a local dev server; server-scan's own `main` cannot
+  send one, so it came from whatever answered at `SERVER_SCAN_URL`).
 - **Git-subprocess activities** (`activities/segment_lifecycle/values_repo.py`): git runs via
   `asyncio.create_subprocess_exec` (no Python git dependency; the limb Dockerfile installs the binary),
   each command under a timeout below the git activities' 180s `start_to_close_timeout`, every clone in

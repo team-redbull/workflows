@@ -74,20 +74,34 @@ def _query(request: AcquireServerRequest) -> dict[str, Any]:
     return params
 
 
+# The most of an answer's text an error carries. Every activity error is
+# recorded verbatim in history, and Temporal turns one over 2 MiB into a
+# non-retryable "Failure exceeds size limit." that fails the run (CLAUDE.md §5).
+_MAX_DETAIL_CHARS = 500
+
+
+def _bounded(text: str) -> str:
+    """The start of `text` an operator reads, saying how much was cut."""
+    if len(text) <= _MAX_DETAIL_CHARS:
+        return text
+    return f"{text[:_MAX_DETAIL_CHARS]}… ({len(text) - _MAX_DETAIL_CHARS} more characters cut)"
+
+
 def _detail(resp: httpx.Response) -> str:
     """server-scan's own RFC 9457 `detail`, which is what an operator acts on.
 
     It distinguishes "nothing matched the pattern" from "everything matching is
     CRITICAL, claimed, unreachable or in maintenance" — a difference the caller
-    cannot otherwise see.
+    cannot otherwise see. Bounded: whatever answers at SERVER_SCAN_URL (a proxy
+    included) decides the body's size, and it goes into an activity error.
     """
     try:
         body = resp.json()
     except ValueError:
-        return resp.text
+        return _bounded(resp.text)
     if isinstance(body, dict):
-        return str(body.get("detail") or body)
-    return str(body)
+        return _bounded(str(body.get("detail") or body))
+    return _bounded(str(body))
 
 
 def _details(resp: httpx.Response) -> dict[str, Any]:

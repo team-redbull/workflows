@@ -19,6 +19,10 @@ CLAUDE.md §1, §2, §5, §6, §7. Checker ids in brackets.
 - **Classify every failure**: deterministic answers raise a class from
   `shared/exceptions.py` that the workflow lists as non-retryable; everything else is
   transient. "Not there yet" from something polled is a typed result, not an exception.
+- **Bounded error text**: an HTTP body or a dependency's message enters an exception as a
+  slice or through a bounding helper, never whole — history records it verbatim, and
+  Temporal fails an activity error over 2 MiB as non-retryable "Failure exceeds size
+  limit.". [AC007]
 - **Long machine waits** are one heartbeating activity that resumes from its heartbeat details.
 - **HTTP**: an `httpx.AsyncClient` per call, inside it, `timeout=` below the activity's
   `start_to_close_timeout`. [AC001, AC002]

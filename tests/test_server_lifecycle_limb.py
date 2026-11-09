@@ -341,6 +341,27 @@ class TestTheInventoryQuerysFailures:
             await fetch_available_servers(SS, "tok", PATTERN_REQUEST)
 
     @respx.mock
+    @pytest.mark.parametrize(
+        ("response", "error"),
+        [
+            (httpx.Response(500, text="z" * (3 << 20)), ServerScanError),
+            (httpx.Response(503, json={"detail": "w" * (3 << 20)}), ServerScanError),
+            (httpx.Response(404, json={"detail": "v" * (3 << 20)}), ServerNotAvailableError),
+        ],
+        ids=["5xx-page", "5xx-json-detail", "404-detail"],
+    )
+    async def test_a_huge_answer_is_cut_before_it_becomes_the_error(self, response, error):
+        # History records an activity error verbatim, and Temporal turns one
+        # over 2 MiB into a non-retryable "Failure exceeds size limit." — so a
+        # 5xx that should have been out-waited failed the run (2026-11-09).
+        respx.get(AVAILABLE).mock(return_value=response)
+        with pytest.raises(error) as excinfo:
+            await fetch_available_servers(SS, "tok", PATTERN_REQUEST)
+        message = str(excinfo.value)
+        assert len(message) < 1_000
+        assert "more characters cut" in message
+
+    @respx.mock
     async def test_an_empty_draw_is_treated_as_nothing_assignable(self):
         # A 200 with no items is server-scan's honest partial-fulfilment answer,
         # but for one install it means the same thing as a 404.

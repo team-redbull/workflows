@@ -673,6 +673,29 @@ def check_activity_module(path: Path, tree: ast.Module, report: _Report) -> None
                 f"`{node.name}` is a sync activity — the workers configure no activity_executor, "
                 "so it would fail at startup; make it `async def` (§5)",
             )
+        unbounded = None
+        if isinstance(node, ast.FormattedValue) and _is_response_text(node.value):
+            unbounded = "put into an f-string"
+        elif isinstance(node, ast.Return) and node.value is not None and _is_response_text(node.value):
+            unbounded = "returned"
+        if unbounded:
+            report.error(
+                path, node.lineno, "AC007",
+                f"an HTTP response's whole `.text` is {unbounded} — it ends up in an activity "
+                "error, which history records verbatim and Temporal fails as non-retryable "
+                "\"Failure exceeds size limit.\" over 2 MiB; slice it or pass it through a "
+                "bounding helper (§5)",
+            )
+
+
+def _is_response_text(node: ast.expr) -> bool:
+    """`resp.text` / `response.text` itself — not sliced, not passed to a helper."""
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr == "text"
+        and isinstance(node.value, ast.Name)
+        and node.value.id in ("resp", "response")
+    )
 
 
 def check_interface_module(path: Path, tree: ast.Module, report: _Report) -> None:

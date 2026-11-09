@@ -789,6 +789,9 @@ class AddServerToMceProgress(_QuietDefaults):
     server_name: str | None = None
     activity_queue: str | None = None
     allowed_unhealthy: list[WaivedHealthCheck] = Field(default_factory=list)
+    # A CANCELLED run has no result: what its rollback did (or could not) is
+    # here, from phase `cancelled` on. None until the run is cancelled.
+    cancel_rollback: str | None = None
 
 
 class AddServerToMceResult(_QuietDefaults):

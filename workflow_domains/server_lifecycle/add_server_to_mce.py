@@ -128,15 +128,20 @@ same string. If no worker polls that queue the run waits rather than acting,
 and the `progress` query names the queue so it reads as "that MCE has no
 worker" instead of "the run is stuck".
 
-TEARDOWN IS PART OF THE LOOP, NOT A CANCELLATION HANDLER. A candidate that
-never produced an Agent is rolled back because the run intends to try another
-machine, and leaving a BareMetalHost behind would make that machine undrawable
-here and invisible to every other MCE — server-scan reports it unclaimed until
-a cluster reports the node, so nothing else would notice. On CANCELLATION there
-is still deliberately no compensating cleanup: the three resources are
-idempotent, so a re-run converges on them, and a half-created set is what an
-operator needs in order to see how far the run got. Removing a SUCCESSFULLY
-installed server remains a separate uninstall-server-from-hc workflow.
+TEARDOWN IS PART OF THE LOOP. A candidate that never produced an Agent is
+rolled back because the run intends to try another machine, and leaving a
+BareMetalHost behind would make that machine undrawable here and invisible to
+every other MCE — server-scan reports it unclaimed until a cluster reports the
+node, so nothing else would notice.
+
+A CANCEL ROLLS BACK TOO (the operator, 2026-11-09; until then it deliberately
+left everything in place). Before the Agent, the candidate being installed is
+undone — through remove-server-from-mce as a child when anything may be on the
+MCE, else its PXE mapping and its lock directly — and the run still ends
+CANCELED (_roll_back_after_cancel). After the Agent the server IS installed and
+stays; the cancel only stops the wait for server-scan. Terminate runs no code,
+so it never rolls back. Removing a SUCCESSFULLY installed server remains
+uninstall-server-from-hc / remove-server-from-mce.
 
 THE INSTALL LOCK IS WHAT MAKES "UNCLAIMED" TRUE ACROSS MCEs. server-scan
 reports a machine AVAILABLE until a cluster reports it, and this run's
@@ -171,6 +176,7 @@ through the BMC that just failed to answer. See teardown_bmh_resources.
 
 from __future__ import annotations
 
+import asyncio
 import re
 from collections.abc import Awaitable, Callable
 from datetime import timedelta
@@ -178,7 +184,14 @@ from typing import cast
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
-from temporalio.exceptions import ActivityError, ApplicationError
+from temporalio.exceptions import (
+    ActivityError,
+    ApplicationError,
+    ChildWorkflowError,
+    WorkflowAlreadyStartedError,
+    is_cancelled_exception,
+)
+from temporalio.workflow import ParentClosePolicy
 
 with workflow.unsafe.imports_passed_through():
     from shared.cluster_names import canonical_mce_cluster
@@ -189,9 +202,11 @@ with workflow.unsafe.imports_passed_through():
         is_k8s_resource_name,
     )
     from shared.consts import (
+        REMOVE_SERVER_FROM_MCE_WORKFLOW_QUEUE,
         SEGMENT_LIFECYCLE_ACTIVITY_QUEUE,
         server_lifecycle_activity_queue,
     )
+    from shared.workflow_ids import remove_server_from_mce_workflow_id
     from shared.exceptions import (
         AllowUnhealthyNeedsServerNameError,
         AmbiguousInventorySegmentError,
@@ -262,6 +277,9 @@ with workflow.unsafe.imports_passed_through():
         PxeBootRequest,
         PxeMapRef,
         ReleaseServerRequest,
+        RemoveServerFromMceInput,
+        RemoveServerFromMceResult,
+        RemoveServerFromMceRunArgs,
         ReserveServerRequest,
         ServerMembershipRequest,
         ServerReservation,
@@ -279,6 +297,10 @@ with workflow.unsafe.imports_passed_through():
         holds_own_lock,
         safety_refusal,
     )
+
+# A cancelled install is taken back out of the MCE through remove-server-from-mce,
+# as uninstall-server-from-hc's inventory half is — never reimplemented here.
+from workflow_domains.server_lifecycle.remove_server_from_mce import RemoveServerFromMceWorkflow
 
 # Same budget rules as the segment-lifecycle workflows: a bounded per-attempt
 # timeout (with the HTTP client timing out below it) and UNBOUNDED retries, so a
@@ -413,6 +435,14 @@ _OWN_LOCK_RERUN_PATCH = "named-install-own-lock-rerun"
 # Gates the wait for server-scan after success and the early release of the
 # lock. A run recorded before it completes at the hold, its lock left to expire.
 _RELEASE_ONCE_INSTALLED_PATCH = "add-server-release-once-installed"
+# Gates the rollback on CANCEL (the operator, 2026-11-09). A run recorded before
+# it stops where it is when cancelled, everything left in place.
+_ROLLBACK_ON_CANCEL_PATCH = "add-server-rollback-on-cancel"
+# How long a cancelled run waits before it cleans up: a cancel stops waiting for
+# an activity but not the activity — none here heartbeats — so a create, a lock
+# or a PXE mapping already sent may still land. One attempt's whole budget, and
+# a margin, lets it land first, so nothing reappears after the cleanup.
+_CANCEL_SETTLE = _ACTIVITY_TIMEOUT + timedelta(seconds=30)
 
 # assisted-service regenerates the discovery image within seconds of an
 # NMStateConfig change; ten minutes of no new image means it is not going to
@@ -643,6 +673,17 @@ class AddServerToMceWorkflow:
         self._nmstate_replace = False
         self._own_lock_rerun = False
         self._release_once_installed = False
+        self._rollback_on_cancel = False
+        # What a cancel would have to undo, set BEFORE each call that may lock,
+        # write or map (a call a cancel cuts off may still land): the candidate
+        # being installed, whether anything may be on the MCE for it, and its PXE
+        # mapping. Reset as each candidate is done with; `_installed` once the
+        # Agent proved the install, after which a cancel undoes nothing.
+        self._held: AcquiredServer | None = None
+        self._mce_written = False
+        self._pxe_mapped: tuple[list[BondMember], str] | None = None
+        self._installed = False
+        self._cancel_rollback: str | None = None
         # The health refusals waived for the server being installed
         # (`allow_unhealthy`), each with what was observed.
         self._allowed_unhealthy: list[WaivedHealthCheck] = []
@@ -660,10 +701,27 @@ class AddServerToMceWorkflow:
             server_name=self._server_name,
             activity_queue=self._activity_queue,
             allowed_unhealthy=self._allowed_unhealthy,
+            cancel_rollback=self._cancel_rollback,
         )
 
     @workflow.run
     async def run(self, run_args: AddServerToMceRunArgs) -> AddServerToMceResult:
+        """The install; on a CANCEL, its rollback first (_roll_back_after_cancel), then CANCELED.
+
+        A cancel arrives as asyncio.CancelledError, or wrapped in the ActivityError
+        or ChildWorkflowError of the call it cut off. It is re-raised after the
+        rollback, so the run still ends CANCELED, never FAILED. Terminate runs no
+        code at all: it never rolls back.
+        """
+        try:
+            return await self._install(run_args)
+        except (asyncio.CancelledError, ActivityError, ChildWorkflowError) as err:
+            if not (self._rollback_on_cancel and is_cancelled_exception(err)):
+                raise
+            await self._roll_back_after_cancel(run_args.input)
+            raise
+
+    async def _install(self, run_args: AddServerToMceRunArgs) -> AddServerToMceResult:
         install_input = run_args.input
         infra_env = install_input.infra_env
         namespace = install_input.namespace
@@ -681,6 +739,7 @@ class AddServerToMceWorkflow:
         self._nmstate_replace = workflow.patched(_NMSTATE_REPLACE_PATCH)
         self._own_lock_rerun = workflow.patched(_OWN_LOCK_RERUN_PATCH)
         self._release_once_installed = workflow.patched(_RELEASE_ONCE_INSTALLED_PATCH)
+        self._rollback_on_cancel = workflow.patched(_ROLLBACK_ON_CANCEL_PATCH)
         workflow.logger.info(
             "Installing a server into InfraEnv=%s for MCE=%s",
             infra_env,
@@ -751,6 +810,9 @@ class AddServerToMceWorkflow:
         attempts = 0
 
         for candidate in candidates:
+            # Whatever the last candidate held was given back, or is another
+            # run's now, before the loop moved on: nothing of it for a cancel.
+            self._held, self._mce_written, self._pxe_mapped = None, False, None
             self._phase = "selecting-server"
             bond_members = await self._evaluate_candidate(
                 candidate,
@@ -778,6 +840,7 @@ class AddServerToMceWorkflow:
             # server-scan's draw cannot know which candidate a run will choose.
             if self._reserving:
                 self._phase = "reserving-server"
+                self._held = candidate  # before the call: a lock it sends may land
                 lock = await self._reserve(
                     candidate, install_input, _RESERVATION_TTL, activity_queue, rejections
                 )
@@ -804,6 +867,8 @@ class AddServerToMceWorkflow:
             # create) in BOTH create orders: create_nmstate_config would fail
             # on it, and nothing written yet means nothing to roll back.
             nmstate_replaced: list[str] = []
+            # From here on something may be written on the MCE for it.
+            self._mce_written = True
             if self._nmstate_replace:
                 self._phase = "checking-nmstateconfig"
                 replacement = await self._replace_conflicting_nmstate(
@@ -823,6 +888,7 @@ class AddServerToMceWorkflow:
             pxe_registered = False
             if self._pxe_booting and network_boot:
                 self._phase = "registering-pxe-boot"
+                self._pxe_mapped = (bond_members, segment.site)  # before the call, as the lock
                 pxe_registered = await self._register_pxe_boot(
                     candidate,
                     bond_members,
@@ -935,6 +1001,9 @@ class AddServerToMceWorkflow:
             )
 
             if agent.found:
+                # Installed: a cancel from here on undoes nothing (the operator,
+                # 2026-11-09) — it only stops the wait for server-scan.
+                self._installed = True
                 reservation_expires_at = None
                 held: ServerReservation | None = None
                 if self._reserving:
@@ -1483,6 +1552,98 @@ class AddServerToMceWorkflow:
                 "PXE map cleanup of %s skipped: %s", candidate.name, result.detail
             )
 
+    async def _roll_back_after_cancel(self, install_input: AddServerToMceInput) -> None:
+        """Undo the candidate this cancelled run was installing (the operator, 2026-11-09).
+
+        Before it a cancel left everything in place. Nothing to undo before a
+        lock, and nothing once the Agent proved the install: the server stays,
+        the cancel only stops the wait for server-scan, and the lock expires.
+        Otherwise, after _CANCEL_SETTLE (a call the cancel cut off may still land):
+
+          * anything possibly written on the MCE is taken out by
+            remove-server-from-mce as an awaited child, as uninstall-server-from-hc
+            does — host powered off first, BareMetalHost + NMStateConfig, any Agent
+            it registered, its MACs on its site's PXE VM, a verification, and
+            add-server-to-mce's lock for this MCE released;
+          * when that child found nothing of it on the MCE — or nothing was
+            written — an IPMI mapping this run sent is removed here (the child
+            touches the PXE map only for a host it finds), and the lock released
+            with this run's holder and id (none of ours is success).
+
+        Never raises: a step that fails is logged and named in `progress`
+        (`cancel_rollback`), and the run still ends CANCELED — what is left then
+        is what a cancel left before.
+        """
+        candidate = self._held
+        if candidate is None or self._installed:
+            self._phase = "cancelled"
+            self._cancel_rollback = (
+                "nothing to undo: no server was locked yet" if candidate is None
+                else f"{candidate.name} is installed and stays: the lock expires on its own"
+            )
+            return
+        task_queue = server_lifecycle_activity_queue(install_input.mce_cluster)
+        self._phase = "cancel-settling"
+        await workflow.sleep(_CANCEL_SETTLE)
+        removal: RemoveServerFromMceResult | None = None
+        if self._mce_written:
+            self._phase = "cancel-removing-server"
+            child_id = remove_server_from_mce_workflow_id(candidate.name)
+            try:
+                removal = await workflow.execute_child_workflow(
+                    RemoveServerFromMceWorkflow.run,
+                    RemoveServerFromMceRunArgs(
+                        input=RemoveServerFromMceInput(
+                            server_name=candidate.name,
+                            mce_cluster=install_input.mce_cluster,
+                            namespace=install_input.namespace,
+                        )
+                    ),
+                    id=child_id,
+                    task_queue=REMOVE_SERVER_FROM_MCE_WORKFLOW_QUEUE,
+                    # It powers off and deletes in a load-bearing order: closing
+                    # this run must never cut it off between two of those steps.
+                    parent_close_policy=ParentClosePolicy.ABANDON,
+                )
+            except (WorkflowAlreadyStartedError, ChildWorkflowError) as err:
+                cause = getattr(err, "cause", None)
+                why = (
+                    f"{cause.type}: {cause.message}" if isinstance(cause, ApplicationError)
+                    else f"{type(err).__name__}: {err}"
+                )
+                workflow.logger.warning("Rollback of cancelled %s failed at %s: %s", candidate.name, child_id, why)
+                self._phase = "cancelled"
+                self._cancel_rollback = (
+                    f"{child_id} could not take {candidate.name} out of the MCE ({why}): what it "
+                    "left is still there, and the install lock expires on its own"
+                )
+                return
+        done = (
+            f"{candidate.name} taken out of the MCE by {remove_server_from_mce_workflow_id(candidate.name)}"
+            + ("" if removal.lock_released else f"; lock: {removal.lock_detail or 'kept'}")
+            if removal is not None and removal.found
+            else None
+        )
+        if done is None:
+            try:
+                if self._pxe_mapped is not None:
+                    self._phase = "cancel-releasing-lock"
+                    bond_members, site = self._pxe_mapped
+                    await self._unregister_pxe_boot(candidate, bond_members, site, task_queue)
+                self._phase = "cancel-releasing-lock"
+                await self._release(candidate, task_queue)
+                done = f"{candidate.name}: nothing on the MCE; " + (
+                    "PXE mapping removed, " if self._pxe_mapped is not None else ""
+                ) + "install lock released"
+            except ActivityError as err:
+                cause = err.cause
+                why = f"{cause.type}: {cause.message}" if isinstance(cause, ApplicationError) else str(cause or err)
+                workflow.logger.warning("Rollback of cancelled %s: %s", candidate.name, why)
+                done = f"{candidate.name}: cleanup incomplete ({why}); the install lock expires on its own"
+        workflow.logger.info("Cancelled run rolled back: %s", done)
+        self._phase = "cancelled"
+        self._cancel_rollback = done
+
     async def _release_once_seen_installed(
         self, candidate: AcquiredServer, install_input: AddServerToMceInput, task_queue: str
     ) -> tuple[bool, str | None, str]:
@@ -1521,6 +1682,8 @@ class AddServerToMceWorkflow:
                     retry_policy=_RETRY_POLICY,
                 )
             except ActivityError as err:
+                if is_cancelled_exception(err):
+                    raise  # a cancel of the run, not server-scan unreadable
                 cause = err.cause
                 why = f"{cause.type}: {cause.message}" if isinstance(cause, ApplicationError) else str(cause or err)
                 workflow.logger.warning("server-scan could not be read for %s: %s", candidate.name, why)

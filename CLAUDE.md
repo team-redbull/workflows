@@ -304,6 +304,26 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   `SERVER_SCAN_API_TOKEN`. Gated by `workflow.patched("server-scan-install-lock")`
   so runs started before it replay unchanged — keep the patch until none can
   remain in history.
+- **A CANCELLED add-server-to-mce ROLLS BACK** (the operator, 2026-11-09 — it used
+  to leave everything in place, "a half-created set shows how far it got"; that
+  is reversed, do not restore it). `run` catches the cancel (asyncio.CancelledError,
+  or the ActivityError/ChildWorkflowError wrapping it — `is_cancelled_exception`),
+  runs `_roll_back_after_cancel`, and RE-RAISES, so the run ends CANCELED, never
+  FAILED. What a cancel must undo is recorded BEFORE each call that may lock,
+  write or map (`_held`, `_mce_written`, `_pxe_mapped`), because a cancel stops
+  waiting for an activity, not the activity: a call it cut off may still land.
+  So the rollback first waits `_CANCEL_SETTLE` (one attempt's budget + 30 s),
+  then: anything possibly written on the MCE → remove-server-from-mce as an
+  awaited child (ABANDON), exactly as uninstall-server-from-hc's inventory half —
+  power off, BMH + NMStateConfig, any Agent, its PXE MACs, verification, and
+  add-server-to-mce's lock for this MCE — never reimplemented here; when the
+  child finds nothing on the MCE, or nothing was written, an IPMI mapping is
+  unmapped and the lock released here. After the Agent (`_installed`) a cancel
+  undoes NOTHING: the server stays, the wait for server-scan just stops (the
+  operator's choice). Before any lock there is nothing to undo. The rollback
+  never raises — a failing step is named in `progress.cancel_rollback` — and
+  TERMINATE runs no code, so it never rolls back. Gated
+  `add-server-rollback-on-cancel`: a run recorded before it stops as it did.
 - **An IPMI server boots from the NETWORK, so add-server-to-mce maps it on the
   site's PXE VM first.** IPMI (a UCS-managed `CISCO` blade; `boots_from_network`
   in `shared/bmc_address.py`) has no virtual media. After the install lock and

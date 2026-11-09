@@ -16,18 +16,21 @@ import re
 import uuid
 
 import pytest
-from temporalio import activity
-from temporalio.client import Client, WorkflowFailureError
+from temporalio import activity, workflow
+from temporalio.client import Client, WorkflowFailureError, WorkflowHandle
 from temporalio.contrib.pydantic import pydantic_data_converter
-from temporalio.exceptions import ActivityError, ApplicationError
+from temporalio.exceptions import ActivityError, ApplicationError, is_cancelled_exception
+from temporalio.service import RPCError
 from temporalio.testing import WorkflowEnvironment
-from temporalio.worker import Worker
+from temporalio.worker import Replayer, Worker
 
 from shared.consts import (
     ADD_SERVER_TO_MCE_WORKFLOW_QUEUE,
+    REMOVE_SERVER_FROM_MCE_WORKFLOW_QUEUE,
     SEGMENT_LIFECYCLE_ACTIVITY_QUEUE,
     server_lifecycle_activity_queue,
 )
+from shared.workflow_ids import remove_server_from_mce_workflow_id
 from shared.exceptions import (
     BmhConflictError,
     InfraEnvNotFoundError,
@@ -65,6 +68,8 @@ from shared.models.server_lifecycle import (
     PxeMapRef,
     PxeUnregistration,
     ReleaseServerRequest,
+    RemoveServerFromMceResult,
+    RemoveServerFromMceRunArgs,
     ReserveServerRequest,
     ServerInterface,
     ServerLockRecord,
@@ -73,7 +78,7 @@ from shared.models.server_lifecycle import (
     ServerReservation,
     TeardownResult,
 )
-from workflow_domains.server_lifecycle.add_server_to_mce import AddServerToMceWorkflow
+from workflow_domains.server_lifecycle.add_server_to_mce import AddServerToMceWorkflow, InstallServerWorkflow
 
 INFRA_ENV = "cisco-m6-bat-yam-64c-512gb"
 MCE_CLUSTER = "ocp4-mce-bat-yam-01"
@@ -215,6 +220,8 @@ def make_mock_activities(
     scan_states: list[str | None] | None = None,
     scan_mce: str | None = None,
     scan_error: Exception | None = None,
+    acquire_gate: asyncio.Event | None = None,
+    reserve_gate: asyncio.Event | None = None,
 ):
     """Build the full mock activity set + a call recorder.
 
@@ -262,6 +269,10 @@ def make_mock_activities(
     `scan_states` in turn, one per read, the last one repeated (None = server-
     scan does not know the name; default: INSTALLED_TO_INVENTORY at once),
     `scan_mce` the MCE its agents job names, `scan_error` raised every read.
+
+    `acquire_gate` / `reserve_gate` hold `acquire_servers` / `reserve_server`
+    open until the test sets them: a call in flight when the run is cancelled,
+    which then lands anyway (a cancel stops waiting for it, not it).
     """
     calls: dict[str, list] = {
         name: []
@@ -311,6 +322,8 @@ def make_mock_activities(
     async def acquire_servers(request: AcquireServerRequest) -> list[AcquiredServer]:
         calls["acquire_servers"].append(request)
         calls["order"].append("acquire_servers")
+        if acquire_gate is not None:
+            await acquire_gate.wait()
         if acquire_error is not None:
             raise acquire_error
         if scan_hides_locked and request.name is not None:
@@ -496,6 +509,8 @@ def make_mock_activities(
     @activity.defn
     async def reserve_server(request: ReserveServerRequest) -> ServerReservation:
         calls["reserve_server"].append(request)
+        if reserve_gate is not None:
+            await reserve_gate.wait()
         if reserve_error is not None:
             raise reserve_error
         if request.server_name in gone:
@@ -573,8 +588,27 @@ def make_mock_activities(
     return calls, segment_activities, server_activities
 
 
+@workflow.defn(name="RemoveServerFromMceWorkflow", sandboxed=False)
+class _FakeRemoveServerFromMce:
+    """remove-server-from-mce as a cancelled install's rollback meets it.
+
+    It takes the host out (found, powered off, lock released) — except a server
+    whose name says `nowhere`, which it finds nothing of on the MCE.
+    """
+
+    @workflow.run
+    async def run(self, run_args: RemoveServerFromMceRunArgs) -> RemoveServerFromMceResult:
+        request = run_args.input
+        found = "nowhere" not in request.server_name
+        return RemoveServerFromMceResult(
+            server_name=request.server_name, namespace=request.namespace,
+            mce_cluster=request.mce_cluster, found=found, powered_off=found, lock_released=found,
+        )
+
+
 class _Harness:
-    """Brain + BOTH limbs, mirroring the real three-queue split."""
+    """Brain + BOTH limbs, mirroring the real three-queue split (plus a fake
+    remove-server-from-mce child, for a cancelled install's rollback)."""
 
     def __init__(self, segment_activities, server_activities, server_queue=None) -> None:
         self._segment_activities = segment_activities
@@ -601,6 +635,11 @@ class _Harness:
                 client,
                 task_queue=SEGMENT_LIFECYCLE_ACTIVITY_QUEUE,
                 activities=self._segment_activities,
+            ),
+            Worker(
+                client,
+                task_queue=REMOVE_SERVER_FROM_MCE_WORKFLOW_QUEUE,
+                workflows=[_FakeRemoveServerFromMce],
             ),
         ]
         for worker in self._workers:
@@ -2378,3 +2417,124 @@ class TestTheLockIsReleasedOnceServerScanSeesTheServer:
         assert len(calls["lookup_server_membership"]) == 1  # permanent: one read
         assert calls["release_server"] == []
         assert result.lock_released is False and "ServerScanAuthError" in (result.lock_detail or "")
+
+
+# --- a cancel rolls the install back -------------------------------------------
+
+
+async def _start(client: Client, args: AddServerToMceRunArgs) -> WorkflowHandle:
+    return await client.start_workflow(
+        AddServerToMceWorkflow.run, args, id=f"test-{uuid.uuid4()}", task_queue=ADD_SERVER_TO_MCE_WORKFLOW_QUEUE,
+    )
+
+
+async def _until_phase(handle: WorkflowHandle, phase: str) -> None:
+    """Poll the progress query until the run reports `phase` (real seconds, bounded)."""
+    for _ in range(300):
+        if (await handle.query(AddServerToMceWorkflow.progress)).phase == phase:
+            return
+        await asyncio.sleep(0.05)
+    raise AssertionError(f"the run never reached {phase}")
+
+
+async def _cancelled(handle: WorkflowHandle):
+    """Cancel, wait for the run to end, and return its final progress: it must end CANCELED."""
+    with pytest.raises(WorkflowFailureError) as excinfo:
+        await asyncio.wait_for(handle.result(), timeout=60)
+    assert is_cancelled_exception(excinfo.value.cause), excinfo.value.cause
+    return await handle.query(AddServerToMceWorkflow.progress)
+
+
+async def _child_ran(client: Client, server_name: str) -> RemoveServerFromMceResult | None:
+    try:
+        return await client.get_workflow_handle(
+            remove_server_from_mce_workflow_id(server_name), result_type=RemoveServerFromMceResult
+        ).result()
+    except RPCError:
+        return None
+
+
+class TestACancelRollsTheInstallBack:
+    """The operator, 2026-11-09: Cancel undoes the candidate being installed — before the
+    Agent. After the Agent the server stays installed. The run still ends CANCELED."""
+
+    async def test_cancelled_while_waiting_for_the_agent_it_is_taken_out_by_remove_server_from_mce(self):
+        calls, segment_acts, server_acts = make_mock_activities(agent_never_for={SERVER_NAME})
+        async with _Harness(segment_acts, server_acts) as client:
+            handle = await _start(client, AddServerToMceRunArgs(input=INPUT))
+            await _until_phase(handle, "awaiting-agent")
+            await handle.cancel()
+            progress = await _cancelled(handle)
+            removal = await _child_ran(client, SERVER_NAME)
+            history = await handle.fetch_history()
+
+        assert removal is not None and removal.found and removal.mce_cluster == MCE_CLUSTER
+        assert (progress.phase, progress.server_name) == ("cancelled", SERVER_NAME)
+        assert "taken out of the MCE by remove-server-from-mce-" in (progress.cancel_rollback or "")
+        # The child did the whole job, the lock included: nothing doubled here.
+        assert calls["teardown_bmh_resources"] == [] and calls["release_server"] == []
+        # The cancel path replays as recorded.
+        await Replayer(
+            workflows=[AddServerToMceWorkflow, InstallServerWorkflow], data_converter=pydantic_data_converter,
+        ).replay_workflow(history)
+
+    async def test_cancelled_while_locking_the_lock_that_still_lands_is_released(self):
+        gate = asyncio.Event()
+        calls, segment_acts, server_acts = make_mock_activities(reserve_gate=gate)
+        async with _Harness(segment_acts, server_acts) as client:
+            handle = await _start(client, AddServerToMceRunArgs(input=INPUT))
+            await _until_phase(handle, "reserving-server")
+            await handle.cancel()
+            # The run took the cancel and waits for calls in flight to land;
+            # the lock call the cancel cut off lands now, after it.
+            await _until_phase(handle, "cancel-settling")
+            gate.set()
+            await asyncio.sleep(0.2)
+            progress = await _cancelled(handle)
+            removal = await _child_ran(client, SERVER_NAME)
+
+        assert removal is None  # nothing was written on the MCE
+        assert calls["create_bmc_secret"] == [] and calls["replace_conflicting_nmstate_config"] == []
+        assert [r.server_name for r in calls["release_server"]] == [SERVER_NAME]
+        assert progress.phase == "cancelled" and "install lock released" in (progress.cancel_rollback or "")
+
+    async def test_cancelled_before_any_lock_there_is_nothing_to_undo(self):
+        gate = asyncio.Event()
+        calls, segment_acts, server_acts = make_mock_activities(acquire_gate=gate)
+        async with _Harness(segment_acts, server_acts) as client:
+            handle = await _start(client, AddServerToMceRunArgs(input=INPUT))
+            await _until_phase(handle, "acquiring-server")
+            await handle.cancel()
+            await _until_phase(handle, "cancelled")
+            gate.set()
+            progress = await _cancelled(handle)
+
+        assert calls["reserve_server"] == [] and calls["release_server"] == []
+        assert progress.phase == "cancelled" and "nothing to undo" in (progress.cancel_rollback or "")
+
+    async def test_cancelled_after_the_agent_the_server_stays_installed(self):
+        calls, segment_acts, server_acts = make_mock_activities(scan_states=["AVAILABLE"])
+        async with _Harness(segment_acts, server_acts) as client:
+            handle = await _start(client, AddServerToMceRunArgs(input=INPUT))
+            await _until_phase(handle, "awaiting-server-scan")
+            await handle.cancel()
+            progress = await _cancelled(handle)
+            removal = await _child_ran(client, SERVER_NAME)
+
+        assert removal is None and calls["teardown_bmh_resources"] == [] and calls["release_server"] == []
+        assert progress.phase == "cancelled" and "is installed and stays" in (progress.cancel_rollback or "")
+
+    async def test_a_blade_the_child_finds_nowhere_has_its_pxe_mapping_and_lock_undone_here(self):
+        blade = ucs_server(name="ocp-cisco-m6-bat-yam-64c-512gb-nowhere")
+        calls, segment_acts, server_acts = make_mock_activities(candidates=[blade], agent_never_for={blade.name})
+        async with _Harness(segment_acts, server_acts) as client:
+            handle = await _start(client, AddServerToMceRunArgs(input=INPUT))
+            await _until_phase(handle, "awaiting-agent")
+            await handle.cancel()
+            progress = await _cancelled(handle)
+            removal = await _child_ran(client, blade.name)
+
+        assert removal is not None and not removal.found
+        assert [r.macs for r in calls["unregister_pxe_boot"]] == [r.macs for r in calls["register_pxe_boot"]]
+        assert [r.server_name for r in calls["release_server"]] == [blade.name]
+        assert "PXE mapping removed, install lock released" in (progress.cancel_rollback or "")

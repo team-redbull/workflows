@@ -300,6 +300,10 @@ const FLOWS = {
       "holding-server": ["Holding the lock a day", "So no other MCE draws the machine before a cluster reports it."],
       "awaiting-server-scan": ["Waiting for server-scan", "Installed. Reads server-scan every 5 min (up to a day) until it shows the server INSTALLED_TO_INVENTORY or INSTALLED; not seen by then, the lock is left to expire and the run still completes."],
       "releasing-lock": ["Releasing the lock", "server-scan now shows the server installed and hides it from every draw itself, so the lock goes back."],
+      "cancel-settling": ["Cancelled: letting a last call land", "Waits 2 min so a create, lock or PXE mapping already sent cannot reappear after the cleanup."],
+      "cancel-removing-server": ["Cancelled: removing the server", "remove-server-from-mce takes it out of the MCE: powered off, BareMetalHost, NMStateConfig and any Agent deleted, its PXE MACs cleared, the lock released."],
+      "cancel-releasing-lock": ["Cancelled: releasing the lock", "Nothing of it on the MCE: its PXE mapping (IPMI) and its install lock go back."],
+      "cancelled": ["Cancelled", "Rolled back before the Agent; an installed server stays. What was done is in progress.cancel_rollback."],
       "completed": ["Installed", ""],
     },
     steps: [
@@ -314,6 +318,7 @@ const FLOWS = {
       ["Agent registers", ["awaiting-agent"]],
       ["Hold the lock a day", ["holding-server"]],
       ["Release it once server-scan sees it", ["awaiting-server-scan", "releasing-lock"]],
+      ["Rolled back on cancel", ["cancel-settling", "cancel-removing-server", "cancel-releasing-lock", "cancelled"]],
     ],
   },
   remove: {

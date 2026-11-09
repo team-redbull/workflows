@@ -228,7 +228,9 @@ check before a cluster write. No NIC count is sent to server-scan
 | the lock lapsed and another run took the machine | deletes its *own* resources, tries the next | theirs, untouched |
 | every candidate skipped or tried | fails, reasons grouped | none held |
 | crash/failure while creating resources | stops, resources **left** on the MCE | expires after 2 h; a re-run of the same named install extends it |
-| operator cancels | stops, resources **left** to show progress | expires |
+| operator **cancels** before the Agent | **rolls back** (since 2026-11-09): after 2 min for calls in flight, **remove-server-from-mce** takes the server out of the MCE (power off, delete, PXE, verify) — or, nothing written, its PXE mapping is removed here; ends CANCELED, `progress.cancel_rollback` says what was done | released |
+| operator cancels after the Agent | stops the wait for server-scan, ends CANCELED; the server **stays installed** | expires |
+| operator **terminates** | stops at once — no rollback, resources left (use Cancel to roll back) | expires |
 | no worker in that MCE | waits; `progress` names the queue | — |
 | server-scan token not admin | fails at the first lock (`ServerScanAuthError`) | never taken |
 

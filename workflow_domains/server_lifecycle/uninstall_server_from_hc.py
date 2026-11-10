@@ -162,8 +162,9 @@ operator's decision, 2026-10-31: a server just uninstalled could not be
 installed anywhere for a day) — unless the PXE cleanup failed, where the
 host may still boot this MCE's image and the day-long hold stays. Runs
 recorded before `uninstall-server-release-after-removal`
-keep the hold. A lock another run holds — add-server-to-mce's day-long hold
-after it installed the machine, typically — fails the run before anything is
+keep the hold. A lock another run holds — add-server-to-mce's hold after it
+installed the machine, typically, until its run sees server-scan report the
+machine (usually 15-30 min, at most a day) — fails the run before anything is
 written.
 
 WHAT IS NEVER DONE: no NodePool change; no drain or Node delete where CAPI can

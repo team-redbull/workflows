@@ -312,6 +312,10 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   FAILED. What a cancel must undo is recorded BEFORE each call that may lock,
   write or map (`_held`, `_mce_written`, `_pxe_mapped`), because a cancel stops
   waiting for an activity, not the activity: a call it cut off may still land.
+  Every activity call is `ActivityCancellationType.ABANDON` (`_ON_CANCEL`): none
+  heartbeats, so a cancel REQUEST could never reach one, and sending it raced
+  the activity's own completion (ACTIVITY_UNKNOWN, a failed workflow task —
+  found by the cancel tests).
   So the rollback first waits `_CANCEL_SETTLE` (one attempt's budget + 30 s),
   then: anything possibly written on the MCE → remove-server-from-mce as an
   awaited child (ABANDON), exactly as uninstall-server-from-hc's inventory half —
@@ -1425,7 +1429,12 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   case-insensitively) one run per name with a per-run report, even for a list of one — the reply
   follows the request's shape. Every named run is on `add-server-to-mce-<mce>_<server>`, so one machine
   is one run however it is asked for. `count` and `candidate_count` size a POOL draw, so either
-  next to `server_names` is a 422, never silently ignored. `AddServerToMceRequest` is therefore its
+  next to `server_names` is a 422, never silently ignored. `namespace`, `candidate_count` and
+  `labels` are HIDDEN from Swagger (`SkipJsonSchema`; the operator, 2026-11-09 — expert knobs,
+  so Swagger shows `infra_env`, `mce_cluster`, `count`, `server_names`), yet accepted, validated and
+  used as before, defaults unchanged; `TestTheHiddenExpertFields` pins both halves. Hidden is not
+  protected: the API has no auth. Still documented in the README and the docs page, unlike
+  `allow_unhealthy`. `AddServerToMceRequest` is therefore its
   OWN model, not an AddServerToMceInput subclass: one request is many runs, each built by
   `run_input` with ONE `server_name`; `test_every_run_field_can_be_sent` keeps the two in step,
   and the old `server_name` field is a 422 pointing at `server_names`. Decided with the operator

@@ -191,7 +191,7 @@ from temporalio.exceptions import (
     WorkflowAlreadyStartedError,
     is_cancelled_exception,
 )
-from temporalio.workflow import ParentClosePolicy
+from temporalio.workflow import ActivityCancellationType, ParentClosePolicy
 
 with workflow.unsafe.imports_passed_through():
     from shared.cluster_names import canonical_mce_cluster
@@ -345,6 +345,14 @@ _RETRY_POLICY = RetryPolicy(
     maximum_interval=timedelta(minutes=1),
     non_retryable_error_types=[error.__name__ for error in _PERMANENT_ACTIVITY_ERRORS],
 )
+# What a cancel of the run does to the activity it is waiting on: ABANDON —
+# stop waiting, send Temporal no cancel request. None of these activities
+# heartbeats, so a request could never reach one (each runs to its end either
+# way), and sending it races the activity's own completion: an activity that
+# finishes as the cancel lands makes the request name an activity Temporal no
+# longer has (ACTIVITY_UNKNOWN), failing the workflow task. The rollback on
+# cancel already assumes a call may still land (_CANCEL_SETTLE).
+_ON_CANCEL = ActivityCancellationType.ABANDON
 
 # How long a cluster write may sit in an MCE's queue before Temporal reports
 # that nobody picked it up. Temporal advises against schedule-to-start timeouts
@@ -778,6 +786,7 @@ class AddServerToMceWorkflow:
                 start_to_close_timeout=_ACTIVITY_TIMEOUT,
                 schedule_to_start_timeout=_SCHEDULE_TO_START_TIMEOUT,
                 retry_policy=_RETRY_POLICY,
+                cancellation_type=_ON_CANCEL,
             )
             if state.cluster_ref:
                 workflow.logger.warning(
@@ -1197,6 +1206,7 @@ class AddServerToMceWorkflow:
                 start_to_close_timeout=_ACTIVITY_TIMEOUT,
                 schedule_to_start_timeout=_SCHEDULE_TO_START_TIMEOUT,
                 retry_policy=_RETRY_POLICY,
+                cancellation_type=_ON_CANCEL,
             )
         except ActivityError as err:
             cause = err.cause
@@ -1255,6 +1265,7 @@ class AddServerToMceWorkflow:
             start_to_close_timeout=_ACTIVITY_TIMEOUT,
             schedule_to_start_timeout=_SCHEDULE_TO_START_TIMEOUT,
             retry_policy=_RETRY_POLICY,
+            cancellation_type=_ON_CANCEL,
         )
         workflow_id = workflow.info().workflow_id
         refusal = safety_refusal(record, workflow_id)
@@ -1343,6 +1354,7 @@ class AddServerToMceWorkflow:
                 start_to_close_timeout=_ACTIVITY_TIMEOUT,
                 schedule_to_start_timeout=_SCHEDULE_TO_START_TIMEOUT,
                 retry_policy=_RETRY_POLICY,
+                cancellation_type=_ON_CANCEL,
             )
         except ActivityError as err:
             cause = err.cause
@@ -1392,6 +1404,7 @@ class AddServerToMceWorkflow:
                 start_to_close_timeout=_ACTIVITY_TIMEOUT,
                 schedule_to_start_timeout=_SCHEDULE_TO_START_TIMEOUT,
                 retry_policy=_RETRY_POLICY,
+                cancellation_type=_ON_CANCEL,
             )
         except ActivityError as err:
             cause = err.cause
@@ -1468,6 +1481,7 @@ class AddServerToMceWorkflow:
                 start_to_close_timeout=_ACTIVITY_TIMEOUT,
                 schedule_to_start_timeout=_SCHEDULE_TO_START_TIMEOUT,
                 retry_policy=_RETRY_POLICY,
+                cancellation_type=_ON_CANCEL,
             )
         except ActivityError as err:
             cause = err.cause
@@ -1516,6 +1530,7 @@ class AddServerToMceWorkflow:
                 start_to_close_timeout=_ACTIVITY_TIMEOUT,
                 schedule_to_start_timeout=_SCHEDULE_TO_START_TIMEOUT,
                 retry_policy=_RETRY_POLICY,
+                cancellation_type=_ON_CANCEL,
             )
             if state.published:
                 return state
@@ -1546,6 +1561,7 @@ class AddServerToMceWorkflow:
             start_to_close_timeout=_ACTIVITY_TIMEOUT,
             schedule_to_start_timeout=_SCHEDULE_TO_START_TIMEOUT,
             retry_policy=_RETRY_POLICY,
+            cancellation_type=_ON_CANCEL,
         )
         if result.detail:
             workflow.logger.warning(
@@ -1680,6 +1696,7 @@ class AddServerToMceWorkflow:
                     # never the run (caught below).
                     schedule_to_close_timeout=remaining,
                     retry_policy=_RETRY_POLICY,
+                    cancellation_type=_ON_CANCEL,
                 )
             except ActivityError as err:
                 if is_cancelled_exception(err):
@@ -1729,6 +1746,7 @@ class AddServerToMceWorkflow:
             start_to_close_timeout=_ACTIVITY_TIMEOUT,
             schedule_to_start_timeout=_SCHEDULE_TO_START_TIMEOUT,
             retry_policy=_RETRY_POLICY,
+            cancellation_type=_ON_CANCEL,
         )
         if released.detail:
             workflow.logger.info(
@@ -1753,6 +1771,7 @@ class AddServerToMceWorkflow:
             task_queue=SEGMENT_LIFECYCLE_ACTIVITY_QUEUE,
             start_to_close_timeout=_ACTIVITY_TIMEOUT,
             retry_policy=_RETRY_POLICY,
+            cancellation_type=_ON_CANCEL,
         )
         # Re-checked even though the activity already matched the cluster: that
         # match is client-side, because the list endpoint has no cluster filter,
@@ -1782,6 +1801,7 @@ class AddServerToMceWorkflow:
             start_to_close_timeout=_ACTIVITY_TIMEOUT,
             schedule_to_start_timeout=_SCHEDULE_TO_START_TIMEOUT,
             retry_policy=_RETRY_POLICY,
+            cancellation_type=_ON_CANCEL,
         )
 
     async def _read_bmh(self, ref: BmhRef, task_queue: str) -> BmhState:
@@ -1797,6 +1817,7 @@ class AddServerToMceWorkflow:
             start_to_close_timeout=_ACTIVITY_TIMEOUT,
             schedule_to_start_timeout=_SCHEDULE_TO_START_TIMEOUT,
             retry_policy=_RETRY_POLICY,
+            cancellation_type=_ON_CANCEL,
         )
 
     async def _await_agent(
@@ -1820,6 +1841,7 @@ class AddServerToMceWorkflow:
                 start_to_close_timeout=_ACTIVITY_TIMEOUT,
                 schedule_to_start_timeout=_SCHEDULE_TO_START_TIMEOUT,
                 retry_policy=_RETRY_POLICY,
+                cancellation_type=_ON_CANCEL,
             )
             if agent.found:
                 return agent, None
@@ -1843,6 +1865,7 @@ class AddServerToMceWorkflow:
             start_to_close_timeout=_ACTIVITY_TIMEOUT,
             schedule_to_start_timeout=_SCHEDULE_TO_START_TIMEOUT,
             retry_policy=_RETRY_POLICY,
+            cancellation_type=_ON_CANCEL,
         )
 
 

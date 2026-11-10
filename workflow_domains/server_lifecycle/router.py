@@ -216,10 +216,16 @@ class AddServerToMceRequest(BaseModel):
         ),
     )
     mce_cluster: str = Field(min_length=1, description=_MCE_CLUSTER_DESCRIPTION)
+    # `namespace`, `candidate_count` and `labels` are HIDDEN from the OpenAPI
+    # schema and Swagger (the operator, 2026-11-09): expert knobs, so a request
+    # is `infra_env` + `mce_cluster` + `count` or `server_names`. Sent anyway,
+    # each is validated and used exactly as before, and unsent each keeps its
+    # default. Pinned by TestTheHiddenExpertFields in test_server_lifecycle_api.py.
+    #
     # Defaulted HERE, at the edge: the run's input always carries the
     # namespace it was started with, so a later change of this default never
     # alters what a recorded run targets on replay.
-    namespace: str = Field(
+    namespace: SkipJsonSchema[str] = Field(
         default=_DEFAULT_NAMESPACE,
         min_length=1,
         description=(
@@ -232,7 +238,7 @@ class AddServerToMceRequest(BaseModel):
         description=(
             "Install exactly these machines (server-scan names) instead of letting "
             f"the pool pick: one name, or a list of up to {_MAX_INSTALLS_PER_REQUEST}, "
-            "each once. Each is its own run. Not with `count` or `candidate_count`."
+            "each once. Each is its own run. Not with `count`."
         ),
     )
     # None, not 1: it must stay unset next to `server_names` (a 422 there),
@@ -248,7 +254,7 @@ class AddServerToMceRequest(BaseModel):
             "without `count` — adds installs rather than colliding."
         ),
     )
-    candidate_count: int | None = Field(
+    candidate_count: SkipJsonSchema[int | None] = Field(
         default=None,
         ge=1,
         le=_MAX_CANDIDATES,
@@ -259,7 +265,7 @@ class AddServerToMceRequest(BaseModel):
             f"(at most {_MAX_CANDIDATES}): 3 for a lone install."
         ),
     )
-    labels: dict[str, str] = Field(
+    labels: SkipJsonSchema[dict[str, str]] = Field(
         default_factory=dict, description="Extra labels for each BareMetalHost."
     )
     # HIDDEN ON PURPOSE — the operator's "easter egg" (CLAUDE.md §4): out of the
@@ -421,9 +427,9 @@ async def start_add_server_to_mce(
     takes server-scan's install lock (an atomic compare-and-set there) before
     writing anything, and server-scan stops listing a locked machine. A pool
     run that loses the race skips to its next candidate, and one left with
-    none fails with ServerReservedError — raise `candidate_count`, or the pool
-    has fewer free servers than are being installed. A named machine another
-    run took first fails its own run.
+    none fails with ServerReservedError — the pool has fewer free servers than
+    are being installed. A named machine another run took first fails its own
+    run.
 
     Poll GET /workflows/runs/{workflow_id} (one per run) for progress/result.
     No healthy server matching, no candidate with two link-up NICs on distinct

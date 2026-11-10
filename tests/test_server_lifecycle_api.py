@@ -847,3 +847,43 @@ class TestTheHiddenAllowUnhealthy:
 
     def test_false_on_a_pool_draw_is_harmless(self, client, fake):
         assert client.post(PATH, json={**BODY, "allow_unhealthy": False}).status_code == 202
+
+
+class TestTheHiddenExpertFields:
+    """`namespace`, `candidate_count`, `labels`: out of Swagger, still working (the operator, 2026-11-09).
+
+    A request in Swagger is `infra_env` + `mce_cluster` + `count` or `server_names`.
+    The three expert knobs are hidden there — and must keep their defaults unsent
+    and do exactly what they did when sent, so they are pinned here.
+    """
+
+    _HIDDEN = ("namespace", "candidate_count", "labels")
+
+    def test_they_are_not_in_the_request_schema_nor_named_in_the_route(self, client):
+        spec = client.get("/openapi.json").json()
+        schema = spec["components"]["schemas"]["AddServerToMceRequest"]
+        assert not set(self._HIDDEN) & set(schema["properties"])
+        assert set(schema["properties"]) == {"infra_env", "mce_cluster", "server_names", "count"}
+        route = json.dumps(spec["paths"][PATH]) + json.dumps(schema)
+        assert "candidate_count" not in route and "`labels`" not in route
+
+    def test_unsent_they_keep_their_defaults(self, client, fake):
+        assert client.post(PATH, json=BODY).status_code == 202
+        run_input = fake.args[0].input
+        assert (run_input.namespace, run_input.labels, run_input.candidate_count) == ("inventory", {}, 3)
+
+    def test_sent_they_are_used(self, client, fake):
+        body = {**BODY, "namespace": "lab-kv", "labels": {"team": "redbull"}, "candidate_count": 5}
+        assert client.post(PATH, json=body).status_code == 202
+        run_input = fake.args[0].input
+        assert (run_input.namespace, run_input.labels, run_input.candidate_count) == (
+            "lab-kv", {"team": "redbull"}, 5,
+        )
+
+    @pytest.mark.parametrize(
+        "bad", [{"namespace": ""}, {"labels": {"a": 1}}, {"candidate_count": 0}],
+        ids=["empty-namespace", "non-string-label", "zero-candidates"],
+    )
+    def test_sent_they_are_still_validated(self, client, fake, bad):
+        assert client.post(PATH, json={**BODY, **bad}).status_code == 422
+        assert not fake.args

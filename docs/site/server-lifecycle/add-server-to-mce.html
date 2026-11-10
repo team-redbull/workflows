@@ -848,6 +848,9 @@
         </tbody>
       </table>
     </div>
+    <p class="note" style="margin-top:10px"><code>namespace</code>, <code>candidate_count</code> and <code>labels</code>
+    are <b>not shown in Swagger</b> (the operator, 2026-11-09): expert knobs. They are accepted, validated
+    and used exactly as described above, and unsent keep their defaults.</p>
     <p class="note" style="margin-top:10px">No <code>vlan_id</code>, on purpose: it belongs to the MCE&rsquo;s
     inventory segment, and a supplied one could contradict it. Each run is started with an
     <code>AddServerToMceInput</code> for ONE server (<code>server_name</code>, or null for a pool draw) and

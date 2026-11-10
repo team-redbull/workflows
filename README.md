@@ -428,6 +428,10 @@ resource name — three different people's problem, so they are never merged.
 | `candidate_count` | int \| null | 1–20, default `null` | How many candidates each pool run draws: if unset, (runs on the pool) + new runs + 2, max 20 — 3 for a lone install. Not with `server_names`. |
 | `labels` | map | default `{}` | Extra labels for the BareMetalHost. Cannot override the InfraEnv label — that would split the host from its NMStateConfig. |
 
+`namespace`, `candidate_count` and `labels` are **not shown in Swagger** (the
+operator, 2026-11-09): expert knobs. They are accepted, validated and used as
+above, and unsent keep their defaults.
+
 There is deliberately **no `vlan_id`**: it belongs to the MCE's segment, and a
 supplied one could contradict it. The request body forbids unknown fields, so
 sending `vlan_id` is a 422 rather than a silently ignored value. So is the old

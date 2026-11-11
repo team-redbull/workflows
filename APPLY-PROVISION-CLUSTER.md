@@ -117,7 +117,7 @@ done
 |---|---|---|
 | the project line, `200`, `refs/heads/main`, and `Everything up-to-date` (or a would-push line) per sig | the token is enough | continue |
 | `401` / `403` on the API, or `{"message":"403 Forbidden"}` | the token lacks `api` (a `write_repository`-only token clones and pushes but cannot open a merge request) | re-issue the project/group access token with `api` + `write_repository`; rotate the Secret (gitops/SECRETS.md) |
-| the sig push dry-run says `protected branch` / `You are not allowed to push` | the sig's default branch is protected against this token | allow the token's role to push to the default branch of every sig project (the chart Job this replaces pushed the same way — APPLY-DAY2-COPY §3), or give `DAY2_GIT_TOKEN` a token that may |
+| the sig push dry-run says `protected branch` / `You are not allowed to push` | the sig's default branch is protected against this token | allow the token's role to push to the default branch of every sig project (the chart Job this replaces pushed the same way — APPLY-DAY2-COPY §3); there is no second token for the sigs, the group token does both |
 
 Which sigs exist is whatever the merged day1 value layers list under
 `day2.copy_to_sigs` — the cluster file, the MCE's and the site's `values.yaml`
@@ -572,15 +572,13 @@ config:
   day2SigRepoUrlTemplate: "https://<GITLAB>/redbull/gitops-day2-prod/sigs/{sig}.git"
   day2SigPathTemplate: ""
 secrets:
-  # The one Secret every git limb reads (gitops/SECRETS.md). The pod gets it as REDBULL_GIT_TOKEN.
-  # For provision-cluster it must also reach the GitLab API (`api` + `write_repository`).
+  # The one Secret every git limb reads (gitops/SECRETS.md): the redbull GROUP token, ONE token
+  # for day1 and every sig project — the chart has no second Secret. The pod gets it as
+  # REDBULL_GIT_TOKEN. For provision-cluster it must also reach the GitLab API
+  # (`api` + `write_repository`) and push each sig project's default branch.
   gitTokenSecret:
     name: redbull-git-token
     key: REDBULL_GIT_TOKEN
-  # A different token for the sig projects (DAY2_GIT_TOKEN), only if the day1 token may not push them.
-  day2GitTokenSecret:
-    name: ""
-    key: ""
 activityWorker:
   image:
     repository: <mirror-registry>/team-redbull/cluster-lifecycle-worker
@@ -597,8 +595,8 @@ Copy the three files verbatim from the dev redbull-platform's `main`
 between the two environments (§5.2).
 Nothing in them is environment-specific: the ConfigMap renders the five keys
 above, the Deployment mounts `workflows-orchestrator-config` +
-`cluster-lifecycle-config`, maps the Secret's key onto `REDBULL_GIT_TOKEN` (and
-`DAY2_GIT_TOKEN` when a second Secret is named), `automountServiceAccountToken:
+`cluster-lifecycle-config`, maps the Secret's key onto `REDBULL_GIT_TOKEN` (the one token for day1 and the
+sigs), `automountServiceAccountToken:
 false`, no Namespace; `app.yaml` is `namespace: redbull-workflows`.
 
 ### 5.4 Verify before merging

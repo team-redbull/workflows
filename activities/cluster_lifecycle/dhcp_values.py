@@ -19,6 +19,9 @@ for a /24 only (dhcp_scope_manager requires an explicit gateway + subnetMask
 and explicit bounds for anything else). The first non-/24 segment stops the
 run with UnsupportedSegmentPrefix instead of quietly writing a block whose
 inherited defaults do not fit it.
+
+Moved here from activities/segment_lifecycle/ on 2026-11-11, with the cluster
+file: the limb that writes the block is the one that derives it.
 """
 
 from __future__ import annotations

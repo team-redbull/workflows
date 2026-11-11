@@ -31,6 +31,7 @@ from shared.consts import (
     LEGACY_PUBLISH_INFRAENV_BOOT_WORKFLOW_QUEUE,
     LEGACY_REMOVE_SERVER_WORKFLOW_QUEUE,
     LEGACY_UNINSTALL_SERVER_WORKFLOW_QUEUE,
+    PROVISION_CLUSTER_WORKFLOW_QUEUE,
     PROVISION_DELL_SERVER_WORKFLOW_QUEUE,
     PUBLISH_INFRAENV_TO_PXE_SERVER_WORKFLOW_QUEUE,
     RELEASE_SEGMENT_WORKFLOW_QUEUE,
@@ -44,6 +45,7 @@ from shared.logging_config import configure_logging
 from shared.settings import TemporalSettings
 from shared.shutdown import install_shutdown_handler
 from shared.temporal_client import connect_temporal
+from workflow_domains.cluster_lifecycle.provision_cluster import ProvisionClusterWorkflow
 from workflow_domains.cluster_upgrade.upgrade_cluster import UpgradeClusterWorkflow
 from workflow_domains.cluster_upgrade.upgrade_control_plane import (
     UpgradeControlPlaneWorkflow,
@@ -90,6 +92,7 @@ _WORKER_SPECS: list[tuple[str, list[type]]] = [
     (ALLOCATE_SEGMENT_WORKFLOW_QUEUE, [AllocateSegmentWorkflow]),
     (CREATE_VM_WORKFLOW_QUEUE, [CreateVmWorkflow]),
     (INITIALIZE_SEGMENT_WORKFLOW_QUEUE, [InitializeSegmentWorkflow]),
+    (PROVISION_CLUSTER_WORKFLOW_QUEUE, [ProvisionClusterWorkflow]),
     (PROVISION_DELL_SERVER_WORKFLOW_QUEUE, [ProvisionDellServerWorkflow]),
     (PUBLISH_INFRAENV_TO_PXE_SERVER_WORKFLOW_QUEUE, [PublishInfraEnvToPxeServerWorkflow]),
     (RELEASE_SEGMENT_WORKFLOW_QUEUE, [ReleaseSegmentWorkflow]),

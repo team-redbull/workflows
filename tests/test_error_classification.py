@@ -375,3 +375,98 @@ class TestCreateVmClassification:
         assert not self.RETRIED & permanent
         assert {"KvAgentAuthError", "VmIdentityConflictError", "VmNamespaceNotFoundError", "VmRequestRejectedError",
                 "VmDisappearedError"} <= permanent
+
+
+class TestProvisionClusterClassification:
+    """The same invariants for provision-cluster (workflow_domains/cluster_lifecycle/
+    provision_cluster.py), its limb, and the refactored allocate-segment."""
+
+    _PROVISION_CLUSTER = pathlib.Path(__file__).resolve().parent.parent / "workflow_domains/cluster_lifecycle/provision_cluster.py"
+    _ALLOCATE_SEGMENT = pathlib.Path(__file__).resolve().parent.parent / "workflow_domains/segment_lifecycle/allocate_segment.py"
+    # Retried by design: a day1 or sig-repo clone/push that fails (a rejected
+    # push is re-done from a fresh clone; a missing `main` is unreachable, not
+    # missing), the git provider down, a 5xx, a merge request born in between.
+    RETRIED = {"ValuesRepoGitError", "ValuesBranchNotFoundError", "GitProviderError"}
+
+    def test_every_entry_names_a_real_error_class_and_none_is_workflow_raised(self):
+        from workflow_domains.cluster_lifecycle.provision_cluster import _RETRY_POLICY as policy
+
+        listed = set(policy.non_retryable_error_types or [])
+        assert listed, "provision-cluster lists no permanent error"
+        for name in listed:
+            assert isinstance(getattr(exceptions, name, None), type), name
+        assert not _workflow_raised_errors() & listed
+
+    @pytest.mark.parametrize("module", [_PROVISION_CLUSTER, _ALLOCATE_SEGMENT], ids=["provision-cluster", "allocate-segment"])
+    def test_the_list_is_derived_from_classes_and_every_type_is_a_workflow_raised_class(self, module):
+        tree = ast.parse(module.read_text())
+        listed = next(
+            node.value for node in ast.walk(tree)
+            if isinstance(node, ast.keyword) and node.arg == "non_retryable_error_types"
+        )
+        assert not isinstance(listed, ast.List)
+        literals = [
+            keyword for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "ApplicationError"
+            for keyword in node.keywords if keyword.arg == "type" and isinstance(keyword.value, ast.Constant)
+        ]
+        assert literals == []
+        used = {
+            keyword.value.value.id for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "ApplicationError"
+            for keyword in node.keywords
+            if keyword.arg == "type" and isinstance(keyword.value, ast.Attribute) and keyword.value.attr == "__name__"
+        }
+        assert used, f"{module.name} raises no classified ApplicationError"
+        assert used <= _workflow_raised_errors(), sorted(used - _workflow_raised_errors())
+
+    def test_provision_cluster_raises_exactly_its_four_workflow_errors(self):
+        tree = ast.parse(self._PROVISION_CLUSTER.read_text())
+        used = {
+            keyword.value.value.id for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "ApplicationError"
+            for keyword in node.keywords
+            if keyword.arg == "type" and isinstance(keyword.value, ast.Attribute) and keyword.value.attr == "__name__"
+        }
+        assert used == {"AllocateSegmentAlreadyRunningError", "AllocateSegmentFailedError", "MergeRequestClosedError", "Day2EnvMissingError"}
+
+    def test_allocate_segment_raises_exactly_its_three_workflow_errors(self):
+        tree = ast.parse(self._ALLOCATE_SEGMENT.read_text())
+        used = {
+            keyword.value.value.id for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "ApplicationError"
+            for keyword in node.keywords
+            if keyword.arg == "type" and isinstance(keyword.value, ast.Attribute) and keyword.value.attr == "__name__"
+        }
+        assert used == {"UnsupportedSegmentType", "SiteMissingError", "UnknownSite", "AllocationNotConfirmed"}
+
+    def _raised_by_the_limb(self) -> set[str]:
+        root = pathlib.Path(__file__).resolve().parent.parent / "activities"
+        modules = [*sorted((root / "cluster_lifecycle").glob("*.py")), root / "git_repo.py", root / "day1_repo.py"]
+        names = set()
+        for module in modules:
+            for node in ast.walk(ast.parse(module.read_text())):
+                call = node.exc if isinstance(node, ast.Raise) else None
+                if isinstance(call, ast.Call) and isinstance(call.func, ast.Name):
+                    names.add(call.func.id)
+        return {name for name in names if isinstance(getattr(exceptions, name, None), type)}
+
+    def test_every_error_the_limb_raises_is_permanent_or_retried_on_purpose(self):
+        from workflow_domains.cluster_lifecycle.provision_cluster import _PERMANENT_ACTIVITY_ERRORS
+
+        permanent = {error.__name__ for error in _PERMANENT_ACTIVITY_ERRORS}
+        raised = self._raised_by_the_limb()
+        assert raised, "the scan found no shared error raised by the cluster-lifecycle limb"
+        assert raised <= permanent | self.RETRIED, sorted(raised - permanent - self.RETRIED)
+        assert not self.RETRIED & permanent
+        assert {"MceFolderNotFoundError", "AmbiguousMceFolderError", "ClusterAlreadyProvisionedError",
+                "ClusterValuesRejectedError", "ClusterFileConflictError", "GitProviderAuthError",
+                "GitProviderRequestRejectedError"} <= permanent
+
+    def test_allocate_segments_permanent_errors_are_the_segments_managers_answers(self):
+        from workflow_domains.segment_lifecycle.allocate_segment import _PERMANENT_ACTIVITY_ERRORS, _RETRY_POLICY as policy
+
+        assert {error.__name__ for error in _PERMANENT_ACTIVITY_ERRORS} == {
+            "SegmentsManagerAuthError", "SegmentNotFoundError", "SegmentValidationError", "SegmentPoolExhaustedError",
+        }
+        assert not _workflow_raised_errors() & set(policy.non_retryable_error_types or [])

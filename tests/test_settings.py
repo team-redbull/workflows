@@ -1,5 +1,8 @@
-"""Fail-fast parsing in SegmentLifecycleActivitySettings: DHCP_EXCLUSION_OCTET_RANGES,
-the DAY1_REPO_URL scheme and the DHCP scope API keys.
+"""Fail-fast parsing of the limbs' settings: the DHCP scope API keys
+(SegmentLifecycleActivitySettings), and DHCP_EXCLUSION_OCTET_RANGES, the
+DAY1_REPO_URL scheme, the git provider and the day2 sig templates
+(ClusterLifecycleActivitySettings — the day1 and DHCP-policy keys moved there
+from segment-lifecycle with the cluster file, 2026-11-11).
 
 The activity worker's config is fail-fast by design: it is instantiated at
 module import, so a bad value crash-loops the pod at startup rather than
@@ -16,7 +19,7 @@ import pytest
 from pydantic import ValidationError
 
 from shared.models.segment_lifecycle import SegmentType
-from shared.settings import SegmentLifecycleActivitySettings
+from shared.settings import ClusterLifecycleActivitySettings, SegmentLifecycleActivitySettings
 
 
 class TestDay1RepoUrl:
@@ -26,7 +29,7 @@ class TestDay1RepoUrl:
 
     def test_https_is_accepted(self, monkeypatch):
         monkeypatch.setenv("DAY1_REPO_URL", "https://gitlab.internal/redbull/day1.git")
-        assert SegmentLifecycleActivitySettings().day1_repo_url.startswith("https://")
+        assert ClusterLifecycleActivitySettings().day1_repo_url.startswith("https://")
 
     @pytest.mark.parametrize(
         "url",
@@ -39,21 +42,22 @@ class TestDay1RepoUrl:
     def test_any_other_scheme_is_rejected_at_startup(self, monkeypatch, url):
         monkeypatch.setenv("DAY1_REPO_URL", url)
         with pytest.raises(ValidationError, match="must be an https:// URL"):
-            SegmentLifecycleActivitySettings()
+            ClusterLifecycleActivitySettings()
 
 
 class TestDhcpExclusionOctetRanges:
     """The ONE DHCP policy knob, keyed by segment type — a bad edit must
     crash-loop the worker at startup, never mis-render a scope hours later.
     Every per-range rule is enforced for EVERY type in the map, not just HC:
-    a type configured ahead of the code that uses it is validated now."""
+    a type configured ahead of the code that uses it is validated now.
+    (provision-cluster's limb reads it: it writes the block into the cluster file.)"""
 
     def test_parses_the_per_type_configmap_json_object(self, monkeypatch):
         monkeypatch.setenv(
             "DHCP_EXCLUSION_OCTET_RANGES",
             '{"HC": [[1, 10], [100, 110], [241, 254]], "PXE": [[1, 20]]}',
         )
-        s = SegmentLifecycleActivitySettings()
+        s = ClusterLifecycleActivitySettings()
         assert s.dhcp_exclusion_octet_ranges == {
             SegmentType.HC: [(1, 10), (100, 110), (241, 254)],
             SegmentType.PXE: [(1, 20)],
@@ -63,14 +67,14 @@ class TestDhcpExclusionOctetRanges:
         # Same env-not-kwarg rule as the empty topology above.
         monkeypatch.setenv("DHCP_EXCLUSION_OCTET_RANGES", "{}")
         with pytest.raises(ValidationError, match="must not be empty"):
-            SegmentLifecycleActivitySettings()
+            ClusterLifecycleActivitySettings()
 
     def test_a_policy_without_hc_is_rejected(self, monkeypatch):
-        # HC is the only type allocate-segment supports, so a map that omits it
+        # HC is the only type provision-cluster allocates, so a map that omits it
         # configures nothing any run can reach.
         monkeypatch.setenv("DHCP_EXCLUSION_OCTET_RANGES", '{"PXE": [[1, 10]]}')
         with pytest.raises(ValidationError, match="must carry a policy for type 'HC'"):
-            SegmentLifecycleActivitySettings()
+            ClusterLifecycleActivitySettings()
 
     def test_an_unknown_type_key_is_rejected(self, monkeypatch):
         # The map is keyed by SegmentType, so a key that is not one is a typo
@@ -79,32 +83,32 @@ class TestDhcpExclusionOctetRanges:
             "DHCP_EXCLUSION_OCTET_RANGES", '{"HC": [[1, 10]], "STORAGE": [[1, 10]]}'
         )
         with pytest.raises(ValidationError):
-            SegmentLifecycleActivitySettings()
+            ClusterLifecycleActivitySettings()
 
     def test_a_types_empty_range_list_means_no_exclusions(self, monkeypatch):
         # A type that excludes nothing is a real configuration: its block
         # carries a network and no exclusions, and the scope distributes the
         # DHCP API's whole derived .1-.253.
         monkeypatch.setenv("DHCP_EXCLUSION_OCTET_RANGES", '{"HC": [], "PXE": []}')
-        s = SegmentLifecycleActivitySettings()
+        s = ClusterLifecycleActivitySettings()
         assert s.dhcp_exclusion_octet_ranges == {SegmentType.HC: [], SegmentType.PXE: []}
 
     @pytest.mark.parametrize("ranges", ["[[0, 10]]", "[[1, 255]]", "[[241, 300]]"])
     def test_octets_outside_the_slash_24_host_range_are_rejected(self, monkeypatch, ranges):
         monkeypatch.setenv("DHCP_EXCLUSION_OCTET_RANGES", '{"HC": %s}' % ranges)
         with pytest.raises(ValidationError, match=r"1\.\.254"):
-            SegmentLifecycleActivitySettings()
+            ClusterLifecycleActivitySettings()
 
     def test_inverted_pair_is_rejected(self, monkeypatch):
         monkeypatch.setenv("DHCP_EXCLUSION_OCTET_RANGES", '{"HC": [[10, 1]]}')
         with pytest.raises(ValidationError, match="inverted"):
-            SegmentLifecycleActivitySettings()
+            ClusterLifecycleActivitySettings()
 
     @pytest.mark.parametrize("ranges", ["[[241, 254], [1, 10]]", "[[1, 10], [5, 20]]"])
     def test_descending_or_overlapping_pairs_are_rejected(self, monkeypatch, ranges):
         monkeypatch.setenv("DHCP_EXCLUSION_OCTET_RANGES", '{"HC": %s}' % ranges)
         with pytest.raises(ValidationError, match="ascending"):
-            SegmentLifecycleActivitySettings()
+            ClusterLifecycleActivitySettings()
 
     @pytest.mark.parametrize("ranges", ["[[1, 254]]", "[[1, 253]]"])
     def test_excluding_every_distributable_octet_is_rejected(self, monkeypatch, ranges):
@@ -112,14 +116,14 @@ class TestDhcpExclusionOctetRanges:
         # leaves nothing to lease — whether or not .254 is named too.
         monkeypatch.setenv("DHCP_EXCLUSION_OCTET_RANGES", '{"HC": %s}' % ranges)
         with pytest.raises(ValidationError, match="nothing left to distribute"):
-            SegmentLifecycleActivitySettings()
+            ClusterLifecycleActivitySettings()
 
     def test_a_non_hc_types_ranges_are_validated_too(self, monkeypatch):
         monkeypatch.setenv(
             "DHCP_EXCLUSION_OCTET_RANGES", '{"HC": [[1, 10]], "PXE": [[10, 1]]}'
         )
         with pytest.raises(ValidationError, match="inverted"):
-            SegmentLifecycleActivitySettings()
+            ClusterLifecycleActivitySettings()
 
 
 class TestDhcpApiKeys:
@@ -214,3 +218,71 @@ class TestVmLifecycleSettings:
     def test_the_day1_url_must_be_https(self, monkeypatch):
         with pytest.raises(ValidationError, match="https://"):
             self._settings(monkeypatch, DAY1_REPO_URL="git@x:y.git")
+
+
+class TestClusterLifecycleSettings:
+    """provision-cluster's limb: the provider, the day2 templates and the day2 token fallback
+    fail at worker start, never on the first run."""
+
+    def _settings(self, monkeypatch, **env):
+        for key, value in env.items():
+            monkeypatch.setenv(key, value)
+        return ClusterLifecycleActivitySettings()
+
+    @pytest.mark.parametrize("value", ["gitlab", "GitHub", " github "])
+    def test_the_provider_is_one_of_the_two_known_lowercased(self, monkeypatch, value):
+        assert self._settings(monkeypatch, DAY1_GIT_PROVIDER=value).day1_git_provider == value.strip().lower()
+
+    @pytest.mark.parametrize("value", ["bitbucket", "", "git"])
+    def test_an_unknown_provider_is_refused(self, monkeypatch, value):
+        with pytest.raises(ValidationError, match="day1_git_provider"):
+            self._settings(monkeypatch, DAY1_GIT_PROVIDER=value)
+
+    def test_the_provider_is_required(self, monkeypatch):
+        monkeypatch.delenv("DAY1_GIT_PROVIDER")
+        with pytest.raises(ValidationError, match="day1_git_provider"):
+            ClusterLifecycleActivitySettings()
+
+    def test_the_sig_url_template_fills_the_sig_and_the_prefix_is_stripped(self, monkeypatch):
+        s = self._settings(monkeypatch, DAY2_SIG_REPO_URL_TEMPLATE="https://g/sigs/{sig}.git/", DAY2_SIG_PATH_TEMPLATE="/x/{sig}/")
+        assert s.day2_sig_repo_url("redbull") == "https://g/sigs/redbull.git"
+        assert s.day2_sig_path_prefix("redbull") == "x/redbull"
+
+    def test_the_sig_may_be_in_the_path_template_only(self, monkeypatch):
+        s = self._settings(monkeypatch, DAY2_SIG_REPO_URL_TEMPLATE="https://github.com/t/day2.git", DAY2_SIG_PATH_TEMPLATE="sigs/{sig}")
+        assert (s.day2_sig_repo_url("a"), s.day2_sig_path_prefix("a")) == ("https://github.com/t/day2.git", "sigs/a")
+
+    def test_no_sig_placeholder_anywhere_is_refused(self, monkeypatch):
+        with pytest.raises(ValidationError, match="names {sig}"):
+            self._settings(monkeypatch, DAY2_SIG_REPO_URL_TEMPLATE="https://g/day2.git", DAY2_SIG_PATH_TEMPLATE="")
+
+    @pytest.mark.parametrize("template", ["https://g/{sgi}.git", "https://g/{}.git", "https://g/{sig}/{env}.git", "https://g/{sig.name}.git"])
+    def test_a_placeholder_that_is_not_sig_is_refused(self, monkeypatch, template):
+        with pytest.raises(ValidationError):
+            self._settings(monkeypatch, DAY2_SIG_REPO_URL_TEMPLATE=template)
+
+    @pytest.mark.parametrize("template", ["http://g/{sig}.git", "git@g:{sig}.git"])
+    def test_the_sig_url_must_be_https(self, monkeypatch, template):
+        with pytest.raises(ValidationError, match="https://"):
+            self._settings(monkeypatch, DAY2_SIG_REPO_URL_TEMPLATE=template)
+
+    @pytest.mark.parametrize("prefix", ["../{sig}", "sigs/../{sig}", "{sig}/.."])
+    def test_a_path_template_escaping_the_repo_is_refused(self, monkeypatch, prefix):
+        with pytest.raises(ValidationError, match="inside the repo"):
+            self._settings(monkeypatch, DAY2_SIG_REPO_URL_TEMPLATE="https://g/day2.git", DAY2_SIG_PATH_TEMPLATE=prefix)
+
+    @pytest.mark.parametrize("prefix", ["/sigs/{sig}", "sigs/{sig}/", " /sigs/{sig}/ "])
+    def test_a_path_templates_slashes_are_normalised(self, monkeypatch, prefix):
+        s = self._settings(monkeypatch, DAY2_SIG_REPO_URL_TEMPLATE="https://g/day2.git", DAY2_SIG_PATH_TEMPLATE=prefix)
+        assert s.day2_sig_path_template == "sigs/{sig}" and s.day2_sig_path_prefix("a") == "sigs/a"
+
+    def test_the_day2_token_falls_back_to_the_day1_token(self, monkeypatch):
+        monkeypatch.delenv("DAY2_GIT_TOKEN", raising=False)
+        assert self._settings(monkeypatch).day2_token == "test-git-token"
+        assert self._settings(monkeypatch, DAY2_GIT_TOKEN="other").day2_token == "other"
+
+    @pytest.mark.parametrize("key", ["DAY1_REPO_URL", "DAY1_GIT_TOKEN", "DHCP_EXCLUSION_OCTET_RANGES", "DAY2_SIG_REPO_URL_TEMPLATE"])
+    def test_each_required_key_is_required(self, monkeypatch, key):
+        monkeypatch.delenv(key)
+        with pytest.raises(ValidationError, match=key.lower()):
+            ClusterLifecycleActivitySettings()

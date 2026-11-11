@@ -1,0 +1,515 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>provision-cluster — Redbull Workflows</title>
+<meta name="description" content="The provision-cluster workflow: a hosted cluster from the YAML a person wrote — its segment, its day1 file on a branch, the merge request, the wait for a person to merge it, and its registration in the day2 sig repos.">
+<link rel="icon" href="/assets/favicon.svg?v=__DOC_VERSION__" type="image/svg+xml">
+<link rel="stylesheet" href="/assets/site.css?v=__DOC_VERSION__">
+</head>
+<body data-page="/cluster-lifecycle/provision-cluster.html">
+
+<a class="skip-link" href="#main">Skip to content</a>
+
+<!-- Topbar: identical on every page. Brand + deployed version upper-left; the
+     "Workflows" menu is built from the catalogue in assets/nav.js. -->
+<header class="topbar">
+  <a class="brand" href="/">
+    <img class="brand-mark" src="/assets/redbull-logo.png?v=__DOC_VERSION__" alt="" aria-hidden="true"
+         width="480" height="179">
+    <span class="brand-name">Redbull Workflows</span>
+    <span class="brand-ver" title="deployed image tag of this documentation site">__DOC_VERSION__</span>
+  </a>
+  <nav class="topnav" aria-label="Site">
+    <a class="topnav-link" href="/">Orchestrator guide</a>
+    <div class="wfmenu">
+      <button class="wfmenu-btn" id="wfmenu-btn" type="button"
+              aria-expanded="false" aria-haspopup="true" aria-controls="wfmenu-panel">
+        Workflows <span class="caret" aria-hidden="true">&#9662;</span>
+      </button>
+      <div class="wfmenu-panel" id="wfmenu-panel" role="menu" aria-label="Workflows by domain" hidden></div>
+    </div>
+    <noscript>
+      <a class="topnav-link" href="/cluster-lifecycle/provision-cluster.html">provision-cluster</a>
+    </noscript>
+  </nav>
+</header>
+
+<main id="main">
+<header class="masthead">
+  <div class="masthead-inner">
+    <div class="eyebrow">Temporal workflow · domain: cluster-lifecycle</div>
+    <h1>provision-cluster<span class="dim"> — what actually happens</span></h1>
+    <p class="lede">
+      You send the <b>hosted-cluster YAML</b> you would have committed to day1 — owner, mastertag, the nodepools and
+      their config names — plus the cluster's <b>name</b> and the <b>MCE folder</b> it goes in. The run reserves a
+      VLAN segment for it, pushes the file with the allocation block to its own day1 branch, opens the merge request,
+      <em>waits for a person to merge it</em> (no deadline), and then registers the cluster in the day2 sig repos.
+      The orchestrator is the entry point for a new cluster; the merge, the Application sync and the MachineConfigs
+      stay where they are today.
+    </p>
+    <div class="facts">
+      <div class="fact"><span class="k">Trigger</span><span class="v">POST /workflows/cluster-lifecycle/provision-cluster?cluster=…&amp;mce=…</span></div>
+      <div class="fact"><span class="k">Workflow id</span><span class="v">provision-cluster-ocp4-&lt;clusterName&gt;</span></div>
+      <div class="fact"><span class="k">Workflow queue</span><span class="v">provision-cluster-workflow</span></div>
+      <div class="fact"><span class="k">Activity queue</span><span class="v">cluster-lifecycle-activity (+ segment-lifecycle-activity through the child)</span></div>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <!-- ======================= THE FLOW ======================= -->
+  <section id="flow">
+    <div class="sec-head">
+      <div class="eyebrow">The run, step by step</div>
+      <h2>From “here is the cluster file” to “merged, and known to day2”</h2>
+      <p class="lede">Six phases. Each card carries a <code>phase</code> — read live off a running workflow through a
+      Temporal <b>query</b>, which is how <code>GET /workflows/runs/{workflow_id}</code> can tell you where inside the
+      run a cluster currently is. The colour of a call is the system it talks to.</p>
+    </div>
+
+    <div class="flow">
+
+      <div class="step">
+        <div class="marker">1</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>inspect_cluster_target</h3>
+            <span class="phase">phase <b>inspecting-target</b></span>
+          </div>
+          <p>A fresh clone of day1 <code>main</code>. The MCE folder is found <b>by name</b> among
+          <code>sites/*/mces/</code> — iterated, never globbed with your input, because real folders
+          (<code>ocp4-mce-site2</code>, <code>ocp4-mce-site4-prep</code>) follow no convention a parser could
+          trust. Exactly one site must hold it. The cluster must have <em>no file there yet</em>: this workflow
+          creates cluster files and never rewrites one. Then your text is judged the way the chart would render it,
+          merged with the value layers (<code>configValues.yaml</code> → site → MCE → your file):
+          <code>mastertag</code>, a non-empty <code>nodepool</code>, <code>owner.{merkaz,anaf,mador}</code> required;
+          <code>vlanId</code>, <code>dhcp_values</code>, <code>mcConfigMap</code>, <code>AutomateAllocation</code>
+          forbidden (the run and the day1 chain write those); a <code>clusterName</code> only if it equals the one the
+          file name derives; config names must be DNS-1123 labels; no key written twice. A nodepool without
+          <code>configs</code> is fine (a KubeVirt pool has none). <b>Every reason lands in one failure</b>.</p>
+          <div class="calls">
+            <div class="call nxt"><span class="verb">GIT</span><span class="path">clone --depth 1 --branch main <em>· fresh temp clone, always discarded</em></span></div>
+          </div>
+          <p class="note">Also derived here: the config names (for the merge request's description), the day2 sigs the
+          value layers list under <code>day2.copy_to_sigs</code>, and their environment folder (<code>day2.env</code>,
+          else the first field of the cluster name, cross-checked against the MCE folder's when it is
+          <code>ocp4-&lt;env&gt;-mce-…</code>). Nothing is written.</p>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="marker">2</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>allocate-segment — an awaited child</h3>
+            <span class="phase">phase <b>allocating-segment</b></span>
+          </div>
+          <p>The <a href="/segment-lifecycle/allocate-segment.html">allocate-segment</a> workflow runs as a
+          <b>child on its own id</b>, <code>allocate-segment-HC-ocp4-&lt;clusterName&gt;</code>, on its own queue, with
+          the SITE the folder is in: the Segments Manager reserves any Available /24 at that site as HC and the child
+          reads it back to verify. The parent waits for it. A child <em>already running</em> for the cluster (someone
+          started it by hand) is <code>AllocateSegmentAlreadyRunningError</code>; a child that fails is
+          <code>AllocateSegmentFailedError</code> carrying the child's own type and message (<code>UnknownSite</code>,
+          <code>SegmentPoolExhaustedError</code>, …). The child is never cut off by the parent closing — it verifies
+          by read-back, and must finish.</p>
+          <p class="note">The segment-lifecycle limb holds the Segments Manager token; this limb never does. That is why
+          the allocation is a child and not an activity here.</p>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="marker">3</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>publish_cluster_file</h3>
+            <span class="phase">phase <b>publishing-cluster-file</b></span>
+          </div>
+          <p>Your text, <b>byte for byte</b>, one blank line, and the allocation block (below) — written as
+          <code>sites/&lt;site&gt;/mces/&lt;mce&gt;/hostedClusters/ocp4-&lt;clusterName&gt;.yaml</code> and pushed to
+          <code>provision-cluster/ocp4-&lt;clusterName&gt;</code>, a branch the push itself creates from
+          <code>main</code>. The commit is <code>feat: provision hosted cluster … [provision-cluster-workflow]</code>
+          with <b>no <code>[skip ci]</code></b>: the day1 CI chain must run on the branch. It skips allocation (the
+          file carries <code>vlanId</code>), renders the MachineConfigs from the config names and pushes its own
+          <code>CI: Update mcConfigMap from mc-files [skip ci]</code> commit on top. The workflow never writes
+          <code>mcConfigMap</code>.</p>
+          <div class="calls">
+            <div class="call nxt"><span class="verb">GIT</span><span class="path">ls-remote refs/heads/provision-cluster/&lt;stem&gt; → clone main → write → commit → push HEAD:refs/heads/&lt;branch&gt;</span></div>
+          </div>
+          <p class="note"><b>Safe to run twice.</b> A branch already there is a re-run: its file is compared
+          <em>semantically</em> — its YAML mapping, with the <code>mcConfigMap</code> key the chain appended set
+          aside, must equal this run's text — then nothing is pushed (<code>file_changed: false</code>). A different
+          spec, vlan or network, a branch without the file, or one that does not parse is
+          <code>ClusterFileConflictError</code>: a human decides, the workflow never overwrites.</p>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="marker">4</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>ensure_merge_request</h3>
+            <span class="phase">phase <b>opening-merge-request</b></span>
+          </div>
+          <p>The open merge request from the branch to <code>main</code>: found by source branch when one is open,
+          else created — on GitLab (production) with <code>remove_source_branch</code>, on GitHub (dev) a pull
+          request, delete-on-merge being the repository's setting. Which API is <code>DAY1_GIT_PROVIDER</code>.
+          The description tells the reviewer what was written (site, folder, mastertag, config names, segment, vlan,
+          day2 sigs) and <b>to merge only once the branch pipeline is green and its <code>mcConfigMap</code> commit is
+          on the branch</b>.</p>
+          <div class="calls">
+            <div class="call sm"><span class="verb">GET</span><span class="path">…/merge_requests?source_branch=&amp;state=opened <em>· GitLab</em> &nbsp;|&nbsp; …/pulls?head=&amp;state=open <em>· GitHub</em></span></div>
+            <div class="call sm"><span class="verb">POST</span><span class="path">…/merge_requests <em>· remove_source_branch</em> &nbsp;|&nbsp; …/pulls</span></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="step wait">
+        <div class="marker">⏸</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>get_merge_request_state, every 5 minutes</h3>
+            <span class="phase">phase <b>awaiting-merge</b></span>
+          </div>
+          <p>A <b>human wait</b>, so it has <b>no deadline</b>: the merge request is read every five minutes on a
+          durable timer, for as long as the review takes. Every 48 polls (four hours) — or sooner when Temporal
+          suggests it — the run <em>continues as new</em>, carrying everything it did so far, so its history stays
+          short however long the wait; a continued run picks up at the wait and calls nothing twice. The status
+          endpoint shows the merge request's URL, its state, since when and how many polls.</p>
+          <p class="note"><code>merged</code> → on to day2. <code>closed</code> without merging →
+          <code>MergeRequestClosedError</code>: a person decided against the cluster; the branch and the
+          allocation stand (release-segment gives the segment back if the cluster is abandoned). A provider outage
+          is retried, never a failure.</p>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="marker">5</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>register_cluster_in_day2_sig — one per sig, in parallel</h3>
+            <span class="phase">phase <b>registering-day2</b></span>
+          </div>
+          <p>Only <b>after the merge</b>. For every sig the value layers listed under <code>day2.copy_to_sigs</code>,
+          the folder <code>sites/&lt;site&gt;/&lt;env&gt;/mces/&lt;mce&gt;/ocp4-&lt;clusterName&gt;/</code> with a
+          <code>.gitkeep</code> is pushed to that sig repo's <em>default branch</em> (read from the remote). That folder
+          is how day2 learns a cluster exists. Already there is success. After the merge because day2 renders the
+          cluster's <code>mastertag</code> from day1 <code>main</code>: a folder created before the merge breaks the
+          sig's whole render. No sigs listed → nothing to do, <code>day2: []</code>.</p>
+          <div class="calls">
+            <div class="call nxt"><span class="verb">GIT</span><span class="path">ls-remote --symref HEAD → clone &lt;default&gt; → mkdir + .gitkeep → commit → push <em>· per sig</em></span></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="step done">
+        <div class="marker">✓</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>Done</h3>
+            <span class="phase">phase <b>completed</b></span>
+          </div>
+          <p>The result carries the file's path and branch, the commit (or <code>null</code> on a re-run), the
+          segment, vlan, EPG and network, the merge request's URL, whether it was created or found, the merge commit,
+          and each day2 registration. What it does <em>not</em> do: sync the Application — in production a person
+          does, by hand, after the merge.</p>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ======================= WHAT GETS WRITTEN ======================= -->
+  <section id="file">
+    <div class="sec-head">
+      <div class="eyebrow">What gets written</div>
+      <h2>The file on the branch, before and after the day1 chain</h2>
+      <p class="lede">Your text is never re-serialised: comments, quotes and layout reach day1 as you typed them. The
+      run appends the allocation block; the chain appends the MachineConfigs in its own commit.</p>
+    </div>
+
+    <div class="endpoint">
+      <div class="endpoint-head">
+        <span class="method">YAML</span>
+        <span class="path">sites/&lt;site&gt;/mces/&lt;mce&gt;/hostedClusters/ocp4-&lt;clusterName&gt;.yaml</span>
+      </div>
+      <div class="endpoint-body">
+        <pre>owner:
+  merkaz: "unit-a"                  <span class="c">&lt;- your text, byte for byte</span>
+  anaf: "unit-b"
+  mador: "unit-c"
+
+mastertag: 4.22.8
+
+nodepool:
+- infraEnvName: dell-r660-site4-128c-1024gb-5tb
+  replicas: 2
+  labels:
+    allowDeletion: false
+  configs:
+  - name: nm-conf
+  - name: worker-kubeletconfig-reserved
+  - name: nic-ring-buffer
+  - name: workers-chrony-configuration
+                                    <span class="c">&lt;- one blank line, always</span>
+# === Added By Provision-Cluster Workflow ===
+vlanId: 23                          <span class="c">// what the chain renders nm-conf from</span>
+
+dhcp_values:
+  network: "10.20.90.0"             <span class="c">// mask stripped; no startRange/endRange — the DHCP API derives .1-.253</span>
+  exclusions:                       <span class="c">// the type's DHCP_EXCLUSION_OCTET_RANGES, ascending</span>
+    - startAddress: "10.20.90.1"
+      endAddress: "10.20.90.10"
+    - startAddress: "10.20.90.241"
+      endAddress: "10.20.90.254"
+
+# === Added by CI ===                <span class="c">&lt;- the day1 chain's own commit, [skip ci]</span>
+mcConfigMap:
+- name: nm-conf
+  config: |
+    …</pre>
+        <p class="note" style="margin-top:12px">The block assumes a /24 — asserted, not silent: a non-/24 segment fails
+        the run with <code>UnsupportedSegmentPrefix</code>. A type whose policy excludes nothing drops the
+        <code>exclusions</code> key. In dev, where the day1 copy has no MachineConfig chain, the file stays without
+        the <code>mcConfigMap</code> section.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================= API ======================= -->
+  <section id="api">
+    <div class="sec-head">
+      <div class="eyebrow">HTTP surface</div>
+      <h2>How you start it and how you watch it</h2>
+      <p class="lede">Served by <code>workflows-orchestrator-api</code> (Swagger at <code>/docs</code>). The body is
+      the cluster file itself — Swagger's “Try it out” opens a text area holding the example below for you to edit.
+      Starting is always async: the run outlives the request by days.</p>
+    </div>
+
+    <div class="api">
+
+      <div class="endpoint">
+        <div class="endpoint-head">
+          <span class="method">POST</span>
+          <span class="path">/workflows/cluster-lifecycle/provision-cluster?cluster=&lt;name&gt;&amp;mce=&lt;folder&gt;</span>
+          <span class="ret">202 · 409 if already running · 422 if the body or a name is unusable</span>
+        </div>
+        <div class="endpoint-body">
+          <p><code>cluster</code>: the hosted cluster's name, with or without <code>ocp4-</code> — a lowercase
+          DNS-1123 label of at most 24 characters (so <code>hcp-&lt;name&gt;-openshift-&lt;name&gt;</code> fits a
+          label). <code>mce</code>: the MCE <em>folder</em> name under <code>sites/&lt;site&gt;/mces/</code>,
+          verbatim. The body, <code>Content-Type: application/yaml</code>, must be non-empty, at most 256 KiB,
+          UTF-8 and ONE YAML mapping; everything else about it is judged in the run, where a rejected file is a
+          FAILED run naming every reason — never a 4xx here.</p>
+          <pre><span class="c">// request</span>
+POST /workflows/cluster-lifecycle/provision-cluster?cluster=prep-e2e-site2-a&amp;mce=ocp4-prep-mce-site2-a
+Content-Type: application/yaml
+
+owner:
+  merkaz: "unit-a"
+  anaf: "unit-b"
+  mador: "unit-c"
+
+mastertag: 4.22.8
+
+nodepool:
+- infraEnvName: dell-r660-site4-128c-1024gb-5tb
+  replicas: 2
+  labels:
+    allowDeletion: false
+  configs:
+  - name: nm-conf
+  - name: worker-kubeletconfig-reserved
+  - name: nic-ring-buffer
+  - name: workers-chrony-configuration
+
+<span class="c">// 202 response</span>
+{ "workflow_id": "provision-cluster-ocp4-prep-e2e-site2-a", "run_id": "…" }
+
+<span class="c">// the same from a shell</span>
+curl -X POST -H 'Content-Type: application/yaml' --data-binary @cluster.yaml \
+  'https://&lt;api&gt;/workflows/cluster-lifecycle/provision-cluster?cluster=prep-e2e-site2-a&amp;mce=ocp4-prep-mce-site2-a'</pre>
+          <p class="note"><b>The id is the file stem.</b> One cluster, one run: a second request while the run waits
+          for its merge is a <b>409</b> naming the id; a request for a cluster already on <code>main</code> starts a
+          run that fails <code>ClusterAlreadyProvisionedError</code> at once. There is no bulk route.</p>
+        </div>
+      </div>
+
+      <div class="endpoint">
+        <div class="endpoint-head">
+          <span class="method">GET</span>
+          <span class="path">/workflows/runs/{workflow_id}</span>
+          <span class="ret">200 · 404 if unknown id</span>
+        </div>
+        <div class="endpoint-body">
+          <p>The same domain-agnostic status endpoint every workflow uses. While RUNNING it returns the live
+          <code>progress</code>; when COMPLETED, the result.</p>
+          <pre><span class="c">// RUNNING, during the wait</span>
+{ "workflow_id": "provision-cluster-ocp4-prep-e2e-site2-a",
+  "workflow_type": "ProvisionClusterWorkflow", "status": "RUNNING",
+  "progress": { "phase": "awaiting-merge",
+                "allocate_segment_workflow_id": "allocate-segment-HC-ocp4-prep-e2e-site2-a",
+                "branch": "provision-cluster/ocp4-prep-e2e-site2-a",
+                "merge_request_url": "https://gitlab…/merge_requests/42",
+                "merge_request_state": "open", "waited_since": "2026-11-11T09:00:00Z", "polls": 7 } }
+
+<span class="c">// COMPLETED</span>
+{ …, "status": "COMPLETED",
+  "result": { "cluster": "ocp4-prep-e2e-site2-a", "cluster_name": "prep-e2e-site2-a",
+              "site": "site2", "mce": "ocp4-prep-mce-site2-a", "mastertag": "4.22.8",
+              "config_names": ["nm-conf", "worker-kubeletconfig-reserved", "nic-ring-buffer", "workers-chrony-configuration"],
+              "vlan_id": 23, "segment": "10.20.90.0/24", "epg_name": "EPG_HC_23", "network": "10.20.90.0",
+              "branch": "provision-cluster/ocp4-prep-e2e-site2-a",
+              "cluster_file": "sites/site2/mces/ocp4-prep-mce-site2-a/hostedClusters/ocp4-prep-e2e-site2-a.yaml",
+              "commit_sha": "8f2…", "file_changed": true,
+              "merge_request_url": "https://gitlab…/merge_requests/42", "merge_request_created": true,
+              "merged_sha": "c1a…",
+              "day2": [ { "sig": "redbull", "path": "sites/site2/prep/mces/ocp4-prep-mce-site2-a/ocp4-prep-e2e-site2-a",
+                          "created": true, "commit_sha": "d4e…" } ] } }</pre>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ======================= FAILURE ======================= -->
+  <section id="failure">
+    <div class="sec-head">
+      <div class="eyebrow">When things go wrong</div>
+      <h2>Outages are out-waited. Real errors stop the run.</h2>
+      <p class="lede">Same rule as every workflow here: <b>retries are unbounded</b> (1 s → doubling → capped at
+      1 min), so a day1, git-provider or sig-repo outage never fails a run. Retrying stops <em>only</em> for errors
+      classified as permanent. No activity here has a schedule-to-start timeout: a run spans days, and a limb pod
+      away for five minutes must not fail it.</p>
+    </div>
+
+    <div class="grid-2">
+      <div class="panel alarm">
+        <h3>Classified as permanent — these fail the run</h3>
+        <ul>
+          <li><code>MceFolderNotFoundError</code> · <code>AmbiguousMceFolderError</code> — no such folder under any site, or under two</li>
+          <li><code>ClusterAlreadyProvisionedError</code> — the cluster's file is already on <code>main</code></li>
+          <li><code>ClusterValuesRejectedError</code> — the file would not render; the message lists every reason</li>
+          <li><code>AllocateSegmentAlreadyRunningError</code> · <code>AllocateSegmentFailedError</code> — the child (workflow-raised; the second carries the child's own type)</li>
+          <li><code>ClusterFileConflictError</code> — the branch carries a different file</li>
+          <li><code>GitProviderAuthError</code> — the token, or its scope (GitLab needs <code>api</code>)</li>
+          <li><code>GitProviderRequestRejectedError</code> — no such project for this token, no <code>main</code>, a merge request gone</li>
+          <li><code>MergeRequestClosedError</code> — closed without merging (workflow-raised)</li>
+          <li><code>Day2EnvMissingError</code> — sigs listed but no environment folder (a limb older than the field)</li>
+          <li><code>UnsupportedSegmentPrefix</code> / <code>InvalidSegmentCidr</code> — the pool handed back a non-/24</li>
+        </ul>
+      </div>
+      <div class="panel">
+        <h3>Transient by classification</h3>
+        <p style="font-size:var(--fs-14);color:var(--ink-2)"><code>ValuesRepoGitError</code> (an unreachable day1 or
+        sig repo, a rejected non-fast-forward push — the retry re-clones), <code>ValuesBranchNotFoundError</code>
+        (a repo without <code>main</code> yet) and <code>GitProviderError</code> (the provider down, a 5xx, a merge
+        request born between the find and the create — the retry finds it). They retry forever; an unclassified
+        permanent error shows as a run stuck <b>RUNNING</b> in the Temporal UI — the fix is to classify it, not to add
+        a deadline.</p>
+        <h3 style="margin-top:6px">Nothing to clean up</h3>
+        <p style="font-size:var(--fs-14);color:var(--ink-2)">On failure or cancellation there is deliberately no
+        compensating cleanup: the allocation is idempotent per (cluster, site, type), the branch and the merge
+        request converge on a re-run, day2 folders are “already there = success”. Cancelling the merge wait is an
+        operator's action in the Temporal UI.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================= REFERENCE ======================= -->
+  <section id="reference">
+    <div class="sec-head">
+      <div class="eyebrow">Reference</div>
+      <h2>Inputs, phases, and the knobs an operator can turn</h2>
+    </div>
+
+    <h3 style="margin-bottom:10px">The request</h3>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>Where</th><th>Name</th><th>Rules</th><th>What it's for</th></tr></thead>
+        <tbody>
+          <tr><td class="k">query</td><td class="k">cluster</td><td class="muted">required; DNS-1123 label ≤ 24 chars, with or without <code>ocp4-</code></td><td class="muted">The cluster: the day1 file <code>ocp4-&lt;name&gt;.yaml</code>, the Argo CD Application, the Segments Manager's cluster, the run's id.</td></tr>
+          <tr><td class="k">query</td><td class="k">mce</td><td class="muted">required; a folder name (lowercase, digits, dashes)</td><td class="muted">The MCE folder under <code>sites/&lt;site&gt;/mces/</code>, verbatim; the site is read from where it is.</td></tr>
+          <tr><td class="k">body</td><td class="k">the cluster file</td><td class="muted">required; <code>application/yaml</code>; one mapping, ≤ 256 KiB</td><td class="muted">Sent verbatim. Must carry <code>mastertag</code>, <code>nodepool</code>, <code>owner.{merkaz,anaf,mador}</code>; must not carry <code>vlanId</code>, <code>dhcp_values</code>, <code>mcConfigMap</code>, <code>AutomateAllocation</code>.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 style="margin:28px 0 10px">Phases you'll see on the status endpoint</h3>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>phase</th><th>Meaning</th><th>Normal duration</th></tr></thead>
+        <tbody>
+          <tr><td class="k">pending</td><td class="muted">Run accepted</td><td class="muted">instant</td></tr>
+          <tr><td class="k">inspecting-target</td><td class="muted">Cloning day1 main, finding the folder, judging the file</td><td class="muted">seconds</td></tr>
+          <tr><td class="k">allocating-segment</td><td class="muted">The allocate-segment child: reserve + verify</td><td class="muted">seconds</td></tr>
+          <tr><td class="k">publishing-cluster-file</td><td class="muted">Clone main → write → push the branch (or compare on a re-run)</td><td class="muted">seconds</td></tr>
+          <tr><td class="k">opening-merge-request</td><td class="muted">Find or create the merge request</td><td class="muted">seconds</td></tr>
+          <tr><td class="k">awaiting-merge</td><td class="muted">A person reviews and merges; read every 5 min; continued as new every 48 polls</td><td class="muted">hours to days</td></tr>
+          <tr><td class="k">registering-day2</td><td class="muted">The folder in each sig repo</td><td class="muted">seconds</td></tr>
+          <tr><td class="k">completed</td><td class="muted">Done; <code>result</code> is available</td><td class="muted">—</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 style="margin:28px 0 10px">Operator knobs — change these without a rebuild</h3>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>Key</th><th>Lives in</th><th>Effect</th></tr></thead>
+        <tbody>
+          <tr><td class="k">DAY1_REPO_URL</td><td class="muted">cluster-lifecycle-config</td><td class="muted">The day1 values repo: read at <code>main</code>, pushed on <code>provision-cluster/&lt;cluster&gt;</code>. Its host is also where the merge request is opened.</td></tr>
+          <tr><td class="k">DAY1_GIT_PROVIDER</td><td class="muted">cluster-lifecycle-config</td><td class="muted"><code>gitlab</code> (a merge request with <code>remove_source_branch</code>) or <code>github</code> (a pull request). No default.</td></tr>
+          <tr><td class="k">DAY1_GIT_TOKEN</td><td class="muted">Secret redbull-git-token</td><td class="muted">The push credential AND the provider's API token (GitLab: <code>api</code> + <code>write_repository</code>; GitHub: <code>repo</code>). Scrubbed from every error.</td></tr>
+          <tr><td class="k">DHCP_EXCLUSION_OCTET_RANGES</td><td class="muted">cluster-lifecycle-config</td><td class="muted">The ONE DHCP policy knob, per segment type, written into every cluster file's block (HC required). Validated at worker startup.</td></tr>
+          <tr><td class="k">DAY2_SIG_REPO_URL_TEMPLATE · DAY2_SIG_PATH_TEMPLATE</td><td class="muted">cluster-lifecycle-config</td><td class="muted">The sig repos: the URL with <code>{sig}</code> (production: one project per sig, tree at the root) or one repo with the tree under the path template (dev: <code>sigs/{sig}</code>).</td></tr>
+          <tr><td class="k">DAY2_GIT_TOKEN</td><td class="muted">optional Secret</td><td class="muted">The sig repos' push token; empty = the day1 token.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ======================= RE-RUNNING ======================= -->
+  <section id="rerun">
+    <div class="sec-head">
+      <div class="eyebrow">Operating it</div>
+      <h2>What happens if you run the same cluster again</h2>
+      <p class="lede">Idempotency is a rule of the orchestrator — see
+      <a href="/#principles">the three rules that surprise people</a>.</p>
+    </div>
+
+    <div class="grid-2">
+      <div class="panel ok">
+        <h3>Re-run after a failure, or after completion — it converges</h3>
+        <p>The child returns the <em>same</em> allocation (idempotent per cluster/site/type), the branch's file is
+        recognised as this run's — the chain's <code>mcConfigMap</code> and its blank-line re-spacing set aside — and
+        nothing is pushed (<code>file_changed: false</code>), the open merge request is found
+        (<code>merge_request_created: false</code>), folders already in the sig repos are success. A cluster whose
+        file is already on <code>main</code> fails <code>ClusterAlreadyProvisionedError</code>: provisioning is
+        done, and changing a cluster is an edit on day1, not a run here.</p>
+      </div>
+      <div class="panel warn">
+        <h3>The two things a re-run will not do</h3>
+        <p>Overwrite a branch that carries a <em>different</em> file — every run refuses with
+        <code>ClusterFileConflictError</code> until a human reconciles or deletes the branch. And re-open a merge
+        request that a person closed: the run fails <code>MergeRequestClosedError</code>, and the next run on the
+        cluster opens a new one for the same branch — if that is what is wanted; otherwise release the segment
+        (<a href="/segment-lifecycle/release-segment.html">release-segment</a>) and delete the branch.</p>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <span>workflow_domains/cluster_lifecycle/provision_cluster.py</span>
+    <span>activities/cluster_lifecycle/activities.py</span>
+    <span>activities/cluster_lifecycle/cluster_values.py · day1_writer.py · git_provider.py · day2_sigs.py</span>
+    <span>shared/models/cluster_lifecycle.py</span>
+  </footer>
+
+</div>
+</main>
+
+<script src="/assets/nav.js?v=__DOC_VERSION__" defer></script>
+</body>
+</html>

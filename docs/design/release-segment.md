@@ -44,8 +44,8 @@ allocate path forecloses it:
   CIDR alone, idempotent for an already-Available segment);
 - the block allocate-segment appends to a cluster's values file is designed to
   be strippable — it starts at a fixed marker line and runs to end of file,
-  and `values_repo.split_marker_block` /
-  `values_repo.render_allocation_block` are the shared parse/render pair a
+  and `cluster_values.split_marker_block` /
+  `cluster_values.render_allocation_block` (activities/cluster_lifecycle/) are the shared parse/render pair a
   `remove_allocation_from_cluster_values` reuses unchanged.
 
 ## The flow, when it is built
@@ -61,7 +61,7 @@ run(ReleaseSegmentRunArgs{input: {cluster, type=HC}})
                                   (release clears the type allocation stamped on)
   4. clean the values file      strip the marker block (split_marker_block),
                                 commit, push — same clone/push plumbing as
-                                append_allocation_to_cluster_values
+                                publish_cluster_file (provision-cluster)
 ```
 
 Verification sits before the git write, mirroring allocate-segment's

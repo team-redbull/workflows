@@ -2,7 +2,9 @@
 
 Same harness shape as tests/test_workflow.py: two workers — one per queue —
 exactly like the real brain/limb split, with the time-skipping environment
-collapsing the retry backoffs to milliseconds.
+collapsing the retry backoffs to milliseconds. Since 2026-11-11 the run
+allocates and verifies only: the site is its input (provision-cluster passes
+the day1 folder's), and nothing touches git.
 """
 
 from __future__ import annotations
@@ -19,55 +21,34 @@ from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
 from shared.consts import ALLOCATE_SEGMENT_WORKFLOW_QUEUE, SEGMENT_LIFECYCLE_ACTIVITY_QUEUE
-from shared.exceptions import ClusterFileNotFoundError, ValuesBranchNotFoundError
+from shared.exceptions import SegmentPoolExhaustedError, SegmentsManagerAuthError, SegmentValidationError
 from shared.models.segment_lifecycle import (
     AllocateSegmentInput,
     AllocateSegmentResult,
     AllocateSegmentRunArgs,
-    ClusterFileLocation,
-    ClusterFileLookupRequest,
-    ClusterValuesAppendRequest,
-    DhcpExclusion,
-    DhcpValues,
     SegmentAllocation,
     SegmentAllocationRequest,
     SegmentEntry,
     SegmentType,
-    ValuesCommitRef,
 )
-from workflow_domains.segment_lifecycle.allocate_segment import (
-    AllocateSegmentWorkflow,
-)
+from workflow_domains.segment_lifecycle.allocate_segment import AllocateSegmentWorkflow
 
 CLUSTER = "ocp4-e2e-alloc-site1-a"
 SITE = "site1"
-RELATIVE_PATH = f"sites/{SITE}/mces/mce-a/hostedClusters/{CLUSTER}.yaml"
 SEGMENT = "10.20.90.0/24"
 VLAN_ID = 23
-# The day1 pipeline's branch — where the run records the allocation.
-VALUES_BRANCH = f"feature/{CLUSTER}"
 
 # type defaults to HC
-HC_INPUT = AllocateSegmentInput(cluster=CLUSTER, values_branch=VALUES_BRANCH)
-
-DHCP_VALUES = DhcpValues(
-    network="10.20.90.0",
-    exclusions=[
-        DhcpExclusion(start_address="10.20.90.1", end_address="10.20.90.10"),
-        DhcpExclusion(start_address="10.20.90.241", end_address="10.20.90.254"),
-    ],
-)
+HC_INPUT = AllocateSegmentInput(cluster=CLUSTER, site=SITE)
 
 
 def make_mock_activities(
     *,
     valid_sites: tuple[str, ...] = (SITE, "site2"),
-    location: ClusterFileLocation | None = None,
-    locate_error: Exception | None = None,
     allocate_fail_times: int = 0,
+    allocate_error: Exception | None = None,
     entry_overrides: dict | None = None,
     entry_omits_type: bool = False,
-    append_changed: bool = True,
 ):
     """Build the full mock activity set + a call recorder.
 
@@ -77,19 +58,7 @@ def make_mock_activities(
     way a limb built before SegmentEntry.type existed (or history recorded by
     the previous brain) serializes it.
     """
-    calls: dict[str, list] = {
-        name: []
-        for name in (
-            "get_valid_sites",
-            "locate_cluster_file",
-            "allocate_segment",
-            "get_segment",
-            "append_allocation_to_cluster_values",
-        )
-    }
-    resolved_location = location or ClusterFileLocation(
-        site=SITE, relative_path=RELATIVE_PATH
-    )
+    calls: dict[str, list] = {name: [] for name in ("get_valid_sites", "allocate_segment", "get_segment")}
     entry_fields = {
         "segment": SEGMENT,
         "site": SITE,
@@ -107,15 +76,10 @@ def make_mock_activities(
         return list(valid_sites)
 
     @activity.defn
-    async def locate_cluster_file(request: ClusterFileLookupRequest) -> ClusterFileLocation:
-        calls["locate_cluster_file"].append(request)
-        if locate_error is not None:
-            raise locate_error
-        return resolved_location
-
-    @activity.defn
     async def allocate_segment(request: SegmentAllocationRequest) -> SegmentAllocation:
         calls["allocate_segment"].append(request)
+        if allocate_error is not None:
+            raise allocate_error
         if allocate_failures_left[0] > 0:
             allocate_failures_left[0] -= 1
             raise RuntimeError("simulated transient Segments Manager outage")
@@ -129,24 +93,7 @@ def make_mock_activities(
             return {k: v for k, v in entry_fields.items() if k != "type"}
         return SegmentEntry(**entry_fields)
 
-    @activity.defn
-    async def append_allocation_to_cluster_values(
-        request: ClusterValuesAppendRequest,
-    ) -> ValuesCommitRef:
-        calls["append_allocation_to_cluster_values"].append(request)
-        if append_changed:
-            return ValuesCommitRef(
-                commit_sha="a" * 40, changed=True, dhcp_values=DHCP_VALUES
-            )
-        return ValuesCommitRef(commit_sha=None, changed=False, dhcp_values=DHCP_VALUES)
-
-    return calls, [
-        get_valid_sites,
-        locate_cluster_file,
-        allocate_segment,
-        get_segment,
-        append_allocation_to_cluster_values,
-    ]
+    return calls, [get_valid_sites, allocate_segment, get_segment]
 
 
 class _Harness:
@@ -200,79 +147,51 @@ async def _execute(client: Client, args: AllocateSegmentRunArgs):
     )
 
 
-async def test_happy_path_allocates_verifies_and_pushes_to_the_branch():
+async def test_happy_path_validates_the_site_allocates_and_verifies():
     calls, mocks = make_mock_activities()
     async with _Harness(mocks) as client:
         result = await _execute(client, AllocateSegmentRunArgs(input=HC_INPUT))
 
-    assert result.cluster == CLUSTER
-    assert result.site == SITE
-    assert result.type == SegmentType.HC
-    assert result.vlan_id == VLAN_ID
-    assert result.segment == SEGMENT
-    assert result.values_branch == VALUES_BRANCH
-    assert result.commit_sha == "a" * 40
-    assert result.values_updated is True
-    # The run ends at the push: the scope appears only after a human merges
-    # the branch (Argo reads main only), so the result makes no claim on it.
-    # The day1 pipeline parses this shape — pin it whole.
-    assert set(AllocateSegmentResult.model_fields) == {
-        "cluster", "site", "type", "vlan_id", "segment", "epg_name",
-        "values_branch", "commit_sha", "values_updated",
-    }
-    # The cluster file was looked up on the run's branch — the only place a
-    # new cluster's file exists.
-    assert calls["locate_cluster_file"] == [
-        ClusterFileLookupRequest(cluster=CLUSTER, values_branch=VALUES_BRANCH)
-    ]
-    # The allocation request carried the DERIVED site, never a caller's claim.
-    assert calls["allocate_segment"] == [
-        SegmentAllocationRequest(cluster=CLUSTER, site=SITE, type=SegmentType.HC)
-    ]
-    # Verification read back the allocated CIDR before any git write.
+    assert result == AllocateSegmentResult(
+        cluster=CLUSTER, site=SITE, type=SegmentType.HC, vlan_id=VLAN_ID, segment=SEGMENT, epg_name="EPG_HC_23"
+    )
+    # Nothing about git in the result any more: provision-cluster records the
+    # allocation in the cluster file it publishes. Pin the shape whole — the
+    # parent reads it.
+    assert set(AllocateSegmentResult.model_fields) == {"cluster", "site", "type", "vlan_id", "segment", "epg_name"}
+    assert calls["get_valid_sites"] == [None]
+    # The allocation request carried the caller's site, verbatim.
+    assert calls["allocate_segment"] == [SegmentAllocationRequest(cluster=CLUSTER, site=SITE, type=SegmentType.HC)]
+    # Verification read back the allocated CIDR.
     assert calls["get_segment"] == [SEGMENT]
-    (append_request,) = calls["append_allocation_to_cluster_values"]
-    assert append_request.relative_path == RELATIVE_PATH
-    assert append_request.vlan_id == VLAN_ID
-    # The type travels with the append: the exclusion policy is per type, and
-    # the activity selects that type's ranges out of the ConfigMap.
-    assert append_request.type == SegmentType.HC
-    # ...and the block is pushed to the same branch it was located on.
-    assert append_request.values_branch == VALUES_BRANCH
 
 
-async def test_missing_values_branch_is_rejected_before_any_activity():
-    """The API requires the branch; the boundary model defaults it to None only
+async def test_missing_site_is_rejected_before_any_activity():
+    """The API requires the site; the boundary model defaults it to None only
     for history. A run that still arrives without one fails at once — there is
-    no configured fallback, which would push to main."""
+    nothing to derive a site from any more."""
     calls, mocks = make_mock_activities()
     async with _Harness(mocks) as client:
         with pytest.raises(WorkflowFailureError) as exc_info:
-            await _execute(
-                client, AllocateSegmentRunArgs(input=AllocateSegmentInput(cluster=CLUSTER))
-            )
+            await _execute(client, AllocateSegmentRunArgs(input=AllocateSegmentInput(cluster=CLUSTER)))
 
     cause = _workflow_cause(exc_info)
     assert isinstance(cause, ApplicationError)
-    assert cause.type == "ValuesBranchMissing"
+    assert cause.type == "SiteMissingError"
     assert all(recorded == [] for recorded in calls.values())
 
 
-async def test_nonexistent_branch_fails_after_exactly_one_attempt():
-    # Attempt count is the proof of the non-retryable classification: a typo'd
-    # or deleted branch must fail the run, not retry every minute forever.
-    calls, mocks = make_mock_activities(
-        locate_error=ValuesBranchNotFoundError(f"Branch {VALUES_BRANCH!r} does not exist")
+async def test_a_retired_values_branch_on_an_old_input_is_ignored():
+    """History recorded before 2026-11-11 carries `values_branch`; it decodes
+    and the run neither reads it nor fails on it."""
+    calls, mocks = make_mock_activities()
+    old_input = AllocateSegmentInput.model_validate(
+        {"cluster": CLUSTER, "site": SITE, "type": "HC", "values_branch": "feature/old"}
     )
     async with _Harness(mocks) as client:
-        with pytest.raises(WorkflowFailureError) as exc_info:
-            await _execute(client, AllocateSegmentRunArgs(input=HC_INPUT))
-
-    cause = _workflow_cause(exc_info)
-    assert isinstance(cause, ApplicationError)
-    assert cause.type == "ValuesBranchNotFoundError"
-    assert len(calls["locate_cluster_file"]) == 1
-    assert calls["allocate_segment"] == []
+        result = await _execute(client, AllocateSegmentRunArgs(input=old_input))
+    assert result.vlan_id == VLAN_ID
+    assert len(calls["allocate_segment"]) == 1
 
 
 async def test_non_hc_type_is_rejected_before_any_activity():
@@ -281,11 +200,7 @@ async def test_non_hc_type_is_rejected_before_any_activity():
         with pytest.raises(WorkflowFailureError) as exc_info:
             await _execute(
                 client,
-                AllocateSegmentRunArgs(
-                    input=AllocateSegmentInput(
-                        cluster=CLUSTER, type=SegmentType.MCE, values_branch=VALUES_BRANCH
-                    )
-                ),
+                AllocateSegmentRunArgs(input=AllocateSegmentInput(cluster=CLUSTER, site=SITE, type=SegmentType.MCE)),
             )
 
     cause = _workflow_cause(exc_info)
@@ -295,11 +210,7 @@ async def test_non_hc_type_is_rejected_before_any_activity():
 
 
 async def test_unknown_site_fails_with_no_allocation_attempted():
-    calls, mocks = make_mock_activities(
-        location=ClusterFileLocation(
-            site="site-x", relative_path=f"sites/site-x/mces/m/hostedClusters/{CLUSTER}.yaml"
-        )
-    )
+    calls, mocks = make_mock_activities(valid_sites=("site2", "site3"))
     async with _Harness(mocks) as client:
         with pytest.raises(WorkflowFailureError) as exc_info:
             await _execute(client, AllocateSegmentRunArgs(input=HC_INPUT))
@@ -307,31 +218,37 @@ async def test_unknown_site_fails_with_no_allocation_attempted():
     cause = _workflow_cause(exc_info)
     assert isinstance(cause, ApplicationError)
     assert cause.type == "UnknownSite"
+    assert SITE in str(cause) and "site2" in str(cause)
     assert calls["allocate_segment"] == []
-    assert calls["append_allocation_to_cluster_values"] == []
+    assert calls["get_segment"] == []
 
 
-async def test_missing_cluster_file_fails_after_exactly_one_attempt():
+@pytest.mark.parametrize(
+    "error",
+    [
+        SegmentPoolExhaustedError("no Available segment at site1"),
+        SegmentValidationError("bad cluster name"),
+        SegmentsManagerAuthError("401"),
+    ],
+    ids=lambda e: type(e).__name__,
+)
+async def test_each_permanent_allocation_error_fails_after_exactly_one_attempt(error):
     # Attempt count is the proof of the non-retryable classification: an
     # unclassified error here would retry forever and time the test out.
-    calls, mocks = make_mock_activities(
-        locate_error=ClusterFileNotFoundError(f"No {CLUSTER}.yaml under sites/")
-    )
+    calls, mocks = make_mock_activities(allocate_error=error)
     async with _Harness(mocks) as client:
         with pytest.raises(WorkflowFailureError) as exc_info:
             await _execute(client, AllocateSegmentRunArgs(input=HC_INPUT))
 
     cause = _workflow_cause(exc_info)
     assert isinstance(cause, ApplicationError)
-    assert cause.type == "ClusterFileNotFoundError"
-    assert len(calls["locate_cluster_file"]) == 1
-    assert calls["allocate_segment"] == []
+    assert cause.type == type(error).__name__
+    assert len(calls["allocate_segment"]) == 1
+    assert calls["get_segment"] == []
 
 
-async def test_read_back_mismatch_fails_with_no_git_commit():
-    calls, mocks = make_mock_activities(
-        entry_overrides={"cluster_name": "some-other-cluster"}
-    )
+async def test_read_back_mismatch_fails_the_run():
+    calls, mocks = make_mock_activities(entry_overrides={"cluster_name": "some-other-cluster"})
     async with _Harness(mocks) as client:
         with pytest.raises(WorkflowFailureError) as exc_info:
             await _execute(client, AllocateSegmentRunArgs(input=HC_INPUT))
@@ -340,12 +257,11 @@ async def test_read_back_mismatch_fails_with_no_git_commit():
     assert isinstance(cause, ApplicationError)
     assert cause.type == "AllocationNotConfirmed"
     assert "cluster_name" in str(cause)
-    # Verification sits BEFORE the git write: nothing was pushed.
-    assert calls["append_allocation_to_cluster_values"] == []
+    assert calls["get_segment"] == [SEGMENT]
 
 
 @pytest.mark.parametrize("read_back_type", ["MCE", None])
-async def test_read_back_type_mismatch_fails_with_no_git_commit(read_back_type):
+async def test_read_back_type_mismatch_fails_the_run(read_back_type):
     """The allocation stamps the type onto the segment, so the read-back must
     show the requested one. A null is a failure too: an Allocated segment
     always has a type."""
@@ -358,7 +274,6 @@ async def test_read_back_type_mismatch_fails_with_no_git_commit(read_back_type):
     assert isinstance(cause, ApplicationError)
     assert cause.type == "AllocationNotConfirmed"
     assert "type: expected 'HC'" in str(cause)
-    assert calls["append_allocation_to_cluster_values"] == []
 
 
 async def test_read_back_without_a_type_field_is_not_held_against_the_run():
@@ -370,8 +285,8 @@ async def test_read_back_without_a_type_field_is_not_held_against_the_run():
     async with _Harness(mocks) as client:
         result = await _execute(client, AllocateSegmentRunArgs(input=HC_INPUT))
 
-    assert result.values_updated is True
-    assert len(calls["append_allocation_to_cluster_values"]) == 1
+    assert result.vlan_id == VLAN_ID
+    assert len(calls["get_segment"]) == 1
 
 
 async def test_transient_activity_failures_are_outwaited():
@@ -383,13 +298,13 @@ async def test_transient_activity_failures_are_outwaited():
     assert len(calls["allocate_segment"]) == 3  # 2 transient failures + success
 
 
-async def test_rerun_over_already_appended_file_reports_values_unchanged():
-    calls, mocks = make_mock_activities(append_changed=False)
+async def test_progress_reports_the_phases_in_order():
+    calls, mocks = make_mock_activities()
     async with _Harness(mocks) as client:
-        result = await _execute(client, AllocateSegmentRunArgs(input=HC_INPUT))
-
-    assert result.values_updated is False
-    assert result.commit_sha is None
-    # A no-op re-run still reports the branch that carries the block.
-    assert result.values_branch == VALUES_BRANCH
-
+        handle = await client.start_workflow(
+            AllocateSegmentWorkflow.run, AllocateSegmentRunArgs(input=HC_INPUT),
+            id=f"test-{uuid.uuid4()}", task_queue=ALLOCATE_SEGMENT_WORKFLOW_QUEUE,
+        )
+        await asyncio.wait_for(handle.result(), timeout=60)
+        progress = await handle.query(AllocateSegmentWorkflow.progress)
+    assert progress.phase == "completed"

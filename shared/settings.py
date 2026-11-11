@@ -7,9 +7,13 @@ Settings groups, matching the deployment boundary:
   - TemporalSettings: needed by anything that connects a Temporal Client
     (every worker and api.py).
   - SegmentLifecycleActivitySettings: needed only by the segment-lifecycle
-    activity worker/tasks (the Segments Manager, the day1 values repo, the
-    DHCP exclusion policy and the DHCP scope API). The workflow worker has no
-    business holding these.
+    activity worker/tasks (the Segments Manager and the DHCP scope API). The
+    workflow worker has no business holding these.
+  - ClusterLifecycleActivitySettings: the cluster-lifecycle hub limb — the
+    day1 repo (the same keys as upgrade-gitops's and vm-lifecycle's) plus its
+    git provider, the DHCP exclusion policy the allocation block is written
+    with (moved here from segment-lifecycle on 2026-11-11), and the day2 sig
+    repos the cluster is registered in.
   - ServerLifecycleActivitySettings / ServerProvisioningActivitySettings: the
     same, for those domains' activity workers.
   - UpgradeGitopsActivitySettings, ClusterUpgradeActivitySettings and
@@ -36,8 +40,10 @@ charts in the Argo CD repo:
 redbull-platform/gitops/charts/workflows-orchestrator/templates/config.yaml
     (workflows-orchestrator-config: temporal + segments-manager url)
 redbull-platform/gitops/charts/segment-lifecycle-worker/templates/config.yaml
-    (segment-lifecycle-config: the day1 repo URL, the DHCP policy and the DHCP
-    API URL; + the day1-git-token and dhcp-api-token Secrets)
+    (segment-lifecycle-config: the DHCP API URL; + the dhcp-api-token Secret)
+redbull-platform/gitops/charts/cluster-lifecycle-worker/templates/config.yaml
+    (cluster-lifecycle-config: the day1 repo URL and provider, the DHCP policy,
+    the day2 sig templates; + the redbull-git-token Secret)
 
 Do NOT import this module from inside a workflow definition (it runs in the
 sandbox) — only from worker entrypoints, api.py, and activity
@@ -49,7 +55,7 @@ from __future__ import annotations
 import re
 import string
 
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from shared.cluster_names import canonical_mce_cluster
@@ -82,63 +88,12 @@ class SegmentLifecycleActivitySettings(BaseSettings):
     segments_manager_url: str
     segments_manager_api_token: str
 
-    # --- allocate-segment: the day1 values repo -----------------------------
-    # Where cluster values files live (sites/<site>/mces/<mce>/hostedClusters/
-    # <cluster>.yaml). The workflow appends the vlanId + dhcp_values block
-    # there and pushes. The token authenticates the push (and the clone, for a
-    # private repo) — it is injected into the clone URL in memory only and
-    # scrubbed from every log line and error message.
-    #
-    # The BRANCH is deliberately NOT a setting: every run names it
-    # (`values_branch`), because the day1 pipeline that triggers allocate-segment
-    # runs on a temporary branch only it knows, and a new cluster's file exists
-    # only there. The block reaches Argo CD (which reads main only) when a human
-    # merges that branch — after the run, outside it.
-    #
-    # The clusters root and the committer identity are NOT config: they are
-    # hardcoded in activities/segment_lifecycle/values_repo.py (CLUSTERS_ROOT,
-    # GIT_USER_NAME, GIT_USER_EMAIL). The root is the day1 repo's own layout —
-    # a wrong value simply finds no cluster file — and the identity names THIS
-    # workflow, so neither is something an operator tunes per environment.
-    day1_repo_url: str
-    day1_git_token: str
-
-    @field_validator("day1_repo_url")
-    @classmethod
-    def _require_https_day1_repo_url(cls, url: str) -> str:
-        """The push token is injected into https:// URLs ONLY
-        (values_repo.authenticated_url). Any other scheme would silently drop
-        it: every ls-remote would then fail authentication, which is the
-        retryable ValuesRepoGitError, so each run would retry forever. Fail at
-        worker startup instead, where the fix is one config edit."""
-        if not url.startswith("https://"):
-            raise ValueError(
-                "day1_repo_url must be an https:// URL — the push token is only "
-                f"injected into https clone URLs (got {url.split('@')[-1]!r})"
-            )
-        return url
-
-    # --- allocate-segment: DHCP scope policy --------------------------------
-    # The ONE DHCP policy knob, PER SEGMENT TYPE: last-octet ranges excluded
-    # from distribution, e.g. {"HC": [[1, 10], [241, 254]]}. Together with the
-    # network they are the WHOLE written block: no startRange/endRange, so the
-    # DHCP API derives .1-.253 and these exclusions carve the ends out of it —
-    # one derivation, in the service that owns it. /24 segments only —
-    # build_dhcp_values asserts the prefix and rejects anything else as
-    # UnsupportedSegmentPrefix. A type's list may be EMPTY (excludes nothing).
-    #
-    # Keyed by TYPE because the policy genuinely differs per type (a PXE
-    # segment reserves a different slice of its /24 than an HC one), and the
-    # lookup is DYNAMIC — the activity selects the ranges for the type actually
-    # allocated, which a flat per-type key could not express.
-    #
-    # A type that is NOT LISTED excludes nothing — a type earns an entry by
-    # reserving part of its /24, and no operator should have to write an empty
-    # list to say "nothing". HC is the one REQUIRED key: it is the only type
-    # allocate-segment allocates today, and a forgotten HC policy would quietly
-    # hand out the addresses production reserves rather than fail. Types listed
-    # ahead of the code that allocates them are validated the same way now.
-    dhcp_exclusion_octet_ranges: dict[SegmentType, list[tuple[int, int]]]
+    # The day1 repo and the DHCP exclusion policy are NOT here any more: since
+    # provision-cluster owns the cluster file (2026-11-11), allocate-segment
+    # allocates and verifies only, and DAY1_REPO_URL, DAY1_GIT_TOKEN and
+    # DHCP_EXCLUSION_OCTET_RANGES moved to ClusterLifecycleActivitySettings.
+    # The segment-lifecycle chart keeps rendering them until this image is the
+    # deployed one (CLAUDE.md §8); `extra="ignore"` lets the limb ignore them.
 
     # --- release-segment: the DHCP scope API (dhcp_scope_manager) -----------
     # release-segment checks whether a released cluster's scope survived the
@@ -153,62 +108,6 @@ class SegmentLifecycleActivitySettings(BaseSettings):
     # with DhcpApiAuthError (non-retryable), never silently.
     dhcp_api_url: str
     dhcp_api_token: str
-
-    @field_validator("dhcp_exclusion_octet_ranges")
-    @classmethod
-    def _validate_dhcp_exclusion_octet_ranges(
-        cls, policy: dict[SegmentType, list[tuple[int, int]]]
-    ) -> dict[SegmentType, list[tuple[int, int]]]:
-        """Strict, fail-fast validation of the one DHCP policy knob: a policy
-        for HC at minimum, and within EVERY type's ranges each octet a valid
-        /24 host octet, pairs ordered, strictly ascending and non-overlapping,
-        and at least one distributable octet left. A type's list may be EMPTY
-        (that type excludes nothing); the map itself may not be."""
-        if not policy:
-            raise ValueError("dhcp_exclusion_octet_ranges must not be empty")
-        if SegmentType.HC not in policy:
-            raise ValueError(
-                "dhcp_exclusion_octet_ranges must carry a policy for type "
-                f"{SegmentType.HC.value!r} (the only type allocate-segment "
-                "supports); got "
-                f"{sorted(segment_type.value for segment_type in policy)}"
-            )
-        for segment_type, ranges in policy.items():
-            label = segment_type.value
-            # An EMPTY list is legal and meaningful: that type excludes
-            # nothing, so its block carries a network and no exclusions and the
-            # scope distributes the DHCP API's whole derived .1-.253. Written
-            # explicitly, it says an operator decided — unlike a missing key.
-            previous_end = 0
-            for start, end in ranges:
-                if not (1 <= start <= 254 and 1 <= end <= 254):
-                    raise ValueError(
-                        f"exclusion octets must be in 1..254 "
-                        f"(got [{start}, {end}] for {label})"
-                    )
-                if start > end:
-                    raise ValueError(
-                        f"inverted exclusion range [{start}, {end}] for {label}"
-                    )
-                if start <= previous_end:
-                    raise ValueError(
-                        "exclusion ranges must be strictly ascending and "
-                        f"non-overlapping (got [{start}, {end}] after octet "
-                        f"{previous_end} for {label})"
-                    )
-                previous_end = end
-            # The DHCP API distributes .1-.253 (it stops short of the .254
-            # gateway it derives), so that is what the exclusions eat into — a
-            # policy covering all of it leaves nothing to lease.
-            excluded = {
-                octet for start, end in ranges for octet in range(start, end + 1)
-            }
-            if excluded >= set(range(1, 254)):
-                raise ValueError(
-                    f"dhcp_exclusion_octet_ranges[{label}] excludes every "
-                    "distributable octet (.1-.253) — nothing left to distribute"
-                )
-        return policy
 
 
 class ServerLifecycleActivitySettings(BaseSettings):
@@ -422,7 +321,8 @@ class UpgradeGitopsActivitySettings(BaseSettings):
 
     # --- day1: the rules, the cluster files, the upgrade's commits ------------
     # The same repo and the same keys as segment-lifecycle's (DAY1_REPO_URL,
-    # DAY1_GIT_TOKEN), so one Secret may serve both limbs. This limb reads and
+    # DAY1_GIT_TOKEN); the chart fills DAY1_GIT_TOKEN from the shared
+    # `redbull-git-token` Secret. This limb reads and
     # pushes `main` only: Argo CD renders main, and nothing else (CONTEXT §6.1).
     day1_repo_url: str
     day1_git_token: str
@@ -569,8 +469,8 @@ class VmLifecycleActivitySettings(BaseSettings):
 
     # --- day1: the zone's KubeVirt clusters ----------------------------------
     # The same repo and keys as segment-lifecycle's and upgrade-gitops's
-    # (DAY1_REPO_URL, DAY1_GIT_TOKEN): the chart mounts the SAME `day1-git-token`
-    # Secret — one Secret, three consumers. Read at `main` only, never pushed.
+    # (DAY1_REPO_URL, DAY1_GIT_TOKEN): the chart fills DAY1_GIT_TOKEN from the shared
+    # `redbull-git-token` Secret. Read at `main` only, never pushed.
     day1_repo_url: str
     day1_git_token: str
 
@@ -666,3 +566,208 @@ def _url_fields(ref: KvClusterRef) -> dict[str, str]:
         "cluster": ref.cluster_name, "name": ref.name, "hosted_cluster": ref.hosted_cluster,
         "site": ref.site, "zone": ref.zone,
     }
+
+
+# The git providers the cluster-lifecycle limb knows how to open a merge request on.
+GIT_PROVIDERS = ("gitlab", "github")
+
+
+class ClusterLifecycleActivitySettings(BaseSettings):
+    """Config for the cluster-lifecycle HUB limb (`cluster-lifecycle-worker`) only.
+
+    The day1 values repo (the cluster file, its branch, the merge request on
+    the repo's git provider), the DHCP exclusion policy the allocation block is
+    written with, and the day2 sig repos the cluster is registered in. No
+    Kubernetes credential. Keep aligned with redbull-platform's
+    gitops/charts/cluster-lifecycle-worker/ (cluster-lifecycle-config and the
+    Secrets it names).
+    """
+
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    # --- day1: the cluster file, its branch, the merge request ----------------
+    # The same repo and keys as upgrade-gitops's and vm-lifecycle's (DAY1_REPO_URL,
+    # DAY1_GIT_TOKEN); the chart fills DAY1_GIT_TOKEN from the shared
+    # `redbull-git-token` Secret. This limb READS `main` (where the cluster goes)
+    # and PUSHES a new branch per cluster, `provision-cluster/<cluster>`, which a
+    # person merges through the merge request the limb opens. The token must
+    # therefore reach the provider's API too: a GitLab project/personal token
+    # with `api` + `write_repository`, or a GitHub token with `repo`.
+    #
+    # The clusters root, the branch scheme and the committer identity are NOT
+    # config: they are the day1 repo's own layout and this workflow's identity
+    # (activities/cluster_lifecycle/day1_writer.py).
+    day1_repo_url: str
+    day1_git_token: str
+    # Which API opens the merge request: production is the air-gapped GitLab
+    # (a merge request with `remove_source_branch`), dev is GitHub (a pull
+    # request; delete-on-merge is a repository setting there). No default: the
+    # two APIs share nothing, and a wrong guess fails every run at phase 4.
+    day1_git_provider: str
+
+    # --- the DHCP exclusion policy, written into every cluster file ------------
+    # The ONE DHCP policy knob, PER SEGMENT TYPE: last-octet ranges excluded
+    # from distribution, e.g. {"HC": [[1, 10], [241, 254]]}. Together with the
+    # network they are the WHOLE written block: no startRange/endRange, so the
+    # DHCP API derives .1-.253 and these exclusions carve the ends out of it —
+    # one derivation, in the service that owns it. /24 segments only —
+    # build_dhcp_values asserts the prefix and rejects anything else as
+    # UnsupportedSegmentPrefix. A type's list may be EMPTY (excludes nothing).
+    #
+    # Keyed by TYPE because the policy genuinely differs per type (a PXE
+    # segment reserves a different slice of its /24 than an HC one), and the
+    # lookup is DYNAMIC — the activity selects the ranges for the type actually
+    # allocated, which a flat per-type key could not express.
+    #
+    # A type that is NOT LISTED excludes nothing — a type earns an entry by
+    # reserving part of its /24, and no operator should have to write an empty
+    # list to say "nothing". HC is the one REQUIRED key: it is the only type
+    # provision-cluster allocates today, and a forgotten HC policy would quietly
+    # hand out the addresses production reserves rather than fail. Types listed
+    # ahead of the code that allocates them are validated the same way now.
+    # (Moved here from SegmentLifecycleActivitySettings on 2026-11-11, with the
+    # cluster file; the policy predates the service-prefix rule, CLAUDE.md §3.)
+    dhcp_exclusion_octet_ranges: dict[SegmentType, list[tuple[int, int]]]
+
+    # --- day2: the sig repos the cluster is registered in -----------------------
+    # Each sig is a repo (production: one GitLab project per sig, the tree at
+    # its root) or a folder of one repo (dev: `sigs/<sig>` of one GitHub repo).
+    # `{sig}` must appear in the URL template or the path template, or every
+    # sig would be registered in one place. The path template is the prefix
+    # before `sites/`; "" for the tree at the repo root. The push goes to the
+    # sig repo's default branch with DAY2_GIT_TOKEN — the day1 token when
+    # empty, which is what the shared `redbull-git-token` is.
+    day2_sig_repo_url_template: str
+    day2_sig_path_template: str = ""
+    day2_git_token: str = ""
+
+    @field_validator("day1_repo_url")
+    @classmethod
+    def _require_https_day1_repo_url(cls, url: str) -> str:
+        """The token is injected into https:// URLs only (git_repo.authenticated_url).
+        Any other scheme would silently drop it: every ls-remote would then fail
+        authentication, which is the retryable ValuesRepoGitError, so each run
+        would retry forever. Fail at worker startup instead."""
+        if not url.startswith("https://"):
+            raise ValueError(
+                "day1_repo_url must be an https:// URL — the token is only "
+                f"injected into https clone URLs (got {url.split('@')[-1]!r})"
+            )
+        return url.rstrip("/")
+
+    @field_validator("day1_git_provider")
+    @classmethod
+    def _known_git_provider(cls, value: str) -> str:
+        provider = value.strip().lower()
+        if provider not in GIT_PROVIDERS:
+            raise ValueError(f"day1_git_provider must be one of {list(GIT_PROVIDERS)} (got {value!r})")
+        return provider
+
+    @field_validator("dhcp_exclusion_octet_ranges")
+    @classmethod
+    def _validate_dhcp_exclusion_octet_ranges(
+        cls, policy: dict[SegmentType, list[tuple[int, int]]]
+    ) -> dict[SegmentType, list[tuple[int, int]]]:
+        """Strict, fail-fast validation of the one DHCP policy knob: a policy
+        for HC at minimum, and within EVERY type's ranges each octet a valid
+        /24 host octet, pairs ordered, strictly ascending and non-overlapping,
+        and at least one distributable octet left. A type's list may be EMPTY
+        (that type excludes nothing); the map itself may not be."""
+        if not policy:
+            raise ValueError("dhcp_exclusion_octet_ranges must not be empty")
+        if SegmentType.HC not in policy:
+            raise ValueError(
+                "dhcp_exclusion_octet_ranges must carry a policy for type "
+                f"{SegmentType.HC.value!r} (the only type provision-cluster "
+                "allocates); got "
+                f"{sorted(segment_type.value for segment_type in policy)}"
+            )
+        for segment_type, ranges in policy.items():
+            label = segment_type.value
+            # An EMPTY list is legal and meaningful: that type excludes
+            # nothing, so its block carries a network and no exclusions and the
+            # scope distributes the DHCP API's whole derived .1-.253. Written
+            # explicitly, it says an operator decided — unlike a missing key.
+            previous_end = 0
+            for start, end in ranges:
+                if not (1 <= start <= 254 and 1 <= end <= 254):
+                    raise ValueError(
+                        f"exclusion octets must be in 1..254 "
+                        f"(got [{start}, {end}] for {label})"
+                    )
+                if start > end:
+                    raise ValueError(
+                        f"inverted exclusion range [{start}, {end}] for {label}"
+                    )
+                if start <= previous_end:
+                    raise ValueError(
+                        "exclusion ranges must be strictly ascending and "
+                        f"non-overlapping (got [{start}, {end}] after octet "
+                        f"{previous_end} for {label})"
+                    )
+                previous_end = end
+            # The DHCP API distributes .1-.253 (it stops short of the .254
+            # gateway it derives), so that is what the exclusions eat into — a
+            # policy covering all of it leaves nothing to lease.
+            excluded = {
+                octet for start, end in ranges for octet in range(start, end + 1)
+            }
+            if excluded >= set(range(1, 254)):
+                raise ValueError(
+                    f"dhcp_exclusion_octet_ranges[{label}] excludes every "
+                    "distributable octet (.1-.253) — nothing left to distribute"
+                )
+        return policy
+
+    @field_validator("day2_sig_path_template")
+    @classmethod
+    def _relative_sig_path_template(cls, template: str) -> str:
+        """A path inside the repo: leading and trailing slashes dropped, `..` refused."""
+        template = template.strip().strip("/")
+        if ".." in template.split("/"):
+            raise ValueError(f"day2_sig_path_template {template!r} must stay inside the repo (no `..`)")
+        return template
+
+    @field_validator("day2_sig_repo_url_template")
+    @classmethod
+    def _https_sig_url_template(cls, template: str) -> str:
+        if not template.startswith("https://"):
+            raise ValueError(
+                "day2_sig_repo_url_template must be an https:// URL — the token is only "
+                f"injected into https clone URLs (got {template.split('@')[-1]!r})"
+            )
+        return template.rstrip("/")
+
+    @model_validator(mode="after")
+    def _sig_is_somewhere_in_the_templates(self) -> ClusterLifecycleActivitySettings:
+        """`{sig}` in the URL or the path template, and nothing else in braces: a typo
+        (`{sgi}`) fails at worker start, not as a KeyError on the first run."""
+        placeholders: set[str] = set()
+        for name, template in (
+            ("day2_sig_repo_url_template", self.day2_sig_repo_url_template),
+            ("day2_sig_path_template", self.day2_sig_path_template),
+        ):
+            try:
+                fields = {field for _, field, _, _ in string.Formatter().parse(template) if field is not None}
+            except ValueError as err:
+                raise ValueError(f"{name} {template!r} is not a format string: {err}") from None
+            if fields - {"sig"}:
+                raise ValueError(f"{name} {template!r} may name only {{sig}} (got {sorted(fields - {'sig'})})")
+            placeholders |= fields
+        if "sig" not in placeholders:
+            raise ValueError(
+                "neither day2_sig_repo_url_template nor day2_sig_path_template names {sig}: every sig "
+                "would be registered in one place"
+            )
+        return self
+
+    @property
+    def day2_token(self) -> str:
+        """The token the sig repos are pushed with: DAY2_GIT_TOKEN, else the day1 token."""
+        return self.day2_git_token or self.day1_git_token
+
+    def day2_sig_repo_url(self, sig: str) -> str:
+        return self.day2_sig_repo_url_template.format(sig=sig)
+
+    def day2_sig_path_prefix(self, sig: str) -> str:
+        return self.day2_sig_path_template.format(sig=sig).strip("/")

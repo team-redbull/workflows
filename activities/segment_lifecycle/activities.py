@@ -4,22 +4,24 @@ These run in the `segment-lifecycle-worker` deployment. They talk to:
   - the team's Segments Manager (SEGMENTS_MANAGER_URL) — create segments,
     allocate one for a cluster and read it back (Bearer token via
     SEGMENTS_MANAGER_API_TOKEN; GETs are public)
-  - the day1 values repo (DAY1_REPO_URL) — git subprocess via
-    activities/segment_lifecycle/values_repo.py (clone, append the allocation
-    block, push; the token is never logged), on the branch each run names
   - the DHCP scope API (DHCP_API_URL) — release-segment's safety net: GET a
     scope (anonymous) and DELETE it (Bearer DHCP_API_TOKEN) if it survived the
     Argo CD cascade, via activities/segment_lifecycle/dhcp_api.py (plain
     parameters, no settings). The only write this worker makes there;
     Crossplane stays the only creator/updater of scopes.
 
+The day1 values repo is NOT reached from here any more (2026-11-11): the
+cluster file, its branch and the allocation block written into it are the
+cluster-lifecycle limb's (activities/cluster_lifecycle/), which starts
+allocate-segment as a child and records what it allocated. This limb runs no
+git at all.
+
 Conventions enforced here:
   * activity.logger only (not the root logger).
   * Idempotency: create accepts an existing segment that matches the requested
     definition; allocate is idempotent server-side per (cluster, site, type);
-    the values-repo append is a no-op for a file already recording this
-    allocation; release answers 200 for an already-released segment and the
-    scope DELETE answers 204 for an absent scope.
+    release answers 200 for an already-released segment and the scope DELETE
+    answers 204 for an absent scope.
   * Every httpx.AsyncClient is created INSIDE the activity via `async with`,
     with an explicit timeout strictly below the workflow's
     start_to_close_timeout (60s < 90s). This frees the worker on a network hang
@@ -33,10 +35,8 @@ from __future__ import annotations
 
 import httpx
 from temporalio import activity
-from temporalio.exceptions import ApplicationError
 
-from activities.segment_lifecycle import dhcp_api, values_repo
-from activities.segment_lifecycle.dhcp_values import build_dhcp_values
+from activities.segment_lifecycle import dhcp_api
 from shared.exceptions import (
     AmbiguousInventorySegmentError,
     InventorySegmentNotFoundError,
@@ -47,20 +47,15 @@ from shared.exceptions import (
     SegmentsManagerError,
     SegmentNotFoundError,
     SegmentValidationError,
-    ValuesBranchMissing,
 )
 from shared.models.segment_lifecycle import (
     ClusterAllocationLookup,
     ClusterAllocationLookupRequest,
-    ClusterFileLocation,
-    ClusterFileLookupRequest,
-    ClusterValuesAppendRequest,
     DhcpScopeState,
     InitializeSegmentInput,
     SegmentAllocation,
     SegmentAllocationRequest,
     SegmentEntry,
-    ValuesCommitRef,
 )
 from shared.settings import SegmentLifecycleActivitySettings
 
@@ -81,7 +76,7 @@ _HTTP_TIMEOUT = httpx.Timeout(60.0)
 # trusted properly.
 #
 # The git subprocess has its own trust store and is switched off separately —
-# see values_repo._exec_git.
+# see activities/git_repo.exec_git.
 _TLS_VERIFY = False
 
 # The most of an answer's text an error carries. Every activity error is
@@ -257,47 +252,6 @@ async def get_valid_sites() -> list[str]:
     return sites
 
 
-def _require_values_branch(values_branch: str | None) -> str:
-    """The branch a git activity clones and pushes, or a non-retryable failure.
-
-    The request models default `values_branch` to None only so payloads
-    recorded before the field existed still decode. A request that actually
-    arrives without one has nothing to clone, and retrying cannot invent a
-    branch — so it fails at once instead of falling back to one (there is no
-    configured branch any more: a fallback would push to main by omission).
-    """
-    if not values_branch:
-        raise ApplicationError(
-            "No values_branch on the request — the values-repo branch to clone "
-            "and push is a per-run input, and this request carries none",
-            type=ValuesBranchMissing.__name__,
-            non_retryable=True,
-        )
-    return values_branch
-
-
-@activity.defn
-async def locate_cluster_file(request: ClusterFileLookupRequest) -> ClusterFileLocation:
-    """Find the cluster's values file in the day1 values repo, on the run's
-    branch (fresh shallow clone per invocation; the site is derived from the
-    path under the clusters root)."""
-    branch = _require_values_branch(request.values_branch)
-    location = await values_repo.locate_cluster_file(
-        repo_url=_settings.day1_repo_url,
-        branch=branch,
-        token=_settings.day1_git_token,
-        cluster=request.cluster,
-    )
-    activity.logger.info(
-        "Cluster %s lives at %s on branch %s (site=%s)",
-        request.cluster,
-        location.relative_path,
-        branch,
-        location.site,
-    )
-    return location
-
-
 @activity.defn
 async def allocate_segment(request: SegmentAllocationRequest) -> SegmentAllocation:
     """Reserve a segment in the Segments Manager, as request.type.
@@ -362,49 +316,6 @@ async def get_segment(segment: str) -> SegmentEntry:
                 f"{_segments_manager_detail(resp)}"
             )
         _raise_segments_manager_error("Look up segment", resp)
-
-
-@activity.defn
-async def append_allocation_to_cluster_values(
-    request: ClusterValuesAppendRequest,
-) -> ValuesCommitRef:
-    """Append the vlanId + dhcp_values block to the cluster's values file and
-    push it to the run's branch. The DhcpValues are derived HERE (the policy
-    lives in this worker's config, unreachable from the sandboxed workflow) and
-    returned in both the pushed and the already-present case."""
-    branch = _require_values_branch(request.values_branch)
-    # The exclusion policy is per segment type — pick this allocation's. A type
-    # the map does not list excludes NOTHING: an operator lists a type when it
-    # reserves part of its /24 and leaves it out otherwise, rather than writing
-    # an empty list to say "nothing". The block then carries a network alone
-    # and the scope distributes the DHCP API's whole derived .1-.253.
-    dhcp_values = build_dhcp_values(
-        request.segment, _settings.dhcp_exclusion_octet_ranges.get(request.type, [])
-    )
-    commit_sha, changed = await values_repo.append_allocation(
-        repo_url=_settings.day1_repo_url,
-        branch=branch,
-        token=_settings.day1_git_token,
-        relative_path=request.relative_path,
-        cluster=request.cluster,
-        vlan_id=request.vlan_id,
-        dhcp_values=dhcp_values,
-    )
-    if changed:
-        activity.logger.info(
-            "Pushed allocation for %s to %s on %s (commit %s)",
-            request.cluster,
-            request.relative_path,
-            branch,
-            commit_sha,
-        )
-    else:
-        activity.logger.info(
-            "%s on %s already carries this exact allocation — nothing pushed",
-            request.relative_path,
-            branch,
-        )
-    return ValuesCommitRef(commit_sha=commit_sha, changed=changed, dhcp_values=dhcp_values)
 
 
 # --- shared with the server-lifecycle domain --------------------------------

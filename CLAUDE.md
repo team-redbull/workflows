@@ -64,7 +64,9 @@ activities/<domain>/         The execution "limbs" (one deployment per domain)
                                activity.logger, and a call into a module below
   <technology>.py            One module per dependency, taking PLAIN PARAMETERS and
                                holding no settings and no Temporal, so it is testable
-                               with no worker: values_repo.py (git), dhcp_api.py (the
+                               with no worker: day1_writer.py (the cluster file on its
+                               branch), git_provider.py (GitLab/GitHub merge requests),
+                               day2_sigs.py (the sig repos), dhcp_api.py (the
                                DHCP scope API), server_scan.py (the inventory API),
                                cluster_api.py (the Kubernetes API, its idempotency
                                rule and its error classification),
@@ -74,8 +76,8 @@ activities/<domain>/         The execution "limbs" (one deployment per domain)
 activities/git_repo.py       Shared by limbs, owned by no domain: the git client (clone,
 activities/day1_repo.py        push, token scrubbing) and THE day1 repo reader (a
                                cluster file with its value layers, an MCE folder's
-                               files) — vm-lifecycle and upgrade-gitops both read day1
-                               through it, neither through the other's domain
+                               files) — cluster-lifecycle, vm-lifecycle and upgrade-gitops
+                               all read day1 through it, none through another's domain
 docs/                             The static documentation site (its own image, no code)
 ```
 
@@ -85,8 +87,9 @@ all domains), `segment-lifecycle-worker`, `server-lifecycle-worker` and `server-
 (limbs: one per domain), cluster-upgrade's `cluster-upgrade-worker`, `upgrade-agent-worker`
 and `upgrade-gitops-worker` (since 2026-11-02; with `server-provisioning-worker`, these have no
 `gitops/services/` entry yet, so CI bumps their tags and Argo CD deploys nothing), and
-`vm-lifecycle-worker` (written 2026-11-05, in redbull-platform's working tree until pushed: CI's
-bump of it fails until then, so its job is LAST in the chain). One generic ApplicationSet
+`vm-lifecycle-worker` (written 2026-11-05) and `cluster-lifecycle-worker` (written 2026-11-11), both
+in redbull-platform's working tree until pushed: CI's bump of each fails until then, so their jobs
+are the LAST two in the chain. One generic ApplicationSet
 sweeps `gitops/services/<service>/app.yaml`, so the service FOLDER NAME is the Argo app name,
 the chart path and the release name at once. There is no per-environment values layer — a
 chart's own `values.yaml` is exactly what the cluster runs — and pushing redbull-platform's
@@ -144,6 +147,17 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   run, so nothing known at the edge identifies it — add-server-to-mce's pool-draw shape, with the walk
   itself extracted to `workflow_domains/routers/slots.py` (add-server-to-mce keeps its own until a
   follow-up migrates it: its `candidate_count` depends on the busy count).
+- **cluster-lifecycle is ONE hub limb holding git tokens only.** provision-cluster reads day1 `main`
+  (the shared `activities/day1_repo.py` reader), pushes a branch per cluster, opens the merge request
+  through the day1 repo's git provider API (`DAY1_GIT_PROVIDER`: GitLab in the air-gap, GitHub in
+  dev — same token as the push, `redbull-git-token`) and pushes each day2 sig repo's default branch
+  (`DAY2_GIT_TOKEN`, the day1 token when empty). No Kubernetes credential, nothing per MCE:
+  `activities/cluster_lifecycle/`, queue `cluster-lifecycle-activity`, chart
+  `gitops/charts/cluster-lifecycle-worker/`, domain `workflow_domains/cluster_lifecycle/` with ONE
+  workflow, `provision-cluster`, on `provision-cluster-workflow`, id `provision-cluster-<stem>`
+  (`shared/workflow_ids.py`). The segment comes from the segment-lifecycle limb, through
+  allocate-segment as an AWAITED CHILD on its own id — never a second copy of the Segments Manager
+  token here (§5).
 - **Brain is ONE deployment for every domain**, not one per workflow — the `workflows-orchestrator`
   chart is standalone, deployed once. Each new domain adds `activities/<domain>/` + a
   `gitops/charts/<domain>-worker/` chart folder (plus its `gitops/services/` app.yaml) and registers
@@ -600,8 +614,10 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   - **The zone's clusters are the FILES of the seed folder**
     `sites/<site>/mces/ocp4-seed-<site>-<zone>/hostedClusters/` at day1 `main`, read by the
     vm-lifecycle limb ITSELF (`list_kv_clusters`, its own clone, the shared `activities/git_repo.py`
-    client, the segment-lifecycle chart's `day1-git-token` Secret as a third consumer — one Secret,
-    three consumers, the dhcp-token-chain shape). The operator REJECTED putting the read on the
+    client, and the `redbull-git-token` Secret its own chart deploys in the namespace, which
+    upgrade-gitops reads too: key `REDBULL_GIT_TOKEN`, mapped by each chart onto the
+    `DAY1_GIT_TOKEN` the limb reads, so the images did not change; segment-lifecycle still renders
+    its own `day1-git-token`). The operator REJECTED putting the read on the
     upgrade-gitops limb (2026-11-05): upgrade-gitops is not production, and create-vm must not depend
     on it. NOT filtered by day1 `platform: kubevirt` — that key means a cluster whose NODES are VMs.
     The folder is built from VALIDATED tokens and read with `iterdir()`, never globbed with input.
@@ -816,19 +832,56 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   never holds a gate: `write_incident` always returns, with a `note` when Brain is missing,
   unreachable after its third attempt, or refuses; a page its validator refuses, or a validator
   that times out or crashes, is not pushed (fail closed), and the run is told.
-- **allocate-segment writes to the BRANCH THE RUN NAMES, and ends at the push.** Until a
-  create-cluster workflow exists, allocate-segment is a step INSIDE the day1 values repo's GitLab
-  pipeline, which runs only on non-`main` branches: a human pushes a temp branch with the new
-  `<cluster>.yaml`, the pipeline calls allocate-segment (replacing its old in-house VLAN allocator),
-  waits for the run, generates the MachineConfig files from the recorded `vlanId`, and a human merges
-  afterwards. So `values_branch` is a PER-RUN input (the pipeline's `$CI_COMMIT_BRANCH`), never
-  config — `DAY1_BRANCH` was removed, and there is no fallback, because a fallback pushes to `main`
-  by omission. Required on the API edge (`AllocateSegmentRequest`, which also refuses option-shaped
-  or malformed names); a branch the remote lacks is `ValuesBranchNotFoundError` (non-retryable); our
-  commit carries `[skip ci]` or it would start a second pipeline that re-runs the allocator. The
-  branch is NOT in the workflow id: the SM allocates per (cluster, site, type) whatever the branch,
-  so two branches for one cluster must collide on one run. A future create-cluster workflow keeps
-  this shape — it merges AFTER its allocate-segment child returns.
+- **provision-cluster is the ENTRY POINT for a new hosted cluster, and owns its day1 file, its
+  branch, its merge request and its day2 folders** (domain `cluster-lifecycle`; designed with the
+  operator 2026-10-24 … 2026-11-11, plan `~/.claude/plans/i-want-you-to-pure-hickey.md`,
+  `docs/design/provision-cluster.md`). The caller hands over the COMPLETE hosted-cluster YAML a
+  person wrote — the request BODY, `application/yaml`, verbatim; Swagger pre-fills the slim shape
+  (`EXAMPLE_CLUSTER_FILE` in the router) — plus `cluster` (canonicalised to the file stem
+  `ocp4-<clusterName>`) and `mce` (the MCE FOLDER name, verbatim: `ocp4-mce-site2` and
+  `ocp4-mce-site4-prep` are real folders no convention parses; the folder is found by NAME among
+  `sites/*/mces/`, never derived). The run: (1) `inspect_cluster_target` at day1 `main` — the folder,
+  no file of that name there yet, and the text judged against the merged value layers the way the
+  chart renders them (REQUIRED `mastertag`, non-empty `nodepool`, `owner.{merkaz,anaf,mador}`;
+  FORBIDDEN `vlanId`, `dhcp_values`, `mcConfigMap`, `AutomateAllocation`; `clusterName` only equal to
+  the derived one; config names DNS-1123 labels; `configs` OPTIONAL per pool — a KubeVirt pool has
+  none) — EVERY reason in one `ClusterValuesRejectedError`; (2) allocate-segment as an AWAITED
+  child (§5); (3) the text plus the allocation block (marker `# === Added By Provision-Cluster
+  Workflow ===`, `vlanId`, `dhcp_values` with the type's `DHCP_EXCLUSION_OCTET_RANGES` — the policy
+  and `build_dhcp_values` moved to this limb with the file) pushed to `provision-cluster/<stem>`,
+  created from `main` by the push, with NO `[skip ci]`; (4) the merge request, found or created;
+  (5) a HUMAN wait for the merge, no deadline (§5); (6) only AFTER the merge, the folder
+  `sites/<site>/<env>/mces/<mce>/<stem>/.gitkeep` in every sig the layers list under
+  `day2.copy_to_sigs`, on that sig repo's default branch — day2 renders `mastertag` from day1 `main`,
+  so a folder created before the merge breaks the sig's whole render (APPLY-DAY2-COPY §4b); the
+  env is `day2.env` else the cluster name's first field, cross-checked against the MCE folder's
+  when it is `ocp4-<env>-mce-…`, derived only when there are sigs. **MachineConfigs stay the day1
+  CI chain's** (the operator, 2026-11-11, deferring the chart-at-sync design in
+  `~/.claude/plans/mc-sources-rendered-at-sync.md`): the chain runs on the branch, skips allocation
+  (`vlanId` is there), renders the MachineConfigs and pushes `CI: Update mcConfigMap from mc-files
+  [skip ci]` on top — so the workflow NEVER writes `mcConfigMap`, and a re-run's publish compares
+  the branch file SEMANTICALLY (its YAML mapping with `mcConfigMap` dropped) against this run's text,
+  `changed=False` when equal, `ClusterFileConflictError` otherwise; never byte-for-byte, the
+  injector re-spaces blank lines too. Nothing is undone on failure: the allocation is idempotent,
+  the branch and the merge request converge on a re-run, day2 folders are "already there = success".
+  Not the workflow's: rendering a MachineConfig, pushing `main`, merging, syncing the Application (a
+  person, by hand, in production), the go-links and `*.apps` DNS DisposableRequests (still the
+  chart's, until their contracts are reported from the air-gap) — see `docs/design/provision-cluster.md`.
+- **allocate-segment allocates and VERIFIES; it no longer touches git** (2026-11-11). Until then it
+  located the cluster file on a day1 branch the caller named (`values_branch`, the pipeline's
+  `$CI_COMMIT_BRANCH`) and pushed the `vlanId` + `dhcp_values` block there with `[skip ci]`, as a
+  step inside the day1 pipeline. Since provision-cluster owns the cluster file, the run takes the
+  SITE as input (the day1 folder the file goes in, passed by the parent; cross-checked against
+  `GET /api/sites`, `UnknownSite`), allocates, reads back, and ends. `values_branch` stays on the
+  input model (history), is IGNORED by the run and REFUSED at the edge with a 422 naming
+  provision-cluster; `site` is required there (`AllocateSegmentRequest`), `SiteMissingError` from the
+  run. Gone with it: `locate_cluster_file`, `append_allocation_to_cluster_values`,
+  `values_repo.py`, `ClusterValuesConflictError`, `ValuesBranchMissing`, the limb's git binary, and
+  `DAY1_REPO_URL`/`DAY1_GIT_TOKEN`/`DHCP_EXCLUSION_OCTET_RANGES` from its settings (its chart keeps
+  rendering them until its image stops reading them — §8). The standalone route stays for a manual
+  allocation, on the same id, so a manual run and provision-cluster's child dedup against each
+  other. The day1 CI's `allocate_segments` job must stop calling the route (it would get the 422)
+  — `APPLY-PROVISION-CLUSTER.md`.
 - **THE DHCP SCOPE WAIT IS GONE. Do not re-add it to allocate-segment.** After the push, the run used
   to poll the DHCP scope API (`DHCP_API_URL`, `GET /api/v1/scopes/{network}`, anonymous, 404 = not
   yet) every 15s for up to 15 min until the live scope carried the exclusions it had written, then
@@ -840,8 +893,9 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   truth and Crossplane the only CREATOR/UPDATER of scopes (we never POST or PUT one), and convergence
   is judged on the EXCLUSIONS we wrote, never the DHCP API's own derived range. `get_dhcp_scope`,
   `DhcpScopeState`, `DhcpApiError` and `DHCP_API_URL` are back — for release-segment's safety net
-  (next bullet), not for this wait; when create-cluster verifies the scope after ITS merge step, it
-  reuses them with a bounded deadline (`git log -S dhcp_scope_ready` has the removed loop).
+  (next bullet), not for this wait; when provision-cluster verifies the scope after ITS merge wait
+  (a follow-up), it reuses them with a bounded deadline (`git log -S dhcp_scope_ready` has the
+  removed loop).
 - **release-segment gives a decommissioned cluster's segment back — and is the ONE DHCP API writer,
   delete-only.** Decommissioning a hosted cluster is deleting its `<cluster>.yaml` from the day1
   repo's `main`: the ApplicationSet deletes the Application, its resources finalizer deletes the
@@ -951,9 +1005,14 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   Bounded vs unbounded is a MEANING, not a style. MACHINE convergence gets a real deadline and fails
   loudly (precedent: allocate-segment's removed DHCP scope wait, 15 min on a 15s durable timer, then
   `DhcpScopeNotConverged` — §4). A wait on a HUMAN gets no deadline ever — back off to a capped
-  interval and `continue_as_new` every N cycles so history stays bounded (precedent:
-  initialize-segment's removed firewall-approval wait, §4). NO workflow polls today; both halves of
-  the rule stand for the next workflow that needs one.
+  interval and `continue_as_new` every N cycles so history stays bounded. THE LIVE PRECEDENT is
+  provision-cluster's merge wait (`awaiting-merge`): `get_merge_request_state` every `_MERGE_POLL`
+  (5 min, a durable timer, a constant — changing it is a non-deterministic change), no deadline
+  ever, `continue_as_new` carrying `ProvisionClusterState` every `_POLLS_PER_RUN` polls (48, four
+  hours) or when the server suggests it, so a continued run skips every phase whose outcome it
+  restored and calls nothing twice (`tests/test_provision_cluster_workflow.py` pins it);
+  `MergeRequestClosedError` when a person closes without merging. (initialize-segment's removed
+  firewall-approval wait, §4, was the earlier precedent.)
 - **httpx timeout < activity `start_to_close_timeout`** (currently 60s < 90s): give every
   `httpx.AsyncClient` an explicit `timeout=` below the activity timeout so a network hang fails the call
   and frees the worker before Temporal reaps the activity.
@@ -969,7 +1028,8 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   add-server-to-mce run failed at `acquire_servers` because `server_scan._detail` copied an error
   answer of more than 2 MiB whole (reproduced on a local dev server; server-scan's own `main` cannot
   send one, so it came from whatever answered at `SERVER_SCAN_URL`).
-- **Git-subprocess activities** (`activities/segment_lifecycle/values_repo.py`): git runs via
+- **Git-subprocess activities** (`activities/git_repo.py`, used by cluster-lifecycle's
+  `day1_writer.py` / `day2_sigs.py` and by upgrade-gitops): git runs via
   `asyncio.create_subprocess_exec` (no Python git dependency; the limb Dockerfile installs the binary),
   each command under a timeout below the git activities' 180s `start_to_close_timeout`, every clone in
   a fresh `TemporaryDirectory` so retries start clean. The push token is injected into the clone URL in
@@ -980,16 +1040,21 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   tail-matches): exit 2 is the deterministic `ValuesBranchNotFoundError`, any other failure the
   retryable `ValuesRepoGitError` (unreachable is not missing). Without it a mistyped branch would
   retry forever as a clone failure.
-- **Cross-workflow orchestration:** a workflow that spawns sibling runs starts them as DETACHED
-  child workflows — `workflow.start_child_workflow(...,
+- **Cross-workflow orchestration — two shapes, chosen by whether the parent's OUTCOME depends on
+  the child.** A FAN-OUT (one run per item, each answering to its own id and failure, the /bulk
+  philosophy) starts siblings DETACHED: `workflow.start_child_workflow(...,
   parent_close_policy=ParentClosePolicy.ABANDON)` on the sibling's workflow queue, catching
-  `WorkflowAlreadyStartedError` as an `already_running` report item — and never waits on them (each
-  child answers to its own id and its own failure, the /bulk philosophy). NO CURRENT WORKFLOW SPAWNS
-  SIBLINGS: convert-segment (since removed, §4) was the precedent, starting an initialize-segment run
-  per converted segment to re-open its firewall rules, and that fan-out went with the firewall flow
-  (§4) before the workflow itself went. The rule
-  stands for the next workflow that needs one — as does the builders-in-`shared/workflow_ids.py`
-  arrangement that made it possible (a workflow can never import a router).
+  `WorkflowAlreadyStartedError` as an `already_running` report item, never waiting. No current
+  workflow fans out (convert-segment, since removed, §4, was the precedent). A STEP the parent cannot
+  continue without is an AWAITED child: `workflow.execute_child_workflow(<Class>.run, <RunArgs>,
+  id=<its own id from shared/workflow_ids.py>, task_queue=<its own queue>,
+  parent_close_policy=ParentClosePolicy.ABANDON)`, `WorkflowAlreadyStartedError` mapped to a named
+  WORKFLOW-RAISED `<Child>AlreadyRunningError`, `ChildWorkflowError` to `<Child>FailedError` carrying
+  the child's own type and message (unwrapping an `ActivityError` behind it) — uninstall-server-from-hc
+  → remove-server-from-mce and provision-cluster → allocate-segment. ABANDON either way: a child
+  verifies by read-back and must never be cut off between the mutation and the verify; its id is
+  the dedup key a re-run or a manual start meets. The builders-in-`shared/workflow_ids.py`
+  arrangement is what makes both possible (a workflow can never import a router).
 - **NEVER cancel a sibling to make room for your own work — choose inputs that cannot have one.**
   A cancel result cannot tell you whether anything was running: Temporal ACCEPTS a cancel against an
   already-CLOSED execution and reports it accepted, failing only for an id that has NEVER existed. So
@@ -1129,22 +1194,30 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
 - **ConfigMaps split by scope, not chart-convenience:** `workflows-orchestrator-config` (GLOBAL; owned by the
   always-present `workflows-orchestrator` brain release) holds only shared values — `TEMPORAL_HOST`,
   `TEMPORAL_NAMESPACE`, `SEGMENTS_MANAGER_URL`. `<domain>-config` (owned by that domain's
-  chart) holds its own endpoints/policy — e.g. `segment-lifecycle-config` = the allocate-segment keys
-  (`DAY1_REPO_URL`, `DHCP_EXCLUSION_OCTET_RANGES`; the push credential in the `day1-git-token`
-  Secret) and release-segment's `DHCP_API_URL` (its token in the `dhcp-api-token` Secret). A
+  chart) holds its own endpoints/policy — e.g. `cluster-lifecycle-config` = provision-cluster's keys
+  (`DAY1_REPO_URL`, `DAY1_GIT_PROVIDER`, `DHCP_EXCLUSION_OCTET_RANGES`, `DAY2_SIG_REPO_URL_TEMPLATE`,
+  `DAY2_SIG_PATH_TEMPLATE`; the credentials from the shared `redbull-git-token` Secret as
+  `DAY1_GIT_TOKEN`, and optionally `DAY2_GIT_TOKEN`) and `segment-lifecycle-config` = release-segment's
+  `DHCP_API_URL` (its token in the `dhcp-api-token` Secret) — the day1 and DHCP-policy keys it
+  rendered for allocate-segment are dropped only once its image stops reading them. A
   domain worker mounts BOTH + its Secrets, so the
   brain release must install before any limb (else `CreateContainerConfigError` on the missing
   global ConfigMap) — and the chart must ship the new keys BEFORE (or with) an image that requires
   them, or the worker crash-loops on its fail-fast settings.
 - **`shared/settings.py`** groups: `TemporalSettings` (workers + api.py),
   `SegmentLifecycleActivitySettings`, `ServerLifecycleActivitySettings`,
-  `ServerProvisioningActivitySettings` and `VmLifecycleActivitySettings` (each that domain's activity
-  worker only; the last: `DAY1_REPO_URL`/`DAY1_GIT_TOKEN` again, `KV_CAPACITY_URL_TEMPLATE` /
+  `ServerProvisioningActivitySettings`, `VmLifecycleActivitySettings` (each that domain's activity
+  worker only; this one: `DAY1_REPO_URL`/`DAY1_GIT_TOKEN` again, `KV_CAPACITY_URL_TEMPLATE` /
   `KV_VM_API_URL_TEMPLATE` with their placeholders checked at startup, the two tokens, `KV_AGENT_CA`,
-  `HEADROOM_BUFFER_PERCENT` 0..90 and `VM_MAC_PREFIX` — locally administered unicast, checked). Field names = Helm ConfigMap/Secret keys
+  `HEADROOM_BUFFER_PERCENT` 0..90 and `VM_MAC_PREFIX` — locally administered unicast, checked) and
+  `ClusterLifecycleActivitySettings` (`DAY1_REPO_URL`/`DAY1_GIT_TOKEN`, `DAY1_GIT_PROVIDER` gitlab|github,
+  `DHCP_EXCLUSION_OCTET_RANGES` with its validator — moved here from segment-lifecycle 2026-11-11 —
+  `DAY2_SIG_REPO_URL_TEMPLATE` + `DAY2_SIG_PATH_TEMPLATE`, one of which must name `{sig}`, and
+  `DAY2_GIT_TOKEN`, the day1 token when empty). Field names = Helm ConfigMap/Secret keys
   lowercased — keep aligned with redbull-platform's `gitops/charts/workflows-orchestrator/templates/config.yaml`
-  (global) and `gitops/charts/segment-lifecycle-worker/templates/config.yaml` (day1 URL + DHCP
-  policy + DHCP API URL + the credential Secrets). Which ConfigMap
+  (global), `gitops/charts/cluster-lifecycle-worker/templates/config.yaml` (day1 URL + provider +
+  DHCP policy + day2 templates) and `gitops/charts/segment-lifecycle-worker/templates/config.yaml`
+  (DHCP API URL + the credential Secrets). Which ConfigMap
   a key lives in is INDEPENDENT of which settings class declares it (pydantic reads the flat merged pod
   env — `SEGMENTS_MANAGER_URL` sits in the global ConfigMap yet stays a
   `SegmentLifecycleActivitySettings` field; the brain ignores extras via `extra="ignore"`). Do NOT
@@ -1199,8 +1272,11 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   copy, moved from `deploy/charts/` on 2026-11-02) and `gitops/charts/vm-lifecycle-worker/`
   (create-vm's hub limb: ConfigMap + the two agent-token Secrets behind `existing*` hooks + limb +
   SA, `automountServiceAccountToken: false`, an optional CA ConfigMap; it NAMES the
-  segment-lifecycle chart's `day1-git-token` and never renders it again; `build-vm-lifecycle-worker`
-  is last in CI's sequential chain). This repo ships the PER-MCE limbs' charts, written to be copied into
+  `redbull-git-token` Secret and never renders it) and `gitops/charts/cluster-lifecycle-worker/`
+  (provision-cluster's hub limb: ConfigMap + limb + SA, `automountServiceAccountToken: false`; it
+  NAMES `redbull-git-token` for `DAY1_GIT_TOKEN` and an optional second Secret for `DAY2_GIT_TOKEN`;
+  `build-vm-lifecycle-worker` and `build-cluster-lifecycle-worker` are the last two in CI's
+  sequential chain). This repo ships the PER-MCE limbs' charts, written to be copied into
   redbull-platform for Argo CD (example ApplicationSet in `deploy/argocd/`):
   `deploy/charts/server-lifecycle-worker/`, `deploy/charts/cluster-upgrade-worker/` and
   `deploy/charts/upgrade-agent-worker/` — the last two copied into redbull-platform's
@@ -1307,10 +1383,16 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   the full segment definition; poll `GET /workflows/runs/{workflow_id}` for progress/result. The
   `/bulk` variant takes a list and starts ONE WORKFLOW PER SEGMENT (never one batch workflow — each
   segment has its own dedup id, its own run status and its own failure), answering 202 with a
-  per-item report rather than a single pass/fail code. `POST .../allocate-segment` is normally
-  called by the day1 pipeline (`{"cluster", "values_branch": "$CI_COMMIT_BRANCH"}`), which then
-  polls the same runs endpoint until COMPLETED (§4). `POST .../release-segment` (`{"cluster"}`) is
+  per-item report rather than a single pass/fail code. `POST .../allocate-segment`
+  (`{"cluster", "site"}`) is a MANUAL allocation on the same id provision-cluster's child uses, so
+  the two dedup; `values_branch` is a 422 (§4). `POST .../release-segment` (`{"cluster"}`) is
   called by the hostedcluster-setup chart's PostDelete hook once a cluster's Application is gone (§4).
+  `POST /workflows/cluster-lifecycle/provision-cluster?cluster=<name>&mce=<folder>` is ASYNC and its
+  BODY IS THE HOSTED-CLUSTER YAML (`Content-Type: application/yaml`; Swagger's "Try it out" shows
+  the slim example to edit): the edge refuses only what could not be a cluster file (empty, over
+  256 KiB, not UTF-8, not one YAML mapping) and a bad `cluster`/`mce` (422); everything semantic is
+  a FAILED run (§4). A second request for a cluster whose run waits for its merge is a 409; one for
+  a cluster already on day1 `main` starts a run that fails `ClusterAlreadyProvisionedError` at once.
 - In-cluster the API is `workflows-orchestrator-api` (ClusterIP:8080) plus an OpenShift **Route**
   (`workflowsApi.route.*` in the `workflows-orchestrator` chart) — it needs a hostname because starting a workflow
   is now an operator action. NOTE: `workflow_domains/api.py` has NO auth of its own; anyone who can reach

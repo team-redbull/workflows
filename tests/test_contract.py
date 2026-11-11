@@ -14,6 +14,7 @@ import typing
 
 import pytest
 
+import activities.cluster_lifecycle.activities as cluster_lifecycle_impl
 import activities.cluster_upgrade.activities as cluster_upgrade_impl
 import activities.segment_lifecycle.activities as segment_impl
 import activities.server_lifecycle.activities as server_impl
@@ -21,6 +22,7 @@ import activities.server_provisioning.activities as provisioning_impl
 import activities.upgrade_agent.activities as upgrade_agent_impl
 import activities.upgrade_gitops.activities as upgrade_gitops_impl
 import activities.vm_lifecycle.activities as vm_lifecycle_impl
+import shared.interfaces.cluster_lifecycle as cluster_lifecycle_interface
 import shared.interfaces.cluster_upgrade as cluster_upgrade_interface
 import shared.interfaces.segment_lifecycle as segment_interface
 import shared.interfaces.server_lifecycle as server_interface
@@ -39,6 +41,7 @@ _DOMAINS = [
     pytest.param(upgrade_agent_interface, upgrade_agent_impl, id="upgrade_agent"),
     pytest.param(upgrade_gitops_interface, upgrade_gitops_impl, id="upgrade_gitops"),
     pytest.param(vm_lifecycle_interface, vm_lifecycle_impl, id="vm_lifecycle"),
+    pytest.param(cluster_lifecycle_interface, cluster_lifecycle_impl, id="cluster_lifecycle"),
 ]
 
 

@@ -21,6 +21,7 @@ from fastapi import FastAPI
 
 from shared.settings import TemporalSettings
 from shared.temporal_client import connect_temporal
+from workflow_domains.cluster_lifecycle.router import router as cluster_lifecycle_router
 from workflow_domains.cluster_upgrade.router import router as cluster_upgrade_router
 from workflow_domains.cluster_upgrade.ui import router as cluster_upgrade_ui_router
 from workflow_domains.routers.runs import router as runs_router
@@ -55,6 +56,9 @@ app.include_router(cluster_upgrade_router)
 # create-vm: a run's activities wait, visible as pending, on the vm-lifecycle
 # limb and on the KubeVirt clusters' agents until both are deployed.
 app.include_router(vm_lifecycle_router)
+# provision-cluster: the body is the hosted-cluster YAML itself; a run waits on
+# the cluster-lifecycle limb until it is deployed, then on a person's merge.
+app.include_router(cluster_lifecycle_router)
 app.include_router(runs_router)
 # The temporary cluster-upgrade page, on the routes above.
 app.include_router(cluster_upgrade_ui_router)

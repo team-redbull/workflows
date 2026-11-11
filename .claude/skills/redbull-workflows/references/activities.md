@@ -9,7 +9,7 @@ a read-back) that Temporal may run MORE THAN ONCE. Everything below follows from
 | --- | --- |
 | `shared/interfaces/<limb>.py` | `@activity.defn async def verb_object(request: ReqModel) -> RespModel:` docstring, `...` |
 | `activities/<limb>/activities.py` | the implementation, same signature, THIN: settings, `activity.logger`, one call into a technology module |
-| `activities/<limb>/<technology>.py` | the logic: plain parameters in, typed values out, no settings and no Temporal, so it is tested with no worker (`cluster_api.py`, `values_repo.py`, `dhcp_api.py`) |
+| `activities/<limb>/<technology>.py` | the logic: plain parameters in, typed values out, no settings and no Temporal, so it is tested with no worker (`cluster_api.py`, `day1_writer.py`, `dhcp_api.py`) |
 | `activities/<limb>/worker_init.py` | the name in the Worker's `activities=[...]` |
 
 Workflows import the STUB and pass it to `workflow.execute_activity` on the limb's
@@ -29,8 +29,9 @@ Write the mechanism into the stub's docstring:
 - **check-before-create / accept-existing** (`create_segment`; `cluster_api`'s create
   rule): an existing object with the same IDENTITY is success, a different one is a
   classified conflict; never compare state another actor may change;
-- **re-read and compare the meaning** (`append_allocation_to_cluster_values`): never text
-  equality, which turns every operator edit into a phantom conflict;
+- **re-read and compare the meaning** (`publish_cluster_file`: the branch file's YAML mapping,
+  the day1 chain's appended key set aside): never text equality, which turns every operator
+  edit into a phantom conflict;
 - **compare-and-set** where two runs may mutate one record (server-scan's install lock);
 - **observe-only**: no side effect; "not there yet" is a normal typed answer
   (`found=False`), never an exception.

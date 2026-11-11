@@ -151,7 +151,8 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   (the shared `activities/day1_repo.py` reader), pushes a branch per cluster, opens the merge request
   through the day1 repo's git provider API (`DAY1_GIT_PROVIDER`: GitLab in the air-gap, GitHub in
   dev — same token as the push, `redbull-git-token`) and pushes each day2 sig repo's default branch
-  (`DAY2_GIT_TOKEN`, the day1 token when empty). No Kubernetes credential, nothing per MCE:
+  with the SAME token — `redbull-git-token` is the redbull GROUP token, so the chart names no second
+  Secret (the limb's `DAY2_GIT_TOKEN` stays, empty = that token). No Kubernetes credential, nothing per MCE:
   `activities/cluster_lifecycle/`, queue `cluster-lifecycle-activity`, chart
   `gitops/charts/cluster-lifecycle-worker/`, domain `workflow_domains/cluster_lifecycle/` with ONE
   workflow, `provision-cluster`, on `provision-cluster-workflow`, id `provision-cluster-<stem>`
@@ -1199,7 +1200,7 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   chart) holds its own endpoints/policy — e.g. `cluster-lifecycle-config` = provision-cluster's keys
   (`DAY1_REPO_URL`, `DAY1_GIT_PROVIDER`, `DHCP_EXCLUSION_OCTET_RANGES`, `DAY2_SIG_REPO_URL_TEMPLATE`,
   `DAY2_SIG_PATH_TEMPLATE`; the credentials from the shared `redbull-git-token` Secret under its
-  own key, `REDBULL_GIT_TOKEN`, and optionally `DAY2_GIT_TOKEN`) and `segment-lifecycle-config` = release-segment's
+  own key, `REDBULL_GIT_TOKEN` — the group token, day1 and the sigs alike) and `segment-lifecycle-config` = release-segment's
   `DHCP_API_URL` (its token in the `dhcp-api-token` Secret) — the day1 and DHCP-policy keys it
   rendered for allocate-segment are dropped only once its image stops reading them. A
   domain worker mounts BOTH + its Secrets, so the
@@ -1277,7 +1278,7 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   SA, `automountServiceAccountToken: false`, an optional CA ConfigMap; it NAMES the
   `redbull-git-token` Secret and never renders it) and `gitops/charts/cluster-lifecycle-worker/`
   (provision-cluster's hub limb: ConfigMap + limb + SA, `automountServiceAccountToken: false`; it
-  NAMES `redbull-git-token` for `REDBULL_GIT_TOKEN` and an optional second Secret for `DAY2_GIT_TOKEN`;
+  NAMES `redbull-git-token` for `REDBULL_GIT_TOKEN`, the one group token for day1 and the sigs;
   `build-vm-lifecycle-worker` and `build-cluster-lifecycle-worker` are the last two in CI's
   sequential chain). This repo ships the PER-MCE limbs' charts, written to be copied into
   redbull-platform for Argo CD (example ApplicationSet in `deploy/argocd/`):

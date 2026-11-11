@@ -468,7 +468,7 @@ curl -X POST -H 'Content-Type: application/yaml' --data-binary @cluster.yaml \
           <tr><td class="k">REDBULL_GIT_TOKEN</td><td class="muted">Secret redbull-git-token, key REDBULL_GIT_TOKEN</td><td class="muted">The push credential AND the provider's API token (GitLab: <code>api</code> + <code>write_repository</code>; GitHub: <code>repo</code>). The Secret's key reaches the pod under its own name. <code>DAY1_GIT_TOKEN</code> is accepted too, for a cluster with only a <code>day1-git-token</code> Secret; <code>REDBULL_GIT_TOKEN</code> wins when both are set. Scrubbed from every error.</td></tr>
           <tr><td class="k">DHCP_EXCLUSION_OCTET_RANGES</td><td class="muted">cluster-lifecycle-config</td><td class="muted">The ONE DHCP policy knob, per segment type, written into every cluster file's block (HC required). Validated at worker startup.</td></tr>
           <tr><td class="k">DAY2_SIG_REPO_URL_TEMPLATE · DAY2_SIG_PATH_TEMPLATE</td><td class="muted">cluster-lifecycle-config</td><td class="muted">The sig repos: the URL with <code>{sig}</code> (production: one project per sig, tree at the root) or one repo with the tree under the path template (dev: <code>sigs/{sig}</code>).</td></tr>
-          <tr><td class="k">DAY2_GIT_TOKEN</td><td class="muted">optional Secret</td><td class="muted">The sig repos' push token; empty = the day1 token.</td></tr>
+          <tr><td class="k">DAY2_GIT_TOKEN</td><td class="muted">not rendered by the chart</td><td class="muted">The sig repos' push token; empty = <code>REDBULL_GIT_TOKEN</code>. The chart sets none: the group token pushes day1 and every sig repo.</td></tr>
         </tbody>
       </table>
     </div>

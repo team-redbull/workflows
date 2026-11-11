@@ -201,7 +201,6 @@ class TestDay2:
 
 class TestTheAssembledFile:
     EXPECTED_BLOCK = """\
-# === Added By Provision-Cluster Workflow ===
 vlanId: 23
 
 dhcp_values:
@@ -228,7 +227,14 @@ dhcp_values:
 
     def test_a_type_without_exclusions_renders_network_only(self):
         block = cluster_values.render_allocation_block(23, build_dhcp_values("10.20.90.0/24", []))
-        assert block == '# === Added By Provision-Cluster Workflow ===\nvlanId: 23\n\ndhcp_values:\n  network: "10.20.90.0"'
+        assert block == 'vlanId: 23\n\ndhcp_values:\n  network: "10.20.90.0"'
+
+    def test_the_block_carries_no_marker_comment(self):
+        # The operator, 2026-11-11: one push writes the whole file, so nothing needs separating.
+        assembled = cluster_values.assemble_cluster_file(EXAMPLE_CLUSTER_FILE, 23, DHCP)
+        added = assembled[len(EXAMPLE_CLUSTER_FILE):]
+        assert "#" not in added
+        assert not hasattr(cluster_values, "MARKER")
 
     def test_the_assembled_file_is_what_the_validator_derived_plus_the_allocation(self, tmp_path):
         """The block must parse into exactly the two keys the chart and the chain read."""
@@ -246,8 +252,9 @@ dhcp_values:
         }
 
 
+# What the day1 chain's injector appends: without a header since the CI-header
+# removal (APPLY-PROVISION-CLUSTER.md §4), with one from a chain not yet changed.
 CHAIN_SECTION = """
-# === Added by CI ===
 mcConfigMap:
 - name: nm-conf
   config: |
@@ -263,8 +270,10 @@ class TestTheRerunCheck:
     def test_the_same_text_is_the_same_file(self):
         assert cluster_values.same_cluster_file(self.assembled, self.assembled) is None
 
-    def test_the_chains_appended_mc_config_map_is_not_a_difference(self):
-        assert cluster_values.same_cluster_file(self.assembled + CHAIN_SECTION, self.assembled) is None
+    @pytest.mark.parametrize("header", ["", "# === Added by CI ===\n"], ids=["new-chain", "legacy-ci-header"])
+    def test_the_chains_appended_mc_config_map_is_not_a_difference(self, header):
+        section = CHAIN_SECTION.replace("\nmcConfigMap:", "\n" + header + "mcConfigMap:")
+        assert cluster_values.same_cluster_file(self.assembled + section, self.assembled) is None
 
     def test_the_chains_blank_line_respacing_is_not_a_difference(self):
         respaced = self.assembled.replace("\n\n", "\n").replace("nodepool:", "\nnodepool:") + "\n\n\n" + CHAIN_SECTION

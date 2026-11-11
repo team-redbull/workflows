@@ -15,8 +15,7 @@ day1 main ──┐
             │     sites/<site>/mces/<mce>/hostedClusters/<stem>.yaml
             │       = the person's text, verbatim
             │       + one blank line
-            │       + # === Added By Provision-Cluster Workflow ===
-            │         vlanId: <vlan>
+            │       + vlanId: <vlan>          (no marker comment)
             │         dhcp_values: {network, exclusions}
             │     NO [skip ci]
             │
@@ -24,7 +23,8 @@ day1 main ──┐
             │       allocate_segments   → "already carries allocation state — skipping"
             │       stage_mc_sources    → mc-files/<clusterName>/ from the names + vlanId + mastertag
             │       render_mc_configs   → butane
-            │       inject_configs      → appends `# === Added by CI ===` + mcConfigMap: [...]
+            │       inject_configs      → appends mcConfigMap: [...] (no CI header since the
+            │                             APPLY-PROVISION-CLUSTER.md §4.5 patch; a legacy one is removed)
             │       commit_and_push     → CI: Update mcConfigMap from mc-files [skip ci]
             │
             │  3. provision-cluster: the merge request from provision-cluster/<stem> to main

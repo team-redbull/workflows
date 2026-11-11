@@ -195,14 +195,15 @@ class TestPublish:
         assert (published.changed, published.commit_sha, published.branch) == (False, None, BRANCH)
         assert _git("rev-parse", BRANCH, cwd=origin).strip() == before
 
-    async def test_a_rerun_after_the_chains_mc_config_map_commit_is_a_no_op(self, origin, tmp_path):
+    @pytest.mark.parametrize("header", ["", "# === Added by CI ===\n"], ids=["new-chain", "legacy-ci-header"])
+    async def test_a_rerun_after_the_chains_mc_config_map_commit_is_a_no_op(self, origin, tmp_path, header):
         """Production's shape: the day1 CI chain appends mcConfigMap in its own commit."""
         await _publish(origin)
 
         def inject(checkout: Path) -> None:
             file = checkout / PATH
             text = file.read_text().replace("\n\n", "\n")  # the injector re-spaces too
-            file.write_text(text.rstrip("\n") + "\n\n# === Added by CI ===\nmcConfigMap:\n- name: nm-conf\n  config: |\n    kind: MachineConfig\n")
+            file.write_text(text.rstrip("\n") + "\n\n" + header + "mcConfigMap:\n- name: nm-conf\n  config: |\n    kind: MachineConfig\n")
 
         _push_onto_branch(origin, tmp_path, "ci", inject, "CI: Update mcConfigMap from mc-files [skip ci]")
         before = _git("rev-parse", BRANCH, cwd=origin).strip()

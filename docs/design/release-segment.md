@@ -42,11 +42,12 @@ allocate path forecloses it:
 
 - the Segments Manager already has `POST /api/segments/release` (keyed by the
   CIDR alone, idempotent for an already-Available segment);
-- the block allocate-segment appends to a cluster's values file is designed to
-  be strippable — it starts at a fixed marker line and runs to end of file,
-  and `cluster_values.split_marker_block` /
-  `cluster_values.render_allocation_block` (activities/cluster_lifecycle/) are the shared parse/render pair a
-  `remove_allocation_from_cluster_values` reuses unchanged.
+- the allocation block provision-cluster appends to a cluster's file is two
+  top-level keys, `vlanId` and `dhcp_values`, rendered by
+  `cluster_values.render_allocation_block` (activities/cluster_lifecycle/). It
+  carries NO marker line since 2026-11-11 (one push writes the whole file, so
+  nothing needed separating), so a `remove_allocation_from_cluster_values`
+  strips those two keys by name, never by a comment.
 
 ## The flow, when it is built
 
@@ -59,7 +60,7 @@ run(ReleaseSegmentRunArgs{input: {cluster, type=HC}})
   3. verify by read-back        GET /api/segments/by-segment
                                 → status Available ∧ cluster_name None ∧ type None
                                   (release clears the type allocation stamped on)
-  4. clean the values file      strip the marker block (split_marker_block),
+  4. clean the values file      strip the vlanId + dhcp_values keys,
                                 commit, push — same clone/push plumbing as
                                 publish_cluster_file (provision-cluster)
 ```
@@ -105,7 +106,7 @@ From `hcAppset.yaml`'s own comment: *"A `files` generator has nothing to
 template from an empty file… a placeholder left empty fails the generator
 rather than being skipped."* A release that restores the file byte-for-byte to
 0 bytes (plausible when the file was empty before allocate-segment wrote the
-block, since the marker is then the first line) **breaks Application
+block, since the block is then the whole file) **breaks Application
 generation for that whole MCE**.
 
 So release must either:

@@ -1198,8 +1198,8 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   `TEMPORAL_NAMESPACE`, `SEGMENTS_MANAGER_URL`. `<domain>-config` (owned by that domain's
   chart) holds its own endpoints/policy — e.g. `cluster-lifecycle-config` = provision-cluster's keys
   (`DAY1_REPO_URL`, `DAY1_GIT_PROVIDER`, `DHCP_EXCLUSION_OCTET_RANGES`, `DAY2_SIG_REPO_URL_TEMPLATE`,
-  `DAY2_SIG_PATH_TEMPLATE`; the credentials from the shared `redbull-git-token` Secret as
-  `DAY1_GIT_TOKEN`, and optionally `DAY2_GIT_TOKEN`) and `segment-lifecycle-config` = release-segment's
+  `DAY2_SIG_PATH_TEMPLATE`; the credentials from the shared `redbull-git-token` Secret under its
+  own key, `REDBULL_GIT_TOKEN`, and optionally `DAY2_GIT_TOKEN`) and `segment-lifecycle-config` = release-segment's
   `DHCP_API_URL` (its token in the `dhcp-api-token` Secret) — the day1 and DHCP-policy keys it
   rendered for allocate-segment are dropped only once its image stops reading them. A
   domain worker mounts BOTH + its Secrets, so the
@@ -1212,7 +1212,8 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   worker only; this one: `DAY1_REPO_URL`/`DAY1_GIT_TOKEN` again, `KV_CAPACITY_URL_TEMPLATE` /
   `KV_VM_API_URL_TEMPLATE` with their placeholders checked at startup, the two tokens, `KV_AGENT_CA`,
   `HEADROOM_BUFFER_PERCENT` 0..90 and `VM_MAC_PREFIX` — locally administered unicast, checked) and
-  `ClusterLifecycleActivitySettings` (`DAY1_REPO_URL`/`DAY1_GIT_TOKEN`, `DAY1_GIT_PROVIDER` gitlab|github,
+  `ClusterLifecycleActivitySettings` (`DAY1_REPO_URL`, `REDBULL_GIT_TOKEN` — the air-gap Secret's key, the
+  operator 2026-11-11; `DAY1_GIT_TOKEN` accepted as an alias, the air-gap name winning — `DAY1_GIT_PROVIDER` gitlab|github,
   `DHCP_EXCLUSION_OCTET_RANGES` with its validator — moved here from segment-lifecycle 2026-11-11 —
   `DAY2_SIG_REPO_URL_TEMPLATE` + `DAY2_SIG_PATH_TEMPLATE`, one of which must name `{sig}`, and
   `DAY2_GIT_TOKEN`, the day1 token when empty). Field names = Helm ConfigMap/Secret keys
@@ -1276,7 +1277,7 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   SA, `automountServiceAccountToken: false`, an optional CA ConfigMap; it NAMES the
   `redbull-git-token` Secret and never renders it) and `gitops/charts/cluster-lifecycle-worker/`
   (provision-cluster's hub limb: ConfigMap + limb + SA, `automountServiceAccountToken: false`; it
-  NAMES `redbull-git-token` for `DAY1_GIT_TOKEN` and an optional second Secret for `DAY2_GIT_TOKEN`;
+  NAMES `redbull-git-token` for `REDBULL_GIT_TOKEN` and an optional second Secret for `DAY2_GIT_TOKEN`;
   `build-vm-lifecycle-worker` and `build-cluster-lifecycle-worker` are the last two in CI's
   sequential chain). This repo ships the PER-MCE limbs' charts, written to be copied into
   redbull-platform for Argo CD (example ApplicationSet in `deploy/argocd/`):

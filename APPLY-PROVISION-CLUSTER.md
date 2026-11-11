@@ -572,7 +572,7 @@ config:
   day2SigRepoUrlTemplate: "https://<GITLAB>/redbull/gitops-day2-prod/sigs/{sig}.git"
   day2SigPathTemplate: ""
 secrets:
-  # The one Secret every git limb reads (gitops/SECRETS.md). The pod gets it as DAY1_GIT_TOKEN.
+  # The one Secret every git limb reads (gitops/SECRETS.md). The pod gets it as REDBULL_GIT_TOKEN.
   # For provision-cluster it must also reach the GitLab API (`api` + `write_repository`).
   gitTokenSecret:
     name: redbull-git-token
@@ -591,13 +591,13 @@ activityWorker:
 
 ### 5.3 `templates/config.yaml`, `templates/activity-worker.yaml`, `gitops/services/cluster-lifecycle-worker/app.yaml` — new
 
-Copy the three files verbatim from this repo's dev checkout of redbull-platform
+Copy the three files verbatim from the dev redbull-platform's `main`
 (`gitops/charts/cluster-lifecycle-worker/templates/` and
-`gitops/services/cluster-lifecycle-worker/app.yaml`, branch
-`feat/cluster-lifecycle-worker`), or from the chart section of the docs page.
+`gitops/services/cluster-lifecycle-worker/app.yaml`). Only `values.yaml` differs
+between the two environments (§5.2).
 Nothing in them is environment-specific: the ConfigMap renders the five keys
 above, the Deployment mounts `workflows-orchestrator-config` +
-`cluster-lifecycle-config`, maps the Secret onto `DAY1_GIT_TOKEN` (and
+`cluster-lifecycle-config`, maps the Secret's key onto `REDBULL_GIT_TOKEN` (and
 `DAY2_GIT_TOKEN` when a second Secret is named), `automountServiceAccountToken:
 false`, no Namespace; `app.yaml` is `namespace: redbull-workflows`.
 

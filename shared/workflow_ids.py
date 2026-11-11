@@ -243,6 +243,21 @@ def upgrade_control_plane_workflow_id(mce_cluster: str, slot: int) -> str:
     return f"upgrade-control-plane-{mce_cluster}_{slot}"
 
 
+def provision_cluster_workflow_id(cluster: str) -> str:
+    """`provision-cluster-<cluster>`: one provisioning of a hosted cluster at a time.
+
+    Keyed on the day1 file STEM (`ocp4-<clusterName>`, canonical at the edge): it
+    is the Argo CD Application's name and the Segments Manager's `cluster_name`,
+    so two runs on it would race for one file, one branch and one segment. No
+    MCE in it: cluster names are unique across day1 (the chart keys the
+    HostedCluster and its namespace on the name alone), so the MCE is where the
+    file goes, not what makes the run unique. A second request while a run
+    waits for its merge is a 409; a run that COMPLETED frees the id, and the
+    next run on it fails at once as ClusterAlreadyProvisionedError.
+    """
+    return f"provision-cluster-{cluster}"
+
+
 def create_vm_slot_workflow_id(mce_cluster: str, infra_env: str, slot: int) -> str:
     """`create-vm-<mce>_<infraEnv>_<slot>`: one of the PARALLEL creates for an InfraEnv.
 

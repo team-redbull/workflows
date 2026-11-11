@@ -21,9 +21,8 @@ TWO KINDS live here, and the difference is which side may RAISE them:
     `non_retryable_error_types` would be inert, because workflow failures are
     never retried. Each is marked WORKFLOW-RAISED below.
 
-Four workflow-raised types predate the `Error` suffix and keep their names:
-`UnsupportedSegmentType`, `ValuesBranchMissing`, `UnknownSite` and
-`AllocationNotConfirmed`. The type name is what a failed run reports on the
+Three workflow-raised types predate the `Error` suffix and keep their names:
+`UnsupportedSegmentType`, `UnknownSite` and `AllocationNotConfirmed`. The type name is what a failed run reports on the
 status endpoint, what the day1 pipeline and the docs show, and what tests pin,
 so the class takes the existing name rather than renaming the failure.
 """
@@ -79,8 +78,9 @@ class SegmentConflictError(OrchestratorError):
 
 class ClusterFileNotFoundError(OrchestratorError):
     """No `<cluster>.yaml` exists anywhere under the values repo's clusters
-    root — the cluster the caller asked to allocate a segment for has no
-    values file to write the allocation into.
+    root — the cluster the caller named has no day1 file (the cluster-upgrade
+    hub limb reads it; allocate-segment used to, before provision-cluster owned
+    the file).
 
     Deterministic — the file has to be created by whoever defines the cluster,
     so workflows list this type in non_retryable_error_types.
@@ -107,18 +107,6 @@ class SegmentPoolExhaustedError(OrchestratorError):
     """
 
 
-class ClusterValuesConflictError(OrchestratorError):
-    """The cluster's values file already carries an allocation that disagrees
-    with this one — a marker block with different values, or a `dhcp_values` /
-    top-level `vlanId` key written by something other than this workflow.
-
-    Appending anyway would create a duplicate top-level YAML key, which
-    silently discards the first block (taking scopeName/pxe/gateway/failover
-    with it). Deterministic — only a human can decide which allocation is
-    right, so non-retryable.
-    """
-
-
 class ValuesRepoGitError(OrchestratorError):
     """A git operation against the values repo failed (ls-remote, clone,
     commit, push — including a rejected non-fast-forward push).
@@ -131,8 +119,8 @@ class ValuesRepoGitError(OrchestratorError):
 
 
 class ValuesBranchNotFoundError(OrchestratorError):
-    """The values-repo branch the run names (`values_branch`) does not exist on
-    the remote: `git ls-remote --exit-code --heads` found no
+    """The branch a limb asked the values repo for does not exist on the
+    remote: `git ls-remote --exit-code --heads` found no
     `refs/heads/<branch>`.
 
     Deterministic — the caller (the day1 pipeline) passes the branch it runs
@@ -199,24 +187,24 @@ class UnsupportedSegmentType(OrchestratorError):
     """
 
 
-class ValuesBranchMissing(OrchestratorError):
-    """WORKFLOW-RAISED. An allocate-segment run carries no `values_branch`.
+class SiteMissingError(OrchestratorError):
+    """WORKFLOW-RAISED. An allocate-segment run carries no `site`.
 
-    The branch is a per-run input with no fallback (a fallback would push to
-    main by omission), and the API requires it, so only a run started some
-    other way can lack it. Also raised by the segment-lifecycle activities that
-    clone the values repo, as `ApplicationError(..., non_retryable=True)` under
-    this same name, for a request that reaches them without one.
+    The site is the run's input since provision-cluster owns the cluster file
+    (it reads the site from the file's folder and passes it on); the API
+    requires it, so only a run started some other way can lack it, and there
+    is no fallback to guess one from.
     """
 
 
 class UnknownSite(OrchestratorError):
-    """WORKFLOW-RAISED. The cluster's values file sits under a site the
-    Segments Manager does not know.
+    """WORKFLOW-RAISED. The site the run was given is one the Segments
+    Manager does not know.
 
-    The site is derived from the file's path in the day1 repo
-    (sites/<site>/...) and cross-checked against `GET /api/sites` before
-    anything is allocated, so a repo layout mistake fails loudly here.
+    allocate-segment takes the site as input (provision-cluster reads it from
+    the day1 folder the cluster file goes in) and cross-checks it against
+    `GET /api/sites` before anything is allocated, so a folder or spelling
+    mismatch between day1 and the Segments Manager fails loudly here.
     """
 
 
@@ -1236,3 +1224,90 @@ class VmRootDiskNotBoundError(OrchestratorError):
     deleted its own VM first (phase `removing-vm`): a re-run draws a new suffix
     and could never converge on the orphan.
     """
+
+
+# --- cluster-lifecycle ------------------------------------------------------
+
+
+class MceFolderNotFoundError(OrchestratorError):
+    """No `sites/<site>/mces/<mce>` folder of that exact name exists at day1 `main`.
+
+    The MCE folder is where the cluster file goes, named by the caller
+    verbatim; retrying cannot make a folder appear. Deterministic — non-retryable.
+    """
+
+
+class AmbiguousMceFolderError(OrchestratorError):
+    """More than one site holds a `mces/<mce>` folder of that name. An MCE lives
+    at one site, so this is a day1 layout mistake a human must resolve — the
+    run never guesses which. Deterministic — non-retryable."""
+
+
+class ClusterAlreadyProvisionedError(OrchestratorError):
+    """`sites/<site>/mces/<mce>/hostedClusters/<cluster>.yaml` already exists at
+    day1 `main`: the cluster is provisioned (or a file of its name is), and this
+    workflow creates files, never rewrites one. Deterministic — non-retryable;
+    changing an existing cluster is an edit on day1, not a run here."""
+
+
+class ClusterValuesRejectedError(OrchestratorError):
+    """The hosted-cluster YAML would not render as a cluster: a required key is
+    missing (`mastertag`, `nodepool`, `owner.{merkaz,anaf,mador}`), a key this
+    workflow writes or the chain adds is already there (`vlanId`, `dhcp_values`,
+    `mcConfigMap`, `AutomateAllocation`), `clusterName` disagrees with the file
+    name, a config name is not a DNS-1123 label, a key is written twice, or the
+    merged value layers have a problem. The message lists EVERY reason.
+    Deterministic — non-retryable."""
+
+
+class ClusterFileConflictError(OrchestratorError):
+    """The branch `provision-cluster/<cluster>` exists and does not carry THIS
+    cluster file: a different spec, no file at all, or one that does not parse.
+    A re-run converges only onto its own work (the day1 chain's appended
+    `mcConfigMap` is not a difference); anything else a human has to look at.
+    Deterministic — non-retryable."""
+
+
+class GitProviderError(OrchestratorError):
+    """The day1 git provider's API (GitLab or GitHub) failed in a way a retry can
+    fix: unreachable, a 5xx, a 409 for a merge request born between the find
+    and the create (the retry finds it). Transient by classification —
+    deliberately NOT in non_retryable_error_types."""
+
+
+class GitProviderAuthError(OrchestratorError):
+    """The git provider rejected the token (401/403). Deterministic — a bad
+    DAY1_GIT_TOKEN, or one without `api` scope, never fixes itself. Non-retryable."""
+
+
+class GitProviderRequestRejectedError(OrchestratorError):
+    """The git provider refused the request as sent (400/404/422): no such
+    project or repository at DAY1_REPO_URL for this token, no `main` to merge
+    into, a merge request that is gone. The provider's own message is carried
+    through, bounded. Deterministic — non-retryable."""
+
+
+class AllocateSegmentAlreadyRunningError(OrchestratorError):
+    """WORKFLOW-RAISED. allocate-segment is already running for this cluster
+    (someone started it by hand, or a previous provision-cluster run's child is
+    still going). The id is named; let it finish, then re-run."""
+
+
+class AllocateSegmentFailedError(OrchestratorError):
+    """WORKFLOW-RAISED. The allocate-segment child failed; the message carries
+    the child's own failure type and message (an unknown site, an exhausted
+    pool, an allocation that did not verify). Nothing was pushed to day1."""
+
+
+class MergeRequestClosedError(OrchestratorError):
+    """WORKFLOW-RAISED. The merge request was closed WITHOUT merging while the
+    run waited for the merge. The branch and the allocation stand; a person
+    decided against the cluster, and this run says so instead of waiting on.
+    Re-running the same cluster re-opens a merge request for the same branch."""
+
+
+class Day2EnvMissingError(OrchestratorError):
+    """WORKFLOW-RAISED. The target lists day2 sigs to register the cluster in but
+    carries no environment folder for them — a limb older than the field, or a
+    limb bug: inspect_cluster_target derives both together. Nothing was pushed
+    to day2; the merged cluster file stands."""

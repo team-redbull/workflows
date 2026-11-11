@@ -7,3 +7,6 @@ pydantic-settings>=2,<3
 # Lightweight web deps only — still no activity-execution libraries.
 fastapi>=0.110,<1
 uvicorn>=0.29,<1
+# provision-cluster's route parses the hosted-cluster YAML body once at the edge
+# (workflow_domains/cluster_lifecycle/router.py). Never imported by workflow code.
+PyYAML>=6,<7

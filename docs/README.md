@@ -33,6 +33,8 @@ docs/
       upgrade-targets.html
     vm-lifecycle/
       create-vm.html
+    cluster-lifecycle/
+      provision-cluster.html
     assets/
       site.css                     every page's styling
       nav.js                       THE workflow catalogue + topbar menu behaviour

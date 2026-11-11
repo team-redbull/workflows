@@ -74,14 +74,19 @@ workflow_domains/                 The brain — one folder per domain, plus main
                                     (its pure rules), dispatch.py, router.py (not
                                     mounted yet)
   vm_lifecycle/                   create_vm.py, router.py
+  cluster_lifecycle/              provision_cluster.py, router.py (the body is the
+                                    hosted-cluster YAML itself)
   routers/                        What no domain owns: deps, shared models, runs.py
                                     (status), slots.py (the free-slot walk)
 activities/<domain>/              The limbs
   activities.py                   The @activity.defn surface ONLY — thin
   <technology>.py                 One module per dependency, plain parameters, no
                                     settings and no Temporal, so each is testable
-                                    with no worker: values_repo.py (git),
-                                    dhcp_api.py (the DHCP scope API),
+                                    with no worker: cluster_lifecycle/day1_writer.py
+                                    (the cluster file on its branch), git_provider.py
+                                    (GitLab/GitHub merge requests), day2_sigs.py (the
+                                    sig repos), cluster_values.py (what a file must
+                                    look like), dhcp_api.py (the DHCP scope API),
                                     server_scan.py (the inventory API),
                                     cluster_api.py (the Kubernetes API, its
                                     idempotency rule and error classification),
@@ -105,7 +110,8 @@ The prod charts are vendored into the Argo CD repo, not this one:
 | `redbull-platform/gitops/charts/segment-lifecycle-worker/` | the `segment-lifecycle-worker` limb |
 | `redbull-platform/gitops/charts/server-lifecycle-worker/` | the `server-lifecycle-worker` limb |
 | `redbull-platform/gitops/charts/server-provisioning-worker/` | the `server-provisioning-worker` limb — no `gitops/services/` entry yet, so nothing deploys it |
-| `redbull-platform/gitops/charts/vm-lifecycle-worker/` | the `vm-lifecycle-worker` limb (create-vm) — ONE release on the hub for every zone; needs the `kv-capacity-token` and `kv-vm-api-token` Secrets and mounts the segment-lifecycle chart's `day1-git-token` — not on redbull-platform's `main` yet, so CI's image bump fails until it is |
+| `redbull-platform/gitops/charts/vm-lifecycle-worker/` | the `vm-lifecycle-worker` limb (create-vm) — ONE release on the hub for every zone; needs the `kv-capacity-token` and `kv-vm-api-token` Secrets and reads the shared `redbull-git-token` — not on redbull-platform's `main` yet, so CI's image bump fails until it is |
+| `redbull-platform/gitops/charts/cluster-lifecycle-worker/` | the `cluster-lifecycle-worker` limb (provision-cluster) — ONE release on the hub; reads the shared `redbull-git-token` (day1 push + its provider's merge-request API, the day2 sig repos) — not on redbull-platform's `main` yet either |
 | `redbull-platform/gitops/charts/cluster-upgrade-worker/`, `.../upgrade-agent-worker/` | cluster-upgrade's per-MCE limbs, copied from `deploy/charts/` here by CI (`sync-upgrade-charts`) on every `main` push that changes them — no `gitops/services/` entry yet |
 | `redbull-platform/gitops/charts/upgrade-gitops-worker/` | cluster-upgrade's hub limb (its only copy) — no `gitops/services/` entry yet |
 
@@ -122,7 +128,8 @@ Each has its own workflow queue and its own deterministic id. The three
 segment-lifecycle workflows share the one `segment-lifecycle-activity` queue and
 therefore the one limb deployment; `add-server-to-mce` runs on
 `server-lifecycle-activity` and reaches back to the segment-lifecycle queue for
-one activity (below).
+one activity (below); `provision-cluster` runs on `cluster-lifecycle-activity`
+and starts `allocate-segment` as an awaited child.
 
 **The server-lifecycle workflows were renamed on 2026-11-01**, so each name says
 what it does to what:
@@ -715,29 +722,81 @@ agents the platform deploys there behind Routes (`kv-capacity`, `kv-vm-api`;
 their contract is `docs/design/kv-agents-api.md`), one fleet token each. Until
 they are up, a run waits with every cluster `no-agent`.
 
-### `allocate-segment` — give a cluster a segment
+### `provision-cluster` — a hosted cluster from the YAML a person wrote
 
-Takes the cluster, the **values-repo branch** to record on, and the **type** to
-allocate as (default `HC`):
+The body **is the hosted-cluster file**, as a person would commit it to day1 —
+without `vlanId`, `dhcp_values` or `mcConfigMap`; the cluster and its MCE folder
+are query parameters (Swagger's "Try it out" shows this file pre-filled):
 
-```json
-{"cluster": "ocp4-prep-herzi-site1-a", "values_branch": "feature/ocp4-prep-herzi-site1-a"}
+```
+POST /workflows/cluster-lifecycle/provision-cluster?cluster=prep-e2e-site2-a&mce=ocp4-prep-mce-site2-a
+Content-Type: application/yaml
+
+owner:
+  merkaz: "unit-a"
+  anaf: "unit-b"
+  mador: "unit-c"
+
+mastertag: 4.22.8
+
+nodepool:
+- infraEnvName: dell-r660-site4-128c-1024gb-5tb
+  replicas: 2
+  labels:
+    allowDeletion: false
+  configs:
+  - name: nm-conf
+  - name: worker-kubeletconfig-reserved
+  - name: nic-ring-buffer
+  - name: workers-chrony-configuration
 ```
 
-Locate the cluster's values file on that branch of the day1 repo (the path gives
-the site, cross-checked against `GET /api/sites`), allocate a segment from the
-Segments Manager — any Available segment at the site, which becomes the requested
-type in the same step — **read it back** to verify status/cluster/vlan/type all
-match, then append the `vlanId` + `dhcp_values` block to the file and push it to
-that branch with `[skip ci]`. The run ends there. HC only for now; any other type
-is rejected up front, and a branch the repo does not have fails with
-`ValuesBranchNotFoundError`.
+The run reads day1 `main` for the MCE folder (found by name under
+`sites/*/mces/`, never derived), refuses a cluster that already has a file
+there, and judges the text against the merged value layers the way the chart
+renders them — every reason in one failure. Then **allocate-segment runs as an
+awaited child** (a /24 at the folder's site, verified), the text plus the
+allocation block is pushed to `provision-cluster/<cluster>` (created from main
+by the push, **no `[skip ci]`**: the day1 CI chain runs on the branch, skips
+allocation, renders the MachineConfigs and pushes its own `mcConfigMap` commit
+on top), the merge request is opened (GitLab in production with
+`remove_source_branch`, a pull request on GitHub in dev), and the run **waits
+for a person to merge it** — no deadline, a 5-minute durable timer, continued
+as new every 48 polls so history stays short. After the merge it registers the
+cluster in every day2 sig the value layers list under `day2.copy_to_sigs`
+(`sites/<site>/<env>/mces/<mce>/<cluster>/.gitkeep` on the sig repo's default
+branch) and completes. A merge request closed without merging fails the run.
 
-It runs as a step **inside the day1 values repo's CI pipeline**, which runs on a
-temporary branch only: the pipeline passes its own `$CI_COMMIT_BRANCH`, waits for
-the run, then generates the MachineConfig files from the recorded `vlanId`; a
-human merges afterwards. There is no DHCP scope wait: Argo CD reads `main` only,
-so the scope appears after that merge, outside the run (see CLAUDE.md §4).
+Re-running the same cluster converges: the branch's file is compared
+semantically (the chain's `mcConfigMap` set aside), the open merge request is
+found, folders already there are success. A cluster already on `main` fails
+`ClusterAlreadyProvisionedError` at once; a second request while a run waits
+for its merge is a 409. See `docs/design/provision-cluster.md` and the
+[docs page](docs/site/cluster-lifecycle/provision-cluster.html).
+
+### `allocate-segment` — give a cluster a segment
+
+Takes the cluster, the **site** to allocate at (the day1 folder the cluster's
+file goes in, as the Segments Manager spells it) and the **type** to allocate
+as (default `HC`):
+
+```json
+{"cluster": "ocp4-prep-herzi-site1-a", "site": "site1"}
+```
+
+Cross-check the site against `GET /api/sites`, allocate a segment from the
+Segments Manager — any Available segment at the site, which becomes the
+requested type in the same step — and **read it back** to verify
+status/cluster/vlan/type all match. The run ends there: nothing is written to
+git. HC only for now; any other type is rejected up front.
+
+It is normally started by **provision-cluster as an awaited child**, which
+records the allocation in the cluster file it publishes; the route stays for a
+manual allocation on the same id, so the two dedup. Until 2026-11-11 the run
+pushed the `vlanId` + `dhcp_values` block to a day1 branch the caller named
+(`values_branch`, the day1 pipeline's own) — that field is now a 422 saying so.
+There is no DHCP scope wait: Argo CD reads `main` only, so the scope appears
+after a human merges the cluster file, outside the run (see CLAUDE.md §4).
 
 ### `release-segment` — give a decommissioned cluster's segment back
 
@@ -773,7 +832,7 @@ result.
 | --- | --- |
 | `POST /workflows/segment-lifecycle/initialize-segment` | one segment |
 | `POST /workflows/segment-lifecycle/initialize-segment/bulk` | one workflow PER segment |
-| `POST /workflows/segment-lifecycle/allocate-segment` | one allocation |
+| `POST /workflows/segment-lifecycle/allocate-segment` | one allocation (manual; provision-cluster starts it as a child) |
 | `POST /workflows/segment-lifecycle/release-segment` | one release (after the cluster's Application is gone) |
 | `POST /workflows/server-lifecycle/add-server-to-mce` | one workflow PER server into an InfraEnv: one from its pool, `count` from its pool in parallel, or the machines in `server_names` |
 | `POST /workflows/server-lifecycle/remove-server-from-mce` | one server out of an MCE's inventory |
@@ -782,6 +841,7 @@ result.
 | `POST /workflows/server-provisioning/provision-dell-server` | one Dell server, by iDRAC IP |
 | `POST /workflows/server-provisioning/provision-dell-server/bulk` | one workflow PER iDRAC IP |
 | `POST /workflows/vm-lifecycle/create-vm` | one workflow PER VM for a KubeVirt InfraEnv: one in the first free slot, or `count` in parallel |
+| `POST /workflows/cluster-lifecycle/provision-cluster?cluster=&mce=` | one hosted cluster from the YAML in the body (`application/yaml`): segment, day1 branch, merge request, the wait for the merge, day2 |
 | `GET  /workflows/runs/{workflow_id}` | (status, every domain) |
 
 ### Paths: `/workflows/<domain>/<workflow>`, status on `/workflows/runs`
@@ -847,12 +907,15 @@ would hide which segments actually got a workflow.
 | --- | --- | --- |
 | `TEMPORAL_HOST`, `TEMPORAL_NAMESPACE` | `workflows-orchestrator-config` | shared by every domain |
 | `SEGMENTS_MANAGER_URL` | `workflows-orchestrator-config` | shared by every domain |
-| `DAY1_REPO_URL` | `segment-lifecycle-config` | allocate-segment's values repo (the branch is per run) |
-| `DHCP_EXCLUSION_OCTET_RANGES` | `segment-lifecycle-config` | DHCP policy |
 | `DHCP_API_URL` | `segment-lifecycle-config` | release-segment's DHCP scope API (GETs anonymous) |
 | `SEGMENTS_MANAGER_API_TOKEN` | Secret | mutating calls only; GETs are public |
-| `DAY1_GIT_TOKEN` | Secret `day1-git-token` | push rights; scrubbed from every error |
 | `DHCP_API_TOKEN` | Secret `dhcp-api-token` | the scope DELETE; a copy of the DHCP API's own token — rotate together |
+| `DAY1_REPO_URL` | `cluster-lifecycle-config` | provision-cluster's day1 repo: read at `main`, pushed on `provision-cluster/<cluster>` (the same repo the vm-lifecycle and upgrade-gitops charts name) |
+| `DAY1_GIT_PROVIDER` | `cluster-lifecycle-config` | `gitlab` (production: a merge request with `remove_source_branch`) or `github` (dev: a pull request) |
+| `DHCP_EXCLUSION_OCTET_RANGES` | `cluster-lifecycle-config` | the DHCP policy written into every cluster file (was segment-lifecycle's until 2026-11-11) |
+| `DAY2_SIG_REPO_URL_TEMPLATE`, `DAY2_SIG_PATH_TEMPLATE` | `cluster-lifecycle-config` | the day2 sig repos: the URL with `{sig}` (production: one GitLab project per sig, tree at the root) or one repo with the tree under the path template (dev: `sigs/{sig}`) |
+| `DAY1_GIT_TOKEN` | Secret `redbull-git-token`, key `REDBULL_GIT_TOKEN` | push rights AND the provider's API (GitLab `api` + `write_repository`, GitHub `repo`); scrubbed from every error |
+| `DAY2_GIT_TOKEN` | optional Secret | the sig repos' push token; empty = the day1 token |
 | `MCE_CLUSTER` | `server-lifecycle-config` | which MCE this worker serves — names its queue, so it must match callers' `mce_cluster` |
 | `SERVER_SCAN_URL` | `server-lifecycle-config` | inventory API base, INCLUDING `/api/v1` |
 | `SERVER_SCAN_API_TOKEN` | Secret | an **admin** token — add-server-to-mce takes and releases the install lock |
@@ -866,8 +929,7 @@ would hide which segments actually got a workflow.
 | `SERVER_NAMER_URL` | `server-provisioning-config` | the naming service |
 | `SERVER_NAMER_API_TOKEN` | Secret | optional bearer token |
 | `SERVER_SCAN_URL`/`_API_TOKEN` | as above | the provisioning worker reads it too (a viewer token) |
-| `DAY1_REPO_URL` | `vm-lifecycle-config` | create-vm lists a zone's KubeVirt clusters from it (read only) |
-| `DAY1_GIT_TOKEN` | Secret `day1-git-token` | the same Secret, mounted by the vm-lifecycle worker too — one Secret, three consumers |
+| `DAY1_REPO_URL` | `vm-lifecycle-config` | create-vm lists a zone's KubeVirt clusters from it (read only); the shared `redbull-git-token` is mapped onto `DAY1_GIT_TOKEN` here too |
 | `KV_CAPACITY_URL_TEMPLATE`, `KV_VM_API_URL_TEMPLATE` | `vm-lifecycle-config` | the agents' Routes per KubeVirt cluster: `{cluster}`, `{name}`, `{hosted_cluster}`, `{site}`, `{zone}` |
 | `KV_CAPACITY_TOKEN`, `KV_VM_API_TOKEN` | Secrets `kv-capacity-token`, `kv-vm-api-token` | the agents' fleet tokens; rotate each with its agents |
 | `KV_AGENT_CA` | chart value `kvAgentCa` | PEM CA for the agents' Routes; empty = **not verified** (the operator's decision) |
@@ -888,9 +950,10 @@ matching `SEGMENTS_MANAGER_API_TOKEN`.
 cp .env.example .env    # then point it at your Temporal / Segments Manager
 
 # Workers (from the repo root)
-pip install -r activities/segment_lifecycle/requirements.txt
+pip install -r activities/segment_lifecycle/requirements.txt -r activities/cluster_lifecycle/requirements.txt
 PYTHONPATH=. python -m workflow_domains.main_worker_init &
 PYTHONPATH=. python -m activities.segment_lifecycle.worker_init &
+PYTHONPATH=. python -m activities.cluster_lifecycle.worker_init &     # provision-cluster (git + the provider's API)
 
 # Unified API
 pip install -r requirements.txt
@@ -900,6 +963,9 @@ PYTHONPATH=. uvicorn workflow_domains.api:app --port 8080
 #   -H 'content-type: application/json' \
 #   -d '{"segment":"130.154.20.0/24","site":"site1","vlan_id":100,"epg_name":"EPG_PROD_01"}'
 # curl localhost:8080/workflows/runs/initialize-segment-130.154.20.0
+# curl -X POST -H 'content-type: application/yaml' --data-binary @cluster.yaml \
+#   'localhost:8080/workflows/cluster-lifecycle/provision-cluster?cluster=prep-e2e-site2-a&mce=ocp4-prep-mce-site2-a'
+# curl localhost:8080/workflows/runs/provision-cluster-ocp4-prep-e2e-site2-a
 ```
 
 Inspect runs in the Temporal UI and verify the segment in the manager:
@@ -938,18 +1004,24 @@ helm install workflows-orchestrator \
   --set config.temporalHost=<temporal-host>:7233 \
   --set config.segmentsManagerUrl=https://<segments-manager-route>
 
-# The limb sets its own day1/DHCP-policy config; it reads the global values from
-# workflows-orchestrator-config above.
+# The limbs read the global values from workflows-orchestrator-config above and
+# set their own.
 helm install segment-lifecycle-worker \
   ../redbull-platform/gitops/charts/segment-lifecycle-worker -n redbull-workflows \
   --set activityWorker.image.repository=<registry>/segment-lifecycle-worker \
+  --set secrets.segmentsManagerApiToken=<real-token>
+helm install cluster-lifecycle-worker \
+  ../redbull-platform/gitops/charts/cluster-lifecycle-worker -n redbull-workflows \
+  --set activityWorker.image.repository=<registry>/cluster-lifecycle-worker \
   --set config.day1RepoUrl=https://<values-repo> \
-  --set secrets.segmentsManagerApiToken=<real-token> \
-  --set secrets.day1GitToken=<real-token>
+  --set config.day1GitProvider=gitlab \
+  --set 'config.day2SigRepoUrlTemplate=https://<gitlab>/redbull/gitops-day2-prod/sigs/{sig}.git' \
+  --set config.day2SigPathTemplate=""
+# plus the redbull-git-token Secret (REDBULL_GIT_TOKEN) both charts' values name.
 ```
 
-Edit `config.dhcpExclusionOctetRanges` in the chart's `values.yaml` (then restart
-the activity workers) to change the DHCP policy without a rebuild.
+Edit `config.dhcpExclusionOctetRanges` in the cluster-lifecycle-worker chart's
+`values.yaml` (then restart that worker) to change the DHCP policy without a rebuild.
 
 ## Working on this repo with Claude Code
 

@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 
 from shared.settings import (
+    ClusterLifecycleActivitySettings,
     ClusterUpgradeActivitySettings,
     SegmentLifecycleActivitySettings,
     ServerLifecycleActivitySettings,
@@ -28,6 +29,7 @@ from shared.settings import (
 )
 
 for _settings_class in (
+    ClusterLifecycleActivitySettings,
     ClusterUpgradeActivitySettings,
     SegmentLifecycleActivitySettings,
     ServerLifecycleActivitySettings,
@@ -44,10 +46,14 @@ os.environ.update(
         "TEMPORAL_HOST": "localhost:7233",
         "SEGMENTS_MANAGER_URL": "http://segments-manager.test",
         "SEGMENTS_MANAGER_API_TOKEN": "test-token",
-        # --- allocate-segment: values repo + DHCP policy ---
+        # --- the day1 repo (cluster-lifecycle, upgrade-gitops, vm-lifecycle) ---
         "DAY1_REPO_URL": "https://git.test/team/gitops-day1-platform-config.git",
         "DAY1_GIT_TOKEN": "test-git-token",
+        # --- provision-cluster: the day1 provider, the DHCP policy, the day2 sigs ---
+        "DAY1_GIT_PROVIDER": "gitlab",
         "DHCP_EXCLUSION_OCTET_RANGES": '{"HC": [[1, 10], [241, 254]]}',
+        "DAY2_SIG_REPO_URL_TEMPLATE": "https://git.test/redbull/gitops-day2-prod/sigs/{sig}.git",
+        "DAY2_SIG_PATH_TEMPLATE": "",
         # --- add-server-to-mce: server-scan + BMC credentials ---
         # Names this worker's queue; one deployment serves one MCE.
         "MCE_CLUSTER": "ocp4-mce-test",

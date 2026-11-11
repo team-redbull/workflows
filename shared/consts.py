@@ -122,3 +122,13 @@ def upgrade_agent_activity_queue(mce_cluster: str) -> str:
 # nothing to run per KubeVirt cluster — one deployment serves every zone.
 CREATE_VM_WORKFLOW_QUEUE = "create-vm-workflow"
 VM_LIFECYCLE_ACTIVITY_QUEUE = "vm-lifecycle-activity"
+
+# -- Cluster-lifecycle domain --
+# ONE workflow today, provision-cluster, on its own queue; ONE activity queue,
+# on the hub: the limb holds the day1 git token, the day1 git provider's API
+# token (the same token, used for the merge request) and the day2 sig repos'
+# push token — a credential set no other limb has — and writes to no cluster.
+# It reaches the Segments Manager through allocate-segment, as an awaited child
+# on ALLOCATE_SEGMENT_WORKFLOW_QUEUE, never through a second copy of that token.
+PROVISION_CLUSTER_WORKFLOW_QUEUE = "provision-cluster-workflow"
+CLUSTER_LIFECYCLE_ACTIVITY_QUEUE = "cluster-lifecycle-activity"

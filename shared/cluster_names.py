@@ -74,6 +74,82 @@ def kv_cluster_prefix(site: str, zone: str) -> str:
     return f"{KV_CLUSTER_PREFIX}{name_token(site, "site")}-{name_token(zone, "zone")}"
 
 
+# --- hosted clusters: the day1 file stem and its parts ---------------------------------
+#
+# A hosted cluster's day1 file is `sites/<site>/mces/<mce>/hostedClusters/ocp4-<clusterName>.yaml`
+# (argocd-platform's `clusterFilePrefix`). The STEM, `ocp4-<clusterName>`, is the
+# Argo CD Application's name and the Segments Manager's `cluster_name`; the
+# chart gets `<clusterName>` (hcAppset.yaml strips the prefix). Callers name a
+# cluster either way, so the edge canonicalises to the stem — once, carried in
+# the run's input, never re-derived on replay (the MCE-name precedent above).
+
+HOSTED_CLUSTER_FILE_PREFIX = "ocp4-"
+# `hcp-<clusterName>` and HyperShift's `hcp-<clusterName>-openshift-<clusterName>`
+# must fit a 63-character DNS label: 24 keeps the longest at 59.
+MAX_HOSTED_CLUSTER_NAME_LENGTH = 24
+_DNS_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
+_MCE_FOLDER_ENV = re.compile(r"^ocp4-(?P<env>[a-z0-9]+)-mce(?:-|$)")
+
+
+class HostedClusterNameError(ValueError):
+    """The name is not a usable hosted-cluster name. A ValueError too, so a Pydantic
+    validator (or a route) turns it into a 422 at the API edge."""
+
+
+def hosted_cluster_stem(name: str) -> str:
+    """`prep-e2e-site2-a` or `ocp4-prep-e2e-site2-a` -> `ocp4-prep-e2e-site2-a`.
+
+    The clusterName part must be a lowercase DNS-1123 label of at most
+    MAX_HOSTED_CLUSTER_NAME_LENGTH characters: it becomes the `hcp-<name>`
+    namespace and the `openshift-<name>` HostedCluster.
+    """
+    cluster_name = name.strip().removeprefix(HOSTED_CLUSTER_FILE_PREFIX)
+    if not _DNS_LABEL.fullmatch(cluster_name):
+        raise HostedClusterNameError(
+            f"cluster {name!r} must be lowercase letters, digits and dashes, starting and ending "
+            f"with a letter or digit (with or without the {HOSTED_CLUSTER_FILE_PREFIX!r} prefix)"
+        )
+    if len(cluster_name) > MAX_HOSTED_CLUSTER_NAME_LENGTH:
+        raise HostedClusterNameError(
+            f"cluster name {cluster_name!r} is {len(cluster_name)} characters; at most "
+            f"{MAX_HOSTED_CLUSTER_NAME_LENGTH}, so hcp-<name>-openshift-<name> fits a DNS label"
+        )
+    return f"{HOSTED_CLUSTER_FILE_PREFIX}{cluster_name}"
+
+
+def hosted_cluster_name(stem: str) -> str:
+    """`ocp4-prep-e2e-site2-a` -> `prep-e2e-site2-a`: what hcAppset.yaml hands the chart."""
+    return stem.removeprefix(HOSTED_CLUSTER_FILE_PREFIX)
+
+
+def env_of_hosted_cluster(stem: str) -> str | None:
+    """`ocp4-prod-iac-site2-a` -> `prod`: the environment token day2 files a cluster under,
+    the first field of the clusterName. None when the name has no second field."""
+    fields = hosted_cluster_name(stem).split("-")
+    return fields[0] if len(fields) >= 2 and fields[0] else None
+
+
+PROVISION_CLUSTER_BRANCH_PREFIX = "provision-cluster/"
+
+
+def provision_cluster_branch(stem: str) -> str:
+    """`provision-cluster/<stem>`: the day1 branch a cluster's file is proposed on.
+
+    Named after the WORKFLOW and the cluster, so a reviewer reads what the
+    merge request is from its branch, and so a re-run converges onto the same
+    branch instead of opening a second one. Both sides build it: the workflow
+    (progress, the result) and the limb (the clone, the push).
+    """
+    return f"{PROVISION_CLUSTER_BRANCH_PREFIX}{stem}"
+
+
+def env_of_mce_folder(mce: str) -> str | None:
+    """`ocp4-prod-mce-site2-a` -> `prod`; None for a folder not named `ocp4-<env>-mce…`
+    (`ocp4-mce-site2`, `ocp4-mce-site4-prep` carry no environment)."""
+    match = _MCE_FOLDER_ENV.match(mce)
+    return match.group("env") if match else None
+
+
 def is_kv_cluster_of(name: str, site: str, zone: str) -> bool:
     """True when `name` is one of (site, zone)'s KubeVirt clusters.
 

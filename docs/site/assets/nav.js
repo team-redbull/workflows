@@ -19,6 +19,20 @@
 
   var CATALOGUE = [
     {
+      domain: "cluster-lifecycle",
+      // One hub limb: the day1 git token (a push and the provider's merge-request
+      // API) and the day2 sig repos' token; no Kubernetes credential. The
+      // segment comes from allocate-segment, started as an awaited child.
+      queue: "cluster-lifecycle-activity",
+      workflows: [
+        {
+          name: "provision-cluster",
+          href: "/cluster-lifecycle/provision-cluster.html",
+          blurb: "a hosted cluster from its YAML: segment, day1 branch, merge request, day2"
+        }
+      ]
+    },
+    {
       domain: "segment-lifecycle",
       queue: "segment-lifecycle-activity",
       workflows: [
@@ -30,7 +44,7 @@
         {
           name: "allocate-segment",
           href: "/segment-lifecycle/allocate-segment.html",
-          blurb: "reserve a VLAN + write the DHCP block"
+          blurb: "reserve a VLAN for a cluster and verify it"
         },
         {
           name: "release-segment",

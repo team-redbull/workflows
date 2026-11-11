@@ -20,7 +20,6 @@ from temporalio.worker import Worker
 
 from activities.segment_lifecycle.activities import (
     allocate_segment,
-    append_allocation_to_cluster_values,
     create_segment,
     get_inventory_segment,
     delete_dhcp_scope,
@@ -28,7 +27,6 @@ from activities.segment_lifecycle.activities import (
     get_dhcp_scope,
     get_segment,
     get_valid_sites,
-    locate_cluster_file,
     release_segment,
 )
 from shared.consts import SEGMENT_LIFECYCLE_ACTIVITY_QUEUE
@@ -52,10 +50,8 @@ async def main() -> None:
             create_segment,
             # allocate-segment (get_segment is release-segment's read-back too)
             get_valid_sites,
-            locate_cluster_file,
             allocate_segment,
             get_segment,
-            append_allocation_to_cluster_values,
             # add-server-to-mce (server-lifecycle domain) — routed to THIS queue
             # because the Segments Manager credential lives on this limb only.
             get_inventory_segment,

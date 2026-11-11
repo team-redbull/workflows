@@ -139,27 +139,27 @@ def test_failed_surfaces_the_root_cause(make_client):
 )
 def test_closed_run_still_reports_the_work_it_did(make_client, status):
     """A run that died PART WAY is when progress matters most — it is the only
-    report of the work already done (allocate-segment's phase says whether it
-    died before the allocation or after the values-repo push, whose commit
-    outlives it). Temporal answers queries on closed workflows, so the
-    endpoint must ask, and still surface the failure alongside."""
+    report of the work already done (provision-cluster's phase says whether it
+    died before the allocation or after the day1 push, whose branch outlives
+    it). Temporal answers queries on closed workflows, so the endpoint must
+    ask, and still surface the failure alongside."""
     failure = WorkflowFailureError(
         cause=ApplicationError(
-            "cluster-a.yaml already carries a segment-allocation block",
-            type="ClusterValuesConflictError",
+            "branch provision-cluster/cluster-a already carries a different cluster-a.yaml",
+            type="ClusterFileConflictError",
         )
     )
     handle = _FakeHandle(
         status,
-        progress={"phase": "updating-values-repo"},
+        progress={"phase": "publishing-cluster-file"},
         result_error=failure,
     )
     response = make_client(handle).get("/workflows/runs/allocate-segment-HC-cluster-a")
 
     body = response.json()
     assert body["status"] == status.name
-    assert body["progress"] == {"phase": "updating-values-repo"}
-    assert "already carries a segment-allocation block" in body["error"]
+    assert body["progress"] == {"phase": "publishing-cluster-file"}
+    assert "already carries a different cluster-a.yaml" in body["error"]
 
 
 def test_closed_run_progress_is_best_effort(make_client):

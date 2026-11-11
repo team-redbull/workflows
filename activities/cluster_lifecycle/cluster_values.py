@@ -8,18 +8,20 @@ tested with a string:
     them (activities/day1_repo.load_cluster_values). Every reason is
     collected; the ONE exception raised lists them all.
   * assemble_cluster_file — the text that goes to day1: the person's text,
-    byte for byte, then ONE blank line, then the allocation block under this
-    workflow's marker. No YAML round-trip ever: comments and layout survive.
+    byte for byte, then ONE blank line, then the allocation block (`vlanId`,
+    `dhcp_values`). No YAML round-trip ever: comments and layout survive.
   * same_cluster_file — the re-run check: the file on the branch means the
     same as the text this run would write, with the `mcConfigMap` key the
     day1 CI chain appends (in its own commit, after our push) set aside.
     Semantic, not textual: the chain's injector also re-spaces blank lines.
 
 The allocation block's layout lives in ONE place (render_allocation_block,
-moved from the retired activities/segment_lifecycle/values_repo.py); the
-marker names THIS workflow, so a reader of the file knows who wrote the
-block. day1's own scripts key on the `vlanId:` / `dhcp_values:` lines, never
-on the marker text.
+moved from the retired activities/segment_lifecycle/values_repo.py). It carries
+NO marker comment (the operator, 2026-11-11): the marker existed because
+several writers committed to one file in turn (a person, allocate-segment,
+the day1 chain), and since provision-cluster writes the whole file in one push
+there is nothing to separate. day1's own scripts key on the `vlanId:` /
+`dhcp_values:` lines, never on a comment.
 """
 
 from __future__ import annotations
@@ -33,8 +35,6 @@ from activities.day1_repo import load_cluster_values, load_yaml
 from shared.cluster_names import env_of_hosted_cluster, env_of_mce_folder
 from shared.exceptions import ClusterValuesRejectedError
 from shared.models.segment_lifecycle import DhcpValues
-
-MARKER = "# === Added By Provision-Cluster Workflow ==="
 
 # What the chart cannot render without (templates/owner-configmap.yaml is not
 # nil-safe; nodepool.yaml ranges over `nodepool`; hc.yaml needs `mastertag`).
@@ -227,7 +227,6 @@ def validate_cluster_values(root: Path, path: str, text: str, *, mce: str) -> Va
 # .1-.253, which the exclusions then carve the ends out of. vlanId is what the
 # day1 chain renders the nm-conf MachineConfig from.
 _ALLOCATION_BLOCK_TEMPLATE = """\
-{marker}
 vlanId: {vlan_id}
 
 dhcp_values:
@@ -261,30 +260,16 @@ def render_allocation_block(vlan_id: int, dhcp_values: DhcpValues) -> str:
             )
         )
     return _ALLOCATION_BLOCK_TEMPLATE.format(
-        marker=MARKER,
         vlan_id=vlan_id,
         network=dhcp_values.network,
         exclusions=exclusions_section,
     )
 
 
-def split_marker_block(content: str) -> tuple[str, str | None]:
-    """Split file content into (everything before the marker, the marker block).
-
-    The block is None when no marker is present. The counterpart of
-    render_allocation_block — and the helper a future deprovision-cluster
-    reuses to strip the block (docs/design/release-segment.md).
-    """
-    index = content.find(MARKER)
-    if index == -1:
-        return content, None
-    return content[:index], content[index:]
-
-
 def append_block(content: str, block: str) -> str:
     """Append the block per the blank-line rule: one blank line always
-    separates the file's last content line from the marker; an empty or
-    whitespace-only file gets the block with the marker as its first line."""
+    separates the file's last content line from the block; an empty or
+    whitespace-only file gets the block as its whole content."""
     if not content.strip():
         return block + "\n"
     return content.rstrip("\n") + "\n\n" + block + "\n"

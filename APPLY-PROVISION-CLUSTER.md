@@ -13,7 +13,8 @@ the cluster in the day2 sig repos.
 
 **What stays exactly as it is.** The day1 CI chain keeps rendering the
 MachineConfigs on the branch (it skips allocation when `vlanId` is present —
-it already does). The hostedclusters-setup chart, the argocd-platform appsets,
+it already does); it only stops writing its `# === Added by CI ===` header
+(§4.5). The hostedclusters-setup chart, the argocd-platform appsets,
 the day2 platform and the sig repos' structure do not change. A person still
 merges, and still syncs the Application by hand.
 
@@ -21,7 +22,7 @@ merges, and still syncs the Application by hand.
 
 | repo | change | section |
 |---|---|---|
-| `gitops-day1/platform-config` (day1 values) | the `allocate_segments` CI job stops calling allocate-segment (two lines); `scripts/allocate_segments.py` and its test go; README | §4 |
+| `gitops-day1/platform-config` (day1 values) | the `allocate_segments` CI job stops calling allocate-segment (two lines); `scripts/allocate_segments.py` and its test go; the chain stops writing the `# === Added by CI ===` header; README | §4 |
 | `redbull-platform` (Argo CD) | a new chart `gitops/charts/cluster-lifecycle-worker/` + `gitops/services/cluster-lifecycle-worker/app.yaml`; new image tags for the brain and `segment-lifecycle-worker` | §5 |
 | the image registry | three images to mirror: `workflows-orchestrator`, `segment-lifecycle-worker`, `cluster-lifecycle-worker` | §6 |
 
@@ -178,7 +179,9 @@ before you merge; `{sig}` must stay in it (or in `day2SigPathTemplate`).
   branch per cluster and opens a merge request; the merge is a person's, as it
   was. It never pushes `main`, never rewrites an existing cluster file (a file
   already on `main` fails the run at once), never touches another cluster.
-- **The day1 chain is unchanged except for one call.** It already skips a file
+- **The day1 chain is unchanged except for one call and one comment line.**
+  §4.5 only stops it writing a comment; every key it renders is the same, and
+  a legacy header it finds is removed, never stacked. It already skips a file
   that carries `vlanId` ("already carries allocation state — skipping"); the
   workflow's file does. The two lines removed in §4.1 only stop the chain from
   calling an allocate-segment that would now answer 422 — for a file a person
@@ -281,12 +284,257 @@ the run then registers the cluster in day2 and completes.
 
 ### 4.4 Untouched
 
-`stage_mc_sources`, `render_mc_configs`, `inject_configs`,
-`commit_and_push_changes`, `run_tests`, `validate_all_clusters`, every script
-they run, `mc-files/`, and the `workflow.rules` that keep the chain off
-`[skip ci]` commits and off `main`. The upgrade-gitops limb's
+`stage_mc_sources`, `render_mc_configs`, `commit_and_push_changes`,
+`run_tests`, `validate_all_clusters` (one docstring line in §4.5), every
+script they run except the two §4.5 changes, `mc-files/`, and the
+`workflow.rules` that keep the chain off `[skip ci]` commits and off `main`. The upgrade-gitops limb's
 `DAY1_VALIDATE_COMMAND` (`python3 scripts/validate_all_clusters.py`) keeps
 working unchanged.
+
+### 4.5 No more marker comments — the CI header goes
+
+The cluster file used to carry two marker comments: `# === Added By
+Segment-Allocation Workflow ===` (allocate-segment's block) and `# === Added by
+CI ===` (the chain's `mcConfigMap`). They separated several writers' commits to
+one file. provision-cluster writes the whole file in ONE push and adds no
+marker, so the chain's header has nothing left to separate (decided
+2026-11-11). After this patch:
+
+- `generate_from_template.py` no longer appends the header for a
+  manual-allocation (`AutomateAllocation: false`) cluster;
+- `inject_configs.py` writes `mcConfigMap:` after one blank line with no
+  header, and REMOVES a legacy header it finds directly above `mcConfigMap` or
+  alone at the end of the file, so an existing cluster loses its header the
+  next time the chain rewrites it (a one-comment diff in that MR) and never
+  gets a second one;
+- a legacy header above anything else (an old `vlanId` block) is left alone;
+- `CI_HEADER` stays in `generate_from_template.py`, marked LEGACY, only for
+  that removal.
+
+Tested against the mirror: the suite was 159 passed, 1 skipped before and is
+159 passed, 1 skipped after (two header tests replaced by three that pin the
+new behaviour), and `git apply --check` is clean. Save the block below as
+`no-ci-header.patch` at the repo root and run `git apply no-ci-header.patch`
+(on a sanitised-mirror mismatch, apply the hunks by hand: they are small).
+
+```diff
+--- a/scripts/generate_from_template.py
++++ b/scripts/generate_from_template.py
+@@ -38,6 +38,10 @@
+ 
+ TEMPLATES_DIR = Path('mc-files/templates')
+ MC_FILES_DIR = Path('mc-files')
++# LEGACY: the header CI used to write above mcConfigMap (and, for manual-allocation
++# clusters, at the end of the file). Nothing writes it any more — provision-cluster
++# pushes the whole file in one commit, so there is nothing to separate. Kept only so
++# inject_configs can remove the old header from a file it rewrites.
+ CI_HEADER = "# === Added by CI ==="
+ 
+ # Hosted-cluster files are named <CLUSTER_FILE_PREFIX><clusterName>.yaml. Must
+@@ -148,23 +152,6 @@
+             if name and name not in names:
+                 names.append(name)
+     return names
+-
+-
+-def add_ci_header(yaml_file):
+-    """Append the CI header to a YAML file if it is not already present."""
+-    with open(yaml_file, 'r', encoding='utf-8') as f:
+-        content = f.read()
+-
+-    if CI_HEADER in content:
+-        return
+-
+-    with open(yaml_file, 'a', encoding='utf-8') as f:
+-        # Match the old shell wrapper: always add a blank line before the header
+-        if content and not content.endswith('\n'):
+-            f.write('\n')
+-        f.write('\n' + CI_HEADER + '\n')
+-
+-    logger.info(f"Added '{CI_HEADER}' to {yaml_file}")
+ 
+ 
+ def validate_mastertag(mastertag):
+@@ -215,7 +202,6 @@
+             raise ValueError(
+                 f"vlanId missing in {yaml_file} - required when AutomateAllocation=false"
+             )
+-        add_ci_header(yaml_file)
+ 
+     return cluster_name, vlan_id, openshift_version
+ 
+--- a/scripts/inject_configs.py
++++ b/scripts/inject_configs.py
+@@ -14,8 +14,8 @@
+ import verify_missing_configs
+ # Same-directory import (scripts/ is on sys.path when run as a script).
+ # generate_from_template.py owns the shared YAML-error formatter and the
+-# CI-header constant (it appends the same header for manual-allocation
+-# clusters).
++# LEGACY CI-header constant (removed from files this script rewrites, never
++# written).
+ from generate_from_template import (format_yaml_error, CI_HEADER,
+                                     resolve_cluster_name, resolve_mc_files)
+ 
+@@ -222,10 +222,9 @@
+ def write_yaml_preserving_original_formatting(target_file, original_content, mc_config_map):
+     """Write YAML preserving original formatting and only adding/updating mcConfigMap"""
+ 
+-    # Remove any existing mcConfigMap section, together with the CI header
+-    # that marks it — a re-run must never stack another header. The header
+-    # is only eaten when directly adjacent to the section; a header marking
+-    # something else (e.g. a vlanId block) is left alone.
++    # Remove any existing mcConfigMap section, together with a LEGACY CI
++    # header directly above it (nothing writes the header any more). A
++    # header marking something else (e.g. a vlanId block) is left alone.
+     # This regex handles mcConfigMap at any indentation level and removes the entire section
+     content_without_mc = re.sub(
+         rf'^({re.escape(CI_HEADER)}\n)?mcConfigMap:.*?(?=^\w|\Z)',
+@@ -233,6 +232,12 @@
+ 
+     # Clean up any trailing whitespace but preserve the structure
+     lines = content_without_mc.rstrip().split('\n')
++    # A LEGACY header left alone at the end of the file (the old
++    # add_ci_header for manual-allocation clusters) marks nothing: drop it.
++    while lines and lines[-1] == CI_HEADER:
++        lines.pop()
++        while lines and lines[-1].strip() == '':
++            lines.pop()
+ 
+     # Add consistent spacing between TOP-LEVEL sections only
+     formatted_lines = []
+@@ -265,20 +270,12 @@
+         # file's final newline.
+         f.write('\n'.join(formatted_lines) + '\n')
+ 
+-        # Add mcConfigMap section under the CI header
++        # Add the mcConfigMap section after one blank line, with no header
+         if mc_config_map:
+-            # A header already trailing the content (generate's
+-            # add_ci_header appends one for manual-allocation clusters) is
+-            # reused, not duplicated.
+-            trailing_header = bool(formatted_lines) and formatted_lines[-1] == CI_HEADER
+-            if not trailing_header:
+-                # Blank line between content and the header — the content
+-                # above already ends with a newline, so this adds just the
+-                # blank line (no extra newline when content already ends
+-                # with a trailing blank line).
+-                if formatted_lines and formatted_lines[-1].strip() != '':
+-                    f.write('\n')
+-                f.write(CI_HEADER + '\n')
++            # The content above already ends with a newline, so this adds
++            # just the blank line.
++            if formatted_lines and formatted_lines[-1].strip() != '':
++                f.write('\n')
+             f.write('mcConfigMap:\n')
+             for i, item in enumerate(mc_config_map):
+                 f.write(f'- name: {item["name"]}\n')
+--- a/scripts/validate_all_clusters.py
++++ b/scripts/validate_all_clusters.py
+@@ -11,8 +11,7 @@
+ 
+ Non-mutating by construction: each cluster is rendered inside a throwaway
+ per-cluster copy of mc-files/ in a temp directory. generate_from_template.py
+-appends its '# === Added by CI ===' header to the cluster YAML it processes
+-and writes generated files under mc-files/<cluster>/ — both land in the temp
++writes generated files under mc-files/<cluster>/, which land in the temp
+ copy. The checkout is never touched; nothing is committed or pushed.
+ 
+ Every cluster in the repo must render — there is no skip list. A deferred
+--- a/tests/test_generate_from_template.py
++++ b/tests/test_generate_from_template.py
+@@ -227,25 +227,19 @@
+         assert not (run_in_repo_tmp / "mc-files/trap-cluster/trapped.bu").exists()
+ 
+ 
+-class TestCiHeader:
+-    """The '# === Added by CI ===' marker added by the old shell wrapper."""
++class TestNoCiHeader:
++    """The '# === Added by CI ===' header is no longer written: provision-cluster
++    pushes the whole file in one commit, so nothing needs separating."""
+ 
+-    def test_ci_header_added_when_automate_false(self, run_in_repo_tmp):
++    def test_no_ci_header_is_added_when_automate_false(self, run_in_repo_tmp):
+         yaml_path = run_in_repo_tmp / "sites/site4/mces/ocp4-mce-site4/hostedClusters/test-cluster.yaml"
++        before = yaml_path.read_text()
+ 
+         assert generator.process_yaml_file(str(yaml_path)) is True
+-
+-        content = yaml_path.read_text()
+-        assert "# === Added by CI ===" in content
+ 
+-    def test_ci_header_not_duplicated(self, run_in_repo_tmp):
+-        yaml_path = run_in_repo_tmp / "sites/site4/mces/ocp4-mce-site4/hostedClusters/test-cluster.yaml"
+-
+-        generator.process_yaml_file(str(yaml_path))
+-        generator.process_yaml_file(str(yaml_path))
+-
+         content = yaml_path.read_text()
+-        assert content.count("# === Added by CI ===") == 1
++        assert "# === Added by CI ===" not in content
++        assert content == before  # generate never edits the cluster file
+ 
+ 
+ class TestOutputVerification:
+--- a/tests/test_inject_configs.py
++++ b/tests/test_inject_configs.py
+@@ -124,14 +124,14 @@
+             [{"name": "cfg", "config": "key: value"}])
+         lines = target.read_text().split("\n")
+         idx = lines.index("mcConfigMap:")
+-        assert lines[idx - 1] == "# === Added by CI ==="  # the CI header
+-        assert lines[idx - 2] == ""   # the separator blank line
+-        assert lines[idx - 3] != ""   # and only one of them
++        assert lines[idx - 1] == ""   # the separator blank line, no header
++        assert lines[idx - 2] != ""   # and only one of them
++        assert "# === Added by CI ===" not in lines
+ 
+-    def test_trailing_ci_header_is_reused_not_duplicated(self, tmp_path):
+-        # generate_from_template appends the CI header at EOF for
+-        # manual-allocation clusters; inject must write its mcConfigMap
+-        # under that header, not stack a second one.
++    def test_a_legacy_trailing_ci_header_is_dropped(self, tmp_path):
++        # The old generate_from_template appended the CI header at EOF for
++        # manual-allocation clusters; nothing writes it now, and inject removes
++        # one it finds there.
+         original = ("clusterName: c\n"
+                     "mastertag: 4.16.27-x86_64\n"
+                     "\n"
+@@ -139,9 +139,24 @@
+         target = self._write(
+             tmp_path, original, [{"name": "cfg", "config": "key: value"}])
+         content = target.read_text()
+-        assert content.count("# === Added by CI ===") == 1
+-        assert "mcConfigMap:" in content
++        assert "# === Added by CI ===" not in content
++        # (top-level keys get their usual blank-line spacing)
++        assert content.startswith("clusterName: c\n\nmastertag: 4.16.27-x86_64\n\nmcConfigMap:\n")
+ 
++    def test_a_legacy_ci_header_above_mcconfigmap_is_dropped(self, tmp_path):
++        original = ("clusterName: c\n"
++                    "\n"
++                    "# === Added by CI ===\n"
++                    "mcConfigMap:\n"
++                    "- name: old\n"
++                    "  config: |\n"
++                    "    a: b\n")
++        target = self._write(
++            tmp_path, original, [{"name": "cfg", "config": "key: value"}])
++        content = target.read_text()
++        assert "# === Added by CI ===" not in content
++        assert content == "clusterName: c\n\nmcConfigMap:\n- name: cfg\n  config: |\n    key: value\n"
++
+     def test_idempotent_over_own_output(self, tmp_path):
+         # Re-serializing over the first write's output (parse → re-serialize)
+         # must be byte-identical.
+```
+
+```bash
+cd <day1>
+git apply no-ci-header.patch && rm no-ci-header.patch
+python -m pytest tests/ -q                                                         # -> all passed (the butane skips as before)
+grep -rn 'add_ci_header\|f.write(CI_HEADER' scripts/                               # -> nothing
+```
 
 ---
 
@@ -430,8 +678,8 @@ Then, in order:
 |---|---|
 | the status endpoint | `inspecting-target` → `allocating-segment` → `publishing-cluster-file` → `opening-merge-request` → `awaiting-merge` within a minute; `progress.merge_request_url` set |
 | the Segments Manager | an Allocated HC segment for `ocp4-prep-e2e-<site>-a` at the site |
-| GitLab, branch `provision-cluster/ocp4-prep-e2e-<site>-a` | one commit by `provision-cluster-workflow`: the file = your YAML + the `# === Added By Provision-Cluster Workflow ===` block (`vlanId`, `dhcp_values`), NO `mcConfigMap` |
-| the branch's pipeline | `allocate_segments` says "already carries allocation state — skipping"; the chain renders and pushes `CI: Update mcConfigMap from mc-files [skip ci]`; green |
+| GitLab, branch `provision-cluster/ocp4-prep-e2e-<site>-a` | one commit by `provision-cluster-workflow`: the file = your YAML + one blank line + `vlanId` and `dhcp_values`, NO marker comment, NO `mcConfigMap` |
+| the branch's pipeline | `allocate_segments` says "already carries allocation state — skipping"; the chain renders and pushes `CI: Update mcConfigMap from mc-files [skip ci]`, which appends `mcConfigMap:` with NO `# === Added by CI ===` header; green |
 | the merge request | open, from the branch to `main`, "delete source branch" ticked, description with the site/vlan/segment and the merge instruction |
 | POST again (same cluster) | **409** naming the run id |
 | POST `allocate-segment` `{"cluster": "ocp4-prep-e2e-<site>-a", "site": "<site>"}` by hand while the run waits | **409** (same id as the child); after the child finished, a new run that COMPLETES with the same segment |
@@ -460,7 +708,8 @@ the branch and the allocation stay for a person to decide on.
 1. `<platform>`: previous `image.tag` for `workflows-orchestrator` and
    `segment-lifecycle-worker`; delete `gitops/services/cluster-lifecycle-worker/`
    (the chart folder may stay). Merge; Argo CD rolls back and removes the limb.
-2. `<day1>`: revert §4 (restore the two lines and `allocate_segments.py`).
+2. `<day1>`: revert §4 (restore the two lines and `allocate_segments.py`; §4.5
+   can stay — no header is harmless — or be reverted with `git apply -R`).
 3. Any `provision-cluster-*` run in flight: terminate in the Temporal UI, then
    finish its merge request by hand or close it; release its segment with
    `POST /workflows/segment-lifecycle/release-segment {"cluster": …}` if the
@@ -483,7 +732,7 @@ rendering has its own plan and is not part of this change.
 ## 10. Final gate
 
 - [ ] checks 1–8 green
-- [ ] (a) the day1 MR merged, its pipeline green
+- [ ] (a) the day1 MR merged (§4.1–4.5), its pipeline green
 - [ ] (b)+(c) the platform MR: chart + app entry + three tags, lint/template/dry-run green, images mirrored
 - [ ] (d) merged; the three pods Running on the new tags; the API lists `application/yaml` for provision-cluster; `values_branch` answers 422
 - [ ] (e) the first run COMPLETED end to end (§7.2), the test cluster cleaned up

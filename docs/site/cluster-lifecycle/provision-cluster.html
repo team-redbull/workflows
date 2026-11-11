@@ -237,7 +237,7 @@
       </div>
       <div class="endpoint-body">
         <pre>owner:
-  merkaz: "unit-a"                  <span class="c">&lt;- your text, byte for byte</span>
+  merkaz: "unit-a"
   anaf: "unit-b"
   mador: "unit-c"
 
@@ -253,23 +253,27 @@ nodepool:
   - name: worker-kubeletconfig-reserved
   - name: nic-ring-buffer
   - name: workers-chrony-configuration
-                                    <span class="c">&lt;- one blank line, always</span>
-# === Added By Provision-Cluster Workflow ===
-vlanId: 23                          <span class="c">// what the chain renders nm-conf from</span>
+
+vlanId: 23
 
 dhcp_values:
-  network: "10.20.90.0"             <span class="c">// mask stripped; no startRange/endRange — the DHCP API derives .1-.253</span>
-  exclusions:                       <span class="c">// the type's DHCP_EXCLUSION_OCTET_RANGES, ascending</span>
+  network: "10.20.90.0"
+  exclusions:
     - startAddress: "10.20.90.1"
       endAddress: "10.20.90.10"
     - startAddress: "10.20.90.241"
       endAddress: "10.20.90.254"
 
-# === Added by CI ===                <span class="c">&lt;- the day1 chain's own commit, [skip ci]</span>
 mcConfigMap:
 - name: nm-conf
   config: |
     …</pre>
+        <p class="note" style="margin-top:12px">Everything above <code>vlanId</code> is your text, byte for byte. One
+        blank line separates it from the allocation block, which carries no marker comment. The chain renders nm-conf
+        from <code>vlanId</code>. <code>network</code> is the segment with its mask stripped, with no
+        <code>startRange</code>/<code>endRange</code>: the DHCP API derives .1-.253. The <code>exclusions</code> are the
+        type's <code>DHCP_EXCLUSION_OCTET_RANGES</code>, ascending. <code>mcConfigMap</code> arrives in the day1
+        chain's own <code>[skip ci]</code> commit, with no header.</p>
         <p class="note" style="margin-top:12px">The block assumes a /24 — asserted, not silent: a non-/24 segment fails
         the run with <code>UnsupportedSegmentPrefix</code>. A type whose policy excludes nothing drops the
         <code>exclusions</code> key. In dev, where the day1 copy has no MachineConfig chain, the file stays without

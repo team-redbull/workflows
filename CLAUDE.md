@@ -846,9 +846,11 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   FORBIDDEN `vlanId`, `dhcp_values`, `mcConfigMap`, `AutomateAllocation`; `clusterName` only equal to
   the derived one; config names DNS-1123 labels; `configs` OPTIONAL per pool — a KubeVirt pool has
   none) — EVERY reason in one `ClusterValuesRejectedError`; (2) allocate-segment as an AWAITED
-  child (§5); (3) the text plus the allocation block (marker `# === Added By Provision-Cluster
-  Workflow ===`, `vlanId`, `dhcp_values` with the type's `DHCP_EXCLUSION_OCTET_RANGES` — the policy
-  and `build_dhcp_values` moved to this limb with the file) pushed to `provision-cluster/<stem>`,
+  child (§5); (3) the text plus the allocation block (`vlanId`, `dhcp_values` with the type's
+  `DHCP_EXCLUSION_OCTET_RANGES` — the policy and `build_dhcp_values` moved to this limb with the file;
+  NO marker comment, and the day1 chain's `# === Added by CI ===` header goes too: the operator,
+  2026-11-11 — markers separated several writers' commits to one file, and one push now writes it
+  whole; do not re-add either) pushed to `provision-cluster/<stem>`,
   created from `main` by the push, with NO `[skip ci]`; (4) the merge request, found or created;
   (5) a HUMAN wait for the merge, no deadline (§5); (6) only AFTER the merge, the folder
   `sites/<site>/<env>/mces/<mce>/<stem>/.gitkeep` in every sig the layers list under

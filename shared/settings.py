@@ -55,7 +55,9 @@ from __future__ import annotations
 import re
 import string
 
-from pydantic import field_validator, model_validator
+from typing import Annotated
+
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from shared.cluster_names import canonical_mce_cluster
@@ -586,9 +588,12 @@ class ClusterLifecycleActivitySettings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     # --- day1: the cluster file, its branch, the merge request ----------------
-    # The same repo and keys as upgrade-gitops's and vm-lifecycle's (DAY1_REPO_URL,
-    # DAY1_GIT_TOKEN); the chart fills DAY1_GIT_TOKEN from the shared
-    # `redbull-git-token` Secret. This limb READS `main` (where the cluster goes)
+    # The same repo as upgrade-gitops's and vm-lifecycle's (DAY1_REPO_URL). The
+    # token is REDBULL_GIT_TOKEN, the key of the shared `redbull-git-token` Secret
+    # (the air-gap's name, the operator 2026-11-11), so the chart passes the Secret
+    # through unrenamed. DAY1_GIT_TOKEN is still accepted, for a chart that maps a
+    # `day1-git-token` Secret (the dev cluster): REDBULL_GIT_TOKEN wins when both
+    # are set. This limb READS `main` (where the cluster goes)
     # and PUSHES a new branch per cluster, `provision-cluster/<cluster>`, which a
     # person merges through the merge request the limb opens. The token must
     # therefore reach the provider's API too: a GitLab project/personal token
@@ -598,7 +603,7 @@ class ClusterLifecycleActivitySettings(BaseSettings):
     # config: they are the day1 repo's own layout and this workflow's identity
     # (activities/cluster_lifecycle/day1_writer.py).
     day1_repo_url: str
-    day1_git_token: str
+    redbull_git_token: Annotated[str, Field(validation_alias=AliasChoices("REDBULL_GIT_TOKEN", "DAY1_GIT_TOKEN"))]
     # Which API opens the merge request: production is the air-gapped GitLab
     # (a merge request with `remove_source_branch`), dev is GitHub (a pull
     # request; delete-on-merge is a repository setting there). No default: the
@@ -635,8 +640,8 @@ class ClusterLifecycleActivitySettings(BaseSettings):
     # `{sig}` must appear in the URL template or the path template, or every
     # sig would be registered in one place. The path template is the prefix
     # before `sites/`; "" for the tree at the repo root. The push goes to the
-    # sig repo's default branch with DAY2_GIT_TOKEN — the day1 token when
-    # empty, which is what the shared `redbull-git-token` is.
+    # sig repo's default branch with DAY2_GIT_TOKEN — REDBULL_GIT_TOKEN when
+    # empty, the shared `redbull-git-token` covering both.
     day2_sig_repo_url_template: str
     day2_sig_path_template: str = ""
     day2_git_token: str = ""
@@ -763,8 +768,8 @@ class ClusterLifecycleActivitySettings(BaseSettings):
 
     @property
     def day2_token(self) -> str:
-        """The token the sig repos are pushed with: DAY2_GIT_TOKEN, else the day1 token."""
-        return self.day2_git_token or self.day1_git_token
+        """The token the sig repos are pushed with: DAY2_GIT_TOKEN, else REDBULL_GIT_TOKEN."""
+        return self.day2_git_token or self.redbull_git_token
 
     def day2_sig_repo_url(self, sig: str) -> str:
         return self.day2_sig_repo_url_template.format(sig=sig)

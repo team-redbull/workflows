@@ -36,13 +36,13 @@ _settings = ClusterLifecycleActivitySettings()
 
 
 def _provider() -> git_provider.Provider:
-    return git_provider.provider_for(_settings.day1_git_provider, _settings.day1_repo_url, _settings.day1_git_token)
+    return git_provider.provider_for(_settings.day1_git_provider, _settings.day1_repo_url, _settings.redbull_git_token)
 
 
 @activity.defn
 async def inspect_cluster_target(request: ClusterTargetRequest) -> ClusterTarget:
     target = await day1_writer.inspect(
-        repo_url=_settings.day1_repo_url, token=_settings.day1_git_token,
+        repo_url=_settings.day1_repo_url, token=_settings.redbull_git_token,
         cluster=request.cluster, mce=request.mce, values=request.values,
     )
     activity.logger.info(
@@ -60,7 +60,7 @@ async def publish_cluster_file(request: ClusterFilePublishRequest) -> ClusterFil
     # reserves part of its /24 and leaves it out otherwise.
     dhcp_values = build_dhcp_values(request.segment, _settings.dhcp_exclusion_octet_ranges.get(request.type, []))
     published = await day1_writer.publish(
-        repo_url=_settings.day1_repo_url, token=_settings.day1_git_token, request=request, dhcp_values=dhcp_values
+        repo_url=_settings.day1_repo_url, token=_settings.redbull_git_token, request=request, dhcp_values=dhcp_values
     )
     if published.changed:
         activity.logger.info(

@@ -281,8 +281,28 @@ class TestClusterLifecycleSettings:
         assert self._settings(monkeypatch).day2_token == "test-git-token"
         assert self._settings(monkeypatch, DAY2_GIT_TOKEN="other").day2_token == "other"
 
-    @pytest.mark.parametrize("key", ["DAY1_REPO_URL", "DAY1_GIT_TOKEN", "DHCP_EXCLUSION_OCTET_RANGES", "DAY2_SIG_REPO_URL_TEMPLATE"])
+    @pytest.mark.parametrize("key", ["DAY1_REPO_URL", "DHCP_EXCLUSION_OCTET_RANGES", "DAY2_SIG_REPO_URL_TEMPLATE"])
     def test_each_required_key_is_required(self, monkeypatch, key):
         monkeypatch.delenv(key)
         with pytest.raises(ValidationError, match=key.lower()):
             ClusterLifecycleActivitySettings()
+
+    def test_the_git_token_is_required_under_one_of_its_two_names(self, monkeypatch):
+        monkeypatch.delenv("DAY1_GIT_TOKEN")
+        monkeypatch.delenv("REDBULL_GIT_TOKEN", raising=False)
+        with pytest.raises(ValidationError, match="REDBULL_GIT_TOKEN"):
+            ClusterLifecycleActivitySettings()
+
+    def test_the_air_gap_name_alone_is_enough(self, monkeypatch):
+        # The air-gap's `redbull-git-token` Secret, passed through unrenamed.
+        monkeypatch.delenv("DAY1_GIT_TOKEN")
+        s = self._settings(monkeypatch, REDBULL_GIT_TOKEN="rb-token")
+        assert s.redbull_git_token == "rb-token" and s.day2_token == "rb-token"
+
+    def test_the_dev_name_alone_is_enough(self, monkeypatch):
+        # A chart mapping a `day1-git-token` Secret's DAY1_GIT_TOKEN (the dev cluster).
+        monkeypatch.delenv("REDBULL_GIT_TOKEN", raising=False)
+        assert self._settings(monkeypatch).redbull_git_token == "test-git-token"
+
+    def test_the_air_gap_name_wins_when_both_are_set(self, monkeypatch):
+        assert self._settings(monkeypatch, REDBULL_GIT_TOKEN="rb-token").redbull_git_token == "rb-token"

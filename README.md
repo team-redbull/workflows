@@ -914,7 +914,7 @@ would hide which segments actually got a workflow.
 | `DAY1_GIT_PROVIDER` | `cluster-lifecycle-config` | `gitlab` (production: a merge request with `remove_source_branch`) or `github` (dev: a pull request) |
 | `DHCP_EXCLUSION_OCTET_RANGES` | `cluster-lifecycle-config` | the DHCP policy written into every cluster file (was segment-lifecycle's until 2026-11-11) |
 | `DAY2_SIG_REPO_URL_TEMPLATE`, `DAY2_SIG_PATH_TEMPLATE` | `cluster-lifecycle-config` | the day2 sig repos: the URL with `{sig}` (production: one GitLab project per sig, tree at the root) or one repo with the tree under the path template (dev: `sigs/{sig}`) |
-| `DAY1_GIT_TOKEN` | Secret `redbull-git-token`, key `REDBULL_GIT_TOKEN` | push rights AND the provider's API (GitLab `api` + `write_repository`, GitHub `repo`); scrubbed from every error |
+| `REDBULL_GIT_TOKEN` | Secret `redbull-git-token`, key `REDBULL_GIT_TOKEN`, under its own name | push rights AND the provider's API (GitLab `api` + `write_repository`, GitHub `repo`); `DAY1_GIT_TOKEN` is accepted too (a cluster with only `day1-git-token`), `REDBULL_GIT_TOKEN` wins; scrubbed from every error |
 | `DAY2_GIT_TOKEN` | optional Secret | the sig repos' push token; empty = the day1 token |
 | `MCE_CLUSTER` | `server-lifecycle-config` | which MCE this worker serves — names its queue, so it must match callers' `mce_cluster` |
 | `SERVER_SCAN_URL` | `server-lifecycle-config` | inventory API base, INCLUDING `/api/v1` |

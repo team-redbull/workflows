@@ -1,4 +1,4 @@
-# add-server-to-mce: draw cheaply, lock, then live-check one server
+# add-server-to-mce: draw one server, lock it, then live-check it
 
 Status: **proposed with the operator 2026-11-13, not implemented.** The server-scan half is that repo's
 ADR-0062 (`docs/adr/0062-lock-then-recheck-one-server.md`), which has to ship first.
@@ -27,10 +27,13 @@ all 20 stayed at `acquiring-server` for good. What made it happen, each from cod
 
 ## The decision
 
-### `candidate_count` is the number of tries
+### `candidate_count` is the number of tries, drawn one at a time
 
 Default **3 for every pool run**, whatever else is running: the `busy + count + 2` sizing goes. The range
-stays 1-20. A *try* is one server the run considers, and every way a server can fail uses one:
+stays 1-20. The run asks server-scan for **one** server, tries it, and only if that try fails asks for the
+next. It never draws its later tries ahead of time.
+
+A *try* is one server the run considers, and every way a server can fail uses one:
 
 - the run's own checks reject it (no bond, no BMC host, a bad MAC, an unusable name, a BareMetalHost already
   there);
@@ -43,37 +46,54 @@ reasons as `_REJECTION_SUMMARY` does today, and takes a specific type when all o
 failures are `VendorRecheckFailedError`, naming the manager).
 
 **A server another run locked first does not use a try.** It says nothing about the server or this run, so
-the run draws again (below).
+the run simply draws again.
+
+### Why one at a time, not all three at the start
+
+- **The draw is free now.** With `recheck=false` it is a Mongo query. Asking for spares up front saved a
+  vendor round only while the draw checked every server it returned; now it saves nothing.
+- **A try can take an hour** (the Agent wait). Spares drawn at the start would be up to an hour old by the
+  time the run reached them: locked by another run, or claimed by a cluster. A draw made when it is needed
+  sees what is free at that moment.
+- **One path for every failure.** Whatever went wrong (a rejection, a failed check, no Agent, a lock lost to
+  another run), the run does the same thing: draw again, with or without using a try.
 
 ### The loop
 
 1. `resolving-vlan`, `validating-infraenv`: unchanged.
-2. `acquiring-server`: `GET /servers/available?pattern=^ocp-<infraEnv>&count=<candidate_count>&health=HEALTHY&recheck=false`.
-   Mongo only: free, unlocked, stored-HEALTHY, random. It answers in well under a second whatever the count.
-3. For each candidate:
-   - `selecting-server`: the run's own checks, on the stored document.
-   - `reserving-server`: the install lock (unchanged). Lost to another run: draw again, no try used.
+2. `acquiring-server`: draw one server (below).
+3. For that server:
+   - `selecting-server`: the run's own checks, on the stored document. Rejected: one try used, back to 2.
+   - `reserving-server`: the install lock (unchanged). Lost to another run: back to 2, no try used.
    - `rechecking-server` (new): `POST /servers/{id}/recheck` with this run's workflow id, on the MCE's queue
      like every server-scan call. A new activity, `recheck_server`: HTTP timeout 300 s (server-scan's Route
      allows 300 s, above the slowest manager's 240), `start_to_close_timeout` 330 s, and
      `schedule_to_close_timeout` 10 min. This is the best-effort exception the rules allow, because the
      workflow catches its `ActivityError`.
-     - **Does not qualify:** reason `unqualified`, carrying server-scan's reasons. Release the lock, next try.
-     - **Vendor failure, or 429 still answered when the 10 min run out:** reason `recheck-failed`. Release the
-       lock, next try. A 429 means server-scan's per-manager cap is full; the activity waits for its
-       `Retry-After` and heartbeats.
+     - **Does not qualify:** reason `unqualified`, carrying server-scan's reasons. Release the lock, one try
+       used, back to 2.
+     - **Vendor failure, or 429 still answered when the 10 min run out:** reason `recheck-failed`. Release
+       the lock, one try used, back to 2. A 429 means server-scan's per-manager cap is full; the activity
+       waits for its `Retry-After` and heartbeats.
    - The run's own checks **again, on the fresh document** the check returned: links and MACs may have
      changed since the collection, and the bond is built from what was just read.
    - From here everything is unchanged: the NMStateConfig check, the PXE map, the creates, the Agent wait, the
-     day-long hold.
+     day-long hold. No Agent: the rollback as today, one try used, back to 2.
+4. Three tries used: the run fails with the grouped reasons.
 
-### Drawing again
+### Drawing one server
 
-The same request again. The draw already leaves out every locked server, so what comes back is free; the run
-skips any name it has already used a try on. At most *tries used* of the drawable servers are ones this run
-tried, so a draw of `candidate_count` always holds every untried server the run still needs, if the pool has
-them. A draw with nothing new means the pool is exhausted: `ServerReservedError`, as today. At most 10 draws
-again, as a safety stop.
+`GET /servers/available?pattern=^ocp-<infraEnv>&count=<tries used + 1>&health=HEALTHY&recheck=false`, and the
+run takes the first server in the answer **it has not already tried**. This means 1 on the first draw, at most
+3 later.
+
+- The draw already leaves out every locked server, so a server another run holds never comes back.
+- A server this run tried and **rejected before locking it** is not locked, so the random pick can return it.
+  At most *tries used* of the drawable servers are ones this run already tried, so a draw of `tries used + 1`
+  always holds at least one untried server, if the pool has one. No server-scan change is needed for this.
+- Nothing untried in the answer means the pool is exhausted. The run fails with the reasons it has gathered,
+  or `ServerReservedError` when every server it reached was taken by other runs, as today.
+- At most 10 draws lost to other runs' locks, as a safety stop.
 
 ### What it costs
 
@@ -81,14 +101,14 @@ Vendor checks made by server-scan:
 
 | case | today | proposed |
 | --- | --- | --- |
-| 1 run, `candidate_count` 3, all healthy | 3, before the run gets an answer | 1 |
+| 1 run, `candidate_count` 3, first server healthy | 3, before the run gets an answer | 1 |
 | 3 runs × 3, a pool of exactly 9, every check fails | up to 9 per draw, 27 in all | 9 (3 tries each) |
 | 3 runs × 3, a pool of exactly 9, all healthy | up to 9 | 3 |
 | 20 runs (two `count: 10` requests) | about 320, sequential inside 20 requests | 20, at most 4 per manager type per server-scan pod at once |
 
-With a pool of exactly 9 and `count` 9, the draw returns all 9 at once, unchecked. Overlap between runs costs
-a lock attempt and a draw, never a vendor call. More runs than servers is a pool too small for the request,
-and the extra runs fail saying so.
+The draws themselves are Mongo queries: one per try, plus one per lock lost to another run. With a pool of
+exactly 9, overlap between runs costs a lock attempt and a draw, never a vendor call. More runs than servers is
+a pool too small for the request, and the extra runs fail saying so.
 
 ## Not decided yet
 
@@ -118,6 +138,9 @@ and the extra runs fail saying so.
 
 ## Considered and rejected
 
+- **Draw all the tries at the start.** That was this note's first version. It saves nothing once the draw is
+  free, the spares go up to an hour stale during the Agent wait, and it still needs a second draw when another
+  run takes one of them.
 - **Keep the recheck in the draw, ask for 3, draw again only on a lost lock.** One UCS check can still outlast
   the 60 s draw, and the spare candidates are still checked before the run locks anything.
 - **Parallel rechecks inside the draw.** Faster, but it still checks servers the run will not use, and 20

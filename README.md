@@ -471,7 +471,8 @@ listing a locked machine. A pool run that loses the race skips that machine and
 tries its next candidate. `candidate_count` defaults to (slots still running) +
 `count` + 2 (max 20). That sizing assumed every run draws the same top of the
 pool, but server-scan's draw is random, and every candidate costs a live vendor
-check before the draw answers; a proposal replaces it with three tries per run
+check before the draw answers; a proposal replaces it with up to three tries per
+run, each server drawn only when the previous one failed
 (`docs/design/add-server-to-mce-lock-then-recheck.md`). Today
 a pool run that finds only locked machines fails with `ServerReservedError` —
 the pool was smaller than the installs asked for, or raise `candidate_count`.

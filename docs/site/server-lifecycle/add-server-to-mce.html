@@ -660,8 +660,11 @@
       pool and then 5 by name. Each run locks the machine it chose in server-scan before writing
       anything, and server-scan stops listing a locked machine. A pool run that loses the race tries its
       next candidate; a named machine another run took first fails its own run.</p>
-      <p class="note">Every run on the pool draws the same top of it, so <code>candidate_count</code>
-      defaults to (slots still running) + new runs + 2, at most 20. A run that finds every
+      <p class="note"><code>candidate_count</code> defaults to (slots still running) + new runs + 2,
+      at most 20. That sizing assumed every run draws the same top of the pool; server-scan's draw is
+      random, so it is to be replaced by up to three tries per run, each server drawn only when the
+      previous one failed (a proposal,
+      <code>docs/design/add-server-to-mce-lock-then-recheck.md</code>). A run that finds every
       candidate locked by its siblings fails with <code>ServerReservedError</code>: the pool had fewer
       free servers than were installing.</p>
     </div>

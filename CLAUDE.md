@@ -1333,8 +1333,12 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   closed slot is reused (Temporal's default ALLOW_DUPLICATE id reuse; `TestAFinishedSlotIsFreeAgain`).
   A start Temporal refuses for any other reason stops the scan (a 502 with its reason when the
   request is one run). Each run draws `candidate_count` =
-  (busy slots) + new runs + 2 (max 20) by default, because every run on the pool locks one
-  machine from the same top of the list. Safe because server-scan's reserve is a compare-and-set on the document revision that
+  (busy slots) + new runs + 2 (max 20) by default, on the premise that every run locks one
+  machine from the same top of the list. The premise is WRONG: server-scan's draw is a random
+  `$sample`, and draws of 12-20, each candidate live-checked in turn, hung 20 runs at
+  `acquiring-server` on 2026-11-12. `docs/design/add-server-to-mce-lock-then-recheck.md`
+  (proposed, not built) replaces it with up to 3 tries per run, each server drawn only when the
+  previous try failed, locked first, then checked. Safe because server-scan's reserve is a compare-and-set on the document revision that
   refuses a live lock to any other workflow id, and the run writes nothing before holding it —
   `TestParallelRunsOnOnePool` runs two at once. The test harness's mock lock must keep refusing
   another workflow id's live lock, or that test proves nothing.

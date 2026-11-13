@@ -5,7 +5,10 @@ request without `count` takes a slot too, so it is never a 409 — see
 [the revision](#revised-2026-10-24-no-409-from-the-pool)). Implemented in
 `workflow_domains/server_lifecycle/router.py` (`AddServerToMceRequest`,
 `start_add_server_to_mce`), tested in `tests/test_server_lifecycle_api.py`.
-The workflow itself did not change.
+The workflow itself did not change. The spares sizing below (`candidate_count`
+counting every run on the pool) assumed a sorted draw; server-scan's is random,
+see [add-server-to-mce-lock-then-recheck.md](add-server-to-mce-lock-then-recheck.md)
+(2026-11-13).
 
 The workflow was named **install-server** when this was decided; it was
 renamed **add-server-to-mce** on 2026-11-01, and `POST .../install-server` now

@@ -468,8 +468,11 @@ or 5 from the pool and then 5 by name. Each run takes server-scan's install
 lock before writing anything; server-scan takes it by compare-and-set on the
 document revision, refuses a live lock to any other workflow id, and stops
 listing a locked machine. A pool run that loses the race skips that machine and
-tries its next candidate. Because every run on the pool draws the same top of
-it, `candidate_count` defaults to (slots still running) + `count` + 2 (max 20);
+tries its next candidate. `candidate_count` defaults to (slots still running) +
+`count` + 2 (max 20). That sizing assumed every run draws the same top of the
+pool, but server-scan's draw is random, and every candidate costs a live vendor
+check before the draw answers; a proposal replaces it with three tries per run
+(`docs/design/add-server-to-mce-lock-then-recheck.md`). Today
 a pool run that finds only locked machines fails with `ServerReservedError` —
 the pool was smaller than the installs asked for, or raise `candidate_count`.
 A named machine another run took first fails its own run instead.

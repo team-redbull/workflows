@@ -10,8 +10,8 @@ Settings groups, matching the deployment boundary:
     activity worker/tasks (the Segments Manager and the DHCP scope API). The
     workflow worker has no business holding these.
   - ClusterLifecycleActivitySettings: the cluster-lifecycle hub limb — the
-    day1 repo (the same keys as upgrade-gitops's and vm-lifecycle's) plus its
-    git provider, the DHCP exclusion policy the allocation block is written
+    day1 repo (the same keys as upgrade-gitops's and vm-lifecycle's) plus
+    GitLab's API for the merge request, the DHCP exclusion policy the allocation block is written
     with (moved here from segment-lifecycle on 2026-11-11), and the day2 sig
     repos the cluster is registered in.
   - ServerLifecycleActivitySettings / ServerProvisioningActivitySettings: the
@@ -42,8 +42,8 @@ redbull-platform/gitops/charts/workflows-orchestrator/templates/config.yaml
 redbull-platform/gitops/charts/segment-lifecycle-worker/templates/config.yaml
     (segment-lifecycle-config: the DHCP API URL; + the dhcp-api-token Secret)
 redbull-platform/gitops/charts/cluster-lifecycle-worker/templates/config.yaml
-    (cluster-lifecycle-config: the day1 repo URL and provider, the DHCP policy,
-    the day2 sig templates; + the redbull-git-token Secret)
+    (cluster-lifecycle-config: the day1 repo URL, the DHCP policy,
+    the day2 sig URL template; + the redbull-git-token Secret)
 
 Do NOT import this module from inside a workflow definition (it runs in the
 sandbox) — only from worker entrypoints, api.py, and activity
@@ -570,10 +570,6 @@ def _url_fields(ref: KvClusterRef) -> dict[str, str]:
     }
 
 
-# The git providers the cluster-lifecycle limb knows how to open a merge request on.
-GIT_PROVIDERS = ("gitlab", "github")
-
-
 class ClusterLifecycleActivitySettings(BaseSettings):
     """Config for the cluster-lifecycle HUB limb (`cluster-lifecycle-worker`) only.
 
@@ -596,20 +592,18 @@ class ClusterLifecycleActivitySettings(BaseSettings):
     # are set. This limb READS `main` (where the cluster goes)
     # and PUSHES a new branch per cluster, `provision-cluster/<cluster>`, which a
     # person merges through the merge request the limb opens. The token must
-    # therefore reach the provider's API too: a GitLab project/personal token
-    # with `api` + `write_repository`, or a GitHub token with `repo`.
+    # therefore reach GitLab's API too (the merge request): a group, project or
+    # personal token with `api` + `write_repository`, and a role that may push
+    # the sig projects' protected default branch (Maintainer, by default).
+    # GitLab is the ONLY provider (the operator, 2026-11-14: one convention, so
+    # there is no key choosing one — do not add it). The API base is derived
+    # from this URL's host and path.
     #
     # The clusters root, the branch scheme and the committer identity are NOT
     # config: they are the day1 repo's own layout and this workflow's identity
     # (activities/cluster_lifecycle/day1_writer.py).
     day1_repo_url: str
     redbull_git_token: Annotated[str, Field(validation_alias=AliasChoices("REDBULL_GIT_TOKEN", "DAY1_GIT_TOKEN"))]
-    # Which API opens the merge request: production is the air-gapped GitLab
-    # (a merge request with `remove_source_branch`), dev is GitHub (a pull
-    # request; delete-on-merge is a repository setting there). No default: the
-    # two APIs share nothing, and a wrong guess fails every run at phase 4.
-    day1_git_provider: str
-
     # --- the DHCP exclusion policy, written into every cluster file ------------
     # The ONE DHCP policy knob, PER SEGMENT TYPE: last-octet ranges excluded
     # from distribution, e.g. {"HC": [[1, 10], [241, 254]]}. Together with the
@@ -635,15 +629,14 @@ class ClusterLifecycleActivitySettings(BaseSettings):
     dhcp_exclusion_octet_ranges: dict[SegmentType, list[tuple[int, int]]]
 
     # --- day2: the sig repos the cluster is registered in -----------------------
-    # Each sig is a repo (production: one GitLab project per sig, the tree at
-    # its root) or a folder of one repo (dev: `sigs/<sig>` of one GitHub repo).
-    # `{sig}` must appear in the URL template or the path template, or every
-    # sig would be registered in one place. The path template is the prefix
-    # before `sites/`; "" for the tree at the repo root. The push goes to the
-    # sig repo's default branch with DAY2_GIT_TOKEN — REDBULL_GIT_TOKEN when
-    # empty, the shared `redbull-git-token` covering both.
+    # Each sig is its own GitLab project, the tree at its root:
+    # https://<gitlab>/redbull/gitops-day2-prod/sigs/{sig}.git — `{sig}` must
+    # appear in the URL, or every sig would be registered in one project. The
+    # push goes to the project's default branch with DAY2_GIT_TOKEN —
+    # REDBULL_GIT_TOKEN when empty, the group token covering both.
+    # (A path-prefix template, for sigs kept as folders of ONE repo, was removed
+    # 2026-11-14: a sig is always its own project.)
     day2_sig_repo_url_template: str
-    day2_sig_path_template: str = ""
     day2_git_token: str = ""
 
     @field_validator("day1_repo_url")
@@ -659,14 +652,6 @@ class ClusterLifecycleActivitySettings(BaseSettings):
                 f"injected into https clone URLs (got {url.split('@')[-1]!r})"
             )
         return url.rstrip("/")
-
-    @field_validator("day1_git_provider")
-    @classmethod
-    def _known_git_provider(cls, value: str) -> str:
-        provider = value.strip().lower()
-        if provider not in GIT_PROVIDERS:
-            raise ValueError(f"day1_git_provider must be one of {list(GIT_PROVIDERS)} (got {value!r})")
-        return provider
 
     @field_validator("dhcp_exclusion_octet_ranges")
     @classmethod
@@ -724,15 +709,6 @@ class ClusterLifecycleActivitySettings(BaseSettings):
                 )
         return policy
 
-    @field_validator("day2_sig_path_template")
-    @classmethod
-    def _relative_sig_path_template(cls, template: str) -> str:
-        """A path inside the repo: leading and trailing slashes dropped, `..` refused."""
-        template = template.strip().strip("/")
-        if ".." in template.split("/"):
-            raise ValueError(f"day2_sig_path_template {template!r} must stay inside the repo (no `..`)")
-        return template
-
     @field_validator("day2_sig_repo_url_template")
     @classmethod
     def _https_sig_url_template(cls, template: str) -> str:
@@ -744,25 +720,20 @@ class ClusterLifecycleActivitySettings(BaseSettings):
         return template.rstrip("/")
 
     @model_validator(mode="after")
-    def _sig_is_somewhere_in_the_templates(self) -> ClusterLifecycleActivitySettings:
-        """`{sig}` in the URL or the path template, and nothing else in braces: a typo
+    def _sig_is_in_the_url_template(self) -> ClusterLifecycleActivitySettings:
+        """`{sig}` in the URL template, and nothing else in braces: a typo
         (`{sgi}`) fails at worker start, not as a KeyError on the first run."""
-        placeholders: set[str] = set()
-        for name, template in (
-            ("day2_sig_repo_url_template", self.day2_sig_repo_url_template),
-            ("day2_sig_path_template", self.day2_sig_path_template),
-        ):
-            try:
-                fields = {field for _, field, _, _ in string.Formatter().parse(template) if field is not None}
-            except ValueError as err:
-                raise ValueError(f"{name} {template!r} is not a format string: {err}") from None
-            if fields - {"sig"}:
-                raise ValueError(f"{name} {template!r} may name only {{sig}} (got {sorted(fields - {'sig'})})")
-            placeholders |= fields
-        if "sig" not in placeholders:
+        template = self.day2_sig_repo_url_template
+        try:
+            fields = {field for _, field, _, _ in string.Formatter().parse(template) if field is not None}
+        except ValueError as err:
+            raise ValueError(f"day2_sig_repo_url_template {template!r} is not a format string: {err}") from None
+        if fields - {"sig"}:
+            raise ValueError(f"day2_sig_repo_url_template {template!r} may name only {{sig}} (got {sorted(fields - {'sig'})})")
+        if "sig" not in fields:
             raise ValueError(
-                "neither day2_sig_repo_url_template nor day2_sig_path_template names {sig}: every sig "
-                "would be registered in one place"
+                f"day2_sig_repo_url_template {template!r} does not name {{sig}}: every sig would be "
+                "registered in one project"
             )
         return self
 
@@ -773,6 +744,3 @@ class ClusterLifecycleActivitySettings(BaseSettings):
 
     def day2_sig_repo_url(self, sig: str) -> str:
         return self.day2_sig_repo_url_template.format(sig=sig)
-
-    def day2_sig_path_prefix(self, sig: str) -> str:
-        return self.day2_sig_path_template.format(sig=sig).strip("/")

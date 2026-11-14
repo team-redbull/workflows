@@ -77,8 +77,8 @@ class ClusterFileRef(BaseModel):
 
 
 class MergeRequestRef(BaseModel):
-    """The merge request (GitLab) or pull request (GitHub) for the branch: its web
-    URL, the provider's identifier (a GitLab iid or a GitHub number, as text) and
+    """The GitLab merge request for the branch: its web URL, its identifier (the
+    project-scoped iid, as text) and
     whether ensure_merge_request created it or found it already open."""
 
     url: str = Field(min_length=1)

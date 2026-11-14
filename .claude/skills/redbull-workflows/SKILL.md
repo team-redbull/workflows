@@ -144,4 +144,4 @@ Do not report a change as finished until every line holds:
 - [ ] **Docs updated per Step 3**, in this same change.
 - [ ] CLAUDE.md updated when a decision, dependency or rule changed, with the matching `.claude/rules/` file and the checker when it is a rule.
 - [ ] Deploy order stated in the hand-off when it matters: brain before limb; chart key before image; which side of a cross-repo contract ships first.
-- [ ] Nothing CLAUDE.md records as removed came back (convert-segment, the firewall flow, the DHCP scope wait in allocate-segment, `/bulk` on add-server-to-mce, a demo mode on a UI page, a sibling `cancel()`).
+- [ ] Nothing CLAUDE.md records as removed came back (convert-segment, the firewall flow, the DHCP scope wait in allocate-segment, `/bulk` on add-server-to-mce, a demo mode on a UI page, a sibling `cancel()`, a second git provider next to GitLab).

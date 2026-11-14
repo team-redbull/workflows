@@ -1,7 +1,8 @@
 """The day2 sig repos for provision-cluster: register a cluster by creating its folder.
 
 day2 has no registration file — a cluster exists for a sig when
-`sites/<site>/<env>/mces/<mce>/<cluster>/` exists in that sig's repo
+`sites/<site>/<env>/mces/<mce>/<cluster>/` exists in that sig's repo, ONE
+GitLab project per sig (`redbull/gitops-day2-prod/sigs/<sig>`), the tree at its root
 (gitops-day2-prod ARCHITECTURE.md R6; the semantics of the retired chart Job's
 files/add-cluster-to-day2.sh). So "registering" is one folder with a
 `.gitkeep`, pushed to the sig repo's DEFAULT branch — bypassing the sig's
@@ -44,18 +45,12 @@ def _segment(value: str, what: str) -> str:
     return value
 
 
-def cluster_folder(path_prefix: str, request: Day2SigRegistrationRequest) -> str:
-    """`<prefix>/sites/<site>/<env>/mces/<mce>/<cluster>` (no prefix when the tree is at the root)."""
-    parts = [
+def cluster_folder(request: Day2SigRegistrationRequest) -> str:
+    """`sites/<site>/<env>/mces/<mce>/<cluster>`, from the root of the sig's own project."""
+    return "/".join([
         "sites", _segment(request.site, "site"), _segment(request.env, "env"),
         "mces", _segment(request.mce, "MCE"), _segment(request.cluster, "cluster"),
-    ]
-    prefix = path_prefix.strip("/")
-    if prefix:
-        if ".." in prefix.split("/"):
-            raise ValuesRepoGitError(f"day2 path prefix {prefix!r} must stay inside the repo")
-        parts = prefix.split("/") + parts
-    return "/".join(parts)
+    ])
 
 
 async def default_branch(*, repo_url: str, token: str) -> str:
@@ -71,12 +66,10 @@ async def default_branch(*, repo_url: str, token: str) -> str:
     return match.group("branch")
 
 
-async def register(
-    *, repo_url: str, token: str, path_prefix: str, request: Day2SigRegistrationRequest
-) -> Day2SigRegistration:
+async def register(*, repo_url: str, token: str, request: Day2SigRegistrationRequest) -> Day2SigRegistration:
     """The cluster's folder in the sig repo: created on the default branch, or already there."""
     _segment(request.sig, "sig")
-    folder = cluster_folder(path_prefix, request)
+    folder = cluster_folder(request)
     branch = await default_branch(repo_url=repo_url, token=token)
     with tempfile.TemporaryDirectory(prefix="day2-sig-") as tmp:
         clone = Path(tmp) / "repo"

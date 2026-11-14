@@ -81,10 +81,8 @@ sig repo's default branch (read from `ls-remote --symref`), bypassing the sig's
 merge-request lint by design, as `add-cluster-to-day2.sh` did; a folder already
 there is success.
 
-Production: one GitLab project per sig, `DAY2_SIG_REPO_URL_TEMPLATE =
-https://<gitlab>/redbull/gitops-day2-prod/sigs/{sig}.git`, the tree at the root
-(`DAY2_SIG_PATH_TEMPLATE = ""`). Dev: one GitHub repo, the tree under
-`sigs/{sig}`.
+One GitLab project per sig, `DAY2_SIG_REPO_URL_TEMPLATE =
+https://<gitlab>/redbull/gitops-day2-prod/sigs/{sig}.git`, the tree at the root.
 
 ## What the run deliberately does not do
 
@@ -102,14 +100,34 @@ https://<gitlab>/redbull/gitops-day2-prod/sigs/{sig}.git`, the tree at the root
   the run and leaves the branch and the allocation for a person to decide on;
   release-segment gives the segment back if the cluster is abandoned.
 
-## Dev versus the air-gap
+## One git provider: GitLab
 
-| | dev (GitHub) | air-gap (GitLab) |
-| --- | --- | --- |
-| merge request | pull request; delete-on-merge is the repo's setting | merge request with `remove_source_branch` |
-| `DAY1_GIT_PROVIDER` | `github` | `gitlab` |
-| day1 CI on the branch | none (no MachineConfig chain in the dev copy) — the merged file has no `mcConfigMap` | the chain: allocation skipped, MachineConfigs rendered and committed |
-| day2 sigs | one repo, `sigs/{sig}` | one project per sig, tree at the root |
-| token | a PAT with `repo` | a project/personal token with `api` + `write_repository` |
+GitLab is the only provider the limb knows (the operator, 2026-11-14: one
+convention to maintain, and the air-gapped service must not carry a second one).
+`DAY1_GIT_PROVIDER`, the GitHub pull-request path and `DAY2_SIG_PATH_TEMPLATE`
+(sigs as folders of one repo) were removed. The merge request is opened through
+`<host of DAY1_REPO_URL>/api/v4/projects/<the URL's path, URL-encoded>` — the
+path with every subgroup, `redbull/gitops-day1/platform-config` — and each sig is
+its own project, `redbull/gitops-day2-prod/sigs/<sig>`.
 
-The air-gap's own changes are in `APPLY-PROVISION-CLUSTER.md`.
+Proven on 2026-11-14 against the GitLab on the dev cluster (CE 19.5.3, the
+`redbull` group mocking the air-gap's subgroups), with a GROUP access token
+(Maintainer, `api` + `write_repository`), the limb's modules alone and then a
+whole run from source:
+
+| checked | result |
+| --- | --- |
+| clone / `ls-remote` / push with the token in the URL | works (`x-access-token:<token>@`; GitLab takes any username) |
+| the project id as one encoded segment through the Route | works |
+| merge request: created, found on a re-run, a second create | 201, found, 409 → retried and found |
+| `remove_source_branch` | the branch is gone after the merge |
+| state: open, closed, merged | read; the merged commit for a merge commit, a squash and a fast-forward (GitLab reports no merge commit there, so the merge request's head is taken) |
+| the day1 chain's `mcConfigMap` commit on the branch, then a re-run | `changed=False`; another vlan → `ClusterFileConflictError` |
+| day2: the folder on each sig project's protected `main` | pushed with Maintainer; again → `created=False` |
+| a wrong token / one without `api` / an unknown project | 401, 403 → `GitProviderAuthError`; 404 → `GitProviderRequestRejectedError` |
+| a Developer-role token on a sig's protected branch, or a sig with no project | the push or `ls-remote` is refused → `ValuesRepoGitError`, RETRIED: the run waits at `registering-day2` with GitLab's words on the activity, and goes on once the role or the project is fixed (failing it would strand a merged cluster — a re-run stops at `ClusterAlreadyProvisionedError`) |
+
+Not on that instance, so not proven there: a pipeline on the branch (it has no
+runner — the day1 chain's commit was made by hand), push rules, merge-request
+approvals, and a GitLab served under a relative URL root (`https://host/gitlab/…`
+is not supported: the URL's host is taken as GitLab's root).

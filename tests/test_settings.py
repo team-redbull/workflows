@@ -1,6 +1,6 @@
 """Fail-fast parsing of the limbs' settings: the DHCP scope API keys
 (SegmentLifecycleActivitySettings), and DHCP_EXCLUSION_OCTET_RANGES, the
-DAY1_REPO_URL scheme, the git provider and the day2 sig templates
+DAY1_REPO_URL scheme and the day2 sig URL template
 (ClusterLifecycleActivitySettings — the day1 and DHCP-policy keys moved there
 from segment-lifecycle with the cluster file, 2026-11-11).
 
@@ -221,7 +221,7 @@ class TestVmLifecycleSettings:
 
 
 class TestClusterLifecycleSettings:
-    """provision-cluster's limb: the provider, the day2 templates and the day2 token fallback
+    """provision-cluster's limb: the day2 sig URL template and the day2 token fallback
     fail at worker start, never on the first run."""
 
     def _settings(self, monkeypatch, **env):
@@ -229,32 +229,21 @@ class TestClusterLifecycleSettings:
             monkeypatch.setenv(key, value)
         return ClusterLifecycleActivitySettings()
 
-    @pytest.mark.parametrize("value", ["gitlab", "GitHub", " github "])
-    def test_the_provider_is_one_of_the_two_known_lowercased(self, monkeypatch, value):
-        assert self._settings(monkeypatch, DAY1_GIT_PROVIDER=value).day1_git_provider == value.strip().lower()
+    @pytest.mark.parametrize("key", ["DAY1_GIT_PROVIDER", "DAY2_SIG_PATH_TEMPLATE"])
+    def test_the_removed_keys_are_ignored_not_read(self, monkeypatch, key):
+        """GitLab is the only provider and a sig is always its own project: a chart
+        still rendering either key (the image ships first) changes nothing."""
+        s = self._settings(monkeypatch, **{key: "anything"})
+        assert not hasattr(s, key.lower())
+        assert s.day2_sig_repo_url("a") == "https://git.test/redbull/gitops-day2-prod/sigs/a.git"
 
-    @pytest.mark.parametrize("value", ["bitbucket", "", "git"])
-    def test_an_unknown_provider_is_refused(self, monkeypatch, value):
-        with pytest.raises(ValidationError, match="day1_git_provider"):
-            self._settings(monkeypatch, DAY1_GIT_PROVIDER=value)
+    def test_the_sig_url_template_fills_the_sig(self, monkeypatch):
+        s = self._settings(monkeypatch, DAY2_SIG_REPO_URL_TEMPLATE="https://g/redbull/gitops-day2-prod/sigs/{sig}.git/")
+        assert s.day2_sig_repo_url("redbull") == "https://g/redbull/gitops-day2-prod/sigs/redbull.git"
 
-    def test_the_provider_is_required(self, monkeypatch):
-        monkeypatch.delenv("DAY1_GIT_PROVIDER")
-        with pytest.raises(ValidationError, match="day1_git_provider"):
-            ClusterLifecycleActivitySettings()
-
-    def test_the_sig_url_template_fills_the_sig_and_the_prefix_is_stripped(self, monkeypatch):
-        s = self._settings(monkeypatch, DAY2_SIG_REPO_URL_TEMPLATE="https://g/sigs/{sig}.git/", DAY2_SIG_PATH_TEMPLATE="/x/{sig}/")
-        assert s.day2_sig_repo_url("redbull") == "https://g/sigs/redbull.git"
-        assert s.day2_sig_path_prefix("redbull") == "x/redbull"
-
-    def test_the_sig_may_be_in_the_path_template_only(self, monkeypatch):
-        s = self._settings(monkeypatch, DAY2_SIG_REPO_URL_TEMPLATE="https://github.com/t/day2.git", DAY2_SIG_PATH_TEMPLATE="sigs/{sig}")
-        assert (s.day2_sig_repo_url("a"), s.day2_sig_path_prefix("a")) == ("https://github.com/t/day2.git", "sigs/a")
-
-    def test_no_sig_placeholder_anywhere_is_refused(self, monkeypatch):
-        with pytest.raises(ValidationError, match="names {sig}"):
-            self._settings(monkeypatch, DAY2_SIG_REPO_URL_TEMPLATE="https://g/day2.git", DAY2_SIG_PATH_TEMPLATE="")
+    def test_a_url_template_without_the_sig_is_refused(self, monkeypatch):
+        with pytest.raises(ValidationError, match="does not name {sig}"):
+            self._settings(monkeypatch, DAY2_SIG_REPO_URL_TEMPLATE="https://g/day2.git")
 
     @pytest.mark.parametrize("template", ["https://g/{sgi}.git", "https://g/{}.git", "https://g/{sig}/{env}.git", "https://g/{sig.name}.git"])
     def test_a_placeholder_that_is_not_sig_is_refused(self, monkeypatch, template):
@@ -265,16 +254,6 @@ class TestClusterLifecycleSettings:
     def test_the_sig_url_must_be_https(self, monkeypatch, template):
         with pytest.raises(ValidationError, match="https://"):
             self._settings(monkeypatch, DAY2_SIG_REPO_URL_TEMPLATE=template)
-
-    @pytest.mark.parametrize("prefix", ["../{sig}", "sigs/../{sig}", "{sig}/.."])
-    def test_a_path_template_escaping_the_repo_is_refused(self, monkeypatch, prefix):
-        with pytest.raises(ValidationError, match="inside the repo"):
-            self._settings(monkeypatch, DAY2_SIG_REPO_URL_TEMPLATE="https://g/day2.git", DAY2_SIG_PATH_TEMPLATE=prefix)
-
-    @pytest.mark.parametrize("prefix", ["/sigs/{sig}", "sigs/{sig}/", " /sigs/{sig}/ "])
-    def test_a_path_templates_slashes_are_normalised(self, monkeypatch, prefix):
-        s = self._settings(monkeypatch, DAY2_SIG_REPO_URL_TEMPLATE="https://g/day2.git", DAY2_SIG_PATH_TEMPLATE=prefix)
-        assert s.day2_sig_path_template == "sigs/{sig}" and s.day2_sig_path_prefix("a") == "sigs/a"
 
     def test_the_day2_token_falls_back_to_the_day1_token(self, monkeypatch):
         monkeypatch.delenv("DAY2_GIT_TOKEN", raising=False)

@@ -1,7 +1,6 @@
 """day2_sigs against REAL local bare repos — fully offline.
 
-One bare repo per sig stands in for the GitLab project (tree at the root) or,
-with a path prefix, for the one dev GitHub repo with `sigs/<sig>/`. The
+One bare repo per sig stands in for its GitLab project, the tree at the root. The
 default branch is whatever the remote's HEAD says — `main` or `master` —
 and the folder lands there with its .gitkeep; a second run finds it.
 """
@@ -43,8 +42,8 @@ def _tree(origin: Path, branch: str) -> list[str]:
     return _git("ls-tree", "-r", "--name-only", branch, cwd=origin).split()
 
 
-async def _register(origin: Path, prefix: str = "", request: Day2SigRegistrationRequest = REQUEST):
-    return await day2_sigs.register(repo_url=str(origin), token="", path_prefix=prefix, request=request)
+async def _register(origin: Path, request: Day2SigRegistrationRequest = REQUEST):
+    return await day2_sigs.register(repo_url=str(origin), token="", request=request)
 
 
 async def test_creates_the_folder_on_the_default_branch(tmp_path):
@@ -85,23 +84,6 @@ async def test_a_second_run_is_a_no_op(tmp_path):
     assert _git("rev-parse", "main", cwd=origin).strip() == first.commit_sha
 
 
-async def test_the_dev_layout_puts_the_tree_under_the_prefix(tmp_path):
-    origin = _bare(tmp_path, "day2.git", "main", {"sigs/redbull/README.md": "x\n"})
-    registration = await _register(origin, prefix="sigs/redbull")
-    assert registration.path == f"sigs/redbull/{FOLDER}"
-    assert f"sigs/redbull/{FOLDER}/.gitkeep" in _tree(origin, "main")
-
-
-@pytest.mark.parametrize("prefix", ["/sigs/redbull", "sigs/redbull/", "/sigs/redbull/"])
-async def test_a_prefix_is_taken_without_its_slashes(tmp_path, prefix):
-    assert day2_sigs.cluster_folder(prefix, REQUEST) == f"sigs/redbull/{FOLDER}"
-
-
-def test_a_prefix_escaping_the_repo_is_refused():
-    with pytest.raises(ValuesRepoGitError, match="inside the repo"):
-        day2_sigs.cluster_folder("../elsewhere", REQUEST)
-
-
 @pytest.mark.parametrize("field", ["sig", "site", "env", "mce", "cluster"])
 @pytest.mark.parametrize("value", ["../x", "a/b", "Up", "", "-x", "a b"])
 def test_every_path_segment_is_a_plain_token(field, value):
@@ -110,7 +92,7 @@ def test_every_path_segment_is_a_plain_token(field, value):
         if field == "sig":
             day2_sigs._segment(request.sig, "sig")
         else:
-            day2_sigs.cluster_folder("", request)
+            day2_sigs.cluster_folder(request)
 
 
 async def test_an_unreachable_sig_repo_stays_retryable(tmp_path):

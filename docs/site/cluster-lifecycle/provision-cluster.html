@@ -154,14 +154,14 @@
             <span class="phase">phase <b>opening-merge-request</b></span>
           </div>
           <p>The open merge request from the branch to <code>main</code>: found by source branch when one is open,
-          else created — on GitLab (production) with <code>remove_source_branch</code>, on GitHub (dev) a pull
-          request, delete-on-merge being the repository's setting. Which API is <code>DAY1_GIT_PROVIDER</code>.
+          else created with <code>remove_source_branch</code>, through GitLab's API on the day1 repo's host — the project
+          is <code>DAY1_REPO_URL</code>'s path, subgroups included. GitLab is the only provider.
           The description tells the reviewer what was written (site, folder, mastertag, config names, segment, vlan,
           day2 sigs) and <b>to merge only once the branch pipeline is green and its <code>mcConfigMap</code> commit is
           on the branch</b>.</p>
           <div class="calls">
-            <div class="call sm"><span class="verb">GET</span><span class="path">…/merge_requests?source_branch=&amp;state=opened <em>· GitLab</em> &nbsp;|&nbsp; …/pulls?head=&amp;state=open <em>· GitHub</em></span></div>
-            <div class="call sm"><span class="verb">POST</span><span class="path">…/merge_requests <em>· remove_source_branch</em> &nbsp;|&nbsp; …/pulls</span></div>
+            <div class="call sm"><span class="verb">GET</span><span class="path">…/api/v4/projects/&lt;path&gt;/merge_requests?source_branch=&amp;state=opened</span></div>
+            <div class="call sm"><span class="verb">POST</span><span class="path">…/api/v4/projects/&lt;path&gt;/merge_requests <em>· remove_source_branch</em></span></div>
           </div>
         </div>
       </div>
@@ -410,7 +410,11 @@ curl -X POST -H 'Content-Type: application/yaml' --data-binary @cluster.yaml \
         <p style="font-size:var(--fs-14);color:var(--ink-2)"><code>ValuesRepoGitError</code> (an unreachable day1 or
         sig repo, a rejected non-fast-forward push — the retry re-clones), <code>ValuesBranchNotFoundError</code>
         (a repo without <code>main</code> yet) and <code>GitProviderError</code> (the provider down, a 5xx, a merge
-        request born between the find and the create — the retry finds it). They retry forever; an unclassified
+        request born between the find and the create — the retry finds it). They retry forever. <b>A run that stays
+        at <code>registering-day2</code></b> is the usual case: GitLab refused the push to a sig project — the token's
+        role may not push its protected default branch (it needs Maintainer), or a sig listed under
+        <code>day2.copy_to_sigs</code> has no project. GitLab's words are on the pending activity; the cluster file is
+        already merged, so the run waits and goes on once the role or the project is fixed. An unclassified
         permanent error shows as a run stuck <b>RUNNING</b> in the Temporal UI — the fix is to classify it, not to add
         a deadline.</p>
         <h3 style="margin-top:6px">Nothing to clean up</h3>
@@ -464,10 +468,9 @@ curl -X POST -H 'Content-Type: application/yaml' --data-binary @cluster.yaml \
         <thead><tr><th>Key</th><th>Lives in</th><th>Effect</th></tr></thead>
         <tbody>
           <tr><td class="k">DAY1_REPO_URL</td><td class="muted">cluster-lifecycle-config</td><td class="muted">The day1 values repo: read at <code>main</code>, pushed on <code>provision-cluster/&lt;cluster&gt;</code>. Its host is also where the merge request is opened.</td></tr>
-          <tr><td class="k">DAY1_GIT_PROVIDER</td><td class="muted">cluster-lifecycle-config</td><td class="muted"><code>gitlab</code> (a merge request with <code>remove_source_branch</code>) or <code>github</code> (a pull request). No default.</td></tr>
-          <tr><td class="k">REDBULL_GIT_TOKEN</td><td class="muted">Secret redbull-git-token, key REDBULL_GIT_TOKEN</td><td class="muted">The push credential AND the provider's API token (GitLab: <code>api</code> + <code>write_repository</code>; GitHub: <code>repo</code>). The Secret's key reaches the pod under its own name. <code>DAY1_GIT_TOKEN</code> is accepted too, for a cluster with only a <code>day1-git-token</code> Secret; <code>REDBULL_GIT_TOKEN</code> wins when both are set. Scrubbed from every error.</td></tr>
+          <tr><td class="k">REDBULL_GIT_TOKEN</td><td class="muted">Secret redbull-git-token, key REDBULL_GIT_TOKEN</td><td class="muted">The push credential AND GitLab's API token: <code>api</code> + <code>write_repository</code>, with a role that may push each sig project's protected default branch (Maintainer). The Secret's key reaches the pod under its own name. <code>DAY1_GIT_TOKEN</code> is accepted too, for a cluster with only a <code>day1-git-token</code> Secret; <code>REDBULL_GIT_TOKEN</code> wins when both are set. Scrubbed from every error.</td></tr>
           <tr><td class="k">DHCP_EXCLUSION_OCTET_RANGES</td><td class="muted">cluster-lifecycle-config</td><td class="muted">The ONE DHCP policy knob, per segment type, written into every cluster file's block (HC required). Validated at worker startup.</td></tr>
-          <tr><td class="k">DAY2_SIG_REPO_URL_TEMPLATE · DAY2_SIG_PATH_TEMPLATE</td><td class="muted">cluster-lifecycle-config</td><td class="muted">The sig repos: the URL with <code>{sig}</code> (production: one project per sig, tree at the root) or one repo with the tree under the path template (dev: <code>sigs/{sig}</code>).</td></tr>
+          <tr><td class="k">DAY2_SIG_REPO_URL_TEMPLATE</td><td class="muted">cluster-lifecycle-config</td><td class="muted">The sig repos: the URL with <code>{sig}</code>, one GitLab project per sig, the tree at its root.</td></tr>
           <tr><td class="k">DAY2_GIT_TOKEN</td><td class="muted">not rendered by the chart</td><td class="muted">The sig repos' push token; empty = <code>REDBULL_GIT_TOKEN</code>. The chart sets none: the group token pushes day1 and every sig repo.</td></tr>
         </tbody>
       </table>

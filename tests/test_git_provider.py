@@ -1,6 +1,7 @@
-"""git_provider: GitLab's and GitHub's merge-request APIs, mocked at the httpx layer.
+"""git_provider: GitLab's merge-request API, mocked at the httpx layer.
 
-What is pinned is the request each provider sends (path, auth header, body)
+GitLab is the ONLY provider (CLAUDE.md §4): nothing here may name another.
+What is pinned is the request it sends (path, auth header, body)
 and the classification of every answer: find-before-create, 401/403 →
 GitProviderAuthError, 400/404/422 → GitProviderRequestRejectedError, 409/5xx/
 unreachable → the retryable GitProviderError, bodies bounded in the message.
@@ -18,10 +19,9 @@ from activities.cluster_lifecycle import git_provider
 from shared.exceptions import GitProviderAuthError, GitProviderError, GitProviderRequestRejectedError
 
 TOKEN = "glpat-not-real"
-GITLAB_REPO = "https://gitlab.example.internal/platform/gitops-day1/platform-config.git"
-GITLAB_API = "https://gitlab.example.internal/api/v4/projects/platform%2Fgitops-day1%2Fplatform-config"
-GITHUB_REPO = "https://github.com/team-redbull/gitops-day1-platform-config.git"
-GITHUB_API = "https://api.github.com/repos/team-redbull/gitops-day1-platform-config"
+# The air-gap's layout: the project sits two subgroups deep, and the whole path is ONE encoded segment.
+GITLAB_REPO = "https://gitlab.example.internal/redbull/gitops-day1/platform-config.git"
+GITLAB_API = "https://gitlab.example.internal/api/v4/projects/redbull%2Fgitops-day1%2Fplatform-config"
 BRANCH = "provision-cluster/ocp4-prep-e2e-site2-a"
 
 
@@ -30,18 +30,18 @@ class TestRepoPath:
     def test_a_gitlab_project_path_is_url_encoded(self, url):
         assert git_provider.GitLabProvider(url, TOKEN)._base == GITLAB_API
 
-    def test_a_github_enterprise_host_gets_its_api_v3(self):
-        provider = git_provider.GitHubProvider("https://ghe.example/org/repo.git", TOKEN)
-        assert provider._base == "https://ghe.example/api/v3/repos/org/repo"
-
-    @pytest.mark.parametrize("url", ["git@github.com:org/repo.git", "https://github.com/", "https://github.com/only-owner"])
+    @pytest.mark.parametrize("url", ["git@gitlab.example.internal:redbull/repo.git", "https://gitlab.example.internal/", "https://gitlab.example.internal/only-group"])
     def test_a_url_that_is_not_a_clone_url_is_refused(self, url):
         with pytest.raises(GitProviderRequestRejectedError):
-            git_provider.GitHubProvider(url, TOKEN)
+            git_provider.GitLabProvider(url, TOKEN)
 
-    def test_an_unknown_provider_name_is_refused(self):
-        with pytest.raises(GitProviderRequestRejectedError, match="unknown git provider"):
-            git_provider.provider_for("bitbucket", GITHUB_REPO, TOKEN)
+    def test_gitlab_is_the_only_provider(self):
+        """One convention (the operator, 2026-11-14): no second provider class, no selector."""
+        import inspect
+
+        source = inspect.getsource(git_provider).lower()
+        assert "github" not in source and "pull request" not in source
+        assert not hasattr(git_provider, "provider_for")
 
 
 @respx.mock
@@ -87,6 +87,19 @@ class TestGitLab:
         )
         assert (await self.provider.state("42")).merged_sha == "sq1"
 
+    async def test_a_fast_forward_merge_reports_the_merge_requests_head(self):
+        # GitLab's answer for a fast-forward merge, as the 2qsc5 instance gave it (19.5.3).
+        respx.get(f"{GITLAB_API}/merge_requests/42").mock(return_value=httpx.Response(
+            200, json={"state": "merged", "merge_commit_sha": None, "squash_commit_sha": None, "sha": "head1"}
+        ))
+        assert (await self.provider.state("42")).merged_sha == "head1"
+
+    async def test_the_merge_commit_wins_over_the_head(self):
+        respx.get(f"{GITLAB_API}/merge_requests/42").mock(return_value=httpx.Response(
+            200, json={"state": "merged", "merge_commit_sha": "m1", "squash_commit_sha": None, "sha": "head1"}
+        ))
+        assert (await self.provider.state("42")).merged_sha == "m1"
+
     async def test_an_unknown_state_is_retried_not_guessed(self):
         respx.get(f"{GITLAB_API}/merge_requests/42").mock(return_value=httpx.Response(200, json={"state": "weird"}))
         with pytest.raises(GitProviderError, match="unknown state"):
@@ -131,51 +144,16 @@ class TestGitLab:
         with pytest.raises(GitProviderError, match="not a list"):
             await self.provider.find_open(BRANCH)
 
-
-@respx.mock
-class TestGitHub:
-    def setup_method(self):
-        self.provider = git_provider.GitHubProvider(GITHUB_REPO, TOKEN)
-
-    async def test_find_then_create_as_a_pull_request(self):
-        find = respx.get(f"{GITHUB_API}/pulls").mock(return_value=httpx.Response(200, json=[]))
-        create = respx.post(f"{GITHUB_API}/pulls").mock(
-            return_value=httpx.Response(201, json={"number": 5, "html_url": "https://github.com/t/r/pull/5"})
-        )
-        ref = await git_provider.ensure_merge_request(self.provider, BRANCH, "Provision x", "desc")
-        assert (ref.identifier, ref.created, ref.url) == ("5", True, "https://github.com/t/r/pull/5")
-        request = find.calls[0].request
-        assert request.headers["Authorization"] == f"Bearer {TOKEN}"
-        assert request.headers["Accept"] == "application/vnd.github+json"
-        assert dict(request.url.params) == {"head": f"team-redbull:{BRANCH}", "base": "main", "state": "open"}
-        assert json.loads(create.calls[0].request.content) == {"title": "Provision x", "head": BRANCH, "base": "main", "body": "desc"}
-
-    async def test_an_open_pull_request_is_found_not_created(self):
-        respx.get(f"{GITHUB_API}/pulls").mock(return_value=httpx.Response(200, json=[{"number": 9, "html_url": "https://g/pull/9"}]))
-        create = respx.post(f"{GITHUB_API}/pulls")
-        ref = await git_provider.ensure_merge_request(self.provider, BRANCH, "t", "d")
-        assert (ref.identifier, ref.created) == ("9", False)
-        assert not create.called
-
-    @pytest.mark.parametrize(("body", "expected", "sha"), [
-        ({"state": "open", "merged": False}, "open", None),
-        ({"state": "closed", "merged": False}, "closed", None),
-        ({"state": "closed", "merged": True, "merge_commit_sha": "m1"}, "merged", "m1"),
-    ])
-    async def test_state_is_read_back_with_merged_before_closed(self, body, expected, sha):
-        respx.get(f"{GITHUB_API}/pulls/5").mock(return_value=httpx.Response(200, json=body))
-        result = await self.provider.state("5")
-        assert (result.state, result.merged_sha) == (expected, sha)
-
-    async def test_no_token_sends_no_authorization_header(self):
-        provider = git_provider.GitHubProvider(GITHUB_REPO, "")
-        route = respx.get(f"{GITHUB_API}/pulls").mock(return_value=httpx.Response(200, json=[]))
+    async def test_no_token_sends_no_private_token_header(self):
+        provider = git_provider.GitLabProvider(GITLAB_REPO, "")
+        route = respx.get(f"{GITLAB_API}/merge_requests").mock(return_value=httpx.Response(200, json=[]))
         assert await provider.find_open(BRANCH) is None
-        assert "Authorization" not in route.calls[0].request.headers
+        assert "PRIVATE-TOKEN" not in route.calls[0].request.headers
 
-    async def test_a_422_for_an_existing_pull_request_is_rejected_with_githubs_words(self):
-        respx.post(f"{GITHUB_API}/pulls").mock(
-            return_value=httpx.Response(422, json={"message": "Validation Failed", "errors": [{"message": "A pull request already exists"}]})
-        )
-        with pytest.raises(GitProviderRequestRejectedError, match="A pull request already exists"):
+    async def test_gitlabs_field_errors_are_carried_in_the_message(self):
+        # GitLab's 409 for a second open merge request from one branch: `message` is a LIST.
+        respx.post(f"{GITLAB_API}/merge_requests").mock(return_value=httpx.Response(
+            409, json={"message": ["Another open merge request already exists for this source branch: !1"]}
+        ))
+        with pytest.raises(GitProviderError, match="Another open merge request already exists"):
             await self.provider.create(BRANCH, "t", "d")

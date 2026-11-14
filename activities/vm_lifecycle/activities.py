@@ -60,7 +60,7 @@ _ROOT_DISK_READY_PHASE = "Succeeded"
 
 def tls_verify(ca_path: str) -> ssl.SSLContext | bool:
     """What httpx verifies the agents' certificates against: the CA file, or NOTHING when
-    none is configured — the operator's decision (shared/settings.py, kv_agent_ca)."""
+    none is configured — the operator's decision (shared/settings/vm_lifecycle.py, kv_agent_ca)."""
     return ssl.create_default_context(cafile=ca_path) if ca_path else False
 
 

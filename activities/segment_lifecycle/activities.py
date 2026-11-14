@@ -57,7 +57,7 @@ from shared.models.segment_lifecycle import (
     SegmentAllocationRequest,
     SegmentEntry,
 )
-from shared.settings import SegmentLifecycleActivitySettings
+from shared.settings.segment_lifecycle import SegmentLifecycleActivitySettings
 
 _settings = SegmentLifecycleActivitySettings()
 

@@ -27,7 +27,7 @@ from activities.cluster_lifecycle.activities import (
 )
 from shared.consts import CLUSTER_LIFECYCLE_ACTIVITY_QUEUE
 from shared.logging_config import configure_logging
-from shared.settings import TemporalSettings
+from shared.settings.temporal import TemporalSettings
 from shared.shutdown import install_shutdown_handler
 from shared.temporal_client import connect_temporal
 

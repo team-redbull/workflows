@@ -16,7 +16,7 @@ from temporalio.exceptions import ApplicationError
 from activities.upgrade_agent import agent_api
 from shared.exceptions import UpgradeAgentRefusedError
 from shared.models.cluster_upgrade import AgentRequest, AgentVerdict
-from shared.settings import UpgradeAgentActivitySettings
+from shared.settings.upgrade_agent import UpgradeAgentActivitySettings
 
 _settings = UpgradeAgentActivitySettings()
 

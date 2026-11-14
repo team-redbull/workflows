@@ -59,7 +59,7 @@ from shared.models.cluster_upgrade import (
     WatchOutcome,
     WatchResult,
 )
-from shared.settings import ClusterUpgradeActivitySettings
+from shared.settings.cluster_upgrade import ClusterUpgradeActivitySettings
 
 # Argo CD on the MCE: one Application per hosted cluster, named after its day1
 # file, made by the hcAppset (CONTEXT §6.1), in ARGO_NAMESPACE; the day1

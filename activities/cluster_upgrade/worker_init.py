@@ -45,7 +45,8 @@ from activities.cluster_upgrade.activities import (
 )
 from shared.consts import cluster_upgrade_activity_queue
 from shared.logging_config import configure_logging
-from shared.settings import ClusterUpgradeActivitySettings, TemporalSettings
+from shared.settings.cluster_upgrade import ClusterUpgradeActivitySettings
+from shared.settings.temporal import TemporalSettings
 from shared.shutdown import install_shutdown_handler
 from shared.temporal_client import connect_temporal
 

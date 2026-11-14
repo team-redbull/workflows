@@ -16,17 +16,15 @@ from __future__ import annotations
 
 import os
 
-from shared.settings import (
-    ClusterLifecycleActivitySettings,
-    ClusterUpgradeActivitySettings,
-    SegmentLifecycleActivitySettings,
-    ServerLifecycleActivitySettings,
-    ServerProvisioningActivitySettings,
-    TemporalSettings,
-    UpgradeAgentActivitySettings,
-    UpgradeGitopsActivitySettings,
-    VmLifecycleActivitySettings,
-)
+from shared.settings.cluster_lifecycle import ClusterLifecycleActivitySettings
+from shared.settings.cluster_upgrade import ClusterUpgradeActivitySettings
+from shared.settings.segment_lifecycle import SegmentLifecycleActivitySettings
+from shared.settings.server_lifecycle import ServerLifecycleActivitySettings
+from shared.settings.server_provisioning import ServerProvisioningActivitySettings
+from shared.settings.temporal import TemporalSettings
+from shared.settings.upgrade_agent import UpgradeAgentActivitySettings
+from shared.settings.upgrade_gitops import UpgradeGitopsActivitySettings
+from shared.settings.vm_lifecycle import VmLifecycleActivitySettings
 
 for _settings_class in (
     ClusterLifecycleActivitySettings,

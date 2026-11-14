@@ -33,7 +33,8 @@ CLAUDE.md §1, §2, §5, §6, §7. Checker ids in brackets.
   `TemporaryDirectory` per attempt, every token scrubbed from error text BEFORE the
   exception is built.
 - **Settings**: `<Limb>ActivitySettings()` at module level (fail-fast). A new key goes in
-  `shared/settings.py`, `.env.example`, `tests/conftest.py` and the chart, which ships first.
+  the limb's OWN module `shared/settings/<limb>.py` (imported from that module, never from
+  the package), `.env.example`, `tests/conftest.py` and the chart, which ships first.
 - **RBAC** (per-MCE limbs): a new verb or resource is a row in the chart README's table.
 - **Dependencies** go in this limb's `requirements.txt` and Dockerfile, never in `shared/`.
 - **Docs in the same change**: the page of every workflow that calls the activity

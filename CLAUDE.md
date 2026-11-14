@@ -25,8 +25,8 @@ every teammate; use them in this order and keep them in step:
   named through exception classes, no whole response body in an activity error,
   `ApplicationError` from workflow code, one `run()`
   argument, `connect_temporal` only, interface ↔ implementation ↔ worker registration,
-  `_WORKER_SPECS`, router paths and 202s, Dockerfile CMDs, CI jobs, a docs page per
-  started workflow). It runs on every Edit/Write through the PostToolUse hook in
+  `_WORKER_SPECS`, router paths and 202s, Dockerfile CMDs, CI jobs each gated on their own
+  image, a settings package that re-exports nothing, a docs page per started workflow). It runs on every Edit/Write through the PostToolUse hook in
   `.claude/settings.json` (which also names the docs pages describing the edited file),
   as `tests/test_conventions.py`, and in CI's `test` job, which every image build needs.
 
@@ -45,7 +45,8 @@ shared/                      Contract layer — the API between brain and limbs
   models/                    Pydantic data classes (typed state across boundaries)
   interfaces/                Activity signatures ONLY (@activity.defn, no body)
   exceptions.py  consts.py   Shared errors / constants (e.g. task-queue names)
-  settings.py                pydantic-settings BaseSettings (fail-fast typed config)
+  settings/<limb>.py         pydantic-settings BaseSettings (fail-fast typed config),
+                               ONE module per worker + temporal.py; __init__ imports nothing
   logging_config.py          Shared worker logging setup
 workflow_domains/            The orchestration "brain" (one lightweight deployment)
   <domain>/                  One folder per domain — mirrors activities/<domain>/
@@ -1229,7 +1230,18 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   brain release must install before any limb (else `CreateContainerConfigError` on the missing
   global ConfigMap) — and the chart must ship the new keys BEFORE (or with) an image that requires
   them, or the worker crash-loops on its fail-fast settings.
-- **`shared/settings.py`** groups: `TemporalSettings` (workers + api.py),
+- **Settings are ONE MODULE PER WORKER, `shared/settings/<limb>.py`, and the package re-exports
+  nothing** (checker SH007). Until 2026-11-14 they were one `shared/settings.py`: every image loads
+  its own class from it, so every image loaded the file, and each of its 34 commits in ten weeks —
+  nearly all "this worker gets a key" — rebuilt and re-tagged ten images, each one more image to
+  mirror into the air-gap. Split with the operator the day CI began building an image only for the
+  files it LOADS (§9): import a class from ITS module, `from shared.settings.vm_lifecycle import
+  VmLifecycleActivitySettings`; an import in `shared/settings/__init__.py` would undo it.
+  **`shared/exceptions.py` stays ONE file on purpose** (the operator, same day): the brain needs
+  every class anyway (the non-retryable lists), several are raised by more than one limb (the git
+  errors), and "errors live in one place, named through the class" is what makes a mistyped type
+  fail at startup (§5) — so a new exception still rebuilds every image, and that is accepted.
+  The classes: `TemporalSettings` (workers + api.py),
   `SegmentLifecycleActivitySettings`, `ServerLifecycleActivitySettings`,
   `ServerProvisioningActivitySettings`, `VmLifecycleActivitySettings` (each that domain's activity
   worker only; this one: `DAY1_REPO_URL`/`DAY1_GIT_TOKEN` again, `KV_CAPACITY_URL_TEMPLATE` /
@@ -1331,6 +1343,25 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   set by hand; do not go back to that. None of the three has a `gitops/services/` entry yet, so
   their bumps deploy nothing; deploy them by adding one (per MCE for the two per-MCE limbs). The
   domain keeps THREE images, one per limb (§2): the operator confirmed it the same day.
+- **CI builds an image only when a file IT LOADS changed** (`scripts/image_changes.py`, the
+  `changes` job; with the operator, 2026-11-14). The rule used to be by folder — `shared/` rebuilt
+  every Python image, `activities/` every limb — so the GitLab-only change to ONE limb re-tagged
+  ten images. Now each image's files are followed STATICALLY from its entrypoint (the Dockerfile's
+  `python -m` module; the brain also from `workflow_domains.api`, which the chart starts from the
+  same image) through every `import` statement, lazy ones included, plus its own Dockerfile and
+  requirements; `tests/test_image_changes.py` imports each entrypoint in a fresh interpreter and
+  checks that everything really loaded is in that set, so the script can over-build, never
+  under-build. WHEN IT CANNOT TELL, IT BUILDS WIDE: a data file in a copied folder (the UI pages'
+  `index.html`), a deleted or renamed path, a module that does not parse, the script itself,
+  `build.yml`, `.dockerignore`, a crash of the script. An interface (`shared/interfaces/<limb>.py`)
+  is loaded by the BRAIN only — the limb registers by name and never imports it. Each limb image
+  still CONTAINS the whole `activities/` tree (the Dockerfile's COPY); it is not rebuilt for files
+  it never imports. Each build job asks for its OWN image name in the one `images` list (checker
+  DL002), so a new limb is found from its Dockerfile and registers nowhere. **The diff base is the
+  last push on the branch whose WHOLE run succeeded**, not the previous push: with per-image
+  precision an image whose build failed, or whose push GitHub skipped (a CI-skip marker in the
+  message), would otherwise stay stale until its own files changed again. `python3
+  scripts/image_changes.py --table` prints which images load each file.
 - Assumed already running: a Temporal server and the Segments Manager (via OpenShift routes or
   localhost — no port assumptions in code).
 - Trigger via the unified API: `uvicorn workflow_domains.api:app --port 8080`, Swagger at `/docs`.

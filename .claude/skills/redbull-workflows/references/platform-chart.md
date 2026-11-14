@@ -38,7 +38,7 @@ reading. The archived `helm-charts-<service>` repos are dead: read nothing, push
 2. Ship the chart BEFORE (or with) the image whose settings require the key, or the pod
    crash-loops on fail-fast settings. Removing is the reverse: the chart drops the key
    only after the image that stopped needing it is the deployed tag.
-3. `shared/settings.py`, `.env.example`, `tests/conftest.py`, README's configuration
+3. `shared/settings/<limb>.py`, `.env.example`, `tests/conftest.py`, README's configuration
    table, the chart README's configuration table.
 
 ## Verify before pushing

@@ -42,7 +42,7 @@ from shared.consts import (
     UPGRADE_TARGETS_WORKFLOW_QUEUE,
 )
 from shared.logging_config import configure_logging
-from shared.settings import TemporalSettings
+from shared.settings.temporal import TemporalSettings
 from shared.shutdown import install_shutdown_handler
 from shared.temporal_client import connect_temporal
 from workflow_domains.cluster_lifecycle.provision_cluster import ProvisionClusterWorkflow

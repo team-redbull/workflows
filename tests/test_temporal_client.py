@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from shared.settings import TemporalSettings
+from shared.settings.temporal import TemporalSettings
 from shared.temporal_client import tls_config
 
 CA_PEM = b"-----BEGIN CERTIFICATE-----\nMIIBfake\n-----END CERTIFICATE-----\n"

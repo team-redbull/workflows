@@ -19,7 +19,8 @@ import pytest
 from pydantic import ValidationError
 
 from shared.models.segment_lifecycle import SegmentType
-from shared.settings import ClusterLifecycleActivitySettings, SegmentLifecycleActivitySettings
+from shared.settings.cluster_lifecycle import ClusterLifecycleActivitySettings
+from shared.settings.segment_lifecycle import SegmentLifecycleActivitySettings
 
 
 class TestDay1RepoUrl:
@@ -142,14 +143,14 @@ class TestClusterUpgradeActivitySettings:
     """The per-MCE cluster-upgrade limb: its MCE, and where Argo CD keeps the hosted clusters' Applications."""
 
     def test_the_defaults_are_the_hcappset_s(self):
-        from shared.settings import ClusterUpgradeActivitySettings
+        from shared.settings.cluster_upgrade import ClusterUpgradeActivitySettings
 
         settings = ClusterUpgradeActivitySettings()
         assert (settings.mce_cluster, settings.argo_namespace, settings.argo_values_ref) == (
             "ocp4-mce-test", "openshift-gitops", "values")
 
     def test_both_argo_keys_are_read_from_the_environment(self, monkeypatch):
-        from shared.settings import ClusterUpgradeActivitySettings
+        from shared.settings.cluster_upgrade import ClusterUpgradeActivitySettings
 
         monkeypatch.setenv("ARGO_NAMESPACE", "gitops-hc")
         monkeypatch.setenv("ARGO_VALUES_REF", "day1")
@@ -161,7 +162,7 @@ class TestClusterUpgradeActivitySettings:
         ("ARGO_VALUES_REF", "$values"), ("ARGO_VALUES_REF", ""),
     ])
     def test_a_value_argo_could_not_mean_is_rejected_at_startup(self, monkeypatch, key, value):
-        from shared.settings import ClusterUpgradeActivitySettings
+        from shared.settings.cluster_upgrade import ClusterUpgradeActivitySettings
 
         monkeypatch.setenv(key, value)
         with pytest.raises(ValidationError, match=key.lower()):
@@ -172,7 +173,7 @@ class TestVmLifecycleSettings:
     """The vm-lifecycle limb's knobs fail at worker start, never on the first run."""
 
     def _settings(self, monkeypatch, **env):
-        from shared.settings import VmLifecycleActivitySettings
+        from shared.settings.vm_lifecycle import VmLifecycleActivitySettings
 
         for key, value in env.items():
             monkeypatch.setenv(key, value)

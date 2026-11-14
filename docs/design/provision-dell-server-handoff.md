@@ -143,7 +143,7 @@ pytest -q tests/test_provision_dell_server_e2e.py       # REAL workflow + REAL a
 3. Replace the placeholder prefixes in `regions.py` with the real iDRAC networks
    and server-scan site codes.
 4. The **chart** `gitops/charts/server-provisioning-worker/` in
-   `team-redbull/redbull-platform`: settings from `shared/settings.py`
+   `team-redbull/redbull-platform`: settings from `shared/settings/server_provisioning.py`
    (`ServerProvisioningActivitySettings`; secrets are `OME_PASSWORD`,
    `IDRAC_ROOT_PASSWORD`, `IDRAC_FACTORY_PASSWORDS`, the tokens), no RBAC, and
    network access to the iDRACs, OME, the naming service and server-scan. CI's

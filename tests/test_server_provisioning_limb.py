@@ -31,7 +31,7 @@ from shared.exceptions import (
     TemplateNotFoundError,
 )
 from shared.models.server_provisioning import ServerNameRequest, ServerScanLookup
-from shared.settings import ServerProvisioningActivitySettings
+from shared.settings.server_provisioning import ServerProvisioningActivitySettings
 
 IP = "10.1.2.3"
 BASE = f"https://{IP}"

@@ -60,7 +60,8 @@ shared/                           Contract layer (temporalio + pydantic only)
   bmc_address.py                  Pure naming/address logic BOTH sides need
   infraenv_names.py               The naming convention: an InfraEnv's zone and VM size
   cluster_names.py                Canonical MCE names; site, seed and KV-cluster names
-  settings.py / exceptions.py / consts.py / workflow_ids.py / logging_config.py
+  settings/<limb>.py              One settings module per worker (+ temporal.py); never re-exported
+  exceptions.py / consts.py / workflow_ids.py / logging_config.py
 workflow_domains/                 The brain — one folder per domain, plus main_worker_init.py + api.py
   segment_lifecycle/              initialize_segment.py, allocate_segment.py, router.py
   server_lifecycle/               add_server_to_mce.py (the SHAPE of the run),

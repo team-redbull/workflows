@@ -21,8 +21,14 @@ The typed API between brain and limbs. Rationale: CLAUDE.md §1, §2, §5, §8. 
   dimension that scopes a run. Routers and workflows both import it. [SH004]
 - **`exceptions.py`**: `OrchestratorError` subclasses whose docstring says
   deterministic, transient or `WORKFLOW-RAISED.` Named through the class everywhere. [SH005]
-- **`settings.py`**: `BaseSettings` with `extra="ignore"`, keys = ConfigMap/Secret keys
-  lowercased, validators for structured knobs; never imported by workflow-side code. [SH006]
+- **`settings/<limb>.py`**, one module per worker (+ `temporal.py`): `BaseSettings` with
+  `extra="ignore"`, keys = ConfigMap/Secret keys lowercased, validators for structured
+  knobs; never imported by workflow-side code. [SH006] The package's `__init__.py`
+  imports NOTHING: a re-export loads every worker's settings into every image, and CI
+  would rebuild them all for one worker's key. [SH007]
+- **What a module here imports decides which images rebuild** (`scripts/image_changes.py`):
+  keep per-limb things in per-limb modules; `exceptions.py` and `consts.py` are loaded
+  by every image and stay single files on purpose (CLAUDE.md §8).
 - **`temporal_client.py`** is the only place a client connects (`connect_temporal`). [EP005]
 - **Docs in the same change**: a model or interface change updates the page of every
   workflow it touches (inputs, results, failures); a settings change updates

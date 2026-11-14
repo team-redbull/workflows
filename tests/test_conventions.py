@@ -11,6 +11,8 @@ teammate who never opens Claude Code.
 
 from __future__ import annotations
 
+import ast
+
 from pathlib import Path
 
 import pytest
@@ -230,6 +232,7 @@ async def approve(workflow_id: str, client):
 def test_a_limb_image_is_version_tagged_never_built_image_only(checker):
     reusable = """
   build-probe-worker:
+    if: ${{ !cancelled() && !failure() && contains(fromJSON(needs.changes.outputs.images || '[]'), 'probe-worker') }}
     uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
     with:
       image-name: probe-worker
@@ -249,6 +252,56 @@ def test_a_limb_image_is_version_tagged_never_built_image_only(checker):
     problems = checker.limb_build_problems("probe", image_only)
     assert len(problems) == 1 and "image-only" in problems[0] and "vX.Y.Z" in problems[0]
     assert "no build job" in checker.limb_build_problems("probe", "")[0]
+
+
+def test_a_limb_job_is_gated_on_its_own_image_name(checker):
+    """A job copied from another limb and left on that limb's name builds on the wrong pushes."""
+    job = """
+  build-other-worker:
+    if: ${{ contains(fromJSON(needs.changes.outputs.images || '[]'), 'other-worker') }}
+    with:
+      image-name: other-worker
+      dockerfile: activities/other/Dockerfile
+      helm-values-path: gitops/charts/other-worker/values.yaml
+
+  build-probe-worker:
+    if: ${{ !cancelled() && !failure() && contains(fromJSON(needs.changes.outputs.images || '[]'), 'other-worker') }}
+    uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
+    with:
+      image-name: probe-worker
+      dockerfile: activities/probe/Dockerfile
+      helm-values-path: gitops/charts/probe-worker/values.yaml
+"""
+    problems = checker.limb_build_problems("probe", job)
+    assert len(problems) == 1 and "'probe-worker'" in problems[0]
+    assert checker.limb_build_problems("other", job) == []
+
+
+def test_the_settings_package_re_exports_nothing(checker):
+    """SH007: a re-export loads every worker's settings into every image."""
+    source = "from shared.settings.temporal import TemporalSettings\n"
+    assert "SH007" in _rules(checker.run_source("shared/settings/__init__.py", source))
+    assert "SH007" not in _rules(checker.run_source("shared/settings/__init__.py", '"""Docstring only."""\n'))
+    assert "SH007" not in _rules(checker.run_source("shared/settings/temporal.py", source))
+
+
+def test_a_settings_class_in_any_module_of_the_package_is_checked(checker):
+    """SH006 and DL004 follow the split: they must not go quiet on shared/settings/<limb>.py."""
+    source = "from pydantic_settings import BaseSettings\n\n\nclass ProbeActivitySettings(BaseSettings):\n    probe_url: str\n"
+    assert "SH006" in _rules(checker.run_source("shared/settings/probe.py", source))
+    classes = [node for node in ast.parse(source).body if isinstance(node, ast.ClassDef)]
+    assert checker.undocumented_settings_keys(classes, "OTHER_KEY=x\n") == [
+        "`PROBE_URL` (ProbeActivitySettings) is not documented in .env.example (§8)"
+    ]
+    assert checker.undocumented_settings_keys(classes, "# PROBE_URL=x\n") == []
+
+
+def test_every_settings_class_of_the_repo_is_found(checker):
+    """DL004/DL005 read shared/settings/*.py: one class per module, none missed."""
+    found = sorted(node.name for node in checker._settings_classes())
+    modules = sorted(p.stem for p in (REPO_ROOT / "shared" / "settings").glob("*.py") if p.stem != "__init__")
+    assert len(found) == len(modules) == 9, (found, modules)
+    assert "TemporalSettings" in found and "ClusterLifecycleActivitySettings" in found
 
 
 def test_the_hook_names_the_docs_pages_of_the_edited_code(checker):

@@ -146,7 +146,7 @@ async def test_day2_registration_fills_the_sig_into_the_url_and_uses_the_day1_to
 
 
 async def test_a_day2_token_is_honoured(env, monkeypatch):
-    from shared.settings import ClusterLifecycleActivitySettings
+    from shared.settings.cluster_lifecycle import ClusterLifecycleActivitySettings
 
     monkeypatch.setenv("DAY2_GIT_TOKEN", "sig-token")
     monkeypatch.setattr(limb, "_settings", ClusterLifecycleActivitySettings())

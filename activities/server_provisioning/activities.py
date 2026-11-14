@@ -44,7 +44,7 @@ from shared.models.server_provisioning import (
     TemplateDeployRequest,
     TemplateDeployResult,
 )
-from shared.settings import ServerProvisioningActivitySettings
+from shared.settings.server_provisioning import ServerProvisioningActivitySettings
 
 _settings = ServerProvisioningActivitySettings()
 

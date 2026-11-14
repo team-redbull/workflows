@@ -41,7 +41,7 @@ from shared.models.server_lifecycle import (
     PxeHostEntriesRef,
     PxeMapRef,
 )
-from shared.settings import ServerLifecycleActivitySettings
+from shared.settings.server_lifecycle import ServerLifecycleActivitySettings
 
 PXE = "http://pxe.bat-yam.test:8080"  # PXE_MAP_URLS["bat-yam"] in conftest
 IPXE = "https://assisted-image-service.test/byid/abc/4.16/x86_64/ipxe-script"

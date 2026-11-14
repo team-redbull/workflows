@@ -17,7 +17,7 @@ from temporalio.client import Client
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.service import TLSConfig
 
-from shared.settings import TemporalSettings
+from shared.settings.temporal import TemporalSettings
 
 
 def tls_config(settings: TemporalSettings) -> TLSConfig | None:

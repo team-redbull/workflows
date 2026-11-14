@@ -45,7 +45,7 @@ from shared.models.vm_lifecycle import (
     VmReadyOutcome,
     VmReadyRequest,
 )
-from shared.settings import VmLifecycleActivitySettings
+from shared.settings.vm_lifecycle import VmLifecycleActivitySettings
 
 _settings = VmLifecycleActivitySettings()
 

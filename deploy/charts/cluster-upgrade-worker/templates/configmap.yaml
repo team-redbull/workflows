@@ -1,5 +1,5 @@
 {{- include "cuw.validate" . -}}
-# Everything this worker reads (shared/settings.py ClusterUpgradeActivitySettings
+# Everything this worker reads (shared/settings/cluster_upgrade.py ClusterUpgradeActivitySettings
 # and TemporalSettings). An MCE has no brain, so the Temporal endpoint is
 # rendered here and this one ConfigMap is self-sufficient on any cluster. No
 # credential: the worker's ServiceAccount is its identity.

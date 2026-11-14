@@ -30,7 +30,7 @@ from shared.models.cluster_lifecycle import (
     MergeRequestRequest,
     MergeRequestState,
 )
-from shared.settings import ClusterLifecycleActivitySettings
+from shared.settings.cluster_lifecycle import ClusterLifecycleActivitySettings
 
 _settings = ClusterLifecycleActivitySettings()
 

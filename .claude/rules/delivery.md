@@ -19,8 +19,12 @@ Checker ids in brackets.
   site (`docs/Dockerfile`). [DL001]
 - **`build.yml`**: the `test` job runs the whole suite on every push and every image job
   needs it, so a red test builds nothing and bumps nothing. `changes` decides which images
-  a push touches. Every image job uses the reusable `ghcr-build-push.yml` (it bumps
-  redbull-platform `main`, which deploys) and they form one sequential chain guarded by
+  a push touches: `scripts/image_changes.py` builds an image only when a file IT LOADS
+  changed (the imports followed from its entrypoint; its Dockerfile and requirements),
+  measured since the last fully successful run on the branch, and builds WIDE whenever it
+  cannot tell (a data file, a deletion, the script or `build.yml` itself). Each build job
+  is gated on its OWN image name in that list. [DL002] Every image job uses the reusable
+  `ghcr-build-push.yml` (it bumps redbull-platform `main`, which deploys) and they form one sequential chain guarded by
   `!cancelled() && !failure()`. So a `main` build is tagged `vX.Y.Z`, never by commit sha:
   no image-only job (the operator, 2026-11-02); vendor a new limb's chart in
   redbull-platform first. A new limb adds `build-<limb>-worker` and

@@ -9,7 +9,7 @@ from __future__ import annotations
 import pytest
 
 from shared.cluster_names import canonical_mce_cluster
-from shared.settings import ServerLifecycleActivitySettings
+from shared.settings.server_lifecycle import ServerLifecycleActivitySettings
 
 
 @pytest.mark.parametrize(

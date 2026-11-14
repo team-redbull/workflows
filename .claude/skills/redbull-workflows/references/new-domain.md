@@ -16,7 +16,8 @@ settings class (`<Limb>ActivitySettings`) and the chart name from them.
    `shared/consts.py` either `<LIMB>_ACTIVITY_QUEUE = "<limb>-activity"` (hub) or a
    builder `def <limb>_activity_queue(mce_cluster: str) -> str` (per MCE, like
    `server_lifecycle_activity_queue`).
-2. **Settings** — `<Limb>ActivitySettings(BaseSettings)` in `shared/settings.py`
+2. **Settings** — `<Limb>ActivitySettings(BaseSettings)` in its OWN module `shared/settings/<limb>.py`
+   (never re-exported from the package: checker SH007)
    (`env_file=".env", extra="ignore"`), keys = ConfigMap/Secret keys lowercased, a
    service prefix only for that service's own values; `.env.example`; `tests/conftest.py`.
 3. **Limb** — `activities/<limb>/`: `activities.py` (the `@activity.defn` surface only:
@@ -31,7 +32,9 @@ settings class (`<Limb>ActivitySettings`) and the chart name from them.
    guard test fails until you do) and its queue to `tests/test_worker_registration.py`'s
    `_WORKERS`; activity tests per [testing.md](testing.md).
 5. **CI** — `.github/workflows/build.yml`: a `build-<limb>-worker` job that `needs` the
-   `test` job: the reusable `ghcr-build-push.yml` at the end of the sequential chain
+   `test` job and runs `if: ... contains(fromJSON(needs.changes.outputs.images || '[]'),
+   '<limb>-worker')` (its own image name — `scripts/image_changes.py` finds the image from
+   its Dockerfile, nothing to register there): the reusable `ghcr-build-push.yml` at the end of the sequential chain
    (`helm-values-path: gitops/charts/<limb>-worker/values.yaml`), so `main` builds get
    `vX.Y.Z` tags. Put the chart into redbull-platform first (step 6), or the bump fails;
    no image-only job with a `<branch-slug>-<sha>` tag (removed 2026-11-02).

@@ -592,11 +592,21 @@ Copy the three files verbatim from the dev redbull-platform's `main`
 (`gitops/charts/cluster-lifecycle-worker/templates/` and
 `gitops/services/cluster-lifecycle-worker/app.yaml`). Only `values.yaml` differs
 between the two environments (§5.2).
-Nothing in them is environment-specific: the ConfigMap renders the five keys
-above, the Deployment mounts `workflows-orchestrator-config` +
+Nothing in them is environment-specific: the ConfigMap renders the three keys
+above (`DAY1_REPO_URL`, `DHCP_EXCLUSION_OCTET_RANGES`, `DAY2_SIG_REPO_URL_TEMPLATE`), the Deployment mounts `workflows-orchestrator-config` +
 `cluster-lifecycle-config`, maps the Secret's key onto `REDBULL_GIT_TOKEN` (the one token for day1 and the
 sigs), `automountServiceAccountToken:
 false`, no Namespace; `app.yaml` is `namespace: redbull-workflows`.
+
+**If you applied this chart before 2026-11-14** (image `cluster-lifecycle-worker`
+up to `v1.0.2`): its `values.yaml` carries `day1GitProvider` and
+`day2SigPathTemplate`, and `templates/config.yaml` renders `DAY1_GIT_PROVIDER` and
+`DAY2_SIG_PATH_TEMPLATE`. From `v1.0.3` the limb knows GitLab only and one project
+per sig, and ignores both keys. Order: mirror and deploy the `v1.0.3` image FIRST
+(it starts with the old chart as long as `day2SigRepoUrlTemplate` names `{sig}`,
+which the air-gap's does), THEN remove the two values and the two ConfigMap lines
+together. Removing them first crash-loops a `v1.0.2` pod on its missing
+`day1_git_provider`.
 
 ### 5.4 Verify before merging
 

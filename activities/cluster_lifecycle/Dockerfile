@@ -9,7 +9,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends git \
     && rm -rf /var/lib/apt/lists/*
 
-# HTTP only otherwise: the day1 repo's git provider API (GitLab or GitHub) for
+# HTTP only otherwise: GitLab's API on the day1 repo's host, for
 # the merge request. No Kubernetes client.
 WORKDIR /app
 

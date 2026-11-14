@@ -169,7 +169,7 @@ git -c http.sslVerify=false ls-remote --symref "https://x-access-token:$TOKEN@<G
 ```
 
 If the sigs live elsewhere, adjust `config.day2SigRepoUrlTemplate` in §5.2
-before you merge; `{sig}` must stay in it (or in `day2SigPathTemplate`).
+before you merge; `{sig}` must stay in it.
 
 ---
 
@@ -559,8 +559,8 @@ appVersion: "v0.1.0"
 config:
   # The day1 values repo, as the segment-lifecycle, upgrade-gitops and vm-lifecycle charts name it.
   day1RepoUrl: "https://<GITLAB>/platform/gitops-day1/platform-config.git"
-  # GitLab: a merge request with remove_source_branch.
-  day1GitProvider: "gitlab"
+  # The merge request (remove_source_branch) is opened through GitLab's API on this
+  # URL's host; the project is the URL's path, subgroups included.
   # The DHCP exclusion policy written into every cluster file's dhcp_values block,
   # per segment type: last-octet ranges NOT distributed. COPY the value from
   # gitops/charts/segment-lifecycle-worker/values.yaml (config.dhcpExclusionOctetRanges).
@@ -570,7 +570,6 @@ config:
       - [241, 254]
   # One GitLab project per sig, the tree at the project root.
   day2SigRepoUrlTemplate: "https://<GITLAB>/redbull/gitops-day2-prod/sigs/{sig}.git"
-  day2SigPathTemplate: ""
 secrets:
   # The one Secret every git limb reads (gitops/SECRETS.md): the redbull GROUP token, ONE token
   # for day1 and every sig project — the chart has no second Secret. The pod gets it as
@@ -652,7 +651,7 @@ curl -sk -o /dev/null -w '%{http_code}\n' -X POST -H 'content-type: application/
 ```
 
 A crash-looping `cluster-lifecycle-worker` names the missing or invalid key in
-its log (fail-fast settings): `day1_git_provider`, `day2_sig_repo_url_template`
+its log (fail-fast settings): `day2_sig_repo_url_template`
 (`{sig}` missing), `dhcp_exclusion_octet_ranges`.
 
 ### 7.2 The first run (step e)

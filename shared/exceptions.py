@@ -1269,7 +1269,7 @@ class ClusterFileConflictError(OrchestratorError):
 
 
 class GitProviderError(OrchestratorError):
-    """The day1 git provider's API (GitLab or GitHub) failed in a way a retry can
+    """The day1 git provider's API (GitLab) failed in a way a retry can
     fix: unreachable, a 5xx, a 409 for a merge request born between the find
     and the create (the retry finds it). Transient by classification —
     deliberately NOT in non_retryable_error_types."""
@@ -1277,12 +1277,12 @@ class GitProviderError(OrchestratorError):
 
 class GitProviderAuthError(OrchestratorError):
     """The git provider rejected the token (401/403). Deterministic — a bad
-    DAY1_GIT_TOKEN, or one without `api` scope, never fixes itself. Non-retryable."""
+    REDBULL_GIT_TOKEN, or one without `api` scope, never fixes itself. Non-retryable."""
 
 
 class GitProviderRequestRejectedError(OrchestratorError):
     """The git provider refused the request as sent (400/404/422): no such
-    project or repository at DAY1_REPO_URL for this token, no `main` to merge
+    project at DAY1_REPO_URL for this token, no `main` to merge
     into, a merge request that is gone. The provider's own message is carried
     through, bounded. Deterministic — non-retryable."""
 

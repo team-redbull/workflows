@@ -4,7 +4,7 @@ activities/cluster_lifecycle/activities.py is settings + logger + one call into 
 module with plain parameters; these tests run the real activities through
 ActivityEnvironment with the modules replaced, and pin the wiring the module
 tests cannot see: which policy ranges the publish picks per type, how the day2
-URL and path templates are filled, which provider the settings choose, and
+URL template is filled, that the merge request goes to GitLab, and
 that the answers come back as the models the workflow expects.
 """
 
@@ -98,7 +98,7 @@ async def test_a_non_slash_24_from_the_pool_fails_before_any_git(env, monkeypatc
     assert caught.value.type == "UnsupportedSegmentPrefix" and caught.value.non_retryable
 
 
-async def test_the_merge_request_goes_through_the_provider_the_settings_name(env, monkeypatch):
+async def test_the_merge_request_goes_to_gitlab_for_the_day1_repo(env, monkeypatch):
     seen = {}
 
     async def fake_ensure(provider, branch, title, description):
@@ -108,7 +108,7 @@ async def test_the_merge_request_goes_through_the_provider_the_settings_name(env
     monkeypatch.setattr(git_provider, "ensure_merge_request", fake_ensure)
     ref = await env.run(limb.ensure_merge_request, MergeRequestRequest(branch="b", title="t", description="d"))
     assert ref.identifier == "1"
-    # conftest: DAY1_GIT_PROVIDER=gitlab, bound to the day1 repo URL with the token
+    # GitLab, bound to the day1 repo URL (its path one encoded segment) with the token
     assert isinstance(seen["provider"], git_provider.GitLabProvider)
     assert seen["provider"]._base.startswith("https://git.test/api/v4/projects/team%2Fgitops-day1-platform-config")
     assert seen["provider"]._headers == {"PRIVATE-TOKEN": "test-git-token"}
@@ -138,19 +138,17 @@ async def test_day2_registration_fills_the_sig_into_the_url_and_uses_the_day1_to
     request = Day2SigRegistrationRequest(sig="redbull", site="site2", env="prep", mce="ocp4-prep-mce-site2-a", cluster=CLUSTER)
     registration = await env.run(limb.register_cluster_in_day2_sig, request)
     assert registration.created
-    # conftest: DAY2_SIG_REPO_URL_TEMPLATE=https://git.test/redbull/gitops-day2-prod/sigs/{sig}.git, path "", no DAY2_GIT_TOKEN
+    # conftest: DAY2_SIG_REPO_URL_TEMPLATE=https://git.test/redbull/gitops-day2-prod/sigs/{sig}.git, no DAY2_GIT_TOKEN
     assert seen["repo_url"] == "https://git.test/redbull/gitops-day2-prod/sigs/redbull.git"
-    assert seen["path_prefix"] == ""
+    assert "path_prefix" not in seen
     assert seen["token"] == "test-git-token"
     assert seen["request"] == request
 
 
-async def test_a_day2_token_and_a_path_template_are_honoured(env, monkeypatch):
+async def test_a_day2_token_is_honoured(env, monkeypatch):
     from shared.settings import ClusterLifecycleActivitySettings
 
     monkeypatch.setenv("DAY2_GIT_TOKEN", "sig-token")
-    monkeypatch.setenv("DAY2_SIG_REPO_URL_TEMPLATE", "https://github.com/team-redbull/gitops-day2-prod.git")
-    monkeypatch.setenv("DAY2_SIG_PATH_TEMPLATE", "/sigs/{sig}/")
     monkeypatch.setattr(limb, "_settings", ClusterLifecycleActivitySettings())
     seen = {}
 
@@ -160,6 +158,5 @@ async def test_a_day2_token_and_a_path_template_are_honoured(env, monkeypatch):
 
     monkeypatch.setattr(day2_sigs, "register", fake_register)
     await env.run(limb.register_cluster_in_day2_sig, Day2SigRegistrationRequest(sig="redbull", site="s", env="prep", mce="m", cluster="c"))
-    assert seen["repo_url"] == "https://github.com/team-redbull/gitops-day2-prod.git"
-    assert seen["path_prefix"] == "sigs/redbull"
+    assert seen["repo_url"] == "https://git.test/redbull/gitops-day2-prod/sigs/redbull.git"
     assert seen["token"] == "sig-token"

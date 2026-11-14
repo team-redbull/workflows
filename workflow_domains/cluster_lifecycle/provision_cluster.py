@@ -31,8 +31,8 @@ Shape of the run:
                               the branch, compares the file SEMANTICALLY
                               (that appended key set aside) and pushes nothing.
   4. opening-merge-request  — the open merge request from the branch to main,
-                              found or created (GitLab: remove_source_branch;
-                              GitHub: a pull request).
+                              found or created on GitLab, with
+                              remove_source_branch.
   5. awaiting-merge         — a HUMAN wait (CLAUDE.md §5): the merge request
                               is read every _MERGE_POLL on a durable timer,
                               with no deadline ever; every _POLLS_PER_RUN

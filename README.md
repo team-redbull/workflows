@@ -84,7 +84,7 @@ activities/<domain>/              The limbs
                                     settings and no Temporal, so each is testable
                                     with no worker: cluster_lifecycle/day1_writer.py
                                     (the cluster file on its branch), git_provider.py
-                                    (GitLab/GitHub merge requests), day2_sigs.py (the
+                                    (GitLab merge requests), day2_sigs.py (the
                                     sig repos), cluster_values.py (what a file must
                                     look like), dhcp_api.py (the DHCP scope API),
                                     server_scan.py (the inventory API),
@@ -759,8 +759,8 @@ awaited child** (a /24 at the folder's site, verified), the text plus the
 allocation block is pushed to `provision-cluster/<cluster>` (created from main
 by the push, **no `[skip ci]`**: the day1 CI chain runs on the branch, skips
 allocation, renders the MachineConfigs and pushes its own `mcConfigMap` commit
-on top), the merge request is opened (GitLab in production with
-`remove_source_branch`, a pull request on GitHub in dev), and the run **waits
+on top), the merge request is opened (GitLab's API, with
+`remove_source_branch`), and the run **waits
 for a person to merge it** — no deadline, a 5-minute durable timer, continued
 as new every 48 polls so history stays short. After the merge it registers the
 cluster in every day2 sig the value layers list under `day2.copy_to_sigs`
@@ -910,11 +910,10 @@ would hide which segments actually got a workflow.
 | `DHCP_API_URL` | `segment-lifecycle-config` | release-segment's DHCP scope API (GETs anonymous) |
 | `SEGMENTS_MANAGER_API_TOKEN` | Secret | mutating calls only; GETs are public |
 | `DHCP_API_TOKEN` | Secret `dhcp-api-token` | the scope DELETE; a copy of the DHCP API's own token — rotate together |
-| `DAY1_REPO_URL` | `cluster-lifecycle-config` | provision-cluster's day1 repo: read at `main`, pushed on `provision-cluster/<cluster>` (the same repo the vm-lifecycle and upgrade-gitops charts name) |
-| `DAY1_GIT_PROVIDER` | `cluster-lifecycle-config` | `gitlab` (production: a merge request with `remove_source_branch`) or `github` (dev: a pull request) |
+| `DAY1_REPO_URL` | `cluster-lifecycle-config` | provision-cluster's day1 repo: read at `main`, pushed on `provision-cluster/<cluster>` (the same repo the vm-lifecycle and upgrade-gitops charts name). GitLab: the merge request is opened through the API on this URL's host, the project being the URL's path (subgroups included) |
 | `DHCP_EXCLUSION_OCTET_RANGES` | `cluster-lifecycle-config` | the DHCP policy written into every cluster file (was segment-lifecycle's until 2026-11-11) |
-| `DAY2_SIG_REPO_URL_TEMPLATE`, `DAY2_SIG_PATH_TEMPLATE` | `cluster-lifecycle-config` | the day2 sig repos: the URL with `{sig}` (production: one GitLab project per sig, tree at the root) or one repo with the tree under the path template (dev: `sigs/{sig}`) |
-| `REDBULL_GIT_TOKEN` | Secret `redbull-git-token`, key `REDBULL_GIT_TOKEN`, under its own name | push rights AND the provider's API (GitLab `api` + `write_repository`, GitHub `repo`); `DAY1_GIT_TOKEN` is accepted too (a cluster with only `day1-git-token`), `REDBULL_GIT_TOKEN` wins; scrubbed from every error |
+| `DAY2_SIG_REPO_URL_TEMPLATE` | `cluster-lifecycle-config` | the day2 sig repos: the URL with `{sig}`, one GitLab project per sig, the tree at its root |
+| `REDBULL_GIT_TOKEN` | Secret `redbull-git-token`, key `REDBULL_GIT_TOKEN`, under its own name | push rights AND GitLab's API (`api` + `write_repository`), with a role that may push each sig project's protected default branch (Maintainer); `DAY1_GIT_TOKEN` is accepted too (a cluster with only `day1-git-token`), `REDBULL_GIT_TOKEN` wins; scrubbed from every error |
 | `DAY2_GIT_TOKEN` | not rendered by the chart | the sig repos' push token; empty = `REDBULL_GIT_TOKEN`. The chart sets none: `redbull-git-token` is the group token and pushes day1 and every sig repo |
 | `MCE_CLUSTER` | `server-lifecycle-config` | which MCE this worker serves — names its queue, so it must match callers' `mce_cluster` |
 | `SERVER_SCAN_URL` | `server-lifecycle-config` | inventory API base, INCLUDING `/api/v1` |
@@ -1014,9 +1013,7 @@ helm install cluster-lifecycle-worker \
   ../redbull-platform/gitops/charts/cluster-lifecycle-worker -n redbull-workflows \
   --set activityWorker.image.repository=<registry>/cluster-lifecycle-worker \
   --set config.day1RepoUrl=https://<values-repo> \
-  --set config.day1GitProvider=gitlab \
-  --set 'config.day2SigRepoUrlTemplate=https://<gitlab>/redbull/gitops-day2-prod/sigs/{sig}.git' \
-  --set config.day2SigPathTemplate=""
+  --set 'config.day2SigRepoUrlTemplate=https://<gitlab>/redbull/gitops-day2-prod/sigs/{sig}.git'
 # plus the redbull-git-token Secret (REDBULL_GIT_TOKEN) both charts' values name.
 ```
 

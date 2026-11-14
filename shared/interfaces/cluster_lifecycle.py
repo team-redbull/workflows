@@ -65,10 +65,8 @@ async def publish_cluster_file(request: ClusterFilePublishRequest) -> ClusterFil
 
 @activity.defn
 async def ensure_merge_request(request: MergeRequestRequest) -> MergeRequestRef:
-    """The open merge request (GitLab) / pull request (GitHub) from the branch to
-    `main`: found by source branch when one is open, else created — GitLab with
-    `remove_source_branch`, GitHub relying on the repository's delete-on-merge
-    setting — and read back.
+    """The open GitLab merge request from the branch to `main`: found by source
+    branch when one is open, else created with `remove_source_branch`.
 
     Idempotent by find-before-create. Raises GitProviderAuthError (401/403) and
     GitProviderRequestRejectedError (400/404/422: the provider refused the
@@ -93,16 +91,17 @@ async def get_merge_request_state(merge_request: MergeRequestRef) -> MergeReques
 
 @activity.defn
 async def register_cluster_in_day2_sig(request: Day2SigRegistrationRequest) -> Day2SigRegistration:
-    """Create `<path prefix>/sites/<site>/<env>/mces/<mce>/<cluster>/.gitkeep` in the
-    sig's repo, on its default branch — how day2 learns a cluster exists (there is
+    """Create `sites/<site>/<env>/mces/<mce>/<cluster>/.gitkeep` in the sig's GitLab
+    project, on its default branch — how day2 learns a cluster exists (there is
     no registration file, only the folder; APPLY-DAY2-COPY).
 
-    The repo is DAY2_SIG_REPO_URL_TEMPLATE with `{sig}` filled in, the prefix
-    DAY2_SIG_PATH_TEMPLATE likewise; the default branch is read from the remote
+    The repo is DAY2_SIG_REPO_URL_TEMPLATE with `{sig}` filled in (one project per
+    sig, the tree at its root); the default branch is read from the remote
     (`ls-remote --symref HEAD`). Idempotent: a folder already there is success
     with `created=False` and nothing pushed. The push goes straight to the
     default branch, bypassing the sig's merge-request lint by design. A rejected
-    push is the retryable ValuesRepoGitError and the retry re-clones — the
+    push — the branch moved, or a token whose role may not push the protected
+    branch — is the retryable ValuesRepoGitError and the retry re-clones — the
     convergence loop add-cluster-to-day2.sh ran itself.
     """
     ...

@@ -2,7 +2,7 @@
 
 Polls CLUSTER_LIFECYCLE_ACTIVITY_QUEUE on the hub. Holds no Kubernetes
 credential: it reaches the day1 values repo with the day1 git token (a clone,
-a push, and the repo's git provider API for the merge request —
+a push, and GitLab's API for the merge request —
 day1_writer.py, git_provider.py) and the day2 sig repos with the day2 token
 (day2_sigs.py). Each activity reads its settings and hands plain parameters to
 one module per dependency; what a cluster file must look like is
@@ -10,7 +10,7 @@ cluster_values.py, and the DHCP block it gets is dhcp_values.py.
 
 Budgets, all under the workflow's timeouts (workflow_domains/cluster_lifecycle/
 provision_cluster.py): git under the 180 s start_to_close (git_repo's 150 s
-per command), the provider's HTTP calls at 60 s under the 90 s start_to_close.
+per command), GitLab's HTTP calls at 60 s under the 90 s start_to_close.
 """
 
 from __future__ import annotations
@@ -35,8 +35,8 @@ from shared.settings import ClusterLifecycleActivitySettings
 _settings = ClusterLifecycleActivitySettings()
 
 
-def _provider() -> git_provider.Provider:
-    return git_provider.provider_for(_settings.day1_git_provider, _settings.day1_repo_url, _settings.redbull_git_token)
+def _provider() -> git_provider.GitLabProvider:
+    return git_provider.GitLabProvider(_settings.day1_repo_url, _settings.redbull_git_token)
 
 
 @activity.defn
@@ -94,8 +94,7 @@ async def get_merge_request_state(merge_request: MergeRequestRef) -> MergeReques
 @activity.defn
 async def register_cluster_in_day2_sig(request: Day2SigRegistrationRequest) -> Day2SigRegistration:
     registration = await day2_sigs.register(
-        repo_url=_settings.day2_sig_repo_url(request.sig), token=_settings.day2_token,
-        path_prefix=_settings.day2_sig_path_prefix(request.sig), request=request,
+        repo_url=_settings.day2_sig_repo_url(request.sig), token=_settings.day2_token, request=request,
     )
     activity.logger.info(
         "day2 sig %s: %s %s", request.sig, "created" if registration.created else "already has", registration.path

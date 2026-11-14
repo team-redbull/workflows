@@ -65,7 +65,7 @@ activities/<domain>/         The execution "limbs" (one deployment per domain)
   <technology>.py            One module per dependency, taking PLAIN PARAMETERS and
                                holding no settings and no Temporal, so it is testable
                                with no worker: day1_writer.py (the cluster file on its
-                               branch), git_provider.py (GitLab/GitHub merge requests),
+                               branch), git_provider.py (GitLab merge requests),
                                day2_sigs.py (the sig repos), dhcp_api.py (the
                                DHCP scope API), server_scan.py (the inventory API),
                                cluster_api.py (the Kubernetes API, its idempotency
@@ -149,8 +149,8 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   follow-up migrates it: its `candidate_count` depends on the busy count).
 - **cluster-lifecycle is ONE hub limb holding git tokens only.** provision-cluster reads day1 `main`
   (the shared `activities/day1_repo.py` reader), pushes a branch per cluster, opens the merge request
-  through the day1 repo's git provider API (`DAY1_GIT_PROVIDER`: GitLab in the air-gap, GitHub in
-  dev — same token as the push, `redbull-git-token`) and pushes each day2 sig repo's default branch
+  through GitLab's API on the day1 repo's host (GitLab is the ONLY provider, §4 — same token as
+  the push, `redbull-git-token`) and pushes each day2 sig project's default branch
   with the SAME token — `redbull-git-token` is the redbull GROUP token, so the chart names no second
   Secret (the limb's `DAY2_GIT_TOKEN` stays, empty = that token). No Kubernetes credential, nothing per MCE:
   `activities/cluster_lifecycle/`, queue `cluster-lifecycle-activity`, chart
@@ -870,6 +870,28 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   Not the workflow's: rendering a MachineConfig, pushing `main`, merging, syncing the Application (a
   person, by hand, in production), the go-links and `*.apps` DNS DisposableRequests (still the
   chart's, until their contracts are reported from the air-gap) — see `docs/design/provision-cluster.md`.
+- **GitLab is the ONLY git provider the services know. Do not re-add a second one.** This repo's
+  own source and CI live on GitHub; the air-gapped production is GitLab, with SUBGROUPS (which
+  GitHub has not). provision-cluster's limb first carried both — `DAY1_GIT_PROVIDER` gitlab|github,
+  a `GitHubProvider` opening pull requests, and `DAY2_SIG_PATH_TEMPLATE` for sigs kept as folders of
+  ONE GitHub repo. All three were removed on 2026-11-14 (the operator: "i don't want to manage 2
+  different conventions" — the air-gapped service must not even know another option exists). So:
+  the merge request goes through `<host of DAY1_REPO_URL>/api/v4/projects/<the URL's whole path as
+  ONE URL-encoded segment>` (`redbull%2Fgitops-day1%2Fplatform-config`) with `PRIVATE-TOKEN`; a sig
+  is ALWAYS its own project (`redbull/gitops-day2-prod/sigs/<sig>`, the tree at its root), so
+  `DAY2_SIG_REPO_URL_TEMPLATE` must name `{sig}`; the settings ignore the two retired keys
+  (`extra="ignore"`), so the image ships before a chart stops rendering them. It is tested against
+  a REAL GitLab, not GitHub: the instance in namespace `gitlab` on the dev cluster, whose `redbull`
+  group mocks the air-gap's repos in their subgroups — proven there 2026-11-14 with a GROUP access
+  token (Maintainer, `api` + `write_repository`), the table in `docs/design/provision-cluster.md`.
+  What that run fixed or pinned: a FAST-FORWARD merge reports neither `merge_commit_sha` nor
+  `squash_commit_sha`, so `merged_sha` falls back to the merge request's head (`sha`); GitLab's 409
+  for a second open merge request from one branch stays the retryable `GitProviderError` (the retry
+  finds it); a token whose role may not push a sig's protected default branch, or a sig with no
+  project, is a refused git command — `ValuesRepoGitError`, RETRIED on purpose: the cluster file is
+  already merged, a failed run could not be re-run (`ClusterAlreadyProvisionedError`), so the run
+  waits at `registering-day2` until the role or the project is fixed. Not supported: a GitLab under
+  a relative URL root (the clone URL's host is taken as GitLab's root).
 - **allocate-segment allocates and VERIFIES; it no longer touches git** (2026-11-11). Until then it
   located the cluster file on a day1 branch the caller named (`values_branch`, the pipeline's
   `$CI_COMMIT_BRANCH`) and pushed the `vlanId` + `dhcp_values` block there with `[skip ci]`, as a
@@ -1198,8 +1220,8 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   always-present `workflows-orchestrator` brain release) holds only shared values — `TEMPORAL_HOST`,
   `TEMPORAL_NAMESPACE`, `SEGMENTS_MANAGER_URL`. `<domain>-config` (owned by that domain's
   chart) holds its own endpoints/policy — e.g. `cluster-lifecycle-config` = provision-cluster's keys
-  (`DAY1_REPO_URL`, `DAY1_GIT_PROVIDER`, `DHCP_EXCLUSION_OCTET_RANGES`, `DAY2_SIG_REPO_URL_TEMPLATE`,
-  `DAY2_SIG_PATH_TEMPLATE`; the credentials from the shared `redbull-git-token` Secret under its
+  (`DAY1_REPO_URL`, `DHCP_EXCLUSION_OCTET_RANGES`, `DAY2_SIG_REPO_URL_TEMPLATE`;
+  the credentials from the shared `redbull-git-token` Secret under its
   own key, `REDBULL_GIT_TOKEN` — the group token, day1 and the sigs alike) and `segment-lifecycle-config` = release-segment's
   `DHCP_API_URL` (its token in the `dhcp-api-token` Secret) — the day1 and DHCP-policy keys it
   rendered for allocate-segment are dropped only once its image stops reading them. A
@@ -1214,13 +1236,13 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   `KV_VM_API_URL_TEMPLATE` with their placeholders checked at startup, the two tokens, `KV_AGENT_CA`,
   `HEADROOM_BUFFER_PERCENT` 0..90 and `VM_MAC_PREFIX` — locally administered unicast, checked) and
   `ClusterLifecycleActivitySettings` (`DAY1_REPO_URL`, `REDBULL_GIT_TOKEN` — the air-gap Secret's key, the
-  operator 2026-11-11; `DAY1_GIT_TOKEN` accepted as an alias, the air-gap name winning — `DAY1_GIT_PROVIDER` gitlab|github,
+  operator 2026-11-11; `DAY1_GIT_TOKEN` accepted as an alias, the air-gap name winning,
   `DHCP_EXCLUSION_OCTET_RANGES` with its validator — moved here from segment-lifecycle 2026-11-11 —
-  `DAY2_SIG_REPO_URL_TEMPLATE` + `DAY2_SIG_PATH_TEMPLATE`, one of which must name `{sig}`, and
+  `DAY2_SIG_REPO_URL_TEMPLATE`, which must name `{sig}` (one GitLab project per sig), and
   `DAY2_GIT_TOKEN`, the day1 token when empty). Field names = Helm ConfigMap/Secret keys
   lowercased — keep aligned with redbull-platform's `gitops/charts/workflows-orchestrator/templates/config.yaml`
-  (global), `gitops/charts/cluster-lifecycle-worker/templates/config.yaml` (day1 URL + provider +
-  DHCP policy + day2 templates) and `gitops/charts/segment-lifecycle-worker/templates/config.yaml`
+  (global), `gitops/charts/cluster-lifecycle-worker/templates/config.yaml` (day1 URL +
+  DHCP policy + day2 sig URL template) and `gitops/charts/segment-lifecycle-worker/templates/config.yaml`
   (DHCP API URL + the credential Secrets). Which ConfigMap
   a key lives in is INDEPENDENT of which settings class declares it (pydantic reads the flat merged pod
   env — `SEGMENTS_MANAGER_URL` sits in the global ConfigMap yet stays a

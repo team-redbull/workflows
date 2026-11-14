@@ -26,6 +26,9 @@ CLAUDE.md §1, §2, §5, §6, §7. Checker ids in brackets.
 - **Long machine waits** are one heartbeating activity that resumes from its heartbeat details.
 - **HTTP**: an `httpx.AsyncClient` per call, inside it, `timeout=` below the activity's
   `start_to_close_timeout`. [AC001, AC002]
+- **GitLab is the only git provider** (CLAUDE.md §4): no GitHub client, no setting choosing
+  a provider, no layout only another provider needs. A project is its clone URL's whole
+  path (subgroups included), URL-encoded as one segment; tested against the dev cluster's GitLab.
 - **Subprocesses and secrets**: `asyncio.create_subprocess_exec` under a timeout, a fresh
   `TemporaryDirectory` per attempt, every token scrubbed from error text BEFORE the
   exception is built.

@@ -410,7 +410,11 @@ curl -X POST -H 'Content-Type: application/yaml' --data-binary @cluster.yaml \
         <p style="font-size:var(--fs-14);color:var(--ink-2)"><code>ValuesRepoGitError</code> (an unreachable day1 or
         sig repo, a rejected non-fast-forward push — the retry re-clones), <code>ValuesBranchNotFoundError</code>
         (a repo without <code>main</code> yet) and <code>GitProviderError</code> (the provider down, a 5xx, a merge
-        request born between the find and the create — the retry finds it). They retry forever; an unclassified
+        request born between the find and the create — the retry finds it). They retry forever. <b>A run that stays
+        at <code>registering-day2</code></b> is the usual case: GitLab refused the push to a sig project — the token's
+        role may not push its protected default branch (it needs Maintainer), or a sig listed under
+        <code>day2.copy_to_sigs</code> has no project. GitLab's words are on the pending activity; the cluster file is
+        already merged, so the run waits and goes on once the role or the project is fixed. An unclassified
         permanent error shows as a run stuck <b>RUNNING</b> in the Temporal UI — the fix is to classify it, not to add
         a deadline.</p>
         <h3 style="margin-top:6px">Nothing to clean up</h3>

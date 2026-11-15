@@ -33,7 +33,7 @@ async def inspect_cluster_target(request: ClusterTargetRequest) -> ClusterTarget
     `hostedClusters/<cluster>.yaml` already exists there, and validates the
     YAML text against the merged value layers the way the hostedclusters-setup
     chart renders them: `mastertag`, a non-empty `nodepool`, the three `owner`
-    fields, no `vlanId`/`dhcp_values`/`mcConfigMap`/`AutomateAllocation`, a
+    fields, no `vlanId`/`dhcp_values`/`mcConfigMap`/`tuningConfigmap`/`AutomateAllocation`, a
     `clusterName` only if it equals the derived one, config names that are
     DNS-1123 labels, no duplicate keys. Derives the config names, the day2 sig
     list and its environment.
@@ -55,8 +55,8 @@ async def publish_cluster_file(request: ClusterFilePublishRequest) -> ClusterFil
     `main`, the file written, committed WITHOUT `[skip ci]` (the day1 chain must
     run on the branch and render the MachineConfigs onto it) and pushed, which
     creates the branch. Present: cloned, and the file compared SEMANTICALLY —
-    its YAML mapping, with the `mcConfigMap` key the day1 chain appends
-    dropped, must equal the assembled text's — then `changed=False` and nothing
+    its YAML mapping, with the `mcConfigMap` and `tuningConfigmap` keys the
+    day1 chain appends dropped, must equal the assembled text's — then `changed=False` and nothing
     pushed; anything else is ClusterFileConflictError (deterministic): a
     different spec on the branch, a branch without the file, a file that does
     not parse. A rejected push (the branch moved) is the retryable

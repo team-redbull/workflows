@@ -845,7 +845,7 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   `sites/*/mces/`, never derived). The run: (1) `inspect_cluster_target` at day1 `main` — the folder,
   no file of that name there yet, and the text judged against the merged value layers the way the
   chart renders them (REQUIRED `mastertag`, non-empty `nodepool`, `owner.{merkaz,anaf,mador}`;
-  FORBIDDEN `vlanId`, `dhcp_values`, `mcConfigMap`, `AutomateAllocation`; `clusterName` only equal to
+  FORBIDDEN `vlanId`, `dhcp_values`, `mcConfigMap`, `tuningConfigmap`, `AutomateAllocation`; `clusterName` only equal to
   the derived one; config names DNS-1123 labels; `configs` OPTIONAL per pool — a KubeVirt pool has
   none) — EVERY reason in one `ClusterValuesRejectedError`; (2) allocate-segment as an AWAITED
   child (§5); (3) the text plus the allocation block (`vlanId`, `dhcp_values` with the type's
@@ -873,8 +873,10 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   CI chain's** (the operator, 2026-11-11, deferring the chart-at-sync design in
   `~/.claude/plans/mc-sources-rendered-at-sync.md`): the chain runs on the branch, skips allocation
   (`vlanId` is there), renders the MachineConfigs and pushes `CI: Update mcConfigMap from mc-files
-  [skip ci]` on top — so the workflow NEVER writes `mcConfigMap`, and a re-run's publish compares
-  the branch file SEMANTICALLY (its YAML mapping with `mcConfigMap` dropped) against this run's text,
+  [skip ci]` on top — so the workflow NEVER writes `mcConfigMap`, nor `tuningConfigmap`, the tuning
+  profiles (Tuned, PerformanceProfile) the chain injects in the same commit from day1's `tuning/`
+  catalogue by the nodepools' `tuningConfig` names — and a re-run's publish compares the branch file
+  SEMANTICALLY (its YAML mapping with both chain keys dropped, `CHAIN_APPENDED_KEYS`) against this run's text,
   `changed=False` when equal, `ClusterFileConflictError` otherwise; never byte-for-byte, the
   injector re-spaces blank lines too. Nothing is undone on failure: the allocation is idempotent,
   the branch and the merge request converge on a re-run, day2 folders are "already there = success".

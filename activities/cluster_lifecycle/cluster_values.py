@@ -11,8 +11,9 @@ tested with a string:
     byte for byte, then ONE blank line, then the allocation block (`vlanId`,
     `dhcp_values`). No YAML round-trip ever: comments and layout survive.
   * same_cluster_file — the re-run check: the file on the branch means the
-    same as the text this run would write, with the `mcConfigMap` key the
-    day1 CI chain appends (in its own commit, after our push) set aside.
+    same as the text this run would write, with the keys the day1 CI chain
+    appends (`mcConfigMap`, `tuningConfigmap`; in its own commit, after our
+    push) set aside.
     Semantic, not textual: the chain's injector also re-spaces blank lines.
 
 The allocation block's layout lives in ONE place (render_allocation_block,
@@ -42,11 +43,14 @@ REQUIRED_OWNER_FIELDS = ("merkaz", "anaf", "mador")
 # Keys this workflow writes or the day1 chain appends: a file that already
 # carries one would end up with a duplicate top-level key, whose first
 # occurrence YAML silently discards.
-FORBIDDEN_KEYS = ("vlanId", "dhcp_values", "mcConfigMap", "AutomateAllocation")
+FORBIDDEN_KEYS = ("vlanId", "dhcp_values", "mcConfigMap", "tuningConfigmap", "AutomateAllocation")
 # The environment folders day2 files a cluster under (add-cluster-to-day2.sh).
 DAY2_ENVIRONMENTS = ("prod", "prep", "test")
-# The key the day1 CI chain's injector appends, set aside by same_cluster_file.
-CHAIN_APPENDED_KEY = "mcConfigMap"
+# The keys the day1 CI chain's injectors append, set aside by same_cluster_file:
+# the rendered MachineConfigs, and the tuning profiles (Tuned, PerformanceProfile)
+# the chain injects from the day1 repo's tuning/ catalogue by the nodepools'
+# tuningConfig names.
+CHAIN_APPENDED_KEYS = ("mcConfigMap", "tuningConfigmap")
 
 # X.Y.Z, optionally -<arch> (the chart completes a bare X.Y.Z with -x86_64).
 _MASTERTAG = re.compile(r"^\d+\.\d+\.\d+(?:-[A-Za-z0-9_]+)?$")
@@ -188,7 +192,7 @@ def validate_cluster_values(root: Path, path: str, text: str, *, mce: str) -> Va
         if key in own:
             reasons.append(
                 f"`{key}` must not be in the file: this workflow writes the allocation "
-                "(vlanId, dhcp_values) and the day1 CI chain appends mcConfigMap"
+                "(vlanId, dhcp_values) and the day1 CI chain appends mcConfigMap and tuningConfigmap"
             )
 
     stem = Path(path).stem
@@ -295,8 +299,8 @@ def _mapping(text: str, where: str) -> tuple[dict[str, Any] | None, str | None]:
 def same_cluster_file(published_text: str, assembled_text: str) -> str | None:
     """None when the file on the branch means what this run would write; else why not.
 
-    The branch file's mapping, with CHAIN_APPENDED_KEY (what the day1 chain's
-    injector appends in its own commit) dropped, must equal the assembled
+    The branch file's mapping, with CHAIN_APPENDED_KEYS (what the day1 chain's
+    injectors append in its own commit) dropped, must equal the assembled
     text's mapping. Whitespace, comments and the chain's blank-line
     re-spacing are not differences; a different spec, vlan or network is.
     """
@@ -306,7 +310,7 @@ def same_cluster_file(published_text: str, assembled_text: str) -> str | None:
     assembled, problem = _mapping(assembled_text, "the assembled cluster file")
     if problem:
         return problem
-    published = {key: value for key, value in published.items() if key != CHAIN_APPENDED_KEY}
+    published = {key: value for key, value in published.items() if key not in CHAIN_APPENDED_KEYS}
     if published == assembled:
         return None
     differing = sorted(

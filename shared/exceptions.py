@@ -1254,7 +1254,7 @@ class ClusterValuesRejectedError(OrchestratorError):
     """The hosted-cluster YAML would not render as a cluster: a required key is
     missing (`mastertag`, `nodepool`, `owner.{merkaz,anaf,mador}`), a key this
     workflow writes or the chain adds is already there (`vlanId`, `dhcp_values`,
-    `mcConfigMap`, `AutomateAllocation`), `clusterName` disagrees with the file
+    `mcConfigMap`, `tuningConfigmap`, `AutomateAllocation`), `clusterName` disagrees with the file
     name, a config name is not a DNS-1123 label, a key is written twice, or the
     merged value layers have a problem. The message lists EVERY reason.
     Deterministic — non-retryable."""
@@ -1264,7 +1264,7 @@ class ClusterFileConflictError(OrchestratorError):
     """The branch `provision-cluster/<cluster>` exists and does not carry THIS
     cluster file: a different spec, no file at all, or one that does not parse.
     A re-run converges only onto its own work (the day1 chain's appended
-    `mcConfigMap` is not a difference); anything else a human has to look at.
+    `mcConfigMap` and `tuningConfigmap` are not differences); anything else a human has to look at.
     Deterministic — non-retryable."""
 
 

@@ -33,7 +33,7 @@ from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.worker import Replayer
 
 from shared.consts import PROVISION_CLUSTER_WORKFLOW_QUEUE
-from shared.exceptions import ClusterValuesRejectedError, GitProviderAuthError
+from shared.exceptions import ClusterValuesRejectedError, GitProviderAuthError, ShortcutTakenError
 from shared.models.cluster_lifecycle import ProvisionClusterRunArgs
 from tests.test_provision_cluster_workflow import INPUT, _error, _Harness, _target, make_mocks, make_segment_mocks
 from workflow_domains.cluster_lifecycle.provision_cluster import _POLLS_PER_RUN, ProvisionClusterWorkflow
@@ -76,6 +76,18 @@ SCENARIOS: dict[str, Callable[[], Scenario]] = {
     "rerun": lambda: Scenario(cluster={"changed": False, "mr_created": False}),
     # Enough polls to continue as new: the recorded history is the CONTINUED run's.
     "continued": lambda: Scenario(cluster={"states": ["open"] * (_POLLS_PER_RUN + 2) + ["merged"]}),
+    # --- since the console shortcut (patch `provision-cluster-shortcut`); the goldens
+    # above were recorded before it and replay WITHOUT the step. ---
+    # The whole run, day2 in one sig, the shortcut created last.
+    "shortcut": lambda: Scenario(
+        cluster={"states": ["open", "merged"], "target": _target(day2_env="prep", day2_sigs=["redbull"])},
+    ),
+    # The shortcut refused twice (retried), then found as ours.
+    "shortcut-retried": lambda: Scenario(cluster={"shortcut_errors_before_success": 2, "shortcut_created": False}),
+    # Another owner holds the name: the run fails after day2.
+    "shortcut-taken": lambda: Scenario(
+        cluster={"shortcut_error": ShortcutTakenError("taken by 'someone-else'")}, fails_with=ShortcutTakenError.__name__,
+    ),
 }
 
 _SCRUBBED = {"identity": "provision-cluster-replay", "stackTrace": ""}

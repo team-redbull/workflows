@@ -859,7 +859,17 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   `day2.copy_to_sigs`, on that sig repo's default branch — day2 renders `mastertag` from day1 `main`,
   so a folder created before the merge breaks the sig's whole render (APPLY-DAY2-COPY §4b); the
   env is `day2.env` else the cluster name's first field, cross-checked against the MCE folder's
-  when it is `ocp4-<env>-mce-…`, derived only when there are sigs. **MachineConfigs stay the day1
+  when it is `ocp4-<env>-mce-…`, derived only when there are sigs; (7) LAST, the console SHORTCUT
+  (go-link; the operator, 2026-11-15, `ensure_cluster_shortcut`, phase `creating-shortcut`, gated
+  `provision-cluster-shortcut`): name = the cluster name without `ocp4-`, URL =
+  `CLUSTER_CONSOLE_URL_TEMPLATE` with `{cluster}` = the stem (day1 records no base domain),
+  `username` = `SHORTCUT_OWNER`, against `SHORTCUTS_API_URL` with `SHORTCUTS_API_TOKEN`. `GET
+  /check/<name>` first: taken by `SHORTCUT_OWNER` = success, nothing posted (the service records the
+  username sent as the owner — the operator confirmed it; the check reports no URL, so ours is never
+  re-pointed); taken by ANYONE ELSE = `ShortcutTakenError`, the one permanent answer; else `POST
+  /create`, then the check again as the read-back. Every other failure, a 401/403/400/422 included,
+  is the RETRYABLE `ShortcutsApiError` on purpose — the day2 reasoning: past the merge a failed run
+  cannot be re-run. **MachineConfigs stay the day1
   CI chain's** (the operator, 2026-11-11, deferring the chart-at-sync design in
   `~/.claude/plans/mc-sources-rendered-at-sync.md`): the chain runs on the branch, skips allocation
   (`vlanId` is there), renders the MachineConfigs and pushes `CI: Update mcConfigMap from mc-files
@@ -869,8 +879,10 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   injector re-spaces blank lines too. Nothing is undone on failure: the allocation is idempotent,
   the branch and the merge request converge on a re-run, day2 folders are "already there = success".
   Not the workflow's: rendering a MachineConfig, pushing `main`, merging, syncing the Application (a
-  person, by hand, in production), the go-links and `*.apps` DNS DisposableRequests (still the
-  chart's, until their contracts are reported from the air-gap) — see `docs/design/provision-cluster.md`.
+  person, by hand, in production), the `*.apps` DNS DisposableRequest (still the chart's, until its
+  contract is reported from the air-gap) — see `docs/design/provision-cluster.md`. The chart's go-link
+  DisposableRequest must GO (or create under `SHORTCUT_OWNER`): one made first under another owner
+  fails every run at `ShortcutTakenError`.
 - **GitLab is the ONLY git provider the services know. Do not re-add a second one.** This repo's
   own source and CI live on GitHub; the air-gapped production is GitLab, with SUBGROUPS (which
   GitHub has not). provision-cluster's limb first carried both — `DAY1_GIT_PROVIDER` gitlab|github,
@@ -1221,9 +1233,10 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   always-present `workflows-orchestrator` brain release) holds only shared values — `TEMPORAL_HOST`,
   `TEMPORAL_NAMESPACE`, `SEGMENTS_MANAGER_URL`. `<domain>-config` (owned by that domain's
   chart) holds its own endpoints/policy — e.g. `cluster-lifecycle-config` = provision-cluster's keys
-  (`DAY1_REPO_URL`, `DHCP_EXCLUSION_OCTET_RANGES`, `DAY2_SIG_REPO_URL_TEMPLATE`;
-  the credentials from the shared `redbull-git-token` Secret under its
-  own key, `REDBULL_GIT_TOKEN` — the group token, day1 and the sigs alike) and `segment-lifecycle-config` = release-segment's
+  (`DAY1_REPO_URL`, `DHCP_EXCLUSION_OCTET_RANGES`, `DAY2_SIG_REPO_URL_TEMPLATE`, `SHORTCUTS_API_URL`,
+  `SHORTCUT_OWNER`, `CLUSTER_CONSOLE_URL_TEMPLATE`; the credentials from the shared `redbull-git-token`
+  Secret under its own key, `REDBULL_GIT_TOKEN` — the group token, day1 and the sigs alike — and
+  `SHORTCUTS_API_TOKEN` from the out-of-band `shortcuts-api-token` Secret) and `segment-lifecycle-config` = release-segment's
   `DHCP_API_URL` (its token in the `dhcp-api-token` Secret) — the day1 and DHCP-policy keys it
   rendered for allocate-segment are dropped only once its image stops reading them. A
   domain worker mounts BOTH + its Secrets, so the
@@ -1250,8 +1263,10 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   `ClusterLifecycleActivitySettings` (`DAY1_REPO_URL`, `REDBULL_GIT_TOKEN` — the air-gap Secret's key, the
   operator 2026-11-11; `DAY1_GIT_TOKEN` accepted as an alias, the air-gap name winning,
   `DHCP_EXCLUSION_OCTET_RANGES` with its validator — moved here from segment-lifecycle 2026-11-11 —
-  `DAY2_SIG_REPO_URL_TEMPLATE`, which must name `{sig}` (one GitLab project per sig), and
-  `DAY2_GIT_TOKEN`, the day1 token when empty). Field names = Helm ConfigMap/Secret keys
+  `DAY2_SIG_REPO_URL_TEMPLATE`, which must name `{sig}` (one GitLab project per sig),
+  `DAY2_GIT_TOKEN`, the day1 token when empty, and the shortcut's `SHORTCUTS_API_URL`,
+  `SHORTCUTS_API_TOKEN`, `SHORTCUT_OWNER` and `CLUSTER_CONSOLE_URL_TEMPLATE`, which must name
+  `{cluster}` and nothing else). Field names = Helm ConfigMap/Secret keys
   lowercased — keep aligned with redbull-platform's `gitops/charts/workflows-orchestrator/templates/config.yaml`
   (global), `gitops/charts/cluster-lifecycle-worker/templates/config.yaml` (day1 URL +
   DHCP policy + day2 sig URL template) and `gitops/charts/segment-lifecycle-worker/templates/config.yaml`

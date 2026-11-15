@@ -39,11 +39,15 @@ from shared.exceptions import (
     GitProviderRequestRejectedError,
     MceFolderNotFoundError,
     SegmentPoolExhaustedError,
+    ShortcutsApiError,
+    ShortcutTakenError,
     ValuesRepoGitError,
 )
 from shared.models.cluster_lifecycle import (
     ClusterFilePublishRequest,
     ClusterFileRef,
+    ClusterShortcut,
+    ClusterShortcutRequest,
     ClusterTarget,
     ClusterTargetRequest,
     Day2SigRegistration,
@@ -82,6 +86,8 @@ VLAN_ID = 23
 MR_URL = "https://gitlab.example/p/-/merge_requests/42"
 INPUT = ProvisionClusterInput(cluster=CLUSTER, mce=MCE, values=EXAMPLE_CLUSTER_FILE)
 DHCP = DhcpValues(network="10.20.90.0", exclusions=[DhcpExclusion(start_address="10.20.90.1", end_address="10.20.90.10")])
+SHORTCUT = "prep-e2e-site2-a"
+CONSOLE = f"https://console-openshift-console.apps.{CLUSTER}.test"
 CONFIGS = ["nm-conf", "worker-kubeletconfig-reserved", "nic-ring-buffer", "workers-chrony-configuration"]
 
 
@@ -105,6 +111,9 @@ def make_mocks(
     state_errors_before_success: int = 0,
     register_results: dict[str, bool] | None = None,
     register_error: Exception | None = None,
+    shortcut_error: Exception | None = None,
+    shortcut_errors_before_success: int = 0,
+    shortcut_created: bool = True,
 ):
     """The cluster-lifecycle limb's mocks + a call recorder.
 
@@ -113,10 +122,11 @@ def make_mocks(
     `register_results` maps a sig to whether its folder was created (default
     True for every sig).
     """
-    calls: dict[str, list] = {k: [] for k in ("inspect", "publish", "ensure", "state", "register", "order")}
+    calls: dict[str, list] = {k: [] for k in ("inspect", "publish", "ensure", "state", "register", "shortcut", "order")}
     remaining_states = list(states or ["merged"])
     publish_failures = [publish_errors_before_success]
     state_failures = [state_errors_before_success]
+    shortcut_failures = [shortcut_errors_before_success]
 
     @activity.defn
     async def inspect_cluster_target(request: ClusterTargetRequest) -> ClusterTarget:
@@ -166,8 +176,20 @@ def make_mocks(
         path = f"sites/{request.site}/{request.env}/mces/{request.mce}/{request.cluster}"
         return Day2SigRegistration(sig=request.sig, path=path, created=created, commit_sha="d" * 40 if created else None)
 
+    @activity.defn
+    async def ensure_cluster_shortcut(request: ClusterShortcutRequest) -> ClusterShortcut:
+        calls["shortcut"].append(request)
+        calls["order"].append("shortcut")
+        if shortcut_error is not None:
+            raise shortcut_error
+        if shortcut_failures[0] > 0:
+            shortcut_failures[0] -= 1
+            raise ShortcutsApiError("check shortcut: the shortcuts service answered 401 — check SHORTCUTS_API_TOKEN")
+        return ClusterShortcut(shortcut=request.shortcut, url=f"https://console-openshift-console.apps.{request.cluster}.test",
+                               owner="redbull-workflows", created=shortcut_created)
+
     return calls, [inspect_cluster_target, publish_cluster_file, ensure_merge_request, get_merge_request_state,
-                   register_cluster_in_day2_sig]
+                   register_cluster_in_day2_sig, ensure_cluster_shortcut]
 
 
 def make_segment_mocks(*, valid_sites: tuple[str, ...] = (SITE, "site4"), allocate_error: Exception | None = None,
@@ -260,7 +282,7 @@ async def test_the_whole_run_from_text_to_merged_file():
     async with harness as client:
         result = await _execute(client)
 
-    assert calls["order"] == ["inspect", "publish", "ensure", "state"]
+    assert calls["order"] == ["inspect", "publish", "ensure", "state", "shortcut"]
     # 1. inspected with the input verbatim
     assert calls["inspect"] == [ClusterTargetRequest(cluster=CLUSTER, mce=MCE, values=EXAMPLE_CLUSTER_FILE)]
     # 2. the REAL child allocated at the folder's site, as HC, and verified
@@ -280,7 +302,9 @@ async def test_the_whole_run_from_text_to_merged_file():
     assert calls["state"] == [MergeRequestRef(url=MR_URL, identifier="42", created=True)]
     # 6. no sigs listed: no day2 call
     assert calls["register"] == []
-    # 7. the result
+    # 7. the shortcut: the cluster name without ocp4-, the console built from the stem
+    assert calls["shortcut"] == [ClusterShortcutRequest(shortcut=SHORTCUT, cluster=CLUSTER)]
+    # 8. the result
     assert (result.cluster, result.cluster_name, result.site, result.mce, result.mastertag) == (
         CLUSTER, "prep-e2e-site2-a", SITE, MCE, "4.22.8")
     assert result.config_names == CONFIGS
@@ -288,16 +312,18 @@ async def test_the_whole_run_from_text_to_merged_file():
     assert (result.branch, result.cluster_file, result.commit_sha, result.file_changed) == (BRANCH, PATH, "c" * 40, True)
     assert (result.merge_request_url, result.merge_request_created, result.merged_sha) == (MR_URL, True, "m" * 40)
     assert result.day2 == []
+    assert result.shortcut == ClusterShortcut(shortcut=SHORTCUT, url=CONSOLE, owner="redbull-workflows", created=True)
 
 
 async def test_a_rerun_converges_file_present_merge_request_open_folders_present():
     calls, _, harness = _harness(
         {"changed": False, "mr_created": False, "target": _target(day2_env="prep", day2_sigs=["redbull"]),
-         "register_results": {"redbull": False}}
+         "register_results": {"redbull": False}, "shortcut_created": False}
     )
     async with harness as client:
         result = await _execute(client)
     assert (result.file_changed, result.commit_sha, result.merge_request_created) == (False, None, False)
+    assert result.shortcut is not None and not result.shortcut.created
     assert result.day2 == [Day2SigRegistration(sig="redbull", path=f"sites/{SITE}/prep/mces/{MCE}/{CLUSTER}", created=False, commit_sha=None)]
 
 
@@ -479,6 +505,7 @@ async def test_a_merge_request_closed_without_merging_fails_the_run():
     assert failure.type == "MergeRequestClosedError"
     assert MR_URL in failure.message
     assert calls["register"] == []  # never registered in day2
+    assert calls["shortcut"] == []  # and no shortcut to a cluster that will not exist
 
 
 async def test_the_wait_continues_as_new_every_n_polls_and_calls_nothing_twice():
@@ -523,7 +550,7 @@ async def test_a_continued_run_restores_its_state_and_skips_what_was_done():
         handle = await _start(client, ProvisionClusterRunArgs(input=INPUT, state=state))
         result = await asyncio.wait_for(handle.result(), timeout=60)
         progress = await handle.query(ProvisionClusterWorkflow.progress)
-    assert calls["order"] == ["state", "register", "register"]
+    assert calls["order"] == ["state", "register", "register", "shortcut"]
     assert segment_calls["sites"] == []
     assert sorted(r.sig for r in calls["register"]) == ["data", "redbull"]
     assert all((r.site, r.env, r.mce, r.cluster) == (SITE, "prep", MCE, CLUSTER) for r in calls["register"])
@@ -606,3 +633,52 @@ async def test_a_second_start_on_the_same_cluster_while_it_waits_is_already_star
         with pytest.raises(WorkflowAlreadyStartedError):
             await _start(client, workflow_id=workflow_id)
         await asyncio.wait_for(handle.result(), timeout=60)
+
+
+# --- phase 7: the console shortcut ---------------------------------------------------------------
+
+
+async def test_the_shortcut_is_the_last_step_after_day2():
+    calls, _, harness = _harness({"target": _target(day2_env="prep", day2_sigs=["redbull", "data"])})
+    async with harness as client:
+        handle = await _start(client)
+        result = await asyncio.wait_for(handle.result(), timeout=60)
+        progress = await handle.query(ProvisionClusterWorkflow.progress)
+    assert calls["order"][-1] == "shortcut" and calls["order"].count("shortcut") == 1
+    assert calls["order"].index("shortcut") > max(i for i, c in enumerate(calls["order"]) if c == "register")
+    assert result.shortcut is not None and result.shortcut.shortcut == SHORTCUT
+    assert progress.phase == "completed"
+
+
+async def test_a_shortcut_another_owner_holds_fails_the_run_after_one_attempt():
+    taken = ShortcutTakenError(f"shortcut '{SHORTCUT}' is taken by 'someone-else', not by SHORTCUT_OWNER")
+    calls, _, harness = _harness({"shortcut_error": taken, "target": _target(day2_env="prep", day2_sigs=["redbull"])})
+    async with harness as client:
+        with pytest.raises(WorkflowFailureError) as excinfo:
+            await _execute(client)
+    failure = _error(excinfo.value)
+    assert failure.type == "ShortcutTakenError" and "someone-else" in failure.message
+    assert len(calls["shortcut"]) == 1
+    assert len(calls["register"]) == 1  # day2 was done before
+
+
+async def test_a_refused_shortcut_is_retried_until_fixed():
+    """A 401 is NOT permanent here: the cluster is merged and the run could not be re-run."""
+    calls, _, harness = _harness({"shortcut_errors_before_success": 4})
+    async with harness as client:
+        result = await _execute(client)
+    assert len(calls["shortcut"]) == 5
+    assert result.shortcut is not None and result.shortcut.created
+
+
+async def test_progress_names_the_shortcut_phase_while_it_is_retried():
+    calls, _, harness = _harness({"shortcut_errors_before_success": 1000})
+    async with harness as client:
+        handle = await _start(client)
+        for _ in range(200):
+            if calls["shortcut"]:
+                break
+            await asyncio.sleep(0.05)
+        progress = await handle.query(ProvisionClusterWorkflow.progress)
+        assert progress.phase == "creating-shortcut"
+        await handle.terminate("test done")

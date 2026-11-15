@@ -50,6 +50,11 @@ os.environ.update(
         # --- provision-cluster: the DHCP policy, the day2 sigs (GitLab, one project per sig) ---
         "DHCP_EXCLUSION_OCTET_RANGES": '{"HC": [[1, 10], [241, 254]]}',
         "DAY2_SIG_REPO_URL_TEMPLATE": "https://git.test/redbull/gitops-day2-prod/sigs/{sig}.git",
+        # --- provision-cluster: the console shortcut ---
+        "SHORTCUTS_API_URL": "https://shorts.test",
+        "SHORTCUTS_API_TOKEN": "test-shorts-token",
+        "SHORTCUT_OWNER": "redbull-workflows",
+        "CLUSTER_CONSOLE_URL_TEMPLATE": "https://console-openshift-console.apps.{cluster}.test",
         # --- add-server-to-mce: server-scan + BMC credentials ---
         # Names this worker's queue; one deployment serves one MCE.
         "MCE_CLUSTER": "ocp4-mce-test",

@@ -105,6 +105,19 @@ class Day2SigRegistration(BaseModel):
     commit_sha: str | None
 
 
+class ClusterShortcut(BaseModel):
+    """Outcome of ensure_cluster_shortcut: the go-link `shortcut` owned by `owner`
+    (SHORTCUT_OWNER, read back from the service) for the cluster's console `url`.
+    `created=False` means it was already there under our owner — a re-run or a
+    retry — and nothing was posted; its URL is then the one this run would have
+    written, which the service's check does not report back."""
+
+    shortcut: str = Field(min_length=1)
+    url: str = Field(min_length=1)
+    owner: str = Field(min_length=1)
+    created: bool
+
+
 class ProvisionClusterState(BaseModel):
     """Everything a run has done so far, carried across continue-as-new (CLAUDE.md
     §5: a HUMAN wait backs off and continues as new so history stays bounded).
@@ -164,6 +177,9 @@ class ProvisionClusterResult(BaseModel):
     merge_request_created: bool
     merged_sha: str | None
     day2: list[Day2SigRegistration]
+    # The console shortcut (the last step). None for a run recorded before the
+    # step existed (patch `provision-cluster-shortcut`), which never made one.
+    shortcut: ClusterShortcut | None = None
 
 
 # --- activity requests ------------------------------------------------------------------
@@ -208,4 +224,13 @@ class Day2SigRegistrationRequest(BaseModel):
     site: str = Field(min_length=1)
     env: str = Field(min_length=1)
     mce: str = Field(min_length=1)
+    cluster: str = Field(min_length=1)
+
+
+class ClusterShortcutRequest(BaseModel):
+    """Input to ensure_cluster_shortcut: the go-link name (the cluster name without
+    `ocp4-`) and the day1 file stem the limb builds the console URL from
+    (CLUSTER_CONSOLE_URL_TEMPLATE's `{cluster}`)."""
+
+    shortcut: str = Field(min_length=1)
     cluster: str = Field(min_length=1)

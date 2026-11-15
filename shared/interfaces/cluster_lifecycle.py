@@ -12,6 +12,8 @@ from temporalio import activity
 from shared.models.cluster_lifecycle import (
     ClusterFilePublishRequest,
     ClusterFileRef,
+    ClusterShortcut,
+    ClusterShortcutRequest,
     ClusterTarget,
     ClusterTargetRequest,
     Day2SigRegistration,
@@ -103,5 +105,21 @@ async def register_cluster_in_day2_sig(request: Day2SigRegistrationRequest) -> D
     push — the branch moved, or a token whose role may not push the protected
     branch — is the retryable ValuesRepoGitError and the retry re-clones — the
     convergence loop add-cluster-to-day2.sh ran itself.
+    """
+    ...
+
+
+@activity.defn
+async def ensure_cluster_shortcut(request: ClusterShortcutRequest) -> ClusterShortcut:
+    """The cluster's console shortcut (go-link) in the shortcuts service: `request.shortcut`
+    pointing at CLUSTER_CONSOLE_URL_TEMPLATE with `{cluster}` = `request.cluster`,
+    created with `username` SHORTCUT_OWNER.
+
+    Find-before-create (`GET /check/<name>`), then the create (`POST /create`) and
+    a read-back check: success only once the service reports the name taken by
+    SHORTCUT_OWNER. Already taken by SHORTCUT_OWNER is success, `created=False`,
+    nothing posted. Raises ShortcutTakenError (another owner holds the name —
+    deterministic, non-retryable); EVERY other failure, refusals included, is the
+    retryable ShortcutsApiError (the run is past its merge and cannot be re-run).
     """
     ...

@@ -86,7 +86,8 @@ activities/<domain>/              The limbs
                                     with no worker: cluster_lifecycle/day1_writer.py
                                     (the cluster file on its branch), git_provider.py
                                     (GitLab merge requests), day2_sigs.py (the
-                                    sig repos), cluster_values.py (what a file must
+                                    sig repos), shortcuts_api.py (the console
+                                    go-link), cluster_values.py (what a file must
                                     look like), dhcp_api.py (the DHCP scope API),
                                     server_scan.py (the inventory API),
                                     cluster_api.py (the Kubernetes API, its
@@ -112,7 +113,7 @@ The prod charts are vendored into the Argo CD repo, not this one:
 | `redbull-platform/gitops/charts/server-lifecycle-worker/` | the `server-lifecycle-worker` limb |
 | `redbull-platform/gitops/charts/server-provisioning-worker/` | the `server-provisioning-worker` limb — no `gitops/services/` entry yet, so nothing deploys it |
 | `redbull-platform/gitops/charts/vm-lifecycle-worker/` | the `vm-lifecycle-worker` limb (create-vm) — ONE release on the hub for every zone; needs the `kv-capacity-token` and `kv-vm-api-token` Secrets and reads the shared `redbull-git-token` — not on redbull-platform's `main` yet, so CI's image bump fails until it is |
-| `redbull-platform/gitops/charts/cluster-lifecycle-worker/` | the `cluster-lifecycle-worker` limb (provision-cluster) — ONE release on the hub; reads the shared `redbull-git-token` (day1 push + its provider's merge-request API, the day2 sig repos) — not on redbull-platform's `main` yet either |
+| `redbull-platform/gitops/charts/cluster-lifecycle-worker/` | the `cluster-lifecycle-worker` limb (provision-cluster) — ONE release on the hub; reads the shared `redbull-git-token` (day1 push + its provider's merge-request API, the day2 sig repos) and names the `shortcuts-api-token` Secret — not on redbull-platform's `main` yet either |
 | `redbull-platform/gitops/charts/cluster-upgrade-worker/`, `.../upgrade-agent-worker/` | cluster-upgrade's per-MCE limbs, copied from `deploy/charts/` here by CI (`sync-upgrade-charts`) on every `main` push that changes them — no `gitops/services/` entry yet |
 | `redbull-platform/gitops/charts/upgrade-gitops-worker/` | cluster-upgrade's hub limb (its only copy) — no `gitops/services/` entry yet |
 
@@ -766,7 +767,12 @@ for a person to merge it** — no deadline, a 5-minute durable timer, continued
 as new every 48 polls so history stays short. After the merge it registers the
 cluster in every day2 sig the value layers list under `day2.copy_to_sigs`
 (`sites/<site>/<env>/mces/<mce>/<cluster>/.gitkeep` on the sig repo's default
-branch) and completes. A merge request closed without merging fails the run.
+branch), and last creates the cluster's **console shortcut** in the shortcuts
+service — the cluster name without `ocp4-` → the console URL, owned by
+`SHORTCUT_OWNER` (already ours = success; held by another owner =
+`ShortcutTakenError`; any other refusal is retried until fixed, since the run
+is past its merge) — and completes. A merge request closed without merging
+fails the run.
 
 Re-running the same cluster converges: the branch's file is compared
 semantically (the chain's `mcConfigMap` set aside), the open merge request is
@@ -842,7 +848,7 @@ result.
 | `POST /workflows/server-provisioning/provision-dell-server` | one Dell server, by iDRAC IP |
 | `POST /workflows/server-provisioning/provision-dell-server/bulk` | one workflow PER iDRAC IP |
 | `POST /workflows/vm-lifecycle/create-vm` | one workflow PER VM for a KubeVirt InfraEnv: one in the first free slot, or `count` in parallel |
-| `POST /workflows/cluster-lifecycle/provision-cluster?cluster=&mce=` | one hosted cluster from the YAML in the body (`application/yaml`): segment, day1 branch, merge request, the wait for the merge, day2 |
+| `POST /workflows/cluster-lifecycle/provision-cluster?cluster=&mce=` | one hosted cluster from the YAML in the body (`application/yaml`): segment, day1 branch, merge request, the wait for the merge, day2, the console shortcut |
 | `GET  /workflows/runs/{workflow_id}` | (status, every domain) |
 
 ### Paths: `/workflows/<domain>/<workflow>`, status on `/workflows/runs`
@@ -916,6 +922,10 @@ would hide which segments actually got a workflow.
 | `DAY2_SIG_REPO_URL_TEMPLATE` | `cluster-lifecycle-config` | the day2 sig repos: the URL with `{sig}`, one GitLab project per sig, the tree at its root |
 | `REDBULL_GIT_TOKEN` | Secret `redbull-git-token`, key `REDBULL_GIT_TOKEN`, under its own name | push rights AND GitLab's API (`api` + `write_repository`), with a role that may push each sig project's protected default branch (Maintainer); `DAY1_GIT_TOKEN` is accepted too (a cluster with only `day1-git-token`), `REDBULL_GIT_TOKEN` wins; scrubbed from every error |
 | `DAY2_GIT_TOKEN` | not rendered by the chart | the sig repos' push token; empty = `REDBULL_GIT_TOKEN`. The chart sets none: `redbull-git-token` is the group token and pushes day1 and every sig repo |
+| `SHORTCUTS_API_URL` | `cluster-lifecycle-config` | the shortcuts service (go-links): `GET <url>/check/<name>`, `POST <url>/create` — provision-cluster's last step |
+| `SHORTCUTS_API_TOKEN` | Secret `shortcuts-api-token`, key `SHORTCUTS_API_TOKEN` | its bearer token, created out of band; a rejected one holds runs at `creating-shortcut` (retried) |
+| `SHORTCUT_OWNER` | `cluster-lifecycle-config` | the `username` every shortcut is created with; the service reports it back as the owner, which is how a re-run knows a taken name is its own |
+| `CLUSTER_CONSOLE_URL_TEMPLATE` | `cluster-lifecycle-config` | the console URL a shortcut points at, `{cluster}` = the day1 file stem: `https://console-openshift-console.apps.{cluster}.<base domain>` |
 | `MCE_CLUSTER` | `server-lifecycle-config` | which MCE this worker serves — names its queue, so it must match callers' `mce_cluster` |
 | `SERVER_SCAN_URL` | `server-lifecycle-config` | inventory API base, INCLUDING `/api/v1` |
 | `SERVER_SCAN_API_TOKEN` | Secret | an **admin** token — add-server-to-mce takes and releases the install lock |

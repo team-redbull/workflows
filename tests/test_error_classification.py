@@ -385,8 +385,10 @@ class TestProvisionClusterClassification:
     _ALLOCATE_SEGMENT = pathlib.Path(__file__).resolve().parent.parent / "workflow_domains/segment_lifecycle/allocate_segment.py"
     # Retried by design: a day1 or sig-repo clone/push that fails (a rejected
     # push is re-done from a fresh clone; a missing `main` is unreachable, not
-    # missing), the git provider down, a 5xx, a merge request born in between.
-    RETRIED = {"ValuesRepoGitError", "ValuesBranchNotFoundError", "GitProviderError"}
+    # missing), the git provider down, a 5xx, a merge request born in between;
+    # the shortcuts service failing OR refusing (the step is after the merge, so
+    # the run waits until the token or the config is fixed — the operator, 2026-11-15).
+    RETRIED = {"ValuesRepoGitError", "ValuesBranchNotFoundError", "GitProviderError", "ShortcutsApiError"}
 
     def test_every_entry_names_a_real_error_class_and_none_is_workflow_raised(self):
         from workflow_domains.cluster_lifecycle.provision_cluster import _RETRY_POLICY as policy

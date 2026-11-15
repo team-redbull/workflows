@@ -1311,3 +1311,21 @@ class Day2EnvMissingError(OrchestratorError):
     carries no environment folder for them — a limb older than the field, or a
     limb bug: inspect_cluster_target derives both together. Nothing was pushed
     to day2; the merged cluster file stands."""
+
+
+class ShortcutsApiError(OrchestratorError):
+    """The shortcuts service (SHORTCUTS_API_URL) failed or refused: unreachable,
+    any non-2xx — a 401/403 token, a 400/422 request, a lost race on create —
+    or an answer that is not what its API documents. RETRYABLE BY DESIGN, even
+    for a refusal: the shortcut is provision-cluster's last step, after the
+    merge, and a failed run could not be re-run (ClusterAlreadyProvisionedError),
+    so the run waits at `creating-shortcut` with the service's words on the
+    activity until the token or the config is fixed (the day2 precedent).
+    Deliberately NOT in non_retryable_error_types."""
+
+
+class ShortcutTakenError(OrchestratorError):
+    """The cluster's shortcut name is already taken by ANOTHER owner than
+    SHORTCUT_OWNER, so it cannot be pointed at this cluster's console. The owner
+    the service reports is named. Deterministic — non-retryable: a person
+    decides whether the existing shortcut is removed or kept."""

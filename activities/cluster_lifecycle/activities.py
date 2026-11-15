@@ -4,24 +4,28 @@ Polls CLUSTER_LIFECYCLE_ACTIVITY_QUEUE on the hub. Holds no Kubernetes
 credential: it reaches the day1 values repo with the day1 git token (a clone,
 a push, and GitLab's API for the merge request —
 day1_writer.py, git_provider.py) and the day2 sig repos with the day2 token
-(day2_sigs.py). Each activity reads its settings and hands plain parameters to
+(day2_sigs.py), and the shortcuts service with its own bearer token
+(shortcuts_api.py). Each activity reads its settings and hands plain parameters to
 one module per dependency; what a cluster file must look like is
 cluster_values.py, and the DHCP block it gets is dhcp_values.py.
 
 Budgets, all under the workflow's timeouts (workflow_domains/cluster_lifecycle/
 provision_cluster.py): git under the 180 s start_to_close (git_repo's 150 s
-per command), GitLab's HTTP calls at 60 s under the 90 s start_to_close.
+per command), GitLab's HTTP calls at 60 s under the 90 s start_to_close, the
+shortcuts service's three calls at 20 s each under its 90 s.
 """
 
 from __future__ import annotations
 
 from temporalio import activity
 
-from activities.cluster_lifecycle import day1_writer, day2_sigs, git_provider
+from activities.cluster_lifecycle import day1_writer, day2_sigs, git_provider, shortcuts_api
 from activities.cluster_lifecycle.dhcp_values import build_dhcp_values
 from shared.models.cluster_lifecycle import (
     ClusterFilePublishRequest,
     ClusterFileRef,
+    ClusterShortcut,
+    ClusterShortcutRequest,
     ClusterTarget,
     ClusterTargetRequest,
     Day2SigRegistration,
@@ -100,3 +104,16 @@ async def register_cluster_in_day2_sig(request: Day2SigRegistrationRequest) -> D
         "day2 sig %s: %s %s", request.sig, "created" if registration.created else "already has", registration.path
     )
     return registration
+
+
+@activity.defn
+async def ensure_cluster_shortcut(request: ClusterShortcutRequest) -> ClusterShortcut:
+    shortcut = await shortcuts_api.ensure(
+        base_url=_settings.shortcuts_api_url, token=_settings.shortcuts_api_token, owner=_settings.shortcut_owner,
+        shortcut=request.shortcut, url=_settings.cluster_console_url(request.cluster),
+    )
+    activity.logger.info(
+        "shortcut %s → %s %s (owner %s)", shortcut.shortcut, shortcut.url,
+        "created" if shortcut.created else "already there", shortcut.owner,
+    )
+    return shortcut

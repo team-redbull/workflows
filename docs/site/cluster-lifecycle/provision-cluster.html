@@ -64,8 +64,8 @@
   <section id="flow">
     <div class="sec-head">
       <div class="eyebrow">The run, step by step</div>
-      <h2>From “here is the cluster file” to “merged, and known to day2”</h2>
-      <p class="lede">Six phases. Each card carries a <code>phase</code> — read live off a running workflow through a
+      <h2>From “here is the cluster file” to “merged, known to day2, one click away”</h2>
+      <p class="lede">Seven phases. Each card carries a <code>phase</code> — read live off a running workflow through a
       Temporal <b>query</b>, which is how <code>GET /workflows/runs/{workflow_id}</code> can tell you where inside the
       run a cluster currently is. The colour of a call is the system it talks to.</p>
     </div>
@@ -204,6 +204,30 @@
         </div>
       </div>
 
+      <div class="step">
+        <div class="marker">6</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>ensure_cluster_shortcut — the console go-link, last</h3>
+            <span class="phase">phase <b>creating-shortcut</b></span>
+          </div>
+          <p>The cluster's shortcut in the shortcuts service: the name is the cluster name <em>without</em>
+          <code>ocp4-</code> (<code>prod-herz1-site1-a</code>), the URL its console
+          (<code>CLUSTER_CONSOLE_URL_TEMPLATE</code> with <code>{cluster}</code> = <code>ocp4-prod-herz1-site1-a</code>),
+          the <code>username</code> <code>SHORTCUT_OWNER</code>. The name is <b>checked first</b>: taken by
+          <code>SHORTCUT_OWNER</code> is a re-run → success, nothing posted; taken by anyone else fails the run
+          (<code>ShortcutTakenError</code> — it may point anywhere, a person decides). Available → created, then
+          checked again: success only once the service reports it taken by <code>SHORTCUT_OWNER</code>. Any refusal
+          (a bad token, a rejected request, a 5xx) is <b>retried until fixed</b> — the cluster is merged, so the run
+          waits here rather than fail into a state no re-run can reach.</p>
+          <div class="calls">
+            <div class="call cfg"><span class="verb">GET</span><span class="path">/check/&lt;name&gt; → available? owner</span></div>
+            <div class="call cfg"><span class="verb">POST</span><span class="path">/create {shortcut, username, url} <em>· only when available</em></span></div>
+            <div class="call cfg"><span class="verb">GET</span><span class="path">/check/&lt;name&gt; <em>· the read-back: owner = SHORTCUT_OWNER</em></span></div>
+          </div>
+        </div>
+      </div>
+
       <div class="step done">
         <div class="marker">✓</div>
         <div class="card">
@@ -213,7 +237,7 @@
           </div>
           <p>The result carries the file's path and branch, the commit (or <code>null</code> on a re-run), the
           segment, vlan, EPG and network, the merge request's URL, whether it was created or found, the merge commit,
-          and each day2 registration. What it does <em>not</em> do: sync the Application — in production a person
+          each day2 registration, and the shortcut (<code>created</code> false when it was already ours). What it does <em>not</em> do: sync the Application — in production a person
           does, by hand, after the merge.</p>
         </div>
       </div>
@@ -371,7 +395,10 @@ curl -X POST -H 'Content-Type: application/yaml' --data-binary @cluster.yaml \
               "merge_request_url": "https://gitlab…/merge_requests/42", "merge_request_created": true,
               "merged_sha": "c1a…",
               "day2": [ { "sig": "redbull", "path": "sites/site2/prep/mces/ocp4-prep-mce-site2-a/ocp4-prep-e2e-site2-a",
-                          "created": true, "commit_sha": "d4e…" } ] } }</pre>
+                          "created": true, "commit_sha": "d4e…" } ],
+              "shortcut": { "shortcut": "prep-e2e-site2-a",
+                            "url": "https://console-openshift-console.apps.ocp4-prep-e2e-site2-a.&lt;base&gt;",
+                            "owner": "redbull-workflows", "created": true } } }</pre>
         </div>
       </div>
 
@@ -402,6 +429,7 @@ curl -X POST -H 'Content-Type: application/yaml' --data-binary @cluster.yaml \
           <li><code>GitProviderRequestRejectedError</code> — no such project for this token, no <code>main</code>, a merge request gone</li>
           <li><code>MergeRequestClosedError</code> — closed without merging (workflow-raised)</li>
           <li><code>Day2EnvMissingError</code> — sigs listed but no environment folder (a limb older than the field)</li>
+          <li><code>ShortcutTakenError</code> — the cluster's shortcut name is held by another owner than <code>SHORTCUT_OWNER</code>; the merged cluster and its day2 folders stand, the shortcut is a person's to sort out</li>
           <li><code>UnsupportedSegmentPrefix</code> / <code>InvalidSegmentCidr</code> — the pool handed back a non-/24</li>
         </ul>
       </div>
@@ -414,7 +442,10 @@ curl -X POST -H 'Content-Type: application/yaml' --data-binary @cluster.yaml \
         at <code>registering-day2</code></b> is the usual case: GitLab refused the push to a sig project — the token's
         role may not push its protected default branch (it needs Maintainer), or a sig listed under
         <code>day2.copy_to_sigs</code> has no project. GitLab's words are on the pending activity; the cluster file is
-        already merged, so the run waits and goes on once the role or the project is fixed. An unclassified
+        already merged, so the run waits and goes on once the role or the project is fixed. <b>A run that stays at
+        <code>creating-shortcut</code></b> is the same case for the shortcuts service: <code>ShortcutsApiError</code>
+        is retryable whatever the service answered — a rejected <code>SHORTCUTS_API_TOKEN</code> (401/403), a refused
+        request, a 5xx — with the service's words on the pending activity. An unclassified
         permanent error shows as a run stuck <b>RUNNING</b> in the Temporal UI — the fix is to classify it, not to add
         a deadline.</p>
         <h3 style="margin-top:6px">Nothing to clean up</h3>
@@ -457,6 +488,7 @@ curl -X POST -H 'Content-Type: application/yaml' --data-binary @cluster.yaml \
           <tr><td class="k">opening-merge-request</td><td class="muted">Find or create the merge request</td><td class="muted">seconds</td></tr>
           <tr><td class="k">awaiting-merge</td><td class="muted">A person reviews and merges; read every 5 min; continued as new every 48 polls</td><td class="muted">hours to days</td></tr>
           <tr><td class="k">registering-day2</td><td class="muted">The folder in each sig repo</td><td class="muted">seconds</td></tr>
+          <tr><td class="k">creating-shortcut</td><td class="muted">The console go-link: check, create, check again</td><td class="muted">seconds</td></tr>
           <tr><td class="k">completed</td><td class="muted">Done; <code>result</code> is available</td><td class="muted">—</td></tr>
         </tbody>
       </table>
@@ -472,6 +504,10 @@ curl -X POST -H 'Content-Type: application/yaml' --data-binary @cluster.yaml \
           <tr><td class="k">DHCP_EXCLUSION_OCTET_RANGES</td><td class="muted">cluster-lifecycle-config</td><td class="muted">The ONE DHCP policy knob, per segment type, written into every cluster file's block (HC required). Validated at worker startup.</td></tr>
           <tr><td class="k">DAY2_SIG_REPO_URL_TEMPLATE</td><td class="muted">cluster-lifecycle-config</td><td class="muted">The sig repos: the URL with <code>{sig}</code>, one GitLab project per sig, the tree at its root.</td></tr>
           <tr><td class="k">DAY2_GIT_TOKEN</td><td class="muted">not rendered by the chart</td><td class="muted">The sig repos' push token; empty = <code>REDBULL_GIT_TOKEN</code>. The chart sets none: the group token pushes day1 and every sig repo.</td></tr>
+          <tr><td class="k">SHORTCUTS_API_URL</td><td class="muted">cluster-lifecycle-config</td><td class="muted">The shortcuts service's base URL: <code>GET &lt;url&gt;/check/&lt;name&gt;</code>, <code>POST &lt;url&gt;/create</code>.</td></tr>
+          <tr><td class="k">SHORTCUTS_API_TOKEN</td><td class="muted">Secret shortcuts-api-token, key SHORTCUTS_API_TOKEN</td><td class="muted">Its bearer token. Created out of band; the chart only names it.</td></tr>
+          <tr><td class="k">SHORTCUT_OWNER</td><td class="muted">cluster-lifecycle-config</td><td class="muted">The <code>username</code> every shortcut is created with — and how a re-run recognises a taken name as its own (the service reports it back as the owner). Change it and every existing shortcut reads as someone else's.</td></tr>
+          <tr><td class="k">CLUSTER_CONSOLE_URL_TEMPLATE</td><td class="muted">cluster-lifecycle-config</td><td class="muted">The URL a shortcut points at: <code>https://console-openshift-console.apps.{cluster}.&lt;base domain&gt;</code>, <code>{cluster}</code> = the day1 file stem and nothing else in braces. Validated at worker startup.</td></tr>
         </tbody>
       </table>
     </div>
@@ -492,7 +528,9 @@ curl -X POST -H 'Content-Type: application/yaml' --data-binary @cluster.yaml \
         <p>The child returns the <em>same</em> allocation (idempotent per cluster/site/type), the branch's file is
         recognised as this run's — the chain's <code>mcConfigMap</code> and its blank-line re-spacing set aside — and
         nothing is pushed (<code>file_changed: false</code>), the open merge request is found
-        (<code>merge_request_created: false</code>), folders already in the sig repos are success. A cluster whose
+        (<code>merge_request_created: false</code>), folders already in the sig repos are success, and a shortcut
+        already held by <code>SHORTCUT_OWNER</code> is success (<code>created: false</code>; the check reports no URL,
+        so an existing shortcut of ours is not re-pointed). A cluster whose
         file is already on <code>main</code> fails <code>ClusterAlreadyProvisionedError</code>: provisioning is
         done, and changing a cluster is an edit on day1, not a run here.</p>
       </div>
@@ -510,7 +548,7 @@ curl -X POST -H 'Content-Type: application/yaml' --data-binary @cluster.yaml \
   <footer>
     <span>workflow_domains/cluster_lifecycle/provision_cluster.py</span>
     <span>activities/cluster_lifecycle/activities.py</span>
-    <span>activities/cluster_lifecycle/cluster_values.py · day1_writer.py · git_provider.py · day2_sigs.py</span>
+    <span>activities/cluster_lifecycle/cluster_values.py · day1_writer.py · git_provider.py · day2_sigs.py · shortcuts_api.py</span>
     <span>shared/models/cluster_lifecycle.py</span>
   </footer>
 

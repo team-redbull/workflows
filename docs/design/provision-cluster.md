@@ -34,6 +34,7 @@ day1 main ──┐
             ▼
 day1 main   5. Argo CD renders the Application (synced by hand in production)
             6. provision-cluster registers the cluster in the day2 sig repos
+            7. provision-cluster creates the console shortcut (go-link), last
 ```
 
 Commit 1 must not carry `[skip ci]`: the chain's `workflow.rules` skip a commit
@@ -89,9 +90,10 @@ https://<gitlab>/redbull/gitops-day2-prod/sigs/{sig}.git`, the tree at the root.
 - Render a MachineConfig or write `mcConfigMap`: the day1 chain's, on the
   branch, until the chart renders them at sync time.
 - Push `main`, merge, or sync the Application: a person's, in production.
-- The go-links console shortcut and the `*.apps` DNS record: still the
-  hostedclusters-setup chart's Crossplane `DisposableRequest`s, until their
-  contracts are reported from the air-gap and mocked for dev.
+- The `*.apps` DNS record: still the hostedclusters-setup chart's Crossplane
+  `DisposableRequest`, until its contract is reported from the air-gap and
+  mocked for dev. (The console go-link is the run's own LAST step since
+  2026-11-15 — next section — and the chart's go-link request has to go.)
 - Verify the DHCP scope after the merge (a bounded read-back with
   `get_dhcp_scope`): a follow-up.
 - Undo anything on failure: the allocation is idempotent per (cluster, site,
@@ -99,6 +101,41 @@ https://<gitlab>/redbull/gitops-day2-prod/sigs/{sig}.git`, the tree at the root.
   are "already there = success". A merge request closed without merging fails
   the run and leaves the branch and the allocation for a person to decide on;
   release-segment gives the segment back if the cluster is abandoned.
+
+## The console shortcut, last
+
+The go-link the hostedclusters-setup chart used to make through a Crossplane
+`DisposableRequest` is the run's own step since 2026-11-15 (the operator),
+`creating-shortcut`, after day2:
+
+| | |
+| --- | --- |
+| name | the cluster name without `ocp4-` (`prod-herz1-site1-a`) |
+| url | `CLUSTER_CONSOLE_URL_TEMPLATE`, `{cluster}` = the stem: `https://console-openshift-console.apps.ocp4-prod-herz1-site1-a.<base>` |
+| username | `SHORTCUT_OWNER` |
+| service | `SHORTCUTS_API_URL`, bearer `SHORTCUTS_API_TOKEN` |
+
+```
+GET  /check/<name>                       → {"available": bool, "owner": str}
+     available: false, owner = ours      → success, created=false, nothing posted
+     available: false, owner = another   → ShortcutTakenError (permanent)
+POST /create {shortcut, username, url}   → [{name, url, username, id, hits}]  (not parsed)
+GET  /check/<name>                       → the read-back: taken, owner = ours
+```
+
+Why the check decides ownership: the service records the `username` sent as
+the owner (confirmed by the operator), and `/check` is the only read. It does
+not report the URL, so a shortcut already ours is never compared or re-pointed.
+Why every refusal is RETRIED (`ShortcutsApiError`, a 401 included): the step
+runs after the merge, and a failed run could not be re-run
+(`ClusterAlreadyProvisionedError`) — the day2 reasoning. Only a name held by
+someone else fails the run: it may point anywhere, and whether it goes is a
+person's call. Why a template for the URL: day1 records no base domain the run
+could read.
+
+Before this image ships, the chart's own go-link request must go (or create
+under `SHORTCUT_OWNER`): a shortcut it made first under another owner fails
+every run at the last step.
 
 ## One git provider: GitLab
 

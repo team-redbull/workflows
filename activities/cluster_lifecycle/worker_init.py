@@ -3,7 +3,8 @@
 ONE DEPLOYMENT ON THE HUB, polling CLUSTER_LIFECYCLE_ACTIVITY_QUEUE. Its own
 deployment because its dependency and credential set is its own (CLAUDE.md
 §2): the day1 git token used for a push AND for the repo's git provider API
-(the merge request), plus the day2 sig repos' push token — no Kubernetes
+(the merge request), plus the day2 sig repos' push token and the shortcuts service's bearer
+token — no Kubernetes
 credential at all, so nothing to run per MCE.
 
 Connects with the Pydantic data converter so that Pydantic models serialize
@@ -19,6 +20,7 @@ from datetime import timedelta
 from temporalio.worker import Worker
 
 from activities.cluster_lifecycle.activities import (
+    ensure_cluster_shortcut,
     ensure_merge_request,
     get_merge_request_state,
     inspect_cluster_target,
@@ -48,6 +50,7 @@ async def main() -> None:
             ensure_merge_request,
             get_merge_request_state,
             register_cluster_in_day2_sig,
+            ensure_cluster_shortcut,
         ],
         # A clone or a push in flight gets this long to finish after shutdown
         # starts; a cut push is re-done from a fresh clone by Temporal's retry.

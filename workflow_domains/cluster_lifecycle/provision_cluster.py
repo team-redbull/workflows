@@ -1,6 +1,6 @@
 """provision-cluster — a hosted cluster from the YAML a person wrote: its segment, its
-day1 file on a branch, the merge request, the wait for a person to merge it, and its
-registration in the day2 sig repos.
+day1 file on a branch, the merge request, the wait for a person to merge it, its
+registration in the day2 sig repos, and its console shortcut.
 
 The orchestrator is the ENTRY POINT for a new cluster (CLAUDE.md §4). The caller
 hands over the COMPLETE hosted-cluster file (owner, mastertag, nodepools with
@@ -47,8 +47,17 @@ Shape of the run:
                               is success). After the merge because day2 renders
                               mastertag from day1 main: a folder created before
                               breaks the sig's whole render.
-  7. completed              — the file, the branch, the allocation, the merge
-                              request, the day2 folders.
+  7. creating-shortcut      — the cluster's console go-link in the shortcuts
+                              service: the cluster name without `ocp4-` →
+                              the console URL, owned by SHORTCUT_OWNER. Found
+                              (ours = success, someone else's =
+                              ShortcutTakenError), else created and read back.
+                              Any other refusal is RETRIED until fixed: the
+                              cluster is merged, the run could not be re-run.
+                              Gated `provision-cluster-shortcut`: a run
+                              recorded before it never makes one.
+  8. completed              — the file, the branch, the allocation, the merge
+                              request, the day2 folders, the shortcut.
 
 What the run never does: render a MachineConfig (the day1 chain does, on the
 branch, as it always has), write `mcConfigMap`, push to `main`, merge, sync the
@@ -87,8 +96,10 @@ with workflow.unsafe.imports_passed_through():
         GitProviderRequestRejectedError,
         MceFolderNotFoundError,
         MergeRequestClosedError,
+        ShortcutTakenError,
     )
     from shared.interfaces.cluster_lifecycle import (
+        ensure_cluster_shortcut,
         ensure_merge_request,
         get_merge_request_state,
         inspect_cluster_target,
@@ -98,6 +109,8 @@ with workflow.unsafe.imports_passed_through():
     from shared.models.cluster_lifecycle import (
         ClusterFilePublishRequest,
         ClusterFileRef,
+        ClusterShortcut,
+        ClusterShortcutRequest,
         ClusterTarget,
         ClusterTargetRequest,
         Day2SigRegistration,
@@ -140,6 +153,7 @@ _PERMANENT_ACTIVITY_ERRORS: tuple[type[Exception], ...] = (
     ClusterFileConflictError,
     GitProviderAuthError,
     GitProviderRequestRejectedError,
+    ShortcutTakenError,
 )
 _RETRY_POLICY = RetryPolicy(
     initial_interval=timedelta(seconds=1),
@@ -287,12 +301,26 @@ class ProvisionClusterWorkflow:
                 )
             )
 
+        # Step 7 — the console shortcut, last. A run recorded before this step
+        # existed completed without it, and replays so.
+        shortcut: ClusterShortcut | None = None
+        if workflow.patched("provision-cluster-shortcut"):
+            self._phase = "creating-shortcut"
+            shortcut = await workflow.execute_activity(
+                ensure_cluster_shortcut,
+                ClusterShortcutRequest(shortcut=target.cluster_name, cluster=cluster),
+                task_queue=CLUSTER_LIFECYCLE_ACTIVITY_QUEUE,
+                start_to_close_timeout=_ACTIVITY_TIMEOUT,
+                retry_policy=_RETRY_POLICY,
+            )
+
         self._phase = "completed"
         workflow.logger.info(
-            "%s provisioned: %s on %s (vlan %d, %s), merge request %s merged%s, day2 %s",
+            "%s provisioned: %s on %s (vlan %d, %s), merge request %s merged%s, day2 %s, shortcut %s",
             cluster, published.relative_path, published.branch, allocation.vlan_id, allocation.segment,
             merge_request.url, f" ({merged.merged_sha})" if merged.merged_sha else "",
             ", ".join(f"{r.sig}:{'created' if r.created else 'present'}" for r in registrations) or "none",
+            f"{shortcut.shortcut} → {shortcut.url}" if shortcut else "none",
         )
         return ProvisionClusterResult(
             cluster=cluster,
@@ -313,6 +341,7 @@ class ProvisionClusterWorkflow:
             merge_request_created=merge_request.created,
             merged_sha=merged.merged_sha,
             day2=registrations,
+            shortcut=shortcut,
         )
 
     async def _allocate(self, cluster: str, site: str) -> AllocateSegmentResult:

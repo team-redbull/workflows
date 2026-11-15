@@ -1,4 +1,4 @@
-"""ClusterLifecycleActivitySettings — The cluster-lifecycle hub limb only: the day1 repo, GitLab's API, the DHCP policy and the day2 sig projects.
+"""ClusterLifecycleActivitySettings — The cluster-lifecycle hub limb only: the day1 repo, GitLab's API, the DHCP policy, the day2 sig projects and the shortcuts service.
 
 One settings module per worker (shared/settings/__init__.py says why): this file
 is loaded by the images that read it and by no other.
@@ -84,6 +84,21 @@ class ClusterLifecycleActivitySettings(BaseSettings):
     day2_sig_repo_url_template: str
     day2_git_token: str = ""
 
+    # --- the console shortcut (go-link), provision-cluster's last step ----------
+    # The shortcuts service: its base URL (`<url>/check/<name>`, `<url>/create`)
+    # and its bearer token — that service's own values, so its prefix (§3).
+    shortcuts_api_url: str
+    shortcuts_api_token: str
+    # The `username` every shortcut is created with — and how a re-run knows a
+    # taken name is ITS OWN: the service records the username sent and its check
+    # reports it back as `owner`. A name owned by anyone else fails the run.
+    shortcut_owner: str = Field(min_length=1)
+    # The URL the shortcut points at: the hosted cluster's console, with
+    # `{cluster}` = the day1 file stem (`ocp4-prod-herz1-site1-a`), e.g.
+    # https://console-openshift-console.apps.{cluster}.<base domain>. A template
+    # because day1 records no base domain the run could read.
+    cluster_console_url_template: str
+
     @field_validator("day1_repo_url")
     @classmethod
     def _require_https_day1_repo_url(cls, url: str) -> str:
@@ -164,6 +179,31 @@ class ClusterLifecycleActivitySettings(BaseSettings):
             )
         return template.rstrip("/")
 
+    @field_validator("shortcuts_api_url")
+    @classmethod
+    def _http_shortcuts_api_url(cls, url: str) -> str:
+        if not url.startswith(("http://", "https://")):
+            raise ValueError(f"shortcuts_api_url must be an http:// or https:// URL (got {url!r})")
+        return url.rstrip("/")
+
+    @field_validator("cluster_console_url_template")
+    @classmethod
+    def _console_url_template(cls, template: str) -> str:
+        """http(s), `{cluster}` and nothing else in braces: a typo (`{clustr}`)
+        fails at worker start, not as a KeyError at the end of a merged run."""
+        if not template.startswith(("http://", "https://")):
+            raise ValueError(f"cluster_console_url_template must be an http:// or https:// URL (got {template!r})")
+        try:
+            fields = {field for _, field, _, _ in string.Formatter().parse(template) if field is not None}
+        except ValueError as err:
+            raise ValueError(f"cluster_console_url_template {template!r} is not a format string: {err}") from None
+        if fields != {"cluster"}:
+            raise ValueError(
+                f"cluster_console_url_template {template!r} must name {{cluster}} and nothing else "
+                f"(got {sorted(fields) or 'no placeholder'})"
+            )
+        return template.rstrip("/")
+
     @model_validator(mode="after")
     def _sig_is_in_the_url_template(self) -> ClusterLifecycleActivitySettings:
         """`{sig}` in the URL template, and nothing else in braces: a typo
@@ -189,3 +229,6 @@ class ClusterLifecycleActivitySettings(BaseSettings):
 
     def day2_sig_repo_url(self, sig: str) -> str:
         return self.day2_sig_repo_url_template.format(sig=sig)
+
+    def cluster_console_url(self, cluster: str) -> str:
+        return self.cluster_console_url_template.format(cluster=cluster)

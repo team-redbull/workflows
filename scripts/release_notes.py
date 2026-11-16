@@ -14,18 +14,25 @@ Where the facts come from:
 
   * VERSIONS: the reusable build workflow (team-redbull/.github, ghcr-build-push.yml)
     tags each main release `<chart>/vX.Y.Z` in redbull-platform, and each chart
-    directory is named after its image (tests/test_image_builds.py). The `changes` job
-    records the newest tag of every image BEFORE anything builds (`versions`); `notes`
-    reads them again AFTER. An image the run was asked to build whose tag moved was
-    released; one whose tag did not move was not (its build failed, or a failed brain
-    held it back). Runs on one branch are serialized (build.yml's `concurrency`), so no
-    other run moves them in between.
+    directory is named after its image (tests/test_image_builds.py). `notes` reads the
+    newest tags AFTER the builds.
+  * WHAT CHANGED is measured against the PREVIOUS RELEASE of these notes: each one
+    carries its versions and its commit in a comment nobody sees (MARKER), and the next
+    one lists every image whose version differs from it, and the commits since it. So a
+    release whose publishing failed is not lost: the next one lists its images too.
+  * THE FIRST RELEASE IS A BASELINE (the operator, 2026-11-16): with no release before
+    it, every image is listed at its current version and digest, unchanged, and the
+    whole set is the pull list. Nothing is rebuilt for it.
+  * A FAILED BUILD: the `changes` job records the newest tags BEFORE anything builds
+    (`versions`). An image the run was asked to build whose tag did not move is listed
+    as not released, at the version it stays at. Runs on one branch are serialized
+    (build.yml's `concurrency`), so no other run moves the tags in between.
   * A BRANCH build bumps nothing: its image is tagged `<branch-slug>-<short sha>` (the
     reusable workflow's slug rule), looked up in the registry.
   * DIGESTS: ghcr.io, the manifest each tag points at, asked anonymously (the packages
     are public).
-  * COMMITS: `git log <base>..<head>` without merges, `base` being the `changes` job's
-    diff base (the last run on the branch that succeeded).
+  * COMMITS: `git log <since>..<head>` without merges, `since` being the previous
+    release's commit, else the `changes` job's diff base.
 
 Nothing here decides what is built or deployed; a lookup that fails is written as
 unknown, and the notes still name every image.
@@ -35,15 +42,18 @@ Usage (the repo root is the working directory):
       -> {"<image>": "vX.Y.Z", ...}, the newest release of each image, on stdout
   python3 scripts/release_notes.py notes --head <sha> --ref <branch> --images '<json list>' \\
       [--base <sha>] [--before '<versions json>'] [--repo owner/name] [--run-url URL] \\
-      [--notes-file PATH] [--github-output PATH] [--no-registry]
+      [--releases-url URL] [--notes-file PATH] [--github-output PATH] [--no-registry]
       -> the Markdown notes (on stdout, or in --notes-file); --github-output gets
-         `released` (how many images got a new version), `tag`, `title` and `notes`
+         `publish` (true: main, and the first release or a changed image), `released`
+         (how many images changed), `tag`, `title` and `notes`. The previous release is
+         read from --releases-url (GitHub's API; $GH_TOKEN when set).
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -182,7 +192,8 @@ class Commit:
 
 
 def _git(root: Path, *args: str) -> str:
-    return subprocess.run(["git", *args], cwd=root, capture_output=True, text=True, timeout=60, check=True).stdout
+    return subprocess.run(["git", *args], cwd=root, capture_output=True, text=True, timeout=60, check=True,
+                          env={**os.environ, "TZ": "UTC"}).stdout
 
 
 def read_commits(base: str, head: str, root: Path = REPO_ROOT) -> list[Commit]:
@@ -210,6 +221,11 @@ def commit_date(head: str, root: Path = REPO_ROOT) -> str:
     return _git(root, "log", "-1", "--date=format-local:%Y-%m-%d", "--format=%cd", head).strip()
 
 
+def is_ancestor(older: str, newer: str, root: Path = REPO_ROOT) -> bool:
+    done = subprocess.run(["git", "merge-base", "--is-ancestor", older, newer], cwd=root, capture_output=True, timeout=60)
+    return done.returncode == 0
+
+
 def commits_by_image(commits: list[Commit], images: list[image_changes.Image], root: Path = REPO_ROOT) -> dict[str, list[Commit]]:
     """{image: the commits that affect it}, by the decision's own rule, commit by commit: a
     commit that changes .github/image-builds.json is its changed rows' images only."""
@@ -220,6 +236,68 @@ def commits_by_image(commits: list[Commit], images: list[image_changes.Image], r
         for name in image_changes.affected_images(commit.files, images, root, changed_rows=rows):
             found.setdefault(name, []).append(commit)
     return found
+
+
+# --- the previous release ----------------------------------------------------------------
+
+# Each release's notes end with this comment, which GitHub does not show: the commit it
+# is the release of and every image's version then. The next release is measured from it.
+MARKER = "release-notes"
+_MARKER = re.compile(r"<!-- release-notes (?P<data>\{.*?\}) -->", re.S)
+FOUND, NONE, UNKNOWN = "found", "none", "unknown"
+
+
+@dataclass
+class Release:
+    tag: str
+    head: str
+    versions: dict[str, str]
+
+
+def marker(head: str, entries: list["Entry"]) -> str:
+    versions = {e.image: e.version for e in entries if e.version}
+    return f"<!-- {MARKER} {json.dumps({'head': head, 'versions': versions}, separators=(',', ':'))} -->"
+
+
+def read_marker(body: str | None) -> tuple[str, dict[str, str]] | None:
+    match = _MARKER.search(body or "")
+    if match is None:
+        return None
+    try:
+        data = json.loads(match["data"])
+        return str(data["head"]), {str(k): str(v) for k, v in dict(data["versions"]).items()}
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
+def releases_url(repo: str) -> str:
+    return f"https://api.github.com/repos/{repo}/releases?per_page=100"
+
+
+def previous_release(url: str, head: str, opener=urllib.request.urlopen,
+                     token: str | None = None) -> tuple[str, Release | None]:
+    """(FOUND, the newest release of these notes that is not `head`'s own), (NONE, None)
+    when the repo has none yet, or (UNKNOWN, None) when the list cannot be read. A
+    re-run of a commit's jobs finds that commit's own release first: it is skipped."""
+    try:
+        request = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json",
+                                                       "X-GitHub-Api-Version": "2022-11-28"})
+        if token:
+            request.add_header("Authorization", f"Bearer {token}")
+        with opener(request, timeout=20) as answer:
+            releases = json.load(answer)
+    except (urllib.error.URLError, OSError, ValueError):
+        return UNKNOWN, None
+    if not isinstance(releases, list):
+        return UNKNOWN, None
+    for release in releases:                    # newest first
+        if not isinstance(release, dict) or release.get("draft"):
+            continue
+        found = read_marker(release.get("body"))
+        if found is None or found[0] == head:
+            continue
+        return FOUND, Release(tag=str(release.get("tag_name", "")), head=found[0], versions=found[1])
+    return NONE, None
 
 
 # --- the plan -----------------------------------------------------------------------------
@@ -237,34 +315,55 @@ class Entry:
     commits: list[Commit] = field(default_factory=list)
 
 
+def _previous(name: str, *, release: Release | None, before: dict[str, str] | None,
+              tags: dict[str, list[str]]) -> str | None:
+    """The version an image had at the previous release, else before this run, else (no
+    record at all) the tag before its newest."""
+    if release is not None:
+        return release.versions.get(name)       # absent: an image the previous release did not have
+    if before is not None:
+        return before.get(name)
+    history = tags.get(name, [])
+    return history[-2] if len(history) > 1 else None
+
+
 def plan(*, names: list[str], built: list[str], ref: str, head: str, before: dict[str, str] | None,
-         tags: dict[str, list[str]], registry: Registry, commits: dict[str, list[Commit]]) -> list[Entry]:
-    """One Entry per image, in `names` order. `before` is None when the run-start record of
-    versions is missing: a built image then counts as released at its newest tag."""
+         tags: dict[str, list[str]], registry: Registry, commits: dict[str, list[Commit]],
+         release: Release | None = None) -> list[Entry]:
+    """One Entry per image, in `names` order.
+
+    On main an image is RELEASED when its version differs from the previous release's,
+    even one this run did not build (a release whose publishing failed is caught up). With
+    no release before (`release` None), only this run's images are compared, with the
+    record taken before the run; `before` None (no record) counts a built image released
+    at its newest tag. An image this run built whose version did not move is NOT
+    RELEASED (the build failed); every other is UNCHANGED."""
     after = newest_versions(tags, names)
     entries = []
     for name in names:
         current = after.get(name)
-        if name not in built:
-            entries.append(Entry(name, UNCHANGED, version=current, digest=registry.digest(name, current)))
-        elif ref != MAIN:
+        if ref != MAIN:
+            if name not in built:
+                entries.append(Entry(name, UNCHANGED, version=current, digest=registry.digest(name, current)))
+                continue
             tag = registry.branch_tag(name, ref, head)
             if tag:
                 entries.append(Entry(name, BRANCH, version=tag, previous=current, digest=registry.digest(name, tag),
                                      commits=commits.get(name, [])))
             else:                        # built, but not in the registry: the build failed
                 entries.append(Entry(name, NOT_RELEASED, version=current, digest=registry.digest(name, current)))
+            continue
+        if release is None and name not in built:
+            entries.append(Entry(name, UNCHANGED, version=current, digest=registry.digest(name, current)))
+            continue
+        previous = _previous(name, release=release, before=before, tags=tags)
+        if current is not None and current != previous:
+            entries.append(Entry(name, RELEASED, version=current, previous=previous,
+                                 digest=registry.digest(name, current), commits=commits.get(name, [])))
+        elif name in built:
+            entries.append(Entry(name, NOT_RELEASED, version=current, digest=registry.digest(name, current)))
         else:
-            if before is None:
-                history = tags.get(name, [])
-                previous = history[-2] if len(history) > 1 else None
-            else:
-                previous = before.get(name)
-            if current is not None and current != previous:
-                entries.append(Entry(name, RELEASED, version=current, previous=previous,
-                                     digest=registry.digest(name, current), commits=commits.get(name, [])))
-            else:
-                entries.append(Entry(name, NOT_RELEASED, version=previous, digest=registry.digest(name, previous)))
+            entries.append(Entry(name, UNCHANGED, version=current, digest=registry.digest(name, current)))
     return entries
 
 
@@ -273,11 +372,14 @@ def release_tag(date: str, head: str) -> str:
     return f"release-{date}-{head[:7]}"
 
 
-def title(entries: list[Entry], date: str) -> str:
+def title(entries: list[Entry], date: str, *, baseline: bool = False) -> str:
     released = [entry for entry in entries if entry.status == RELEASED]
+    if not released:
+        return f"Images {date}: baseline, every image at its current version" if baseline else (
+            f"Images {date}: nothing released")
     names = ", ".join(f"{entry.image} {entry.version}" for entry in released[:3])
     more = f" and {len(released) - 3} more" if len(released) > 3 else ""
-    return f"Images {date}: {names}{more}" if released else f"Images {date}: nothing released"
+    return f"Images {date}: {names}{more}"
 
 
 # --- the notes ----------------------------------------------------------------------------
@@ -298,45 +400,78 @@ def _pull_ref(owner: str, entry: Entry) -> str | None:
     return f"{ref}@{entry.digest}" if entry.digest else ref
 
 
-def _header(entries: list[Entry], *, ref: str, head: str, base: str, url: str, run_url: str | None,
-            pull_requests: list[int], before_known: bool) -> list[str]:
+@dataclass
+class Context:
+    """Where the notes stand: the branch, the commits they cover, the release before them."""
+    ref: str
+    head: str
+    since: str                            # the commits are since..head; '' = none listed
+    repo: str
+    run_url: str | None = None
+    pull_requests: list[int] = field(default_factory=list)
+    before_known: bool = True
+    release_state: str = UNKNOWN          # FOUND, NONE or UNKNOWN (always UNKNOWN on a branch)
+    release: Release | None = None
+
+    @property
+    def url(self) -> str:
+        return f"https://github.com/{self.repo}"
+
+    @property
+    def baseline(self) -> bool:
+        return self.ref == MAIN and self.release_state == NONE
+
+
+def _header(entries: list[Entry], ctx: Context) -> list[str]:
     new = sum(entry.status in (RELEASED, BRANCH) for entry in entries)
     held = sum(entry.status == NOT_RELEASED for entry in entries)
     same = sum(entry.status == UNCHANGED for entry in entries)
+    url, head = ctx.url, ctx.head
     head_link = f"[`{head[:7]}`]({url}/commit/{head})"
-    if ref == MAIN:
+    lines = []
+    if ctx.baseline:
+        lines.append("**Baseline: every image at the version it runs now.** The first release of these notes; "
+                     "each later one lists what changed since the release before it.")
+    if ctx.ref == MAIN:
         counts = f"**{new} rebuilt, {same} unchanged**" + (f", **{held} not released**" if held else "")
-        lines = [f"{counts} — {head_link} on `{MAIN}`."]
+        lines.append(f"{counts} — {head_link} on `{MAIN}`.")
     else:
-        counts = f"{new} built as `{branch_slug(ref)}-<sha>`, {same} not rebuilt" + (
+        counts = f"{new} built as `{branch_slug(ctx.ref)}-<sha>`, {same} not rebuilt" + (
             f", {held} not found in the registry" if held else "")
-        lines = [f"**Branch `{ref}`: nothing released or deployed.** {counts} — {head_link}."]
-    if base:
+        lines.append(f"**Branch `{ctx.ref}`: nothing released or deployed.** {counts} — {head_link}.")
+    since = ctx.since
+    if ctx.release is not None and since == ctx.release.head:
+        lines.append(f"The change since the previous release, [`{ctx.release.tag}`]({url}/releases/tag/{ctx.release.tag}) "
+                     f"([compare]({url}/compare/{since}...{head})).")
+    elif since:
         # The `changes` job's base: the last run on the branch that succeeded, or one of its
         # fallbacks (the push range, the branch point), so the notes do not say which.
-        lines.append(f"The change since [`{base[:7]}`]({url}/commit/{base}), the diff base the `changes` job "
-                     f"measured from ([compare]({url}/compare/{base}...{head})).")
-    else:
-        lines.append(f"No usable diff base on `{ref}`, so every image was rebuilt; no commits are listed.")
-    if pull_requests:
-        lines.append("Pull requests: " + ", ".join(f"[#{n}]({url}/pull/{n})" for n in pull_requests) + ".")
-    if run_url:
-        lines.append(f"[The run]({run_url}).")
+        lines.append(f"The change since [`{since[:7]}`]({url}/commit/{since}), the diff base the `changes` job "
+                     f"measured from ([compare]({url}/compare/{since}...{head})).")
+    elif not ctx.baseline:
+        lines.append(f"No usable diff base on `{ctx.ref}`, so every image was rebuilt; no commits are listed.")
+    if ctx.pull_requests:
+        lines.append("Pull requests: " + ", ".join(f"[#{n}]({url}/pull/{n})" for n in ctx.pull_requests) + ".")
+    if ctx.run_url:
+        lines.append(f"[The run]({ctx.run_url}).")
     lines.append("")
-    if not before_known and ref == MAIN:
+    if ctx.ref == MAIN and ctx.release_state == UNKNOWN:
+        lines += ["> The previous release could not be read: this compares with the versions before the run.", ""]
+    if not ctx.before_known and ctx.ref == MAIN and ctx.release is None:
         lines += ["> The versions before the run were not recorded: an image whose build failed shows as "
                   "released at its last version. Check the run.", ""]
     return lines
 
 
-def _rebuilt(new: list[Entry], *, ref: str, base: str, url: str) -> list[str]:
-    lines = ["## Rebuilt" if ref == MAIN else "## Built on this branch", "",
-             f"| image | {'version' if ref == MAIN else 'tag'} | {'previous' if ref == MAIN else 'main runs'} | digest |",
+def _rebuilt(new: list[Entry], ctx: Context) -> list[str]:
+    main = ctx.ref == MAIN
+    lines = ["## Rebuilt" if main else "## Built on this branch", "",
+             f"| image | {'version' if main else 'tag'} | {'previous' if main else 'main runs'} | digest |",
              "| --- | --- | --- | --- |"]
     lines += [f"| `{e.image}` | **{_code(e.version)}** | {_code(e.previous) if e.previous else 'new image'} | "
               f"{_short_digest(e.digest)} |" for e in new]
     lines.append("")
-    if not base:
+    if not ctx.since:
         return lines
     # The commits behind each image; images changed by the same commits share one list
     # (a change to a file every image loads would otherwise repeat it image after image).
@@ -347,7 +482,7 @@ def _rebuilt(new: list[Entry], *, ref: str, base: str, url: str) -> list[str]:
     for members in groups.values():
         lines.append("**" + ", ".join(f"`{e.image}`" for e in members) + "**")      # versions: the table
         if members[0].commits:
-            lines += [f"- [`{c.sha[:7]}`]({url}/commit/{c.sha}) {c.subject}" for c in members[0].commits]
+            lines += [f"- [`{c.sha[:7]}`]({ctx.url}/commit/{c.sha}) {c.subject}" for c in members[0].commits]
         else:
             lines.append("- built wide: no single commit of the range touches what it loads (the `changes` "
                          "job's log says why)")
@@ -355,17 +490,24 @@ def _rebuilt(new: list[Entry], *, ref: str, base: str, url: str) -> list[str]:
     return lines
 
 
-def render(entries: list[Entry], *, ref: str, head: str, base: str, repo: str, run_url: str | None = None,
-           pull_requests: list[int] | None = None, before_known: bool = True) -> str:
-    owner = repo.split("/", 1)[0]
-    url = f"https://github.com/{repo}"
+def _unchanged_text(ctx: Context) -> str:
+    if ctx.ref != MAIN:
+        return "Not rebuilt on this branch; main's current release."
+    if ctx.baseline:
+        return "Every image at the version it runs now: the whole set to mirror."
+    if ctx.release is not None:
+        return "Not rebuilt since the previous release."
+    return "Not rebuilt: no file these images load changed."
+
+
+def render(entries: list[Entry], ctx: Context) -> str:
+    owner = ctx.repo.split("/", 1)[0]
     new = [e for e in entries if e.status in (RELEASED, BRANCH)]
     held = [e for e in entries if e.status == NOT_RELEASED]
     same = [e for e in entries if e.status == UNCHANGED]
-    lines = _header(entries, ref=ref, head=head, base=base, url=url, run_url=run_url,
-                    pull_requests=pull_requests or [], before_known=before_known)
+    lines = _header(entries, ctx)
     if new:
-        lines += _rebuilt(new, ref=ref, base=base, url=url)
+        lines += _rebuilt(new, ctx)
     if held:
         lines += ["## Not released", "",
                   "In this run's list, but no new version: its build failed or did not run (a failed brain or "
@@ -374,20 +516,22 @@ def render(entries: list[Entry], *, ref: str, head: str, base: str, repo: str, r
         lines += [f"| `{e.image}` | {_code(e.version)} | {_short_digest(e.digest)} |" for e in held]
         lines.append("")
     if same:
-        lines += ["## Unchanged", "",
-                  "Not rebuilt: no file these images load changed." if ref == MAIN
-                  else "Not rebuilt on this branch; main's current release.", "",
+        lines += ["## Unchanged", "", _unchanged_text(ctx), "",
                   "| image | stays at | digest |", "| --- | --- | --- |"]
         lines += [f"| `{e.image}` | {_code(e.version)} | {_short_digest(e.digest)} |" for e in same]
         lines.append("")
     pull = [ref_ for e in new if (ref_ := _pull_ref(owner, e))]
-    every = [ref_ for e in entries if (ref_ := _pull_ref(owner, e))] if ref == MAIN else []
+    every = [ref_ for e in entries if (ref_ := _pull_ref(owner, e))] if ctx.ref == MAIN else []
     if pull:
-        intro = "This branch's images:" if ref != MAIN else (
+        intro = "This branch's images:" if ctx.ref != MAIN else (
             "New in this release, which rebuilt every image:" if pull == every else "New in this release:")
         lines += ["## To pull", "", intro, "", "```text", *pull, "```", ""]
     if every and every != pull:
+        if not pull:
+            lines += ["## To pull", ""]
         lines += ["Every image at this release, the unchanged ones included:", "", "```text", *every, "```", ""]
+    if ctx.ref == MAIN:
+        lines += [marker(ctx.head, entries), ""]
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -414,14 +558,25 @@ def _write_outputs(path: str, values: dict[str, str]) -> None:
                 out.write(f"{key}={value}\n")
 
 
-def _attributed(base: str, head: str, images: list[image_changes.Image]) -> tuple[dict[str, list[Commit]], list[int]]:
-    if not base:
+def _attributed(since: str, head: str, images: list[image_changes.Image]) -> tuple[dict[str, list[Commit]], list[int]]:
+    if not since:
         return {}, []
     try:
-        return commits_by_image(read_commits(base, head), images), read_pull_requests(base, head)
+        return commits_by_image(read_commits(since, head), images), read_pull_requests(since, head)
     except (subprocess.SubprocessError, OSError, RuntimeError, ValueError) as exc:
         print(f"::warning::commits not attributed: {exc}", file=sys.stderr)
         return {}, []
+
+
+def _release_before(args: argparse.Namespace) -> tuple[str, Release | None]:
+    if args.ref != MAIN:
+        return UNKNOWN, None
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN") or None
+    state, release = previous_release(args.releases_url or releases_url(args.repo), args.head, token=token)
+    if state == UNKNOWN:
+        print("::warning::the previous release is unreadable: compared with the versions before the run, "
+              "and no baseline is published", file=sys.stderr)
+    return state, release
 
 
 def _notes(args: argparse.Namespace) -> int:
@@ -437,21 +592,28 @@ def _notes(args: argparse.Namespace) -> int:
         tags = {}
     owner = args.repo.split("/", 1)[0]
     registry = NoRegistry(owner) if args.no_registry else Registry(owner)
-    commits, pull_requests = _attributed(args.base, args.head, images)
+    state, release = _release_before(args)
+    # The commits since the previous release when it is this commit's ancestor (a force
+    # push can leave it off the branch), else since the `changes` job's diff base.
+    since = release.head if release is not None and is_ancestor(release.head, args.head) else args.base
+    commits, pull_requests = _attributed(since, args.head, images)
     entries = plan(names=names, built=built, ref=args.ref, head=args.head, before=before, tags=tags,
-                   registry=registry, commits=commits)
-    notes = render(entries, ref=args.ref, head=args.head, base=args.base, repo=args.repo, run_url=args.run_url,
-                   pull_requests=pull_requests, before_known=before is not None)
+                   registry=registry, commits=commits, release=release)
+    ctx = Context(ref=args.ref, head=args.head, since=since, repo=args.repo, run_url=args.run_url,
+                  pull_requests=pull_requests, before_known=before is not None, release_state=state, release=release)
+    notes = render(entries, ctx)
     if args.notes_file:
         Path(args.notes_file).write_text(notes, encoding="utf-8")
     else:
         sys.stdout.write(notes)
+    released = sum(entry.status == RELEASED for entry in entries)
     if args.github_output:
         date = commit_date(args.head)
         _write_outputs(args.github_output, {
-            "released": str(sum(entry.status == RELEASED for entry in entries)),
+            "publish": "true" if args.ref == MAIN and (ctx.baseline or released > 0) else "false",
+            "released": str(released),
             "tag": release_tag(date, args.head),
-            "title": title(entries, date),
+            "title": title(entries, date, baseline=ctx.baseline),
             "notes": notes,
         })
     return 0
@@ -471,6 +633,7 @@ def main(argv: list[str]) -> int:
     notes.add_argument("--repo", default=DEFAULT_REPO)
     notes.add_argument("--run-url", default=None)
     notes.add_argument("--chart-repo", default=CHART_REPO)
+    notes.add_argument("--releases-url", default=None, help="the repo's releases; default GitHub's API")
     notes.add_argument("--notes-file", default=None)
     notes.add_argument("--github-output", default=None)
     notes.add_argument("--no-registry", action="store_true", help="no digests; a branch build assumed at its tag")

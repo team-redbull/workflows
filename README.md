@@ -124,11 +124,12 @@ CI (`.github/workflows/build.yml`) builds an image only when a file it loads cha
 time, one job each (`.github/image-builds.json` holds every image's build inputs), so one
 image's failure stops no other. A change that only decides how CI runs (`build.yml`, the
 scripts, their tests) rebuilds nothing, and a change to `.github/image-builds.json`
-rebuilds only the images whose row changed. Each `main` run that ships an image publishes a GitHub Release of
-this repo, `release-<date>-<short sha>` (`scripts/release_notes.py`): every image it rebuilt,
-with its new version, the one it replaces, its digest and the commits that changed it, and
-every image it did not, at the version it stays at. A branch run shows the same page as its
-run summary.
+rebuilds only the images whose row changed. Each `main` run that changes an image
+publishes a GitHub Release of this repo, `release-<date>-<short sha>`
+(`scripts/release_notes.py`): every image rebuilt since the previous release, with its new
+version, the one it replaces, its digest and the commits that changed it, and every image
+that was not, at the version it stays at. The first release is a baseline: every image at
+its current version. A branch run shows the same page as its run summary.
 
 Worker-file naming convention: the workflow (brain) worker is
 `workflow_domains/main_worker_init.py`; each activity domain's worker is

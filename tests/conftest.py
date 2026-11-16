@@ -16,18 +16,18 @@ from __future__ import annotations
 
 import os
 
-from shared.settings import (
-    ClusterUpgradeActivitySettings,
-    SegmentLifecycleActivitySettings,
-    ServerLifecycleActivitySettings,
-    ServerProvisioningActivitySettings,
-    TemporalSettings,
-    UpgradeAgentActivitySettings,
-    UpgradeGitopsActivitySettings,
-    VmLifecycleActivitySettings,
-)
+from shared.settings.cluster_lifecycle import ClusterLifecycleActivitySettings
+from shared.settings.cluster_upgrade import ClusterUpgradeActivitySettings
+from shared.settings.segment_lifecycle import SegmentLifecycleActivitySettings
+from shared.settings.server_lifecycle import ServerLifecycleActivitySettings
+from shared.settings.server_provisioning import ServerProvisioningActivitySettings
+from shared.settings.temporal import TemporalSettings
+from shared.settings.upgrade_agent import UpgradeAgentActivitySettings
+from shared.settings.upgrade_gitops import UpgradeGitopsActivitySettings
+from shared.settings.vm_lifecycle import VmLifecycleActivitySettings
 
 for _settings_class in (
+    ClusterLifecycleActivitySettings,
     ClusterUpgradeActivitySettings,
     SegmentLifecycleActivitySettings,
     ServerLifecycleActivitySettings,
@@ -44,10 +44,17 @@ os.environ.update(
         "TEMPORAL_HOST": "localhost:7233",
         "SEGMENTS_MANAGER_URL": "http://segments-manager.test",
         "SEGMENTS_MANAGER_API_TOKEN": "test-token",
-        # --- allocate-segment: values repo + DHCP policy ---
+        # --- the day1 repo (cluster-lifecycle, upgrade-gitops, vm-lifecycle) ---
         "DAY1_REPO_URL": "https://git.test/team/gitops-day1-platform-config.git",
         "DAY1_GIT_TOKEN": "test-git-token",
+        # --- provision-cluster: the DHCP policy, the day2 sigs (GitLab, one project per sig) ---
         "DHCP_EXCLUSION_OCTET_RANGES": '{"HC": [[1, 10], [241, 254]]}',
+        "DAY2_SIG_REPO_URL_TEMPLATE": "https://git.test/redbull/gitops-day2-prod/sigs/{sig}.git",
+        # --- provision-cluster: the console shortcut ---
+        "SHORTCUTS_API_URL": "https://shorts.test",
+        "SHORTCUTS_API_TOKEN": "test-shorts-token",
+        "SHORTCUT_OWNER": "redbull-workflows",
+        "CLUSTER_CONSOLE_URL_TEMPLATE": "https://console-openshift-console.apps.{cluster}.test",
         # --- add-server-to-mce: server-scan + BMC credentials ---
         # Names this worker's queue; one deployment serves one MCE.
         "MCE_CLUSTER": "ocp4-mce-test",

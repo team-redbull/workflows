@@ -221,10 +221,10 @@ def test_bulk_rejects_an_empty_batch(make_client):
 # --- allocate-segment ------------------------------------------------------
 
 _ALLOCATE = "/workflows/segment-lifecycle/allocate-segment"
-_ALLOCATE_BODY = {"cluster": "ocp4-prep-a", "values_branch": "feature/ocp4-prep-a"}
+_ALLOCATE_BODY = {"cluster": "ocp4-prep-a", "site": "site1"}
 
 
-def test_allocate_start_uses_the_deterministic_id_and_carries_the_branch(make_client):
+def test_allocate_start_uses_the_deterministic_id_and_carries_the_site(make_client):
     fake = _FakeClient(expected_queue=ALLOCATE_SEGMENT_WORKFLOW_QUEUE)
     response = make_client(fake).post(_ALLOCATE, json=_ALLOCATE_BODY)
 
@@ -233,58 +233,64 @@ def test_allocate_start_uses_the_deterministic_id_and_carries_the_branch(make_cl
     (run_args,) = fake.args
     assert isinstance(run_args, AllocateSegmentRunArgs)
     assert run_args.input.type == SegmentType.HC
-    assert run_args.input.values_branch == "feature/ocp4-prep-a"
-    # The branch survives the trip through the boundary model — what the
-    # data converter serializes is AllocateSegmentRunArgs, not the request.
+    assert run_args.input.site == "site1"
+    # The site survives the trip through the boundary model — what the data
+    # converter serializes is AllocateSegmentRunArgs, not the request.
     decoded = AllocateSegmentRunArgs.model_validate_json(run_args.model_dump_json())
-    assert decoded.input.values_branch == "feature/ocp4-prep-a"
+    assert decoded.input.site == "site1"
 
 
-def test_allocate_requires_the_values_branch(make_client):
-    """No configured fallback exists: a request without a branch would have
-    nowhere to record the allocation, so it never starts a run."""
+def test_allocate_requires_the_site(make_client):
+    """Nothing derives the site any more (the cluster file is provision-cluster's),
+    so a request without one never starts a run."""
     fake = _FakeClient(expected_queue=ALLOCATE_SEGMENT_WORKFLOW_QUEUE)
     response = make_client(fake).post(_ALLOCATE, json={"cluster": "ocp4-prep-a"})
     assert response.status_code == 422
     assert fake.started == []
 
 
-@pytest.mark.parametrize(
-    "branch", ["", "-x", "--upload-pack=touch /tmp/x", "a..b", "has space", "a~1", "x:y"]
-)
-def test_allocate_rejects_a_branch_git_could_misread(make_client, branch):
-    """The branch reaches git as an argument from an API with no auth: an
-    option-shaped or malformed value is refused before any run starts."""
+@pytest.mark.parametrize("site", ["", "Site1", "site 1", "site1/", "../site1", "site_1"])
+def test_allocate_rejects_a_site_that_is_not_a_name_token(make_client, site):
+    """The site names a day1 folder and a Segments Manager site: the convention's
+    token shape, nothing a path or a query could be smuggled in."""
     fake = _FakeClient(expected_queue=ALLOCATE_SEGMENT_WORKFLOW_QUEUE)
-    response = make_client(fake).post(
-        _ALLOCATE, json={**_ALLOCATE_BODY, "values_branch": branch}
-    )
+    response = make_client(fake).post(_ALLOCATE, json={**_ALLOCATE_BODY, "site": site})
     assert response.status_code == 422
     assert fake.started == []
 
 
+def test_allocate_refuses_the_retired_values_branch_and_says_what_replaced_it(make_client):
+    """A caller still sending the branch expects a push that will not happen:
+    refused, naming provision-cluster, never silently ignored."""
+    fake = _FakeClient(expected_queue=ALLOCATE_SEGMENT_WORKFLOW_QUEUE)
+    response = make_client(fake).post(
+        _ALLOCATE, json={**_ALLOCATE_BODY, "values_branch": "feature/ocp4-prep-a"}
+    )
+    assert response.status_code == 422
+    assert "provision-cluster" in response.text
+    assert fake.started == []
+
+
 def test_allocate_rejects_unknown_fields(make_client):
-    """A misspelt or retired field (a `site`, a `branch`) is refused rather
+    """A misspelt or retired field (a `branch`, a `cluster_name`) is refused rather
     than silently ignored."""
     response = make_client(
         _FakeClient(expected_queue=ALLOCATE_SEGMENT_WORKFLOW_QUEUE)
-    ).post(_ALLOCATE, json={**_ALLOCATE_BODY, "site": "site1"})
+    ).post(_ALLOCATE, json={**_ALLOCATE_BODY, "branch": "x"})
     assert response.status_code == 422
 
 
-def test_allocate_dedups_across_branches(make_client):
-    """The id carries cluster and type, never the branch: the Segments
-    Manager allocates per (cluster, site, type), so two branches for one
-    cluster must collide on one run rather than race for one segment."""
+def test_allocate_dedups_whatever_the_site(make_client):
+    """The id carries cluster and type, never the site: a cluster lives at one
+    site and the Segments Manager allocates per (cluster, site, type), so two
+    requests for one cluster must collide on one run — a manual run and
+    provision-cluster's child included."""
     fake = _FakeClient(expected_queue=ALLOCATE_SEGMENT_WORKFLOW_QUEUE)
     client = make_client(fake)
     assert client.post(_ALLOCATE, json=_ALLOCATE_BODY).status_code == 202
-    response = client.post(
-        _ALLOCATE, json={**_ALLOCATE_BODY, "values_branch": "feature/other"}
-    )
+    response = client.post(_ALLOCATE, json={**_ALLOCATE_BODY, "site": "site2"})
     assert response.status_code == 409
     assert fake.started == ["allocate-segment-HC-ocp4-prep-a"]
-
 
 
 # --- release-segment ---

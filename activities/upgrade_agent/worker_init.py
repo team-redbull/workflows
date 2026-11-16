@@ -21,7 +21,8 @@ from temporalio.worker import Worker
 from activities.upgrade_agent.activities import invoke_upgrade_agent
 from shared.consts import upgrade_agent_activity_queue
 from shared.logging_config import configure_logging
-from shared.settings import TemporalSettings, UpgradeAgentActivitySettings
+from shared.settings.temporal import TemporalSettings
+from shared.settings.upgrade_agent import UpgradeAgentActivitySettings
 from shared.shutdown import install_shutdown_handler
 from shared.temporal_client import connect_temporal
 

@@ -12,15 +12,11 @@ from temporalio import activity
 from shared.models.segment_lifecycle import (
     ClusterAllocationLookup,
     ClusterAllocationLookupRequest,
-    ClusterFileLocation,
-    ClusterFileLookupRequest,
-    ClusterValuesAppendRequest,
     DhcpScopeState,
     InitializeSegmentInput,
     SegmentAllocation,
     SegmentAllocationRequest,
     SegmentEntry,
-    ValuesCommitRef,
 )
 
 
@@ -54,26 +50,10 @@ async def create_segment(rules_input: InitializeSegmentInput) -> None:
 async def get_valid_sites() -> list[str]:
     """Return the Segments Manager's configured site list (GET /api/sites).
 
-    The workflow cross-checks the site DERIVED from the values-repo path
-    against this list, so a repo layout mistake fails loudly as UnknownSite
-    before anything is allocated.
-    """
-    ...
-
-
-@activity.defn
-async def locate_cluster_file(request: ClusterFileLookupRequest) -> ClusterFileLocation:
-    """Find the cluster's values file in the day1 values repo, on
-    request.values_branch.
-
-    Checks the branch exists (git ls-remote), then shallow-clones THAT branch
-    — a new cluster's file exists only on the pipeline branch that created it
-    — and requires EXACTLY ONE <clusters root>/<site>/**/<cluster>.yaml. A
-    missing branch raises ValuesBranchNotFoundError; zero files
-    ClusterFileNotFoundError; more than one AmbiguousClusterFileError; a
-    request without a branch ApplicationError type ValuesBranchMissing — all
-    deterministic and non-retryable. The site is the path segment directly
-    beneath the clusters root. Read-only, so trivially idempotent.
+    The workflow cross-checks the site it was given (provision-cluster reads
+    it from the day1 folder the cluster file goes in) against this list, so a
+    folder or spelling mismatch fails loudly as UnknownSite before anything is
+    allocated.
     """
     ...
 
@@ -103,31 +83,6 @@ async def get_segment(segment: str) -> SegmentEntry:
     Raises SegmentNotFoundError on 404 (the segment the manager just reported
     is gone — deterministic, non-retryable). Read-only, so trivially
     idempotent.
-    """
-    ...
-
-
-@activity.defn
-async def append_allocation_to_cluster_values(
-    request: ClusterValuesAppendRequest,
-) -> ValuesCommitRef:
-    """Append the marker block (vlanId + dhcp_values) to the cluster's values
-    file and push it to request.values_branch.
-
-    The commit message carries `[skip ci]`: the push lands on the day1
-    pipeline's own branch, and without the marker it would start a SECOND
-    pipeline that re-runs the allocator.
-
-    Idempotent by re-clone + allocation check: a marker block already recording
-    this vlanId on this network is a no-op success (changed=False, nothing
-    pushed) whatever else an operator has tuned inside it; a DIFFERENT
-    allocation — another vlan or network, an unreadable marker block, or an
-    unmarked dhcp_values/vlanId key — raises ClusterValuesConflictError
-    (non-retryable). A missing branch raises ValuesBranchNotFoundError and a
-    request without one ApplicationError type ValuesBranchMissing (both
-    non-retryable). A rejected push raises the retryable ValuesRepoGitError;
-    the retry starts from a fresh clone and converges. Returns the derived
-    DhcpValues either way, so the run can report what the file records.
     """
     ...
 

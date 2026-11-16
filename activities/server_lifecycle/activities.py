@@ -162,7 +162,7 @@ from shared.models.server_lifecycle import (
     ServerReservation,
     TeardownResult,
 )
-from shared.settings import ServerLifecycleActivitySettings
+from shared.settings.server_lifecycle import ServerLifecycleActivitySettings
 
 _settings = ServerLifecycleActivitySettings()
 

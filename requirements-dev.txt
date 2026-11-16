@@ -8,6 +8,7 @@
 -r activities/upgrade_agent/requirements.txt
 -r activities/upgrade_gitops/requirements.txt
 -r activities/vm_lifecycle/requirements.txt
+-r activities/cluster_lifecycle/requirements.txt
 pytest>=8,<10
 pytest-asyncio>=1,<2
 respx>=0.22,<1

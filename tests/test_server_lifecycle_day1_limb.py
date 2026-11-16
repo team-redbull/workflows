@@ -17,7 +17,7 @@ from temporalio.testing import ActivityEnvironment
 from activities.server_lifecycle import activities
 from shared.exceptions import Day1ChangeRejectedError, Day1NotConfiguredError
 from shared.models.cluster_upgrade import Day1ChangeKind, Day1ChangeRequest, Day1Cluster, Day1ClusterRequest, Day1Commit
-from shared.settings import ServerLifecycleActivitySettings
+from shared.settings.server_lifecycle import ServerLifecycleActivitySettings
 
 URL = "https://git.example/day1.git"
 PATH = "sites/site1/mces/ocp4-mce-a/hostedClusters/ocp4-alpha.yaml"

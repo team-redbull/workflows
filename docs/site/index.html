@@ -50,8 +50,8 @@
     <div class="facts">
       <div class="fact"><span class="k">Stack</span><span class="v">Python 3.12 · temporalio · pydantic · FastAPI</span></div>
       <div class="fact"><span class="k">Deployables</span><span class="v">1 brain + 1 limb per domain (+ trigger API)</span></div>
-      <div class="fact"><span class="k">Domains today</span><span class="v">segment-lifecycle &middot; server-lifecycle &middot; server-provisioning &middot; cluster-upgrade</span></div>
-      <div class="fact"><span class="k">Workflows today</span><span class="v">initialize-segment &middot; allocate-segment &middot; add-server-to-mce &middot; uninstall-server-from-hc &middot; update-nodepool &middot; provision-dell-server</span></div>
+      <div class="fact"><span class="k">Domains today</span><span class="v">cluster-lifecycle &middot; segment-lifecycle &middot; server-lifecycle &middot; server-provisioning &middot; cluster-upgrade &middot; vm-lifecycle</span></div>
+      <div class="fact"><span class="k">Workflows today</span><span class="v">provision-cluster &middot; initialize-segment &middot; allocate-segment &middot; add-server-to-mce &middot; uninstall-server-from-hc &middot; update-nodepool &middot; provision-dell-server &middot; create-vm</span></div>
     </div>
   </div>
 </header>
@@ -211,7 +211,7 @@
         <text class="hd mid" x="450" y="208">THE CONTRACT BETWEEN THEM</text>
         <rect class="box sm" x="20" y="218" width="860" height="74" rx="5"/>
         <text class="t" x="38" y="244">shared/</text>
-        <text class="s" x="38" y="264">models/ (typed state) · interfaces/ (signatures, no bodies) · consts.py · settings.py</text>
+        <text class="s" x="38" y="264">models/ (typed state) · interfaces/ (signatures, no bodies) · consts.py · settings/</text>
         <text class="s" x="38" y="282">stays featherweight on purpose — never httpx, never a cloud SDK</text>
       </svg>
     </div>
@@ -626,7 +626,7 @@
           <tr><td class="k">shared/interfaces/</td><td class="muted">Activity signatures, bodies are <code>...</code></td><td class="muted">adding or re-typing an activity</td></tr>
           <tr><td class="k">shared/consts.py</td><td class="muted">Task-queue names</td><td class="muted">adding a workflow or a domain</td></tr>
           <tr><td class="k">shared/workflow_ids.py</td><td class="muted">Deterministic workflow-id builders — one definition per scheme</td><td class="muted">adding a workflow</td></tr>
-          <tr><td class="k">shared/settings.py</td><td class="muted">Typed env config, validated at worker startup</td><td class="muted">adding a ConfigMap or Secret key</td></tr>
+          <tr><td class="k">shared/settings/&lt;limb&gt;.py</td><td class="muted">Typed env config, one module per worker, validated at worker startup</td><td class="muted">adding a ConfigMap or Secret key</td></tr>
           <tr><td class="k">shared/exceptions.py</td><td class="muted">Error classes — the ones you classify as non-retryable</td><td class="muted">a new permanent failure mode appears</td></tr>
           <tr><td class="k">workflow_domains/&lt;domain&gt;/&lt;name&gt;.py</td><td class="muted">One workflow's orchestration logic</td><td class="muted">changing what happens, or in what order</td></tr>
           <tr><td class="k">workflow_domains/main_worker_init.py</td><td class="muted">Brain entrypoint — one Worker per workflow queue, all in one process</td><td class="muted">adding a workflow</td></tr>
@@ -672,7 +672,7 @@
           <li><code>shared/models|interfaces/&lt;domain&gt;.py</code> and a domain activity queue constant.</li>
           <li><code>activities/&lt;domain&gt;/</code> with its own <code>requirements.txt</code>,
           <code>Dockerfile</code> and <code>worker_init.py</code>.</li>
-          <li>A settings group in <code>shared/settings.py</code> for its endpoints and credentials.</li>
+          <li>A settings module <code>shared/settings/&lt;limb&gt;.py</code> for its endpoints and credentials.</li>
           <li>A new <code>workflow_domains/&lt;domain&gt;/</code> folder with its workflows and a <code>router.py</code>, included in <code>api.py</code>.</li>
           <li>A build job in <code>.github/workflows/build.yml</code> and a new
           <code>gitops/charts/&lt;domain&gt;-worker/</code> chart in the redbull-platform repo for Argo CD.</li>

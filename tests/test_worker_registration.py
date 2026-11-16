@@ -32,6 +32,7 @@ _WORKERS = {
     "upgrade_agent_activity_queue": "activities/upgrade_agent/worker_init.py",
     "UPGRADE_GITOPS_ACTIVITY_QUEUE": "activities/upgrade_gitops/worker_init.py",
     "VM_LIFECYCLE_ACTIVITY_QUEUE": "activities/vm_lifecycle/worker_init.py",
+    "CLUSTER_LIFECYCLE_ACTIVITY_QUEUE": "activities/cluster_lifecycle/worker_init.py",
 }
 
 # the workflow modules that dispatch activities, and the interface module each
@@ -46,6 +47,7 @@ _WORKFLOW_MODULES = [
     "workflow_domains/server_provisioning/provision_dell_server.py",
     "workflow_domains/segment_lifecycle/release_segment.py",
     "workflow_domains/vm_lifecycle/create_vm.py",
+    "workflow_domains/cluster_lifecycle/provision_cluster.py",
 ]
 
 

@@ -322,7 +322,7 @@ class TestTheActivityNeverHoldsTheGate:
 
 class TestTheSettings:
     def test_an_optional_repo_may_be_empty_but_never_plain_http(self, monkeypatch):
-        from shared.settings import UpgradeGitopsActivitySettings
+        from shared.settings.upgrade_gitops import UpgradeGitopsActivitySettings
 
         monkeypatch.setenv("BRAIN_REPO_URL", "")
         assert UpgradeGitopsActivitySettings().brain_repo_url == ""
@@ -331,11 +331,11 @@ class TestTheSettings:
             UpgradeGitopsActivitySettings()
 
     def test_the_commits_name_the_upgrade_and_no_environment_changes_that(self):
-        from activities.segment_lifecycle import values_repo
-        from shared.settings import UpgradeGitopsActivitySettings
+        from activities.cluster_lifecycle import day1_writer
+        from shared.settings.upgrade_gitops import UpgradeGitopsActivitySettings
 
         assert git_repo.UPGRADE_AUTHOR == git_repo.GitIdentity(
             name="cluster-upgrade-workflow", email="cluster-upgrade-workflow@redbull.local"
         )
-        assert git_repo.UPGRADE_AUTHOR.name != values_repo.GIT_USER_NAME
+        assert git_repo.UPGRADE_AUTHOR.name != day1_writer.PROVISION_AUTHOR.name
         assert not {"commit_author_name", "commit_author_email"} & set(UpgradeGitopsActivitySettings.model_fields)

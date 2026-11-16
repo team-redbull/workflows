@@ -753,7 +753,16 @@ def check_shared_module(path: Path, tree: ast.Module, report: _Report) -> None:
                     f"`{node.name}` has no docstring — say whether it is deterministic "
                     "(non-retryable), transient (retried) or WORKFLOW-RAISED (§5)",
                 )
-    if parts[-1:] == ("settings.py",):
+    if parts[1:2] == ("settings",) and parts[-1] == "__init__.py":
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                report.error(
+                    path, node.lineno, "SH007",
+                    "shared/settings/__init__.py imports nothing: a re-export loads every worker's settings "
+                    "into every image, so one worker's config key rebuilds all of them (§8). Import the "
+                    "class from its own module",
+                )
+    if parts[1:2] == ("settings",):
         for node in tree.body:
             if isinstance(node, ast.ClassDef) and any(_dotted(b) == "BaseSettings" for b in node.bases):
                 config = next(
@@ -1116,18 +1125,44 @@ def check_delivery(report: _Report) -> None:
         _check_workflow_docs(module_path, domain, cls, nav, nav_text, report)
 
     env_example = REPO_ROOT / ".env.example"
-    settings_tree = _parse(REPO_ROOT / SHARED_DIR / "settings.py")
-    if env_example.exists() and settings_tree is not None:
-        documented = set(re.findall(r"^#?\s*([A-Z][A-Z0-9_]*)=", _read(env_example) or "", re.M))
-        for node in settings_tree.body:
-            if isinstance(node, ast.ClassDef) and any(_dotted(b) == "BaseSettings" for b in node.bases):
-                for item in node.body:
-                    if isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name) and item.target.id != "model_config":
-                        key = item.target.id.upper()
-                        if key not in documented:
-                            report.warning(env_example, 1, "DL004", f"`{key}` ({node.name}) is not documented in .env.example (§8)")
+    settings_classes = _settings_classes()
+    if not settings_classes:
+        report.error(
+            REPO_ROOT / SHARED_DIR / "settings", 1, "DL006",
+            "no settings class found under shared/settings/ — DL004 and DL005 would check nothing (§8)",
+        )
+    if env_example.exists():
+        for message in undocumented_settings_keys(settings_classes, _read(env_example) or ""):
+            report.warning(env_example, 1, "DL004", message)
 
     _check_charts(report)
+
+
+def _settings_classes() -> list[ast.ClassDef]:
+    """Every BaseSettings class under shared/settings/ — one module per worker (§8)."""
+    classes: list[ast.ClassDef] = []
+    for module in sorted((REPO_ROOT / SHARED_DIR / "settings").glob("*.py")):
+        tree = _parse(module)
+        if tree is None:
+            continue
+        classes += [
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef) and any(_dotted(b) == "BaseSettings" for b in node.bases)
+        ]
+    return classes
+
+
+def undocumented_settings_keys(classes: list[ast.ClassDef], env_example_text: str) -> list[str]:
+    """DL004 — every settings key is in .env.example, optional ones commented out."""
+    documented = set(re.findall(r"^#?\s*([A-Z][A-Z0-9_]*)=", env_example_text, re.M))
+    problems = []
+    for node in classes:
+        for item in node.body:
+            if isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name) and item.target.id != "model_config":
+                key = item.target.id.upper()
+                if key not in documented:
+                    problems.append(f"`{key}` ({node.name}) is not documented in .env.example (§8)")
+    return problems
 
 
 def limb_build_problems(domain: str, build_text: str) -> list[str]:
@@ -1150,7 +1185,26 @@ def limb_build_problems(domain: str, build_text: str) -> list[str]:
         problems.append(f"the {domain} limb image is named `{kebab}-worker` (§2)")
     if reusable and f"helm-values-path: gitops/charts/{kebab}-worker/values.yaml" not in build_text:
         problems.append(f"the reusable build bumps the tag into redbull-platform `gitops/charts/{kebab}-worker/values.yaml` (§1)")
+    if reusable:
+        # The job that builds this Dockerfile must be gated on THIS image's name in
+        # the `changes` job's list (scripts/image_changes.py): a job copied from
+        # another limb and left on that limb's name builds on the wrong pushes.
+        job = _job_block(build_text, reusable.start())
+        wanted = f"contains(fromJSON(needs.changes.outputs.images || '[]'), '{kebab}-worker')"
+        if wanted not in job:
+            problems.append(
+                f"the job building activities/{domain}/Dockerfile must run `if: ... {wanted}` — an image is "
+                "built when a file IT loads changed, by its own name (§9)"
+            )
     return problems
+
+
+def _job_block(build_text: str, offset: int) -> str:
+    """The text of the build.yml job containing `offset`: from its 2-space key to the next one."""
+    starts = [m.start() for m in re.finditer(r"^  [A-Za-z0-9_-]+:\s*$", build_text, re.M)]
+    begin = max((s for s in starts if s <= offset), default=0)
+    end = min((s for s in starts if s > offset), default=len(build_text))
+    return build_text[begin:end]
 
 
 def _check_workflow_docs(module_path: Path, domain: str, cls: ast.ClassDef, nav: Path, nav_text: str, report: _Report) -> None:
@@ -1186,7 +1240,7 @@ def _check_charts(report: _Report) -> None:
     the sibling path is an assumption, and that repo has its own review."""
     platform = REPO_ROOT.parent / "redbull-platform" / "gitops"
     local = REPO_ROOT / "deploy" / "charts"
-    settings_tree = _parse(REPO_ROOT / SHARED_DIR / "settings.py")
+    settings_classes = _settings_classes()
     for domain in _activity_domains():
         kebab = _kebab(domain)
         marker = REPO_ROOT / ACTIVITIES_DIR / domain / "worker_init.py"
@@ -1201,11 +1255,12 @@ def _check_charts(report: _Report) -> None:
         rendered = "".join(
             _read(p) or "" for chart in charts for p in list((chart / "templates").glob("*")) + [chart / "values.yaml"] if p.is_file()
         )
-        if settings_tree is None:
-            continue
         class_name = "".join(part.capitalize() for part in domain.split("_")) + "ActivitySettings"
-        for node in settings_tree.body:
-            if isinstance(node, ast.ClassDef) and node.name == class_name:
+        limb_classes = [node for node in settings_classes if node.name == class_name]
+        if not limb_classes:
+            report.warning(marker, 1, "DL005", f"no `{class_name}` under shared/settings/ — the {domain} limb's required keys cannot be checked against its chart (§8)")
+        for node in limb_classes:
+            if True:
                 for item in node.body:
                     # Only REQUIRED keys (no default): a field with a default runs
                     # without the chart rendering it (IDRAC_USERNAME is "root").

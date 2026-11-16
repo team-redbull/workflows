@@ -1,21 +1,22 @@
 name: Build and Push
 
-# Nine images from this one repo: the workflow "brain" (workflow_domains/Dockerfile),
-# seven activity worker "limbs" (activities/<limb>/Dockerfile) — segment-lifecycle,
-# server-lifecycle, server-provisioning and vm-lifecycle, one per domain, and
-# cluster-upgrade's three: cluster-upgrade and upgrade-agent per MCE, upgrade-gitops
-# on the hub — and the documentation site (docs/Dockerfile), which carries no code at all.
+# Ten images from this one repo: the workflow "brain" (workflow_domains/Dockerfile),
+# eight activity worker "limbs" (activities/<limb>/Dockerfile) — segment-lifecycle,
+# server-lifecycle, server-provisioning, vm-lifecycle and cluster-lifecycle, one per
+# domain, and cluster-upgrade's three: cluster-upgrade and upgrade-agent per MCE,
+# upgrade-gitops on the hub — and the documentation site (docs/Dockerfile), which
+# carries no code at all.
 
-# A commit message containing "[skip ci]" (or "[ci skip]", "[no ci]", "[skip actions]")
-# makes GitHub skip this WHOLE workflow, the `changes` job included, and the next push
-# builds only what ITS OWN range touched. So a skipped push leaves its images unbuilt
-# until a later push touches their paths, which can ship a new brain against an old
-# limb. Never quote the marker in a commit message; if it happens anyway, re-trigger by
-# pushing a change to this file, which rebuilds every image.
-#
-# The same holds for a push whose `test` job failed: re-running it builds that push's images,
-# but a later commit that only fixes tests builds nothing, because its own range touched no
-# image. Re-trigger the same way.
+# An image is built only when a file IT LOADS changed (scripts/image_changes.py follows
+# the imports from each image's entrypoint), so most pushes build one or two images.
+# That precision would make a missed build permanent: an image nobody touches again is
+# never rebuilt. So `changes` measures the change since the last push on this branch
+# whose WHOLE run succeeded, not since the previous push. A push whose `test` or image
+# job failed, and a push GitHub skipped because its commit message contained "[skip ci]"
+# (or "[ci skip]", "[no ci]", "[skip actions]"), are therefore picked up by the next
+# push, whatever that one touches. Still never quote the marker in a commit message: the
+# skipped push's images wait for that next push. To rebuild every image, push a change
+# to this file.
 
 on:
   push:
@@ -35,7 +36,7 @@ jobs:
   # Per-JOB filtering, so it cannot be `on.push.paths`: that gates the whole
   # workflow, which is the opposite of what is wanted when independent images
   # share one file. Hence a cheap job that diffs the push range and
-  # publishes a boolean per image.
+  # publishes the list of images to build.
   #
   # Plain git rather than a marketplace filter action: no third-party
   # dependency in the path that decides what reaches production, and the
@@ -45,10 +46,15 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      actions: read              # the last successful run on this branch (the diff base)
     outputs:
-      brain: ${{ steps.filter.outputs.brain }}
-      limb:  ${{ steps.filter.outputs.limb }}
-      docs:  ${{ steps.filter.outputs.docs }}
+      # A JSON list of the image names to build, e.g. ["cluster-lifecycle-worker"].
+      # One output for every image, so a new limb adds no output here: each build
+      # job asks `contains(fromJSON(needs.changes.outputs.images || '[]'), '<its own
+      # image name>')` (checker DL002). fromJSON, because `contains` on a string is
+      # a substring match; `|| '[]'`, because on a `delete` event this job is
+      # skipped and fromJSON('') is an error, not false.
+      images: ${{ steps.filter.outputs.images }}
       charts: ${{ steps.filter.outputs.charts }}
     steps:
       - uses: actions/checkout@v4
@@ -58,16 +64,32 @@ jobs:
         env:
           BEFORE: ${{ github.event.before }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
-          # Three ways to establish what this push changed, in order of
-          # precision. The fallbacks matter: the obvious "no base → build
+          # Four ways to establish what this push changed, in order of
+          # preference. The fallbacks matter: the obvious "no base → build
           # everything" rule sounds safe but fires on the FIRST push of every
           # new branch (github.event.before is all-zeros there), which turns
           # an ordinary "branch, tweak docs, push" into every image.
+          #
+          # First choice: the head of the last push on THIS branch whose whole
+          # run succeeded. Everything since then is not yet built for certain —
+          # a run that failed, a push GitHub skipped — so it all counts as this
+          # push's change (the header says why). It must still be an ancestor:
+          # after a force-push it is not, and the next rule takes over.
           all=false
-          if [ -n "${BEFORE}" ] \
+          last_good="$(gh run list --repo "${GITHUB_REPOSITORY}" --workflow build.yml \
+                         --branch "${GITHUB_REF_NAME}" --event push --status success \
+                         --limit 1 --json headSha --jq '.[0].headSha // empty' 2>/dev/null || true)"
+          if [ -n "${last_good}" ] \
+             && [ "${last_good}" != "${GITHUB_SHA}" ] \
+             && git cat-file -e "${last_good}^{commit}" 2>/dev/null \
+             && git merge-base --is-ancestor "${last_good}" "${GITHUB_SHA}"; then
+            base="${last_good}"
+            echo "base: the last successful run on ${GITHUB_REF_NAME} (${last_good})"
+          elif [ -n "${BEFORE}" ] \
              && [ "${BEFORE}" != "0000000000000000000000000000000000000000" ] \
              && git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
             base="${BEFORE}"
@@ -96,25 +118,31 @@ jobs:
             printf '%s\n' "${changed}" | sed 's/^/  /'
           fi
 
-          match() {
-            if [ "${all}" = true ]; then echo true; return; fi
-            if printf '%s\n' "${changed}" | grep -qE "$1"; then echo true; else echo false; fi
+          # Which images? scripts/image_changes.py: the files each image LOADS,
+          # followed from its entrypoint through the imports, against the changed
+          # files. Its reasons go to the log. If it cannot answer — it crashed,
+          # or there is no base — EVERY image is built: a red `changes` job would
+          # skip the whole chain, and the images it left unbuilt would be
+          # nobody's until they changed again.
+          every_image() {
+            grep -oE 'image-name: *[a-z0-9-]+' .github/workflows/build.yml | awk '{print $2}' | sort -u | jq -R . | jq -sc .
           }
+          if [ "${all}" = true ]; then
+            images="$(every_image)"
+          elif ! images="$(printf '%s\n' "${changed}" | python3 scripts/image_changes.py)"; then
+            echo "::warning::scripts/image_changes.py failed — building every image"
+            images="$(every_image)"
+          fi
 
-          # Paths mirror each Dockerfile's COPY set, NOT the folder that
-          # happens to share the image's name:
-          #   · every Python image bakes in shared/, so it triggers them all;
-          #   · EACH limb copies the WHOLE activities/ tree, not just its own
-          #     domain — which is why one `limb` flag drives all seven limb jobs;
-          #   · this file changes what gets built, so it triggers everything.
           # `charts` is no image: the per-MCE charts sync-upgrade-charts copies
           # into redbull-platform, and the script that copies them.
-          SELF='\.github/workflows/build\.yml$'
+          charts=false
+          if [ "${all}" = true ] || grep -qE '^(deploy/charts/(cluster-upgrade-worker|upgrade-agent-worker)/|scripts/sync_platform_charts\.sh$|\.github/workflows/build\.yml$)' <<<"${changed}"; then
+            charts=true
+          fi
           {
-            echo "brain=$(match "^(workflow_domains/|shared/|${SELF})")"
-            echo "limb=$(match "^(activities/|shared/|${SELF})")"
-            echo "docs=$(match "^(docs/|${SELF})")"
-            echo "charts=$(match "^(deploy/charts/(cluster-upgrade-worker|upgrade-agent-worker)/|scripts/sync_platform_charts\.sh$|${SELF})")"
+            echo "images=${images}"
+            echo "charts=${charts}"
           } | tee -a "${GITHUB_OUTPUT}"
 
   # The suite runs on EVERY push, and every image job needs it: a red test never
@@ -141,7 +169,7 @@ jobs:
     # `test` gates the whole chain: a failing suite skips this job, and the
     # `!failure()` guards behind it then skip every job that follows.
     needs: [changes, test]
-    if: ${{ needs.changes.outputs.brain == 'true' }}
+    if: ${{ contains(fromJSON(needs.changes.outputs.images || '[]'), 'workflows-orchestrator') }}
     uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
     with:
       # Named for the Argo service / Deployment it becomes, not for this repo:
@@ -169,7 +197,7 @@ jobs:
     # queued behind it — including docs. `!failure()` keeps the old behaviour in
     # the case that matters: a genuine failure upstream still stops the chain.
     needs: [changes, build-workflow-brain]
-    if: ${{ !cancelled() && !failure() && needs.changes.outputs.limb == 'true' }}
+    if: ${{ !cancelled() && !failure() && contains(fromJSON(needs.changes.outputs.images || '[]'), 'segment-lifecycle-worker') }}
     uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
     with:
       image-name: segment-lifecycle-worker
@@ -184,11 +212,11 @@ jobs:
     # the same reason that one is behind the brain: both push to the same
     # redbull-platform branch, so running them together makes them race.
     #
-    # Shares the `limb` flag with every other limb deliberately — each limb
-    # Dockerfile COPYs the whole activities/ tree, so a change under any
-    # domain really does land in every limb image.
+    # Built when a file THIS limb loads changed. Every limb Dockerfile COPYs the
+    # whole activities/ tree, so its image also carries the other limbs' files —
+    # which it never imports, so their change is not its change.
     needs: [changes, build-segment-lifecycle-worker]
-    if: ${{ !cancelled() && !failure() && needs.changes.outputs.limb == 'true' }}
+    if: ${{ !cancelled() && !failure() && contains(fromJSON(needs.changes.outputs.images || '[]'), 'server-lifecycle-worker') }}
     uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
     with:
       image-name: server-lifecycle-worker
@@ -203,7 +231,7 @@ jobs:
     # Last in the chain, so it is the job that most needed the skip guards —
     # a docs-only push skips every job ahead of it.
     needs: [changes, build-server-lifecycle-worker]
-    if: ${{ !cancelled() && !failure() && needs.changes.outputs.docs == 'true' }}
+    if: ${{ !cancelled() && !failure() && contains(fromJSON(needs.changes.outputs.images || '[]'), 'workflows-docs') }}
     uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
     with:
       # The docs site. Its own Argo service (workflows-docs) rather than a page
@@ -222,7 +250,7 @@ jobs:
     # the failing bump could not stop the docs. The chart exists now; the job could move
     # back beside the other limbs.
     needs: [changes, build-workflows-docs]
-    if: ${{ !cancelled() && !failure() && needs.changes.outputs.limb == 'true' }}
+    if: ${{ !cancelled() && !failure() && contains(fromJSON(needs.changes.outputs.images || '[]'), 'server-provisioning-worker') }}
     uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
     with:
       image-name: server-provisioning-worker
@@ -301,7 +329,7 @@ jobs:
   build-cluster-upgrade-worker:
     # The per-MCE limb (activities/cluster_upgrade/), the workflow ServiceAccount.
     needs: [changes, sync-upgrade-charts]
-    if: ${{ !cancelled() && !failure() && needs.changes.outputs.limb == 'true' }}
+    if: ${{ !cancelled() && !failure() && contains(fromJSON(needs.changes.outputs.images || '[]'), 'cluster-upgrade-worker') }}
     uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
     with:
       image-name: cluster-upgrade-worker
@@ -314,7 +342,7 @@ jobs:
   build-upgrade-agent-worker:
     # The per-MCE agent limb (activities/upgrade_agent/): calls the upgrade agent service.
     needs: [changes, build-cluster-upgrade-worker]
-    if: ${{ !cancelled() && !failure() && needs.changes.outputs.limb == 'true' }}
+    if: ${{ !cancelled() && !failure() && contains(fromJSON(needs.changes.outputs.images || '[]'), 'upgrade-agent-worker') }}
     uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
     with:
       image-name: upgrade-agent-worker
@@ -327,7 +355,7 @@ jobs:
   build-upgrade-gitops-worker:
     # The hub limb (activities/upgrade_gitops/: git, oc, the registry).
     needs: [changes, build-upgrade-agent-worker]
-    if: ${{ !cancelled() && !failure() && needs.changes.outputs.limb == 'true' }}
+    if: ${{ !cancelled() && !failure() && contains(fromJSON(needs.changes.outputs.images || '[]'), 'upgrade-gitops-worker') }}
     uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
     with:
       image-name: upgrade-gitops-worker
@@ -338,18 +366,34 @@ jobs:
     secrets: inherit
 
   build-vm-lifecycle-worker:
-    # The create-vm limb (activities/vm_lifecycle/). LAST in the chain on purpose: its chart
-    # (gitops/charts/vm-lifecycle-worker/ in redbull-platform) is not on that repo's main
-    # yet, so the image-tag bump fails until it lands, and a failure here must not stop any
-    # other image. It could move beside the other hub limbs once the chart is there.
+    # The create-vm limb (activities/vm_lifecycle/). Near the end of the chain on purpose:
+    # its chart (gitops/charts/vm-lifecycle-worker/ in redbull-platform) is not on that
+    # repo's main yet, so the image-tag bump fails until it lands, and a failure here must
+    # not stop any other image. It could move beside the other hub limbs once the chart is there.
     needs: [changes, build-upgrade-gitops-worker]
-    if: ${{ !cancelled() && !failure() && needs.changes.outputs.limb == 'true' }}
+    if: ${{ !cancelled() && !failure() && contains(fromJSON(needs.changes.outputs.images || '[]'), 'vm-lifecycle-worker') }}
     uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
     with:
       image-name: vm-lifecycle-worker
       dockerfile: activities/vm_lifecycle/Dockerfile
       chart-repo: team-redbull/redbull-platform
       helm-values-path: gitops/charts/vm-lifecycle-worker/values.yaml
+      helm-image-path: activityWorker.image
+    secrets: inherit
+
+  build-cluster-lifecycle-worker:
+    # The provision-cluster limb (activities/cluster_lifecycle/). LAST in the chain for the
+    # same reason as the vm-lifecycle one: its chart (gitops/charts/cluster-lifecycle-worker/
+    # in redbull-platform) lands on that repo's main first, and until it has, the bump fails
+    # without stopping any other image.
+    needs: [changes, build-vm-lifecycle-worker]
+    if: ${{ !cancelled() && !failure() && contains(fromJSON(needs.changes.outputs.images || '[]'), 'cluster-lifecycle-worker') }}
+    uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
+    with:
+      image-name: cluster-lifecycle-worker
+      dockerfile: activities/cluster_lifecycle/Dockerfile
+      chart-repo: team-redbull/redbull-platform
+      helm-values-path: gitops/charts/cluster-lifecycle-worker/values.yaml
       helm-image-path: activityWorker.image
     secrets: inherit
 
@@ -414,4 +458,11 @@ jobs:
     uses: team-redbull/.github/.github/workflows/ghcr-cleanup-on-delete.yml@main
     with:
       image-name: vm-lifecycle-worker
+    secrets: inherit
+
+  cleanup-cluster-lifecycle-worker-on-delete:
+    if: github.event_name == 'delete'
+    uses: team-redbull/.github/.github/workflows/ghcr-cleanup-on-delete.yml@main
+    with:
+      image-name: cluster-lifecycle-worker
     secrets: inherit

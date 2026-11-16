@@ -88,7 +88,8 @@ from activities.server_lifecycle.activities import (
 )
 from shared.consts import server_lifecycle_activity_queue
 from shared.logging_config import configure_logging
-from shared.settings import ServerLifecycleActivitySettings, TemporalSettings
+from shared.settings.server_lifecycle import ServerLifecycleActivitySettings
+from shared.settings.temporal import TemporalSettings
 from shared.shutdown import install_shutdown_handler
 from shared.temporal_client import connect_temporal
 

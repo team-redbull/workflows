@@ -44,7 +44,7 @@ from shared.models.cluster_upgrade import (
     UpgradeRules,
     UpgradeRulesRequest,
 )
-from shared.settings import UpgradeGitopsActivitySettings
+from shared.settings.upgrade_gitops import UpgradeGitopsActivitySettings
 
 _settings = UpgradeGitopsActivitySettings()
 

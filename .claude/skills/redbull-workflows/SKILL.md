@@ -139,9 +139,9 @@ Do not report a change as finished until every line holds:
 - [ ] Every activity call has `start_to_close_timeout` + an unbounded, classified `RetryPolicy`; every deterministic error is a class in `shared/exceptions.py` and named through the class.
 - [ ] Every activity is idempotent; every mutation whose outcome something else records is verified by read-back first.
 - [ ] A change to a workflow with runs in flight is patched or its drain is stated; golden replays pass without re-recording.
-- [ ] Any new setting is in `shared/settings.py`, `.env.example`, `tests/conftest.py` and the chart, which ships the key before the image that needs it.
+- [ ] Any new setting is in the limb's `shared/settings/<limb>.py`, `.env.example`, `tests/conftest.py` and the chart, which ships the key before the image that needs it.
 - [ ] A new limb has its image job in `.github/workflows/build.yml` behind the `test` job, its chart, and (hub limbs) its `gitops/services/<limb>-worker/app.yaml` in redbull-platform.
 - [ ] **Docs updated per Step 3**, in this same change.
 - [ ] CLAUDE.md updated when a decision, dependency or rule changed, with the matching `.claude/rules/` file and the checker when it is a rule.
 - [ ] Deploy order stated in the hand-off when it matters: brain before limb; chart key before image; which side of a cross-repo contract ships first.
-- [ ] Nothing CLAUDE.md records as removed came back (convert-segment, the firewall flow, the DHCP scope wait in allocate-segment, `/bulk` on add-server-to-mce, a demo mode on a UI page, a sibling `cancel()`).
+- [ ] Nothing CLAUDE.md records as removed came back (convert-segment, the firewall flow, the DHCP scope wait in allocate-segment, `/bulk` on add-server-to-mce, a demo mode on a UI page, a sibling `cancel()`, a second git provider next to GitLab).

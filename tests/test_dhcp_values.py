@@ -4,7 +4,8 @@ The one policy knob is that type's exclusion octet ranges. startRange/endRange
 are deliberately NOT emitted — dhcp_scope_manager derives .1-.253 when both are
 absent — so these tests pin what IS written: the mask-stripped network, the
 exclusions in ascending order, the empty-policy case, and the assertion that
-stops a non-/24 segment.
+stops a non-/24 segment. (The module moved to the cluster-lifecycle limb with
+the cluster file, 2026-11-11.)
 """
 
 from __future__ import annotations
@@ -12,7 +13,7 @@ from __future__ import annotations
 import pytest
 from temporalio.exceptions import ApplicationError
 
-from activities.segment_lifecycle.dhcp_values import build_dhcp_values
+from activities.cluster_lifecycle.dhcp_values import build_dhcp_values
 
 STANDARD_RANGES = [(1, 10), (241, 254)]
 
@@ -36,16 +37,12 @@ def test_no_distribution_bounds_are_emitted():
 
 
 def test_an_empty_policy_yields_a_block_with_no_exclusions():
-    # A type that excludes nothing is a legitimate configuration: the scope
-    # distributes the whole derived .1-.253.
     values = build_dhcp_values("10.20.90.0/24", [])
     assert values.network == "10.20.90.0"
     assert values.exclusions == []
 
 
 def test_a_mid_range_exclusion_is_emitted_like_any_other():
-    # A hole inside the range stays a hole — the DHCP scope holds one
-    # contiguous range with the exclusions carved out of it.
     values = build_dhcp_values("10.20.90.0/24", [(1, 10), (100, 110), (241, 254)])
     assert [(e.start_address, e.end_address) for e in values.exclusions] == [
         ("10.20.90.1", "10.20.90.10"),
@@ -55,26 +52,23 @@ def test_a_mid_range_exclusion_is_emitted_like_any_other():
 
 
 def test_exclusions_are_emitted_ascending():
-    # The DHCP API returns exclusions sorted; any other order in the values
-    # file makes Crossplane diff and PUT on every reconcile poll — and the
-    # workflow compares the two lists directly when polling for convergence.
     values = build_dhcp_values("10.20.90.0/24", [(1, 10), (100, 110), (241, 254)])
     starts = [int(e.start_address.rsplit(".", 1)[1]) for e in values.exclusions]
     assert starts == sorted(starts)
 
 
-def test_non_slash_24_is_rejected_loudly():
+@pytest.mark.parametrize("segment", ["10.20.90.0/23", "10.20.90.0/25", "10.0.0.0/8", "10.20.90.0"])  # a bare address is a /32
+def test_non_slash_24_is_rejected_loudly(segment):
     with pytest.raises(ApplicationError) as exc_info:
-        build_dhcp_values("10.20.90.0/23", STANDARD_RANGES)
+        build_dhcp_values(segment, STANDARD_RANGES)
     assert exc_info.value.type == "UnsupportedSegmentPrefix"
     assert exc_info.value.non_retryable
-    # The message names the segment and its prefix — the operator's lead.
-    assert "10.20.90.0/23" in str(exc_info.value)
-    assert "/23" in str(exc_info.value)
+    assert segment in str(exc_info.value)
 
 
-def test_host_address_is_rejected_as_invalid_cidr():
+@pytest.mark.parametrize("segment", ["10.20.90.1/24", "not-a-cidr", "", "10.20.90.0/24/x"])
+def test_anything_that_is_not_a_network_cidr_is_rejected(segment):
     with pytest.raises(ApplicationError) as exc_info:
-        build_dhcp_values("10.20.90.1/24", STANDARD_RANGES)
+        build_dhcp_values(segment, STANDARD_RANGES)
     assert exc_info.value.type == "InvalidSegmentCidr"
     assert exc_info.value.non_retryable

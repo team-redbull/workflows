@@ -181,10 +181,17 @@ def test_a_module_that_does_not_parse_is_built_wide(tmp_path):
 # --- precision: an image is built for what it loads ---------------------------------------
 
 
+# Workers that also load ANOTHER worker's settings module, because they register some
+# of its activities: the server-lifecycle worker runs cluster-upgrade's
+# read_hosted_cluster / sync_argo_application for update-nodepool (CLAUDE.md §2, §4),
+# so cluster-upgrade's settings are its settings too.
+_ALSO_LOADED_BY = {"cluster-upgrade-worker": ["server-lifecycle-worker"]}
+
+
 @pytest.mark.parametrize("limb", LIMBS)
 def test_a_workers_own_files_build_that_worker_only(limb):
     folder = limb.removesuffix("-worker").replace("-", "_")
-    assert _affected(f"shared/settings/{folder}.py") == [limb]
+    assert _affected(f"shared/settings/{folder}.py") == sorted([limb, *_ALSO_LOADED_BY.get(limb, [])])
     assert _affected(f"activities/{folder}/Dockerfile") == [limb]
     assert _affected(f"activities/{folder}/requirements.txt") == [limb]
     assert limb in _affected(f"activities/{folder}/activities.py")
@@ -197,9 +204,13 @@ def test_a_workers_own_files_build_that_worker_only(limb):
     ("activities/cluster_lifecycle/git_provider.py", ["cluster-lifecycle-worker"]),
     ("activities/vm_lifecycle/placement.py", ["vm-lifecycle-worker"]),
     ("activities/segment_lifecycle/dhcp_api.py", ["segment-lifecycle-worker"]),
-    # the shared git client: the three workers that use git
-    ("activities/git_repo.py", ["cluster-lifecycle-worker", "upgrade-gitops-worker", "vm-lifecycle-worker"]),
-    ("activities/day1_repo.py", ["cluster-lifecycle-worker", "upgrade-gitops-worker", "vm-lifecycle-worker"]),
+    # the shared git client: the four workers that use git (server-lifecycle for
+    # update-nodepool's day1 read and replicas commit, through upgrade-gitops's day1_repo)
+    ("activities/git_repo.py", ["cluster-lifecycle-worker", "server-lifecycle-worker",
+                                "upgrade-gitops-worker", "vm-lifecycle-worker"]),
+    ("activities/day1_repo.py", ["cluster-lifecycle-worker", "server-lifecycle-worker",
+                                 "upgrade-gitops-worker", "vm-lifecycle-worker"]),
+    ("activities/upgrade_gitops/day1_repo.py", ["server-lifecycle-worker", "upgrade-gitops-worker"]),
     # one limb's models: the brain (it builds the requests) and that limb
     ("shared/models/cluster_lifecycle.py", ["cluster-lifecycle-worker", "workflows-orchestrator"]),
     # an interface is the BRAIN's stub: the limb registers its implementation by

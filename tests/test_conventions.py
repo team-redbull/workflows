@@ -267,17 +267,18 @@ async def approve(workflow_id: str, client):
     assert "RT007" not in _rules(checker.run_source("workflow_domains/probe/router.py", source))
 
 
+_PROBE_ROW = {
+    "image-name": "probe-worker",
+    "dockerfile": "activities/probe/Dockerfile",
+    "chart-repo": "team-redbull/redbull-platform",
+    "helm-values-path": "gitops/charts/probe-worker/values.yaml",
+    "helm-image-path": "activityWorker.image",
+}
+
+
 def test_a_limb_image_is_version_tagged_never_built_image_only(checker):
-    reusable = """
-  build-probe-worker:
-    if: ${{ !cancelled() && !failure() && contains(fromJSON(needs.changes.outputs.images || '[]'), 'probe-worker') }}
-    uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
-    with:
-      image-name: probe-worker
-      dockerfile: activities/probe/Dockerfile
-      chart-repo: team-redbull/redbull-platform
-      helm-values-path: gitops/charts/probe-worker/values.yaml
-"""
+    """A limb is a row of .github/image-builds.json, built by the reusable workflow (vX.Y.Z on
+    main); a job building its Dockerfile straight with docker/build-push-action is refused."""
     image_only = """
   build-probe-worker:
     steps:
@@ -286,33 +287,29 @@ def test_a_limb_image_is_version_tagged_never_built_image_only(checker):
           file: activities/probe/Dockerfile
           tags: ghcr.io/${{ github.repository_owner }}/probe-worker:${{ steps.tag.outputs.tag }}
 """
-    assert checker.limb_build_problems("probe", reusable) == []
-    problems = checker.limb_build_problems("probe", image_only)
+    assert checker.limb_build_problems("probe", "", [_PROBE_ROW]) == []
+    problems = checker.limb_build_problems("probe", image_only, [])
     assert len(problems) == 1 and "image-only" in problems[0] and "vX.Y.Z" in problems[0]
-    assert "no build job" in checker.limb_build_problems("probe", "")[0]
+    missing = checker.limb_build_problems("probe", "", [])
+    assert len(missing) == 1 and "no build" in missing[0] and ".github/image-builds.json" in missing[0]
 
 
-def test_a_limb_job_is_gated_on_its_own_image_name(checker):
-    """A job copied from another limb and left on that limb's name builds on the wrong pushes."""
-    job = """
-  build-other-worker:
-    if: ${{ contains(fromJSON(needs.changes.outputs.images || '[]'), 'other-worker') }}
-    with:
-      image-name: other-worker
-      dockerfile: activities/other/Dockerfile
-      helm-values-path: gitops/charts/other-worker/values.yaml
+def test_a_limb_row_carries_its_own_image_name_and_chart(checker):
+    """A row copied from another limb and left on that limb's name or chart: the script answers
+    with THIS limb's name and finds no row, or the bump lands in the other limb's chart."""
+    copied = {**_PROBE_ROW, "image-name": "other-worker"}
+    problems = checker.limb_build_problems("probe", "", [copied])
+    assert len(problems) == 1 and "`probe-worker`" in problems[0]
+    wrong_chart = {**_PROBE_ROW, "helm-values-path": "gitops/charts/other-worker/values.yaml"}
+    problems = checker.limb_build_problems("probe", "", [wrong_chart])
+    assert len(problems) == 1 and "gitops/charts/probe-worker/values.yaml" in problems[0]
 
-  build-probe-worker:
-    if: ${{ !cancelled() && !failure() && contains(fromJSON(needs.changes.outputs.images || '[]'), 'other-worker') }}
-    uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
-    with:
-      image-name: probe-worker
-      dockerfile: activities/probe/Dockerfile
-      helm-values-path: gitops/charts/probe-worker/values.yaml
-"""
-    problems = checker.limb_build_problems("probe", job)
-    assert len(problems) == 1 and "'probe-worker'" in problems[0]
-    assert checker.limb_build_problems("other", job) == []
+
+def test_the_build_rows_must_be_readable(checker):
+    assert checker.image_builds('[{"image-name": "probe-worker"}]') == ([{"image-name": "probe-worker"}], None)
+    assert "missing" in checker.image_builds(None)[1]
+    assert "not JSON" in checker.image_builds("{")[1]
+    assert "list of rows" in checker.image_builds('{"image-name": "probe-worker"}')[1]
 
 
 def test_the_settings_package_re_exports_nothing(checker):

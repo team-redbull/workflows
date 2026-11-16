@@ -1165,9 +1165,13 @@ def _pages_for_limb(limb: str) -> list[Path]:
 
 
 def check_delivery(report: _Report) -> None:
-    """DL rules — §1/§9: Dockerfile CMDs, CI jobs, docs pages, .env.example."""
+    """DL rules — §1/§9: Dockerfile CMDs, CI builds, docs pages, .env.example."""
     build_yml = REPO_ROOT / ".github" / "workflows" / "build.yml"
     build_text = _read(build_yml) or ""
+    builds_file = REPO_ROOT / IMAGE_BUILDS
+    builds, builds_error = image_builds(_read(builds_file))
+    if build_text and builds_error:
+        report.error(builds_file, 1, "DL002", builds_error)
     brain_docker = REPO_ROOT / WORKFLOW_DOMAINS_DIR / "Dockerfile"
     if brain_docker.exists() and f"{WORKFLOW_DOMAINS_DIR}.main_worker_init" not in (_read(brain_docker) or ""):
         report.error(brain_docker, 1, "DL001", "brain Dockerfile CMD must run `workflow_domains.main_worker_init` (§1)")
@@ -1183,8 +1187,8 @@ def check_delivery(report: _Report) -> None:
             report.error(REPO_ROOT / ACTIVITIES_DIR / domain / "requirements.txt", 1, "DL001", f"activities/{domain}/ has no requirements.txt — the limb owns its dependency set (§2)")
         if not build_text:
             continue
-        for message in limb_build_problems(domain, build_text):
-            report.error(build_yml, 1, "DL002", message)
+        for message in limb_build_problems(domain, build_text, builds):
+            report.error(builds_file, 1, "DL002", message)
 
     nav = REPO_ROOT / "docs" / "site" / "assets" / "nav.js"
     nav_text = _read(nav) or ""
@@ -1232,46 +1236,52 @@ def undocumented_settings_keys(classes: list[ast.ClassDef], env_example_text: st
     return problems
 
 
-def limb_build_problems(domain: str, build_text: str) -> list[str]:
-    """DL002 for one limb, from build.yml's text: a job on the reusable workflow, so a
-    main build gets a vX.Y.Z tag and its redbull-platform bump (§9). An image-only job
-    (`docker/build-push-action` straight on the Dockerfile, tagged by commit sha) is
-    refused: the operator's rule since 2026-11-02 is version tags, never commit shas."""
+# The `build` matrix job's rows (scripts/image_changes.py --matrix): every image but the brain.
+IMAGE_BUILDS = ".github/image-builds.json"
+
+
+def image_builds(text: str | None) -> tuple[list[dict], str | None]:
+    """(the rows of .github/image-builds.json, why they cannot be read — or None)."""
+    if text is None:
+        return [], f"{IMAGE_BUILDS} is missing — the `build` job's matrix rows: every image but the brain (§9)"
+    try:
+        rows = json.loads(text)
+    except json.JSONDecodeError as exc:
+        return [], f"{IMAGE_BUILDS} is not JSON: {exc}"
+    if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+        return [], f"{IMAGE_BUILDS} must be a JSON list of rows"
+    return rows, None
+
+
+def limb_build_problems(domain: str, build_text: str, builds: list[dict]) -> list[str]:
+    """DL002 for one limb: its row in .github/image-builds.json, which the `build` matrix
+    job hands to the reusable workflow, so a main build gets a vX.Y.Z tag and its
+    redbull-platform bump (§9), and which scripts/image_changes.py --matrix picks by the
+    image's own name. An image-only job in build.yml (`docker/build-push-action` straight
+    on the Dockerfile, tagged by commit sha) is refused: the operator's rule since
+    2026-11-02 is version tags, never commit shas."""
     kebab = _kebab(domain)
-    reusable = re.search(rf"dockerfile:\s*{ACTIVITIES_DIR}/{domain}/Dockerfile\b", build_text)
+    dockerfile = f"{ACTIVITIES_DIR}/{domain}/Dockerfile"
     image_only = re.search(rf"\bfile:\s*{ACTIVITIES_DIR}/{domain}/Dockerfile\b", build_text)
-    if not (reusable or image_only):
-        return [f"no build job for activities/{domain}/Dockerfile — add `build-{kebab}-worker` (§1, §9)"]
+    rows = [row for row in builds if row.get("dockerfile") == dockerfile]
     problems = []
     if image_only:
         problems.append(
-            f"activities/{domain}/Dockerfile is built image-only (a commit-sha tag) — use the reusable "
-            f"ghcr-build-push.yml so main builds are tagged vX.Y.Z; vendor its chart in redbull-platform first (§9)"
+            f"{dockerfile} is built image-only (a commit-sha tag) — give it a row in {IMAGE_BUILDS} so the "
+            f"reusable ghcr-build-push.yml tags main builds vX.Y.Z; vendor its chart in redbull-platform first (§9)"
         )
-    if not re.search(rf"(image-name:\s*{kebab}-worker\b|/{kebab}-worker:)", build_text):
-        problems.append(f"the {domain} limb image is named `{kebab}-worker` (§2)")
-    if reusable and f"helm-values-path: gitops/charts/{kebab}-worker/values.yaml" not in build_text:
+    if not rows:
+        if not image_only:
+            problems.append(f"no build for {dockerfile} — add its row to {IMAGE_BUILDS} (§1, §9)")
+        return problems
+    row = rows[0]
+    # A row copied from another limb and left on that limb's name: the script answers
+    # with THIS limb's name, finds no row for it and fails the `changes` job.
+    if row.get("image-name") != f"{kebab}-worker":
+        problems.append(f"the {domain} limb image is named `{kebab}-worker` in its {IMAGE_BUILDS} row (§2)")
+    if row.get("helm-values-path") != f"gitops/charts/{kebab}-worker/values.yaml":
         problems.append(f"the reusable build bumps the tag into redbull-platform `gitops/charts/{kebab}-worker/values.yaml` (§1)")
-    if reusable:
-        # The job that builds this Dockerfile must be gated on THIS image's name in
-        # the `changes` job's list (scripts/image_changes.py): a job copied from
-        # another limb and left on that limb's name builds on the wrong pushes.
-        job = _job_block(build_text, reusable.start())
-        wanted = f"contains(fromJSON(needs.changes.outputs.images || '[]'), '{kebab}-worker')"
-        if wanted not in job:
-            problems.append(
-                f"the job building activities/{domain}/Dockerfile must run `if: ... {wanted}` — an image is "
-                "built when a file IT loads changed, by its own name (§9)"
-            )
     return problems
-
-
-def _job_block(build_text: str, offset: int) -> str:
-    """The text of the build.yml job containing `offset`: from its 2-space key to the next one."""
-    starts = [m.start() for m in re.finditer(r"^  [A-Za-z0-9_-]+:\s*$", build_text, re.M)]
-    begin = max((s for s in starts if s <= offset), default=0)
-    end = min((s for s in starts if s > offset), default=len(build_text))
-    return build_text[begin:end]
 
 
 def _check_workflow_docs(module_path: Path, domain: str, cls: ast.ClassDef, nav: Path, nav_text: str, report: _Report) -> None:

@@ -1395,6 +1395,27 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   (`concurrency`), because two `main` runs at once would read the same latest `<chart>/vX.Y.Z` and
   publish one version twice; a waiting run GitHub cancels loses nothing, its change is in the next
   run's range.
+- **Every `main` run that ships an image is a GitHub Release of this repo, naming every image**
+  (the operator's request, 2026-11-16: nothing said which images a merge changed, and the air-gap
+  mirrors only what it is told to). `release-notes` (`scripts/release_notes.py`) runs after the
+  builds, whatever they did, on every branch, and writes the run's summary page: each image the run
+  REBUILT with its new version, the one it replaces, its digest and the commits that changed it,
+  and each one it did NOT at the version it stays at, so the list to pull is complete. It never
+  decides again which images were built — it takes `changes`' list — and attributes each commit
+  of the range to the images that commit affects with `image_changes.affected_images`, the
+  decision's own rule. Versions are redbull-platform's `<chart>/vX.Y.Z` tags (each chart directory
+  is named after its image, `tests/test_image_builds.py`), recorded by `changes` before anything
+  builds and read again after, so a built image whose tag did not move is listed NOT RELEASED at
+  the version it stays at; digests are ghcr.io's, asked anonymously (the packages are public). On
+  `main`, `release` publishes the notes as release `release-<commit date>-<short sha>` on the built
+  commit (a re-run of failed jobs rewrites the same release) and runs none of the repo's code, so
+  the one job there with a write token executes nothing from the checkout. **Neither ever fails
+  the run** (`continue-on-error`): the diff base is the last run that SUCCEEDED, so a red notes job
+  would rebuild, and re-version, every image the run already shipped. A run that released nothing
+  publishes nothing; a branch run's page lists what it built as `<branch-slug>-<sha>`. Known gap,
+  the reusable workflow's: an image job checks out the branch's head when it STARTS (`ref:
+  github.ref_name`), not the run's commit, so an image can hold a commit pushed after its run
+  began; that commit is listed by the next run, which builds it again.
 - Assumed already running: a Temporal server and the Segments Manager (via OpenShift routes or
   localhost — no port assumptions in code).
 - Trigger via the unified API: `uvicorn workflow_domains.api:app --port 8080`, Swagger at `/docs`.

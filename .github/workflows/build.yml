@@ -13,11 +13,14 @@ name: Build and Push
 # `sync-upgrade-charts` ships the per-MCE charts before their images. Then `build` builds
 # every other changed image AT ONCE, one matrix job per image, whose rows are
 # .github/image-builds.json (the reusable workflow's inputs); one image's failure stops no
-# other. A push that does not touch the brain starts `build` straight after `test`.
+# other. A push that does not touch the brain starts `build` straight after `test`. Last,
+# `release-notes` writes what the run shipped, image by image, and on `main` `release`
+# publishes it as a GitHub Release.
 #
 #   changes ─┐
 #   test ────┴─┬─ build-workflow-brain ─┐
 #              └─ sync-upgrade-charts ──┴─ build (one job per changed image, in parallel)
+#                                                └─ release-notes ── release (main)
 
 # An image is built only when a file IT LOADS changed (scripts/image_changes.py follows
 # the imports from each image's entrypoint), so most pushes build one or two images.
@@ -80,6 +83,11 @@ jobs:
       # so `build` is skipped on ''). A new limb adds a row there, no output here.
       matrix: ${{ steps.filter.outputs.matrix }}
       charts: ${{ steps.filter.outputs.charts }}
+      # For `release-notes`: the diff base this job measured from ('' when it had none
+      # and built every image), and the newest release of every image BEFORE anything
+      # builds ('' when it could not be read).
+      base: ${{ steps.filter.outputs.base }}
+      versions: ${{ steps.versions.outputs.versions }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -134,6 +142,7 @@ jobs:
             # redundant build only costs minutes.
             echo "no usable base on ${GITHUB_REF_NAME} — building everything"
             all=true
+            base=""
             changed=""
           fi
 
@@ -177,7 +186,20 @@ jobs:
             echo "images=${images}"
             echo "matrix=${matrix}"
             echo "charts=${charts}"
+            echo "base=${base}"
           } | tee -a "${GITHUB_OUTPUT}"
+      # The version every image is at before this run builds anything: redbull-platform's
+      # newest `<chart>/vX.Y.Z` tags (public, read without a token). `release-notes` reads
+      # them again after the builds, and an image whose tag moved is what this run
+      # released. Never fails the job: unreadable, the notes say the versions before the
+      # run are unknown, and every build still runs.
+      - id: versions
+        run: |
+          if ! versions="$(python3 scripts/release_notes.py versions)"; then
+            echo "::warning::the release versions before the run are unreadable — the notes cannot tell a failed build"
+            versions=""
+          fi
+          echo "versions=${versions}" | tee -a "${GITHUB_OUTPUT}"
 
   # The suite runs on EVERY push, and every image job needs it: a red test never
   # becomes an image, and never reaches redbull-platform's main (which deploys). It
@@ -336,6 +358,81 @@ jobs:
       helm-values-path: ${{ matrix.helm-values-path }}
       helm-image-path: ${{ matrix.helm-image-path }}
     secrets: inherit
+
+  # What this run shipped, for whoever mirrors the images into the air-gap: every image
+  # it rebuilt (its new version, the one it replaces, its digest, the commits that
+  # changed it) and every image it did not (the version it stays at, with its digest).
+  # scripts/release_notes.py is handed `changes`' list and never decides a second time
+  # which images were built; it attributes each commit of the range to the images it
+  # affects with scripts/image_changes.py's own rule. Versions are redbull-platform's
+  # `<chart>/vX.Y.Z` tags, read before the builds (`changes`) and after them (here), so
+  # an image whose build failed is listed as not released, at the version it stays at.
+  # The notes are the run's summary page on every branch; `release` publishes them on
+  # `main`.
+  #
+  # It runs whatever the builds did (`!cancelled()`), and never fails the run
+  # (`continue-on-error`): `changes` measures from the last run that SUCCEEDED, so a red
+  # notes job would make the next push rebuild, and re-version, every image this run
+  # already shipped. Read-only: it holds no token that can write anything.
+  release-notes:
+    needs: [changes, test, build-workflow-brain, build]
+    if: ${{ !cancelled() && needs.changes.result == 'success' && needs.test.result == 'success' && needs.changes.outputs.images != '[]' }}
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      contents: read
+    outputs:
+      released: ${{ steps.notes.outputs.released }}
+      tag: ${{ steps.notes.outputs.tag }}
+      title: ${{ steps.notes.outputs.title }}
+      notes: ${{ steps.notes.outputs.notes }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0          # the commits since the diff base
+          persist-credentials: false
+      - id: notes
+        env:
+          IMAGES: ${{ needs.changes.outputs.images }}
+          BASE: ${{ needs.changes.outputs.base }}
+          BEFORE: ${{ needs.changes.outputs.versions }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release_notes.py notes --head "${GITHUB_SHA}" --ref "${GITHUB_REF_NAME}" \
+            --images "${IMAGES}" --base "${BASE}" --before "${BEFORE}" \
+            --repo "${GITHUB_REPOSITORY}" --run-url "${RUN_URL}" \
+            --notes-file "${RUNNER_TEMP}/notes.md" --github-output "${GITHUB_OUTPUT}"
+          cat "${RUNNER_TEMP}/notes.md" >> "${GITHUB_STEP_SUMMARY}"
+
+  # On `main`, a run that released at least one image becomes a GitHub Release of this
+  # repo: tag `release-<date>-<short sha>` on the commit the run built (the commit's own
+  # date, so the tag depends on the commit alone), the notes above as its text.
+  # Re-running the run's failed jobs therefore rewrites the same release, now with the
+  # images that shipped on the re-run. This job runs none of the repo's code: the job
+  # that does holds no write token.
+  release:
+    needs: [release-notes]
+    if: ${{ !cancelled() && github.ref_name == 'main' && needs.release-notes.outputs.released != '' && needs.release-notes.outputs.released != '0' }}
+    runs-on: ubuntu-latest
+    continue-on-error: true       # as release-notes: a red run would rebuild what shipped
+    permissions:
+      contents: write             # the tag and the release
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.release-notes.outputs.tag }}
+          TITLE: ${{ needs.release-notes.outputs.title }}
+          NOTES: ${{ needs.release-notes.outputs.notes }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "${NOTES}" > "${RUNNER_TEMP}/notes.md"
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release edit "${TAG}" --title "${TITLE}" --notes-file "${RUNNER_TEMP}/notes.md"
+          else
+            gh release create "${TAG}" --target "${GITHUB_SHA}" --title "${TITLE}" --notes-file "${RUNNER_TEMP}/notes.md"
+          fi
 
   cleanup-workflow-brain-on-delete:
     if: github.event_name == 'delete'

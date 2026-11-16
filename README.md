@@ -122,7 +122,11 @@ tag into that chart's `values.yaml`; a branch build is tagged `<branch-slug>-<sh
 CI (`.github/workflows/build.yml`) builds an image only when a file it loads changed
 (`scripts/image_changes.py`): the brain first, then every other changed image at the same
 time, one job each (`.github/image-builds.json` holds their build inputs), so one image's
-failure stops no other.
+failure stops no other. Each `main` run that ships an image publishes a GitHub Release of
+this repo, `release-<date>-<short sha>` (`scripts/release_notes.py`): every image it rebuilt,
+with its new version, the one it replaces, its digest and the commits that changed it, and
+every image it did not, at the version it stays at. A branch run shows the same page as its
+run summary.
 
 Worker-file naming convention: the workflow (brain) worker is
 `workflow_domains/main_worker_init.py`; each activity domain's worker is
@@ -1008,8 +1012,10 @@ are installed there with plain `-n redbull-workflows` (no `--create-namespace`).
 ## Deploying elsewhere (e.g. air-gapped OpenShift)
 
 In the cluster this is Argo CD's job: the charts are vendored in redbull-platform
-and pushing its `main` deploys. To install by hand, push the two worker images to
-a registry the cluster can pull from, then:
+and pushing its `main` deploys. What to mirror is in this repo's GitHub Releases: each
+lists the images it rebuilt under "To pull" and every image at that release, each as
+`ghcr.io/team-redbull/<image>:<version>@<digest>`. To install by hand, push the two
+worker images to a registry the cluster can pull from, then:
 
 ```bash
 # The brain owns workflows-orchestrator-config (the global values), so install it first.

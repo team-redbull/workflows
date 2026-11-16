@@ -34,6 +34,13 @@ Checker ids in brackets.
   new limb's chart in redbull-platform first. A new limb adds its row (its own image
   name, Dockerfile and `gitops/charts/<limb>-worker/values.yaml`) and
   `cleanup-<limb>-worker-on-delete`. [DL002]
+- **Release notes** (`release-notes`, `scripts/release_notes.py`): after the builds, on
+  every branch, never failing the run (a red run would rebuild what shipped). They take
+  `changes`' list, never a second decision, and attribute commits with
+  `image_changes.affected_images`; on `main`, `release` publishes them as the GitHub
+  Release `release-<date>-<short sha>`, from a job that runs no repo code. A new image
+  needs nothing there: the notes list every image `image_changes.py` finds, at the version
+  of its `<chart>/vX.Y.Z` tags, so its chart directory stays named after the image.
 - **Order that keeps prod up**: brain image before limbs; a chart ships a new key before
   the image needs it and drops one only after the image stopped needing it; the brain
   release installs before any hub limb.

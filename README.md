@@ -121,8 +121,10 @@ Every image built on `main` is tagged `vX.Y.Z` by the shared build workflow, whi
 tag into that chart's `values.yaml`; a branch build is tagged `<branch-slug>-<short sha>`.
 CI (`.github/workflows/build.yml`) builds an image only when a file it loads changed
 (`scripts/image_changes.py`): the brain first, then every other changed image at the same
-time, one job each (`.github/image-builds.json` holds their build inputs), so one image's
-failure stops no other. Each `main` run that ships an image publishes a GitHub Release of
+time, one job each (`.github/image-builds.json` holds every image's build inputs), so one
+image's failure stops no other. A change that only decides how CI runs (`build.yml`, the
+scripts, their tests) rebuilds nothing, and a change to `.github/image-builds.json`
+rebuilds only the images whose row changed. Each `main` run that ships an image publishes a GitHub Release of
 this repo, `release-<date>-<short sha>` (`scripts/release_notes.py`): every image it rebuilt,
 with its new version, the one it replaces, its digest and the commits that changed it, and
 every image it did not, at the version it stays at. A branch run shows the same page as its

@@ -1,55 +1,71 @@
 [
   {
+    "image-name": "workflows-orchestrator",
+    "dockerfile": "workflow_domains/Dockerfile",
+    "chart-repo": "team-redbull/redbull-platform",
+    "helm-values-path": "gitops/charts/workflows-orchestrator/values.yaml",
+    "helm-image-path": "image"
+  },
+  {
     "image-name": "cluster-lifecycle-worker",
     "dockerfile": "activities/cluster_lifecycle/Dockerfile",
+    "chart-repo": "team-redbull/redbull-platform",
     "helm-values-path": "gitops/charts/cluster-lifecycle-worker/values.yaml",
     "helm-image-path": "activityWorker.image"
   },
   {
     "image-name": "cluster-upgrade-worker",
     "dockerfile": "activities/cluster_upgrade/Dockerfile",
+    "chart-repo": "team-redbull/redbull-platform",
     "helm-values-path": "gitops/charts/cluster-upgrade-worker/values.yaml",
     "helm-image-path": "image"
   },
   {
     "image-name": "segment-lifecycle-worker",
     "dockerfile": "activities/segment_lifecycle/Dockerfile",
+    "chart-repo": "team-redbull/redbull-platform",
     "helm-values-path": "gitops/charts/segment-lifecycle-worker/values.yaml",
     "helm-image-path": "activityWorker.image"
   },
   {
     "image-name": "server-lifecycle-worker",
     "dockerfile": "activities/server_lifecycle/Dockerfile",
+    "chart-repo": "team-redbull/redbull-platform",
     "helm-values-path": "gitops/charts/server-lifecycle-worker/values.yaml",
     "helm-image-path": "activityWorker.image"
   },
   {
     "image-name": "server-provisioning-worker",
     "dockerfile": "activities/server_provisioning/Dockerfile",
+    "chart-repo": "team-redbull/redbull-platform",
     "helm-values-path": "gitops/charts/server-provisioning-worker/values.yaml",
     "helm-image-path": "activityWorker.image"
   },
   {
     "image-name": "upgrade-agent-worker",
     "dockerfile": "activities/upgrade_agent/Dockerfile",
+    "chart-repo": "team-redbull/redbull-platform",
     "helm-values-path": "gitops/charts/upgrade-agent-worker/values.yaml",
     "helm-image-path": "image"
   },
   {
     "image-name": "upgrade-gitops-worker",
     "dockerfile": "activities/upgrade_gitops/Dockerfile",
+    "chart-repo": "team-redbull/redbull-platform",
     "helm-values-path": "gitops/charts/upgrade-gitops-worker/values.yaml",
     "helm-image-path": "image"
   },
   {
     "image-name": "vm-lifecycle-worker",
     "dockerfile": "activities/vm_lifecycle/Dockerfile",
+    "chart-repo": "team-redbull/redbull-platform",
     "helm-values-path": "gitops/charts/vm-lifecycle-worker/values.yaml",
     "helm-image-path": "activityWorker.image"
   },
   {
     "image-name": "workflows-docs",
     "dockerfile": "docs/Dockerfile",
+    "chart-repo": "team-redbull/redbull-platform",
     "helm-values-path": "gitops/charts/workflows-docs/values.yaml",
     "helm-image-path": "image"
   }

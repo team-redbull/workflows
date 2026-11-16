@@ -32,8 +32,11 @@ settings class (`<Limb>ActivitySettings`) and the chart name from them.
    guard test fails until you do) and its queue to `tests/test_worker_registration.py`'s
    `_WORKERS`; activity tests per [testing.md](testing.md).
 5. **CI** — a row in `.github/image-builds.json`: `image-name: <limb>-worker`, `dockerfile:
-   activities/<limb>/Dockerfile`, `helm-values-path: gitops/charts/<limb>-worker/values.yaml`
-   and the chart's `helm-image-path` (`image`, or `activityWorker.image`). `build.yml`'s
+   activities/<limb>/Dockerfile`, `chart-repo: team-redbull/redbull-platform`,
+   `helm-values-path: gitops/charts/<limb>-worker/values.yaml` and the chart's
+   `helm-image-path` (`image`, or `activityWorker.image`). Every input of the build is in
+   the row, never in `build.yml` (a change there rebuilds no image; a changed row rebuilds
+   its own). `build.yml`'s
    `build` matrix job builds it with the reusable `ghcr-build-push.yml`, behind the `test`
    job and the brain, beside the other images, whenever `scripts/image_changes.py` lists it
    (it finds the image from its Dockerfile; `--matrix` picks the row by that name), so

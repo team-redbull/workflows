@@ -187,8 +187,8 @@ def _commit(*files: str, subject: str = "x") -> rn.Commit:
 def test_a_commit_is_attributed_by_the_decisions_own_rule():
     """affected_images() decides the builds; the same function attributes the commits."""
     one_limb = _commit("activities/vm_lifecycle/placement.py", subject="vm")
-    every = _commit(".github/workflows/build.yml", subject="ci")
-    none = _commit("README.md", subject="readme")
+    every = _commit(".dockerignore", subject="context")
+    none = _commit(".github/workflows/build.yml", "README.md", subject="ci")        # CI plumbing: no image
     found = rn.commits_by_image([one_limb, every, none], IMAGES, REPO_ROOT)
     assert found["vm-lifecycle-worker"] == [one_limb, every]
     assert all(found[name] == [every] for name in NAMES if name != "vm-lifecycle-worker")

@@ -232,6 +232,7 @@ async def approve(workflow_id: str, client):
 _PROBE_ROW = {
     "image-name": "probe-worker",
     "dockerfile": "activities/probe/Dockerfile",
+    "chart-repo": "team-redbull/redbull-platform",
     "helm-values-path": "gitops/charts/probe-worker/values.yaml",
     "helm-image-path": "activityWorker.image",
 }

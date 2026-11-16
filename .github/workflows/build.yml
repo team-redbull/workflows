@@ -8,14 +8,14 @@ name: Build and Push
 # carries no code at all.
 
 # The job graph. `changes` decides which images this push builds and `test` runs the
-# suite; nothing is built or bumped until both pass. The brain builds FIRST, on its own
-# (`build-workflow-brain`): it is deployed before any limb (CLAUDE.md §5). Beside it,
-# `sync-upgrade-charts` ships the per-MCE charts before their images. Then `build` builds
-# every other changed image AT ONCE, one matrix job per image, whose rows are
-# .github/image-builds.json (the reusable workflow's inputs); one image's failure stops no
-# other. A push that does not touch the brain starts `build` straight after `test`. Last,
-# `release-notes` writes what the run shipped, image by image, and on `main` `release`
-# publishes it as a GitHub Release.
+# suite; nothing is built or bumped until both pass. Every image is a row of
+# .github/image-builds.json, the reusable workflow's inputs for it, so this file holds
+# none. The brain's row builds FIRST, on its own (`build-workflow-brain`): it is deployed
+# before any limb (CLAUDE.md §5). Beside it, `sync-upgrade-charts` ships the per-MCE
+# charts before their images. Then `build` builds every other changed image AT ONCE, one
+# matrix job per row; one image's failure stops no other. A push that does not touch the
+# brain starts `build` straight after `test`. Last, `release-notes` writes what the run
+# shipped, image by image, and on `main` `release` publishes it as a GitHub Release.
 #
 #   changes ─┐
 #   test ────┴─┬─ build-workflow-brain ─┐
@@ -30,8 +30,13 @@ name: Build and Push
 # job failed, and a push GitHub skipped because its commit message contained "[skip ci]"
 # (or "[ci skip]", "[no ci]", "[skip actions]"), are therefore picked up by the next
 # push, whatever that one touches. Still never quote the marker in a commit message: the
-# skipped push's images wait for that next push. To rebuild every image, push a change
-# to this file.
+# skipped push's images wait for that next push.
+#
+# This file is no image's input: a change here, to scripts/image_changes.py or to the
+# notes rebuilds nothing (the operator, 2026-11-16: a CI-only change used to give every
+# image a new version with the same contents). A change to .github/image-builds.json
+# rebuilds the images whose row changed. To rebuild every image on purpose, change
+# .dockerignore, which every image's build reads.
 
 on:
   push:
@@ -73,14 +78,13 @@ jobs:
       actions: read              # the last successful run on this branch (the diff base)
     outputs:
       # A JSON list of the image names to build, e.g. ["cluster-lifecycle-worker"].
-      # The brain job asks `contains(fromJSON(needs.changes.outputs.images || '[]'),
-      # 'workflows-orchestrator')`. fromJSON, because `contains` on a string is a
-      # substring match; `|| '[]'`, because on a `delete` event this job is skipped
-      # and fromJSON('') is an error, not false.
       images: ${{ steps.filter.outputs.images }}
-      # The `build` job's matrix: the .github/image-builds.json rows of every other
-      # image in that list, or '' when there is none (GitHub refuses an empty matrix,
-      # so `build` is skipped on ''). A new limb adds a row there, no output here.
+      # The two build matrices, both that list's rows in .github/image-builds.json:
+      # `first`, the brain's row when the brain is in the list (`build-workflow-brain`),
+      # and `matrix`, every other listed image's (`build`). Each is '' when it has no
+      # row (GitHub refuses an empty matrix, so its job is skipped on ''). A new image
+      # adds a row there, no output here.
+      first: ${{ steps.filter.outputs.first }}
       matrix: ${{ steps.filter.outputs.matrix }}
       charts: ${{ steps.filter.outputs.charts }}
       # For `release-notes`: the diff base this job measured from ('' when it had none
@@ -157,23 +161,26 @@ jobs:
           # files. Its reasons go to the log. If it cannot answer — it crashed,
           # or there is no base — EVERY image is built: a red `changes` job would
           # skip every build, and the images it left unbuilt would be
-          # nobody's until they changed again. Every image is named in this file,
-          # by the brain job and by the cleanup jobs (tests/test_image_changes.py).
+          # nobody's until they changed again. Every image is a row of
+          # .github/image-builds.json (tests/test_image_changes.py). `--base` lets the
+          # script compare that file's rows with the base's: a changed row is that
+          # image's change, and nothing else in the file is anyone's.
           every_image() {
-            grep -oE 'image-name: *[a-z0-9-]+' .github/workflows/build.yml | awk '{print $2}' | sort -u | jq -R . | jq -sc .
+            jq -c '[.[]["image-name"]]' .github/image-builds.json
           }
           if [ "${all}" = true ]; then
             images="$(every_image)"
-          elif ! images="$(printf '%s\n' "${changed}" | python3 scripts/image_changes.py)"; then
+          elif ! images="$(printf '%s\n' "${changed}" | python3 scripts/image_changes.py --base "${base}")"; then
             echo "::warning::scripts/image_changes.py failed — building every image"
             images="$(every_image)"
           fi
 
-          # The `build` matrix: the same script maps those names to their rows in
-          # .github/image-builds.json, so the matrix is its answer, never a second
-          # decision here. It reads only that file, never the import graph, so it
-          # serves the every-image fallback too. It fails on a name without a row (an
-          # image nothing would build), and a red `changes` builds nothing.
+          # The two matrices: the same script maps those names to their rows in
+          # .github/image-builds.json, so they are its answer, never a second decision
+          # here. It reads only that file, never the import graph, so it serves the
+          # every-image fallback too. It fails on a name without a row (an image
+          # nothing would build), and a red `changes` builds nothing.
+          first="$(printf '%s' "${images}" | python3 scripts/image_changes.py --first)"
           matrix="$(printf '%s' "${images}" | python3 scripts/image_changes.py --matrix)"
 
           # `charts` is no image: the per-MCE charts sync-upgrade-charts copies
@@ -184,6 +191,7 @@ jobs:
           fi
           {
             echo "images=${images}"
+            echo "first=${first}"
             echo "matrix=${matrix}"
             echo "charts=${charts}"
             echo "base=${base}"
@@ -230,24 +238,27 @@ jobs:
     # A push that does not touch the brain skips this job, and `build` starts at once.
     # `test` gates it: a failing suite skips this job, and the `!failure()` guard
     # behind it then skips `build`.
+    #
+    # A one-row matrix, the brain's row of .github/image-builds.json (`--first`), so its
+    # inputs live beside every other image's and a change to them is the brain's change.
+    # The image is named for the Argo service / Deployment it becomes, not for this
+    # repo: the image, the chart directory and the running Deployment all read
+    # `workflows-orchestrator`.
+    name: build ${{ matrix.image-name }}
     needs: [changes, test]
-    if: ${{ contains(fromJSON(needs.changes.outputs.images || '[]'), 'workflows-orchestrator') }}
+    if: ${{ needs.changes.outputs.first != '' }}
     permissions:
       contents: write             # what the reusable workflow declares; it pushes to
       packages: write             # GHCR with this token, to redbull-platform with its own
+    strategy:
+      matrix: ${{ fromJSON(needs.changes.outputs.first) }}
     uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
     with:
-      # Named for the Argo service / Deployment it becomes, not for this repo:
-      # the image, the chart directory and the running Deployment all read
-      # `workflows-orchestrator`. Was plain `workflows` (the repo name), which
-      # matched nothing that runs in the cluster.
-      image-name: workflows-orchestrator
-      dockerfile: workflow_domains/Dockerfile
-      # Chart lives in the redbull-platform repo now (Argo CD). The bump + tag land
-      # there, in gitops/charts/<service>/.
-      chart-repo: team-redbull/redbull-platform
-      helm-values-path: gitops/charts/workflows-orchestrator/values.yaml
-      helm-image-path: image
+      image-name: ${{ matrix.image-name }}
+      dockerfile: ${{ matrix.dockerfile }}
+      chart-repo: ${{ matrix.chart-repo }}
+      helm-values-path: ${{ matrix.helm-values-path }}
+      helm-image-path: ${{ matrix.helm-image-path }}
     secrets: inherit
 
   # cluster-upgrade's three limbs. Their charts are in redbull-platform since 2026-11-02:
@@ -323,7 +334,7 @@ jobs:
     # Every image but the brain, one job each, side by side: the eight limbs and the
     # docs site, each a row of .github/image-builds.json (the reusable workflow's
     # inputs), and only the rows of this push's images (`changes`, from
-    # scripts/image_changes.py --matrix). Until 2026-11-16 they were ten jobs in one
+    # scripts/image_changes.py --matrix; the brain's row is `build-workflow-brain`'s). Until 2026-11-16 they were ten jobs in one
     # sequential chain, each waiting for the one before, so a run that built every
     # image took the sum of their builds and one failure skipped every job behind it.
     #
@@ -354,7 +365,7 @@ jobs:
     with:
       image-name: ${{ matrix.image-name }}
       dockerfile: ${{ matrix.dockerfile }}
-      chart-repo: team-redbull/redbull-platform
+      chart-repo: ${{ matrix.chart-repo }}
       helm-values-path: ${{ matrix.helm-values-path }}
       helm-image-path: ${{ matrix.helm-image-path }}
     secrets: inherit

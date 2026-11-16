@@ -211,10 +211,13 @@ def commit_date(head: str, root: Path = REPO_ROOT) -> str:
 
 
 def commits_by_image(commits: list[Commit], images: list[image_changes.Image], root: Path = REPO_ROOT) -> dict[str, list[Commit]]:
-    """{image: the commits that affect it}, by the decision's own rule, commit by commit."""
+    """{image: the commits that affect it}, by the decision's own rule, commit by commit: a
+    commit that changes .github/image-builds.json is its changed rows' images only."""
     found: dict[str, list[Commit]] = {}
     for commit in commits:
-        for name in image_changes.affected_images(commit.files, images, root):
+        rows = (image_changes.changed_build_rows(f"{commit.sha}^", root, head=commit.sha)
+                if image_changes.BUILDS_FILE in commit.files else None)
+        for name in image_changes.affected_images(commit.files, images, root, changed_rows=rows):
             found.setdefault(name, []).append(commit)
     return found
 

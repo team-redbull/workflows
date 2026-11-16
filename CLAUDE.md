@@ -1367,15 +1367,25 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   requirements; `tests/test_image_changes.py` imports each entrypoint in a fresh interpreter and
   checks that everything really loaded is in that set, so the script can over-build, never
   under-build. WHEN IT CANNOT TELL, IT BUILDS WIDE: a data file in a copied folder (the UI pages'
-  `index.html`), a deleted or renamed path, a module that does not parse, the script itself,
-  `build.yml`, `.dockerignore`, a crash of the script. An interface (`shared/interfaces/<limb>.py`)
+  `index.html`), a deleted or renamed path, a module that does not parse, `.dockerignore`, a crash
+  of the script. **What only decides how CI runs is NO image's input** (the operator, 2026-11-16,
+  narrowing the rule above: until then `build.yml`, the build rows and the script itself rebuilt
+  every image, so a CI-only change gave all ten a new version with the same contents, ten images
+  to mirror for nothing): `build.yml`, `image_changes.py`, `release_notes.py` and their tests
+  rebuild nothing, and `.github/image-builds.json` rebuilds the images whose ROW changed, the
+  base's rows against today's, as data (`--base`; a reformat or reorder changes no row; a base
+  from before that file is read from its `build.yml`, whose jobs then held the same inputs; rows
+  unreadable at the base build every image). That holds because every input an image's build
+  gets is in its row, `build.yml` none (`tests/test_image_builds.py`). So a fix to how the script
+  finds an image's files rebuilds nothing by itself: the image it under-built waits for its next
+  change; change `.dockerignore` to rebuild every image on purpose. An interface (`shared/interfaces/<limb>.py`)
   is loaded by the BRAIN only — the limb registers by name and never imports it. Each limb image
   still CONTAINS the whole `activities/` tree (the Dockerfile's COPY); it is not rebuilt for files
-  it never imports. The brain job asks for its OWN name in the one `images` list; every other
-  image is a row of `.github/image-builds.json` (the reusable workflow's inputs for it), and
-  `image_changes.py --matrix` hands the `build` job the rows of the listed images, so the
-  workflow never decides a second time (checker DL002: a limb's row names its own image and
-  chart). A new limb is found from its Dockerfile and adds only that row. **The diff base is the
+  it never imports. Every image is a row of `.github/image-builds.json` (the reusable workflow's
+  five inputs for it, `chart-repo` included); `image_changes.py --first` hands
+  `build-workflow-brain` the brain's row and `--matrix` hands the `build` job every other listed
+  image's, so the workflow never decides a second time (checker DL002: a limb's row names its own
+  image and chart). A new limb is found from its Dockerfile and adds only that row. **The diff base is the
   last push on the branch whose WHOLE run succeeded**, not the previous push: with per-image
   precision an image whose build failed, or whose push GitHub skipped (a CI-skip marker in the
   message), would otherwise stay stale until its own files changed again. `python3

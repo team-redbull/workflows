@@ -32,13 +32,17 @@ from activities.server_lifecycle.bmh_resources import AGENT_BMH_LABEL
 from shared.exceptions import (
     AgentBindingChangedError,
     AmbiguousServerNameError,
+    BmhResourceError,
     HostedClusterAccessError,
     HostedClusterUnreachableError,
     ServerScanAuthError,
 )
 from shared.models.server_lifecycle import (
+    UNINSTALLING_AGENT_LABEL,
     AgentMachineCleanupRequest,
     AgentMachineRef,
+    AgentMarkRequest,
+    AgentMarks,
     AgentNameRef,
     AgentReleaseRequest,
     BmhRef,
@@ -766,6 +770,77 @@ class TestInspectingLeftovers:
 
 
 AGENT_REF = AgentNameRef(namespace=NS, name="agent-1")
+
+
+class _LabellingMce(_FakeMce):
+    """Applies a merge patch's labels as the API server would, so the read-back sees them —
+    unless `ignores_labels`: a write accepted and gone again before the read."""
+
+    def __init__(self, *, ignores_labels=False, **kwargs):
+        super().__init__(**kwargs)
+        self.ignores_labels = ignores_labels
+
+    async def patch_custom_object(self, *, plural, namespace, name, body, **kwargs):
+        found = await super().patch_custom_object(
+            plural=plural, namespace=namespace, name=name, body=body, **kwargs
+        )
+        if found and not self.ignores_labels:
+            labels = self.namespaced[(plural, namespace, name)]["metadata"].setdefault("labels", {})
+            for key, value in ((body.get("metadata") or {}).get("labels") or {}).items():
+                if value is None:
+                    labels.pop(key, None)
+                else:
+                    labels[key] = value
+        return found
+
+
+class TestTheUninstallingLabel:
+    """The first write uninstall-server-from-hc makes: no NodePool excluding it takes the server again."""
+
+    def test_the_label_is_read_by_its_exact_value(self):
+        assert UNINSTALLING_AGENT_LABEL == "redbull.io/uninstalling"
+        labelled = _agent()
+        labelled["metadata"]["labels"][UNINSTALLING_AGENT_LABEL] = "true"
+        assert hosted_resources.agent_marked_uninstalling(labelled)
+        assert not hosted_resources.agent_marked_uninstalling(_agent())
+        assert not hosted_resources.agent_marked_uninstalling(None)
+        # The patch carries the label alone: the provider's and the InfraEnv's stay.
+        assert hosted_resources.agent_uninstalling_patch() == {
+            "metadata": {"labels": {UNINSTALLING_AGENT_LABEL: "true"}}
+        }
+
+    async def test_every_agent_is_labelled_and_read_back(self, mce):
+        bound = _agent(label_am="hc-01-np-am-x7k2p", bound="hc-01", state="added-to-existing-cluster")
+        fake = mce(_LabellingMce(agents=[bound, _agent("agent-2", state="known-unbound")]))
+        marks = await activities.mark_agents_uninstalling(AgentMarkRequest(
+            agents=[AGENT_REF, AgentNameRef(namespace=NS, name="agent-2")]
+        ))
+
+        assert marks == AgentMarks(changed=[f"{NS}/agent-1", f"{NS}/agent-2"])
+        assert [(p, ns, n) for p, ns, n, _ in fake.patched] == [
+            ("agents", NS, "agent-1"), ("agents", NS, "agent-2"),
+        ]
+        labels = fake.namespaced[("agents", NS, "agent-1")]["metadata"]["labels"]
+        assert labels[UNINSTALLING_AGENT_LABEL] == "true"
+        # The binding is untouched: the node runs until its Machine goes.
+        assert labels[hosted_resources.AGENT_MACHINE_REF_LABEL] == "hc-01-np-am-x7k2p"
+        assert labels[AGENT_BMH_LABEL] == BMH
+
+    async def test_a_label_already_there_and_a_gone_agent_are_both_success(self, mce):
+        labelled = _agent(state="known-unbound")
+        labelled["metadata"]["labels"][UNINSTALLING_AGENT_LABEL] = "true"
+        fake = mce(_LabellingMce(agents=[labelled]))
+        marks = await activities.mark_agents_uninstalling(AgentMarkRequest(
+            agents=[AGENT_REF, AgentNameRef(namespace=NS, name="gone")]
+        ))
+
+        assert marks == AgentMarks(unchanged=[f"{NS}/agent-1"], missing=[f"{NS}/gone"])
+        assert fake.patched == []
+
+    async def test_a_label_that_does_not_read_back_is_retried(self, mce):
+        mce(_LabellingMce(agents=[_agent(state="known-unbound")], ignores_labels=True))
+        with pytest.raises(BmhResourceError, match="did not read back"):
+            await activities.mark_agents_uninstalling(AgentMarkRequest(agents=[AGENT_REF]))
 
 
 class TestTheProvidersWrites:

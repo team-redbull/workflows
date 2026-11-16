@@ -423,7 +423,7 @@ def test_uninstall_server_from_hc_dispatches_everything_to_the_mces_own_worker()
         "ensure_machine_deleting", "get_machine_state", "get_agent_binding",
         "get_agent_machine_state", "check_hosted_node", "get_baremetal_host",
         "find_hosted_nodes", "drain_hosted_node", "delete_hosted_node", "release_agent",
-        "release_machine_hook", "clean_up_agent_machines",
+        "release_machine_hook", "clean_up_agent_machines", "mark_agents_uninstalling",
     }
 
 

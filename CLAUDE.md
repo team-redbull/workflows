@@ -509,7 +509,8 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   `NotHostedClusterNodeError` (an ORPHAN binding into a control plane is a
   leftover, next bullet), server-scan INSTALLED naming another cluster or
   INSTALLED_TO_INVENTORY while bound — an unbound Agent contradicts no
-  INSTALLED reading, a re-run's normal view) → `reserving-server` ALWAYS → the
+  INSTALLED reading, a re-run's normal view) → `reserving-server` ALWAYS →
+  `marking-agent` (the label, below) → the
   hosted half: `deleting-machine` (`ensure_machine_deleting`, the one write the
   NORMAL path makes, a no-op when it already has a deletionTimestamp or is gone) →
   `awaiting-machine-deletion` (30 s polls of Machine + Agent: `draining` while the
@@ -537,7 +538,24 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   AgentMachines the run started from (`HostAgent.labelled_agent_machine`,
   `AgentBindingState.agent_machine`, both gated on key presence) and stops with
   `AgentRetakenError`; `release_agent` refuses an Agent whose labelled
-  AgentMachine a live Machine holds (`AgentBindingChangedError`). THE LOCK even for an uninstall (holder
+  AgentMachine a live Machine holds (`AgentBindingChangedError`). So, right after
+  the lock and before any other write, the run LABELS every Agent of the server
+  `redbull.io/uninstalling: "true"` (the operator, 2026-11-12: "be sure the server is
+  out of the cluster and the inventory"; `marking-agent`, `mark_agents_uninstalling`,
+  `UNINSTALLING_AGENT_LABEL`, gated `uninstall-server-mark-agents-uninstalling`; never on
+  an old keep_inventory run, which stays a free Agent). A NodePool whose
+  agentLabelSelector carries `matchExpressions: [{key: redbull.io/uninstalling,
+  operator: DoesNotExist}]` then never takes it back — the provider applies the
+  selector only when it picks a FREE Agent (`isValidAgent` + the selector in
+  `findAgent`), so the node runs until its Machine goes. The label goes with the
+  Agent (remove-server-from-mce deletes it; a re-install is a new Agent without it),
+  a failed run leaves it for the re-run (its message names the `oc label … -`
+  that takes it off), and a NodePool WITHOUT the expression still ends in
+  `AgentRetakenError`. Approval was rejected as the mechanism: BMAC re-approves an
+  Agent on every reconcile. The NodePool half — the hostedclusters-setup chart
+  rendering that expression, per NodePool or for all — is NOT BUILT; adding it to a
+  live NodePool changes its template hash (a Replace NodePool rolls every node, an
+  InPlace one does not). THE LOCK even for an uninstall (holder
   `uninstall-server-from-hc`, TTL = two drains + unbind + three verifications + 10 min): the
   hosted cluster's nodes job frees the server on its Node's absence and the MCE's
   agents job re-claims it INSTALLED_TO_INVENTORY on its own 15-min cadence, so

@@ -1208,6 +1208,35 @@ class AgentRelease(BaseModel):
     released: bool = False
 
 
+# The label uninstall-server-from-hc puts on every Agent of the server it takes
+# out, right after its lock and before anything else is written (the operator,
+# 2026-11-12). A NodePool whose `agentLabelSelector` carries
+# `matchExpressions: [{key: redbull.io/uninstalling, operator: DoesNotExist}]`
+# then never takes that server — neither while it is still a node nor once its
+# Agent is free — so the replacement for the deleted Machine is another server.
+# It goes with the Agent, which remove-server-from-mce deletes: a re-install
+# registers a new Agent without it.
+UNINSTALLING_AGENT_LABEL = "redbull.io/uninstalling"
+UNINSTALLING_AGENT_LABEL_VALUE = "true"
+
+
+class AgentMarkRequest(BaseModel):
+    """mark_agents_uninstalling: put UNINSTALLING_AGENT_LABEL on each of these Agents."""
+
+    agents: list[AgentNameRef]
+
+
+class AgentMarks(BaseModel):
+    """What one mark_agents_uninstalling call did, each Agent as `<namespace>/<name>`.
+
+    `changed` it labelled, `unchanged` already carried the label, `missing` were gone.
+    """
+
+    changed: list[str] = Field(default_factory=list)
+    unchanged: list[str] = Field(default_factory=list)
+    missing: list[str] = Field(default_factory=list)
+
+
 class MachineHookRelease(BaseModel):
     """release_machine_hook: the provider's hook removed from a Machine whose AgentMachine is gone.
 
@@ -1327,6 +1356,10 @@ class UninstallServerFromHcResult(BaseModel):
     # that owns it could no longer make it (each with why).
     leftovers_at_start: list[str] = Field(default_factory=list)
     cleaned_up: list[str] = Field(default_factory=list)
+    # Every Agent of the server carrying UNINSTALLING_AGENT_LABEL once the run
+    # labelled them, `<namespace>/<name>` — labelled by it or already so. Empty
+    # on a run recorded before the label, and for a host with no Agent.
+    agents_marked: list[str] = Field(default_factory=list)
     reservation_expires_at: str | None = None
     # The run's own install lock was given back once remove-server-from-mce completed
     # with nothing left on the MCE and no PXE cleanup failure, so the server can

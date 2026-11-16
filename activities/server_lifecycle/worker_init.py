@@ -68,6 +68,7 @@ from activities.server_lifecycle.activities import (
     inspect_inventory_host,
     lookup_install_candidate,
     lookup_server_membership,
+    mark_agents_uninstalling,
     mark_machines_for_deletion,
     publish_infra_env_boot,
     read_day1_nodepools,
@@ -133,6 +134,7 @@ async def main() -> None:
             get_agent_machine_state,
             get_agent_binding,
             check_hosted_node,
+            mark_agents_uninstalling,
             # uninstall-server-from-hc: what a broken HyperShift deletion left behind
             find_hosted_nodes,
             drain_hosted_node,

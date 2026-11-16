@@ -546,10 +546,11 @@ state string:
   Decided with the operator 2026-10-24.
 - **An inventory host** — nothing links it to a hosted cluster; that half is
   skipped (but a stale Node in the cluster server-scan names is deleted). Its
-  Agent is free, so any NodePool may take it at any moment: right before
-  remove-server-from-mce the run inspects it again and stops, changing nothing, if an
-  AgentMachine, a Machine or a binding now links it (`AgentRetakenError` when a
-  NodePool took it, `ServerStillPresentError` otherwise).
+  Agent is free, so any NodePool not excluding the run's label (below) may take
+  it at any moment: right before remove-server-from-mce the run inspects it
+  again and stops, changing nothing but that label, if an AgentMachine, a
+  Machine or a binding now links it (`AgentRetakenError` when a NodePool took
+  it, `ServerStillPresentError` otherwise).
 
 Either way it then runs **remove-server-from-mce as an awaited child**
 (`remove-server-from-mce-<server>`): power off, BareMetalHost, NMStateConfig, the Agent
@@ -569,6 +570,20 @@ ends as it began, and its result says `kept_in_inventory: true`.
 > free Agent, the replacement takes it back: the run stops with
 > `AgentRetakenError` and writes nothing more. A Machine someone else already
 > started deleting is waited on, not deleted again.
+
+**The run labels the server's Agents `redbull.io/uninstalling: "true"`** right
+after the lock, before any other write (`marking-agent`; the operator,
+2026-11-12; `agents_marked` in the result). A NodePool whose
+`agentLabelSelector` carries
+`matchExpressions: [{key: redbull.io/uninstalling, operator: DoesNotExist}]`
+then never takes this server back — the replacement takes another free server,
+or waits for one — while the node keeps running until its Machine goes (the
+Agent provider applies the selector only when it picks a free Agent). The label
+goes with the Agent, which remove-server-from-mce deletes, so a re-install
+starts clean; a failed run leaves it for the re-run (to keep the server
+instead: `oc label agent -n <ns> <agent> redbull.io/uninstalling-`). A NodePool
+without the expression ignores it. The expression itself is the NodePool's,
+written in day1 — the hostedclusters-setup chart does not render it yet.
 
 Before anything is written it **refuses** on a contradiction: a name
 server-scan does not know (`ServerNotInServerScanError`); server-scan saying

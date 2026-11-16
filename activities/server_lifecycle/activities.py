@@ -106,6 +106,8 @@ from shared.models.server_lifecycle import (
     AgentMachineCleanupRequest,
     AgentMachineRef,
     AgentMachineState,
+    AgentMarkRequest,
+    AgentMarks,
     AgentNameRef,
     AgentRef,
     AgentRelease,
@@ -1489,6 +1491,47 @@ async def release_agent(request: AgentReleaseRequest) -> AgentRelease:
         f"released from {request.cluster_deployment}" if patched else "gone meanwhile",
     )
     return AgentRelease(found=patched, released=patched)
+
+
+@activity.defn
+async def mark_agents_uninstalling(request: AgentMarkRequest) -> AgentMarks:
+    """`redbull.io/uninstalling: "true"` on each Agent, read back."""
+    result = AgentMarks()
+    for ref in request.agents:
+        where = f"{ref.namespace}/{ref.name}"
+        agent = await _read(AGENT_GROUP, AGENT_VERSION, AGENT_PLURAL, _AGENT_KIND, ref.namespace, ref.name)
+        if agent is None:
+            result.missing.append(where)
+            continue
+        if hosted_resources.agent_marked_uninstalling(agent):
+            result.unchanged.append(where)
+            continue
+        patched = await cluster_api.patch_custom_object(
+            group=AGENT_GROUP,
+            version=AGENT_VERSION,
+            plural=AGENT_PLURAL,
+            kind=_AGENT_KIND,
+            namespace=ref.namespace,
+            name=ref.name,
+            body=hosted_resources.agent_uninstalling_patch(),
+        )
+        back = (
+            await _read(AGENT_GROUP, AGENT_VERSION, AGENT_PLURAL, _AGENT_KIND, ref.namespace, ref.name)
+            if patched
+            else None
+        )
+        if back is None:
+            result.missing.append(where)
+            continue
+        if not hosted_resources.agent_marked_uninstalling(back):
+            # Accepted but not there on the read just after: rewritten in between.
+            raise BmhResourceError(f"the uninstalling label on Agent {where} did not read back")
+        result.changed.append(where)
+    activity.logger.info(
+        "Uninstalling label: put on %s, already on %s, gone %s",
+        result.changed, result.unchanged, result.missing,
+    )
+    return result
 
 
 @activity.defn

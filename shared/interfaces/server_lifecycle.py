@@ -26,6 +26,8 @@ from shared.models.server_lifecycle import (
     AgentMachineCleanupRequest,
     AgentMachineRef,
     AgentMachineState,
+    AgentMarkRequest,
+    AgentMarks,
     AgentNameRef,
     AgentRef,
     AgentRelease,
@@ -712,6 +714,23 @@ async def release_agent(request: AgentReleaseRequest) -> AgentRelease:
     a re-read). An Agent already released is a no-op; one bound to another
     ClusterDeployment than `request.cluster_deployment` raises
     AgentBindingChangedError (non-retryable). Needs patch on agents.
+    """
+    ...
+
+
+@activity.defn
+async def mark_agents_uninstalling(request: AgentMarkRequest) -> AgentMarks:
+    """uninstall-server-from-hc: label each Agent `redbull.io/uninstalling: "true"`, read back.
+
+    Right after the lock, before anything else is written: a NodePool whose
+    agentLabelSelector excludes the label never takes the server again — the
+    Agent provider applies the selector only when it picks a free Agent, so a
+    node still bound keeps running until its Machine goes. A merge patch of the
+    labels alone; an Agent already carrying it is `unchanged`, one gone is
+    `missing` — both success, so a retry or a re-run is a no-op. A label that
+    does not read back raises the retryable BmhResourceError. Never removed:
+    the Agent and the label go together with remove-server-from-mce. Needs get
+    and patch on agents.
     """
     ...
 

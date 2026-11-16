@@ -30,6 +30,10 @@ tests/histories/uninstall_server/ (LEGACY_GOLDEN), as runs of type
 and queue: replayed by the legacy subclass, they prove such a run still
 starts the very child it recorded. The goldens recorded since, under the new
 type, are in tests/histories/uninstall_server_from_hc/.
+
+Every golden but the two `*-agent-labelled` ones was recorded before the run
+labelled the server's Agents (`uninstall-server-mark-agents-uninstalling`,
+2026-11-12), so they prove a run in flight then replays without the label.
 """
 
 from __future__ import annotations
@@ -138,6 +142,12 @@ SCENARIOS: dict[str, Callable[[], Scenario]] = {
     # ... and kept when remove-server-from-mce's PXE cleanup failed.
     "pxe-failed-hold-kept": lambda: Scenario(
         mocks={"pxe_error": PxeMapAuthError("check PXE_MAP_TOKEN")}
+    ),
+    # Since 2026-11-12: every Agent labelled redbull.io/uninstalling right after
+    # the lock, on both paths.
+    "hosted-node-agent-labelled": lambda: Scenario(),
+    "inventory-host-agent-labelled": lambda: Scenario(
+        mocks={"membership": IN_INVENTORY, "host": INVENTORY_HOST}
     ),
 }
 

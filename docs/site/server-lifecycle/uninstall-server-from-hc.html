@@ -96,6 +96,9 @@
           <li><b>Reads</b> server-scan and the MCE, and finds the server&rsquo;s Node in the hosted
             cluster. Nothing is written.</li>
           <li><b>Locks</b> the server in server-scan.</li>
+          <li><b>Labels its Agent</b> <code>redbull.io/uninstalling: "true"</code> &mdash; the node keeps
+            running, and a NodePool that excludes the label never takes this server back
+            (<a href="#label">below</a>).</li>
           <li><b>Deletes the Machine</b> &mdash; <code>DELETE machines/&lt;machine&gt;</code> in the
             control-plane namespace, the run&rsquo;s own write.</li>
           <li><b>CAPI drains the Node</b>: cordon, then evictions that respect PodDisruptionBudgets
@@ -116,10 +119,12 @@
             to it (owner, infrastructureRef or providerID <code>agent://&lt;agent&gt;</code>), no binding.
             So the hosted-cluster half is skipped and named in <code>skipped</code>.</li>
           <li><b>Locks</b> the server in server-scan.</li>
+          <li><b>Labels its Agent</b> <code>redbull.io/uninstalling: "true"</code>, so a NodePool that
+            excludes the label no longer takes it (<a href="#label">below</a>).</li>
           <li><b>Checks again</b>, fresh, right before removing it: still no AgentMachine, no Machine,
-            no binding. An Available Agent is free for any NodePool to take at any moment; if one took
-            it, the run stops (<code>AgentRetakenError</code>) and touches nothing
-            (<a href="#checked-twice">why twice</a>).</li>
+            no binding. An Available Agent is free for any NodePool without that exclusion to take at
+            any moment; if one took it, the run stops (<code>AgentRetakenError</code>) and touches
+            nothing more (<a href="#checked-twice">why twice</a>).</li>
           <li><b>remove-server-from-mce</b>, awaited:
             <ol type="a">
               <li><b>power off</b> &mdash; <code>spec.online: false</code> on the BareMetalHost, then wait
@@ -153,6 +158,7 @@
             <tr><td class="k">inspecting</td><td class="muted"><b>check 1</b> &mdash; is any AgentMachine, Machine or binding linked to the Agent? None: an inventory host</td></tr>
             <tr><td class="k">checking-hosted-node</td><td class="muted">the hosted cluster server-scan names, for a stale Node of the server</td></tr>
             <tr><td class="k">reserving-server</td><td class="muted">server-scan&rsquo;s lock &mdash; which no NodePool knows about</td></tr>
+            <tr><td class="k">marking-agent</td><td class="muted">the <code>redbull.io/uninstalling</code> label &mdash; which only a NodePool whose selector excludes it honours</td></tr>
             <tr><td class="k">verifying-agentmachine</td><td class="muted"><b>check 2</b> &mdash; still none? Read fresh, with the same links as check 1</td></tr>
             <tr><td class="k">holding-server</td><td class="muted">the lock extended to 24 h</td></tr>
             <tr><td class="k">remove-server-from-mce</td><td class="muted">refuses a bound Agent at its inspection, again right before the power-off, and again right before the Agent delete</td></tr>
@@ -162,7 +168,8 @@
       <p><b>Why the answer can change.</b> An <em>Available</em> Agent is exactly what any NodePool&rsquo;s
       new AgentMachine takes, at any moment: the Agent provider picks any approved, validated, connected,
       unbound Agent the NodePool matches (<code>findAgent</code>). The server-scan lock does not stop it
-      &mdash; the provider knows nothing about server-scan. The gap between the two looks is usually
+      &mdash; the provider knows nothing about server-scan. The run&rsquo;s label stops a NodePool whose
+      selector excludes it, but not one without that exclusion. The gap between the two looks is usually
       seconds, but the lock and the hosted-Node read both retry with no limit, so during a server-scan or
       hosted-cluster outage the first answer can be <b>hours old</b> by the time the run reaches
       remove-server-from-mce.</p>
@@ -211,14 +218,48 @@
       </div>
       <div class="panel">
         <h3>When this server is the only free Agent</h3>
-        <p>The new Machine takes <b>any</b> free Agent the NodePool matches &mdash; this server&rsquo;s
-        too, once it is released. The run then stops with <code>AgentRetakenError</code>, naming the new
-        AgentMachine, and <b>writes nothing more</b>: releasing the Agent again would pull out a node the
-        provider is installing. Free another Agent the NodePool matches, or lower its replicas with
-        update-nodepool, then re-run.</p>
+        <p>The new Machine takes <b>any</b> free Agent the NodePool&rsquo;s selector matches &mdash; this
+        server&rsquo;s too, once it is released, <b>unless the selector excludes the run&rsquo;s label</b>
+        (<a href="#label">next</a>). Without that exclusion the run then stops with
+        <code>AgentRetakenError</code>, naming the new AgentMachine, and <b>writes nothing more</b>:
+        releasing the Agent again would pull out a node the provider is installing. Free another Agent the
+        NodePool matches, or lower its replicas with update-nodepool, then re-run.</p>
         <p class="note">A Machine someone else already started deleting is not deleted again: the run
         waits for it and records the no-op in <code>skipped</code>.</p>
       </div>
+    </div>
+
+    <div class="panel" id="label" style="margin-top:18px">
+      <h3>The <code>redbull.io/uninstalling</code> label &mdash; so no NodePool takes the server back</h3>
+      <p>Right after the lock, before anything else is written, the run labels <b>every Agent</b> of the
+      server <code>redbull.io/uninstalling: "true"</code> (phase <b>marking-agent</b>; the operator,
+      2026-11-12). A NodePool whose <code>agentLabelSelector</code> excludes the label never picks this
+      server for the replacement of the Machine the run deletes &mdash; neither while it unbinds nor once
+      it is back in discovery &mdash; so the replacement takes <b>another</b> free server, or waits for
+      one, and the uninstall finishes.</p>
+<pre>platform:
+  type: Agent
+  agent:
+    agentLabelSelector:
+      matchLabels:
+        infraenvs.agent-install.openshift.io: cisco-m6-bat-yam-64c-512gb
+      matchExpressions:
+        - key: redbull.io/uninstalling
+          operator: DoesNotExist</pre>
+      <ul>
+        <li><b>The node keeps running until its Machine goes.</b> The Agent provider applies the selector
+          only when it picks a <em>free</em> Agent for a new AgentMachine; it never re-checks a bound one.</li>
+        <li><b>Gone with the Agent.</b> remove-server-from-mce deletes the Agent, so the label goes too; a
+          re-install registers a new Agent without it, which any NodePool may take.</li>
+        <li><b>A NodePool without the exclusion ignores it</b> &mdash; there, a retake still ends in
+          <code>AgentRetakenError</code> (<a href="#cases">above</a>). The exclusion is the NodePool&rsquo;s
+          own, written in day1; this run never changes a NodePool.</li>
+        <li><b>A failed run leaves it</b> &mdash; a re-run resumes with it. To leave the server to its
+          cluster instead, take it off: <code>oc label agent -n &lt;namespace&gt; &lt;agent&gt;
+          redbull.io/uninstalling-</code> (the failure message names each command).</li>
+        <li><b>Not on a run started before 2026-11-12</b>, nor on an old run kept in the inventory
+          (<code>keep_inventory</code>, <a href="#keep-inventory">above</a>), which stays a free Agent.</li>
+      </ul>
     </div>
   </section>
 
@@ -417,6 +458,14 @@
           nothing changed. The common case is <b>add-server-to-mce&rsquo;s hold</b> after it installed the
           machine: since 2026-11-09 its run gives it back once server-scan shows the machine installed
           (usually 15&ndash;30 min, at most a day). Wait for that, or release it in server-scan, then re-run.</p>
+          <p><b>mark_agents_uninstalling</b>, phase <b>marking-agent</b> &mdash; the first write: every
+          Agent the inspection found gets <code>redbull.io/uninstalling: "true"</code>, a merge patch of
+          that label alone, read back (<a href="#label">why</a>). An Agent already carrying it, or gone, is
+          success; the labelled ones are in the result&rsquo;s <code>agents_marked</code>. A host with no
+          Agent has nothing to label (named in <code>skipped</code>).</p>
+          <div class="calls">
+            <div class="call sm"><span class="verb">PATCH</span><span class="path">agents/&lt;agent&gt; &nbsp;metadata.labels</span></div>
+          </div>
         </div>
       </div>
 
@@ -432,7 +481,7 @@
           <b>verifying-agentmachine</b> inspects it again, fresh, with the same links as step 2 &mdash; an
           Agent now bound or held by an AgentMachine fails <code>AgentRetakenError</code>, any other
           AgentMachine, Machine or control-plane link <code>ServerStillPresentError</code>, with nothing on
-          the MCE written (<a href="#checked-twice">why twice</a>).</p>
+          the MCE written but the label (<a href="#checked-twice">why twice</a>).</p>
           <p><b>draining-node</b> &mdash; only for a Node <b>no Machine stands behind</b>, which nothing else
           will drain: cordon it, then evict every Pod CAPI&rsquo;s drain would (all but DaemonSet and mirror
           Pods) through the Eviction API, pass after pass every 30 s. <b>20 minutes</b>, else
@@ -609,13 +658,13 @@
       <table>
         <thead><tr><th>error</th><th>when</th></tr></thead>
         <tbody>
-          <tr><td class="k">NodeDrainTimeoutError</td><td class="muted">A Node no Machine stands behind did not drain in 20 min. Names the Pods left and why their evictions were refused &mdash; a PodDisruptionBudget, typically. The Node stays cordoned (<code>oc adm uncordon</code> undoes it); nothing else was changed.</td></tr>
+          <tr><td class="k">NodeDrainTimeoutError</td><td class="muted">A Node no Machine stands behind did not drain in 20 min. Names the Pods left and why their evictions were refused &mdash; a PodDisruptionBudget, typically. The Node stays cordoned (<code>oc adm uncordon</code> undoes it); nothing else was changed but the Agent&rsquo;s label.</td></tr>
           <tr><td class="k">MachineDrainTimeoutError</td><td class="muted">Still draining 20 min after the Machine was first seen deleting. Names the Machine&rsquo;s deletion conditions and every pending <code>pre-drain.delete.hook.*</code> / <code>pre-terminate.delete.hook.*</code> annotation &mdash; usually a PodDisruptionBudget or a hook nobody releases.</td></tr>
-          <tr><td class="k">AgentRetakenError</td><td class="muted">Another AgentMachine took the Agent while the run was taking it out &mdash; the NodePool replaced the deleted Machine with this same server, the only free Agent it matches; or, for an <b>inventory host</b>, a NodePool took its free Agent between the inspection and the removal. Nothing further was written. Free another matching Agent (or lower the replicas), then re-run: it deletes the replacement Machine and the NodePool takes the other Agent.</td></tr>
+          <tr><td class="k">AgentRetakenError</td><td class="muted">Another AgentMachine took the Agent while the run was taking it out &mdash; the NodePool replaced the deleted Machine with this same server, the only free Agent it matches; or, for an <b>inventory host</b>, a NodePool took its free Agent between the inspection and the removal. Only a NodePool whose selector does <b>not</b> exclude <a href="#label"><code>redbull.io/uninstalling</code></a> can. Nothing further was written. Free another matching Agent (or lower the replicas), then re-run: it deletes the replacement Machine and the NodePool takes the other Agent. To leave the server to that cluster instead, take the label off (the message names the command).</td></tr>
           <tr><td class="k">AgentBindingChangedError</td><td class="muted">The run went to make the provider&rsquo;s unbind and found the Agent bound to another cluster, or held by an AgentMachine a live Machine still owns &mdash; the provider releases that one itself. Nothing was changed.</td></tr>
           <tr><td class="k">AgentUnbindTimeoutError</td><td class="muted">The released Agent did not reach <code>known-unbound</code> within an hour; names its last state (or that it is gone).</td></tr>
           <tr><td class="k">MachineDeletionTimeoutError</td><td class="muted">The Agent is free, but the Machine is still there an hour on &mdash; another pre-terminate hook, or a Node deletion CAPI cannot finish.</td></tr>
-          <tr><td class="k">ServerStillPresentError</td><td class="muted">An AgentMachine still names the Agent 5 min after its release (names its finalizers), or a Machine is still linked to it &mdash; a NodePool&rsquo;s replacement Machine may have taken the host again. For an <b>inventory host</b>: the last look before remove-server-from-mce found an AgentMachine, Machine or control-plane link the first one did not; nothing on the MCE was changed.</td></tr>
+          <tr><td class="k">ServerStillPresentError</td><td class="muted">An AgentMachine still names the Agent 5 min after its release (names its finalizers), or a Machine is still linked to it &mdash; a NodePool&rsquo;s replacement Machine may have taken the host again. For an <b>inventory host</b>: the last look before remove-server-from-mce found an AgentMachine, Machine or control-plane link the first one did not; nothing on the MCE was changed but the label.</td></tr>
           <tr><td class="k">HostedNodeStillPresentError</td><td class="muted">A Node that is the server is still <b>Ready</b> 5 min after the host left it &mdash; something still runs as it. A NotReady one is deleted instead. remove-server-from-mce is not started.</td></tr>
           <tr><td class="k">AgentStillBoundError</td><td class="muted">After the Machine went, the Agent is not a clean inventory host within 5 min; names every unmet condition. remove-server-from-mce is not started.</td></tr>
           <tr><td class="k">RemoveServerFromMceAlreadyRunningError</td><td class="muted"><code>remove-server-from-mce-&lt;server&gt;</code> is already running (started on its own route). Let it finish, then re-run.</td></tr>
@@ -840,6 +889,7 @@
     "skipped": [],
     "leftovers_at_start": [],                     <span class="c">// what HyperShift had left, in words</span>
     "cleaned_up": [],                             <span class="c">// every write made on a controller's behalf, and why</span>
+    "agents_marked": [ "inventory/…" ],           <span class="c">// the Agents carrying redbull.io/uninstalling</span>
     "reservation_expires_at": "2026-10-25T09:00:00Z",
     "lock_released": true,                        <span class="c">// false: why is the releasing-server entry in skipped</span>
     "kept_in_inventory": false,                   <span class="c">// true only on a run from before 2026-11-02 with keep_inventory</span>
@@ -882,6 +932,7 @@
           <tr><td class="k">inspecting</td><td class="muted">BMH, Agents, AgentMachine, Machine, HostedCluster &mdash; reads only</td><td class="muted">seconds</td></tr>
           <tr><td class="k">checking-hosted-node</td><td class="muted">Which Node of the hosted cluster is the server, if any &mdash; reads only</td><td class="muted">seconds</td></tr>
           <tr><td class="k">reserving-server</td><td class="muted">The install lock, before any write</td><td class="muted">instant</td></tr>
+          <tr><td class="k">marking-agent</td><td class="muted">Every Agent of the server labelled <code>redbull.io/uninstalling: "true"</code> &mdash; the first write</td><td class="muted">instant</td></tr>
           <tr><td class="k">draining-node</td><td class="muted">A Node no Machine stands behind: cordon + evictions, every 30 s</td><td class="muted">&le; 20 min</td></tr>
           <tr><td class="k">deleting-machine</td><td class="muted">Hosted nodes: the Machine delete, or a recorded no-op</td><td class="muted">instant</td></tr>
           <tr><td class="k">awaiting-machine-deletion</td><td class="muted">Hosted nodes: <code>sub_phase</code> <b>draining</b> (Agent still bound), <b>releasing</b> (the run makes the provider&rsquo;s writes) and <b>unbinding</b> (released, rebooting), polled every 30 s; stops if another AgentMachine takes the Agent</td><td class="muted"><b>&le; 20 min</b> draining, <b>&le; 1 h</b> unbinding</td></tr>
@@ -903,7 +954,7 @@
         <tbody>
           <tr><td class="k">cluster.x-k8s.io machines</td><td class="muted">get, list, delete, patch</td><td class="muted">the Machine behind a hosted node&rsquo;s Agent, found by any link; patch removes the provider&rsquo;s hook from one whose AgentMachine is gone</td></tr>
           <tr><td class="k">capi-provider.agent-install.openshift.io agentmachines</td><td class="muted">get, list, delete, patch</td><td class="muted">found by <code>status.agentRef</code>, the only link once the provider starts unbinding; delete one with no Machine, patch to drop the provider&rsquo;s stuck finalizer</td></tr>
-          <tr><td class="k">agent-install.openshift.io agents <em>(InfraEnv Role)</em></td><td class="muted">patch</td><td class="muted">the provider&rsquo;s unbind, for an Agent the provider can no longer release</td></tr>
+          <tr><td class="k">agent-install.openshift.io agents <em>(InfraEnv Role)</em></td><td class="muted">patch</td><td class="muted">the <code>redbull.io/uninstalling</code> label; the provider&rsquo;s unbind, for an Agent the provider can no longer release</td></tr>
           <tr><td class="k">hypershift.openshift.io hostedclusters</td><td class="muted">get, list</td><td class="muted">found by its control-plane namespace; its <code>status.kubeconfig</code></td></tr>
           <tr><td class="k">"" secrets</td><td class="muted">get</td><td class="muted">the HostedCluster&rsquo;s admin kubeconfig &mdash; <b>every Secret on the MCE, the widest grant in the chart</b></td></tr>
         </tbody>
@@ -919,13 +970,16 @@
     <code>HostedClusterUnreachableError</code>.</p>
     <p class="note"><b>Roll the limb out first.</b> CI ships the brain before the limb, and a brain that
     reaches activities an old limb does not register retries them until it does &mdash; the run sits in
-    <code>checking-inventory</code>. Upgrade each MCE&rsquo;s <code>server-lifecycle-worker</code> and apply
+    <code>checking-inventory</code> &mdash; or, against a limb from before 2026-11-12, in
+    <code>marking-agent</code>, holding the lock, until the limb with <code>mark_agents_uninstalling</code>
+    is up. Upgrade each MCE&rsquo;s <code>server-lifecycle-worker</code> and apply
     its ClusterRole before using this route. Production&rsquo;s chart is <b>vendored in redbull-platform</b>
     (<code>gitops/charts/server-lifecycle-worker/</code>) and needs the same ClusterRole there.</p>
 
     <h3 style="margin:28px 0 10px">What it never does</h3>
     <ul>
-      <li>No NodePool or replicas change &mdash; replicas are update-nodepool&rsquo;s (<a href="#cases">above</a>).</li>
+      <li>No NodePool or replicas change &mdash; replicas are update-nodepool&rsquo;s (<a href="#cases">above</a>),
+        and the selector that honours the run&rsquo;s Agent label is the NodePool&rsquo;s own, in day1 (<a href="#label">above</a>).</li>
       <li>No fight with the NodePool &mdash; an Agent its replacement Machine took is left to it.</li>
       <li>No drain or Node delete where CAPI can still do it &mdash; only for a Node no Machine stands
         behind, and a Node is deleted only once NotReady.</li>

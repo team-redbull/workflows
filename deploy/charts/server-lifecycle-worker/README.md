@@ -404,8 +404,9 @@ workflow runs as before and update-nodepool fails at once on this MCE with
 
 `rbac.targetNamespaces` gets a Role each: everything add-server-to-mce and
 remove-server-from-mce do happens in an InfraEnv namespace — and uninstall-server-from-hc's
-`patch` on agents, the Agent provider's own unbind for an Agent whose Machine
-or AgentMachine a broken HyperShift deletion left behind. uninstall-server-from-hc reaches
+`patch` on agents: its `redbull.io/uninstalling` label on the server's Agents,
+and the Agent provider's own unbind for an Agent whose Machine or AgentMachine
+a broken HyperShift deletion left behind. uninstall-server-from-hc reaches
 further, so `rbac.hostedClusters` (default `true`) adds a **ClusterRole** —
 **a widening, and the widest grant in this chart**:
 

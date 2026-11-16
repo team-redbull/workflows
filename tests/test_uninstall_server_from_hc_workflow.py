@@ -46,6 +46,8 @@ from shared.models.server_lifecycle import (
     AgentMachineCleanupRequest,
     AgentMachineRef,
     AgentMachineState,
+    AgentMarkRequest,
+    AgentMarks,
     AgentNameRef,
     AgentRelease,
     AgentReleaseRequest,
@@ -207,6 +209,7 @@ def make_mocks(
     inventory: InventoryHostState = ON_THE_MCE,
     pxe_error: Exception | None = None,
     release_error: Exception | None = None,
+    marks: AgentMarks | None = None,
 ):
     """Each sequence is consumed one item per call; its last item repeats.
 
@@ -233,7 +236,8 @@ def make_mocks(
             "inspect_inventory_host", "set_host_online", "teardown_bmh_resources",
             "delete_agents", "remove_host_pxe_entries", "find_hosted_nodes",
             "drain_hosted_node", "delete_hosted_node", "release_agent",
-            "release_machine_hook", "clean_up_agent_machines", "release_server", "order",
+            "release_machine_hook", "clean_up_agent_machines", "release_server",
+            "mark_agents_uninstalling", "order",
         )
     }
 
@@ -352,6 +356,14 @@ def make_mocks(
         return AgentRelease(found=True, released=True)
 
     @activity.defn
+    async def mark_agents_uninstalling(request: AgentMarkRequest) -> AgentMarks:
+        calls["mark_agents_uninstalling"].append(request)
+        _mark("mark-agent")
+        if marks is not None:
+            return marks
+        return AgentMarks(changed=[f"{a.namespace}/{a.name}" for a in request.agents])
+
+    @activity.defn
     async def release_machine_hook(ref: MachineRef) -> MachineHookRelease:
         calls["release_machine_hook"].append(ref)
         _mark("release-hook")
@@ -427,6 +439,7 @@ def make_mocks(
             delete_agents, remove_host_pxe_entries, find_hosted_nodes,
             drain_hosted_node, delete_hosted_node, release_agent,
             release_machine_hook, clean_up_agent_machines, release_server,
+            mark_agents_uninstalling,
         ],
         SEGMENT_LIFECYCLE_ACTIVITY_QUEUE: [get_inventory_segment],
     }
@@ -508,8 +521,8 @@ class TestAHostedClustersNode:
         async with _Harness(acts) as client:
             result = await _execute(client, workflow_id="uninstall-server-from-hc-test-happy")
 
-        assert calls["order"] == ["lookup", "inspect", "find-nodes", "reserve", *HOSTED_HALF,
-                                  "hold", *CHILD]
+        assert calls["order"] == ["lookup", "inspect", "find-nodes", "reserve", "mark-agent",
+                                  *HOSTED_HALF, "hold", *CHILD]
         assert result.hosted and result.bound_at_start
         assert result.agent_state_at_start == "added-to-existing-cluster"
         assert result.machine_deleted_by_run is True
@@ -602,8 +615,8 @@ class TestAHostedClustersNode:
         assert result.hosted and not result.bound_at_start
         assert result.agent_state_at_start == "unbinding"
         assert result.machine_deleted_by_run is False
-        assert calls["order"] == ["lookup", "inspect", "find-nodes", "reserve", *HOSTED_HALF,
-                                  "hold", *CHILD]
+        assert calls["order"] == ["lookup", "inspect", "find-nodes", "reserve", "mark-agent",
+                                  *HOSTED_HALF, "hold", *CHILD]
         assert calls["release_agent"] == []  # the provider released it: its Machine is there
 
     async def test_a_drain_that_never_finishes_fails_with_nothing_more_deleted(self):
@@ -960,6 +973,98 @@ class TestTheNodePoolTakingTheServerBack:
             update={"agent_machine": None}), started) is None
 
 
+class TestTheServerIsLabelledUninstalling:
+    """Right after the lock, every Agent of the server gets `redbull.io/uninstalling`
+    (the operator, 2026-11-12): a NodePool whose agentLabelSelector excludes it never
+    takes the server back for the replacement of the Machine the run deletes."""
+
+    async def test_a_hosted_node_is_labelled_before_its_machine_is_deleted(self):
+        calls, acts = make_mocks()
+        async with _Harness(acts) as client:
+            result = await _execute(client)
+
+        order = calls["order"]
+        assert order.index("reserve") < order.index("mark-agent") < order.index("delete-machine")
+        assert calls["mark_agents_uninstalling"] == [
+            AgentMarkRequest(agents=[AgentNameRef(namespace=NS, name="agent-1")])
+        ]
+        assert result.agents_marked == [f"{NS}/agent-1"]
+        assert result.remove_server.found
+
+    async def test_an_inventory_host_is_labelled_before_its_last_look(self):
+        calls, acts = make_mocks(membership=IN_INVENTORY, host=INVENTORY_HOST)
+        async with _Harness(acts) as client:
+            result = await _execute(client)
+
+        order = calls["order"]
+        assert order.index("reserve") < order.index("mark-agent") < order.index("verify-inventory")
+        assert result.agents_marked == [f"{NS}/agent-1"]
+
+    async def test_every_agent_of_the_host_is_labelled(self):
+        """Any free Agent of the host is this server, not only the one the run follows."""
+        two = INVENTORY_HOST.model_copy(update={"agents": [
+            *INVENTORY_HOST.agents,
+            HostAgent(name="agent-2", namespace=NS, state="disconnected-unbound", approved=True),
+        ]})
+        calls, acts = make_mocks(membership=IN_INVENTORY, host=two)
+        async with _Harness(acts) as client:
+            result = await _execute(client)
+
+        [request] = calls["mark_agents_uninstalling"]
+        assert [a.name for a in request.agents] == ["agent-1", "agent-2"]
+        assert result.agents_marked == [f"{NS}/agent-1", f"{NS}/agent-2"]
+
+    async def test_a_label_already_there_and_a_gone_agent_are_both_success(self):
+        """A re-run finds its own label; an Agent gone since the inspection is named, not fatal."""
+        _calls, acts = make_mocks(
+            membership=IN_INVENTORY, host=INVENTORY_HOST,
+            marks=AgentMarks(unchanged=[f"{NS}/agent-1"], missing=[f"{NS}/agent-2"]),
+        )
+        async with _Harness(acts) as client:
+            result = await _execute(client)
+
+        assert result.agents_marked == [f"{NS}/agent-1"]
+        assert f"marking-agent: Agent {NS}/agent-2 was gone — nothing to label" in result.skipped
+        assert result.remove_server.found
+
+    async def test_a_host_with_no_agent_has_nothing_to_label(self):
+        calls, acts = make_mocks(membership=IN_INVENTORY, host=BoundHostState(),
+                                 inventory=InventoryHostState())
+        async with _Harness(acts) as client:
+            result = await _execute(client)
+
+        assert calls["mark_agents_uninstalling"] == [] and result.agents_marked == []
+        assert "marking-agent: the host has no Agent on the MCE to label" in result.skipped
+
+    async def test_a_refusal_after_the_label_says_how_to_take_it_off(self):
+        taken = INVENTORY_HOST.model_copy(update={"agents": [HostAgent(
+            name="agent-1", namespace=NS, cluster_deployment="clusters-hc-01/hc-01",
+            state="binding", approved=True, agent_machine=AM, agent_machine_label=True,
+            hcp_namespaces=["clusters-hc-01"],
+        )]})
+        _calls, acts = make_mocks(membership=IN_INVENTORY, host=INVENTORY_HOST, rechecks=[taken])
+        async with _Harness(acts) as client:
+            error = await _fails(client)
+
+        assert error.type == "AgentRetakenError"
+        assert "Nothing else on the MCE was changed" in error.message
+        assert f"redbull.io/uninstalling label stays on Agent {NS}/agent-1" in error.message
+        assert f"oc label agent -n {NS} agent-1 redbull.io/uninstalling-" in error.message
+
+    async def test_a_run_recorded_before_the_label_labels_nothing(self, monkeypatch):
+        monkeypatch.setattr(
+            workflow, "patched",
+            lambda patch_id: patch_id != uninstall_server_from_hc._MARK_AGENTS_PATCH,
+        )
+        calls, acts = make_mocks()
+        async with _Harness(acts) as client:
+            result = await _execute(client)
+
+        assert calls["order"] == ["lookup", "inspect", "find-nodes", "reserve", *HOSTED_HALF,
+                                  "hold", *CHILD]
+        assert calls["mark_agents_uninstalling"] == [] and result.agents_marked == []
+
+
 class TestAnInventoryHost:
     async def test_it_skips_the_hosted_half_and_still_removes(self):
         calls, acts = make_mocks(membership=IN_INVENTORY, host=INVENTORY_HOST)
@@ -968,7 +1073,7 @@ class TestAnInventoryHost:
 
         # Looked at again, fresh, right before remove-server-from-mce: a free Agent is
         # what any NodePool's new Machine takes.
-        assert calls["order"] == ["lookup", "inspect", "reserve", "verify-inventory", "hold", *CHILD]
+        assert calls["order"] == ["lookup", "inspect", "reserve", "mark-agent", "verify-inventory", "hold", *CHILD]
         assert len(calls["inspect_bound_host"]) == 2
         assert not result.hosted and not result.bound_at_start
         assert result.agent_state_at_start == "known-unbound"
@@ -1052,7 +1157,7 @@ class TestAnInventoryHost:
         async with _Harness(acts) as client:
             result = await _execute(client)
 
-        assert calls["order"] == ["lookup", "inspect", "reserve", "hold", *CHILD]
+        assert calls["order"] == ["lookup", "inspect", "reserve", "mark-agent", "hold", *CHILD]
         assert result.remove_server.found
 
 
@@ -1070,8 +1175,8 @@ class TestEveryUninstallLeavesTheMce:
         async with _Harness(acts) as client:
             result = await _execute(client, KEEP)
 
-        assert calls["order"] == ["lookup", "inspect", "find-nodes", "reserve", *HOSTED_HALF,
-                                  "hold", *CHILD]
+        assert calls["order"] == ["lookup", "inspect", "find-nodes", "reserve", "mark-agent",
+                                  *HOSTED_HALF, "hold", *CHILD]
         assert not result.kept_in_inventory and result.remove_server.found
         assert result.lock_released
 
@@ -1081,7 +1186,7 @@ class TestEveryUninstallLeavesTheMce:
         async with _Harness(acts) as client:
             result = await _execute(client, KEEP)
 
-        assert calls["order"] == ["lookup", "inspect", "reserve", "verify-inventory", "hold", *CHILD]
+        assert calls["order"] == ["lookup", "inspect", "reserve", "mark-agent", "verify-inventory", "hold", *CHILD]
         assert not result.kept_in_inventory and result.remove_server.found
 
     async def test_the_default_takes_it_out_of_the_mce(self):
@@ -1122,6 +1227,8 @@ class TestARunRecordedWithKeepInventory:
         # Still in this InfraEnv, so the day-long hold stays (the operator, 2026-10-31).
         assert result.skipped[-1].startswith("releasing-server: keep_inventory was asked")
         assert calls["release_server"] == [] and result.lock_released is False
+        # Kept as a free Agent, so never labelled: NodePools must still take it.
+        assert calls["mark_agents_uninstalling"] == [] and result.agents_marked == []
 
     async def test_an_inventory_host_has_nothing_to_do_and_takes_no_lock(self):
         calls, acts = make_mocks(membership=IN_INVENTORY, host=INVENTORY_HOST)

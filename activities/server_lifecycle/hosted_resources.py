@@ -43,6 +43,8 @@ from __future__ import annotations
 from typing import Any
 
 from shared.models.server_lifecycle import (
+    UNINSTALLING_AGENT_LABEL,
+    UNINSTALLING_AGENT_LABEL_VALUE,
     AgentBindingState,
     HostedClusterRef,
     MachineState,
@@ -272,6 +274,18 @@ def agent_release_patch(resource_version: str | None) -> dict[str, Any]:
             "clusterDeploymentName": None,
         },
     }
+
+
+def agent_marked_uninstalling(agent: dict[str, Any] | None) -> bool:
+    """Whether the Agent carries uninstall-server-from-hc's `redbull.io/uninstalling: "true"`."""
+    labels = _metadata(agent or {}).get("labels") or {}
+    return labels.get(UNINSTALLING_AGENT_LABEL) == UNINSTALLING_AGENT_LABEL_VALUE
+
+
+def agent_uninstalling_patch() -> dict[str, Any]:
+    """The label alone, as a merge patch: every other label — the provider's
+    `agentMachineRef`, the InfraEnv's — and the Agent's spec are left as they are."""
+    return {"metadata": {"labels": {UNINSTALLING_AGENT_LABEL: UNINSTALLING_AGENT_LABEL_VALUE}}}
 
 
 def _conditions(status: dict[str, Any]) -> list[dict[str, Any]]:

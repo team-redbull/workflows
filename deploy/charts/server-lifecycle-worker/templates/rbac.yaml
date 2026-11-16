@@ -24,8 +24,9 @@ rules:
     verbs: [get, create, delete]
   - apiGroups: [agent-install.openshift.io]
     resources: [agents]
-    # delete: remove-server-from-mce; patch: uninstall-server-from-hc releasing an Agent the
-    # provider no longer can (its Machine or AgentMachine gone)
+    # delete: remove-server-from-mce; patch: uninstall-server-from-hc's redbull.io/uninstalling
+    # label, and its release of an Agent the provider no longer can (its Machine or
+    # AgentMachine gone)
     verbs: [get, list, delete, patch]
   - apiGroups: [agent-install.openshift.io]
     resources: [infraenvs]

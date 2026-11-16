@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from activities import git_repo
 from activities.cluster_lifecycle import day2_sigs
 from shared.exceptions import ValuesRepoGitError
 from shared.models.cluster_lifecycle import Day2SigRegistrationRequest
@@ -58,7 +59,7 @@ async def test_creates_the_folder_on_the_default_branch(tmp_path):
 
 async def test_a_master_default_branch_is_used_as_found(tmp_path):
     origin = _bare(tmp_path, "sig.git", "master", {"README.md": "sig\n"})
-    assert await day2_sigs.default_branch(repo_url=str(origin), token="") == "master"
+    assert await git_repo.default_branch(repo_url=str(origin), token="", repo="sig") == "master"
     registration = await _register(origin)
     assert registration.created and f"{FOLDER}/.gitkeep" in _tree(origin, "master")
 

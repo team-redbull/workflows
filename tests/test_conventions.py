@@ -128,6 +128,44 @@ def _fail(response):
     assert "AC007" not in _rules(checker.run_source("activities/probe/client.py", bounded))
 
 
+def test_git_runs_only_through_git_repo(checker):
+    # CLAUDE.md §5: one git client, a fresh_clone per attempt, worked through its Clone.
+    slips = '''
+import asyncio
+import subprocess
+
+import git
+from activities import git_repo
+from activities.git_repo import run_git
+
+
+async def own_git(dest):
+    await asyncio.create_subprocess_exec("git", "clone", "x", str(dest))
+    subprocess.run(["git", "status"], check=True)
+
+
+async def low_level(dest):
+    await git_repo.clone(repo_url="x", branch="main", token="", dest=dest, missing_message="-")
+    await run_git(["rev-parse", "HEAD"], cwd=dest, secrets=[])
+'''
+    violations = checker.run_source("activities/probe/repo.py", slips)
+    assert sorted(v.line for v in violations if v.rule == "AC008") == [5, 11, 12, 16, 17]
+
+    canonical = '''
+import asyncio
+
+from activities import git_repo
+
+
+async def publish(repo_url, token):
+    async with git_repo.fresh_clone(repo_url=repo_url, token=token, repo="day1", prefix="p-") as day1:
+        await day1.commit_and_push(paths=["a"], message="m", author=git_repo.UPGRADE_AUTHOR)
+    await asyncio.create_subprocess_exec("oc", "adm", "release", "info")
+'''
+    assert "AC008" not in _rules(checker.run_source("activities/probe/repo.py", canonical))
+    assert "AC008" not in _rules(checker.run_source("activities/git_repo.py", slips))
+
+
 def test_checker_catches_router_slips(checker):
     source = '''
 from fastapi import APIRouter

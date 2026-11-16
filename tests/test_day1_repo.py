@@ -25,8 +25,8 @@ def _write(root: Path, files: dict[str, str]) -> None:
 
 def test_both_limbs_read_day1_through_the_one_shared_reader():
     """Neither limb imports the other's domain for day1: each takes the shared module's objects."""
-    assert upgrade_day1_repo.clone_main is day1_repo.clone_main
-    assert upgrade_day1_repo.head is day1_repo.head and upgrade_day1_repo.blob is day1_repo.blob
+    assert upgrade_day1_repo.fresh_main is day1_repo.fresh_main
+    assert vm_day1_repo.fresh_main is day1_repo.fresh_main
     assert day1_values.load_cluster_values is day1_repo.load_cluster_values
     assert day1_values.load_yaml is day1_repo.load_yaml
     assert vm_day1_repo.load_cluster_values is day1_repo.load_cluster_values

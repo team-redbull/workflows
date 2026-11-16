@@ -29,7 +29,6 @@ from __future__ import annotations
 import hashlib
 import re
 import sys
-import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -195,7 +194,7 @@ def _existing(clone: Path, request: IncidentRequest) -> str | None:
     return str(matches[0].relative_to(clone)) if matches else None
 
 
-async def _why_not_pushed(clone: Path, relative: str, token: str) -> str | None:
+async def _why_not_pushed(brain: git_repo.Clone, relative: str) -> str | None:
     """Why the page must not be pushed, or None when brain.py validate passed it.
 
     Fail-closed: only the validator's own answer — exit 0 or 1, ending in its
@@ -205,11 +204,9 @@ async def _why_not_pushed(clone: Path, relative: str, token: str) -> str | None:
     timeout (124), a script that cannot start (127), a crash or any other exit
     is no answer, and no answer is not a pass.
     """
-    if not (clone / _BRAIN).is_file():
+    if not (brain.path / _BRAIN).is_file():
         return f"Brain main has no {_BRAIN} to validate the incident page with, not pushed"
-    code, output = await git_repo.run_command(
-        [sys.executable, _BRAIN, "validate"], cwd=clone, secrets=[token], timeout=VALIDATE_TIMEOUT_SECONDS
-    )
+    code, output = await brain.run_command([sys.executable, _BRAIN, "validate"], timeout=VALIDATE_TIMEOUT_SECONDS)
     if code not in (0, 1) or not _VALIDATE_SUMMARY.search(output):
         return f"Brain's validator did not answer (exit {code}), the incident page was not pushed: {git_repo.tail(output)}"
     ours = [line for line in output.splitlines() if relative in line and line.lstrip().lower().startswith(("error", "warning"))]
@@ -228,9 +225,8 @@ async def write_incident(
     """
     when = now or datetime.now(UTC)
     page = render(request, when)
-    with tempfile.TemporaryDirectory(prefix="brain-incident-") as tmp:
-        clone = Path(tmp) / "repo"
-        await git_repo.clone_main(repo_url=repo_url, token=token, dest=clone, repo="Brain")
+    async with git_repo.fresh_clone(repo_url=repo_url, token=token, repo="Brain", prefix="brain-incident-") as brain:
+        clone = brain.path
         existing = _existing(clone, request)
         if existing is not None:
             return IncidentRecord(path=existing)
@@ -238,12 +234,10 @@ async def write_incident(
         target = clone / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(page, encoding="utf-8")
-        refused = await _why_not_pushed(clone, relative, token)
+        refused = await _why_not_pushed(brain, relative)
         if refused is not None:
             return IncidentRecord(path="", note=refused)
-        code, output = await git_repo.run_command(
-            [sys.executable, _BRAIN, "index"], cwd=clone, secrets=[token], timeout=VALIDATE_TIMEOUT_SECONDS
-        )
+        code, output = await brain.run_command([sys.executable, _BRAIN, "index"], timeout=VALIDATE_TIMEOUT_SECONDS)
         if code != 0:
             # INDEX.md is generated, never hand-edited: a page pushed without
             # it would leave Brain's own CI failing on a stale index.
@@ -252,13 +246,5 @@ async def write_incident(
                 note=f"{_BRAIN} index failed (exit {code}), the incident page was not pushed: {git_repo.tail(output)}",
             )
         subject = _one_line(scrub(f"incident({_AREA}): upgrade agent {request.verdict.verdict} at {request.phase}", request))
-        await git_repo.commit_and_push(
-            clone,
-            repo_url=repo_url,
-            token=token,
-            branch=git_repo.MAIN,
-            paths=[relative, "INDEX.md"],
-            message=subject,
-            author=git_repo.UPGRADE_AUTHOR,
-        )
+        await brain.commit_and_push(paths=[relative, "INDEX.md"], message=subject, author=git_repo.UPGRADE_AUTHOR)
         return IncidentRecord(path=relative)

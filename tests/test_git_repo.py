@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 
 from activities import git_repo
-from shared.exceptions import ValuesRepoGitError
+from shared.exceptions import ValuesBranchNotFoundError, ValuesRepoGitError
 
 HOST = "https://git.test/"
 # Not shaped like any real token on purpose; unique enough to search files for.
@@ -199,3 +199,30 @@ def _alive(pid: int) -> bool:
     except ProcessLookupError:
         return False
     return True
+
+
+class TestFreshClone:
+    """git_repo.fresh_clone: one clean clone per attempt, gone afterwards, the token out of its repr."""
+
+    async def test_the_clone_is_removed_after_the_block_and_after_an_error(self, remote):
+        async with git_repo.fresh_clone(repo_url=str(remote), token=SECRET, repo="day1", prefix="t-") as clone:
+            assert (clone.path / ".git").is_dir() and len(await clone.head()) == 40
+            kept = clone.path
+        assert not kept.exists()
+        with pytest.raises(RuntimeError):
+            async with git_repo.fresh_clone(repo_url=str(remote), token=SECRET, repo="day1", prefix="t-") as clone:
+                kept = clone.path
+                raise RuntimeError("the caller failed")
+        assert not kept.exists()
+
+    async def test_a_missing_branch_is_named_after_the_repo(self, remote):
+        with pytest.raises(ValuesBranchNotFoundError, match="the Brain repo has no `nope` branch"):
+            async with git_repo.fresh_clone(repo_url=str(remote), token="", repo="Brain", prefix="t-", branch="nope"):
+                pass
+
+    def test_the_token_is_not_in_its_repr(self, tmp_path):
+        clone = git_repo.Clone(path=tmp_path, repo_url="https://git.test/r.git", token=SECRET)
+        assert SECRET not in repr(clone)
+
+    async def test_the_default_branch_is_read_from_the_remote(self, remote):
+        assert await git_repo.default_branch(repo_url=str(remote), token="", repo="day1") == "main"

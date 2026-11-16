@@ -108,26 +108,28 @@ class SegmentPoolExhaustedError(OrchestratorError):
 
 
 class ValuesRepoGitError(OrchestratorError):
-    """A git operation against the values repo failed (ls-remote, clone,
-    commit, push — including a rejected non-fast-forward push).
+    """A git operation failed (ls-remote, clone, commit, push — including a
+    rejected non-fast-forward push), on any repo activities/git_repo.py
+    clones (day1, a day2 sig, day2, Brain; the name predates them).
 
     Transient by classification: the retry re-clones from a temporary
-    directory and re-applies the append, so a concurrent push simply converges
+    directory and re-applies the change, so a concurrent push simply converges
     on the next attempt. Deliberately NOT in non_retryable_error_types. A
     branch that does not exist is NOT this error — see ValuesBranchNotFoundError.
     """
 
 
 class ValuesBranchNotFoundError(OrchestratorError):
-    """The branch a limb asked the values repo for does not exist on the
-    remote: `git ls-remote --exit-code --heads` found no
-    `refs/heads/<branch>`.
+    """The branch a limb asked a repo for does not exist on the remote:
+    `git ls-remote --exit-code --heads` found no `refs/heads/<branch>`.
 
-    Deterministic — the caller (the day1 pipeline) passes the branch it runs
-    on, so a missing one is a typo or a branch deleted after the trigger, and
-    retrying cannot make it appear. Workflows list this type in
-    non_retryable_error_types. Any OTHER ls-remote failure (auth, DNS, a
-    timeout) stays ValuesRepoGitError and is retried.
+    The CALLER classifies it. The workflows RETRY it: the branch is `main`, a
+    sig's default branch or one the run itself just checked, so a missing one
+    is a repo to fix, not a run to fail (tests/test_error_classification.py);
+    upgrade-gitops's write_incident turns it into a note (Brain holds no
+    gate). It was non-retryable for allocate-segment's caller-named branch,
+    gone since 2026-11-11. Any OTHER ls-remote failure (auth, DNS, a timeout)
+    is ValuesRepoGitError.
     """
 
 

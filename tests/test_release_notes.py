@@ -284,9 +284,10 @@ def test_the_notes_list_what_to_pull_new_apart_from_the_whole_set():
 
 def test_images_changed_by_the_same_commits_share_one_list():
     notes = _notes([BRAIN, "vm-lifecycle-worker"])
-    assert "**`workflows-orchestrator` v0.1.102, `vm-lifecycle-worker` v1.0.10**" in notes
+    assert "**`workflows-orchestrator`, `vm-lifecycle-worker`**" in notes
     assert notes.count("fix: one error") == 1
-    assert "[compare](https://github.com/team-redbull/workflows/compare/" in notes
+    assert f"[`{BASE[:7]}`](https://github.com/team-redbull/workflows/commit/{BASE}), the diff base" in notes
+    assert f"[compare](https://github.com/team-redbull/workflows/compare/{BASE}...{HEAD})" in notes
     assert "[#23](https://github.com/team-redbull/workflows/pull/23)" in notes
 
 

@@ -309,8 +309,10 @@ def _header(entries: list[Entry], *, ref: str, head: str, base: str, url: str, r
             f", {held} not found in the registry" if held else "")
         lines = [f"**Branch `{ref}`: nothing released or deployed.** {counts} — {head_link}."]
     if base:
-        lines.append(f"The change since [`{base[:7]}`]({url}/commit/{base}), the last run on `{ref}` that "
-                     f"succeeded ([compare]({url}/compare/{base}...{head})).")
+        # The `changes` job's base: the last run on the branch that succeeded, or one of its
+        # fallbacks (the push range, the branch point), so the notes do not say which.
+        lines.append(f"The change since [`{base[:7]}`]({url}/commit/{base}), the diff base the `changes` job "
+                     f"measured from ([compare]({url}/compare/{base}...{head})).")
     else:
         lines.append(f"No usable diff base on `{ref}`, so every image was rebuilt; no commits are listed.")
     if pull_requests:
@@ -340,7 +342,7 @@ def _rebuilt(new: list[Entry], *, ref: str, base: str, url: str) -> list[str]:
         groups.setdefault(tuple(c.sha for c in e.commits), []).append(e)
     lines += ["### What changed them", ""]
     for members in groups.values():
-        lines.append("**" + ", ".join(f"`{e.image}` {e.version}" for e in members) + "**")
+        lines.append("**" + ", ".join(f"`{e.image}`" for e in members) + "**")      # versions: the table
         if members[0].commits:
             lines += [f"- [`{c.sha[:7]}`]({url}/commit/{c.sha}) {c.subject}" for c in members[0].commits]
         else:

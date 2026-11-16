@@ -31,15 +31,16 @@ settings class (`<Limb>ActivitySettings`) and the chart name from them.
 4. **Tests** — conftest env; add the limb to `tests/test_contract.py`'s `_DOMAINS` (a
    guard test fails until you do) and its queue to `tests/test_worker_registration.py`'s
    `_WORKERS`; activity tests per [testing.md](testing.md).
-5. **CI** — `.github/workflows/build.yml`: a `build-<limb>-worker` job that `needs` the
-   `test` job and runs `if: ... contains(fromJSON(needs.changes.outputs.images || '[]'),
-   '<limb>-worker')` (its own image name — `scripts/image_changes.py` finds the image from
-   its Dockerfile, nothing to register there): the reusable `ghcr-build-push.yml` at the end of the sequential chain
-   (`helm-values-path: gitops/charts/<limb>-worker/values.yaml`), so `main` builds get
-   `vX.Y.Z` tags. Put the chart into redbull-platform first (step 6), or the bump fails;
-   no image-only job with a `<branch-slug>-<sha>` tag (removed 2026-11-02).
-   Add a `cleanup-<limb>-worker-on-delete` job. Every limb rebuilds on any change under
-   `activities/` or `shared/`; say so if that matters.
+5. **CI** — a row in `.github/image-builds.json`: `image-name: <limb>-worker`, `dockerfile:
+   activities/<limb>/Dockerfile`, `helm-values-path: gitops/charts/<limb>-worker/values.yaml`
+   and the chart's `helm-image-path` (`image`, or `activityWorker.image`). `build.yml`'s
+   `build` matrix job builds it with the reusable `ghcr-build-push.yml`, behind the `test`
+   job and the brain, beside the other images, whenever `scripts/image_changes.py` lists it
+   (it finds the image from its Dockerfile; `--matrix` picks the row by that name), so
+   `main` builds get `vX.Y.Z` tags. Put the chart into redbull-platform first (step 6), or
+   the bump fails — that image only; no image-only job with a `<branch-slug>-<sha>` tag
+   (removed 2026-11-02). Add a `cleanup-<limb>-worker-on-delete` job in `build.yml`. A
+   limb rebuilds only when a file it LOADS changes; a module of `shared/` it imports is one.
 6. **Chart** — per-MCE limb: `deploy/charts/<limb>-worker/` here, with a README whose
    RBAC table is derived call by call from `activities.py`; hub limb:
    redbull-platform, per [platform-chart.md](platform-chart.md).

@@ -674,7 +674,7 @@
           <code>Dockerfile</code> and <code>worker_init.py</code>.</li>
           <li>A settings module <code>shared/settings/&lt;limb&gt;.py</code> for its endpoints and credentials.</li>
           <li>A new <code>workflow_domains/&lt;domain&gt;/</code> folder with its workflows and a <code>router.py</code>, included in <code>api.py</code>.</li>
-          <li>A build job in <code>.github/workflows/build.yml</code> and a new
+          <li>A row in <code>.github/image-builds.json</code> (CI builds it beside the other images) and a new
           <code>gitops/charts/&lt;domain&gt;-worker/</code> chart in the redbull-platform repo for Argo CD.</li>
         </ol>
         <p class="note">The brain is already deployed — a new domain registers against it, it doesn't fork it.</p>

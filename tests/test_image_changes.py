@@ -55,14 +55,17 @@ def test_every_image_of_the_repo_is_found():
 
 
 def test_the_names_are_the_ones_build_yml_asks_for():
-    """Each build job asks `contains(fromJSON(...images...), '<name>')`: a name the script
-    never answers is an image that is never built."""
+    """The brain job asks `contains(fromJSON(...images...), '<name>')` and every other image
+    is a row of the `build` matrix (`--matrix`): a name the script never answers is an image
+    that is never built. The brain job and the cleanup jobs name every image."""
     build_yml = (REPO_ROOT / ".github" / "workflows" / "build.yml").read_text(encoding="utf-8")
     asked = set(re.findall(r"contains\(fromJSON\(needs\.changes\.outputs\.images \|\| '\[\]'\), '([a-z0-9-]+)'\)", build_yml))
+    rows = {row["image-name"] for row in image_changes.load_builds(REPO_ROOT)}
     built = {
         name for name in re.findall(r"^      image-name: ([a-z0-9-]+)$", build_yml, re.M)
     }
-    assert asked == built == set(BY_NAME)
+    assert asked == {BRAIN} and rows == set(BY_NAME) - {BRAIN}
+    assert built == set(BY_NAME)
     # No job is left on the retired per-folder flags.
     assert not re.search(r"outputs\.(brain|limb|docs)\b", build_yml)
 

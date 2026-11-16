@@ -35,11 +35,20 @@ image and nothing reports it; a redundant build costs minutes. So:
 The docs image has no Python: it is affected by exactly what its Dockerfile
 copies.
 
+HOW AN IMAGE IS BUILT is not this script's question, but it answers it for the
+build matrix: the brain has its own job in build.yml (it ships before every other
+image), and every other image is one row of .github/image-builds.json, the reusable
+workflow's inputs for it. `--matrix` turns the list this script answered into the
+`build` job's matrix, so the workflow never re-derives which images to build.
+
 Usage (the repo root is the working directory):
   git diff --name-only <base> <head> | python3 scripts/image_changes.py
       -> a JSON list of image names on stdout, the reasons on stderr
   python3 scripts/image_changes.py --all      every image
   python3 scripts/image_changes.py --table    which images load each file
+  echo '<that JSON list>' | python3 scripts/image_changes.py --matrix
+      -> the `build` job's matrix for those images, or nothing when none of them is
+         built there (GitHub refuses an empty matrix, so the job is skipped)
 """
 
 from __future__ import annotations
@@ -53,8 +62,11 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
+# The `build` matrix's rows: every image but the brain, with the reusable workflow's inputs.
+BUILDS_FILE = ".github/image-builds.json"
+
 # Files whose change can alter ANY image or the decision itself.
-GLOBAL_TRIGGERS = (".github/workflows/build.yml", "scripts/image_changes.py", ".dockerignore")
+GLOBAL_TRIGGERS = (".github/workflows/build.yml", BUILDS_FILE, "scripts/image_changes.py", ".dockerignore")
 
 # Entrypoints a Dockerfile's CMD does not name: the chart runs the brain image a
 # second time as the API (`uvicorn workflow_domains.api:app`).
@@ -264,7 +276,48 @@ def fan_in_table(images: list[Image]) -> str:
     return "\n".join(lines)
 
 
+# --- the build matrix ---------------------------------------------------------------------
+
+# A row's keys are the reusable workflow's inputs, passed through unchanged.
+BUILD_KEYS = ("image-name", "dockerfile", "helm-values-path", "helm-image-path")
+
+
+def load_builds(root: Path = REPO_ROOT) -> list[dict[str, str]]:
+    """The rows of .github/image-builds.json: one per image the `build` matrix can build."""
+    rows = json.loads((root / BUILDS_FILE).read_text(encoding="utf-8"))
+    if not isinstance(rows, list):
+        raise ValueError(f"{BUILDS_FILE}: a JSON list of rows")
+    for row in rows:
+        if not isinstance(row, dict) or sorted(row) != sorted(BUILD_KEYS) or not all(isinstance(v, str) and v for v in row.values()):
+            raise ValueError(f"{BUILDS_FILE}: each row has exactly {', '.join(BUILD_KEYS)}, non-empty strings — {row!r}")
+    names = [row["image-name"] for row in rows]
+    if len(set(names)) != len(names):
+        raise ValueError(f"{BUILDS_FILE}: an image has two rows")
+    return rows
+
+
+def build_matrix(names: list[str], builds: list[dict[str, str]]) -> dict[str, list[dict[str, str]]]:
+    """The `build` job's matrix for the images this script answered: their rows, in the file's order.
+
+    The brain is built by its own job, so it has no row. Any other name without one is an
+    image that would never be built — refused, not skipped.
+    """
+    by_name = {row["image-name"]: row for row in builds}
+    missing = sorted(set(names) - set(by_name) - {BRAIN_IMAGE})
+    if missing:
+        raise ValueError(f"{', '.join(missing)}: no row in {BUILDS_FILE} — the build job would never build it")
+    wanted = set(names)
+    return {"include": [row for row in builds if row["image-name"] in wanted]}
+
+
 def main(argv: list[str]) -> int:
+    if "--matrix" in argv:
+        # Only the file and the names: nothing here walks the import graph, so the
+        # workflow's every-image fallback goes through this too.
+        names = json.loads(sys.stdin.read() or "[]")
+        matrix = build_matrix(names, load_builds())
+        print(json.dumps(matrix, separators=(",", ":")) if matrix["include"] else "")
+        return 0
     images = discover_images()
     if "--table" in argv:
         print(fan_in_table(images))

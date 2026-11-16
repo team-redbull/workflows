@@ -7,6 +7,18 @@ name: Build and Push
 # upgrade-gitops on the hub — and the documentation site (docs/Dockerfile), which
 # carries no code at all.
 
+# The job graph. `changes` decides which images this push builds and `test` runs the
+# suite; nothing is built or bumped until both pass. The brain builds FIRST, on its own
+# (`build-workflow-brain`): it is deployed before any limb (CLAUDE.md §5). Beside it,
+# `sync-upgrade-charts` ships the per-MCE charts before their images. Then `build` builds
+# every other changed image AT ONCE, one matrix job per image, whose rows are
+# .github/image-builds.json (the reusable workflow's inputs); one image's failure stops no
+# other. A push that does not touch the brain starts `build` straight after `test`.
+#
+#   changes ─┐
+#   test ────┴─┬─ build-workflow-brain ─┐
+#              └─ sync-upgrade-charts ──┴─ build (one job per changed image, in parallel)
+
 # An image is built only when a file IT LOADS changed (scripts/image_changes.py follows
 # the imports from each image's entrypoint), so most pushes build one or two images.
 # That precision would make a missed build permanent: an image nobody touches again is
@@ -23,9 +35,18 @@ on:
     branches: [ '**' ]
   delete:
 
-permissions:
-  contents: write
-  packages: write
+# Each job names the permissions it needs, and nothing else gets any.
+permissions: {}
+
+# One build run per branch at a time. Two main runs at once both read the same latest
+# `<chart>/vX.Y.Z` tag in redbull-platform before either pushed its own, so both would
+# publish the same version of an image. GitHub keeps at most ONE run waiting per group
+# and cancels an older waiting one; nothing is lost by that, because `changes` measures
+# from the last run that succeeded, so the newer run builds the cancelled one's change too.
+# A delete event is never queued or cancelled: its group is its own run.
+concurrency:
+  group: ${{ github.event_name == 'push' && format('build-{0}', github.ref) || format('delete-{0}', github.run_id) }}
+  cancel-in-progress: false
 
 jobs:
   # Which images does this push actually affect? Without this, EVERY push
@@ -49,12 +70,15 @@ jobs:
       actions: read              # the last successful run on this branch (the diff base)
     outputs:
       # A JSON list of the image names to build, e.g. ["cluster-lifecycle-worker"].
-      # One output for every image, so a new limb adds no output here: each build
-      # job asks `contains(fromJSON(needs.changes.outputs.images || '[]'), '<its own
-      # image name>')` (checker DL002). fromJSON, because `contains` on a string is
-      # a substring match; `|| '[]'`, because on a `delete` event this job is
-      # skipped and fromJSON('') is an error, not false.
+      # The brain job asks `contains(fromJSON(needs.changes.outputs.images || '[]'),
+      # 'workflows-orchestrator')`. fromJSON, because `contains` on a string is a
+      # substring match; `|| '[]'`, because on a `delete` event this job is skipped
+      # and fromJSON('') is an error, not false.
       images: ${{ steps.filter.outputs.images }}
+      # The `build` job's matrix: the .github/image-builds.json rows of every other
+      # image in that list, or '' when there is none (GitHub refuses an empty matrix,
+      # so `build` is skipped on ''). A new limb adds a row there, no output here.
+      matrix: ${{ steps.filter.outputs.matrix }}
       charts: ${{ steps.filter.outputs.charts }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -123,8 +147,9 @@ jobs:
           # followed from its entrypoint through the imports, against the changed
           # files. Its reasons go to the log. If it cannot answer — it crashed,
           # or there is no base — EVERY image is built: a red `changes` job would
-          # skip the whole chain, and the images it left unbuilt would be
-          # nobody's until they changed again.
+          # skip every build, and the images it left unbuilt would be
+          # nobody's until they changed again. Every image is named in this file,
+          # by the brain job and by the cleanup jobs (tests/test_image_changes.py).
           every_image() {
             grep -oE 'image-name: *[a-z0-9-]+' .github/workflows/build.yml | awk '{print $2}' | sort -u | jq -R . | jq -sc .
           }
@@ -135,6 +160,13 @@ jobs:
             images="$(every_image)"
           fi
 
+          # The `build` matrix: the same script maps those names to their rows in
+          # .github/image-builds.json, so the matrix is its answer, never a second
+          # decision here. It reads only that file, never the import graph, so it
+          # serves the every-image fallback too. It fails on a name without a row (an
+          # image nothing would build), and a red `changes` builds nothing.
+          matrix="$(printf '%s' "${images}" | python3 scripts/image_changes.py --matrix)"
+
           # `charts` is no image: the per-MCE charts sync-upgrade-charts copies
           # into redbull-platform, and the script that copies them.
           charts=false
@@ -143,6 +175,7 @@ jobs:
           fi
           {
             echo "images=${images}"
+            echo "matrix=${matrix}"
             echo "charts=${charts}"
           } | tee -a "${GITHUB_OUTPUT}"
 
@@ -169,10 +202,17 @@ jobs:
       - run: python -m pytest -q
 
   build-workflow-brain:
-    # `test` gates the whole chain: a failing suite skips this job, and the
-    # `!failure()` guards behind it then skip every job that follows.
+    # FIRST, and alone: every other image's job waits for this one. A new brain is
+    # deployed before the limb whose old payloads it must still read (CLAUDE.md §5,
+    # "brain image before limbs"); a brain that failed to ship keeps every limb back.
+    # A push that does not touch the brain skips this job, and `build` starts at once.
+    # `test` gates it: a failing suite skips this job, and the `!failure()` guard
+    # behind it then skips `build`.
     needs: [changes, test]
     if: ${{ contains(fromJSON(needs.changes.outputs.images || '[]'), 'workflows-orchestrator') }}
+    permissions:
+      contents: write             # what the reusable workflow declares; it pushes to
+      packages: write             # GHCR with this token, to redbull-platform with its own
     uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
     with:
       # Named for the Argo service / Deployment it becomes, not for this repo:
@@ -188,99 +228,24 @@ jobs:
       helm-image-path: image
     secrets: inherit
 
-  build-segment-lifecycle-worker:
-    # Kept sequential after the brain: both now push to the same redbull-platform
-    # branch, so running them in parallel makes them race on that push. (Their VERSION
-    # sequences no longer collide — tags there are namespaced per chart directory — but
-    # the branch is still one branch.)
-    #
-    # The two status guards are what let the chain SURVIVE a skip: a job whose
-    # `needs` was skipped is itself skipped by default, so without a status
-    # function in `if` a docs-only push would skip the brain and then everything
-    # queued behind it — including docs. `!failure()` keeps the old behaviour in
-    # the case that matters: a genuine failure upstream still stops the chain.
-    needs: [changes, build-workflow-brain]
-    if: ${{ !cancelled() && !failure() && contains(fromJSON(needs.changes.outputs.images || '[]'), 'segment-lifecycle-worker') }}
-    uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
-    with:
-      image-name: segment-lifecycle-worker
-      dockerfile: activities/segment_lifecycle/Dockerfile
-      chart-repo: team-redbull/redbull-platform
-      helm-values-path: gitops/charts/segment-lifecycle-worker/values.yaml
-      helm-image-path: activityWorker.image
-    secrets: inherit
-
-  build-server-lifecycle-worker:
-    # The add-server-to-mce limb. Sequential behind the segment-lifecycle one for
-    # the same reason that one is behind the brain: both push to the same
-    # redbull-platform branch, so running them together makes them race.
-    #
-    # Built when a file THIS limb loads changed. Every limb Dockerfile COPYs the
-    # whole activities/ tree, so its image also carries the other limbs' files —
-    # which it never imports, so their change is not its change.
-    needs: [changes, build-segment-lifecycle-worker]
-    if: ${{ !cancelled() && !failure() && contains(fromJSON(needs.changes.outputs.images || '[]'), 'server-lifecycle-worker') }}
-    uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
-    with:
-      image-name: server-lifecycle-worker
-      dockerfile: activities/server_lifecycle/Dockerfile
-      chart-repo: team-redbull/redbull-platform
-      helm-values-path: gitops/charts/server-lifecycle-worker/values.yaml
-      helm-image-path: activityWorker.image
-    secrets: inherit
-
-  build-workflows-docs:
-    # Same sequential chain as the others — see build-segment-lifecycle-worker for why.
-    # Last in the chain, so it is the job that most needed the skip guards —
-    # a docs-only push skips every job ahead of it.
-    needs: [changes, build-server-lifecycle-worker]
-    if: ${{ !cancelled() && !failure() && contains(fromJSON(needs.changes.outputs.images || '[]'), 'workflows-docs') }}
-    uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
-    with:
-      # The docs site. Its own Argo service (workflows-docs) rather than a page
-      # bolted onto the API pod: it is static, holds no credentials and must stay
-      # readable when the orchestrator itself is down or being redeployed.
-      image-name: workflows-docs
-      dockerfile: docs/Dockerfile
-      chart-repo: team-redbull/redbull-platform
-      helm-values-path: gitops/charts/workflows-docs/values.yaml
-      helm-image-path: image
-    secrets: inherit
-
-  build-server-provisioning-worker:
-    # The provision-dell-server limb. It went LAST in the chain while its chart
-    # (gitops/charts/server-provisioning-worker/ in redbull-platform) did not exist, so
-    # the failing bump could not stop the docs. The chart exists now; the job could move
-    # back beside the other limbs.
-    needs: [changes, build-workflows-docs]
-    if: ${{ !cancelled() && !failure() && contains(fromJSON(needs.changes.outputs.images || '[]'), 'server-provisioning-worker') }}
-    uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
-    with:
-      image-name: server-provisioning-worker
-      dockerfile: activities/server_provisioning/Dockerfile
-      chart-repo: team-redbull/redbull-platform
-      helm-values-path: gitops/charts/server-provisioning-worker/values.yaml
-      helm-image-path: activityWorker.image
-    secrets: inherit
-
   # cluster-upgrade's three limbs. Their charts are in redbull-platform since 2026-11-02:
   # cluster-upgrade-worker and upgrade-agent-worker (per MCE) as copies of deploy/charts/
   # here that sync-upgrade-charts keeps equal, upgrade-gitops-worker (hub) only there.
   # Each main build gets a vX.Y.Z tag, the bump of image.tag in that chart's values.yaml
   # and a <chart>/vX.Y.Z tag there, like every other image; a branch build stays
   # <branch-slug>-<short sha>. None of the three has a gitops/services/ entry yet, so
-  # their bumps deploy nothing. Sequential, at the end, for the reason
-  # build-segment-lifecycle-worker gives.
+  # their bumps deploy nothing. All three are rows of the `build` matrix.
   sync-upgrade-charts:
     # Copies deploy/charts/{cluster-upgrade-worker,upgrade-agent-worker} into
     # redbull-platform on a main push that changes them, so nobody keeps the two
     # copies equal by hand (scripts/sync_platform_charts.sh: the whole chart, keeping
     # the image tag and chart version the build jobs wrote there). Renders both the way
-    # Argo would, then commits and pushes. BEFORE the image jobs, so a push that changes
-    # a chart and the code ships the chart first: a new key before the image that needs
-    # it (CLAUDE.md §8). Same token and same rebase-and-retry push as ghcr-build-push.yml.
-    needs: [changes, build-server-provisioning-worker]
-    if: ${{ !cancelled() && !failure() && github.ref_name == 'main' && needs.changes.outputs.charts == 'true' }}
+    # Argo would, then commits and pushes. BEFORE the images: `build` waits for it, so
+    # a push that changes a chart and the code ships the chart first: a new key before
+    # the image that needs it (CLAUDE.md §8). Beside the brain job, which does not need
+    # it. Same token and same rebase-and-retry push as ghcr-build-push.yml.
+    needs: [changes, test]
+    if: ${{ github.ref_name == 'main' && needs.changes.outputs.charts == 'true' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -332,75 +297,44 @@ jobs:
           echo "could not push after 5 attempts"
           exit 1
 
-  build-cluster-upgrade-worker:
-    # The per-MCE limb (activities/cluster_upgrade/), the workflow ServiceAccount.
-    needs: [changes, sync-upgrade-charts]
-    if: ${{ !cancelled() && !failure() && contains(fromJSON(needs.changes.outputs.images || '[]'), 'cluster-upgrade-worker') }}
+  build:
+    # Every image but the brain, one job each, side by side: the eight limbs and the
+    # docs site, each a row of .github/image-builds.json (the reusable workflow's
+    # inputs), and only the rows of this push's images (`changes`, from
+    # scripts/image_changes.py --matrix). Until 2026-11-16 they were ten jobs in one
+    # sequential chain, each waiting for the one before, so a run that built every
+    # image took the sum of their builds and one failure skipped every job behind it.
+    #
+    # fail-fast off: a failing image cancels no other. It stays unbuilt until a later
+    # push, which measures from the last run that succeeded and so builds it again.
+    #
+    # At most three at a time, because each job's last step pushes its bump to the same
+    # redbull-platform `main`. The reusable workflow retries a rejected push five times
+    # on a rebase; with n jobs pushing together, one loses at most n-1 times, so three
+    # stay well inside that and leave room for another repo's push. Nine images are three
+    # rounds either way at three or at four; more waits on a sturdier retry there.
+    #
+    # `!cancelled() && !failure()`: a job whose `needs` was skipped is itself skipped by
+    # default, so without a status function a push that does not touch the brain would
+    # skip every image. `!failure()` still stops on a real failure upstream: a red `test`,
+    # a brain that did not ship, charts that did not sync.
+    name: build ${{ matrix.image-name }}
+    needs: [changes, test, build-workflow-brain, sync-upgrade-charts]
+    if: ${{ !cancelled() && !failure() && needs.changes.outputs.matrix != '' }}
+    permissions:
+      contents: write             # what the reusable workflow declares; it pushes to
+      packages: write             # GHCR with this token, to redbull-platform with its own
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix: ${{ fromJSON(needs.changes.outputs.matrix) }}
     uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
     with:
-      image-name: cluster-upgrade-worker
-      dockerfile: activities/cluster_upgrade/Dockerfile
+      image-name: ${{ matrix.image-name }}
+      dockerfile: ${{ matrix.dockerfile }}
       chart-repo: team-redbull/redbull-platform
-      helm-values-path: gitops/charts/cluster-upgrade-worker/values.yaml
-      helm-image-path: image
-    secrets: inherit
-
-  build-upgrade-agent-worker:
-    # The per-MCE agent limb (activities/upgrade_agent/): calls the upgrade agent service.
-    needs: [changes, build-cluster-upgrade-worker]
-    if: ${{ !cancelled() && !failure() && contains(fromJSON(needs.changes.outputs.images || '[]'), 'upgrade-agent-worker') }}
-    uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
-    with:
-      image-name: upgrade-agent-worker
-      dockerfile: activities/upgrade_agent/Dockerfile
-      chart-repo: team-redbull/redbull-platform
-      helm-values-path: gitops/charts/upgrade-agent-worker/values.yaml
-      helm-image-path: image
-    secrets: inherit
-
-  build-upgrade-gitops-worker:
-    # The hub limb (activities/upgrade_gitops/: git, oc, the registry).
-    needs: [changes, build-upgrade-agent-worker]
-    if: ${{ !cancelled() && !failure() && contains(fromJSON(needs.changes.outputs.images || '[]'), 'upgrade-gitops-worker') }}
-    uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
-    with:
-      image-name: upgrade-gitops-worker
-      dockerfile: activities/upgrade_gitops/Dockerfile
-      chart-repo: team-redbull/redbull-platform
-      helm-values-path: gitops/charts/upgrade-gitops-worker/values.yaml
-      helm-image-path: image
-    secrets: inherit
-
-  build-vm-lifecycle-worker:
-    # The create-vm limb (activities/vm_lifecycle/). Near the end of the chain on purpose:
-    # its chart (gitops/charts/vm-lifecycle-worker/ in redbull-platform) is not on that
-    # repo's main yet, so the image-tag bump fails until it lands, and a failure here must
-    # not stop any other image. It could move beside the other hub limbs once the chart is there.
-    needs: [changes, build-upgrade-gitops-worker]
-    if: ${{ !cancelled() && !failure() && contains(fromJSON(needs.changes.outputs.images || '[]'), 'vm-lifecycle-worker') }}
-    uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
-    with:
-      image-name: vm-lifecycle-worker
-      dockerfile: activities/vm_lifecycle/Dockerfile
-      chart-repo: team-redbull/redbull-platform
-      helm-values-path: gitops/charts/vm-lifecycle-worker/values.yaml
-      helm-image-path: activityWorker.image
-    secrets: inherit
-
-  build-cluster-lifecycle-worker:
-    # The provision-cluster limb (activities/cluster_lifecycle/). LAST in the chain for the
-    # same reason as the vm-lifecycle one: its chart (gitops/charts/cluster-lifecycle-worker/
-    # in redbull-platform) lands on that repo's main first, and until it has, the bump fails
-    # without stopping any other image.
-    needs: [changes, build-vm-lifecycle-worker]
-    if: ${{ !cancelled() && !failure() && contains(fromJSON(needs.changes.outputs.images || '[]'), 'cluster-lifecycle-worker') }}
-    uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
-    with:
-      image-name: cluster-lifecycle-worker
-      dockerfile: activities/cluster_lifecycle/Dockerfile
-      chart-repo: team-redbull/redbull-platform
-      helm-values-path: gitops/charts/cluster-lifecycle-worker/values.yaml
-      helm-image-path: activityWorker.image
+      helm-values-path: ${{ matrix.helm-values-path }}
+      helm-image-path: ${{ matrix.helm-image-path }}
     secrets: inherit
 
   cleanup-workflow-brain-on-delete:

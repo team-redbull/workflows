@@ -22,12 +22,17 @@ Checker ids in brackets.
   a push touches: `scripts/image_changes.py` builds an image only when a file IT LOADS
   changed (the imports followed from its entrypoint; its Dockerfile and requirements),
   measured since the last fully successful run on the branch, and builds WIDE whenever it
-  cannot tell (a data file, a deletion, the script or `build.yml` itself). Each build job
-  is gated on its OWN image name in that list. [DL002] Every image job uses the reusable
-  `ghcr-build-push.yml` (it bumps redbull-platform `main`, which deploys) and they form one sequential chain guarded by
-  `!cancelled() && !failure()`. So a `main` build is tagged `vX.Y.Z`, never by commit sha:
-  no image-only job (the operator, 2026-11-02); vendor a new limb's chart in
-  redbull-platform first. A new limb adds `build-<limb>-worker` and
+  cannot tell (a data file, a deletion, the script or `build.yml` itself). The brain job
+  is gated on its own name in that list; every other image is a row of
+  `.github/image-builds.json`, and `image_changes.py --matrix` gives the `build` job the
+  rows of the listed images — never a second decision in YAML or shell. [DL002] Every
+  image is built by the reusable `ghcr-build-push.yml` (it bumps redbull-platform `main`,
+  which deploys): the brain FIRST and alone, `sync-upgrade-charts` beside it, then the
+  `build` matrix, one job per image, `fail-fast: false`, `max-parallel: 3` (each pushes
+  to that one `main`), behind `!cancelled() && !failure()`. So a `main` build is tagged
+  `vX.Y.Z`, never by commit sha: no image-only job (the operator, 2026-11-02); vendor a
+  new limb's chart in redbull-platform first. A new limb adds its row (its own image
+  name, Dockerfile and `gitops/charts/<limb>-worker/values.yaml`) and
   `cleanup-<limb>-worker-on-delete`. [DL002]
 - **Order that keeps prod up**: brain image before limbs; a chart ships a new key before
   the image needs it and drops one only after the image stopped needing it; the brain

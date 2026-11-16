@@ -20,8 +20,8 @@ helm install upgrade-agent-worker <chart dir> -n upgrade-agent \
 `<chart dir>`: this chart, in the workflows repo at `deploy/charts/upgrade-agent-worker/` or its
 copy in redbull-platform at `gitops/charts/upgrade-agent-worker/` (no `gitops/services/` entry
 yet, so Argo CD deploys nothing from it; CI's `sync-upgrade-charts` copies this chart there on
-every push to `main` that changes it, so edit it here, never there). `<vX.Y.Z>`: every push to `main` that touches `activities/` or `shared/` publishes
-`ghcr.io/team-redbull/upgrade-agent-worker:vX.Y.Z` (`build-upgrade-agent-worker`, the shared
+every push to `main` that changes it, so edit it here, never there). `<vX.Y.Z>`: every push to `main` that changes a file this limb loads publishes
+`ghcr.io/team-redbull/upgrade-agent-worker:vX.Y.Z` (its job in CI's `build` matrix, on the shared
 build workflow) and writes that tag into redbull-platform's copy, so installed from there
 `image.tag` can be left unset. A branch build is tagged `<branch-slug>-<short sha>`.
 

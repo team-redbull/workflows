@@ -727,7 +727,7 @@ they are up, a run waits with every cluster `no-agent`.
 ### `provision-cluster` — a hosted cluster from the YAML a person wrote
 
 The body **is the hosted-cluster file**, as a person would commit it to day1 —
-without `vlanId`, `dhcp_values` or `mcConfigMap`; the cluster and its MCE folder
+without `vlanId`, `dhcp_values`, `mcConfigMap` or `tuningConfigmap`; the cluster and its MCE folder
 are query parameters (Swagger's "Try it out" shows this file pre-filled):
 
 ```
@@ -761,7 +761,8 @@ awaited child** (a /24 at the folder's site, verified), the text plus the
 allocation block is pushed to `provision-cluster/<cluster>` (created from main
 by the push, **no `[skip ci]`**: the day1 CI chain runs on the branch, skips
 allocation, renders the MachineConfigs and pushes its own `mcConfigMap` commit
-on top), the merge request is opened (GitLab's API, with
+on top, with `tuningConfigmap` — the tuning profiles the nodepools'
+`tuningConfig` names, from day1's `tuning/` catalogue), the merge request is opened (GitLab's API, with
 `remove_source_branch`), and the run **waits
 for a person to merge it** — no deadline, a 5-minute durable timer, continued
 as new every 48 polls so history stays short. After the merge it registers the
@@ -775,7 +776,7 @@ is past its merge) — and completes. A merge request closed without merging
 fails the run.
 
 Re-running the same cluster converges: the branch's file is compared
-semantically (the chain's `mcConfigMap` set aside), the open merge request is
+semantically (the chain's `mcConfigMap` and `tuningConfigmap` set aside), the open merge request is
 found, folders already there are success. A cluster already on `main` fails
 `ClusterAlreadyProvisionedError` at once; a second request while a run waits
 for its merge is a 409. See `docs/design/provision-cluster.md` and the

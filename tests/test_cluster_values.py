@@ -4,7 +4,8 @@ Pure functions over strings and a tmp_path day1 layout — no git, no Temporal.
 Three contracts: validate_cluster_values collects EVERY reason into one
 ClusterValuesRejectedError; assemble_cluster_file appends the allocation
 block to the person's text byte for byte; same_cluster_file judges a branch
-file semantically, with the day1 chain's appended mcConfigMap set aside.
+file semantically, with the day1 chain's appended mcConfigMap and
+tuningConfigmap set aside.
 """
 
 from __future__ import annotations
@@ -117,10 +118,21 @@ class TestValidation:
         text = EXAMPLE_CLUSTER_FILE + "- infraEnvName: other\n  replicas: 1\n  configs:\n  - name: nic-ring-buffer\n  - name: extra\n"
         assert _validate(tmp_path, text).config_names[-2:] == ["workers-chrony-configuration", "extra"]
 
-    @pytest.mark.parametrize("key", ["vlanId: 5", "dhcp_values:\n  network: \"10.0.0.0\"", "mcConfigMap: []", 'AutomateAllocation: "false"'])
+    @pytest.mark.parametrize(
+        "key",
+        ["vlanId: 5", "dhcp_values:\n  network: \"10.0.0.0\"", "mcConfigMap: []", "tuningConfigmap: []", 'AutomateAllocation: "false"'],
+    )
     def test_each_key_the_run_or_the_chain_writes_is_refused(self, tmp_path, key):
         _layers(tmp_path)
         assert "must not be in the file" in _reasons(tmp_path, EXAMPLE_CLUSTER_FILE + key + "\n")
+
+    @pytest.mark.parametrize("names", ["tuned-workers", "[tuned-workers, perf-workers]"], ids=["one", "several"])
+    def test_a_nodepools_tuning_names_are_the_persons_to_write(self, tmp_path, names):
+        """tuningConfig (a name, or a list) is the person's; the chain injects the profiles."""
+        _layers(tmp_path)
+        text = EXAMPLE_CLUSTER_FILE.replace("  replicas: 2\n", f"  replicas: 2\n  tuningConfig: {names}\n", 1)
+        assert "tuningConfig" in text
+        _validate(tmp_path, text)
 
     def test_an_explicit_cluster_name_equal_to_the_derived_one_is_fine(self, tmp_path):
         _layers(tmp_path)
@@ -263,6 +275,17 @@ mcConfigMap:
 """
 
 
+# What the day1 chain's tuning injector appends after mcConfigMap: each profile a
+# nodepool's tuningConfig names, from the day1 repo's tuning/ catalogue.
+TUNING_SECTION = """
+tuningConfigmap:
+- name: tuned-workers
+  tuning: |
+    apiVersion: tuned.openshift.io/v1
+    kind: Tuned
+"""
+
+
 class TestTheRerunCheck:
     def setup_method(self):
         self.assembled = cluster_values.assemble_cluster_file(EXAMPLE_CLUSTER_FILE, 23, DHCP)
@@ -274,6 +297,10 @@ class TestTheRerunCheck:
     def test_the_chains_appended_mc_config_map_is_not_a_difference(self, header):
         section = CHAIN_SECTION.replace("\nmcConfigMap:", "\n" + header + "mcConfigMap:")
         assert cluster_values.same_cluster_file(self.assembled + section, self.assembled) is None
+
+    def test_the_chains_appended_tuning_configmap_is_not_a_difference(self):
+        assert cluster_values.same_cluster_file(self.assembled + CHAIN_SECTION + TUNING_SECTION, self.assembled) is None
+        assert cluster_values.same_cluster_file(self.assembled + TUNING_SECTION, self.assembled) is None
 
     def test_the_chains_blank_line_respacing_is_not_a_difference(self):
         respaced = self.assembled.replace("\n\n", "\n").replace("nodepool:", "\nnodepool:") + "\n\n\n" + CHAIN_SECTION

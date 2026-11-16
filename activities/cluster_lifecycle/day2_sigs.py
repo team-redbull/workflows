@@ -24,8 +24,6 @@ folder created before the merge breaks that sig's whole render
 from __future__ import annotations
 
 import re
-import tempfile
-from pathlib import Path
 
 from activities import git_repo
 from activities.cluster_lifecycle.day1_writer import PROVISION_AUTHOR
@@ -36,7 +34,6 @@ GITKEEP = ".gitkeep"
 # One path segment each, as add-cluster-to-day2.sh accepts them: a value from
 # the API or the value layers must never reach the path as `..` or `a/b`.
 _SEGMENT = re.compile(r"^[a-z0-9][a-z0-9-]*$")
-_SYMREF = re.compile(r"^ref: refs/heads/(?P<branch>\S+)\tHEAD$", re.M)
 
 
 def _segment(value: str, what: str) -> str:
@@ -53,40 +50,21 @@ def cluster_folder(request: Day2SigRegistrationRequest) -> str:
     ])
 
 
-async def default_branch(*, repo_url: str, token: str) -> str:
-    """The sig repo's default branch, from `git ls-remote --symref <url> HEAD`."""
-    returncode, stdout, stderr = await git_repo.exec_git(
-        ["ls-remote", "--symref", git_repo.authenticated_url(repo_url, token), "HEAD"], cwd=None, secrets=[token]
-    )
-    if returncode != 0:
-        raise ValuesRepoGitError(f"git ls-remote --symref on the sig repo failed (exit {returncode}): {stderr}")
-    match = _SYMREF.search(stdout)
-    if match is None:
-        raise ValuesRepoGitError("the sig repo reported no default branch (ls-remote --symref HEAD gave no symref)")
-    return match.group("branch")
-
-
 async def register(*, repo_url: str, token: str, request: Day2SigRegistrationRequest) -> Day2SigRegistration:
     """The cluster's folder in the sig repo: created on the default branch, or already there."""
     _segment(request.sig, "sig")
     folder = cluster_folder(request)
-    branch = await default_branch(repo_url=repo_url, token=token)
-    with tempfile.TemporaryDirectory(prefix="day2-sig-") as tmp:
-        clone = Path(tmp) / "repo"
-        await git_repo.clone(
-            repo_url=repo_url, branch=branch, token=token, dest=clone,
-            missing_message=f"the sig repo's default branch {branch!r} vanished between ls-remote and the clone",
-        )
-        target = clone / folder
+    branch = await git_repo.default_branch(repo_url=repo_url, token=token, repo="sig")
+    async with git_repo.fresh_clone(
+        repo_url=repo_url, token=token, repo="sig", prefix="day2-sig-", branch=branch,
+        missing_message=f"the sig repo's default branch {branch!r} vanished between ls-remote and the clone",
+    ) as sig:
+        target = sig.path / folder
         if target.is_dir():
             return Day2SigRegistration(sig=request.sig, path=folder, created=False, commit_sha=None)
         target.mkdir(parents=True)
         (target / GITKEEP).write_text("", encoding="utf-8")
-        sha = await git_repo.commit_and_push(
-            clone,
-            repo_url=repo_url,
-            token=token,
-            branch=branch,
+        sha = await sig.commit_and_push(
             paths=[f"{folder}/{GITKEEP}"],
             message=f"chore: register {request.cluster} in day2 ({request.sig}) [provision-cluster-workflow]",
             author=PROVISION_AUTHOR,

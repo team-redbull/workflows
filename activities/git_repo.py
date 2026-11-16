@@ -1,12 +1,17 @@
-"""Git by subprocess, for every limb that clones a repo — kept out of each limb's activities.py.
+"""Git by subprocess, THE git client of every limb that clones a repo — kept out of each limb's activities.py.
 
-Extracted from activities/segment_lifecycle/values_repo.py (DESIGN O15) when the
-cluster-upgrade hub limb needed the same client for day1, day2 and Brain:
-one git client, not two. values_repo.py keeps its own names for these, so the
-segment-lifecycle behaviour and its tests did not change.
+Used by cluster-lifecycle (day1_writer.py, day2_sigs.py), upgrade-gitops
+(day1, day2, Brain) and vm-lifecycle, the day1 reads through
+activities/day1_repo.py. No other module runs git. What a limb does with a
+clone — which file, and what "already done" means for it — stays the limb's;
+everything that is just git lives here. First extracted from
+segment-lifecycle's values_repo.py (DESIGN O15, since removed).
 
 Plain functions taking explicit parameters (never settings), so the offline
 tests drive them against a local bare repo with no network and no Temporal.
+A caller opens ONE `fresh_clone` per activity attempt and works through the
+`Clone` it yields (head, blob, commit_and_push, run_command), so the repo URL
+and token are passed once.
 
 Rules this module enforces (CLAUDE.md §5, "Git-subprocess activities"):
   * git runs via asyncio.create_subprocess_exec — no Python git dependency;
@@ -26,10 +31,13 @@ Rules this module enforces (CLAUDE.md §5, "Git-subprocess activities"):
     activities' 180s start_to_close_timeout, and no child process outlives its
     call: a timeout or a cancellation kills and reaps it first.
   * A clone first checks its branch with `git ls-remote --exit-code --heads`
-    on the FULL ref: exit 2 is the deterministic ValuesBranchNotFoundError,
-    anything else the retryable ValuesRepoGitError (unreachable is not missing).
+    on the FULL ref: exit 2 is ValuesBranchNotFoundError, anything else
+    ValuesRepoGitError (unreachable is not missing). The CALLER classifies a
+    missing branch: the workflows retry it (a repo without `main` is fixed,
+    not failed on; tests/test_error_classification.py), upgrade-gitops's
+    write_incident turns it into a note.
   * ONE clone per activity attempt: a rejected push raises the retryable
-    ValuesRepoGitError and Temporal's retry re-clones (values_repo.py's rule).
+    ValuesRepoGitError and Temporal's retry re-clones.
     No retry loop runs inside an attempt — it could not fit the 180s.
 """
 
@@ -37,7 +45,11 @@ from __future__ import annotations
 
 import asyncio
 import os
-from dataclasses import dataclass
+import re
+import tempfile
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from shared.exceptions import ValuesBranchNotFoundError, ValuesRepoGitError
@@ -53,9 +65,12 @@ GIT_COMMAND_TIMEOUT_SECONDS = 150.0
 # matching ref — the one answer that means "this branch does not exist".
 _LS_REMOTE_NO_MATCHING_REF = 2
 
-# The cluster-upgrade hub limb's repos (day1, day2, Brain) are read and written
-# at `main` only: Argo CD renders day1's main and nothing else.
+# day1, day2 and Brain are read and written at `main` only: Argo CD renders
+# day1's main and nothing else. A sig repo is worked on its default branch.
 MAIN = "main"
+
+# `git ls-remote --symref <url> HEAD` names the default branch on this line.
+_SYMREF = re.compile(r"^ref: refs/heads/(?P<branch>\S+)\tHEAD$", re.M)
 
 # What a repo's script prints is cut to its last characters in a MESSAGE (it
 # lands in history) — never before the caller has read all of it.
@@ -69,7 +84,7 @@ class GitIdentity:
 
 
 # Who the cluster-upgrade hub limb's commits are by, in day1 and Brain.
-# Hard-coded, not configured, like values_repo.GIT_USER_NAME: it identifies the
+# Hard-coded, not configured, like every writer's identity: it identifies the
 # writer, so it must not vary per environment.
 UPGRADE_AUTHOR = GitIdentity(name="cluster-upgrade-workflow", email="cluster-upgrade-workflow@redbull.local")
 
@@ -179,9 +194,9 @@ async def require_branch(
     git failure and raises the RETRYABLE ValuesRepoGitError, so a mistyped or
     deleted branch would retry every minute forever. ls-remote's --exit-code
     separates the two: exit 2 means the remote answered and holds no such ref
-    (ValuesBranchNotFoundError, non-retryable, carrying `missing_message`);
-    anything else — auth, DNS, a missing repo, a timeout — is an unreachable
-    remote and stays retryable.
+    (ValuesBranchNotFoundError, carrying `missing_message`); anything else —
+    auth, DNS, a missing repo, a timeout — is an unreachable remote
+    (ValuesRepoGitError). The calling workflow classifies both.
 
     The branch is matched as the FULL ref refs/heads/<branch>: a bare pattern
     would tail-match, so `x` would be "found" as `feature/x`.
@@ -201,6 +216,29 @@ async def require_branch(
             f"git ls-remote for branch {branch!r} failed (exit {returncode}): "
             f"{stderr}"
         )
+
+
+async def branch_exists(*, repo_url: str, branch: str, token: str) -> bool:
+    """Whether the remote has the branch (require_branch's classification:
+    absent is a False, unreachable stays the ValuesRepoGitError)."""
+    try:
+        await require_branch(repo_url=repo_url, branch=branch, token=token, missing_message="absent")
+    except ValuesBranchNotFoundError:
+        return False
+    return True
+
+
+async def default_branch(*, repo_url: str, token: str, repo: str) -> str:
+    """The remote's default branch, from `git ls-remote --symref <url> HEAD`; `repo` names it in an error."""
+    returncode, stdout, stderr = await exec_git(
+        ["ls-remote", "--symref", authenticated_url(repo_url, token), "HEAD"], cwd=None, secrets=[token]
+    )
+    if returncode != 0:
+        raise ValuesRepoGitError(f"git ls-remote --symref on the {repo} repo failed (exit {returncode}): {stderr}")
+    match = _SYMREF.search(stdout)
+    if match is None:
+        raise ValuesRepoGitError(f"the {repo} repo reported no default branch (ls-remote --symref HEAD gave no symref)")
+    return match.group("branch")
 
 
 async def clone(
@@ -234,12 +272,70 @@ async def clone(
     await run_git(["remote", "set-url", "origin", repo_url], cwd=dest, secrets=[token])
 
 
-async def clone_main(*, repo_url: str, token: str, dest: Path, repo: str) -> None:
-    """clone() of `main`, the one branch the hub limb's repos are worked on; `repo` names the repo in its error."""
-    await clone(
-        repo_url=repo_url, branch=MAIN, token=token, dest=dest,
-        missing_message=f"the {repo} repo has no `{MAIN}` branch",
-    )
+@dataclass(frozen=True)
+class Clone:
+    """One fresh clone of `branch` (fresh_clone), for ONE activity attempt.
+
+    Carries the remote and its token so a caller passes them once. Each method
+    is the module function of the same name, looked up when called (tests
+    replace `git_repo.commit_and_push` to race a push)."""
+
+    path: Path
+    repo_url: str
+    token: str = field(repr=False)
+    branch: str = MAIN
+
+    async def head(self) -> str:
+        """The commit the clone is at."""
+        return (await run_git(["rev-parse", "HEAD"], cwd=self.path, secrets=[self.token])).strip()
+
+    async def blob(self, relative: str) -> str:
+        """The git blob id of `relative` at HEAD: what a compare-and-set compares."""
+        return (await run_git(["rev-parse", f"HEAD:{relative}"], cwd=self.path, secrets=[self.token])).strip()
+
+    async def commit_and_push(
+        self, *, paths: list[str], message: str, author: GitIdentity, branch: str | None = None
+    ) -> str:
+        """commit_and_push() to `branch`, the cloned branch unless named; the new commit's sha."""
+        return await commit_and_push(
+            self.path,
+            repo_url=self.repo_url,
+            token=self.token,
+            branch=branch or self.branch,
+            paths=paths,
+            message=message,
+            author=author,
+        )
+
+    async def run_command(self, argv: list[str], *, timeout: float) -> tuple[int, str]:
+        """run_command() in this clone, the token scrubbed from its output."""
+        return await run_command(argv, cwd=self.path, secrets=[self.token], timeout=timeout)
+
+
+@asynccontextmanager
+async def fresh_clone(
+    *,
+    repo_url: str,
+    token: str,
+    repo: str,
+    prefix: str,
+    branch: str = MAIN,
+    missing_message: str | None = None,
+) -> AsyncIterator[Clone]:
+    """clone() of `branch` into a new TemporaryDirectory, removed on exit.
+
+    `repo` names the repo in the missing-branch error unless `missing_message`
+    says more; `prefix` names the temporary directory."""
+    with tempfile.TemporaryDirectory(prefix=prefix) as tmp:
+        dest = Path(tmp) / "repo"
+        await clone(
+            repo_url=repo_url,
+            branch=branch,
+            token=token,
+            dest=dest,
+            missing_message=missing_message or f"the {repo} repo has no `{branch}` branch",
+        )
+        yield Clone(path=dest, repo_url=repo_url, token=token, branch=branch)
 
 
 async def commit_and_push(

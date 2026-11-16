@@ -117,6 +117,18 @@ INTERFACE_ALLOWED_TOP_LEVEL = {"temporalio", "shared", "typing", "datetime", "en
 
 GLOBAL_CONFIGMAP_KEYS = {"TEMPORAL_HOST", "TEMPORAL_NAMESPACE", "SEGMENTS_MANAGER_URL"}
 TEMPORAL_CLIENT_MODULE = ("shared", "temporal_client.py")
+GIT_CLIENT_MODULE = ("activities", "git_repo.py")
+# git_repo's one-command and one-step functions: a caller opens a fresh_clone and
+# works through the Clone it yields (CLAUDE.md §5), so none is called from outside.
+GIT_REPO_LOW_LEVEL = {"exec_git", "run_git", "clone", "commit_and_push", "run_command"}
+# Python git libraries: git runs as a subprocess, never through a dependency (§5).
+PYTHON_GIT_LIBRARIES = {"git", "pygit2", "dulwich"}
+# What starts a process, by the dotted origin of the called name.
+PROCESS_STARTERS = {
+    "asyncio.create_subprocess_exec", "asyncio.create_subprocess_shell",
+    "subprocess.run", "subprocess.Popen", "subprocess.call", "subprocess.check_call",
+    "subprocess.check_output", "os.system", "os.popen",
+}
 
 _PRAGMA = re.compile(
     r"#\s*conventions:\s*allow\s+((?:[A-Z]{2}\d{3})(?:\s*,\s*[A-Z]{2}\d{3})*)\s*(?:—|–|-|:)+\s*\S"
@@ -825,6 +837,60 @@ def check_client_connect(path: Path, tree: ast.Module, report: _Report) -> None:
                 report.error(path, node.lineno, "EP001", "`Client.connect(...)` without `data_converter=pydantic_data_converter` (§5)")
 
 
+def _starts_git(node: ast.Call) -> bool:
+    """The call's command is literally git: `"git"`, `"git ..."` or `["git", ...]`."""
+    if not node.args:
+        return False
+    first = node.args[0]
+    if isinstance(first, (ast.List, ast.Tuple)) and first.elts:
+        first = first.elts[0]
+    return isinstance(first, ast.Constant) and isinstance(first.value, str) and (
+        first.value == "git" or first.value.startswith("git ")
+    )
+
+
+def check_git_client(path: Path, tree: ast.Module, report: _Report) -> None:
+    """AC008 — CLAUDE.md §5: git runs ONLY in activities/git_repo.py, and a caller
+    works through `fresh_clone` and its `Clone`, never git_repo's one-command
+    functions — so the token scrubbing, the timeouts and the one-clean-clone-per-
+    attempt rule hold for every limb."""
+    parts = _relparts(path) or tuple(path.parts[-2:])
+    if tuple(parts[-2:]) == GIT_CLIENT_MODULE:
+        return
+    imported = _imported_names(tree)
+    for package, line in _top_level_imports(tree):
+        if package in PYTHON_GIT_LIBRARIES:
+            report.error(
+                path, line, "AC008",
+                f"`{package}` is a Python git library — git runs as a subprocess, through "
+                "activities/git_repo.py (§5)",
+            )
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Name):
+            origin = imported.get(func.id, "")
+        else:
+            dotted = _dotted(func)
+            head, _, rest = dotted.partition(".")
+            origin = f"{imported[head]}.{rest}" if head in imported and rest else dotted
+        if origin in PROCESS_STARTERS and _starts_git(node):
+            report.error(
+                path, node.lineno, "AC008",
+                "git started outside activities/git_repo.py — add what you need there, where the "
+                "token is scrubbed and every command has its timeout (§5)",
+            )
+        module, _, name = origin.rpartition(".")
+        if module == "activities.git_repo" and name in GIT_REPO_LOW_LEVEL:
+            report.error(
+                path, node.lineno, "AC008",
+                f"`git_repo.{name}` called outside activities/git_repo.py — open ONE "
+                "`git_repo.fresh_clone(...)` (day1 main: `day1_repo.fresh_main`) per attempt and "
+                "work through its `Clone`; a missing git step belongs in git_repo.py (§5)",
+            )
+
+
 # --- per-file dispatch --------------------------------------------------------------
 
 
@@ -854,6 +920,7 @@ def check_tree(path: Path, parts: tuple[str, ...], tree: ast.Module, report: _Re
         return
 
     check_client_connect(path, tree, report)
+    check_git_client(path, tree, report)
 
     if parts[0] == SHARED_DIR:
         check_shared_module(path, tree, report)

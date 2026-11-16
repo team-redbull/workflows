@@ -16,10 +16,9 @@ whose NODES are VMs; the folder is.
 
 from __future__ import annotations
 
-import tempfile
 from pathlib import Path
 
-from activities.day1_repo import clone_main, head, list_cluster_files, load_cluster_values
+from activities.day1_repo import fresh_main, list_cluster_files, load_cluster_values
 from shared.cluster_names import name_token, seed_cluster
 from shared.models.vm_lifecycle import KvClusterEntry, KvClusterList
 
@@ -35,9 +34,8 @@ async def list_kv_clusters(*, repo_url: str, token: str, site: str, zone: str) -
     site = name_token(site, "site")
     zone = name_token(zone, "zone")
     seed = seed_cluster(site, zone)
-    with tempfile.TemporaryDirectory(prefix="day1-kv-") as tmp:
-        clone = Path(tmp) / "repo"
-        await clone_main(repo_url=repo_url, token=token, dest=clone)
+    async with fresh_main(repo_url=repo_url, token=token, prefix="day1-kv-") as day1:
+        clone = day1.path
         entries: list[KvClusterEntry] = []
         for path in list_cluster_files(clone, site, seed):
             values = load_cluster_values(clone, path)
@@ -50,4 +48,4 @@ async def list_kv_clusters(*, repo_url: str, token: str, site: str, zone: str) -
                     problems=list(values.problems),
                 )
             )
-        return KvClusterList(clusters=entries, revision=await head(clone, token=token))
+        return KvClusterList(clusters=entries, revision=await day1.head())

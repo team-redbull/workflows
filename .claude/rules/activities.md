@@ -32,6 +32,9 @@ CLAUDE.md §1, §2, §5, §6, §7. Checker ids in brackets.
 - **Subprocesses and secrets**: `asyncio.create_subprocess_exec` under a timeout, a fresh
   `TemporaryDirectory` per attempt, every token scrubbed from error text BEFORE the
   exception is built.
+- **Git only through `activities/git_repo.py`**: one `fresh_clone` (day1 `main`:
+  `day1_repo.fresh_main`) per attempt, worked through its `Clone`; the limb's module keeps
+  only its file and its "already done" rule. No generic git activities (CLAUDE.md §5). [AC008]
 - **Settings**: `<Limb>ActivitySettings()` at module level (fail-fast). A new key goes in
   the limb's OWN module `shared/settings/<limb>.py` (imported from that module, never from
   the package), `.env.example`, `tests/conftest.py` and the chart, which ships first.

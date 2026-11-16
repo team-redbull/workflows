@@ -16,7 +16,6 @@ activities/git_repo.py, read-only.
 
 from __future__ import annotations
 
-import tempfile
 from pathlib import Path
 
 from activities import git_repo
@@ -56,7 +55,5 @@ def layer_gaps(root: Path, cluster: str, versions: list[str]) -> list[Day2LayerG
 
 
 async def check_layers(*, repo_url: str, token: str, cluster: str, versions: list[str]) -> Day2Layers:
-    with tempfile.TemporaryDirectory(prefix="day2-layers-") as tmp:
-        clone = Path(tmp) / "repo"
-        await git_repo.clone_main(repo_url=repo_url, token=token, dest=clone, repo="day2")
-        return Day2Layers(missing=layer_gaps(clone, cluster, versions))
+    async with git_repo.fresh_clone(repo_url=repo_url, token=token, repo="day2", prefix="day2-layers-") as day2:
+        return Day2Layers(missing=layer_gaps(day2.path, cluster, versions))

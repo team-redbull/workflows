@@ -20,12 +20,11 @@ from __future__ import annotations
 
 import shlex
 import sys
-import tempfile
 from pathlib import Path
 
 from activities import git_repo
 from activities.upgrade_gitops import day1_values, upgrade_rules
-from activities.day1_repo import blob, clone_main, head  # the monorepo's day1 reader
+from activities.day1_repo import fresh_main  # the monorepo's day1 reader
 from shared.exceptions import (
     AmbiguousClusterFileError,
     ClusterFileNotFoundError,
@@ -44,9 +43,8 @@ VALIDATOR_TIMEOUT_SECONDS = 90.0
 
 async def read_rules(*, repo_url: str, token: str, mce_cluster: str) -> UpgradeRules:
     """`upgrade/ladder.yaml` + `upgrade/mces/<mce>.yaml` at main, after day1's validator passed them."""
-    with tempfile.TemporaryDirectory(prefix="day1-rules-") as tmp:
-        clone = Path(tmp) / "repo"
-        await clone_main(repo_url=repo_url, token=token, dest=clone)
+    async with fresh_main(repo_url=repo_url, token=token, prefix="day1-rules-") as day1:
+        clone = day1.path
         ladder = clone / upgrade_rules.LADDER_FILE
         mce = clone / upgrade_rules.mce_file(mce_cluster)
         missing = [str(path.relative_to(clone)) for path in (ladder, mce) if not path.is_file()]
@@ -55,14 +53,14 @@ async def read_rules(*, repo_url: str, token: str, mce_cluster: str) -> UpgradeR
         validator = clone / upgrade_rules.VALIDATOR
         if not validator.is_file():
             raise UpgradeRulesInvalidError(f"day1 main has no {upgrade_rules.VALIDATOR} to validate the rules with")
-        code, output = await git_repo.run_command(
+        code, output = await day1.run_command(
             [sys.executable, upgrade_rules.VALIDATOR, "--repo-root", str(clone)],
-            cwd=clone, secrets=[token], timeout=VALIDATOR_TIMEOUT_SECONDS,
+            timeout=VALIDATOR_TIMEOUT_SECONDS,
         )
         if code != 0:
             raise UpgradeRulesInvalidError(f"{upgrade_rules.VALIDATOR} refused the rules:\n{git_repo.tail(output)}")
         return upgrade_rules.parse_rules(
-            revision=await head(clone, token=token),
+            revision=await day1.head(),
             ladder_text=ladder.read_text(encoding="utf-8"),
             mce_text=mce.read_text(encoding="utf-8"),
             mce_cluster=mce_cluster,
@@ -98,13 +96,9 @@ def find_cluster_file(clone: Path, cluster: str) -> str:
 
 
 async def read_cluster(*, repo_url: str, token: str, cluster: str) -> Day1Cluster:
-    with tempfile.TemporaryDirectory(prefix="day1-cluster-") as tmp:
-        clone = Path(tmp) / "repo"
-        await clone_main(repo_url=repo_url, token=token, dest=clone)
-        path = find_cluster_file(clone, cluster)
-        return day1_values.read_cluster(
-            clone, path, revision=await head(clone, token=token), blob=await blob(clone, path, token=token)
-        )
+    async with fresh_main(repo_url=repo_url, token=token, prefix="day1-cluster-") as day1:
+        path = find_cluster_file(day1.path, cluster)
+        return day1_values.read_cluster(day1.path, path, revision=await day1.head(), blob=await day1.blob(path))
 
 
 # --- commit_day1_change ---------------------------------------------------------------------
@@ -141,18 +135,17 @@ async def commit_change(
     not read its own commit as someone else's edit. A push rejected because
     main moved raises the retryable ValuesRepoGitError (git_repo.commit_and_push)
     and the retry re-clones, where the compare-and-set runs again. No retry
-    loop here: one could not fit the activity's 180s (values_repo.py's rule).
+    loop here: one could not fit the activity's 180s.
     Committed as git_repo.UPGRADE_AUTHOR.
     """
     _require_cluster_path(request)
-    with tempfile.TemporaryDirectory(prefix="day1-commit-") as tmp:
-        clone = Path(tmp) / "repo"
-        await clone_main(repo_url=repo_url, token=token, dest=clone)
+    async with fresh_main(repo_url=repo_url, token=token, prefix="day1-commit-") as day1:
+        clone = day1.path
         file = clone / request.path
         if not file.is_file():
             raise ClusterFileNotFoundError(f"{request.path} is no longer in day1 main")
         current = file.read_text(encoding="utf-8")
-        current_blob = await blob(clone, request.path, token=token)
+        current_blob = await day1.blob(request.path)
         changed_by_someone = request.expected_blob is not None and current_blob != request.expected_blob
         try:
             edit = day1_values.plan_edit(clone, request, current)
@@ -163,23 +156,15 @@ async def commit_change(
                 raise _changed(request, current_blob) from None
             raise
         if not edit.changed:
-            return Day1Commit(revision=await head(clone, token=token), blob=current_blob, changed=False)
+            return Day1Commit(revision=await day1.head(), blob=current_blob, changed=False)
         if changed_by_someone:
             raise _changed(request, current_blob)
         file.write_text(edit.text, encoding="utf-8")
         if validate_command:
-            code, output = await git_repo.run_command(
-                shlex.split(validate_command), cwd=clone, secrets=[token], timeout=VALIDATOR_TIMEOUT_SECONDS
-            )
+            code, output = await day1.run_command(shlex.split(validate_command), timeout=VALIDATOR_TIMEOUT_SECONDS)
             if code != 0:
                 raise Day1ChangeRejectedError(f"{validate_command} refused {edit.summary}:\n{git_repo.tail(output)}")
-        revision = await git_repo.commit_and_push(
-            clone,
-            repo_url=repo_url,
-            token=token,
-            branch=git_repo.MAIN,
-            paths=[request.path],
-            message=commit_message(request, edit.summary),
-            author=git_repo.UPGRADE_AUTHOR,
+        revision = await day1.commit_and_push(
+            paths=[request.path], message=commit_message(request, edit.summary), author=git_repo.UPGRADE_AUTHOR
         )
-        return Day1Commit(revision=revision, blob=await blob(clone, request.path, token=token), changed=True)
+        return Day1Commit(revision=revision, blob=await day1.blob(request.path), changed=True)

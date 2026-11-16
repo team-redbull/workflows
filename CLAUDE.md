@@ -24,7 +24,7 @@ every teammate; use them in this order and keep them in step:
   can be checked from source (sandbox imports, activity-call options, unbounded retries
   named through exception classes, no whole response body in an activity error,
   `ApplicationError` from workflow code, one `run()`
-  argument, `connect_temporal` only, interface ↔ implementation ↔ worker registration,
+  argument, `connect_temporal` only, git only through `activities/git_repo.py`'s `fresh_clone`, interface ↔ implementation ↔ worker registration,
   `_WORKER_SPECS`, router paths and 202s, Dockerfile CMDs, each limb's row in CI's build matrix
   naming its own image and chart, a settings package that re-exports nothing, a docs page per started workflow). It runs on every Edit/Write through the PostToolUse hook in
   `.claude/settings.json` (which also names the docs pages describing the edited file),
@@ -624,7 +624,7 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
     on it. NOT filtered by day1 `platform: kubevirt` — that key means a cluster whose NODES are VMs.
     The folder is built from VALIDATED tokens and read with `iterdir()`, never globbed with input.
   - **The day1 reader is SHARED, in `activities/day1_repo.py` next to `git_repo.py`, owned by no
-    domain** (clone/head/blob, the layer-merging `load_cluster_values` with its `ClusterValues`,
+    domain** (`fresh_main` — a `git_repo.Clone` of `main` — the layer-merging `load_cluster_values` with its `ClusterValues`,
     `list_cluster_files`): vm-lifecycle's `list_kv_clusters` and upgrade-gitops's `read_cluster`
     both build on it, and neither limb imports the other's domain for it (the operator,
     2026-11-05 — it first sat in `activities/vm_lifecycle/`, "owned by create-vm", which made the
@@ -809,8 +809,8 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   queue and `SegmentConversionConflictError`). The per-type things that remain are all about an
   ALLOCATION: the allocate id, the SM's (cluster, site, type) idempotency, the DHCP exclusion policy.
 - **The day1 values repo is reached by git subprocess** (`DAY1_REPO_URL`), never a Python git
-  dependency — see §5. ONE git client, `activities/git_repo.py`, shared by segment-lifecycle
-  (`values_repo.py` keeps its own names for it) and the cluster-upgrade hub limb.
+  dependency — see §5. ONE git client, `activities/git_repo.py`, shared by every limb that clones
+  (cluster-lifecycle, upgrade-gitops, vm-lifecycle; segment-lifecycle no longer touches git).
 - **The cluster-upgrade hub limb (`upgrade-gitops-worker`) works on `main` only**: Argo CD
   renders nothing else. It reads the rules after day1's own `scripts/validate_upgrade_rules.py`
   passed them, and a cluster file the way the hostedclusters-setup chart renders it — the value
@@ -1068,18 +1068,28 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   add-server-to-mce run failed at `acquire_servers` because `server_scan._detail` copied an error
   answer of more than 2 MiB whole (reproduced on a local dev server; server-scan's own `main` cannot
   send one, so it came from whatever answered at `SERVER_SCAN_URL`).
-- **Git-subprocess activities** (`activities/git_repo.py`, used by cluster-lifecycle's
-  `day1_writer.py` / `day2_sigs.py` and by upgrade-gitops): git runs via
+- **Git-subprocess activities** (checker AC008; `activities/git_repo.py`, THE one git client: cluster-lifecycle's
+  `day1_writer.py` / `day2_sigs.py`, upgrade-gitops's day1/day2/Brain modules and vm-lifecycle, the
+  day1 reads through `activities/day1_repo.py`; no other module runs git): git runs via
   `asyncio.create_subprocess_exec` (no Python git dependency; the limb Dockerfile installs the binary),
-  each command under a timeout below the git activities' 180s `start_to_close_timeout`, every clone in
-  a fresh `TemporaryDirectory` so retries start clean. The push token is injected into the clone URL in
+  each command under a timeout below the git activities' 180s `start_to_close_timeout`. A caller opens
+  ONE `git_repo.fresh_clone(...)` per attempt (day1 `main`: `day1_repo.fresh_main`) — a fresh
+  `TemporaryDirectory`, so retries start clean — and works through the `Clone` it yields (`head`,
+  `blob`, `commit_and_push`, `run_command`). Only what is GIT lives there: which file, and what
+  "already done" means (create-never-overwrite, a blob compare-and-set, a folder present), stays in
+  the limb's own module, inside the same clone as its push. Never generic git ACTIVITIES — a clone
+  cannot cross activities, the check must share the push's clone, and one git worker would hold every
+  limb's token (§2). The push token is injected into the clone URL in
   memory only and SCRUBBED from every error message BEFORE the exception is constructed — activity
   errors are recorded verbatim in Temporal history and the UI, so redacting at the logging layer alone
-  is too late. The branch is a parameter from an unauthenticated API, so every clone first runs
+  is too late. Every clone first runs
   `git ls-remote --exit-code --heads <url> refs/heads/<branch>` (the FULL ref — a bare pattern
-  tail-matches): exit 2 is the deterministic `ValuesBranchNotFoundError`, any other failure the
-  retryable `ValuesRepoGitError` (unreachable is not missing). Without it a mistyped branch would
-  retry forever as a clone failure.
+  tail-matches): exit 2 is `ValuesBranchNotFoundError`, any other failure `ValuesRepoGitError`
+  (unreachable is not missing). The CALLER classifies both: the workflows retry a missing branch
+  (`main`, a sig's default branch, provision-cluster's own branch just checked — a repo to fix, not a
+  run to fail; `tests/test_error_classification.py`), and upgrade-gitops's `write_incident` turns it
+  into a note (Brain never holds a gate). Its non-retryable caller was allocate-segment's
+  caller-named branch, gone since 2026-11-11 (§4).
 - **Cross-workflow orchestration — two shapes, chosen by whether the parent's OUTCOME depends on
   the child.** A FAN-OUT (one run per item, each answering to its own id and failure, the /bulk
   philosophy) starts siblings DETACHED: `workflow.start_child_workflow(...,

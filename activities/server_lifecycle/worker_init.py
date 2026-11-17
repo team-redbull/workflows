@@ -47,6 +47,7 @@ from temporalio.worker import Worker
 from activities.cluster_upgrade.activities import read_hosted_cluster, sync_argo_application
 from activities.server_lifecycle.activities import (
     acquire_servers,
+    allocate_server,
     check_hosted_node,
     check_infra_env,
     clean_up_agent_machines,
@@ -71,6 +72,7 @@ from activities.server_lifecycle.activities import (
     mark_agents_uninstalling,
     mark_machines_for_deletion,
     publish_infra_env_boot,
+    put_server_in_maintenance,
     read_day1_nodepools,
     read_scale_down_candidates,
     register_pxe_boot,
@@ -106,8 +108,9 @@ async def main() -> None:
         client,
         task_queue=_TASK_QUEUE,
         activities=[
-            # add-server-to-mce
+            # add-server-to-mce (acquire_servers: runs recorded before allocate_server)
             check_infra_env,
+            allocate_server,
             acquire_servers,
             lookup_install_candidate,
             register_pxe_boot,
@@ -121,6 +124,7 @@ async def main() -> None:
             get_baremetal_host,
             reserve_server,
             release_server,
+            put_server_in_maintenance,
             teardown_bmh_resources,
             # remove-server-from-mce
             inspect_inventory_host,

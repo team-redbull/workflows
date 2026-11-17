@@ -144,7 +144,7 @@ class ServerInterface(BaseModel):
 
 
 class AcquiredServer(BaseModel):
-    """One candidate returned by server-scan's `GET /servers/available`.
+    """One server from server-scan's `/servers/available`: a candidate of the GET, or the POST's allocation.
 
     A projection of `AvailableServerItem`, carrying only what building a
     BareMetalHost + Secret + NMStateConfig needs. `id` is the identity the run
@@ -165,19 +165,50 @@ class AcquiredServer(BaseModel):
 
 
 class AcquireServerRequest(BaseModel):
-    """What to ask server-scan for.
+    """What to ask server-scan's `GET /servers/available` for — runs recorded before allocation only.
 
     Exactly one of `pattern`/`name`, mirroring the endpoint's own contract.
     `pattern` is how an InfraEnv resolves to hardware: the InfraEnv name encodes
     vendor, model, site and spec (`cisco-m6-bat-yam-64c-512gb`) and server names
     carry the same tokens after an `ocp-` prefix, so the pattern is built by
     prefixing rather than by parsing either apart.
+
+    `health` is sent as `max_health` since server-scan's ADR-0063 (2026-11-16):
+    `health` is a 400 there now, and HEALTHY means the same in both — that
+    tier and none worse. A run started since asks with AllocateServerRequest.
     """
 
     pattern: str | None = None
     name: str | None = None
     count: int = 1
     health: str = "HEALTHY"
+
+
+class AllocateServerRequest(BaseModel):
+    """`POST /servers/available`: ONE server, locked for this run and live-checked (server-scan ADR-0063).
+
+    server-scan draws a candidate, takes the install lock on it as `holder` +
+    `workflow_id` for `ttl_seconds`, live-rechecks it against its vendor
+    manager WHILE locked, and returns it — or releases it and tries the next,
+    up to its own attempt cap. So the server that comes back is already the
+    run's: no separate reserve, and nothing another run could take in between.
+    Exactly one of `pattern`/`name`, as for AcquireServerRequest.
+
+    `max_health` is the worst acceptable tier (HEALTHY: that tier only);
+    server-scan also requires its network category Healthy whatever this
+    says. `min_nic_macs` 2: a bond needs two MACs read.
+    """
+
+    pattern: str | None = None
+    name: str | None = None
+    max_health: str = "HEALTHY"
+    min_nic_macs: int = Field(default=2, ge=0, le=16)
+    holder: str = Field(min_length=1, max_length=64)
+    workflow_id: str = Field(min_length=1)
+    mce_cluster: str = Field(min_length=1)
+    infra_env: str | None = None
+    namespace: str | None = None
+    ttl_seconds: int = Field(ge=300, le=86_400)
 
 
 class ReserveServerRequest(BaseModel):
@@ -228,6 +259,32 @@ class ServerReservation(BaseModel):
     server_id: str
     held: bool
     expires_at: str | None = None
+    detail: str | None = None
+
+
+class ServerMaintenanceRequest(BaseModel):
+    """Put one server in maintenance in server-scan (`PUT /servers/{id}/maintenance`).
+
+    add-server-to-mce's, for a server that produced no Agent within the hour:
+    server-scan then hands it to no draw until a person ends the maintenance,
+    so the run can give its lock back without the next run drawing it again.
+    `reason` is what that person reads in server-scan.
+    """
+
+    server_id: str = Field(min_length=1)
+    server_name: str
+    reason: str = Field(min_length=1)
+
+
+class ServerMaintenance(BaseModel):
+    """What a maintenance request left on the server.
+
+    `enabled` False only when server-scan no longer knows the server (404),
+    which `detail` then says: there is nothing left to keep out of a draw.
+    """
+
+    server_id: str
+    enabled: bool
     detail: str | None = None
 
 
@@ -744,9 +801,15 @@ class AddServerToMceInput(_QuietDefaults):
     link-up NICs, a RAID or storage fault, any health tier server-scan reports —
     never past a safety refusal. Only with `server_name`. False for every run
     recorded before it, and left out of the payload while false.
+
+    `candidate_count` sized the candidate draw of a run recorded before
+    `add-server-allocates-one-server` (2026-11-17). A run started since asks
+    server-scan for ONE server, which server-scan locks and live-checks itself,
+    and ignores it; it stays only because recorded runs carry it, and is left
+    out of the payload at its default.
     """
 
-    _quiet_defaults: ClassVar[tuple[str, ...]] = ("allow_unhealthy",)
+    _quiet_defaults: ClassVar[tuple[str, ...]] = ("allow_unhealthy", "candidate_count")
 
     infra_env: str = Field(min_length=1)
     mce_cluster: str = Field(min_length=1)

@@ -284,19 +284,20 @@ const FLOWS = {
       "pending": ["Starting", ""],
       "resolving-vlan": ["Reading the inventory VLAN", "The VLAN is the MCE's: it comes from the MCE's inventory segment in the Segments Manager, never from the caller."],
       "validating-infraenv": ["Checking the InfraEnv", "The InfraEnv must exist on the MCE before any server is drawn."],
-      "acquiring-server": ["Drawing candidates", "Asks server-scan for the healthy, unclaimed servers listed under the InfraEnv's name."],
-      "selecting-server": ["Checking a candidate", "A usable name, a known BMC, two link-up NICs on two physical ports, and no BareMetalHost already. Any reason it fails is a skip to the next candidate."],
-      "reserving-server": ["Locking the server", "Takes server-scan's install lock before anything is written, so no other MCE draws this machine."],
+      "acquiring-server": ["Allocating a server", "server-scan picks ONE healthy, unclaimed server listed under the InfraEnv's name (or the one named), locks it for this run and live-checks it before handing it over."],
+      "selecting-server": ["Checking the server", "A usable name, a known BMC and no BareMetalHost already; its two bond NICs are taken as server-scan checked them. If not, its lock goes back and the run fails, saying why."],
+      "reserving-server": ["Locking the server", "Only for a named server the allocation refused that the run takes anyway — its own leftover lock: server-scan's install lock, taken before anything is written."],
       "checking-nmstateconfig": ["Checking an existing NMStateConfig", "An NMStateConfig already under the server's name that differs from this install is replaced."],
       "registering-pxe-boot": ["Mapping it on the PXE VM", "An IPMI server boots from the network: its boot MAC is mapped on its site's PXE VM."],
       "creating-nmstateconfig": ["Creating the NMStateConfig", "The static network config the discovery image carries."],
       "publishing-pxe-boot": ["Publishing the boot entry", "Waits (up to 10 min) for a discovery image that includes the NMStateConfig, then publishes it as the InfraEnv's boot entry."],
       "creating-secret": ["Creating the BMC Secret", "Each create is a no-op when the object already exists."],
       "creating-baremetalhost": ["Creating the BareMetalHost", "Ironic registers the host through its BMC and boots it."],
-      "awaiting-agent": ["Waiting for the Agent", "The host boots the discovery image; its Agent registering is the proof the install worked. Each candidate gets up to 60 min, then it is rolled back and the next one tried."],
-      "rolling-back": ["Rolling the candidate back", "It produced no Agent in time: what was created for it is removed and the machine goes back to the inventory before the next candidate."],
-      "unregistering-pxe-boot": ["Unmapping it from the PXE VM", "The rolled-back candidate's MAC is taken off its site's PXE VM."],
-      "releasing-server": ["Releasing the lock", "The candidate's install lock goes back to server-scan."],
+      "awaiting-agent": ["Waiting for the Agent", "The host boots the discovery image; its Agent registering is the proof the install worked. Up to 60 min; without one the server is rolled back and the run fails."],
+      "rolling-back": ["Rolling the server back", "It produced no Agent in time: what was created for it is removed from the MCE."],
+      "unregistering-pxe-boot": ["Unmapping it from the PXE VM", "The rolled-back server's MAC is taken off its site's PXE VM."],
+      "setting-maintenance": ["Putting it in maintenance", "It produced no Agent in time: server-scan puts it in maintenance, so no run draws it again until someone ends the maintenance there."],
+      "releasing-server": ["Releasing the lock", "The server's install lock goes back to server-scan, before the run fails."],
       "holding-server": ["Holding the lock a day", "So no other MCE draws the machine before a cluster reports it."],
       "awaiting-server-scan": ["Waiting for server-scan", "Installed. Reads server-scan every 5 min (up to a day) until it shows the server INSTALLED_TO_INVENTORY or INSTALLED; not seen by then, the lock is left to expire and the run still completes."],
       "releasing-lock": ["Releasing the lock", "server-scan now shows the server installed and hides it from every draw itself, so the lock goes back."],
@@ -309,8 +310,8 @@ const FLOWS = {
     steps: [
       ["Inventory VLAN", ["resolving-vlan"]],
       ["InfraEnv on the MCE", ["validating-infraenv"]],
-      ["Draw candidates", ["acquiring-server"]],
-      ["Choose a server", ["selecting-server", "rolling-back", "unregistering-pxe-boot", "releasing-server"]],
+      ["Allocate a server (server-scan locks it)", ["acquiring-server"]],
+      ["Check the server", ["selecting-server", "rolling-back", "unregistering-pxe-boot", "setting-maintenance", "releasing-server"]],
       ["Lock it in server-scan", ["reserving-server"]],
       ["Existing NMStateConfig", ["checking-nmstateconfig"]],
       ["PXE boot entry (IPMI only)", ["registering-pxe-boot", "publishing-pxe-boot"]],
@@ -496,11 +497,11 @@ function mceOf(v) {
   return (v.r && v.r.mce_cluster) || v.ids.mce || (q && q.startsWith(QUEUE_PREFIX) ? q.slice(QUEUE_PREFIX.length) : null);
 }
 
-// add-server-to-mce's `progress.server_name` is the candidate of the latest ATTEMPT: set once a
-// candidate is locked and about to be created, and kept while the run rolls it back and
-// checks the next one. What it means therefore depends on the phase.
+// add-server-to-mce's `progress.server_name` is the server being installed: set once it is locked
+// and about to be created, and kept while the run rolls it back (a run started before
+// 2026-11-17 then checks its next candidate). What it means therefore depends on the phase.
 const INSTALLING = ["checking-nmstateconfig", "creating-nmstateconfig", "publishing-pxe-boot", "creating-secret", "creating-baremetalhost", "awaiting-agent", "holding-server", "completed"];
-const ROLLING_BACK = ["rolling-back", "unregistering-pxe-boot", "releasing-server"];
+const ROLLING_BACK = ["rolling-back", "unregistering-pxe-boot", "setting-maintenance", "releasing-server"];
 function serverRole(v) {
   const phase = v.p && v.p.phase;
   if (!isFailed(v) && INSTALLING.includes(phase)) return "Installing";
@@ -544,10 +545,15 @@ function splitError(text) {
   return m ? { type: m[1], message: m[2] } : { type: null, message: text || "" };
 }
 
-// add-server-to-mce names its candidates only in the failure it ends with when none could be
-// installed: "Checked N candidate(s) — <summary>: <entry>; <entry>. <summary>: …".
+// add-server-to-mce names its server(s) only in the failure it ends with: since 2026-11-17 the ONE
+// server-scan allocated, "server-scan allocated <name> for InfraEnv …, and it could not be installed
+// into <ns> — <summary>: <entry>. Its lock …"; a run started before, every candidate it drew,
+// "Checked N candidate(s) — <summary>: <entry>; <entry>. <summary>: …".
 function parseCandidates(message) {
-  const m = /^([\s\S]*?Checked (\d+) candidate\(s\)) — ([\s\S]*)$/.exec(message || "");
+  const allocated = /^(server-scan allocated \S+ for InfraEnv [\s\S]*? could not be installed into \S+) — ([\s\S]*?)(?:\. Its lock [^.]*)?$/.exec(message || "");
+  const m = allocated
+    ? [allocated[0], allocated[1], "1", allocated[2]]
+    : /^([\s\S]*?Checked (\d+) candidate\(s\)) — ([\s\S]*)$/.exec(message || "");
   if (!m) return null;
   const body = m[3];
   const found = [];
@@ -562,7 +568,7 @@ function parseCandidates(message) {
     text = text.replace(/\.\s*$/, "");
     return { key: g.key, label: g.reason.label, summary: g.reason.summary, entries: splitTop(text, "; ").map(entry) };
   });
-  return { headline: `${m[1]}.`, checked: Number(m[2]), groups };
+  return { headline: `${m[1]}.`, checked: Number(m[2]), allocated: Boolean(allocated), groups };
 }
 // Split on a separator outside (), [] — an entry's own detail may contain it.
 function splitTop(text, sep) {
@@ -617,7 +623,7 @@ function steps(v) {
       if (s[5].state === "done") { s[5].state = "skipped"; s[5].note = "Only for an IPMI server; the result says whether it ran"; }
       if (p.server_name && at > 3) note(3, p.server_name);
       if (p.server_name && at === 3) note(3, `${phaseWords(v, p.phase)} · ${serverRole(v).toLowerCase()} ${p.server_name}`);
-      if (p.phase === "awaiting-agent" && !isFailed(v)) note(7, "Up to 60 min per candidate");
+      if (p.phase === "awaiting-agent" && !isFailed(v)) note(7, "Up to 60 min");
     }
   } else if (v.flow === FLOWS.remove) {
     if (r) {
@@ -902,20 +908,24 @@ function renderCandidates(v) {
     if (!parsed) return "";
     const groups = parsed.groups.map((g) => `<div class="group">
       <span class="chip t-bad">${esc(g.label)}</span> <span style="color:var(--muted)">${esc(g.entries.length)} of ${esc(parsed.checked)}</span>
-      <p class="why">They ${esc(g.summary)}.</p>
+      <p class="why">${parsed.allocated ? "It" : "They"} ${esc(g.summary)}.</p>
       <ul>${g.entries.map((e) => `<li>${code(e.name)}${e.detail ? `<span class="d">${esc(e.detail)}</span>` : ""}</li>`).join("")}</ul></div>`).join("");
-    return `<div class="panel card"><h2>Candidates: ${esc(parsed.checked)} checked, none installed</h2>${groups}</div>`;
+    const heading = parsed.allocated
+      ? "Server: allocated, not installed — its lock was given back"
+      : `Candidates: ${esc(parsed.checked)} checked, none installed`;
+    return `<div class="panel card"><h2>${heading}</h2>${groups}</div>`;
   }
   let text;
   if (v.r) {
+    // `attempts` > 1 only on a run started before 2026-11-17, which drew candidates.
     text = v.r.attempts > 1
       ? `${v.r.attempts} candidates were installed: ${rolledBack(v.r.attempts - 1)}, then ${v.r.server_name} registered its Agent.`
-      : `${v.r.server_name} was the first candidate installed.`;
+      : `${v.r.server_name} was installed.`;
   } else {
-    text = v.p && v.p.server_name ? `Now on ${v.p.server_name}.` : "No candidate chosen yet.";
+    text = v.p && v.p.server_name ? `Now on ${v.p.server_name}.` : "No server allocated yet.";
   }
-  return `<div class="panel card"><h2>Candidates</h2><p style="margin:0">${esc(text)}</p>
-    <p class="note">A run names the candidates it skipped, and why, only when none could be installed: they are in its failure.</p></div>`;
+  return `<div class="panel card"><h2>Server</h2><p style="margin:0">${esc(text)}</p>
+    <p class="note">server-scan allocates each run ONE server, locked for it; a failed run says why that server could not be installed, and gives its lock back.</p></div>`;
 }
 
 // --- starting ------------------------------------------------------------------------------

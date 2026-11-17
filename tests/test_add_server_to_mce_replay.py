@@ -24,6 +24,17 @@ The golden set was first recorded on the workflow as it stood before
 `allow_unhealthy`, the NMStateConfig replacement and the own-lock re-run, so
 each of those patches is proven against the shape production runs have.
 
+Every golden but the `allocated-*` ones was recorded before the run was
+allocated ONE server by server-scan (`add-server-allocates-one-server`,
+2026-11-17): they draw a candidate list with GET /servers/available and lock
+the one chosen, and prove a run in flight then still finishes that way. The
+scenarios of the same names now RECORD the allocated shape live; the
+`allocated-*` goldens keep it for the next change. Two of them were
+re-recorded the same day, before the allocation was ever deployed (no run of
+their first shape can exist): `allocated-server-refused` once an allocated
+server's NICs and MACs were no longer judged by the run, and
+`allocated-no-agent` once such a server went into maintenance.
+
 The workflow was install-server until 2026-11-01. Those goldens stay where they
 were recorded, in tests/histories/install_server/ (LEGACY_GOLDEN), as runs of
 type `InstallServerWorkflow`: replayed by the legacy subclass, they prove a run
@@ -48,10 +59,12 @@ from temporalio.worker import Replayer
 
 from shared.consts import ADD_SERVER_TO_MCE_WORKFLOW_QUEUE
 from shared.exceptions import (
+    AgentNeverAppearedError,
     BmhConflictError,
     ServerLooksInstalledError,
     ServerNotAvailableError,
     ServerScanAuthError,
+    UnknownBmcVendorError,
 )
 from shared.models.server_lifecycle import (
     AddServerToMceInput,
@@ -69,8 +82,8 @@ from tests.test_add_server_to_mce_workflow import (
     bondable_server,
     make_mock_activities,
     one_nic_up_server,
-    oneview_server,
     scan_record,
+    standalone_server,
     ucs_server,
 )
 from workflow_domains.server_lifecycle.add_server_to_mce import (
@@ -174,16 +187,43 @@ SCENARIOS: dict[str, Callable[[], Scenario]] = {
         },
         input=_named(SERVER_NAME),
     ),
-    # Skips before the install: no bond, another run's lock, then the next.
-    "skips-then-install": lambda: Scenario(
+    # (`skips-then-install` — no bond, another run's lock, then the next — is a
+    # candidate loop no run started since the allocation has: its golden stays,
+    # replayed, and it is recorded live no more.)
+    #
+    # Since the allocation (2026-11-17): ONE server, locked by server-scan.
+    # Each of these got a golden of the allocated shape.
+    "allocated-pool-install": lambda: Scenario(),
+    "allocated-named-install": lambda: Scenario(input=_named(SERVER_NAME)),
+    # Refused by the run's own checks (no BMC driver; its NICs and MACs are
+    # server-scan's word): its lock given back, the run failed.
+    "allocated-server-refused": lambda: Scenario(
+        mocks={"candidates": [standalone_server(), bondable_server()]},
+        fails_with=UnknownBmcVendorError.__name__,
+    ),
+    # No Agent within the hour: rolled back, put in maintenance, given back, failed.
+    "allocated-no-agent": lambda: Scenario(
+        mocks={"agent_never_for": {SERVER_NAME}},
+        fails_with=AgentNeverAppearedError.__name__,
+    ),
+    # A named re-run meeting its own leftover lock, which the allocation
+    # refuses even to its holder: recognised, re-taken, installed.
+    "allocated-named-own-lock-rerun": lambda: Scenario(
         mocks={
-            "candidates": [
-                oneview_server(),
-                bondable_server("srv_held", name="ocp-held", mac_prefix="11:22:33:44:55"),
+            "acquire_error": ServerNotAvailableError(
+                f"server-scan could not allocate a server (name={SERVER_NAME!r}): RESERVED"
+            ),
+            "record": scan_record(
                 bondable_server(),
-            ],
-            "reserved_elsewhere": {"ocp-held"},
+                health=_FINE,
+                lock=ServerLockRecord(
+                    live=True,
+                    holder="add-server-to-mce",
+                    workflow_id="add-server-to-mce-replay-allocated-named-own-lock-rerun",
+                ),
+            ),
         },
+        input=_named(SERVER_NAME),
     ),
     # After the Agent (2026-11-09): server-scan read every 5 min until it shows
     # the server installed, then the lock released ...

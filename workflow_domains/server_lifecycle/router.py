@@ -93,9 +93,6 @@ _MCE_CLUSTER_DESCRIPTION = (
 
 # The most runs one request starts: `count` and a `server_names` list alike.
 _MAX_INSTALLS_PER_REQUEST = 20
-# AddServerToMceInput.candidate_count's ceiling, which caps the spares a
-# pool run gets by default.
-_MAX_CANDIDATES = 20
 # Slots a pool request looks through for free ones: `_1` … `_100`. Far more
 # than can run at once on one pool; it only bounds the scan.
 _MAX_SLOTS = 100
@@ -149,6 +146,18 @@ def _refuse_server_name(data: Any) -> Any:
     A caller sending it is told what to send, not just "extra field"."""
     if isinstance(data, dict) and "server_name" in data:
         raise ValueError("`server_name` is now `server_names`, which takes one name or a list")
+    return data
+
+
+def _refuse_candidate_count(data: Any) -> Any:
+    """`candidate_count` was removed on 2026-11-17: server-scan ALLOCATES each run
+    one server, locked and live-checked (its ADR-0063), so there are no spare
+    candidates to size. A caller still sending it is told so."""
+    if isinstance(data, dict) and "candidate_count" in data:
+        raise ValueError(
+            "`candidate_count` was removed: each run is allocated ONE server by "
+            "server-scan, already locked and live-checked — drop the field"
+        )
     return data
 
 
@@ -212,15 +221,16 @@ class AddServerToMceRequest(BaseModel):
         description=(
             "The InfraEnv to fill. Its name states the hardware "
             "(`cisco-m6-bat-yam-64c-512gb`), so it is also the pool: the healthy, "
-            "unclaimed servers server-scan lists as `ocp-<infra_env>…`."
+            "unclaimed servers server-scan lists as `ocp-<infra_env>-…`."
         ),
     )
     mce_cluster: str = Field(min_length=1, description=_MCE_CLUSTER_DESCRIPTION)
-    # `namespace`, `candidate_count` and `labels` are HIDDEN from the OpenAPI
-    # schema and Swagger (the operator, 2026-11-09): expert knobs, so a request
-    # is `infra_env` + `mce_cluster` + `count` or `server_names`. Sent anyway,
-    # each is validated and used exactly as before, and unsent each keeps its
-    # default. Pinned by TestTheHiddenExpertFields in test_server_lifecycle_api.py.
+    # `namespace` and `labels` are HIDDEN from the OpenAPI schema and Swagger
+    # (the operator, 2026-11-09): expert knobs, so a request is `infra_env` +
+    # `mce_cluster` + `count` or `server_names`. Sent anyway, each is validated
+    # and used exactly as before, and unsent each keeps its default. Pinned by
+    # TestTheHiddenExpertFields in test_server_lifecycle_api.py. (`candidate_count`
+    # was the third, until each run was allocated one server: now a 422.)
     #
     # Defaulted HERE, at the edge: the run's input always carries the
     # namespace it was started with, so a later change of this default never
@@ -254,17 +264,6 @@ class AddServerToMceRequest(BaseModel):
             "without `count` — adds installs rather than colliding."
         ),
     )
-    candidate_count: SkipJsonSchema[int | None] = Field(
-        default=None,
-        ge=1,
-        le=_MAX_CANDIDATES,
-        description=(
-            "How many healthy servers each pool run asks server-scan for, so it "
-            "has others to try when one is unusable or another run takes it. "
-            "Defaults to one per run on the pool plus 2 "
-            f"(at most {_MAX_CANDIDATES}): 3 for a lone install."
-        ),
-    )
     labels: SkipJsonSchema[dict[str, str]] = Field(
         default_factory=dict, description="Extra labels for each BareMetalHost."
     )
@@ -278,9 +277,9 @@ class AddServerToMceRequest(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
-    def _server_name_became_server_names(cls, data: Any) -> Any:
-        # The field was `server_name`, one machine.
-        return _refuse_server_name(data)
+    def _retired_fields(cls, data: Any) -> Any:
+        # The field was `server_name`, one machine; `candidate_count` is gone.
+        return _refuse_candidate_count(_refuse_server_name(data))
 
     @field_validator("mce_cluster")
     @classmethod
@@ -301,21 +300,13 @@ class AddServerToMceRequest(BaseModel):
 
     @model_validator(mode="after")
     def _pool_options_need_the_pool(self) -> AddServerToMceRequest:
-        # Both size a draw from the pool. A named server is drawn alone, so
-        # either one next to `server_names` could only be ignored.
-        if self.server_names is not None:
-            sent = [
-                f"`{field}`"
-                for field in ("count", "candidate_count")
-                if getattr(self, field) is not None
-            ]
-            if sent:
-                verb = "apply" if len(sent) > 1 else "applies"
-                raise ValueError(
-                    f"{' and '.join(sent)} only {verb} when the pool picks the servers, "
-                    "and `server_names` installs exactly the machines named; send one "
-                    "or the other"
-                )
+        # `count` sizes a draw from the pool. A named server is drawn alone, so
+        # `count` next to `server_names` could only be ignored.
+        if self.server_names is not None and self.count is not None:
+            raise ValueError(
+                "`count` only applies when the pool picks the servers, and "
+                "`server_names` installs exactly the machines named; send one or the other"
+            )
         if self.allow_unhealthy and self.server_names is None:
             raise ValueError(
                 "`allow_unhealthy` only applies to servers named in `server_names`: it "
@@ -325,22 +316,16 @@ class AddServerToMceRequest(BaseModel):
             )
         return self
 
-    def run_input(
-        self, *, server_name: str | None = None, candidate_count: int | None = None
-    ) -> AddServerToMceInput:
-        """The input ONE run is started with: one named server, or one pool draw."""
-        fields: dict[str, Any] = {
-            "infra_env": self.infra_env,
-            "mce_cluster": self.mce_cluster,
-            "namespace": self.namespace,
-            "server_name": server_name,
-            "labels": self.labels,
-            "allow_unhealthy": self.allow_unhealthy,
-        }
-        chosen = candidate_count if candidate_count is not None else self.candidate_count
-        if chosen is not None:  # unset, the run's own default applies
-            fields["candidate_count"] = chosen
-        return AddServerToMceInput(**fields)
+    def run_input(self, *, server_name: str | None = None) -> AddServerToMceInput:
+        """The input ONE run is started with: one named server, or one server from the pool."""
+        return AddServerToMceInput(
+            infra_env=self.infra_env,
+            mce_cluster=self.mce_cluster,
+            namespace=self.namespace,
+            server_name=server_name,
+            labels=self.labels,
+            allow_unhealthy=self.allow_unhealthy,
+        )
 
 
 class ServerRunItem(BaseModel):
@@ -424,17 +409,17 @@ async def start_add_server_to_mce(
       already installing is `already_running`.
 
     Runs cannot take the same machine, whichever way they were asked for: each
-    takes server-scan's install lock (an atomic compare-and-set there) before
-    writing anything, and server-scan stops listing a locked machine. A pool
-    run that loses the race skips to its next candidate, and one left with
-    none fails with ServerReservedError — the pool has fewer free servers than
-    are being installed. A named machine another run took first fails its own
-    run.
+    is ALLOCATED its one server by server-scan, which locks it for that run
+    (an atomic compare-and-set there) and live-checks it before handing it
+    over, and never hands out a locked machine. A pool with fewer free servers
+    than runs fails the runs it cannot serve (ServerNotAvailableError, with
+    server-scan's reasons); a named machine another run holds fails its own run.
 
     Poll GET /workflows/runs/{workflow_id} (one per run) for progress/result.
-    No healthy server matching, no candidate with two link-up NICs on distinct
-    physical ports, or a BareMetalHost that never registers all surface there
-    as a FAILED run — not as a 4xx here.
+    No healthy server matching, a server without two link-up NICs on distinct
+    physical ports, or a host that never registers an Agent all surface there
+    as a FAILED run — not as a 4xx here. A failed run has given its server
+    back; asking again starts a new run with a new server.
     """
     if isinstance(install_request.server_names, list):
         return await _start_named_installs(client, install_request, install_request.server_names)
@@ -534,25 +519,17 @@ async def _start_pool_installs(
     Temporal allows one running workflow per id, and the loser moves on.
     """
     results: list[AddServerToMceItem] = []
-    started = busy = 0
+    started = 0
+    # Each run is allocated its own server by server-scan, so every run's input
+    # is the same: no spares to size by how many runs share the pool.
+    run_input = request.run_input()
     for slot in range(1, _MAX_SLOTS + 1):
         if started == count:
             break
         workflow_id = add_server_to_mce_slot_workflow_id(request.mce_cluster, request.infra_env, slot)
-        # Every run on the pool - the busy slots below this one and the ones
-        # this request has started - takes one machine from the same top of
-        # the list, so each new run needs that many spares, plus its own.
-        run_input = request.run_input(
-            candidate_count=(
-                request.candidate_count
-                if request.candidate_count is not None
-                else min(_MAX_CANDIDATES, busy + count + 2)
-            )
-        )
         try:
             handle = await _start(client, run_input, workflow_id)
         except WorkflowAlreadyStartedError:
-            busy += 1
             results.append(
                 AddServerToMceItem(slot=slot, workflow_id=workflow_id, status="already_running")
             )

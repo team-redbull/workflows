@@ -14,6 +14,7 @@ symptom, which is why it is tested directly rather than through the workflow.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import UTC, datetime
 
@@ -21,9 +22,13 @@ import httpx
 import pytest
 import respx
 from kubernetes import client as k8s_client
+from temporalio.testing import ActivityEnvironment
 
-from activities.server_lifecycle import cluster_api
+from activities.server_lifecycle import cluster_api, server_scan
 from activities.server_lifecycle.server_scan import (
+    _ALLOCATE_TIMEOUT,
+    allocate_available_server,
+    enable_maintenance,
     fetch_available_servers,
     install_candidate_by_name,
     release_server,
@@ -42,10 +47,13 @@ from shared.exceptions import (
     ServerScanRequestInvalidError,
 )
 from shared.models.server_lifecycle import (
+    AcquiredServer,
     AcquireServerRequest,
+    AllocateServerRequest,
     LinkState,
     ReleaseServerRequest,
     ReserveServerRequest,
+    ServerMaintenanceRequest,
 )
 
 SS = "http://server-scan.test/api/v1"
@@ -244,6 +252,68 @@ class TestTheInstallLock:
             await release_server(SS, "viewer-token", RELEASE)
 
 
+MAINTENANCE = f"{SS}/servers/srv_1/maintenance"
+MAINTAIN = ServerMaintenanceRequest(
+    server_id="srv_1", server_name=RESERVE.server_name, reason="no Agent in 60 min"
+)
+
+
+class TestTheMaintenance:
+    """PUT /servers/{id}/maintenance: a server with no Agent leaves every draw."""
+
+    @respx.mock
+    async def test_it_sends_the_reason_and_reads_maintenance_back(self):
+        route = respx.put(MAINTENANCE).mock(
+            return_value=httpx.Response(
+                200, json={"id": "srv_1", "maintenance": {"enabled": True, "reason": "x"}}
+            )
+        )
+        maintenance = await enable_maintenance(SS, "admin-token", MAINTAIN)
+
+        assert maintenance.enabled is True and maintenance.detail is None
+        request = route.calls.last.request
+        assert request.headers["Authorization"] == "Bearer admin-token"
+        assert json.loads(request.content) == {"reason": "no Agent in 60 min"}
+
+    @respx.mock
+    async def test_an_answer_without_maintenance_enabled_is_retried(self):
+        respx.put(MAINTENANCE).mock(
+            return_value=httpx.Response(200, json={"id": "srv_1", "maintenance": {"enabled": False}})
+        )
+        with pytest.raises(ServerScanError, match="without maintenance enabled") as excinfo:
+            await enable_maintenance(SS, "", MAINTAIN)
+        assert type(excinfo.value) is ServerScanError
+
+    @respx.mock
+    async def test_a_server_gone_from_the_inventory_is_no_failure(self):
+        respx.put(MAINTENANCE).mock(return_value=_problem(404, "No server"))
+        maintenance = await enable_maintenance(SS, "", MAINTAIN)
+        assert maintenance.enabled is False
+        assert "no longer in server-scan" in (maintenance.detail or "")
+
+    @respx.mock
+    @pytest.mark.parametrize("status", [401, 403])
+    async def test_a_token_without_admin_is_permanent_and_says_so(self, status):
+        respx.put(MAINTENANCE).mock(return_value=_problem(status, "forbidden"))
+        with pytest.raises(ServerScanAuthError, match="ADMIN"):
+            await enable_maintenance(SS, "viewer-token", MAINTAIN)
+
+    @respx.mock
+    @pytest.mark.parametrize("status", [400, 422])
+    async def test_a_rejected_body_is_permanent(self, status):
+        respx.put(MAINTENANCE).mock(return_value=_problem(status, "reason"))
+        with pytest.raises(ServerScanRequestInvalidError, match="reason"):
+            await enable_maintenance(SS, "", MAINTAIN)
+
+    @respx.mock
+    @pytest.mark.parametrize("status", [409, 503])
+    async def test_a_lost_revision_race_or_an_outage_is_transient(self, status):
+        respx.put(MAINTENANCE).mock(return_value=_problem(status, "modified by another caller"))
+        with pytest.raises(ServerScanError) as excinfo:
+            await enable_maintenance(SS, "", MAINTAIN)
+        assert type(excinfo.value) is ServerScanError
+
+
 class TestTheInventoryQuery:
     @respx.mock
     async def test_a_pool_draw_asks_for_the_pattern_the_count_and_both_gates(self):
@@ -254,7 +324,9 @@ class TestTheInventoryQuery:
         params = route.calls[0].request.url.params
         assert params["pattern"] == "^ocp-dell-r650-tlv"
         assert params["count"] == "3"
-        assert params["health"] == "HEALTHY"
+        # `max_health` since server-scan's ADR-0063: `health` is a 400 there now.
+        assert params["max_health"] == "HEALTHY"
+        assert "health" not in params
         # server-scan's own network gate already requires two links up.
         assert "min_nic_macs" not in params
         assert route.calls[0].request.headers["Authorization"] == "Bearer tok"
@@ -368,6 +440,155 @@ class TestTheInventoryQuerysFailures:
         respx.get(AVAILABLE).mock(return_value=httpx.Response(200, json=_payload()))
         with pytest.raises(ServerNotAvailableError):
             await fetch_available_servers(SS, "tok", PATTERN_REQUEST)
+
+    @respx.mock
+    @pytest.mark.parametrize("status", [400, 422])
+    async def test_a_refused_query_is_permanent_not_retried_forever(self, status):
+        # What a GET still sending `health` met once server-scan took ADR-0063.
+        respx.get(AVAILABLE).mock(return_value=_problem(status, "`health` was replaced by `max_health`"))
+        with pytest.raises(ServerScanRequestInvalidError, match="max_health"):
+            await fetch_available_servers(SS, "tok", PATTERN_REQUEST)
+
+
+ALLOCATE_POOL = AllocateServerRequest(
+    pattern="^ocp-dell-r650-tlv",
+    holder="add-server-to-mce",
+    workflow_id="add-server-to-mce-ocp4-mce-tlv-01_dell-r650-tlv_1",
+    mce_cluster="ocp4-mce-tlv-01",
+    infra_env="dell-r650-tlv",
+    namespace="inventory",
+    ttl_seconds=7200,
+)
+ALLOCATE_NAMED = ALLOCATE_POOL.model_copy(
+    update={"pattern": None, "name": "ocp-dell-r650-tlv-64c-1024gb-DEL0000485"}
+)
+
+
+def _no_server(detail: str, *reasons: str, status: int = 503) -> httpx.Response:
+    """server-scan's 503 NO_AVAILABLE_SERVER, as its exception handler writes it (ADR-0063)."""
+    return httpx.Response(
+        status,
+        json={"status": status, "code": "NO_AVAILABLE_SERVER", "detail": detail,
+              "details": {"reasons": list(reasons)}},
+    )
+
+
+class TestTheAllocation:
+    """POST /servers/available (server-scan ADR-0063): ONE server, locked for the run, live-checked."""
+
+    @respx.mock
+    async def test_a_pool_allocation_sends_the_pattern_the_gates_and_who_takes_it(self):
+        route = respx.post(AVAILABLE).mock(
+            return_value=httpx.Response(200, json={**_payload(_ITEM), "requested": 1, "returned": 1})
+        )
+        server = await allocate_available_server(SS, "admin-token", ALLOCATE_POOL)
+
+        assert (server.id, server.name, server.live_recheck_performed) == ("srv_1", _ITEM["name"], True)
+        request = route.calls.last.request
+        assert request.headers["Authorization"] == "Bearer admin-token"
+        # Exactly server-scan's ReserveAvailableRequest: it forbids unknown
+        # fields, and `name` must not be sent beside `pattern`.
+        assert json.loads(request.content) == {
+            "pattern": "^ocp-dell-r650-tlv",
+            "max_health": "HEALTHY",
+            "min_nic_macs": 2,
+            "holder": "add-server-to-mce",
+            "workflow_id": "add-server-to-mce-ocp4-mce-tlv-01_dell-r650-tlv_1",
+            "mce_cluster": "ocp4-mce-tlv-01",
+            "infra_env": "dell-r650-tlv",
+            "namespace": "inventory",
+            "ttl_seconds": 7200,
+        }
+
+    @respx.mock
+    async def test_a_named_allocation_sends_the_name_and_no_pattern(self):
+        route = respx.post(AVAILABLE).mock(return_value=httpx.Response(200, json=_payload(_ITEM)))
+        await allocate_available_server(SS, "tok", ALLOCATE_NAMED)
+        body = json.loads(route.calls.last.request.content)
+        assert body["name"] == ALLOCATE_NAMED.name and "pattern" not in body
+
+    def test_it_may_wait_for_every_live_check_server_scan_makes(self):
+        # Up to INVENTORY_AVAILABLE_MAX_ATTEMPTS candidates checked one at a
+        # time: far past the reads' 60 s, still below the activity's 30 min.
+        assert 15 * 60 < _ALLOCATE_TIMEOUT.read < 30 * 60
+
+    @respx.mock
+    async def test_nothing_reservable_is_permanent_and_says_why(self):
+        respx.post(AVAILABLE).mock(
+            return_value=_no_server(
+                "No available server: 'ocp-a': its health is MAJOR; 'ocp-b': RESERVED", "HEALTH", "RESERVED"
+            )
+        )
+        with pytest.raises(ServerNotAvailableError) as excinfo:
+            await allocate_available_server(SS, "tok", ALLOCATE_POOL)
+        message = str(excinfo.value)
+        assert "its health is MAJOR" in message
+        assert "[reasons: HEALTH, RESERVED]" in message
+        assert "pattern='^ocp-dell-r650-tlv'" in message
+
+    @respx.mock
+    async def test_a_503_that_is_not_server_scans_answer_is_waited_out(self):
+        # A proxy's or a restarting pod's 503 carries no NO_AVAILABLE_SERVER code.
+        respx.post(AVAILABLE).mock(return_value=httpx.Response(503, text="upstream connect error"))
+        with pytest.raises(ServerScanError) as excinfo:
+            await allocate_available_server(SS, "tok", ALLOCATE_POOL)
+        assert not isinstance(excinfo.value, ServerNotAvailableError)
+
+    @respx.mock
+    @pytest.mark.parametrize("status", [401, 403])
+    async def test_a_token_without_admin_is_permanent_and_says_so(self, status):
+        respx.post(AVAILABLE).mock(return_value=_problem(status, "forbidden"))
+        with pytest.raises(ServerScanAuthError, match="ADMIN"):
+            await allocate_available_server(SS, "viewer-token", ALLOCATE_POOL)
+
+    @respx.mock
+    @pytest.mark.parametrize("status", [400, 422])
+    async def test_a_refused_body_is_permanent(self, status):
+        respx.post(AVAILABLE).mock(return_value=_problem(status, "extra fields not permitted"))
+        with pytest.raises(ServerScanRequestInvalidError, match="extra fields"):
+            await allocate_available_server(SS, "tok", ALLOCATE_POOL)
+
+    @respx.mock
+    async def test_an_ambiguous_name_is_permanent(self):
+        respx.post(AVAILABLE).mock(return_value=_problem(409, "srv_1, srv_2"))
+        with pytest.raises(AmbiguousServerNameError, match="srv_1, srv_2"):
+            await allocate_available_server(SS, "tok", ALLOCATE_NAMED)
+
+    @respx.mock
+    @pytest.mark.parametrize("items", [0, 2])
+    async def test_anything_but_exactly_one_server_is_refused(self, items):
+        respx.post(AVAILABLE).mock(return_value=httpx.Response(200, json=_payload(*[_ITEM] * items)))
+        with pytest.raises(ServerScanRequestInvalidError, match=f"with {items} servers"):
+            await allocate_available_server(SS, "tok", ALLOCATE_POOL)
+
+    @respx.mock
+    async def test_a_huge_refusal_is_cut_before_it_becomes_the_error(self):
+        respx.post(AVAILABLE).mock(return_value=_no_server("u" * (3 << 20), "VENDOR_ERROR"))
+        with pytest.raises(ServerNotAvailableError) as excinfo:
+            await allocate_available_server(SS, "tok", ALLOCATE_POOL)
+        assert len(str(excinfo.value)) < 1_000 and "more characters cut" in str(excinfo.value)
+
+
+class TestTheAllocationActivity:
+    async def test_it_heartbeats_while_server_scan_checks_candidates(self, monkeypatch):
+        from activities.server_lifecycle import activities
+
+        async def _slow(base_url, token, request):
+            await asyncio.sleep(0.25)
+            return AcquiredServer.model_validate(
+                {"id": "srv_1", "name": "ocp-x", "vendor": "dell", "bmc": {"host": "h"},
+                 "health_overall": "HEALTHY", "live_recheck_performed": True}
+            )
+
+        monkeypatch.setattr(server_scan, "allocate_available_server", _slow)
+        monkeypatch.setattr(activities, "_ALLOCATE_HEARTBEAT_SECONDS", 0.05)
+        beats: list = []
+        env = ActivityEnvironment()
+        env.on_heartbeat = lambda *details: beats.append(details)
+        server = await env.run(activities.allocate_server, ALLOCATE_POOL)
+
+        assert server.id == "srv_1"
+        assert len(beats) >= 3
 
 
 def _api_error(status: int, message: str | None = None) -> k8s_client.ApiException:

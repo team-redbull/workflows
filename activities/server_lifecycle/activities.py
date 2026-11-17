@@ -113,6 +113,7 @@ from shared.models.server_lifecycle import (
     AgentRelease,
     AgentReleaseRequest,
     AgentState,
+    AllocateServerRequest,
     BmhRef,
     BmhResourceRequest,
     BmhState,
@@ -157,6 +158,8 @@ from shared.models.server_lifecycle import (
     ScaleDownCandidates,
     ScaleDownCandidatesRequest,
     ScaleDownPolicy,
+    ServerMaintenance,
+    ServerMaintenanceRequest,
     ServerMembership,
     ServerMembershipRequest,
     ServerReservation,
@@ -237,6 +240,42 @@ async def acquire_servers(request: AcquireServerRequest) -> list[AcquiredServer]
     return servers
 
 
+# How often allocate_server tells Temporal it is alive while server-scan
+# live-checks candidates: well inside the workflow's 2-minute heartbeat_timeout,
+# so a dead worker is noticed in minutes rather than at the 30-minute timeout.
+_ALLOCATE_HEARTBEAT_SECONDS = 20.0
+
+
+@activity.defn
+async def allocate_server(request: AllocateServerRequest) -> AcquiredServer:
+    """ONE server for this run, locked and live-checked by server-scan (POST /servers/available)."""
+    allocation = asyncio.ensure_future(
+        server_scan.allocate_available_server(
+            _settings.server_scan_url, _settings.server_scan_api_token, request
+        )
+    )
+    try:
+        while True:
+            done, _ = await asyncio.wait({allocation}, timeout=_ALLOCATE_HEARTBEAT_SECONDS)
+            if done:
+                break
+            activity.heartbeat()
+    finally:
+        # Cancelled or failed: closing the client ends the request, and
+        # server-scan releases a candidate it was still checking.
+        if not allocation.done():
+            allocation.cancel()
+    server = allocation.result()
+    activity.logger.info(
+        "server-scan allocated %s (%s) to %s, live-checked=%s",
+        server.name,
+        server.id,
+        request.workflow_id,
+        server.live_recheck_performed,
+    )
+    return server
+
+
 @activity.defn
 async def reserve_server(request: ReserveServerRequest) -> ServerReservation:
     """Take server-scan's install lock on one chosen candidate (ADR-0035)."""
@@ -290,6 +329,21 @@ async def release_server(request: ReleaseServerRequest) -> ServerReservation:
         f" — {reservation.detail}" if reservation.detail else "",
     )
     return reservation
+
+
+@activity.defn
+async def put_server_in_maintenance(request: ServerMaintenanceRequest) -> ServerMaintenance:
+    """Put a server that produced no Agent in maintenance in server-scan."""
+    maintenance = await server_scan.enable_maintenance(
+        _settings.server_scan_url, _settings.server_scan_api_token, request
+    )
+    activity.logger.info(
+        "%s %s in server-scan%s",
+        request.server_name,
+        "put in maintenance" if maintenance.enabled else "not put in maintenance",
+        f" — {maintenance.detail}" if maintenance.detail else "",
+    )
+    return maintenance
 
 
 async def _read(group: str, version: str, plural: str, kind: str, namespace: str, name: str):

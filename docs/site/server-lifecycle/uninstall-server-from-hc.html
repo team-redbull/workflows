@@ -457,7 +457,7 @@
           <p class="note">A lock another run holds fails the run here (<code>ServerReservedError</code>),
           nothing changed. The common case is <b>add-server-to-mce&rsquo;s hold</b> after it installed the
           machine: since 2026-11-09 its run gives it back once server-scan shows the machine installed
-          (usually 15&ndash;30 min, at most a day). Wait for that, or release it in server-scan, then re-run.</p>
+          (usually 5&ndash;15 min, at most a day). Wait for that, or release it in server-scan, then re-run.</p>
           <p><b>mark_agents_uninstalling</b>, phase <b>marking-agent</b> &mdash; the first write: every
           Agent the inspection found gets <code>redbull.io/uninstalling: "true"</code>, a merge patch of
           that label alone, read back (<a href="#label">why</a>). An Agent already carrying it, or gone, is
@@ -642,12 +642,12 @@
         <thead><tr><th>error</th><th>when</th></tr></thead>
         <tbody>
           <tr><td class="k">ServerNotInServerScanError</td><td class="muted">server-scan has no server of that exact name, so no lock can be taken on it. A host that is only on the MCE is remove-server-from-mce&rsquo;s.</td></tr>
-          <tr><td class="k">ClusterMembershipMismatchError</td><td class="muted">server-scan contradicts the request or the MCE: the server is on <b>another MCE</b>; INSTALLED in <b>another cluster</b> than the one the Agent belongs to; <code>INSTALLED_TO_INVENTORY</code> while the Agent is bound (its agents job re-reads the MCE every 15 min &mdash; re-run once it agrees); or <b>contested</b> between two claims.</td></tr>
+          <tr><td class="k">ClusterMembershipMismatchError</td><td class="muted">server-scan contradicts the request or the MCE: the server is on <b>another MCE</b>; INSTALLED in <b>another cluster</b> than the one the Agent belongs to; <code>INSTALLED_TO_INVENTORY</code> while the Agent is bound (its agents job re-reads the MCE every 5 min &mdash; re-run once it agrees); or <b>contested</b> between two claims.</td></tr>
           <tr><td class="k">MultipleBoundAgentsError</td><td class="muted">More than one of the host&rsquo;s Agents is bound, or has an AgentMachine. One machine is one node.</td></tr>
           <tr><td class="k">NotHostedClusterNodeError</td><td class="muted">An Agent bound into no HostedCluster&rsquo;s control plane with no AgentMachine or Machine behind it (ACM/ZTP); links into a namespace no HostedCluster uses; or an Agent bound to a ClusterDeployment other than its AgentMachine&rsquo;s or Machine&rsquo;s hosted cluster.</td></tr>
           <tr><td class="k">ConflictingHostedObjectsError</td><td class="muted">Two Machines linked to the Agent, two Nodes that are the server, or links into two control planes. The run cannot tell which is real.</td></tr>
           <tr><td class="k">HostedNodeStillPresentError</td><td class="muted">A <b>Ready</b> Node of the hosted cluster is the server, but nothing on the MCE links it any more &mdash; no Machine, AgentMachine or binding to take the host out through. Drain it and power the host off (or boot it into discovery), then re-run: the stale Node is deleted then.</td></tr>
-          <tr><td class="k">ServerReservedError</td><td class="muted">Another run holds server-scan&rsquo;s lock &mdash; typically add-server-to-mce&rsquo;s hold, which its run gives back once server-scan shows the machine installed (usually 15&ndash;30 min, at most a day). Wait for that, or release it in server-scan, then re-run.</td></tr>
+          <tr><td class="k">ServerReservedError</td><td class="muted">Another run holds server-scan&rsquo;s lock &mdash; typically add-server-to-mce&rsquo;s hold, which its run gives back once server-scan shows the machine installed (usually 5&ndash;15 min, at most a day). Wait for that, or release it in server-scan, then re-run.</td></tr>
           <tr><td class="k">AmbiguousServerNameError</td><td class="muted">Two server-scan documents carry the name.</td></tr>
         </tbody>
       </table>
@@ -690,7 +690,7 @@
         <h3>Two jobs see the machine, neither sees the whole move</h3>
         <p>The hosted cluster&rsquo;s <b>nodes</b> job frees the server the moment its Node disappears. The
         MCE&rsquo;s <b>agents</b> job re-claims it as <code>INSTALLED_TO_INVENTORY</code> on its own
-        15-minute cadence. Between the two the document can read <b>AVAILABLE</b> while the host is still in
+        5-minute cadence. Between the two the document can read <b>AVAILABLE</b> while the host is still in
         this MCE&rsquo;s InfraEnv &mdash; and another MCE&rsquo;s add-server-to-mce would draw it, putting two
         clusters on one BMC.</p>
       </div>

@@ -172,3 +172,30 @@ def test_a_failed_draw_names_its_candidates_the_way_the_page_reads_them():
     assert body.group(2).startswith(f"{add_server_to_mce._REJECTION_SUMMARY[reasons[0]]}: ")
     for reason, server in zip(reasons, servers, strict=True):
         assert f"{add_server_to_mce._REJECTION_SUMMARY[reason]}: {server.name} (why it was skipped)" in body.group(2)
+
+
+@pytest.mark.parametrize(
+    "lock_note",
+    [
+        None,
+        "Its lock was given back once server-scan had it in maintenance, so no run draws it "
+        "again: end the maintenance there once the cause is fixed",
+        "Its lock is kept until it expires, because server-scan would not put it in "
+        "maintenance (ServerScanAuthError)",
+    ],
+)
+def test_an_allocated_servers_failure_ends_where_the_page_reads_its_reason(lock_note):
+    """The page cuts the closing words about the lock off at "\\. Its lock [^.]*$" — the
+    page's own pattern, run here — so whatever the maintenance decided must match it."""
+    server = install_tests.bondable_server(name="ocp-pool-0001")
+    error = add_server_to_mce._no_installable_candidate(
+        "pool", "inventory", [server], [("no-agent", f"{server.name} (no Agent in 60 min; x. y)")],
+        allocated=True, lock_note=lock_note,
+    )
+    pattern = re.search(r"const allocated = /(.+?)/\.exec\(message", PAGE.read_text())
+    assert pattern is not None
+    parsed = re.match(pattern.group(1), error.message)
+    assert parsed is not None
+    assert parsed.group(2) == (
+        f"{add_server_to_mce._REJECTION_SUMMARY['no-agent']}: {server.name} (no Agent in 60 min; x. y)"
+    )

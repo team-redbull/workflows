@@ -177,36 +177,42 @@ and its **MCE cluster**.
 
 #### In plain terms — read this first
 
-Say you ask for a server for InfraEnv `x` on **MCE-A** and server-scan returns
-three candidates, **S1, S2, S3**. The run does **not** reserve all three: it
-works on S1 until S1 succeeds or is given back, and only then looks at S2. S2
-and S3 stay free for everyone else meanwhile.
+Say you ask for a server for InfraEnv `x` on **MCE-A**. The run asks server-scan
+to **allocate** it ONE (`POST /servers/available`, server-scan's ADR-0063):
+server-scan picks a candidate, **locks it for this run** for 2 h ("being
+installed into MCE-A"), live-checks it against its vendor manager while locked
+and hands it over — or releases it and tries its next, up to five. Call it
+**S1**: no other run can be handed S1 now.
 
 1. **Check S1** (seconds, nothing written): usable name, known BMC vendor, a
-   BMC address, two link-up NICs on different physical ports, well-formed MACs,
-   no BareMetalHost for it already in MCE-A. Fails one → skip to S2.
-2. **Lock S1 in server-scan** for 2 h ("being installed into MCE-A by this
-   run"). Another run holds it → skip to S2.
-3. **Create** S1's Secret, BareMetalHost and NMStateConfig in MCE-A.
-4. **Wait up to 1 h for an Agent** — the machine phoning home from the
+   BMC address, no BareMetalHost for it already in MCE-A. Its NICs and MACs are
+   not checked again — server-scan did, while it held the lock — but the run
+   picks which two form the NMStateConfig's bond. Fails one → S1's lock goes
+   back and the run **fails**, saying which.
+2. **Create** S1's Secret, BareMetalHost and NMStateConfig in MCE-A.
+3. **Wait up to 1 h for an Agent** — the machine phoning home from the
    discovery ISO, proof that the BMC, bond, VLAN and DHCP all worked. The lock
    is renewed for 2 h as the wait starts.
-5. **Agent** → extend S1's lock to **24 h** (installed; S2 and S3 never touched),
-   then read server-scan **every 5 min** until it shows S1 `INSTALLED_TO_INVENTORY`
-   or `INSTALLED`, **release** the lock and finish — usually 15–30 min. Not seen
-   within the 24 h, the lock is kept to expire and the run still **completes**.
-   **No Agent after 1 h** → delete S1's resources, **release** its lock (S1 is
-   drawable again at once), back to step 1 with S2.
+4. **Agent** → extend S1's lock to **24 h** (installed), then read server-scan
+   **every 5 min** until it shows S1 `INSTALLED_TO_INVENTORY` or `INSTALLED`,
+   **release** the lock and finish — usually 5–15 min. Not seen within the
+   24 h, the lock is kept to expire and the run still **completes**.
+   **No Agent after 1 h** → delete S1's resources, put S1 **in maintenance** in
+   server-scan, **release** its lock, and **fail**, saying where the host's
+   state points. No run is given S1 again until someone ends its maintenance.
 
-The run fails only when every candidate was skipped or tried (worst case about
-3 h for three that never boot), with the reasons grouped.
+**One server per run** (the operator, 2026-11-17). Until then a run drew several
+candidates and tried the next whenever one was unusable — an hour-deep missing
+Agent included. Now a failed run has given its server back, and asking again
+starts a new run with a new allocation. A run started before 2026-11-17 still
+finishes the old way.
 
 **Why the lock, and what the 24 h hold is.** server-scan learns a machine is
-taken only when a *cluster* reports it (its membership job, every 15 min where
+taken only when a *cluster* reports it (its membership jobs, every 5 min where
 enabled); until then it reads `AVAILABLE`. The "already has a BareMetalHost?"
 check sees only *this* MCE, so without the lock a run for MCE-B could draw S1
-minutes after MCE-A installed it. `/servers/available` never hands out a locked
-machine. The 24 h hold after success writes nothing to any cluster — it only
+minutes after MCE-A installed it. server-scan never allocates a locked machine,
+and locks the one it allocates in the same call. The 24 h hold after success writes nothing to any cluster — it only
 keeps S1 out of other draws until server-scan can see it in a cluster itself —
 and the run waits for exactly that, then releases it (`awaiting-server-scan`,
 `releasing-lock`; the operator, 2026-11-09): server-scan hides an
@@ -217,44 +223,47 @@ there and its PXE cleanup did not fail (the operator's decision, 2026-10-31; a f
 cleanup may leave the host able to boot this MCE's discovery image, so the lock then
 runs to its expiry).
 
-**Who checks what.** server-scan: unclaimed, not in maintenance, BMC
+**Who checks what.** server-scan, in the allocation — live, against the vendor
+manager, while the server is locked: unclaimed, not in maintenance, BMC
 reachable, health tier, the **network category HEALTHY — at least two links
 observed UP** (since 2026-09-26; Dell NPAR already reduced to one entry per
-physical port), and not locked. The workflow: *which* two NICs form the bond,
-the name, BMC driver and address, MAC syntax, and no BareMetalHost in this MCE.
-The bond rule overlaps server-scan's network gate on purpose — server-scan says
-the machine *can* be bonded; the workflow picks the two NICs and is the last
-check before a cluster write. No NIC count is sent to server-scan
-(`min_nic_macs` was dropped once that gate existed).
+physical port), at least two NIC MACs read (`min_nic_macs: 2`), and not locked
+by anyone else. The workflow: the name, BMC driver and address, and no
+BareMetalHost in this MCE; it no longer re-checks the NICs or the MACs (the
+operator, 2026-11-17) — server-scan says the machine *can* be bonded, and the
+workflow only picks *which* two NICs, because the bond and the boot MAC are
+written from them. The limb refuses a MAC it cannot use (`InvalidMacError`)
+before the BareMetalHost or the NMStateConfig is written.
 
 | What happens when… | The run | The lock |
 | --- | --- | --- |
-| a candidate fails a check | skips it | never taken |
-| another run holds the candidate | skips it | theirs, untouched |
+| server-scan has nothing to allocate (nothing healthy, all claimed or locked, every candidate failing its live check) | fails at once, `ServerNotAvailableError` with server-scan's reasons | never taken |
+| the allocated server fails a check | gives it back and fails, saying which | released at once |
 | the Agent appears | installed; waits ≤ 24 h for server-scan to show it installed, then completes | held 24 h, **released** once server-scan shows it (`lock_released: true`) |
 | server-scan never shows it in 24 h, is unreadable, or names another MCE | **completes** all the same | kept, expires (`lock_released: false`, `lock_detail` says why) |
-| no Agent within 1 h | deletes the candidate's resources, tries the next | released at once |
-| the lock lapsed and another run took the machine | deletes its *own* resources, tries the next | theirs, untouched |
-| every candidate skipped or tried | fails, reasons grouped | none held |
+| no Agent within 1 h | deletes the server's resources, puts it **in maintenance** in server-scan, then fails (`AgentNeverAppearedError`) | released once in maintenance; **kept** to expire (2 h) if server-scan refuses the maintenance |
+| the lock lapsed and another run took the machine | deletes its *own* resources, then fails (`ServerReservedError`) | theirs, untouched |
+| cancelled while server-scan is still allocating | ends CANCELED, never learning which server server-scan may still lock for it | that one expires (2 h) |
+| the allocation's answer is lost and it is retried | the retry is allocated *another* server — server-scan ties a lock to the request that took it | the first expires (2 h) |
 | crash/failure while creating resources | stops, resources **left** on the MCE | expires after 2 h; a re-run of the same named install extends it |
 | operator **cancels** before the Agent | **rolls back** (since 2026-11-09): after 2 min for calls in flight, **remove-server-from-mce** takes the server out of the MCE (power off, delete, PXE, verify) — or, nothing written, its PXE mapping is removed here; ends CANCELED, `progress.cancel_rollback` says what was done | released |
 | operator cancels after the Agent | stops the wait for server-scan, ends CANCELED; the server **stays installed** | expires |
 | operator **terminates** | stops at once — no rollback, resources left (use Cancel to roll back) | expires |
 | no worker in that MCE | waits; `progress` names the queue | — |
-| server-scan token not admin | fails at the first lock (`ServerScanAuthError`) | never taken |
+| server-scan token not admin | fails at the allocation, which locks (`ServerScanAuthError`) | never taken |
 
 **Precondition.** The 24 h hold relies on server-scan's `nodes-status` `agents`
 job, which runs on every MCE add-server-to-mce targets (each has an InfraEnv and an
-`AgentServiceConfig`): every 15 min it marks a server with an unbound Agent
+`AgentServiceConfig`): every 5 min it marks a server with an unbound Agent
 `INSTALLED_TO_INVENTORY`, so it is never drawn again. An MCE without that job
 would read the machine `AVAILABLE` again after the 24 h (server-scan's ceiling).
 
 **Known gap.** A crash
 mid-create leaves the BareMetalHost on the MCE while the lock expires after
 2 h; clean up by hand, or re-run the same named install (`server_names` set to
-that machine, so the same workflow id). server-scan hides a locked machine
-from `/servers/available` even from the run holding the lock, so a named run it
-refuses reads the machine's record (`lookup_install_candidate`) and goes on
+that machine, so the same workflow id). server-scan's allocation refuses a
+locked machine even to the run holding the lock, so a named run it refuses
+reads the machine's record (`lookup_install_candidate`) and goes on
 when the only reason is its OWN workflow id's lock, which it then extends. Any
 other refusal of a named server — another run's lock, a cluster's claim,
 maintenance, its health — fails saying which.
@@ -262,33 +271,40 @@ maintenance, its health — fails saying which.
 #### Phase by phase
 
 1. **resolving-vlan** — the MCE's `INVENTORY` segment, read from the Segments
-   Manager by **cluster name**. Before the draw, because no candidate could make
-   a missing allocation usable. Runs on the *segment-lifecycle* queue, where that
-   credential already lives.
-2. **acquiring-server** — `GET /servers/available` against server-scan. The
+   Manager by **cluster name**. Before the allocation, because no server could
+   make a missing allocation usable (and one allocated first would sit locked).
+   Runs on the *segment-lifecycle* queue, where that credential already lives.
+2. **acquiring-server** — `POST /servers/available`: server-scan **allocates**
+   ONE server, locked for this run (holder `add-server-to-mce`, the run's
+   workflow id, 2 h) and live-checked while locked (its ADR-0063). The
    InfraEnv's name states which hardware it is for
    (`cisco-m6-bat-yam-64c-512gb`) and server names carry the same tokens behind
-   an `ocp-` prefix, so the pattern is `^ocp-<infraEnv>`. `HEALTHY` only.
-3. **selecting-server** — the first candidate that can actually be installed.
-   Bond members are two link-up NICs on two **distinct physical ports**, taken
-   from `interfaces[]` and never
-   `nic_macs`: server-scan reduces NPAR partitions to one entry per port in the
-   former and leaves the latter whole, so indexing MACs can bond two partitions
-   of one wire. `UP` is required strictly, which no HPE server can satisfy —
-   OneView reports no link state at all.
+   an `ocp-` prefix, so the pattern is `^ocp-<infraEnv>-` — the trailing `-`
+   ends the InfraEnv, so `…-512gb` never draws `…-512gbx-…`; `max_health: HEALTHY`,
+   `min_nic_macs: 2`. Nothing reservable is server-scan's 503
+   `NO_AVAILABLE_SERVER` with its reasons → `ServerNotAvailableError`, the run
+   fails. Seconds as a rule, ~22 min at server-scan's worst (five live checks):
+   the activity heartbeats and allows 30. **Not idempotent**: a retry after a
+   lost answer is allocated another server, the first freeing itself at its TTL.
+   A run started before 2026-11-17 asks `GET /servers/available` (stored data,
+   unlocked, `max_health` since server-scan's ADR-0063) for several candidates.
+3. **selecting-server** — can THIS server be installed? The bond members are
+   PICKED, not judged: two NICs on two **distinct physical ports**, link-UP
+   first, taken from `interfaces[]` and never `nic_macs` — server-scan reduces
+   NPAR partitions to one entry per port in the former and leaves the latter
+   whole, so indexing MACs can bond two partitions of one wire. server-scan
+   allocated the server with two links read UP and its MACs normalized, so the
+   run does not refuse on link state or MAC syntax any more (the operator,
+   2026-11-17; a run started before still requires `UP` strictly). An unusable
+   name, fewer than two ports with a MAC, an unknown `bmc_vendor`, no BMC host
+   or a BareMetalHost it already has: its lock goes back and the run **fails**
+   with that reason's type, naming the server (a run started before 2026-11-17
+   skipped it for its next candidate).
 
-   **Every** reason a candidate is unusable is a *skip*, never a failed run —
-   an unusable name, no bond, an unknown `bmc_vendor`, no BMC host, a malformed
-   MAC, a BareMetalHost it already has, or an install lock another run holds
-   (below). That is what the multi-candidate draw is for. If none survives,
-   the reasons are reported as separate groups and the failure takes the
-   specific error type when they all agree — which they always do for an
-   explicitly named server, whose pool holds one.
-
-   **reserving-server** — the chosen machine is locked in server-scan
-   (`POST /servers/{id}/reservation`, server-scan's ADR-0035) before anything is
-   written. A lock another run holds is a skip (`ServerReservedError` if the
-   whole pool is held), as is a server that has left the inventory.
+   **reserving-server** — only for a NAMED server the allocation refused that
+   the run takes anyway: its own leftover lock (a re-run), or `allow_unhealthy`.
+   The lock is then taken here (`POST /servers/{id}/reservation`, server-scan's
+   ADR-0035) before anything is written.
 4. **creating-secret / -baremetalhost / -nmstateconfig** — all idempotent; an
    existing resource is success **once its BMC address, boot MAC, InfraEnv and
    VLAN match**, and never an overwrite. A resource that differs is a
@@ -305,7 +321,8 @@ maintenance, its health — fails saying which.
    names an Agent after the host's inventory UUID and its spec holds no
    reference back to the BareMetalHost. The lock is renewed as the wait begins,
    so it covers the whole hour however long the creates took; if it had lapsed
-   and another run took the machine, this candidate is torn down instead.
+   and another run took the machine, this run's resources are torn down and the
+   run fails instead.
    On success (**holding-server**) the lock is extended to a day — the machine
    is taken, and server-scan keeps listing it `AVAILABLE` until a membership
    job sees it in a cluster. Then (**awaiting-server-scan**) server-scan is read
@@ -313,18 +330,21 @@ maintenance, its health — fails saying which.
    `INSTALLED` the lock is given back (**releasing-lock**). Not seen within the
    day — or server-scan unreadable, or naming another MCE — the lock is kept to
    expire and the run completes anyway.
-6. **rolling-back** — no Agent by the deadline is that **candidate's** failure,
-   not the run's. The NMStateConfig and BareMetalHost are removed (the Secret
-   cascades off the host's ownerReference) and then the lock is released
-   (**releasing-server**), which returns the machine to the inventory, and the
-   next candidate is tried from step 3. Only an exhausted
-   pool fails the run, as `AgentNeverAppearedError`.
+6. **rolling-back** — no Agent by the deadline: the NMStateConfig and
+   BareMetalHost are removed (the Secret cascades off the host's
+   ownerReference), the server is put **in maintenance** in server-scan
+   (**setting-maintenance**, `PUT /servers/{id}/maintenance` with a reason
+   naming the run, the InfraEnv and where the host's state points; the
+   operator, 2026-11-17), then the lock is released (**releasing-server**), and
+   the run fails as `AgentNeverAppearedError`. server-scan allocates no server
+   in maintenance, so the machine stays out of every draw until someone ends
+   its maintenance there; refused (a viewer token), the lock is kept to expire
+   instead. A run started before 2026-11-17 releases with no maintenance and
+   tries its next candidate from step 3.
 
-   Steps 3–6 are a **loop**, not a pipeline: a server cannot be shown to be
-   installable without creating its resources and watching what happens, so the
-   draw is a list of things to *try*. Teardown order is load-bearing — metal3
-   must be told to detach the host *before* the delete, or its finalizer blocks
-   forever trying to deprovision through the BMC that just failed to answer.
+   Teardown order is load-bearing — metal3 must be told to detach the host
+   *before* the delete, or its finalizer blocks forever trying to deprovision
+   through the BMC that just failed to answer.
 
    This replaced a 10-minute Ironic-registration deadline, which was the wrong
    signal both ways: it passed hosts whose bond or VLAN was wrong (they register
@@ -334,8 +354,8 @@ maintenance, its health — fails saying which.
    host from a slow one.
 
 Its id is `add-server-to-mce-<mce>_<infraEnv>_<slot>` — the hub, the
-**candidate pool** and a slot. The MCE is in the id so each hub finds only its own
-runs; the pool itself (`^ocp-<infraEnv>`) has no MCE in it, so two hubs filling an
+**pool** and a slot. The MCE is in the id so each hub finds only its own
+runs; the pool itself (`^ocp-<infraEnv>-`) has no MCE in it, so two hubs filling an
 InfraEnv of the same name still draw from the same machines, and the install
 lock is what keeps them apart. Installs drawing from one pool run in parallel,
 one per slot (see
@@ -350,10 +370,10 @@ before the rename (2026-11-01), and `install-server-<infraEnv>_<slot>` /
 **The install lock is the guard across MCEs.** server-scan lists a machine
 `AVAILABLE` until a cluster reports it, and the BareMetalHost probe in step 3
 only sees the run's *own* MCE — so without a lock, a server installed into
-MCE-A is drawn again by a run for MCE-B and both clusters drive one BMC. The lock
-is keyed on the run's workflow id (a retry or renewal extends it, never loses a
-race to itself), expires on its own (a dead run costs one TTL, not the
-machine), and is released only after a teardown proved nothing on the cluster
+MCE-A is drawn again by a run for MCE-B and both clusters drive one BMC. server-scan
+takes the lock as it allocates the server, keyed on the run's holder and workflow
+id (the run's renewals extend it, never lose a race to it), it expires on its own
+(a dead run costs one TTL, not the machine), and is released only after a teardown proved nothing on the cluster
 still points at the machine; a failure anywhere else leaves it to expire,
 because half-created resources may still name it. It needs server-scan's
 **admin** role. Runs started before it existed replay without it
@@ -364,8 +384,7 @@ parallel: the id no longer has to keep one run per pool.
 MCE owns one inventory network, allocated in the Segments Manager as
 `INVENTORY` and found by its **cluster name** — so the VLAN is a property of the
 cluster this run targets and of nothing else. It is resolved as step one,
-because no candidate the run might draw could make a missing allocation usable,
-and the lookup runs on the *segment-lifecycle* queue where that token already
+because no server could make a missing allocation usable, and the lookup runs on the *segment-lifecycle* queue where that token already
 lives. There is deliberately no `vlan_id` input.
 
 `bmc_vendor` still decides the Ironic driver — it no longer decides a network:
@@ -407,39 +426,38 @@ several runs (next sections).
 
 | | `server_names` omitted — *"fill this InfraEnv"* | `server_names` given — *"install this machine"* |
 | --- | --- | --- |
-| server-scan query | `?pattern=^ocp-<infraEnv>&count=<candidate_count>` | `?name=<server>&count=1` |
-| candidates drawn | `candidate_count` (default: runs on the pool + 2, so 3 for a lone install; 1–20) | one |
-| already has a BareMetalHost | **skipped**, next candidate tried | **converged** — that is the point |
+| server-scan allocation | `POST /servers/available {"pattern": "^ocp-<infraEnv>-", …}` | `POST /servers/available {"name": "<server>", …}` |
+| servers per run | one — server-scan picks it, locks it for the run, live-checks it | one — that one |
+| already has a BareMetalHost | its lock **given back**, the run fails | **converged** — that is the point |
 | workflow id | `add-server-to-mce-<mce>_<infraEnv>_<slot>`, the first free slot | `add-server-to-mce-<mce>_<server>` |
 | use it for | routine capacity: take whatever is free and healthy | re-running a specific host, or repairing one |
 
-Both modes apply every other rule identically: `HEALTHY` only, at least two NIC
-MACs, two link-up NICs on two distinct physical ports, a `bmc_vendor` this
-orchestrator has a driver for, and well-formed MACs. So naming a server does not
-force an unusable one through — it only narrows the pool to one and turns the
-already-installed check off.
+Both modes apply every other rule identically: server-scan allocates only a
+`HEALTHY` server with at least two NIC MACs and two links read UP, and the run
+needs a `bmc_vendor` this orchestrator has a driver for. So naming a server does
+not force an unusable one through — it only narrows the pool to one and turns
+the already-installed check off.
 
-Drawing several candidates is what makes one unusable server a retry rather than
-a failed run. When no candidate survives, the failure names every candidate with
-its provider and each interface's link state, and lists separately those skipped
-as already installed and those whose server-scan name cannot be a Kubernetes
-resource name — three different people's problem, so they are never merged.
+A failed run names its server and why it could not be installed — the host's
+own state for a missing Agent (and that it is now in maintenance) — with the
+error type of that one reason.
 
 ### Request body — `AddServerToMceRequest`
 
 | field | type | rules | what it is for |
 | --- | --- | --- | --- |
-| `infra_env` | str | non-empty | The InfraEnv to fill. Labels both resources, **and** is the server query (`^ocp-<infra_env>`). Must already exist, in `namespace`. |
+| `infra_env` | str | non-empty | The InfraEnv to fill. Labels both resources, **and** is the server query (`^ocp-<infra_env>-`). Must already exist, in `namespace`. |
 | `mce_cluster` | str | non-empty | Which MCE. Names the `INVENTORY` segment the VLAN comes from **and** the activity queue the cluster writes go to. |
 | `namespace` | str | non-empty | Where the three resources go. **Must be the InfraEnv's own namespace** — BMAC looks for the InfraEnv beside the BareMetalHost. |
 | `server_names` | str \| list \| null | default `null`; a list is 1–20 names, each once | Install these machines instead of letting the pool pick (see above): one name, or a list — one run per name. |
-| `count` | int \| null | 1–20, default `null` (the pool picks one) | Let the pool pick this many and install them in parallel, one run each (see below). Sending it asks for the per-run report. Not with `server_names`. |
-| `candidate_count` | int \| null | 1–20, default `null` | How many candidates each pool run draws: if unset, (runs on the pool) + new runs + 2, max 20 — 3 for a lone install. Not with `server_names`. |
+| `count` | int \| null | 1–20, default `null` (the pool picks one) | Let the pool pick this many and install them in parallel, one run each, each allocated its own server (see below). Sending it asks for the per-run report. Not with `server_names`. |
 | `labels` | map | default `{}` | Extra labels for the BareMetalHost. Cannot override the InfraEnv label — that would split the host from its NMStateConfig. |
 
-`namespace`, `candidate_count` and `labels` are **not shown in Swagger** (the
-operator, 2026-11-09): expert knobs. They are accepted, validated and used as
-above, and unsent keep their defaults.
+`namespace` and `labels` are **not shown in Swagger** (the operator,
+2026-11-09): expert knobs. They are accepted, validated and used as above, and
+unsent keep their defaults. `candidate_count`, which sized a run's candidate
+draw, was **removed** on 2026-11-17 when server-scan began allocating each run
+one server: sent, it is a 422 saying so.
 
 There is deliberately **no `vlan_id`**: it belongs to the MCE's segment, and a
 supplied one could contradict it. The request body forbids unknown fields, so
@@ -466,8 +484,8 @@ follows what was sent:
 
 The per-run report is 202 with `started` / `already_running` / `failed` and one
 `results` item per run (`workflow_id`, `status`, `run_id`, plus `slot` for a
-pool run or `server_name` for a named one). `count` and `candidate_count` size a
-draw from the pool, so either one with `server_names` is a 422.
+pool run or `server_name` for a named one). `count` sizes a draw from the pool,
+so it is a 422 with `server_names`.
 
 **From the pool: slots.** Every run the pool picks for is on a slot,
 `add-server-to-mce-<mce>_<infraEnv>_<slot>`. The route walks the slots from `_1` up,
@@ -483,15 +501,13 @@ however it was asked for: a name already installing reports `already_running`
 rather than being installed twice. One refused start does not stop the others.
 
 **No two runs take one machine**, however they were asked for — two batches,
-or 5 from the pool and then 5 by name. Each run takes server-scan's install
-lock before writing anything; server-scan takes it by compare-and-set on the
-document revision, refuses a live lock to any other workflow id, and stops
-listing a locked machine. A pool run that loses the race skips that machine and
-tries its next candidate. Because every run on the pool draws the same top of
-it, `candidate_count` defaults to (slots still running) + `count` + 2 (max 20);
-a pool run that finds only locked machines fails with `ServerReservedError` —
-the pool was smaller than the installs asked for, or raise `candidate_count`.
-A named machine another run took first fails its own run instead.
+or 5 from the pool and then 5 by name. server-scan allocates each run its own
+server and locks it in the same call, by compare-and-set on the document
+revision, and never allocates a locked one. So no run sizes anything for its
+siblings: every pool run's input is the same. A run server-scan has nothing left
+for fails with `ServerNotAvailableError` and its reasons (`RESERVED` when its
+siblings took the rest) — the pool was smaller than the installs asked for. A
+named machine another run took first fails its own run.
 
 **Why one route.** Decided with the operator 2026-10-23. Someone asked for a
 second healthy server from one InfraEnv and got the 409. The parallel draw
@@ -505,7 +521,8 @@ to learn.
   another runs used to be refused until the first finished — up to an hour.
   Asking the pool again is asking for one more server, so it takes the next
   slot. The 409 stays for a named machine.
-- **`count` and `candidate_count` next to names are refused, not ignored.**
+- **`count` next to names is refused, not ignored** (and `candidate_count` is
+  refused anywhere since 2026-11-17, saying it was removed).
 
 `install-server/bulk` is gone (404). A request to the pool, with or without
 `count`, starts more installs each time it is sent, so it is not retry-safe: a
@@ -606,7 +623,7 @@ the MCE links any more (`HostedNodeStillPresentError`). `AVAILABLE` is not a
 contradiction. Then it
 takes server-scan's **install lock** (holder `uninstall-server-from-hc`): the hosted
 cluster's nodes job frees the server the moment its Node is gone while the
-MCE's agents job re-claims it only every 15 min, so in between it can read
+MCE's agents job re-claims it only every 5 min, so in between it can read
 `AVAILABLE` while still in this InfraEnv. The lock is extended to 24 h before
 the child starts and left to its TTL on a failure. Once remove-server-from-mce completed
 with nothing left on the MCE and no PXE cleanup failure, the run **releases**
@@ -615,7 +632,7 @@ it (**releasing-server**, `lock_released: true`; the operator's decision,
 cleanup failed, the day-long hold stays. A
 lock another run holds —
 add-server-to-mce's hold after it installed the machine, typically, until its
-run sees server-scan report the machine (usually 15–30 min, at most a day) —
+run sees server-scan report the machine (usually 5–15 min, at most a day) —
 fails the run (`ServerReservedError`); wait for that, or release it in
 server-scan, and re-run.
 
@@ -993,7 +1010,8 @@ would hide which segments actually got a workflow.
   values-repo append is a no-op for a file already recording this allocation;
   `release_segment` answers 200 for an already-released segment and the DHCP
   scope DELETE 204 for an absent scope. add-server-to-mce's three creates each treat an existing resource as success once
-  it matches, and a run skips candidates that already have a BareMetalHost.
+  it matches, and a pool run refuses a server that already has a BareMetalHost
+  (giving its lock back) rather than "succeed" over another install's host.
   Workflow ids are deterministic (`initialize-segment-<network>`,
   `allocate-segment-<TYPE>-<cluster>`, `release-segment-<TYPE>-<cluster>`,
   `add-server-to-mce-<mce>_<server>`, `remove-server-from-mce-<server>`,
@@ -1022,7 +1040,7 @@ would hide which segments actually got a workflow.
 | `CLUSTER_CONSOLE_URL_TEMPLATE` | `cluster-lifecycle-config` | the console URL a shortcut points at, `{cluster}` = the day1 file stem: `https://console-openshift-console.apps.{cluster}.<base domain>` |
 | `MCE_CLUSTER` | `server-lifecycle-config` | which MCE this worker serves — names its queue, so it must match callers' `mce_cluster` |
 | `SERVER_SCAN_URL` | `server-lifecycle-config` | inventory API base, INCLUDING `/api/v1` |
-| `SERVER_SCAN_API_TOKEN` | Secret | an **admin** token — add-server-to-mce takes and releases the install lock |
+| `SERVER_SCAN_API_TOKEN` | Secret | an **admin** token — add-server-to-mce takes and releases the install lock, and puts a server with no Agent in maintenance |
 | `{HP,DELL,CISCO,INTERSIGHT}_BMC_USERNAME`/`_PASSWORD` | Secret | what Ironic drives the BMC with |
 | `DAY1_REPO_URL`, `DAY1_VALIDATE_COMMAND` | `server-lifecycle-config` | update-nodepool's day1 read and replicas commit, `https://`; OPTIONAL — unset, only update-nodepool is refused on that MCE |
 | `DAY1_GIT_TOKEN` | Secret (credentials, or `day1.tokenSecret`) | its push token; optional with the URL |

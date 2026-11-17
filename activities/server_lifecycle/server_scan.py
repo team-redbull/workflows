@@ -6,13 +6,18 @@ token as PARAMETERS rather than reading settings, so the offline tests drive it
 with respx against any base URL and no environment at all. The @activity.defn
 wrapper in activities.py owns the settings and the logging.
 
-Three calls are the whole surface for an install. GET /servers/available
-returns servers that are unclaimed, healthy, reachable, unreserved and not in
-maintenance, live-rechecking each one it hands back. POST and DELETE
-/servers/{id}/reservation take and release the install lock on the one a run
-chose (ADR-0035) — mutations, so the token needs server-scan's ADMIN role.
-When /servers/available refuses a NAMED server, the exact-name detail read
-(install_candidate_by_name) says why.
+An install starts with ONE call since server-scan's ADR-0063 (2026-11-16):
+POST /servers/available draws a server that is unclaimed, healthy, reachable,
+unreserved and not in maintenance, takes the install lock on it for this run,
+live-rechecks it while locked and returns it (allocate_available_server).
+POST and DELETE /servers/{id}/reservation extend and release that lock
+(ADR-0035), and PUT /servers/{id}/maintenance takes a server that never
+produced an Agent out of every draw — all mutations, so the token needs
+server-scan's ADMIN role. When
+the POST refuses a NAMED server, the exact-name detail read
+(install_candidate_by_name) says why. GET /servers/available — stored data
+only, unlocked — is what runs recorded before the allocation still draw
+their candidate lists from.
 """
 
 from __future__ import annotations
@@ -33,12 +38,15 @@ from shared.exceptions import (
 from shared.models.server_lifecycle import (
     AcquiredServer,
     AcquireServerRequest,
+    AllocateServerRequest,
     BmcEndpoint,
     InstallCandidateRecord,
     ReleaseServerRequest,
     ReserveServerRequest,
     ServerInterface,
     ServerLockRecord,
+    ServerMaintenance,
+    ServerMaintenanceRequest,
     ServerMembership,
     ServerReservation,
 )
@@ -56,6 +64,19 @@ _TLS_VERIFY = False
 
 _AVAILABLE_PATH = "/servers/available"
 _RESERVATION_PATH = "/servers/{server_id}/reservation"
+_MAINTENANCE_PATH = "/servers/{server_id}/maintenance"
+
+# The allocation live-checks each candidate it locks against its vendor
+# manager, one at a time, up to server-scan's INVENTORY_AVAILABLE_MAX_ATTEMPTS
+# (default 5), each under a probe deadline of up to ~4.5 min (UCS Central's) —
+# so ~22 min at the very worst, seconds to a minute as a rule. Generous, and
+# strictly below allocate_server's start_to_close_timeout (30 min): a client
+# that gives up while server-scan still works may leave a server locked to
+# this run until its TTL.
+_ALLOCATE_TIMEOUT = httpx.Timeout(25 * 60.0, connect=30.0)
+# server-scan's code for "nothing could be reserved", whatever the cause; a 503
+# without it is a proxy or an outage, which is waited out.
+_NO_AVAILABLE_SERVER = "NO_AVAILABLE_SERVER"
 
 
 def _query(request: AcquireServerRequest) -> dict[str, Any]:
@@ -63,9 +84,10 @@ def _query(request: AcquireServerRequest) -> dict[str, Any]:
 
     `name` and `pattern` are mutually exclusive in the endpoint's own contract,
     and `count` only means anything for a pattern draw — a named lookup is a
-    pool of one.
+    pool of one. `max_health` since server-scan's ADR-0063: it answers `health`
+    with a 400 now, and HEALTHY means the same tier under either name.
     """
-    params: dict[str, Any] = {"health": request.health}
+    params: dict[str, Any] = {"max_health": request.health}
     if request.name is not None:
         params["name"] = request.name
     else:
@@ -137,6 +159,12 @@ def _raise_for_status(resp: httpx.Response, request: AcquireServerRequest) -> No
             f"server name {request.name!r} matches more than one server-scan "
             f"document: {_detail(resp)}"
         )
+    if resp.status_code in (400, 422):
+        # A request server-scan will never accept, sent again every minute
+        # forever: the `health` it answers with a 400 since ADR-0063 was one.
+        raise ServerScanRequestInvalidError(
+            f"server-scan rejected the lookup ({resp.status_code}): {_detail(resp)}"
+        )
     raise ServerScanError(
         f"server-scan lookup failed: {resp.status_code} {_detail(resp)}"
     )
@@ -206,6 +234,85 @@ async def fetch_available_servers(
             f"requested={request.count})"
         )
     return [_to_acquired_server(item) for item in items]
+
+
+def _code(resp: httpx.Response) -> str | None:
+    """server-scan's machine-matchable RFC 9457 `code` extension, if the body has one."""
+    try:
+        body = resp.json()
+    except ValueError:
+        return None
+    code = body.get("code") if isinstance(body, dict) else None
+    return code if isinstance(code, str) else None
+
+
+async def allocate_available_server(
+    base_url: str, token: str, request: AllocateServerRequest
+) -> AcquiredServer:
+    """Take ONE server for a run: `POST /servers/available` (server-scan ADR-0063).
+
+    What comes back is already locked as `request.holder` + `request.workflow_id`
+    and was live-checked while locked. Every "nothing could be reserved" is a
+    503 with code NO_AVAILABLE_SERVER — nothing at that health, all installed,
+    in maintenance or locked, every candidate failing its live check — whose
+    `detail` names each candidate's failure and `details.reasons` the codes:
+    ServerNotAvailableError, permanent, as the GET's 404 was. A 503 without
+    that code is not server-scan's answer (a proxy, a restart) and is waited out.
+    """
+    body = request.model_dump(
+        include={
+            "pattern",
+            "name",
+            "max_health",
+            "min_nic_macs",
+            "holder",
+            "workflow_id",
+            "mce_cluster",
+            "infra_env",
+            "namespace",
+            "ttl_seconds",
+        },
+        exclude_none=True,
+    )
+    async with httpx.AsyncClient(
+        base_url=base_url, timeout=_ALLOCATE_TIMEOUT, verify=_TLS_VERIFY
+    ) as client:
+        resp = await client.post(_AVAILABLE_PATH, json=body, headers=_headers(token))
+
+    asked = f"name={request.name!r}" if request.name else f"pattern={request.pattern!r}"
+    if resp.status_code == 200:
+        items = resp.json().get("items") or []
+        if len(items) != 1:
+            # The contract is exactly one, locked. Anything else is not an
+            # allocation this run can hold — and waiting will not change it.
+            raise ServerScanRequestInvalidError(
+                f"server-scan answered the allocation ({asked}) with {len(items)} servers, "
+                "not exactly one"
+            )
+        return _to_acquired_server(items[0])
+    if resp.status_code == 503 and _code(resp) == _NO_AVAILABLE_SERVER:
+        reasons = _details(resp).get("reasons") or []
+        raise ServerNotAvailableError(
+            f"server-scan could not allocate a server ({asked}): {_detail(resp)}"
+            + (f" [reasons: {', '.join(str(r) for r in reasons)}]" if reasons else "")
+        )
+    if resp.status_code in (401, 403):
+        raise ServerScanAuthError(
+            f"server-scan refused the allocation ({resp.status_code}): SERVER_SCAN_API_TOKEN "
+            "needs the ADMIN role — POST /servers/available locks the server it returns"
+        )
+    if resp.status_code == 409:
+        raise AmbiguousServerNameError(
+            f"server name {request.name!r} matches more than one server-scan "
+            f"document: {_detail(resp)}"
+        )
+    if resp.status_code in (400, 422):
+        raise ServerScanRequestInvalidError(
+            f"server-scan rejected the allocation ({resp.status_code}): {_detail(resp)}"
+        )
+    raise ServerScanError(
+        f"server-scan allocation failed: {resp.status_code} {_detail(resp)}"
+    )
 
 
 def _headers(token: str) -> dict[str, str]:
@@ -557,3 +664,58 @@ async def release_server(
     # its write, and nothing was released. Retried like any transient failure —
     # taking it as "not ours" left our lock held until its TTL.
     _raise_for_lock_status(resp, "release")
+
+
+async def enable_maintenance(
+    base_url: str, token: str, request: ServerMaintenanceRequest
+) -> ServerMaintenance:
+    """Put one server in maintenance, read back from server-scan's answer.
+
+    The PUT is idempotent there (a second one updates the reason), so a retry
+    after a lost answer is harmless. Its answer is the server's detail, and
+    maintenance must show enabled in it, or nothing is known to keep the server
+    out of a draw. A 409 is a lost revision race — server-scan writes the
+    document with a compare-and-set, and a collector, membership or lock write
+    came first — so it is retried like any transient failure.
+    """
+    async with httpx.AsyncClient(
+        base_url=base_url, timeout=_HTTP_TIMEOUT, verify=_TLS_VERIFY
+    ) as client:
+        resp = await client.put(
+            _MAINTENANCE_PATH.format(server_id=request.server_id),
+            json={"reason": request.reason},
+            headers=_headers(token),
+        )
+
+    if resp.status_code == 200:
+        try:
+            maintenance = resp.json().get("maintenance") or {}
+        except (ValueError, AttributeError):
+            maintenance = {}
+        if not isinstance(maintenance, dict) or maintenance.get("enabled") is not True:
+            raise ServerScanError(
+                f"server-scan answered the maintenance request for {request.server_name} "
+                f"without maintenance enabled: {_bounded(resp.text)}"
+            )
+        return ServerMaintenance(server_id=request.server_id, enabled=True)
+    if resp.status_code == 404:
+        return ServerMaintenance(
+            server_id=request.server_id,
+            enabled=False,
+            detail="the server is no longer in server-scan's inventory",
+        )
+    if resp.status_code in (401, 403):
+        raise ServerScanAuthError(
+            f"server-scan refused to put {request.server_name} in maintenance "
+            f"({resp.status_code}): SERVER_SCAN_API_TOKEN needs the ADMIN role — "
+            "maintenance is a mutation"
+        )
+    if resp.status_code in (400, 422):
+        raise ServerScanRequestInvalidError(
+            f"server-scan rejected the maintenance request for {request.server_name} "
+            f"({resp.status_code}): {_detail(resp)}"
+        )
+    raise ServerScanError(
+        f"server-scan maintenance request for {request.server_name} failed: "
+        f"{resp.status_code} {_detail(resp)}"
+    )

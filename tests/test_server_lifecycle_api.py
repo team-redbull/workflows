@@ -145,14 +145,21 @@ def test_without_count_it_is_one_run_in_the_first_slot(client, fake):
     assert response.status_code == 202
     # One run, answered as one run - only `count` asks for the report.
     assert response.json() == {"workflow_id": SLOT.format(1), "run_id": "run-1"}
-    # The pool picks the server: itself plus 2 spares.
+    # The pool picks the server — server-scan allocates the run ONE, so no
+    # spares are sized: candidate_count is not even in the run's payload.
     assert fake.args[0].input.server_name is None
-    assert fake.args[0].input.candidate_count == 3
+    assert b"candidate_count" not in to_json(fake.args[0].input)
 
 
-def test_an_explicit_candidate_count_is_the_run_s(client, fake):
-    client.post(PATH, json={**BODY, "candidate_count": 7})
-    assert fake.args[0].input.candidate_count == 7
+@pytest.mark.parametrize("value", [3, 7])
+def test_candidate_count_is_refused_saying_why(client, fake, value):
+    # Removed 2026-11-17: each run is allocated one server by server-scan.
+    response = client.post(PATH, json={**BODY, "candidate_count": value})
+
+    assert response.status_code == 422
+    assert "`candidate_count` was removed" in response.text
+    assert "allocated ONE server" in response.text
+    assert not fake.args
 
 
 def test_one_install_after_another_both_start(client, fake):
@@ -167,8 +174,9 @@ def test_one_install_after_another_both_start(client, fake):
         SLOT.format(1), SLOT.format(2),
     ]
     assert running == {SLOT.format(1), SLOT.format(2)}
-    # The second run knows the first draws from the same pool.
-    assert [a.input.candidate_count for a in fake.args] == [3, 4]
+    # Nothing in the second run's input depends on the first: server-scan
+    # allocates each its own server.
+    assert fake.args[0].input == fake.args[1].input
 
 
 def test_a_lone_install_and_count_share_the_slots(client, fake):
@@ -222,9 +230,11 @@ def test_every_run_input_is_exactly_add_server_to_mce_input(client, fake, extra)
 
 def test_every_run_field_can_be_sent():
     # The request is its own model, not a subclass of the run's input, so a
-    # field added to AddServerToMceInput must be added to it too.
-    # `server_name` is the one exception: the request takes `server_names`.
-    run_fields = set(AddServerToMceInput.model_fields) - {"server_name"}
+    # field added to AddServerToMceInput must be added to it too. The
+    # exceptions: `server_name` (the request takes `server_names`) and
+    # `candidate_count` (on the input only for runs recorded before the
+    # allocation; the request refuses it).
+    run_fields = set(AddServerToMceInput.model_fields) - {"server_name", "candidate_count"}
     assert run_fields <= set(router_module.AddServerToMceRequest.model_fields)
 
 
@@ -236,18 +246,10 @@ def test_the_old_server_name_field_points_at_server_names(client, fake):
     assert not fake.args
 
 
-@pytest.mark.parametrize(
-    "extra",
-    [
-        {"count": 2},
-        {"candidate_count": 5},
-        {"count": 2, "candidate_count": 5},
-    ],
-)
 @pytest.mark.parametrize("names", [NAMES[0], NAMES])
-def test_count_and_candidate_count_are_only_for_the_pool(client, fake, extra, names):
-    # Both size a draw from the pool; a named server is drawn alone.
-    response = client.post(PATH, json={**BODY, "server_names": names, **extra})
+def test_count_is_only_for_the_pool(client, fake, names):
+    # It sizes a draw from the pool; a named server is drawn alone.
+    response = client.post(PATH, json={**BODY, "server_names": names, "count": 2})
 
     assert response.status_code == 422
     assert "send one or the other" in response.text
@@ -279,20 +281,14 @@ class TestInstallServerCount:
         assert body["started"] == 2
         assert [r["workflow_id"] for r in body["results"]] == [SLOT.format(1), SLOT.format(2)]
 
-    def test_each_run_draws_spares_for_the_races_it_will_lose(self, client, fake):
+    def test_every_run_asks_for_one_server_whatever_else_runs_on_the_pool(self, client, fake):
+        # server-scan allocates each run its own server, locked: no run sizes
+        # spares for the others, so busy slots change nothing in an input.
+        _with_temporal(fake, running={SLOT.format(n) for n in (1, 2, 3)})
         client.post(PATH, json={**BODY, "count": 4})
-        assert {a.input.candidate_count for a in fake.args} == {6}
-
-    def test_the_spares_are_capped_and_an_explicit_candidate_count_wins(self, client, fake):
-        client.post(PATH, json={**BODY, "count": 20})
-        assert {a.input.candidate_count for a in fake.args} == {20}
-        fake.args.clear()
-        client.post(PATH, json={**BODY, "count": 2, "candidate_count": 9})
-        assert {a.input.candidate_count for a in fake.args} == {9}
-        fake.args.clear()
-        # An explicit value equal to the run's default is still the caller's.
-        client.post(PATH, json={**BODY, "count": 4, "candidate_count": 3})
-        assert {a.input.candidate_count for a in fake.args} == {3}
+        assert len(fake.args) == 4
+        assert all(a.input == fake.args[0].input for a in fake.args)
+        assert all(b"candidate_count" not in to_json(a.input) for a in fake.args)
 
     def test_a_busy_slot_is_stepped_over_and_count_new_runs_still_start(self, client, fake):
         _with_temporal(fake, running={SLOT.format(2)})
@@ -316,12 +312,6 @@ class TestInstallServerCount:
         ]
         assert len(running) == 10
 
-    def test_spares_count_the_runs_already_on_the_pool(self, client, fake):
-        _with_temporal(fake, running={SLOT.format(n) for n in (1, 2, 3)})
-        client.post(PATH, json={**BODY, "count": 2})
-        # 3 busy + 2 new + 2 spare.
-        assert {a.input.candidate_count for a in fake.args} == {7}
-
     def test_a_start_temporal_refuses_stops_the_scan_and_is_reported(self, client, fake):
         _with_temporal(fake, running=set(), fail_on=SLOT.format(2))
         body = client.post(PATH, json={**BODY, "count": 3}).json()
@@ -336,7 +326,7 @@ class TestInstallServerCount:
 
     @pytest.mark.parametrize(
         "extra",
-        [{"count": 0}, {"count": 21}, {"candidate_count": 0}, {"candidate_count": 21},
+        [{"count": 0}, {"count": 21}, {"count": 2, "candidate_count": 5},
          {"count": 2, "vlan_id": 24}],
     )
     def test_invalid_requests_are_422(self, client, extra):
@@ -833,11 +823,7 @@ class TestTheHiddenAllowUnhealthy:
         assert run_input.allow_unhealthy is False
         assert b"allow_unhealthy" not in to_json(run_input)
 
-    @pytest.mark.parametrize(
-        "extra",
-        [{}, {"count": 2}, {"candidate_count": 4}],
-        ids=["pool", "count", "candidate-count"],
-    )
+    @pytest.mark.parametrize("extra", [{}, {"count": 2}], ids=["pool", "count"])
     def test_a_pool_draw_cannot_ask_for_it(self, client, fake, extra):
         response = client.post(PATH, json={**BODY, **extra, "allow_unhealthy": True})
 
@@ -850,14 +836,15 @@ class TestTheHiddenAllowUnhealthy:
 
 
 class TestTheHiddenExpertFields:
-    """`namespace`, `candidate_count`, `labels`: out of Swagger, still working (the operator, 2026-11-09).
+    """`namespace`, `labels`: out of Swagger, still working (the operator, 2026-11-09).
 
     A request in Swagger is `infra_env` + `mce_cluster` + `count` or `server_names`.
-    The three expert knobs are hidden there — and must keep their defaults unsent
-    and do exactly what they did when sent, so they are pinned here.
+    The expert knobs are hidden there — and must keep their defaults unsent and
+    do exactly what they did when sent, so they are pinned here. (`candidate_count`
+    was the third, until each run was allocated one server: now a 422.)
     """
 
-    _HIDDEN = ("namespace", "candidate_count", "labels")
+    _HIDDEN = ("namespace", "labels")
 
     def test_they_are_not_in_the_request_schema_nor_named_in_the_route(self, client):
         spec = client.get("/openapi.json").json()
@@ -870,19 +857,17 @@ class TestTheHiddenExpertFields:
     def test_unsent_they_keep_their_defaults(self, client, fake):
         assert client.post(PATH, json=BODY).status_code == 202
         run_input = fake.args[0].input
-        assert (run_input.namespace, run_input.labels, run_input.candidate_count) == ("inventory", {}, 3)
+        assert (run_input.namespace, run_input.labels) == ("inventory", {})
 
     def test_sent_they_are_used(self, client, fake):
-        body = {**BODY, "namespace": "lab-kv", "labels": {"team": "redbull"}, "candidate_count": 5}
+        body = {**BODY, "namespace": "lab-kv", "labels": {"team": "redbull"}}
         assert client.post(PATH, json=body).status_code == 202
         run_input = fake.args[0].input
-        assert (run_input.namespace, run_input.labels, run_input.candidate_count) == (
-            "lab-kv", {"team": "redbull"}, 5,
-        )
+        assert (run_input.namespace, run_input.labels) == ("lab-kv", {"team": "redbull"})
 
     @pytest.mark.parametrize(
-        "bad", [{"namespace": ""}, {"labels": {"a": 1}}, {"candidate_count": 0}],
-        ids=["empty-namespace", "non-string-label", "zero-candidates"],
+        "bad", [{"namespace": ""}, {"labels": {"a": 1}}],
+        ids=["empty-namespace", "non-string-label"],
     )
     def test_sent_they_are_still_validated(self, client, fake, bad):
         assert client.post(PATH, json={**BODY, **bad}).status_code == 422

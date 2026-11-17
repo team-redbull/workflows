@@ -165,7 +165,7 @@ before `uninstall-server-mark-agents-uninstalling` label nothing.
 WHY THE LOCK, EVEN FOR AN UNINSTALL. Two server-scan jobs see this machine
 and neither sees the whole move: the hosted cluster's nodes job frees it the
 moment its Node disappears, and the MCE's agents job re-claims it as
-INSTALLED_TO_INVENTORY on its own 15-minute cadence. Between the two the
+INSTALLED_TO_INVENTORY on its own 5-minute cadence. Between the two the
 document can read AVAILABLE while the host is still in this MCE's InfraEnv —
 and another MCE's add-server-to-mce would draw it. The lock closes that window
 from before the first write and is extended to a day before the inventory
@@ -178,7 +178,7 @@ host may still boot this MCE's image and the day-long hold stays. Runs
 recorded before `uninstall-server-release-after-removal`
 keep the hold. A lock another run holds — add-server-to-mce's hold after it
 installed the machine, typically, until its run sees server-scan report the
-machine (usually 15-30 min, at most a day) — fails the run before anything is
+machine (usually 5-15 min, at most a day) — fails the run before anything is
 written.
 
 WHAT IS NEVER DONE: no NodePool change (the label is on the Agent; the
@@ -1049,7 +1049,7 @@ class UninstallServerFromHcWorkflow:
                 f"server-scan reports {server} INSTALLED_TO_INVENTORY (bound to no "
                 f"cluster), but its Agent {agent.name} on MCE {request.mce_cluster} is "
                 f"bound to {agent.cluster_deployment}. Nothing was changed — server-scan's "
-                "agents job re-reads the MCE every 15 minutes; re-run once it agrees",
+                "agents job re-reads the MCE every 5 minutes; re-run once it agrees",
                 type=ClusterMembershipMismatchError.__name__,
             )
 

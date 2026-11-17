@@ -149,7 +149,8 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   (`create-vm-<mce>_<infraEnv>_<slot>`, `shared/workflow_ids.py`): the VM's name is drawn inside the
   run, so nothing known at the edge identifies it — add-server-to-mce's pool-draw shape, with the walk
   itself extracted to `workflow_domains/routers/slots.py` (add-server-to-mce keeps its own until a
-  follow-up migrates it: its `candidate_count` depends on the busy count).
+  follow-up migrates it: it reports its own item model; what tied it to the busy count,
+  `candidate_count`, went with the allocation on 2026-11-17).
 - **cluster-lifecycle is ONE hub limb holding git tokens only.** provision-cluster reads day1 `main`
   (the shared `activities/day1_repo.py` reader), pushes a branch per cluster, opens the merge request
   through GitLab's API on the day1 repo's host (GitLab is the ONLY provider, §4 — same token as
@@ -276,23 +277,75 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
     recheck).
 
 - **server-scan is the inventory source of record for add-server-to-mce**
-  (`SERVER_SCAN_URL`). The workflow makes ONE read — `GET /servers/available`
-  — plus the install lock below, and never queries a vendor manager itself: server-scan already collects HP
-  OneView / UCS Central / Dell OME / Intersight / standalone Redfish on a
-  6-hour cron and knows which servers are unclaimed. This is what replaced the
-  `bmh-generator-operator` Kopf operator and its four vendor SDKs. The endpoint
-  live-rechecks each candidate it returns, so freshness is its problem, not
-  ours; `live_recheck_performed` per item says when it degraded to the stored
-  document. It returns DATA ONLY — never BMC credentials, which server-scan
-  does not hold; those stay in this worker's own Secret.
-- **add-server-to-mce LOCKS the machine it chose in server-scan** (server-scan's
+  (`SERVER_SCAN_URL`), and it ALLOCATES each run ONE server (server-scan's
+  ADR-0063, 2026-11-16; adopted here 2026-11-17, the operator: "every workflow
+  will ask for one server, no need for candidate"). `allocate_server` =
+  `POST /servers/available` {pattern `^ocp-<infraEnv>-` (the trailing `-` is
+  load-bearing, the operator 2026-11-17: `…-512gb` must not draw `…-512gbx-…`) | name, `max_health:
+  HEALTHY`, `min_nic_macs: 2`, holder, workflow id, mce_cluster, infra_env,
+  namespace, `ttl_seconds` = the install TTL}: server-scan draws a candidate,
+  LOCKS it for the run, live-rechecks it against its vendor manager WHILE locked
+  and returns it, or releases it and tries its next (≤ 5). So the server comes
+  back already the run's — no separate reserve, no race. The workflow never
+  queries a vendor manager itself: server-scan collects HP OneView / UCS Central
+  / Dell OME / Intersight / standalone Redfish on a 6-hour cron — what replaced
+  the `bmh-generator-operator` and its four vendor SDKs. It returns DATA ONLY,
+  never BMC credentials (this worker's own Secret). Every "nothing reservable"
+  is its 503 code `NO_AVAILABLE_SERVER` with `details.reasons` →
+  `ServerNotAvailableError` (permanent, the run fails); a 503 WITHOUT that code
+  (a proxy) is waited out. Seconds as a rule, ~22 min at its worst (5 × UCS's
+  probe deadline): httpx 25 min, `start_to_close` 30 min, heartbeat every 20 s
+  under a 2 min `heartbeat_timeout`. NOT IDEMPOTENT — server-scan ties a lock to
+  its request by a per-request `claim_token`: a retry after a lost answer takes
+  ANOTHER server and the first frees itself at the TTL, as does one locked by an
+  allocation a cancel cut off. Gated `add-server-allocates-one-server`; a run
+  recorded before still draws a candidate list with `GET /servers/available`
+  (`acquire_servers`) — stored data only since ADR-0063, which answers `health`
+  with a 400, so the GET sends `max_health` and a 400/422 is the permanent
+  `ServerScanRequestInvalidError` (it used to retry forever).
+- **ONE SERVER PER RUN — a refused server FAILS the run, never a next candidate**
+  (the operator, 2026-11-17). The loop's checks stay (name, BMC vendor/host, a
+  BareMetalHost already in a pool run's namespace, PXE site, an older limb's
+  in-use refusal), and so do the no-Agent rollback and the lapsed-lock
+  teardown; each now gives the allocated lock back (where it is still ours) and
+  fails with that one reason's type, the message naming the server
+  (`_no_installable_candidate(..., allocated=True)`). A run recorded before
+  keeps skipping to its next candidate. `candidate_count` is gone from the
+  request (a 422 saying why, `_refuse_candidate_count`); it stays on
+  `AddServerToMceInput` for history, quiet at its default.
+  **An ALLOCATED server's NICs and MACs are not judged again** (the operator,
+  same day: "the server scan already checks it"): server-scan allocates only a
+  server whose network health is HEALTHY (two link-UP ports read) with
+  `min_nic_macs` read, live-checked while locked. The run still PICKS the two
+  bond members — the NMStateConfig's bond and the BareMetalHost's boot MAC are
+  written from them — link-UP first in server-scan's order, one per physical
+  port (`select_bond_members(..., allow_link_down=True)`, `vouched`); only
+  fewer than two ports with a MAC (nothing to bond) is still `no-bond`. A MAC
+  the limb cannot use is its `InvalidMacError` (permanent) before the
+  BareMetalHost or the NMStateConfig is written. A server the allocation
+  refused that the run takes anyway (own leftover lock, `allow_unhealthy`) is
+  judged as before.
+  **No Agent in the hour → MAINTENANCE, then the release** (the operator, same
+  day: "put the server in maintenance and then release the server"):
+  `put_server_in_maintenance` (`PUT /servers/{id}/maintenance`, a reason naming
+  the run, the InfraEnv and MCE and where the host's state points, ≤ 500 chars,
+  read back) in phase `setting-maintenance`, after the teardown and the PXE
+  unmap, BEFORE the lock goes back — server-scan's allocation skips a server in
+  maintenance, so the next run is not handed a machine that cannot boot into
+  the InfraEnv until a person ends it there. Refused (ADMIN token missing, a
+  rejected request) the lock is KEPT to its TTL instead and the failure says
+  so; a server server-scan no longer knows is released as before. Both ride on
+  the `add-server-allocates-one-server` gate (no run of that shape had ever
+  run; its two goldens were re-recorded the same day).
+- **add-server-to-mce LOCKS the machine it installs in server-scan** (server-scan's
   ADR-0035, `POST`/`DELETE /servers/{id}/reservation`, `reserve_server`/
-  `release_server` on the MCE's queue). `/servers/available` hands candidates
-  out unlocked and lists a machine AVAILABLE until a cluster reports it, while
-  the BareMetalHost probe only sees the run's OWN MCE — so without the lock a
-  server installed into MCE-A is drawn again for MCE-B. Taken after the probe,
-  before any write; holder `add-server-to-mce` + the run's workflow id, so a retry
-  or a renewal EXTENDS it (server-scan matches BOTH, so a run started as
+  `release_server` on the MCE's queue) — taken by the allocation itself since
+  2026-11-17, and by `reserve_server` only for a named server the allocation
+  refused that the run takes anyway (its own leftover lock, `allow_unhealthy`).
+  server-scan lists a machine AVAILABLE until a cluster reports it, while the
+  BareMetalHost probe only sees the run's OWN MCE — so without the lock a server
+  installed into MCE-A is drawn again for MCE-B. Holder `add-server-to-mce` +
+  the run's workflow id, so the run's own renewal EXTENDS it (server-scan matches BOTH, so a run started as
   install-server keeps holder `install-server` to the end — `_reservation_holder`,
   by workflow type); renewed as the Agent wait begins; extended to a day after
   success, and then held ONLY until server-scan knows: the run reads
@@ -304,16 +357,17 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   `schedule_to_close_timeout` = what is left), or it naming ANOTHER MCE, the lock
   is KEPT to expire and the run still COMPLETES — the Agent proved the install;
   `lock_released` / `server_scan_state` / `lock_detail` on the result. The run
-  stays RUNNING meanwhile (~15-30 min), so its slot and a named server's id are
+  stays RUNNING meanwhile (~5-15 min: server-scan's agents and nodes jobs run every 5 min,
+  matching an Agent by its serial, else its hostname — the BMH's server name), so its slot and a named server's id are
   busy until then. The server leaving the MCE first — remove-server-from-mce then releases
   it (the operator's decision, 2026-10-31, below); add-server-to-mce otherwise
-  releases it ONLY after a teardown (a failure elsewhere leaves it to its
-  TTL, since half-created resources may still name the machine). A lock held
-  elsewhere is a skip (`reserved`), like every candidate reason. A RE-RUN of the
-  same named install (same workflow id) after such a failure never reached
-  `reserve_server`: `/servers/available` hides a locked machine even from its
-  holder, so it failed for two hours on a bare "no assignable server" (the
-  2026-10-31 incident). So a named machine it refuses is read once more
+  releases it ONLY after a teardown — after the no-Agent one, once the server is
+  in maintenance (above) — (a failure elsewhere leaves it to its
+  TTL, since half-created resources may still name the machine). A RE-RUN of the
+  same named install (same workflow id) after such a failure meets its own lock:
+  server-scan refuses a locked machine even to its holder (the GET hid it; the
+  allocation answers `RESERVED`), so it failed for two hours on a bare "no
+  assignable server" (the 2026-10-31 incident). So a named machine it refuses is read once more
   (`lookup_install_candidate`, gated `named-install-own-lock-rerun`): the run goes
   on when the only reason is its OWN workflow id's lock, and otherwise fails
   saying which (another run's lock, a claim, maintenance, its health). Needs an ADMIN
@@ -574,12 +628,12 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   InPlace one does not). THE LOCK even for an uninstall (holder
   `uninstall-server-from-hc`, TTL = two drains + unbind + three verifications + 10 min): the
   hosted cluster's nodes job frees the server on its Node's absence and the MCE's
-  agents job re-claims it INSTALLED_TO_INVENTORY on its own 15-min cadence, so
+  agents job re-claims it INSTALLED_TO_INVENTORY on its own 5-min cadence, so
   between them it can read AVAILABLE while still in this InfraEnv and be drawn by
   another MCE's install. Taken after the inspection, before any write; a lock
   held elsewhere fails the run (add-server-to-mce's hold on a freshly installed
   machine does, until its run sees server-scan report the machine — usually
-  15-30 min, at most a day — or release it in server-scan); on failure left
+  5-15 min, at most a day — or release it in server-scan); on failure left
   to its TTL; a refused 24 h extension is logged and the child still runs.
   Once the child completed with `pxe_failed` empty (found=false included:
   nothing on the MCE), the run RELEASES ITS OWN lock (`releasing-server`, gated
@@ -878,7 +932,7 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
     **kubevirt-redfish runs `systemIdConvention: legacy`** (the operator, 2026-11-05, before any
     production VM exists): the Redfish system id IS the VM name, so the id, the VM and the server
     name server-scan lists are one string, `ocp-<infraenv>-<suffix>`, and add-server-to-mce's
-    `^ocp-<infraEnv>` match holds. `enhanced` (`<ns>.<vm>`) was the chart's setting until then;
+    `^ocp-<infraEnv>-` match holds. `enhanced` (`<ns>.<vm>`) was the chart's setting until then;
     its one advantage, duplicate names across chassis namespaces, cannot arise for create-vm's
     VMs (the suffix is the MAC's, unique zone-wide). Changed in redbull-platform's chart values
     and lab manifests; each cluster's out-of-band config Secret is re-rendered by the operator.
@@ -911,7 +965,11 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   usually report none. Those servers fail bond selection with
   `NoBondableInterfacesError` naming the provider and the states observed —
   deliberately loud, so the gap is visible rather than looking like an empty
-  inventory. Decided with the operator, 2026-09-25.
+  inventory. Decided with the operator, 2026-09-25. Since 2026-11-17
+  server-scan enforces it BEFORE it allocates (network health HEALTHY = two
+  link-UP ports read), so such a server is never handed to a run and the run
+  no longer refuses on link state itself (ONE SERVER PER RUN, above); a run
+  recorded before still does.
 - **add-server-to-mce's `allow_unhealthy` is HIDDEN ON PURPOSE — not dead code.** The operator's
   "easter egg" (2026-10-31), after an incident that had to install servers with one NIC up
   and no RAID. Out of OpenAPI/Swagger (`SkipJsonSchema`, pinned by `TestTheHiddenAllowUnhealthy`),
@@ -921,7 +979,7 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   BMC reachability, live recheck, and a bond member whose link is not UP (still two members on
   distinct ports from `interfaces[]`, nic1 the first link-UP NIC) — NEVER safety: unknown to
   server-scan, claimed, contested, maintenance, another run's lock, InfraEnv, BMC credentials,
-  a BMH/Agent present. A named machine `/servers/available` refuses is read once more
+  a BMH/Agent present. A named machine the allocation refuses is read once more
   (`lookup_install_candidate`) and sorted by `health_waiver.py`; every waiver lands in
   `allowed_unhealthy` (progress, result, each create's input). No patch gate: no recorded run
   carries the field.
@@ -952,20 +1010,22 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   per MCE is a second thing to allocate, track and keep in step, and an MCE
   holding only one of them made "this cluster takes no servers driven that way"
   a state every consumer had to model. So the lookup is step ONE again, before
-  a candidate exists, and a missing allocation fails the run rather than
-  skipping a candidate — no candidate could make it usable. `bmc_vendor` still
-  picks the Ironic DRIVER; it no longer picks a network.
-- **In add-server-to-mce, EVERY reason a candidate is unusable is a SKIP.** The
-  multi-candidate draw exists so one unusable server is a retry rather than a
-  failed run, and a reason handled outside the selection loop silently breaks
-  that promise for part of the fleet — a pool of three dying on a STANDALONE
-  machine at the front while two installable servers sit behind it. The reasons
-  are two tables in `add_server_to_mce.py` (`_REJECTION_TYPE`, `_REJECTION_SUMMARY`)
-  keyed by the same strings the loop records; when nothing survives they are
-  reported as separate groups and the failure takes the specific type only if
-  they all agree. A reason missing from either table is a KeyError raised in
-  WORKFLOW code, which hangs the run rather than failing it — so a test keeps
-  the loop and both tables in step.
+  a server is allocated (and locked), and a missing allocation fails the run —
+  no server could make it usable. `bmc_vendor` still picks the Ironic DRIVER;
+  it no longer picks a network.
+- **In add-server-to-mce, every reason a server is unusable is ONE NAMED REASON** —
+  since the allocation (2026-11-17, above) the run's one server, refused, gives
+  its lock back and fails with it; a run recorded before still treats it as a
+  SKIP to its next candidate (its draw existed so one unusable server was a
+  retry, and a reason handled outside the selection loop would have broken that
+  for part of the fleet — a pool of three dying on a STANDALONE machine at the
+  front). The reasons are two tables in `add_server_to_mce.py` (`_REJECTION_TYPE`,
+  `_REJECTION_SUMMARY`) keyed by the same strings the loop records; an old run
+  reports them as separate groups when nothing survives, the failure taking the
+  specific type only if they all agree. The page at `/ui/server-lifecycle`
+  parses both shapes with those summaries. A reason missing from either table is
+  a KeyError raised in WORKFLOW code, which hangs the run rather than failing it
+  — so a test keeps the loop and both tables in step.
 
 - **The workflow is the ENTRY POINT; the Segments Manager is a dependency, never a trigger.** A
   caller POSTs the full segment DEFINITION to `POST /workflows/segment-lifecycle/initialize-segment`
@@ -1569,7 +1629,7 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   (`cisco-m6-bat-yam-64c-512gb`) and server names carry the same tokens behind an `ocp-` prefix,
   so the InfraEnv IS the server query. EVERY POOL RUN IS ON A SLOT of its HUB's CANDIDATE POOL — the
   MCE and the InfraEnv. The MCE is in the id (since 2026-10-25) so a hub finds only its own runs;
-  the machines the pool draws from (`^ocp-<infraEnv>`) are still shared by every hub, so a run
+  the machines the pool draws from (`^ocp-<infraEnv>-`) are still shared by every hub, so a run
   sizing its spares no longer counts another hub's runs, and the install lock keeps two hubs off
   one machine. The install lock (§4) guards the machine itself, so draws are PARALLEL: a request
   without `count` starts ONE new run and `count` (1-20, on the request ONLY — never in a run's
@@ -1584,21 +1644,23 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   second request during the first batch adds installs — it used to collide on `_1`..`_N`. A
   closed slot is reused (Temporal's default ALLOW_DUPLICATE id reuse; `TestAFinishedSlotIsFreeAgain`).
   A start Temporal refuses for any other reason stops the scan (a 502 with its reason when the
-  request is one run). Each run draws `candidate_count` =
-  (busy slots) + new runs + 2 (max 20) by default, because every run on the pool locks one
-  machine from the same top of the list. Safe because server-scan's reserve is a compare-and-set on the document revision that
-  refuses a live lock to any other workflow id, and the run writes nothing before holding it —
-  `TestParallelRunsOnOnePool` runs two at once. The test harness's mock lock must keep refusing
-  another workflow id's live lock, or that test proves nothing.
+  request is one run). Every run asks server-scan for ONE server and every pool run's input
+  is the same: server-scan allocates each its own, locking it in the same call (§4) — until
+  2026-11-17 each run drew `candidate_count` = (busy slots) + new runs + 2 candidates instead.
+  Safe because server-scan's lock is a compare-and-set on the document revision that never
+  hands out a live lock, and the run writes nothing before holding it —
+  `TestParallelRunsOnOnePool` runs two at once. The test harness's mock allocation must keep
+  refusing a locked server (the caller's own included), or that test proves nothing.
   ONE ROUTE, ONE RUN PER SERVER — never a batch workflow. Named machines are `server_names`: a
   string is one run (`{workflow_id, run_id}`, 409 while it installs), a list (1-20, each once,
   case-insensitively) one run per name with a per-run report, even for a list of one — the reply
   follows the request's shape. Every named run is on `add-server-to-mce-<mce>_<server>`, so one machine
-  is one run however it is asked for. `count` and `candidate_count` size a POOL draw, so either
-  next to `server_names` is a 422, never silently ignored. `namespace`, `candidate_count` and
-  `labels` are HIDDEN from Swagger (`SkipJsonSchema`; the operator, 2026-11-09 — expert knobs,
-  so Swagger shows `infra_env`, `mce_cluster`, `count`, `server_names`), yet accepted, validated and
-  used as before, defaults unchanged; `TestTheHiddenExpertFields` pins both halves. Hidden is not
+  is one run however it is asked for. `count` sizes a POOL draw, so next to `server_names` it
+  is a 422, never silently ignored; `candidate_count` is a 422 anywhere since 2026-11-17, saying
+  it was removed. `namespace` and `labels` are HIDDEN from Swagger (`SkipJsonSchema`; the
+  operator, 2026-11-09 — expert knobs, so Swagger shows `infra_env`, `mce_cluster`, `count`,
+  `server_names`), yet accepted, validated and used as before, defaults unchanged;
+  `TestTheHiddenExpertFields` pins both halves. Hidden is not
   protected: the API has no auth. Still documented in the README and the docs page, unlike
   `allow_unhealthy`. `AddServerToMceRequest` is therefore its
   OWN model, not an AddServerToMceInput subclass: one request is many runs, each built by

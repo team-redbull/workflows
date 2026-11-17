@@ -12,6 +12,19 @@ renamed **add-server-to-mce** on 2026-11-01, and `POST .../install-server` now
 answers 410 pointing at the new route. Below, the old name is kept wherever it
 describes what existed then.
 
+**Update 2026-11-17 — `candidate_count` is gone.** server-scan now ALLOCATES
+each run one server, locked for that run and live-checked while locked
+(`POST /servers/available`, its ADR-0063), so a run draws no candidates and
+needs no spares for the runs beside it on the pool. The request refuses
+`candidate_count` with a 422 saying so, and every pool run's input is the
+same. Where this document sizes `candidate_count` by the busy slots, it
+describes what was built then; the slots, `count` and the one-run-per-server
+shape are unchanged. In the scenario table below, two runs racing for one
+machine are now settled inside server-scan (the loser's allocation moves to
+its next candidate there), and a pool with fewer free servers than runs fails
+the extra runs with `ServerNotAvailableError` (server-scan's 503
+`NO_AVAILABLE_SERVER`), not `ServerReservedError`.
+
 ## The problem
 
 An operator asked install-server for a second healthy server from the same

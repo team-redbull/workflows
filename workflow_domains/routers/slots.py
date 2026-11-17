@@ -10,8 +10,9 @@ ones, and stops at the first start Temporal refuses for any other reason —
 every further slot would fail the same way. A finished slot is free again.
 
 Domain-agnostic: the caller supplies the id builder and the start. create-vm
-uses it; add-server-to-mce keeps its own walk (its `candidate_count` depends
-on the busy count) until a follow-up migrates it.
+uses it; add-server-to-mce keeps its own walk, reporting its own item model,
+until a follow-up migrates it (what tied it to the busy count, the
+`candidate_count` sizing, went with the allocation on 2026-11-17).
 """
 
 from __future__ import annotations

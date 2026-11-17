@@ -24,19 +24,27 @@ Shape of the run:
      validating-infraenv — the InfraEnv must exist on the MCE, in the run's
                            namespace, before any server is drawn; missing
                            fails the run (no candidate could fix it).
-  2. acquiring-server    — GET /servers/available. The InfraEnv name states
+  2. acquiring-server    — POST /servers/available: server-scan ALLOCATES one
+                           server (its ADR-0063). The InfraEnv name states
                            which hardware it is for
                            (cisco-m6-bat-yam-64c-512gb), and server names carry
                            the same tokens behind an `ocp-` prefix, so the
-                           InfraEnv IS the query. Several candidates are drawn
-                           so one unusable server is a retry, not a failure.
-  3. selecting-server    — the first candidate that can actually be installed.
-                           EVERY reason a candidate is unusable is a skip here,
-                           so the draw keeps its promise; the reasons are
-                           reported together if none survives.
-     reserving-server    — server-scan's install lock on the chosen machine
-                           (ADR-0035). A lock another run holds is one more
-                           skip reason.
+                           InfraEnv IS the query. server-scan locks a
+                           candidate for this run, live-checks it WHILE locked
+                           and returns it, or releases it and tries its next —
+                           so the server comes back already this run's, and no
+                           other run can take it in between.
+  3. selecting-server    — can THIS server be installed: a usable name, a known
+                           BMC, no BareMetalHost already; and its two bond NICs,
+                           which the NMStateConfig and the BareMetalHost's boot
+                           MAC are written from — taken as server-scan vouched
+                           for them (two link-up ports, normalized MACs), not
+                           judged again. If not, its lock goes back and the run
+                           fails, saying why: one server per run (the operator,
+                           2026-11-17) — asking again is a new run.
+     reserving-server    — only for a named server the allocation refused that
+                           the run takes anyway: its own leftover lock, or
+                           `allow_unhealthy` (ADR-0035's lock, taken here).
      checking-nmstateconfig — before anything else is written for it, in both
                            create orders: an NMStateConfig already under the
                            server's name that differs from this install is
@@ -81,18 +89,25 @@ Shape of the run:
                            itself. Not seen within the day, the lock is left to
                            expire and the run still COMPLETES (the operator,
                            2026-11-09).
-  6. rolling-back        — no Agent by the deadline is that CANDIDATE's
-     unregistering-pxe-boot failure, not the run's: the NMStateConfig and
-     releasing-server      BareMetalHost are removed, an IPMI candidate's MACs
-                           are deleted from its site's PXE VM (while the lock
-                           is still ours), and the lock released, which returns
-                           the machine to the inventory; the next candidate is
-                           tried from step 3.
+  6. rolling-back        — no Agent by the deadline: the NMStateConfig and
+     unregistering-pxe-boot BareMetalHost are removed, an IPMI server's MACs
+     setting-maintenance   are deleted from its site's PXE VM (while the lock
+     releasing-server      is still ours), the server is put in MAINTENANCE in
+                           server-scan so no run draws it again until a person
+                           ends it (the operator, 2026-11-17), and only then
+                           the lock released; then the run fails
+                           (AgentNeverAppearedError), saying where the host's
+                           own state points. A run recorded before releases
+                           with no maintenance, the machine back in the pool.
 
-Steps 3-6 are therefore a LOOP, not a pipeline. A candidate cannot be shown to
-be installable without creating its resources and watching what happens, so the
-draw is a list of things to TRY rather than to validate, and an hour-deep
-failure is a skip like any other. The run fails only when nothing is left.
+ONE SERVER PER RUN since `add-server-allocates-one-server` (the operator,
+2026-11-17, on server-scan's ADR-0063). It used to be a candidate LOOP: the
+run drew several servers with GET /servers/available, locked the one it chose,
+and every reason one was unusable — an hour-deep missing Agent included — was a
+skip to the next. server-scan now picks, locks and live-checks one server
+itself, so a run installs exactly that one or fails, its lock given back; a
+`count` request is still N runs, one server each. A run recorded before keeps
+the loop to its end (the same code, over a list) — `candidate_count` sized it.
 
 THE VLAN IS THE MCE'S, AND IS RESOLVED ONCE. An MCE owns one inventory network,
 so its VLAN is a property of the cluster this run targets and nothing else — not
@@ -128,11 +143,13 @@ same string. If no worker polls that queue the run waits rather than acting,
 and the `progress` query names the queue so it reads as "that MCE has no
 worker" instead of "the run is stuck".
 
-TEARDOWN IS PART OF THE LOOP. A candidate that never produced an Agent is
-rolled back because the run intends to try another machine, and leaving a
-BareMetalHost behind would make that machine undrawable here and invisible to
-every other MCE — server-scan reports it unclaimed until a cluster reports the
-node, so nothing else would notice.
+A FAILED INSTALL IS TORN DOWN. A server that never produced an Agent is rolled
+back before the run fails, because leaving a BareMetalHost behind would make
+that machine undrawable here and invisible to every other MCE — server-scan
+reports it unclaimed until a cluster reports the node, so nothing else would
+notice. Since the allocation it is also put in maintenance in server-scan before
+its lock goes back: a machine that cannot boot into the InfraEnv would only fail
+the next run that drew it.
 
 A CANCEL ROLLS BACK TOO (the operator, 2026-11-09; until then it deliberately
 left everything in place). Before the Agent, the candidate being installed is
@@ -147,10 +164,13 @@ THE INSTALL LOCK IS WHAT MAKES "UNCLAIMED" TRUE ACROSS MCEs. server-scan
 reports a machine AVAILABLE until a cluster reports it, and this run's
 BareMetalHost probe only sees its OWN MCE — so without the lock a server
 installed into MCE-A is drawn again by a run for MCE-B, and both clusters drive
-one BMC. The lock is taken only once a candidate is chosen (server-scan's draw
-cannot know which one will be), keyed on this run's workflow id so a retry or a
-renewal is an extension rather than a lost race, and it expires on its own, so
-a run that dies costs one TTL rather than the machine. It is released only
+one BMC. server-scan takes it as it allocates the server, keyed on this run's
+holder and workflow id, so the run's own renewal is an extension rather than a
+lost race, and it expires on its own, so a run that dies costs one TTL rather
+than the machine. (A run recorded before the allocation took it itself, once it
+had chosen a candidate.) The allocation is NOT idempotent: a retry after a lost
+answer takes another server and the first frees itself at its TTL, and a
+cancel during it leaves the server it took locked to that TTL as well. It is released only
 after a teardown has proved nothing on the cluster still points at the machine
 — a failure anywhere else leaves it held until it expires, deliberately, since
 half-created resources may still name it. Runs started before the lock existed
@@ -239,6 +259,7 @@ with workflow.unsafe.imports_passed_through():
     from shared.models.segment_lifecycle import SegmentEntry
     from shared.interfaces.server_lifecycle import (
         acquire_servers,
+        allocate_server,
         check_infra_env,
         create_baremetal_host,
         create_bmc_secret,
@@ -248,6 +269,7 @@ with workflow.unsafe.imports_passed_through():
         lookup_install_candidate,
         lookup_server_membership,
         publish_infra_env_boot,
+        put_server_in_maintenance,
         register_pxe_boot,
         release_server,
         replace_conflicting_nmstate_config,
@@ -264,6 +286,7 @@ with workflow.unsafe.imports_passed_through():
         AddServerToMceRunArgs,
         AgentRef,
         AgentState,
+        AllocateServerRequest,
         BmhRef,
         BmhResourceRequest,
         BmhState,
@@ -281,6 +304,7 @@ with workflow.unsafe.imports_passed_through():
         RemoveServerFromMceResult,
         RemoveServerFromMceRunArgs,
         ReserveServerRequest,
+        ServerMaintenanceRequest,
         ServerMembershipRequest,
         ServerReservation,
         TeardownResult,
@@ -346,8 +370,9 @@ _RETRY_POLICY = RetryPolicy(
     non_retryable_error_types=[error.__name__ for error in _PERMANENT_ACTIVITY_ERRORS],
 )
 # What a cancel of the run does to the activity it is waiting on: ABANDON —
-# stop waiting, send Temporal no cancel request. None of these activities
-# heartbeats, so a request could never reach one (each runs to its end either
+# stop waiting, send Temporal no cancel request. Only allocate_server
+# heartbeats, and it is the one call whose cancel must not reach server-scan
+# half-way either, so a request could do no good (each runs to its end either
 # way), and sending it races the activity's own completion: an activity that
 # finishes as the cancel lands makes the request name an activity Temporal no
 # longer has (ACTIVITY_UNKNOWN), failing the workflow task. The rollback on
@@ -377,9 +402,10 @@ _SCHEDULE_TO_START_TIMEOUT = timedelta(minutes=5)
 # nothing but the deadline itself ever distinguished a slow host from a dead
 # one, while the Agent distinguishes them by existing.
 #
-# MACHINE convergence still, so still a real deadline — but reaching it is a
-# CANDIDATE's failure, not the run's: the resources are torn down, the machine
-# goes back to the inventory and the next candidate is tried.
+# MACHINE convergence still, so still a real deadline: reaching it, the
+# resources are torn down and the machine goes back to the inventory — then the
+# run fails (one server per run); a run recorded before the allocation tries its
+# next candidate instead.
 #
 # Changing either constant is a non-deterministic change for in-flight runs.
 _AGENT_DEADLINE = timedelta(hours=1)
@@ -402,7 +428,7 @@ _RESERVATION_TTL = _AGENT_DEADLINE + timedelta(hours=1)
 _INSTALLED_HOLD = timedelta(hours=24)
 # After the hold, the run reads server-scan every 5 minutes until its
 # membership jobs report the machine — INSTALLED_TO_INVENTORY (the MCE's agents
-# job, every ~15 min) or INSTALLED (a cluster's nodes job) — and then gives the
+# job, every 5 min) or INSTALLED (a cluster's nodes job) — and then gives the
 # lock back: server-scan hides a claimed machine from /servers/available by
 # itself, so the day-long hold is needed only until it knows (the operator,
 # 2026-11-09). Bounded by the hold: not seen within it, the lock is left to
@@ -446,6 +472,28 @@ _RELEASE_ONCE_INSTALLED_PATCH = "add-server-release-once-installed"
 # Gates the rollback on CANCEL (the operator, 2026-11-09). A run recorded before
 # it stops where it is when cancelled, everything left in place.
 _ROLLBACK_ON_CANCEL_PATCH = "add-server-rollback-on-cancel"
+# Gates the ALLOCATION (the operator, 2026-11-17, on server-scan's ADR-0063):
+# the run asks server-scan for ONE server, which server-scan locks for it and
+# live-checks while locked, and installs that one or fails. A run recorded
+# before it draws a candidate list with GET /servers/available, locks the one
+# it chooses itself and tries the next on a failure, as it did. Two more
+# changes ride on the same gate, decided with the operator the same day: an
+# allocated server's NICs and MACs are not judged again (server-scan vouched
+# for them, _evaluate_candidate), and a server with no Agent in the hour is put
+# in maintenance in server-scan before its lock goes back (_put_in_maintenance).
+_ALLOCATE_PATCH = "add-server-allocates-one-server"
+# The allocation live-checks each candidate it locks, one at a time, against
+# its vendor manager — seconds as a rule, ~22 minutes at server-scan's worst
+# (five candidates, UCS Central's probe deadline each). Its HTTP client gives up
+# at 25 minutes; the activity heartbeats every 20 s, so a dead worker shows in
+# two minutes, not thirty.
+_ALLOCATE_TIMEOUT = timedelta(minutes=30)
+_ALLOCATE_HEARTBEAT_TIMEOUT = timedelta(minutes=2)
+# A bond needs two MACs: server-scan skips a candidate with fewer read.
+_BOND_NIC_MACS = 2
+# The most of a maintenance reason the run sends: what a person reads in
+# server-scan, the host's own state included, never a page of it.
+_MAINTENANCE_REASON_CHARS = 500
 # How long a cancelled run waits before it cleans up: a cancel stops waiting for
 # an activity but not the activity — none here heartbeats — so a create, a lock
 # or a PXE mapping already sent may still land. One attempt's whole budget, and
@@ -484,10 +532,37 @@ def _acquire_request(
     return AcquireServerRequest(
         # Escaped: the InfraEnv name is caller data going into a regex.
         # Today's names are [a-z0-9-] so it changes nothing, but a `.`
-        # would silently widen the pool without it.
+        # would silently widen the pool without it. (Runs recorded before the
+        # allocation only; new runs end the InfraEnv with `-`, _allocation_request.)
         pattern=f"^ocp-{re.escape(infra_env)}",
         count=candidate_count,
         health=_REQUIRED_HEALTH,
+    )
+
+
+def _allocation_request(install_input: AddServerToMceInput) -> AllocateServerRequest:
+    """What to ask server-scan to allocate: the named machine, or one from the InfraEnv's pool.
+
+    Locked for this run's holder and workflow id for the install's TTL, which
+    the run renews as the Agent wait begins, exactly as a lock it took itself.
+    """
+    server_name = install_input.server_name
+    return AllocateServerRequest(
+        name=server_name or None,
+        # Escaped: the InfraEnv name is caller data going into a regex (see
+        # _acquire_request). The trailing `-` is load-bearing (the operator,
+        # 2026-11-17): the InfraEnv name must END where the server name's own
+        # part begins, or InfraEnv `…-512gb` would also draw servers of
+        # `…-512gbx` / `…-512gb2`.
+        pattern=None if server_name else f"^ocp-{re.escape(install_input.infra_env)}-",
+        max_health=_REQUIRED_HEALTH,
+        min_nic_macs=_BOND_NIC_MACS,
+        holder=_reservation_holder(),
+        workflow_id=workflow.info().workflow_id,
+        mce_cluster=install_input.mce_cluster,
+        infra_env=install_input.infra_env,
+        namespace=install_input.namespace,
+        ttl_seconds=int(_RESERVATION_TTL.total_seconds()),
     )
 
 
@@ -566,6 +641,9 @@ def _no_installable_candidate(
     namespace: str,
     candidates: list[AcquiredServer],
     rejections: list[tuple[str, str]],
+    *,
+    allocated: bool = False,
+    lock_note: str | None = None,
 ) -> ApplicationError:
     """The failure for a draw in which no candidate could be installed.
 
@@ -577,7 +655,26 @@ def _no_installable_candidate(
     The failure TYPE is the specific one when every candidate was rejected for
     the same reason — which is the common case, and the whole case when a
     server was named explicitly — and the general one otherwise.
+
+    `allocated`: the run's ONE server, which server-scan allocated (and whose
+    lock the run has given back) — so one reason, one type, and no "next".
+    `lock_note` replaces the closing words about its lock (the maintenance
+    after no Agent); it starts "Its lock" and holds no full stop, which is how
+    the server-lifecycle page finds the end of the reason.
     """
+    if allocated and candidates:
+        reason, description = rejections[0] if rejections else ("gone", candidates[0].name)
+        lock = lock_note or (
+            "Its lock had lapsed and another run holds the machine now"
+            if reason == "reserved"
+            else "Its lock was given back"
+        )
+        return ApplicationError(
+            f"server-scan allocated {candidates[0].name} for InfraEnv {infra_env}, and it "
+            f"could not be installed into {namespace} — {_REJECTION_SUMMARY[reason]}: "
+            f"{description}. {lock}",
+            type=_REJECTION_TYPE[reason].__name__,
+        )
     by_reason: dict[str, list[str]] = {}
     for reason, description in rejections:
         by_reason.setdefault(reason, []).append(description)
@@ -645,6 +742,17 @@ def _describe_no_agent(
     )
 
 
+_MAINTENANCE_REASON_END = ". End the maintenance once the cause is fixed"
+
+
+def _maintenance_reason(why: str) -> str:
+    """`why` and what to do about it, in at most _MAINTENANCE_REASON_CHARS: `why` is cut, never the end."""
+    room = _MAINTENANCE_REASON_CHARS - len(_MAINTENANCE_REASON_END)
+    if len(why) > room:
+        why = why[: room - 1] + "…"
+    return why + _MAINTENANCE_REASON_END
+
+
 def _describe_waived(waived: list[WaivedHealthCheck]) -> str:
     """The health checks a failed candidate was installed past, for its rejection."""
     if not waived:
@@ -682,6 +790,7 @@ class AddServerToMceWorkflow:
         self._own_lock_rerun = False
         self._release_once_installed = False
         self._rollback_on_cancel = False
+        self._allocating = False
         # What a cancel would have to undo, set BEFORE each call that may lock,
         # write or map (a call a cancel cuts off may still land): the candidate
         # being installed, whether anything may be on the MCE for it, and its PXE
@@ -748,6 +857,7 @@ class AddServerToMceWorkflow:
         self._own_lock_rerun = workflow.patched(_OWN_LOCK_RERUN_PATCH)
         self._release_once_installed = workflow.patched(_RELEASE_ONCE_INSTALLED_PATCH)
         self._rollback_on_cancel = workflow.patched(_ROLLBACK_ON_CANCEL_PATCH)
+        self._allocating = workflow.patched(_ALLOCATE_PATCH)
         workflow.logger.info(
             "Installing a server into InfraEnv=%s for MCE=%s",
             infra_env,
@@ -799,9 +909,13 @@ class AddServerToMceWorkflow:
 
         # Step 2 — the InfraEnv name IS the hardware query. It encodes vendor,
         # model, site and spec, and server names carry the same tokens behind
-        # an `ocp-` prefix, so no part of either is parsed apart.
+        # an `ocp-` prefix, so no part of either is parsed apart. Since the
+        # allocation, ONE server, already locked for this run by server-scan
+        # (`allocated`); a run recorded before draws a list of candidates.
         self._phase = "acquiring-server"
-        candidates, record_waivers = await self._acquire(install_input, activity_queue)
+        candidates, record_waivers, allocated = await self._acquire(
+            install_input, activity_queue
+        )
 
         # Step 3 — INSTALL ONE CANDIDATE AT A TIME, all the way to an Agent,
         # and roll it back if it never produces one.
@@ -817,11 +931,16 @@ class AddServerToMceWorkflow:
         # SKIP: the run fails only once nothing is left to try.
         rejections: list[tuple[str, str]] = []
         attempts = 0
+        # The failure's closing words about the lock, when the maintenance
+        # after a missing Agent decided them (one server per run since then).
+        lock_note: str | None = None
 
         for candidate in candidates:
             # Whatever the last candidate held was given back, or is another
             # run's now, before the loop moved on: nothing of it for a cancel.
-            self._held, self._mce_written, self._pxe_mapped = None, False, None
+            # An ALLOCATED server is held from the start: server-scan locked it.
+            self._held = candidate if allocated else None
+            self._mce_written, self._pxe_mapped = False, None
             self._phase = "selecting-server"
             bond_members = await self._evaluate_candidate(
                 candidate,
@@ -830,13 +949,27 @@ class AddServerToMceWorkflow:
                 activity_queue,
                 rejections,
                 allow_link_down=install_input.allow_unhealthy,
+                vouched=allocated,
             )
             if bond_members is None:
+                if allocated:
+                    # Locked for this run and nothing written: straight back to
+                    # the inventory. There is no next candidate — the run fails
+                    # with this reason after the loop.
+                    self._phase = "releasing-server"
+                    await self._release(candidate, activity_queue)
+                    self._held = None
                 continue
             # Only ever non-empty for a named install that asked for it: the
             # record's waivers come from the one machine named, and a bond
-            # member can be down only when the link-up rule was waived.
-            bond_waiver = bond_link_waiver(candidate, bond_members)
+            # member is down by request only when the link-up rule was waived.
+            # (An allocated server's members are taken as server-scan vouched
+            # for them — two link-up ports — and are not judged again.)
+            bond_waiver = (
+                bond_link_waiver(candidate, bond_members)
+                if install_input.allow_unhealthy
+                else None
+            )
             self._allowed_unhealthy = [*record_waivers, *([bond_waiver] if bond_waiver else [])]
             if self._allowed_unhealthy:
                 workflow.logger.warning(
@@ -847,7 +980,8 @@ class AddServerToMceWorkflow:
 
             # Locked only now, once THIS machine is the one being installed:
             # server-scan's draw cannot know which candidate a run will choose.
-            if self._reserving:
+            # An allocated server is locked already, by the allocation itself.
+            if self._reserving and not allocated:
                 self._phase = "reserving-server"
                 self._held = candidate  # before the call: a lock it sends may land
                 lock = await self._reserve(
@@ -1097,18 +1231,32 @@ class AddServerToMceWorkflow:
                 await self._unregister_pxe_boot(
                     candidate, bond_members, segment.site, activity_queue
                 )
-            if self._reserving:
+            no_agent = _describe_no_agent(
+                candidate.name, last_state, pxe_registered
+            ) + _describe_waived(self._allowed_unhealthy)
+            # Since the allocation (the operator, 2026-11-17): into maintenance
+            # in server-scan BEFORE the lock goes back, so no run draws it again
+            # until a person has looked at it. Kept instead when server-scan
+            # would not take it out of the draws.
+            release = self._reserving
+            if self._allocating and self._reserving:
+                self._phase = "setting-maintenance"
+                release, lock_note = await self._put_in_maintenance(
+                    candidate, install_input, no_agent, activity_queue
+                )
+            if release:
                 self._phase = "releasing-server"
                 await self._release(candidate, activity_queue)
-            rejections.append(
-                (
-                    "no-agent",
-                    _describe_no_agent(candidate.name, last_state, pxe_registered)
-                    + _describe_waived(self._allowed_unhealthy),
-                )
-            )
+            rejections.append(("no-agent", no_agent))
 
-        raise _no_installable_candidate(infra_env, namespace, candidates, rejections)
+        raise _no_installable_candidate(
+            infra_env,
+            namespace,
+            candidates,
+            rejections,
+            allocated=allocated,
+            lock_note=lock_note,
+        )
 
     async def _evaluate_candidate(
         self,
@@ -1119,12 +1267,23 @@ class AddServerToMceWorkflow:
         rejections: list[tuple[str, str]],
         *,
         allow_link_down: bool = False,
+        vouched: bool = False,
     ) -> list[BondMember] | None:
         """One candidate's bond members, or None with a reason recorded.
 
         `allow_link_down` (a named install's `allow_unhealthy`) relaxes the
         bond's link-up rule and nothing else: every other reason below is still
         a refusal.
+
+        `vouched`: server-scan ALLOCATED the server, live-checked while locked —
+        network health HEALTHY, i.e. two link-up ports actually read, and its
+        MACs normalized on ingest. Its NICs and MACs are then not judged again
+        (the operator, 2026-11-17): the two bond members are taken as it lists
+        them, link-UP first, which with its guarantee is exactly the strict
+        choice. A MAC the limb cannot use is still refused there, as
+        InvalidMacError, before the BareMetalHost or the NMStateConfig is
+        written. Only fewer than two ports with a MAC — nothing to bond at all —
+        stops it here.
 
         EVERY reason a candidate cannot be installed is a skip, not a failure.
         The draw exists so one unusable server is a retry rather than a failed
@@ -1161,12 +1320,14 @@ class AddServerToMceWorkflow:
         # ports with a MAC at all — still "no-bond", whose summary holds for it.
         # (No reason of its own: the server-lifecycle page copies these tables,
         # and the hidden option's name must not reach a UI.)
-        members = select_bond_members(candidate, allow_link_down=allow_link_down)
+        members = select_bond_members(
+            candidate, allow_link_down=allow_link_down or vouched
+        )
         if members is None:
             rejections.append(("no-bond", described))
             return None
 
-        bad = [m.mac for m in members if not mac_is_valid(m.mac)]
+        bad = [] if vouched else [m.mac for m in members if not mac_is_valid(m.mac)]
         if bad:
             rejections.append(("bad-mac", f"{candidate.name} {bad}"))
             return None
@@ -1185,16 +1346,35 @@ class AddServerToMceWorkflow:
 
     async def _acquire(
         self, install_input: AddServerToMceInput, task_queue: str
-    ) -> tuple[list[AcquiredServer], list[WaivedHealthCheck]]:
-        """The candidates to try, and the health refusals waived to get them.
+    ) -> tuple[list[AcquiredServer], list[WaivedHealthCheck], bool]:
+        """The server(s) to try, the health refusals waived to get them, and whether server-scan locked them.
 
-        `/servers/available` is always asked first, so a machine it hands out
-        comes with its live recheck. A NAMED machine it refuses is looked up
-        once more (_named_server_refused) — to recover this workflow id's own
-        leftover lock, and, when the request asked for `allow_unhealthy`, to
-        waive its health. A pool draw's refusal fails the run as before.
+        Since the allocation, ONE server: `POST /servers/available` draws it,
+        locks it for this run and live-checks it while locked (server-scan
+        ADR-0063), so it comes back held — `True`. A run recorded before asks
+        `GET /servers/available` for a list of candidates and locks the one it
+        chooses itself.
+
+        Either way, a NAMED machine refused is looked up once more
+        (_named_server_refused) — to recover this workflow id's own leftover
+        lock, which server-scan refuses even to its holder, and, when the
+        request asked for `allow_unhealthy`, to waive its health. That machine
+        is not locked yet (`False`): the loop takes the lock, as before. A pool
+        draw's refusal fails the run.
         """
         try:
+            if self._allocating:
+                server = await workflow.execute_activity(
+                    allocate_server,
+                    _allocation_request(install_input),
+                    task_queue=task_queue,
+                    start_to_close_timeout=_ALLOCATE_TIMEOUT,
+                    heartbeat_timeout=_ALLOCATE_HEARTBEAT_TIMEOUT,
+                    schedule_to_start_timeout=_SCHEDULE_TO_START_TIMEOUT,
+                    retry_policy=_RETRY_POLICY,
+                    cancellation_type=_ON_CANCEL,
+                )
+                return [server], [], True
             candidates = await workflow.execute_activity(
                 acquire_servers,
                 _acquire_request(
@@ -1225,8 +1405,9 @@ class AddServerToMceWorkflow:
             )
             if found is None:
                 raise
-            return found
-        return candidates, []
+            servers, waived = found
+            return servers, waived, False
+        return candidates, [], False
 
     async def _named_server_refused(
         self,
@@ -1238,9 +1419,9 @@ class AddServerToMceWorkflow:
     ) -> tuple[list[AcquiredServer], list[WaivedHealthCheck]] | None:
         """A named machine `/servers/available` refused: why, and whether the run may go on.
 
-        Its 404 cannot say — the detail names neither the network category nor
-        the install lock — so server-scan's stored record is read
-        (lookup_install_candidate) and sorted by health_waiver:
+        Its refusal — the GET's 404, the allocation's 503 — cannot say whose
+        lock it met or which health category failed, so server-scan's stored
+        record is read (lookup_install_candidate) and sorted by health_waiver:
 
           * a SAFETY reason (unknown, claimed, contested, maintenance, ANOTHER
             run's lock) fails the run, whatever was asked, saying which;
@@ -1592,11 +1773,21 @@ class AddServerToMceWorkflow:
         """
         candidate = self._held
         if candidate is None or self._installed:
+            if candidate is not None:
+                why = f"{candidate.name} is installed and stays: the lock expires on its own"
+            elif self._allocating and self._phase == "acquiring-server":
+                # The allocation may still land a lock for this run, on a server
+                # the run never learns: nothing to release, so its TTL frees it.
+                minutes = int(_RESERVATION_TTL.total_seconds() // 60)
+                why = (
+                    "nothing known to undo: the cancel came while server-scan was "
+                    "allocating a server, and one it took for this run frees itself "
+                    f"when its lock expires ({minutes} min)"
+                )
+            else:
+                why = "nothing to undo: no server was locked yet"
             self._phase = "cancelled"
-            self._cancel_rollback = (
-                "nothing to undo: no server was locked yet" if candidate is None
-                else f"{candidate.name} is installed and stays: the lock expires on its own"
-            )
+            self._cancel_rollback = why
             return
         task_queue = server_lifecycle_activity_queue(install_input.mce_cluster)
         self._phase = "cancel-settling"
@@ -1731,6 +1922,77 @@ class AddServerToMceWorkflow:
                 workflow.logger.info("server-scan shows %s %s: install lock released", candidate.name, state)
                 return True, state, f"server-scan shows {candidate.name} {state}: the install lock was released"
             await workflow.sleep(_SERVER_SCAN_POLL_INTERVAL)  # durable, replay-safe
+
+    async def _put_in_maintenance(
+        self,
+        candidate: AcquiredServer,
+        install_input: AddServerToMceInput,
+        no_agent: str,
+        task_queue: str,
+    ) -> tuple[bool, str | None]:
+        """Take a server that produced no Agent out of every draw: (release its lock now, closing words).
+
+        Into maintenance in server-scan BEFORE the lock goes back — the other
+        order leaves a moment in which the next run can draw it — and read back
+        by the activity. The reason says which run, where, and what the host's
+        own state points at, for the person who ends the maintenance.
+
+        server-scan no longer knowing the server leaves nothing to keep out of
+        a draw: the lock is released as before. A refusal (a token without the
+        ADMIN role, a rejected request) KEEPS the lock, to expire at its TTL, so
+        the server is not drawn again at once — and the run still fails for its
+        missing Agent, not for this. A cancel is never swallowed here.
+        """
+        minutes = int(_AGENT_DEADLINE.total_seconds() // 60)
+        # `no_agent` names the server, the deadline and where its state points.
+        reason = _maintenance_reason(
+            f"add-server-to-mce run {workflow.info().workflow_id} installed it into "
+            f"InfraEnv {install_input.namespace}/{install_input.infra_env} on "
+            f"{install_input.mce_cluster}: {no_agent}"
+        )
+        try:
+            maintenance = await workflow.execute_activity(
+                put_server_in_maintenance,
+                ServerMaintenanceRequest(
+                    server_id=candidate.id, server_name=candidate.name, reason=reason
+                ),
+                task_queue=task_queue,
+                start_to_close_timeout=_ACTIVITY_TIMEOUT,
+                schedule_to_start_timeout=_SCHEDULE_TO_START_TIMEOUT,
+                retry_policy=_RETRY_POLICY,
+                cancellation_type=_ON_CANCEL,
+            )
+        except ActivityError as err:
+            if is_cancelled_exception(err):
+                raise
+            cause = err.cause
+            kind = (
+                cause.type
+                if isinstance(cause, ApplicationError) and cause.type
+                else type(cause).__name__
+            )
+            workflow.logger.error(
+                "server-scan would not put %s in maintenance (%s): its install lock is "
+                "kept until it expires instead",
+                candidate.name,
+                cause,
+            )
+            return False, (
+                "Its lock is kept until it expires, because server-scan would not put "
+                f"it in maintenance ({kind})"
+            )
+        if not maintenance.enabled:
+            workflow.logger.warning(
+                "%s not put in maintenance: %s", candidate.name, maintenance.detail
+            )
+            return True, None
+        workflow.logger.warning(
+            "%s put in maintenance in server-scan: no Agent in %d min", candidate.name, minutes
+        )
+        return True, (
+            "Its lock was given back once server-scan had it in maintenance, so no run "
+            "draws it again: end the maintenance there once the cause is fixed"
+        )
 
     async def _release(self, candidate: AcquiredServer, task_queue: str) -> ServerReservation:
         """Give the lock back: after a teardown proved nothing points at the machine, or once server-scan knows it."""

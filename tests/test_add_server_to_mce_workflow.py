@@ -34,6 +34,7 @@ from shared.workflow_ids import remove_server_from_mce_workflow_id
 from shared.exceptions import (
     BmhConflictError,
     InfraEnvNotFoundError,
+    InvalidMacError,
     InventorySegmentNotFoundError,
     PxeMapAuthError,
     PxeSiteNotConfiguredError,
@@ -50,6 +51,7 @@ from shared.models.server_lifecycle import (
     AddServerToMceRunArgs,
     AgentRef,
     AgentState,
+    AllocateServerRequest,
     BmcEndpoint,
     BmhRef,
     BmhResourceRequest,
@@ -73,10 +75,13 @@ from shared.models.server_lifecycle import (
     ReserveServerRequest,
     ServerInterface,
     ServerLockRecord,
+    ServerMaintenance,
+    ServerMaintenanceRequest,
     ServerMembership,
     ServerMembershipRequest,
     ServerReservation,
     TeardownResult,
+    mac_is_valid,
 )
 from workflow_domains.server_lifecycle.add_server_to_mce import AddServerToMceWorkflow, InstallServerWorkflow
 
@@ -187,6 +192,13 @@ def ucs_server(
     )
 
 
+def standalone_server(server_id: str = "srv_standalone") -> AcquiredServer:
+    """A STANDALONE Redfish machine: server-scan names no BMC driver for it (bmc_vendor null)."""
+    return bondable_server(server_id, name="ocp-standalone-0001").model_copy(
+        update={"vendor": "standalone", "source_provider": "REDFISH_STANDALONE", "bmc_vendor": None}
+    )
+
+
 def make_mock_activities(
     *,
     candidates: list[AcquiredServer] | None = None,
@@ -222,6 +234,9 @@ def make_mock_activities(
     scan_error: Exception | None = None,
     acquire_gate: asyncio.Event | None = None,
     reserve_gate: asyncio.Event | None = None,
+    probe_gate: asyncio.Event | None = None,
+    maintenance_error: Exception | None = None,
+    maintenance_gone: bool = False,
 ):
     """Build the full mock activity set + a call recorder.
 
@@ -270,15 +285,31 @@ def make_mock_activities(
     scan does not know the name; default: INSTALLED_TO_INVENTORY at once),
     `scan_mce` the MCE its agents job names, `scan_error` raised every read.
 
-    `acquire_gate` / `reserve_gate` hold `acquire_servers` / `reserve_server`
-    open until the test sets them: a call in flight when the run is cancelled,
-    which then lands anyway (a cancel stops waiting for it, not it).
+    `acquire_gate` / `reserve_gate` / `probe_gate` hold the allocation (and
+    `acquire_servers`) / `reserve_server` / the pre-selection BareMetalHost
+    probe open until the test sets them: a call in flight when the run is
+    cancelled, which then lands anyway (a cancel stops waiting for it, not it).
+
+    `allocate_server` answers as server-scan's POST /servers/available does: the
+    first server of `candidates` (or the one named) not under a live lock —
+    `reserved_elsewhere`, or one this mock already locked, the caller's own
+    included — nor gone, nor shown installed by a membership read since, nor
+    put in maintenance; it locks that one for the caller's workflow id. None:
+    ServerNotAvailableError with each server's reason.
+
+    `put_server_in_maintenance` puts the server in maintenance, which every
+    later allocation skips; `maintenance_error` is raised instead, and
+    `maintenance_gone` answers as for a server server-scan no longer knows.
+
+    The BareMetalHost and NMStateConfig creates refuse a MAC they cannot use,
+    as the limb's builders do (InvalidMacError), before writing.
     """
     calls: dict[str, list] = {
         name: []
         for name in (
             "get_inventory_segment",
             "acquire_servers",
+            "allocate_server",
             "create_bmc_secret",
             "create_baremetal_host",
             "create_nmstate_config",
@@ -294,6 +325,7 @@ def make_mock_activities(
             "lookup_install_candidate",
             "replace_conflicting_nmstate_config",
             "lookup_server_membership",
+            "put_server_in_maintenance",
             # Activity names in call order, for the ones whose ORDER matters.
             "order",
         )
@@ -335,6 +367,41 @@ def make_mock_activities(
                     "openshift=AVAILABLE, maintenance=False, reachable=True"
                 )
         return list(drawn)
+
+    @activity.defn
+    async def allocate_server(request: AllocateServerRequest) -> AcquiredServer:
+        calls["allocate_server"].append(request)
+        calls["order"].append("allocate_server")
+        if acquire_gate is not None:
+            await acquire_gate.wait()
+        if acquire_error is not None:
+            raise acquire_error
+        # server-scan's POST /servers/available (its ADR-0063): one candidate at
+        # a time, in its order, never one locked — whoever holds it, this run's
+        # own workflow id included — nor one gone from the inventory; the one
+        # returned is locked for the caller, as reserve_server's lock.
+        pool = [s for s in drawn if s.name == request.name] if request.name else drawn
+        reasons = []
+        for server in pool:
+            if server.name in gone:
+                reasons.append(f"{server.name}: GONE_FROM_MANAGER")
+                continue
+            if server.name in claimed_in_scan:
+                reasons.append(f"{server.name}: CLAIMED")
+                continue
+            if server.name in in_maintenance:
+                reasons.append(f"{server.name}: MAINTENANCE")
+                continue
+            if server.name in held_elsewhere or server.id in locks:
+                reasons.append(f"{server.name}: RESERVED")
+                continue
+            locks[server.id] = request.workflow_id
+            return server
+        asked = f"name={request.name!r}" if request.name else f"pattern={request.pattern!r}"
+        raise ServerNotAvailableError(
+            f"server-scan could not allocate a server ({asked}): "
+            + ("; ".join(reasons) or "no server name matches")
+        )
 
     @activity.defn
     async def lookup_install_candidate(
@@ -424,16 +491,24 @@ def make_mock_activities(
         calls["order"].append("create_bmc_secret")
         return _created("Secret", f"dell-cred-{request.server_name}")
 
+    def _limb_refuses_bad_macs(request: BmhResourceRequest) -> None:
+        # bmh_resources._validate_macs: before the object is built, so nothing written.
+        bad = [m.mac for m in request.bond_members if not mac_is_valid(m.mac)]
+        if bad:
+            raise InvalidMacError(f"{request.server_name}: invalid MAC(s) {bad}")
+
     @activity.defn
     async def create_baremetal_host(request: BmhResourceRequest) -> CreatedResource:
         calls["create_baremetal_host"].append(request)
         calls["order"].append("create_baremetal_host")
+        _limb_refuses_bad_macs(request)
         return _created("BareMetalHost", request.server_name)
 
     @activity.defn
     async def create_nmstate_config(request: BmhResourceRequest) -> CreatedResource:
         calls["create_nmstate_config"].append(request)
         calls["order"].append("create_nmstate_config")
+        _limb_refuses_bad_macs(request)
         if nmstate_error is not None and not nmstate_failed_once:
             if nmstate_error_once:
                 nmstate_failed_once.append(True)
@@ -450,6 +525,8 @@ def make_mock_activities(
         created = [c.server_name for c in calls["create_baremetal_host"]]
         if ref.server_name not in created:
             # The pre-selection probe: does this candidate already have a host?
+            if probe_gate is not None:
+                await probe_gate.wait()
             return BmhState(
                 found=ref.server_name in installed,
                 provisioning_state="provisioned" if ref.server_name in installed else None,
@@ -550,7 +627,25 @@ def make_mock_activities(
             server_id=request.server_id, held=False, detail="not ours"
         )
 
+    in_maintenance: set[str] = set()
+
+    @activity.defn
+    async def put_server_in_maintenance(request: ServerMaintenanceRequest) -> ServerMaintenance:
+        calls["put_server_in_maintenance"].append(request)
+        calls["order"].append("put_server_in_maintenance")
+        if maintenance_error is not None:
+            raise maintenance_error
+        if maintenance_gone:
+            return ServerMaintenance(
+                server_id=request.server_id,
+                enabled=False,
+                detail="the server is no longer in server-scan's inventory",
+            )
+        in_maintenance.add(request.server_name)
+        return ServerMaintenance(server_id=request.server_id, enabled=True)
+
     states = list(scan_states) if scan_states is not None else ["INSTALLED_TO_INVENTORY"]
+    claimed_in_scan: set[str] = set()
 
     @activity.defn
     async def lookup_server_membership(request: ServerMembershipRequest) -> ServerMembership:
@@ -561,6 +656,9 @@ def make_mock_activities(
         state = states.pop(0) if len(states) > 1 else states[0]
         if state is None:
             return ServerMembership(found=False)
+        if state in ("INSTALLED_TO_INVENTORY", "INSTALLED"):
+            # server-scan knows the machine is taken now: it never allocates it again.
+            claimed_in_scan.add(request.server_name)
         return ServerMembership(
             found=True, server_id="srv", server_name=request.server_name,
             lifecycle_state=state, mce_name=scan_mce if state == "INSTALLED_TO_INVENTORY" else None,
@@ -570,6 +668,7 @@ def make_mock_activities(
     server_activities = [
         lookup_server_membership,
         acquire_servers,
+        allocate_server,
         lookup_install_candidate,
         replace_conflicting_nmstate_config,
         create_bmc_secret,
@@ -580,6 +679,7 @@ def make_mock_activities(
         teardown_bmh_resources,
         reserve_server,
         release_server,
+        put_server_in_maintenance,
         register_pxe_boot,
         unregister_pxe_boot,
         publish_infra_env_boot,
@@ -702,15 +802,30 @@ async def test_happy_path_resolves_vlan_acquires_creates_and_awaits_the_agent():
 async def test_the_infraenv_becomes_the_server_query():
     calls, segment_acts, server_acts = make_mock_activities()
     async with _Harness(segment_acts, server_acts) as client:
-        await _execute(client, AddServerToMceRunArgs(input=INPUT))
+        await _execute_as(client, AddServerToMceRunArgs(input=INPUT), "add-server-to-mce-the-query")
 
-    request = calls["acquire_servers"][0]
+    # ONE server, asked for once — the candidate list (acquire_servers) is
+    # only for runs recorded before the allocation.
+    [request] = calls["allocate_server"]
+    assert calls["acquire_servers"] == []
     # Escaped, because the InfraEnv name is caller data going into a regex that
     # server-scan hands to Mongo. `\-` is a literal `-`, so the pool is the
     # same; an unescaped `.` or `+` in a future name would not be.
-    assert request.pattern == f"^ocp-{re.escape(INFRA_ENV)}"
+    # The `-` after the InfraEnv is load-bearing (the operator, 2026-11-17): the
+    # InfraEnv must END where the server's own part begins.
+    assert request.pattern == f"^ocp-{re.escape(INFRA_ENV)}-"
+    pool = re.compile(request.pattern)
+    assert pool.match(f"ocp-{INFRA_ENV}-FCH0001")
+    assert not pool.match(f"ocp-{INFRA_ENV}x-FCH0001")
+    assert not pool.match(f"ocp-{INFRA_ENV}2-FCH0001")
+    assert not pool.match(f"ocp-{INFRA_ENV}")
     assert request.name is None
-    assert request.health == "HEALTHY"
+    assert (request.max_health, request.min_nic_macs) == ("HEALTHY", 2)
+    # The lock server-scan takes as it allocates IS this run's: its holder and
+    # id, for the install's TTL — what the renewal and the release then name.
+    assert (request.holder, request.workflow_id) == ("add-server-to-mce", "add-server-to-mce-the-query")
+    assert (request.mce_cluster, request.infra_env, request.namespace) == (MCE_CLUSTER, INFRA_ENV, NAMESPACE)
+    assert request.ttl_seconds == 2 * 3600
 
 
 async def test_an_explicit_server_name_bypasses_the_pattern():
@@ -719,10 +834,9 @@ async def test_an_explicit_server_name_bypasses_the_pattern():
     async with _Harness(segment_acts, server_acts) as client:
         await _execute(client, AddServerToMceRunArgs(input=named))
 
-    request = calls["acquire_servers"][0]
+    [request] = calls["allocate_server"]
     assert request.name == SERVER_NAME
     assert request.pattern is None
-    assert request.count == 1
 
 
 async def test_the_vlan_comes_from_the_mce_segment_not_the_caller():
@@ -781,24 +895,17 @@ class TestTheInventoryNetworkIsOneScopePerCluster:
         assert result.vlan_id == VLAN_ID
         assert calls["get_inventory_segment"] == [MCE_CLUSTER]
 
-    async def test_the_segment_is_resolved_once_per_run_not_per_candidate(
+    async def test_the_segment_is_resolved_once_per_run_before_the_allocation(
         self,
     ) -> None:
-        # A lookup per candidate would be a round trip to the Segments Manager
-        # for every server in the draw, for an answer that cannot differ.
-        pool = [
-            bondable_server("srv_a", name="ocp-a"),
-            bondable_server("srv_b", name="ocp-b"),
-            bondable_server("srv_c", name="ocp-c"),
-        ]
-        calls, segment_acts, server_acts = make_mock_activities(
-            candidates=pool, already_installed={"ocp-a", "ocp-b"}
-        )
+        # The MCE's, so read once and first: no server could make a missing
+        # allocation usable, so none is allocated (and locked) before it.
+        calls, segment_acts, server_acts = make_mock_activities()
         async with _Harness(segment_acts, server_acts) as client:
-            result = await _execute(client, AddServerToMceRunArgs(input=INPUT))
+            await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
-        assert result.server_name == "ocp-c"
         assert calls["get_inventory_segment"] == [MCE_CLUSTER]
+        assert calls["order"][:2] == ["check_infra_env", "allocate_server"]
 
     async def test_an_mce_with_no_inventory_segment_fails_before_the_draw(
         self,
@@ -852,31 +959,52 @@ async def test_npar_partitions_are_never_bonded():
     assert calls["create_bmc_secret"] == []  # nothing was written
 
 
-async def test_a_oneview_candidate_fails_visibly_not_silently():
-    _, segment_acts, server_acts = make_mock_activities(candidates=[oneview_server()])
+async def test_an_allocated_servers_nics_are_taken_as_server_scan_vouched_for_them():
+    """server-scan allocates only a server whose network health is HEALTHY — two
+    link-up ports actually read — so the run does not judge its NICs again (the
+    operator, 2026-11-17). It still PICKS the two, for the NMStateConfig's bond
+    and the BareMetalHost's boot MAC: in server-scan's order, one per port.
+
+    A OneView server reports no link state (server-scan would never hand one
+    out); allocated all the same, it is installed rather than refused.
+    """
+    hpe = oneview_server()
+    calls, segment_acts, server_acts = make_mock_activities(candidates=[hpe])
+    async with _Harness(segment_acts, server_acts) as client:
+        result = await _execute(client, AddServerToMceRunArgs(input=INPUT))
+
+    assert result.server_name == hpe.name
+    assert result.bond_macs == ["aa:bb:cc:dd:ee:11", "aa:bb:cc:dd:ee:12"]
+    assert result.boot_mac == "aa:bb:cc:dd:ee:11"
+    # Nothing was waived: nobody asked for allow_unhealthy.
+    assert result.allowed_unhealthy == []
+    assert [m.logical_name for m in calls["create_nmstate_config"][0].bond_members] == ["nic1", "nic2"]
+
+
+async def test_an_unusable_allocated_server_is_given_back_and_fails_the_run():
+    """ONE server per run (the operator, 2026-11-17): no next candidate.
+
+    server-scan allocated it — locked for this run — so the lock goes back
+    before the run fails, and nothing was written for it. Asking again is a
+    new run, with a new allocation.
+    """
+    standalone = standalone_server()
+    calls, segment_acts, server_acts = make_mock_activities(
+        candidates=[standalone, bondable_server("srv_good")]
+    )
     async with _Harness(segment_acts, server_acts) as client:
         with pytest.raises(WorkflowFailureError) as excinfo:
             await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
     error = _application_error(excinfo.value)
-    assert error.type == "NoBondableInterfacesError"
-    # The message must name the provider and the link states, or the accepted
-    # HPE gap is indistinguishable from genuinely down hardware.
-    assert "ONEVIEW" in str(error)
-    assert "UNKNOWN" in str(error)
-
-
-async def test_an_unusable_candidate_is_stepped_over_for_the_next():
-    # Drawing several candidates is what makes one bad server a retry inside
-    # the run rather than a failed run.
-    calls, segment_acts, server_acts = make_mock_activities(
-        candidates=[oneview_server(), npar_server(), bondable_server("srv_good")]
-    )
-    async with _Harness(segment_acts, server_acts) as client:
-        result = await _execute(client, AddServerToMceRunArgs(input=INPUT))
-
-    assert result.server_id == "srv_good"
-    assert calls["create_baremetal_host"][0].server_name == SERVER_NAME
+    assert error.type == "UnknownBmcVendorError"
+    assert f"server-scan allocated {standalone.name}" in error.message
+    assert "Its lock was given back" in error.message
+    assert len(calls["allocate_server"]) == 1
+    assert [r.server_id for r in calls["release_server"]] == [standalone.id]
+    # Allocated already locked: no reserve, and nothing created.
+    assert calls["reserve_server"] == calls["create_bmc_secret"] == []
+    assert calls["order"][-1] == "release_server"
 
 
 async def test_a_standalone_server_is_refused_rather_than_guessed():
@@ -905,14 +1033,14 @@ async def test_a_rerun_over_existing_resources_succeeds_and_reports_no_change():
     assert result.bmh_registered is True
 
 
-async def test_a_host_that_never_produces_an_agent_is_rolled_back_and_retried():
-    """The whole point of the loop: an hour-deep failure is a SKIP, not the run's.
+async def test_a_host_that_never_produces_an_agent_is_rolled_back_released_and_fails():
+    """An hour-deep failure ends the run — after its rollback.
 
-    The first candidate is created, waited on for the full deadline, torn down —
-    which returns the machine to the inventory — and the SECOND candidate is
-    installed. Anything less would strand a machine with a BareMetalHost that no
-    other MCE can see, because server-scan reports it unclaimed until a cluster
-    reports the node.
+    The server is created, waited on for the full deadline, torn down, put in
+    maintenance in server-scan (the operator, 2026-11-17) and only then its
+    lock given back; no other server is tried (one per run). Leaving the host
+    would strand a machine with a BareMetalHost no other MCE can see:
+    server-scan reports it unclaimed until a cluster reports the node.
     """
     doomed = bondable_server("srv_doomed", name="ocp-doomed", mac_prefix="11:22:33:44:55")
     good = bondable_server("srv_good")
@@ -920,37 +1048,26 @@ async def test_a_host_that_never_produces_an_agent_is_rolled_back_and_retried():
         candidates=[doomed, good], agent_never_for={"ocp-doomed"}
     )
     async with _Harness(segment_acts, server_acts) as client:
-        result = await _execute(client, AddServerToMceRunArgs(input=INPUT))
-
-    assert result.server_name == SERVER_NAME
-    assert result.attempts == 2
-    assert result.agent_name == f"agent-{SERVER_NAME}"
-    # BOTH were created; only the doomed one was torn down.
-    assert [c.server_name for c in calls["create_baremetal_host"]] == [
-        "ocp-doomed",
-        SERVER_NAME,
-    ]
-    assert [t.server_name for t in calls["teardown_bmh_resources"]] == ["ocp-doomed"]
-
-
-async def test_a_whole_pool_without_agents_fails_and_tears_every_one_down():
-    """Nothing left to try is the only thing that fails the run."""
-    first = bondable_server("srv_1", name="ocp-one", mac_prefix="11:22:33:44:55")
-    second = bondable_server("srv_2", name="ocp-two", mac_prefix="66:77:88:99:aa")
-    calls, segment_acts, server_acts = make_mock_activities(
-        candidates=[first, second], agent_never_for={"ocp-one", "ocp-two"}
-    )
-    async with _Harness(segment_acts, server_acts) as client:
         with pytest.raises(WorkflowFailureError) as excinfo:
             await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
     error = _application_error(excinfo.value)
     assert error.type == "AgentNeverAppearedError"
-    # No machine is left holding a BareMetalHost.
-    assert [t.server_name for t in calls["teardown_bmh_resources"]] == [
-        "ocp-one",
-        "ocp-two",
-    ]
+    assert "server-scan allocated ocp-doomed" in error.message
+    assert [c.server_name for c in calls["create_baremetal_host"]] == ["ocp-doomed"]
+    assert [t.server_name for t in calls["teardown_bmh_resources"]] == ["ocp-doomed"]
+    # Torn down, in maintenance, THEN given back: never a lock released over a
+    # live host, nor before server-scan keeps the machine out of every draw.
+    order = calls["order"]
+    assert (
+        order.index("teardown_bmh_resources")
+        < order.index("put_server_in_maintenance")
+        < order.index("release_server")
+    )
+    assert [m.server_id for m in calls["put_server_in_maintenance"]] == ["srv_doomed"]
+    assert [r.server_id for r in calls["release_server"]] == ["srv_doomed"]
+    assert len(calls["allocate_server"]) == 1
+    assert "server-scan had it in maintenance" in error.message
 
 
 async def test_an_agent_that_takes_its_time_is_waited_for():
@@ -1048,43 +1165,45 @@ async def test_resources_are_created_in_dependency_order():
     assert [m.logical_name for m in request.bond_members] == ["nic1", "nic2"]
 
 
-async def test_a_candidate_that_already_has_a_baremetalhost_is_skipped():
+async def test_an_allocated_server_that_already_has_a_baremetalhost_is_given_back():
     """server-scan cannot know a machine was just installed; the cluster can.
 
     Nothing changes a server's lifecycle state until a CLUSTER reports the
-    node, minutes later, so a second run in that window draws the same machine.
+    node, minutes later. The install lock covers that window (held until
+    server-scan sees the machine), so this is the rare case — and the run
+    gives the lock back and fails rather than "succeed" over another's host.
     """
     taken, free = bondable_server("srv_taken", name="ocp-taken"), bondable_server("srv_free")
     calls, segment_acts, server_acts = make_mock_activities(
         candidates=[taken, free], already_installed={"ocp-taken"}
     )
     async with _Harness(segment_acts, server_acts) as client:
-        result = await _execute(client, AddServerToMceRunArgs(input=INPUT))
+        with pytest.raises(WorkflowFailureError) as excinfo:
+            await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
-    assert result.server_name == SERVER_NAME
-    assert [c.server_name for c in calls["create_baremetal_host"]] == [SERVER_NAME]
+    error = _application_error(excinfo.value)
+    assert error.type == "NoBondableInterfacesError"
+    assert "already hold a BareMetalHost" in error.message
+    assert calls["create_baremetal_host"] == []
+    assert [r.server_id for r in calls["release_server"]] == ["srv_taken"]
 
 
-async def test_a_candidate_kubernetes_cannot_name_is_skipped_not_fatal():
-    """One badly-named machine in the pool must not kill every install from it.
-
-    Every read and every create derives a Kubernetes object name from the
+async def test_an_allocated_server_kubernetes_cannot_name_is_given_back_unprobed():
+    """Every read and every create derives a Kubernetes object name from the
     server's name, and the conversion raises for a name no amount of lowercasing
-    can save. Raised from an ACTIVITY that is a non-retryable failure of the
-    whole run — so the name is checked in the workflow, where it is just another
-    reason to try the next candidate.
-    """
+    can save — raised from an ACTIVITY that would be a non-retryable failure
+    with nothing said about why. So the workflow checks it first, names it, and
+    gives the lock back."""
     bad = bondable_server("srv_bad", name="ocp_dell_underscores_are_illegal")
-    good = bondable_server("srv_good")
-    calls, segment_acts, server_acts = make_mock_activities(candidates=[bad, good])
+    calls, segment_acts, server_acts = make_mock_activities(candidates=[bad])
     async with _Harness(segment_acts, server_acts) as client:
-        result = await _execute(client, AddServerToMceRunArgs(input=INPUT))
+        with pytest.raises(WorkflowFailureError) as excinfo:
+            await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
-    assert result.server_name == SERVER_NAME
+    assert _application_error(excinfo.value).type == "InvalidServerNameError"
     # Never even probed: the probe itself would have raised on the name.
-    assert [r.server_name for r in calls["get_baremetal_host"]] == [SERVER_NAME] * len(
-        calls["get_baremetal_host"]
-    )
+    assert calls["get_baremetal_host"] == []
+    assert [r.server_id for r in calls["release_server"]] == ["srv_bad"]
 
 
 async def test_a_pool_of_unnameable_candidates_says_to_rename_them():
@@ -1134,8 +1253,11 @@ async def test_an_explicitly_named_server_is_converged_not_skipped():
     assert len(calls["create_baremetal_host"]) == 1
 
 
-async def test_a_malformed_mac_fails_before_any_resource_is_written():
-    """An unclassified ValueError inside the create would retry forever, after leaving a Secret."""
+async def test_an_allocated_servers_macs_are_left_to_the_limb_which_refuses_a_bad_one():
+    """server-scan normalizes MACs on ingest, so the run no longer checks them on an
+    allocated server (the operator, 2026-11-17). Should one be malformed all the
+    same, the limb refuses it — permanently, InvalidMacError, once — before the
+    BareMetalHost or the NMStateConfig is written."""
     broken = bondable_server().model_copy(
         update={
             "interfaces": [
@@ -1151,7 +1273,8 @@ async def test_a_malformed_mac_fails_before_any_resource_is_written():
 
     error = _application_error(excinfo.value)
     assert error.type == "InvalidMacError"
-    assert calls["create_bmc_secret"] == []
+    assert len(calls["create_baremetal_host"]) == 1  # one attempt: permanent
+    assert calls["create_nmstate_config"] == []
 
 
 async def test_a_server_with_no_bmc_host_fails_in_seconds_not_in_ten_minutes():
@@ -1261,32 +1384,39 @@ class TestTheInstallLock:
     server installed into one MCE is drawn again by a run for another.
     """
 
-    async def test_the_chosen_machine_is_locked_renewed_held_and_released_once_server_scan_sees_it(self):
+    async def test_the_allocated_machine_is_renewed_held_and_released_once_server_scan_sees_it(self):
         calls, segment_acts, server_acts = make_mock_activities()
         async with _Harness(segment_acts, server_acts) as client:
             result = await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
-        claims = calls["reserve_server"]
-        # Taken, renewed as the Agent wait begins, then held for a day — until
+        # Taken BY THE ALLOCATION — server-scan locks the server it hands over —
+        # then renewed as the Agent wait begins and held for a day, until
         # server-scan shows it installed (the mock does at the first read).
-        assert [c.ttl_seconds for c in claims] == [7200, 7200, 86_400]
+        [allocation] = calls["allocate_server"]
+        assert allocation.ttl_seconds == 7200
+        claims = calls["reserve_server"]
+        assert [c.ttl_seconds for c in claims] == [7200, 86_400]
         assert {c.server_id for c in claims} == {"srv_001"}
-        assert {c.holder for c in claims} == {"add-server-to-mce"}
-        # One workflow id across all three: server-scan EXTENDS a lock its own
-        # run re-takes, and treats anyone else's as a lost race.
-        assert len({c.workflow_id for c in claims}) == 1
-        assert claims[0].workflow_id.startswith("test-")
-        assert claims[0].mce_cluster == MCE_CLUSTER
-        assert claims[0].infra_env == INFRA_ENV
-        assert claims[0].namespace == NAMESPACE
+        # One holder and workflow id throughout: server-scan EXTENDS a lock its
+        # own run re-takes, and treats anyone else's as a lost race.
+        assert {(c.holder, c.workflow_id) for c in claims} == {
+            (allocation.holder, allocation.workflow_id)
+        }
+        assert allocation.holder == "add-server-to-mce"
+        assert allocation.workflow_id.startswith("test-")
+        assert (claims[0].mce_cluster, claims[0].infra_env, claims[0].namespace) == (
+            MCE_CLUSTER, INFRA_ENV, NAMESPACE,
+        )
         (released,) = calls["release_server"]
         assert (released.server_id, released.holder, released.workflow_id) == (
-            "srv_001", "add-server-to-mce", claims[0].workflow_id,
+            "srv_001", "add-server-to-mce", allocation.workflow_id,
         )
         assert result.lock_released is True and result.server_scan_state == "INSTALLED_TO_INVENTORY"
         assert result.reservation_expires_at is None
 
-    async def test_a_machine_another_run_holds_is_skipped_before_anything_is_written(self):
+    async def test_a_machine_another_run_holds_is_never_allocated(self):
+        # server-scan's own rule: a locked server is not handed out, so the run
+        # is given the next one — nothing of the held one is touched.
         held = bondable_server("srv_held", name="ocp-held", mac_prefix="11:22:33:44:55")
         free = bondable_server("srv_free")
         calls, segment_acts, server_acts = make_mock_activities(
@@ -1296,12 +1426,11 @@ class TestTheInstallLock:
             result = await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
         assert result.server_name == SERVER_NAME
-        # A refused lock is not an attempt: nothing was installed or watched.
         assert result.attempts == 1
         assert [c.server_name for c in calls["create_bmc_secret"]] == [SERVER_NAME]
         assert calls["teardown_bmh_resources"] == []
 
-    async def test_a_pool_held_elsewhere_fails_naming_the_holder(self):
+    async def test_a_pool_all_held_elsewhere_fails_with_server_scans_reasons(self):
         calls, segment_acts, server_acts = make_mock_activities(
             reserved_elsewhere={SERVER_NAME}
         )
@@ -1310,11 +1439,13 @@ class TestTheInstallLock:
                 await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
         error = _application_error(excinfo.value)
-        assert error.type == "ServerReservedError"
-        assert "ocp4-mce-other" in error.message
-        assert calls["create_bmc_secret"] == []
+        assert error.type == "ServerNotAvailableError"
+        assert "RESERVED" in error.message
+        # Permanent: asked once, nothing written.
+        assert len(calls["allocate_server"]) == 1
+        assert calls["create_bmc_secret"] == calls["release_server"] == []
 
-    async def test_a_server_gone_from_the_inventory_is_skipped(self):
+    async def test_a_server_gone_from_the_inventory_is_never_allocated(self):
         gone = bondable_server("srv_gone", name="ocp-gone", mac_prefix="11:22:33:44:55")
         calls, segment_acts, server_acts = make_mock_activities(
             candidates=[gone, bondable_server()], gone_from_inventory={"ocp-gone"}
@@ -1325,53 +1456,57 @@ class TestTheInstallLock:
         assert result.server_name == SERVER_NAME
         assert [c.server_name for c in calls["create_bmc_secret"]] == [SERVER_NAME]
 
-    async def test_an_already_installed_candidate_is_never_locked(self):
-        # The probe runs first: locking a machine this MCE already holds would
-        # only withhold it from the operator's view of the fleet.
-        calls, segment_acts, server_acts = make_mock_activities(
-            candidates=[bondable_server("srv_a", name="ocp-a"), bondable_server()],
-            already_installed={"ocp-a"},
-        )
-        async with _Harness(segment_acts, server_acts) as client:
-            await _execute(client, AddServerToMceRunArgs(input=INPUT))
-
-        assert {c.server_name for c in calls["reserve_server"]} == {SERVER_NAME}
-
-    async def test_a_rolled_back_machine_is_released_after_its_teardown(self):
+    async def test_a_rolled_back_machine_is_released_as_the_allocation_took_it(self):
         doomed = bondable_server("srv_doomed", name="ocp-doomed", mac_prefix="11:22:33:44:55")
         calls, segment_acts, server_acts = make_mock_activities(
-            candidates=[doomed, bondable_server()], agent_never_for={"ocp-doomed"}
+            candidates=[doomed], agent_never_for={"ocp-doomed"}
         )
         async with _Harness(segment_acts, server_acts) as client:
-            await _execute(client, AddServerToMceRunArgs(input=INPUT))
+            with pytest.raises(WorkflowFailureError):
+                await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
-        released = calls["release_server"]
-        # The doomed one after its teardown; the installed one at the end, once
-        # server-scan shows it installed.
-        assert [r.server_id for r in released] == ["srv_doomed", "srv_001"]
-        assert released[0].holder == "add-server-to-mce"
-        assert released[0].workflow_id == calls["reserve_server"][0].workflow_id
+        # The lock server-scan took in the allocation, released as its holder
+        # and run: server-scan compares both before it deletes anything.
+        [allocation] = calls["allocate_server"]
+        [released] = calls["release_server"]
+        assert (released.server_id, released.holder, released.workflow_id) == (
+            "srv_doomed", allocation.holder, allocation.workflow_id,
+        )
 
     async def test_a_lock_lost_before_the_agent_wait_rolls_back_without_releasing(self):
-        """Lapsed and taken by another run: undo OUR resources, leave THEIR lock."""
+        """Lapsed and taken by another run: undo OUR resources, leave THEIR lock — and fail."""
         lapsed = bondable_server("srv_lapsed", name="ocp-lapsed", mac_prefix="11:22:33:44:55")
         calls, segment_acts, server_acts = make_mock_activities(
             candidates=[lapsed, bondable_server()], lock_lapses_for={"ocp-lapsed"}
         )
         async with _Harness(segment_acts, server_acts) as client:
-            result = await _execute(client, AddServerToMceRunArgs(input=INPUT))
+            with pytest.raises(WorkflowFailureError) as excinfo:
+                await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
-        assert result.server_name == SERVER_NAME
+        error = _application_error(excinfo.value)
+        assert error.type == "ServerReservedError"
+        assert "Its lock had lapsed and another run holds the machine now" in error.message
         assert [t.server_name for t in calls["teardown_bmh_resources"]] == ["ocp-lapsed"]
-        # Never the lapsed one's — another run holds it now. Only the installed
-        # one's, at the end, once server-scan shows it installed.
-        assert [r.server_name for r in calls["release_server"]] == [SERVER_NAME]
+        # Never the lapsed one's lock — another run holds it now.
+        assert calls["release_server"] == []
         # Never watched for an Agent: the machine is someone else's now.
-        assert all(
-            "11:22:33:44:55:01" not in ref.macs for ref in calls["find_agent_for_host"]
-        )
+        assert calls["find_agent_for_host"] == []
 
     async def test_a_token_without_the_admin_role_fails_the_run(self):
+        # The allocation LOCKS the server it returns, a write: ADMIN only.
+        calls, segment_acts, server_acts = make_mock_activities(
+            acquire_error=ServerScanAuthError("needs the ADMIN role")
+        )
+        async with _Harness(segment_acts, server_acts) as client:
+            with pytest.raises(WorkflowFailureError) as excinfo:
+                await _execute(client, AddServerToMceRunArgs(input=INPUT))
+
+        assert _application_error(excinfo.value).type == "ServerScanAuthError"
+        # Once: permanent, not retried every minute.
+        assert len(calls["allocate_server"]) == 1
+        assert calls["create_bmc_secret"] == []
+
+    async def test_a_renewal_refused_for_its_token_fails_the_run(self):
         calls, segment_acts, server_acts = make_mock_activities(
             reserve_error=ServerScanAuthError("needs the ADMIN role")
         )
@@ -1380,9 +1515,7 @@ class TestTheInstallLock:
                 await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
         assert _application_error(excinfo.value).type == "ServerScanAuthError"
-        # Once: permanent, not retried every minute, and not a per-candidate skip.
         assert len(calls["reserve_server"]) == 1
-        assert calls["create_bmc_secret"] == []
 
 
 class TestThePxeBootOfAnIpmiServer:
@@ -1439,21 +1572,18 @@ class TestThePxeBootOfAnIpmiServer:
 
         assert calls["register_pxe_boot"] == []
 
-    async def test_a_site_without_a_pxe_vm_is_a_skip_and_releases_the_lock(self):
-        """A Redfish machine later in the draw needs no PXE map at all."""
+    async def test_a_site_without_a_pxe_vm_gives_the_lock_back_and_fails(self):
         calls, segment_acts, server_acts = make_mock_activities(
             candidates=[ucs_server(), bondable_server()], pxe_sites=set()
         )
         async with _Harness(segment_acts, server_acts) as client:
-            result = await _execute(client, AddServerToMceRunArgs(input=INPUT))
+            with pytest.raises(WorkflowFailureError) as excinfo:
+                await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
-        assert result.server_name == SERVER_NAME
-        assert result.attempts == 1
+        assert _application_error(excinfo.value).type == "PxeSiteNotConfiguredError"
         # Nothing was written for the blade, and its lock went straight back.
-        assert [c.server_name for c in calls["create_bmc_secret"]] == [SERVER_NAME]
-        assert calls["teardown_bmh_resources"] == []
-        # The installed one's follows at the end, once server-scan shows it installed.
-        assert [r.server_id for r in calls["release_server"]] == ["srv_ucs", "srv_001"]
+        assert calls["create_bmc_secret"] == calls["teardown_bmh_resources"] == []
+        assert [r.server_id for r in calls["release_server"]] == ["srv_ucs"]
 
     async def test_a_pool_of_blades_at_an_unmapped_site_fails_naming_the_fix(self):
         calls, segment_acts, server_acts = make_mock_activities(
@@ -1494,12 +1624,12 @@ class TestThePxeBootOfAnIpmiServer:
 
 
 class TestParallelRunsOnOnePool:
-    """add-server-to-mce `count`'s premise: N runs drawing one pool AT ONCE land on N machines.
+    """add-server-to-mce `count`'s premise: N runs allocating from one pool AT ONCE land on N machines.
 
-    Both runs share one mock server-scan, whose lock behaves as the real one
-    (reservation_service.py there): a live lock is refused to any other
-    workflow id. Every run draws the same candidates in the same order, so
-    the second must skip what the first locked rather than share it.
+    Both runs share one mock server-scan, whose allocation behaves as the real
+    one (ADR-0063 there): it never hands out a server under a live lock, and
+    locks the one it hands out for the caller — so the second run is given
+    another machine rather than the first one's.
     """
 
     async def test_two_concurrent_runs_install_two_different_servers(self):
@@ -1509,7 +1639,7 @@ class TestParallelRunsOnOnePool:
             bondable_server("srv_c", name="ocp-dell-c", mac_prefix="cc:cc:cc:cc:cc"),
         ]
         calls, segment_acts, server_acts = make_mock_activities(candidates=pool)
-        args = AddServerToMceRunArgs(input=INPUT.model_copy(update={"candidate_count": 3}))
+        args = AddServerToMceRunArgs(input=INPUT)
         async with _Harness(segment_acts, server_acts) as client:
             handles = [
                 await client.start_workflow(
@@ -1541,7 +1671,7 @@ class TestAFinishedSlotIsFreeAgain:
         ]
         _, segment_acts, server_acts = make_mock_activities(candidates=pool)
         slot = f"add-server-to-mce-{INFRA_ENV}_1"
-        args = AddServerToMceRunArgs(input=INPUT.model_copy(update={"candidate_count": 2}))
+        args = AddServerToMceRunArgs(input=INPUT)
         async with _Harness(segment_acts, server_acts) as client:
             first = await asyncio.wait_for(
                 client.execute_workflow(
@@ -1557,7 +1687,8 @@ class TestAFinishedSlotIsFreeAgain:
                 timeout=60,
             )
 
-        # And it installed the next machine: the first one now has a BMH.
+        # And it installed the next machine: server-scan saw the first installed
+        # (the first run released its lock only then) and allocates it no more.
         assert (first.server_name, second.server_name) == ("ocp-dell-a", "ocp-dell-b")
 
 
@@ -1684,7 +1815,7 @@ class TestTheInfraEnvIsCheckedFirst:
             InfraEnvRef(name=INFRA_ENV, namespace=NAMESPACE)
         ]
         order = calls["order"]
-        assert order.index("check_infra_env") < order.index("acquire_servers")
+        assert order.index("check_infra_env") < order.index("allocate_server")
 
     async def test_a_missing_infraenv_fails_the_run_before_anything_is_drawn(self):
         calls, segment_acts, server_acts = make_mock_activities(infra_env_missing=True)
@@ -1695,7 +1826,7 @@ class TestTheInfraEnvIsCheckedFirst:
         assert _application_error(excinfo.value).type == "InfraEnvNotFoundError"
         # Once: permanent, not retried every minute.
         assert len(calls["check_infra_env"]) == 1
-        assert calls["acquire_servers"] == []
+        assert calls["allocate_server"] == calls["acquire_servers"] == []
         assert calls["reserve_server"] == []
         assert calls["create_bmc_secret"] == []
 
@@ -1709,9 +1840,9 @@ class TestThePxeMapIsCleanedOnRollback:
             candidates=[blade, bondable_server()], agent_never_for={blade.name}
         )
         async with _Harness(segment_acts, server_acts) as client:
-            result = await _execute(client, AddServerToMceRunArgs(input=INPUT))
+            with pytest.raises(WorkflowFailureError):
+                await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
-        assert result.server_name == SERVER_NAME
         # Exactly what was mapped: the boot MAC.
         assert calls["unregister_pxe_boot"] == [
             PxeMapRef(
@@ -1721,25 +1852,30 @@ class TestThePxeMapIsCleanedOnRollback:
             )
         ]
         assert calls["unregister_pxe_boot"][0].macs == calls["register_pxe_boot"][0].macs
-        # Teardown first (Ironic lets go), then the PXE map, THEN the lock:
-        # after the release another run may map the same MACs. (The last
-        # release is the installed server's, once server-scan shows it.)
-        watched = {"teardown_bmh_resources", "unregister_pxe_boot", "release_server"}
+        # Teardown first (Ironic lets go), then the PXE map, the maintenance,
+        # THEN the lock: after the release another run may map the same MACs.
+        watched = {
+            "teardown_bmh_resources",
+            "unregister_pxe_boot",
+            "put_server_in_maintenance",
+            "release_server",
+        }
         assert [name for name in calls["order"] if name in watched] == [
             "teardown_bmh_resources",
             "unregister_pxe_boot",
-            "release_server",
+            "put_server_in_maintenance",
             "release_server",
         ]
-        assert [r.server_name for r in calls["release_server"]] == [blade.name, SERVER_NAME]
+        assert [r.server_name for r in calls["release_server"]] == [blade.name]
 
     async def test_a_redfish_server_rolled_back_never_touches_the_pxe_map(self):
         doomed = bondable_server("srv_doomed", name="ocp-doomed", mac_prefix="11:22:33:44:55")
         calls, segment_acts, server_acts = make_mock_activities(
-            candidates=[doomed, bondable_server()], agent_never_for={"ocp-doomed"}
+            candidates=[doomed], agent_never_for={"ocp-doomed"}
         )
         async with _Harness(segment_acts, server_acts) as client:
-            await _execute(client, AddServerToMceRunArgs(input=INPUT))
+            with pytest.raises(WorkflowFailureError):
+                await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
         assert [t.server_name for t in calls["teardown_bmh_resources"]] == ["ocp-doomed"]
         assert calls["unregister_pxe_boot"] == []
@@ -1748,14 +1884,15 @@ class TestThePxeMapIsCleanedOnRollback:
         """Another run holds the machine now and may have mapped the same MACs."""
         blade = ucs_server()
         calls, segment_acts, server_acts = make_mock_activities(
-            candidates=[blade, bondable_server()], lock_lapses_for={blade.name}
+            candidates=[blade], lock_lapses_for={blade.name}
         )
         async with _Harness(segment_acts, server_acts) as client:
-            result = await _execute(client, AddServerToMceRunArgs(input=INPUT))
+            with pytest.raises(WorkflowFailureError) as excinfo:
+                await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
-        assert result.server_name == SERVER_NAME
+        assert _application_error(excinfo.value).type == "ServerReservedError"
         assert [t.server_name for t in calls["teardown_bmh_resources"]] == [blade.name]
-        assert calls["unregister_pxe_boot"] == []
+        assert calls["unregister_pxe_boot"] == calls["release_server"] == []
 
     async def test_an_installed_blade_keeps_its_mapping(self):
         calls, segment_acts, server_acts = make_mock_activities(candidates=[ucs_server()])
@@ -1764,6 +1901,67 @@ class TestThePxeMapIsCleanedOnRollback:
 
         assert result.pxe_registered is True
         assert calls["unregister_pxe_boot"] == []
+
+
+class TestAServerWithNoAgentGoesIntoMaintenance:
+    """No Agent within the hour: the server goes into maintenance in server-scan,
+    THEN its lock goes back (the operator, 2026-11-17) — so no run draws a
+    machine that cannot boot into the InfraEnv again until a person has looked."""
+
+    async def test_the_next_run_on_the_pool_is_given_another_server(self):
+        doomed = bondable_server("srv_doomed", name="ocp-doomed", mac_prefix="11:22:33:44:55")
+        calls, segment_acts, server_acts = make_mock_activities(
+            candidates=[doomed, bondable_server()], agent_never_for={"ocp-doomed"}
+        )
+        args = AddServerToMceRunArgs(input=INPUT)
+        async with _Harness(segment_acts, server_acts) as client:
+            with pytest.raises(WorkflowFailureError):
+                await _execute_as(client, args, "add-server-to-mce-pool_1")
+            second = await _execute_as(client, args, "add-server-to-mce-pool_2")
+
+        # Its lock was released, yet server-scan hands it out no more.
+        assert [r.server_id for r in calls["release_server"]][0] == "srv_doomed"
+        assert second.server_name == SERVER_NAME
+        [maintenance] = calls["put_server_in_maintenance"]
+        assert maintenance.server_name == "ocp-doomed"
+        # The reason says which run, where, and where the host's state points.
+        assert "add-server-to-mce run add-server-to-mce-pool_1" in maintenance.reason
+        assert f"InfraEnv {NAMESPACE}/{INFRA_ENV} on {MCE_CLUSTER}" in maintenance.reason
+        assert "no Agent in 60 min" in maintenance.reason
+        assert maintenance.reason.endswith("End the maintenance once the cause is fixed")
+        assert len(maintenance.reason) <= 500
+
+    async def test_refused_by_server_scan_the_lock_is_kept_instead(self):
+        """Not drawn again at once all the same: the lock expires at its TTL."""
+        calls, segment_acts, server_acts = make_mock_activities(
+            agent_never_for={SERVER_NAME},
+            maintenance_error=ServerScanAuthError("needs the ADMIN role"),
+        )
+        async with _Harness(segment_acts, server_acts) as client:
+            with pytest.raises(WorkflowFailureError) as excinfo:
+                await _execute(client, AddServerToMceRunArgs(input=INPUT))
+
+        error = _application_error(excinfo.value)
+        # Still the run's own failure, not the maintenance's.
+        assert error.type == "AgentNeverAppearedError"
+        assert error.message.endswith(
+            "Its lock is kept until it expires, because server-scan would not put it in "
+            "maintenance (ServerScanAuthError)"
+        )
+        assert len(calls["put_server_in_maintenance"]) == 1  # permanent: once
+        assert calls["release_server"] == []
+        assert len(calls["teardown_bmh_resources"]) == 1
+
+    async def test_a_server_server_scan_no_longer_knows_is_released_as_before(self):
+        calls, segment_acts, server_acts = make_mock_activities(
+            agent_never_for={SERVER_NAME}, maintenance_gone=True
+        )
+        async with _Harness(segment_acts, server_acts) as client:
+            with pytest.raises(WorkflowFailureError) as excinfo:
+                await _execute(client, AddServerToMceRunArgs(input=INPUT))
+
+        assert _application_error(excinfo.value).message.endswith("Its lock was given back")
+        assert len(calls["release_server"]) == 1
 
 
 # --- allow_unhealthy (hidden; CLAUDE.md §4) ------------------------------------
@@ -2196,19 +2394,19 @@ class TestAnOlderLimbsInUseRefusal:
             assert calls[kind] == [], kind
         assert [r.server_name for r in calls["release_server"]] == [blade.name]
 
-    async def test_a_pool_candidate_in_use_is_skipped_for_the_next(self):
+    async def test_a_pool_server_in_use_is_given_back_and_fails_the_run(self):
         busy = bondable_server("srv_busy", name="ocp-busy", mac_prefix="11:22:33:44:55")
         calls, segment_acts, server_acts = make_mock_activities(
             candidates=[busy, bondable_server()], in_use={"ocp-busy": _IN_USE}
         )
         async with _Harness(segment_acts, server_acts) as client:
-            result = await _execute(client, AddServerToMceRunArgs(input=INPUT))
+            with pytest.raises(WorkflowFailureError) as excinfo:
+                await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
-        assert result.server_name == SERVER_NAME
-        assert result.attempts == 1
-        # The busy one's straight back; the installed one's once server-scan shows it.
-        assert [r.server_name for r in calls["release_server"]] == ["ocp-busy", SERVER_NAME]
-        assert [c.server_name for c in calls["create_bmc_secret"]] == [SERVER_NAME]
+        assert _IN_USE in str(_application_error(excinfo.value))
+        # Straight back, nothing written; no second server is tried.
+        assert [r.server_name for r in calls["release_server"]] == ["ocp-busy"]
+        assert calls["create_bmc_secret"] == []
 
     async def test_a_pool_all_in_use_fails_with_each_sign(self):
         busy = bondable_server("srv_busy", name="ocp-busy", mac_prefix="11:22:33:44:55")
@@ -2478,15 +2676,16 @@ class TestACancelRollsTheInstallBack:
             workflows=[AddServerToMceWorkflow, InstallServerWorkflow], data_converter=pydantic_data_converter,
         ).replay_workflow(history)
 
-    async def test_cancelled_while_locking_the_lock_that_still_lands_is_released(self):
+    async def test_cancelled_while_checking_the_allocated_server_its_lock_is_released(self):
+        # Allocated = locked for this run, before anything is written for it.
         gate = asyncio.Event()
-        calls, segment_acts, server_acts = make_mock_activities(reserve_gate=gate)
+        calls, segment_acts, server_acts = make_mock_activities(probe_gate=gate)
         async with _Harness(segment_acts, server_acts) as client:
             handle = await _start(client, AddServerToMceRunArgs(input=INPUT))
-            await _until_phase(handle, "reserving-server")
+            await _until_phase(handle, "selecting-server")
             await handle.cancel()
-            # The run took the cancel and waits for calls in flight to land;
-            # the lock call the cancel cut off lands now, after it.
+            # The run took the cancel and waits for calls in flight to land
+            # before it gives the lock back.
             await _until_phase(handle, "cancel-settling")
             gate.set()
             await asyncio.sleep(0.2)
@@ -2498,7 +2697,9 @@ class TestACancelRollsTheInstallBack:
         assert [r.server_name for r in calls["release_server"]] == [SERVER_NAME]
         assert progress.phase == "cancelled" and "install lock released" in (progress.cancel_rollback or "")
 
-    async def test_cancelled_before_any_lock_there_is_nothing_to_undo(self):
+    async def test_cancelled_while_server_scan_allocates_the_lock_is_left_to_expire(self):
+        """A cancel stops waiting for the allocation, not the allocation: server-scan may
+        still lock a server for this run, which the run never learns — its TTL frees it."""
         gate = asyncio.Event()
         calls, segment_acts, server_acts = make_mock_activities(acquire_gate=gate)
         async with _Harness(segment_acts, server_acts) as client:
@@ -2510,7 +2711,42 @@ class TestACancelRollsTheInstallBack:
             progress = await _cancelled(handle)
 
         assert calls["reserve_server"] == [] and calls["release_server"] == []
-        assert progress.phase == "cancelled" and "nothing to undo" in (progress.cancel_rollback or "")
+        assert progress.phase == "cancelled"
+        assert "nothing known to undo" in (progress.cancel_rollback or "")
+        assert "frees itself when its lock expires (120 min)" in (progress.cancel_rollback or "")
+
+    async def test_cancelled_while_locking_a_named_server_the_lock_that_still_lands_is_released(self):
+        """The run's own lock call — a named server's leftover lock, re-taken — cut off
+        by the cancel: it lands after the cancel, and is released all the same."""
+        gate = asyncio.Event()
+        server = bondable_server()
+        calls, segment_acts, server_acts = make_mock_activities(
+            reserve_gate=gate,
+            record=scan_record(
+                server, health=_FINE,
+                lock=ServerLockRecord(live=True, holder="add-server-to-mce", workflow_id="add-server-to-mce-own"),
+            ),
+            # server-scan's allocation refuses a locked server even to its holder.
+            acquire_error=ServerNotAvailableError(
+                f"server-scan could not allocate a server (name={SERVER_NAME!r}): RESERVED"
+            ),
+        )
+        named = INPUT.model_copy(update={"server_name": SERVER_NAME})
+        async with _Harness(segment_acts, server_acts) as client:
+            handle = await client.start_workflow(
+                AddServerToMceWorkflow.run, AddServerToMceRunArgs(input=named),
+                id="add-server-to-mce-own", task_queue=ADD_SERVER_TO_MCE_WORKFLOW_QUEUE,
+            )
+            await _until_phase(handle, "reserving-server")
+            await handle.cancel()
+            await _until_phase(handle, "cancel-settling")
+            gate.set()
+            await asyncio.sleep(0.2)
+            progress = await _cancelled(handle)
+
+        assert calls["create_bmc_secret"] == []
+        assert [r.server_name for r in calls["release_server"]] == [SERVER_NAME]
+        assert progress.phase == "cancelled" and "install lock released" in (progress.cancel_rollback or "")
 
     async def test_cancelled_after_the_agent_the_server_stays_installed(self):
         calls, segment_acts, server_acts = make_mock_activities(scan_states=["AVAILABLE"])

@@ -33,6 +33,7 @@ from shared.models.server_lifecycle import (
     AgentRelease,
     AgentReleaseRequest,
     AgentState,
+    AllocateServerRequest,
     BmhRef,
     BmhResourceRequest,
     BmhState,
@@ -72,6 +73,8 @@ from shared.models.server_lifecycle import (
     ReserveServerRequest,
     ScaleDownCandidates,
     ScaleDownCandidatesRequest,
+    ServerMaintenance,
+    ServerMaintenanceRequest,
     ServerMembership,
     ServerMembershipRequest,
     ServerReservation,
@@ -81,24 +84,45 @@ from shared.models.server_lifecycle import (
 
 @activity.defn
 async def acquire_servers(request: AcquireServerRequest) -> list[AcquiredServer]:
-    """Ask server-scan for assignable candidates (GET /servers/available).
+    """Ask server-scan for assignable candidates (GET /servers/available) — runs recorded before allocation.
 
     Returns up to `request.count` servers that server-scan considers
     installable: unclaimed by any cluster, not in maintenance, reachable, and
     at the requested health. It returns a LIST even in `name` mode (one item),
-    because the workflow's bond selection may reject a candidate and move to
-    the next — drawing several at once is what makes one unusable server a
-    retry rather than a failed run.
-
-    The health filter is applied server-side rather than here: without it the
-    endpoint fills HEALTHY then WARNING then MAJOR, and a WARNING server would
-    be returned — and live-rechecked, at a vendor manager's expense — only to
-    be discarded.
+    because such a run's bond selection may reject a candidate and move to
+    the next. Read from server-scan's stored data, unlocked: since its
+    ADR-0063 the GET rechecks nothing and takes `max_health` (`request.health`
+    is sent as that), and a run started since allocates with allocate_server.
 
     Raises ServerNotAvailableError (404, nothing assignable matched),
-    AmbiguousServerNameError (409, the name spans several documents) or
-    ServerScanAuthError (401/403) — all deterministic and marked non-retryable
-    by the workflow; anything else is transient ServerScanError.
+    AmbiguousServerNameError (409, the name spans several documents),
+    ServerScanRequestInvalidError (400/422) or ServerScanAuthError (401/403) —
+    all deterministic and marked non-retryable by the workflow; anything else
+    is transient ServerScanError.
+    """
+    ...
+
+
+@activity.defn
+async def allocate_server(request: AllocateServerRequest) -> AcquiredServer:
+    """Take ONE server for this run (POST /servers/available, server-scan ADR-0063).
+
+    server-scan draws a candidate matching the pattern (or the one named),
+    LOCKS it as `request.holder` + `request.workflow_id` for
+    `request.ttl_seconds`, live-rechecks it against its vendor manager while
+    locked, and returns it; a candidate failing the check is released and the
+    next tried, up to its own cap. So the server returned is already held.
+
+    NOT idempotent: server-scan matches a lock to its request by a per-request
+    token, so a retry after a lost answer takes ANOTHER server, the first one
+    freeing itself at the TTL; a named retry is refused (`RESERVED`) and the
+    workflow recognises its own lock (lookup_install_candidate). Several
+    minutes at worst (each candidate's live check): heartbeats while it waits.
+
+    Raises ServerNotAvailableError (503 NO_AVAILABLE_SERVER — nothing could be
+    reserved, `details.reasons` named), AmbiguousServerNameError (409),
+    ServerScanRequestInvalidError (400/422) or ServerScanAuthError (401/403 —
+    the POST needs the ADMIN role); anything else is transient ServerScanError.
     """
     ...
 
@@ -165,6 +189,25 @@ async def release_server(request: ReleaseServerRequest) -> ServerReservation:
 
     Raises ServerScanAuthError / ServerScanRequestInvalidError (non-retryable);
     anything else is transient ServerScanError.
+    """
+    ...
+
+
+@activity.defn
+async def put_server_in_maintenance(request: ServerMaintenanceRequest) -> ServerMaintenance:
+    """Put one server in maintenance in server-scan, so no draw hands it out.
+
+    add-server-to-mce's, for a server that produced no Agent within the hour,
+    BEFORE it gives the install lock back: server-scan's allocation skips a
+    server in maintenance until a person ends it there. Idempotent — a second
+    PUT only updates the reason — and read back: the answer must show
+    maintenance enabled. A server server-scan no longer knows (404) answers
+    enabled=False with `detail`, never a failure.
+
+    Raises ServerScanAuthError (401/403 — the token lacks the ADMIN role) or
+    ServerScanRequestInvalidError (400/422); both non-retryable. A 409 (a lost
+    revision race with another write on the document) and anything else is
+    transient ServerScanError.
     """
     ...
 

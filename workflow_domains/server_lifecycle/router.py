@@ -49,6 +49,7 @@ from shared.models.server_lifecycle import (
     PublishInfraEnvToPxeServerRunArgs,
     RemoveServerFromMceInput,
     RemoveServerFromMceRunArgs,
+    ScaleDownPolicy,
     UninstallServerFromHcInput,
     UninstallServerFromHcRunArgs,
     UpdateNodePoolInput,
@@ -828,16 +829,27 @@ async def start_publish_infraenv_to_pxe_server(
 
 
 # A day1 cluster file's name, which is also its Argo CD Application's: a DNS
-# subdomain, as upgrade-cluster's routes take it. An InfraEnv kind is the start
-# of a Kubernetes name the same way.
+# subdomain, as upgrade-cluster's routes take it. A NodePool's name the same way.
 _KUBERNETES_NAME = r"^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$"
+
+
+def _refuse_infra_env_kind(data: Any) -> Any:
+    """`infra_env_kind` was removed on 2026-11-18 (the operator: "no need infraenv
+    kind"): a run sets ONE NodePool. A caller still sending it is told what to
+    send instead, whatever its value. Runs recorded with it still replay."""
+    if isinstance(data, dict) and "infra_env_kind" in data:
+        raise ValueError(
+            "`infra_env_kind` was removed: name the NodePool with `nodepool` — `replicas` is then "
+            "that NodePool's own"
+        )
+    return data
 
 
 class UpdateNodePoolRequest(UpdateNodePoolInput):
     """The update-nodepool request body: strict at the edge, the MCE canonicalised here.
 
-    Exactly one target: `infra_env_kind` (a total spread over that kind's
-    NodePools) or `nodepool` (one NodePool, set exactly). Both or neither is a 422.
+    ONE NodePool, by name, always. `scale_down_policy` and `server_names` are
+    read only if the run scales down, and at most one of them is sent.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -853,27 +865,38 @@ class UpdateNodePoolRequest(UpdateNodePoolInput):
     replicas: int = Field(
         ge=0,
         description=(
-            "0 allowed. With `infra_env_kind`: the TOTAL over the cluster's NodePools of the kind, spread "
-            "so no two are more than one replica apart. With `nodepool`: that NodePool's replicas, set "
-            "exactly — the other NodePools are left as they are."
+            "That NodePool's replicas, set exactly — the other NodePools are left as they are. 0 allowed."
         ),
     )
-    infra_env_kind: str | None = Field(
-        default=None,
+    nodepool: str = Field(
         pattern=_KUBERNETES_NAME,
-        description=(
-            "The InfraEnv kind: a NodePool is of it when the InfraEnv its agentLabelSelector names "
-            "is exactly this, or this followed by `-` (`<kind>-zone-a`, …). Or send `nodepool` instead."
-        ),
+        description="One NodePool of the cluster, by name (`oc get nodepool -n <hc namespace>`).",
     )
-    nodepool: str | None = Field(
+    scale_down_policy: ScaleDownPolicy | None = Field(
         default=None,
-        pattern=_KUBERNETES_NAME,
         description=(
-            "One NodePool of the cluster, by name (`oc get nodepool -n <hc namespace>`): `replicas` is "
-            "then its own, and no balance rule applies. Or send `infra_env_kind` instead."
+            "Scale-down only: rank the NodePool's servers by this and remove the first — "
+            "`fewest-pods`, `least-requested` or `least-utilized`. Ahead of the NodePool's own "
+            "`redbull.io/scale-down-policy`; with neither, CAPI picks. Ignored when the NodePool scales "
+            "up. Not with `server_names`."
         ),
     )
+    server_names: _ServerName | _ServerNameList | None = Field(
+        default=None,
+        description=(
+            "Scale-down only: exactly the servers that leave (server-scan names, one or a list), as many "
+            "as the replicas removed, each a Machine of the NodePool. They are marked first, then the "
+            "NodePool is scaled down. Ignored when the NodePool scales up. Not with `scale_down_policy`."
+        ),
+    )
+    # Retired on 2026-11-18: a 422 when sent (_refuse_infra_env_kind), out of
+    # the schema. Kept on UpdateNodePoolInput for the runs recorded with it.
+    infra_env_kind: SkipJsonSchema[None] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _retired_fields(cls, data: Any) -> Any:
+        return _refuse_infra_env_kind(data)
 
     @field_validator("mce_cluster")
     @classmethod
@@ -882,12 +905,25 @@ class UpdateNodePoolRequest(UpdateNodePoolInput):
         compared with the MCE folder day1 keeps the cluster in."""
         return canonical_mce_cluster(value)
 
+    @field_validator("server_names", mode="before")
+    @classmethod
+    def _one_name_or_a_list(cls, value: Any) -> Any:
+        return _check_server_names(value, empty_hint="; omit it to let a policy or CAPI pick")
+
+    @field_validator("server_names")
+    @classmethod
+    def _a_list_each_server_once(cls, names: str | list[str] | None) -> list[str] | None:
+        """One name is a list of one: the run's input is always a list. Each
+        once, case-insensitively — a server's Machine is matched lowercased."""
+        if isinstance(names, str):
+            return [names]
+        return _check_each_server_once(names)
+
     @model_validator(mode="after")
-    def _one_target(self) -> UpdateNodePoolRequest:
-        if (self.nodepool is None) == (self.infra_env_kind is None):
+    def _one_way_to_pick(self) -> UpdateNodePoolRequest:
+        if self.scale_down_policy is not None and self.server_names:
             raise ValueError(
-                "send exactly one of `nodepool` (that NodePool's replicas) and `infra_env_kind` "
-                "(a total over the kind's NodePools)"
+                "send `scale_down_policy` OR `server_names`: both say which servers leave a scale-down"
             )
         return self
 
@@ -908,15 +944,15 @@ async def start_update_nodepool(
     update_request: UpdateNodePoolRequest,
     client: Client = Depends(get_temporal_client),
 ) -> StartWorkflowResponse:
-    """Set how many workers a hosted cluster runs, by InfraEnv kind or on one NodePool — returns immediately (202).
+    """Set how many workers one NodePool of a hosted cluster runs — returns immediately (202).
 
-    Reads the cluster's NodePools of the kind — or the one named — in day1 and
-    on the MCE (they must agree). By kind, `replicas` is a total spread within
-    one replica of each other; by `nodepool`, that NodePool's own number, set
-    exactly. Commits that to day1 `main` and syncs the cluster's Argo CD Application. On
-    a scale-down, a NodePool labelled or annotated `redbull.io/scale-down-policy`
-    has the servers that leave chosen by that policy and marked first; without
-    one, CAPI picks.
+    Reads the NodePool in day1 and on the MCE (they must agree), commits its
+    new `replicas` to day1 `main` and syncs the cluster's Argo CD Application.
+    On a scale-down the servers that leave are, in this order: the
+    `server_names` sent (exactly as many as the replicas removed), else those
+    a policy ranks first — `scale_down_policy`, else the NodePool's own
+    `redbull.io/scale-down-policy` label or annotation — marked before the
+    push; with neither, CAPI picks. A scale-up ignores both fields.
 
     Poll GET /workflows/runs/{workflow_id}. One run per cluster at a time (409
     while one runs), and none while an upgrade-cluster run of the cluster is

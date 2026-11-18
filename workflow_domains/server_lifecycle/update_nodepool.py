@@ -1,16 +1,25 @@
-"""update-nodepool — set how many workers a hosted cluster runs: by InfraEnv kind, or on one NodePool.
+"""update-nodepool — set how many workers one NodePool of a hosted cluster runs.
 
-The request names the MCE, the cluster (its day1 file), the replicas wanted
-and EXACTLY ONE target:
+The request names the MCE, the cluster (its day1 file), the NodePool and its
+replicas, set EXACTLY as asked whatever its siblings hold: no balance rule
+(the operator, 2026-11-08). Only the cluster's OWN NodePools count — never
+the rest of the MCE.
 
-  * `infra_env_kind` — the replicas are the TOTAL over the cluster's
-    NodePools of that kind, spread so no two are more than one apart. A
-    NodePool is of kind K when the InfraEnv its agentLabelSelector names is
-    `K` or `K-<anything>` (`K-zone-a`, …);
-  * `nodepool` — the replicas are that ONE NodePool's, set EXACTLY as asked,
-    whatever its siblings hold: no balance rule (the operator, 2026-11-08).
+For a scale-down it may also name HOW the servers that leave are picked —
+at most one of (the operator, 2026-11-18):
 
-Only the cluster's OWN NodePools count — never the rest of the MCE.
+  * `scale_down_policy` — ranked by it, ahead of the NodePool's own
+    `redbull.io/scale-down-policy`;
+  * `server_names` — exactly those, as many as the replicas removed.
+
+A run that scales up or changes nothing ignores both, and lists them in its
+result's `ignored` — never a failure.
+
+A run recorded before 2026-11-18 may name an `infra_env_kind` instead of
+the NodePool (the API no longer takes one, the operator: "no need infraenv
+kind"); it still runs as it began: the replicas are the TOTAL over the
+cluster's NodePools of that kind — the InfraEnv its agentLabelSelector names
+is `K` or `K-<anything>` — spread so no two are more than one apart.
 
 Replicas are owned by the day1 file and changed only here (decided with the
 operator, 2026-11-03): the change is a commit to day1 `main`, which Argo CD
@@ -23,25 +32,30 @@ Phases:
                           the request's), blob, HostedCluster, and every
                           NodePool's replicas and InfraEnv. A file with
                           `problems` is refused.
-  2. reading-nodepools  — the HostedCluster's NodePools on the MCE: the kind's,
-                          selected by their matchLabel, or the one named. Live and git must agree
-                          BOTH ways — same NodePools, InfraEnvs and replicas —
-                          else NodePoolReplicasDriftError, nothing written. A
-                          named NodePool on neither side is NodePoolNotFoundError.
-  3. planning           — by kind: NodePools more than one replica apart are
-                          refused (NodePoolsUnbalancedError) and
-                          nodepool_replicas.plan spreads the new total; by
-                          name: the one NodePool takes the number asked. Already
-                          so completes with direction `none`.
+  2. reading-nodepools  — the HostedCluster's NodePools on the MCE: the one
+                          named (a recorded run: the kind's, by their
+                          matchLabel). Live and git must agree BOTH ways —
+                          same NodePools, InfraEnvs and replicas — else
+                          NodePoolReplicasDriftError, nothing written. A named
+                          NodePool on neither side is NodePoolNotFoundError.
+  3. planning           — the NodePool takes the number asked (a recorded run
+                          by kind: NodePools more than one replica apart are
+                          refused, NodePoolsUnbalancedError, and
+                          nodepool_replicas.plan spreads the new total).
+                          Already so completes with direction `none`. A
+                          scale-down's `server_names` must count the replicas
+                          removed (ScaleDownServersInvalidError, nothing
+                          written); its `scale_down_policy` goes on the
+                          shrinking NodePool's plan.
   4. scaling-up / scaling-down — the child of that direction, awaited, on its
                           own id and queue (ABANDON on close: it writes git and
                           marks Machines in an order that must not be cut).
 
-A re-run RESUMES: when day1 already holds what was asked — a balanced plan for
-the total, or the named NodePool's number — but the MCE does not show it yet (a
-child that committed and never synced), the run hands that plan to the child
-instead of failing on the difference: its commit is then a no-op and it
-carries on from the sync.
+A re-run RESUMES: when day1 already holds what was asked — the named
+NodePool's number, or a balanced plan for a recorded run's total — but the
+MCE does not show it yet (a child that committed and never synced), the run
+hands that plan to the child instead of failing on the difference: its commit
+is then a no-op and it carries on from the sync.
 """
 
 from __future__ import annotations
@@ -60,6 +74,7 @@ with workflow.unsafe.imports_passed_through():
         NodePoolReplicasDriftError,
         NodePoolsUnbalancedError,
         NodePoolTargetInvalidError,
+        ScaleDownServersInvalidError,
         ScaleNodePoolAlreadyRunningError,
         ScaleNodePoolFailedError,
     )
@@ -116,6 +131,12 @@ class UpdateNodePoolWorkflow:
                 "`infra_env_kind` (a total over that kind's NodePools); nothing was read",
                 NodePoolTargetInvalidError,
             )
+        if request.scale_down_policy is not None and request.server_names:
+            raise _fail(
+                "`scale_down_policy` and `server_names` both say which servers leave a scale-down: send "
+                "one of them; nothing was read",
+                ScaleDownServersInvalidError,
+            )
 
         self._phase = "reading-day1"
         day1: Day1Cluster = await nodepool_scaling.on_mce(
@@ -139,6 +160,9 @@ class UpdateNodePoolWorkflow:
 
         self._phase = "planning"
         changes = self._plan(request, live, git)
+        down = any(np.after < np.before for np in changes)
+        if down:
+            changes = self._how_servers_leave(request, changes)
         result = UpdateNodePoolResult(
             mce_cluster=request.mce_cluster,
             cluster=request.cluster,
@@ -151,13 +175,13 @@ class UpdateNodePoolWorkflow:
             total_before=sum(np.before for np in changes),
             total_after=sum(np.after for np in changes),
             nodepools=changes,
+            ignored=[] if down else self._ignored(request, changes),
         )
         if all(np.before == np.after for np in changes):
             self._direction = "none"
             self._phase = "completed"
             return result
 
-        down = any(np.after < np.before for np in changes)
         self._direction = result.direction = "down" if down else "up"
         plan = NodePoolScalePlan(
             mce_cluster=request.mce_cluster,
@@ -168,6 +192,7 @@ class UpdateNodePoolWorkflow:
             hosted_cluster=result.hosted_cluster,
             hosted_cluster_namespace=result.hosted_cluster_namespace,
             nodepools=changes,
+            server_names=list(request.server_names or []) if down else [],
         )
         result.child_workflow_id = self._child = (
             scale_down_nodepool_workflow_id(request.cluster) if down else scale_up_nodepool_workflow_id(request.cluster)
@@ -316,6 +341,55 @@ class UpdateNodePoolWorkflow:
             [(name, git[name].infra_env or "", counts[name]) for name in names], request.replicas
         )
         return [change(name, counts[name], planned[name]) for name in names]
+
+    def _how_servers_leave(
+        self, request: UpdateNodePoolInput, changes: list[NodePoolReplicasChange]
+    ) -> list[NodePoolReplicasChange]:
+        """A scale-down's plan, with what the request says about the servers that leave.
+
+        `server_names` must be as many as the replicas removed — checked here,
+        before the child starts; which Machine each one is, the child checks.
+        A named scale-down ranks nothing, so the shrinking NodePool carries no
+        policy; otherwise the request's `scale_down_policy` goes ahead of the
+        NodePool's own. Neither (every recorded run): the plan as it was.
+        """
+        shrinking = [np for np in changes if np.after < np.before]
+        if request.server_names:
+            removed = sum(np.before - np.after for np in shrinking)
+            if len(request.server_names) != removed:
+                raise _fail(
+                    f"{', '.join(f'{np.name} goes from {np.before} to {np.after}' for np in shrinking)}, so "
+                    f"{removed} server(s) leave; `server_names` names {len(request.server_names)} "
+                    f"({', '.join(request.server_names)}). Name exactly the servers that leave; nothing was "
+                    "written",
+                    ScaleDownServersInvalidError,
+                )
+            policy = None
+        elif request.scale_down_policy is not None:
+            policy = request.scale_down_policy.value
+        else:
+            return changes
+        return [
+            np.model_copy(update={"scale_down_policy": policy}) if np.after < np.before else np
+            for np in changes
+        ]
+
+    def _ignored(self, request: UpdateNodePoolInput, changes: list[NodePoolReplicasChange]) -> list[str]:
+        """What the request said about a scale-down that is not one: noted, never refused."""
+        if all(np.before == np.after for np in changes):
+            why = "nothing scales down, the replicas are already " + ", ".join(
+                f"{np.name} {np.after}" for np in changes
+            )
+        else:
+            why = "the NodePool scales up"
+        ignored = []
+        if request.scale_down_policy is not None:
+            ignored.append(f"scale_down_policy {request.scale_down_policy.value}: {why}")
+        if request.server_names:
+            ignored.append(f"server_names {', '.join(request.server_names)}: {why}")
+        if ignored:
+            workflow.logger.info("update-nodepool %s ignores %s", request.cluster, "; ".join(ignored))
+        return ignored
 
     async def _scale(self, plan: NodePoolScalePlan, down: bool, child_id: str) -> NodePoolScaleResult:
         """The child of this direction, awaited on its own id and queue."""

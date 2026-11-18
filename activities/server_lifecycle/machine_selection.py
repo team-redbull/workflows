@@ -34,6 +34,12 @@ The shapes, from the code that writes them:
     rules); one that has finished (Succeeded / Failed) holds nothing.
   * A Pod's request is what the scheduler counts: the larger of its containers'
     sum and its largest init container, plus its overhead.
+  * Which SERVER a Machine is (for a scale-down that names its servers): the
+    Machine's infrastructureRef names its AgentMachine, whose `status.agentRef`
+    names the Agent (cluster-api-provider-agent); BMAC labels that Agent
+    `agent-install.openshift.io/bmh: <BareMetalHost>`, and add-server-to-mce
+    names the BareMetalHost, the Agent's hostname and so the Node after the
+    server, lowercased (bmh_resources.build_baremetal_host).
 """
 
 from __future__ import annotations
@@ -43,7 +49,8 @@ from typing import Any
 
 from kubernetes.utils.quantity import parse_quantity
 
-from activities.server_lifecycle.hosted_resources import node_ready, pod_to_evict
+from activities.server_lifecycle.bmh_resources import AGENT_BMH_LABEL
+from activities.server_lifecycle.hosted_resources import agent_hostname, node_ready, pod_to_evict
 from shared.models.server_lifecycle import ScaleDownMachine
 
 NODEPOOL_ANNOTATION = "hypershift.openshift.io/nodePool"
@@ -102,6 +109,29 @@ def capi_healthy(machine: dict[str, Any]) -> bool:
             if condition.get("status") == "False":
                 return False
     return True
+
+
+def agent_ref(agent_machine: dict[str, Any] | None) -> tuple[str, str] | None:
+    """(namespace, name) of the Agent an AgentMachine's `status.agentRef` names, once it has one."""
+    ref = ((agent_machine or {}).get("status") or {}).get("agentRef") or {}
+    if ref.get("namespace") and ref.get("name"):
+        return ref["namespace"], ref["name"]
+    return None
+
+
+def machine_server(machine: dict[str, Any], agent: dict[str, Any] | None) -> str | None:
+    """The server a Machine is, lowercased: its Agent's BareMetalHost, else hostname, else its Node.
+
+    None when none of the three can be read — a Machine still provisioning,
+    whose AgentMachine has no Agent yet.
+    """
+    if agent is not None:
+        bmh = ((_metadata(agent).get("labels")) or {}).get(AGENT_BMH_LABEL)
+        found = bmh or agent_hostname(agent)
+        if found:
+            return str(found).lower()
+    node = machine_node(machine)
+    return node.lower() if node else None
 
 
 def machine_set(machine: dict[str, Any]) -> str | None:

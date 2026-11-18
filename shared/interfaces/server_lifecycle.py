@@ -861,13 +861,21 @@ async def read_scale_down_candidates(request: ScaleDownCandidatesRequest) -> Sca
     unschedulable and allocatable, the Pods on it — the workload ones a drain
     would move, and every running Pod's requests — and, only for a
     `least-utilized` NodePool, the Node's live use from `metrics.k8s.io`.
+    The hosted cluster is read only when some NodePool has a policy: a
+    scale-down that names its servers ranks nothing.
+
+    `with_servers`: also the server each Machine is (`server`, lowercased) —
+    its infrastructureRef's AgentMachine, that one's `status.agentRef` Agent,
+    and the Agent's `agent-install.openshift.io/bmh` label, else its hostname,
+    else the Machine's Node; None when none can be read.
 
     Returns data, never a decision. Raises HostedClusterUnreachableError
     (retried) and HostedClusterAccessError (non-retryable) as
     check_hosted_node; NodeMetricsUnavailableError (non-retryable) when a
     `least-utilized` NodePool's cluster serves no metrics API, and
     NodeMetricsPendingError (retried) for a Node with no metrics yet. Needs
-    list on machines.cluster.x-k8s.io.
+    list on machines.cluster.x-k8s.io; `with_servers` get on agentmachines
+    and on agents in the Agent's namespace (an InfraEnv namespace).
     """
     ...
 

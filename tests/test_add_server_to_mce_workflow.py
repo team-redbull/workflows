@@ -692,8 +692,10 @@ def make_mock_activities(
 class _FakeRemoveServerFromMce:
     """remove-server-from-mce as a cancelled install's rollback meets it.
 
-    It takes the host out (found, powered off, lock released) — except a server
-    whose name says `nowhere`, which it finds nothing of on the MCE.
+    It takes the host out (found, powered off) and releases no lock, as since
+    2026-11-17 — except a server whose name says `nowhere`, which it finds
+    nothing of on the MCE; `oldchild`, which releases the lock as a child from
+    before did; and `pxefail`, whose PXE cleanup fails.
     """
 
     @workflow.run
@@ -702,7 +704,10 @@ class _FakeRemoveServerFromMce:
         found = "nowhere" not in request.server_name
         return RemoveServerFromMceResult(
             server_name=request.server_name, namespace=request.namespace,
-            mce_cluster=request.mce_cluster, found=found, powered_off=found, lock_released=found,
+            mce_cluster=request.mce_cluster, found=found, powered_off=found,
+            lock_released=found and "oldchild" in request.server_name,
+            pxe_failed=["bat-yam: PxeMapAuthError: check PXE_MAP_TOKEN"]
+            if "pxefail" in request.server_name else [],
         )
 
 
@@ -2669,8 +2674,12 @@ class TestACancelRollsTheInstallBack:
         assert removal is not None and removal.found and removal.mce_cluster == MCE_CLUSTER
         assert (progress.phase, progress.server_name) == ("cancelled", SERVER_NAME)
         assert "taken out of the MCE by remove-server-from-mce-" in (progress.cancel_rollback or "")
-        # The child did the whole job, the lock included: nothing doubled here.
-        assert calls["teardown_bmh_resources"] == [] and calls["release_server"] == []
+        assert (progress.cancel_rollback or "").endswith("; install lock released")
+        # The child did the removal; the lock, which the child leaves to its holder, here.
+        assert calls["teardown_bmh_resources"] == []
+        assert [(r.server_name, r.holder) for r in calls["release_server"]] == [
+            (SERVER_NAME, "add-server-to-mce")
+        ]
         # The cancel path replays as recorded.
         await Replayer(
             workflows=[AddServerToMceWorkflow, InstallServerWorkflow], data_converter=pydantic_data_converter,
@@ -2759,6 +2768,31 @@ class TestACancelRollsTheInstallBack:
 
         assert removal is None and calls["teardown_bmh_resources"] == [] and calls["release_server"] == []
         assert progress.phase == "cancelled" and "is installed and stays" in (progress.cancel_rollback or "")
+
+    async def test_a_failed_pxe_cleanup_in_the_child_keeps_the_lock(self):
+        # Its MACs may still chain to this MCE's discovery image.
+        server = ucs_server(name="ocp-cisco-m6-bat-yam-64c-512gb-pxefail")
+        calls, segment_acts, server_acts = make_mock_activities(candidates=[server], agent_never_for={server.name})
+        async with _Harness(segment_acts, server_acts) as client:
+            handle = await _start(client, AddServerToMceRunArgs(input=INPUT))
+            await _until_phase(handle, "awaiting-agent")
+            await handle.cancel()
+            progress = await _cancelled(handle)
+
+        assert calls["release_server"] == []
+        assert "lock kept: the PXE cleanup failed" in (progress.cancel_rollback or "")
+
+    async def test_a_child_from_before_that_released_the_lock_is_not_doubled(self):
+        server = ucs_server(name="ocp-cisco-m6-bat-yam-64c-512gb-oldchild")
+        calls, segment_acts, server_acts = make_mock_activities(candidates=[server], agent_never_for={server.name})
+        async with _Harness(segment_acts, server_acts) as client:
+            handle = await _start(client, AddServerToMceRunArgs(input=INPUT))
+            await _until_phase(handle, "awaiting-agent")
+            await handle.cancel()
+            progress = await _cancelled(handle)
+
+        assert calls["release_server"] == []
+        assert (progress.cancel_rollback or "").endswith(f"taken out of the MCE by remove-server-from-mce-{server.name.lower()}")
 
     async def test_a_blade_the_child_finds_nowhere_has_its_pxe_mapping_and_lock_undone_here(self):
         blade = ucs_server(name="ocp-cisco-m6-bat-yam-64c-512gb-nowhere")

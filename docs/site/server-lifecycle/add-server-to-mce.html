@@ -180,9 +180,10 @@
         waits for exactly that (phase <b>awaiting-server-scan</b>): once server-scan shows S1
         <code>INSTALLED_TO_INVENTORY</code> or <code>INSTALLED</code> it hides S1 from every draw itself,
         so the run gives the lock back (phase <b>releasing-lock</b>; the operator, 2026-11-09).</p>
-        <p class="note">Taken out of MCE-A within that day, S1 gets its lock back early:
-        remove-server-from-mce releases add-server-to-mce&rsquo;s lock for <em>its</em> MCE once nothing of S1 is left there and its PXE cleanup did not fail (the operator&rsquo;s decision,
-        2026-10-31). Another MCE&rsquo;s lock it leaves alone.</p>
+        <p class="note">remove-server-from-mce does <b>not</b> give this lock back (it did from 2026-10-31
+        until the operator removed that on 2026-11-17): a lock is its holder&rsquo;s. Taken out of MCE-A
+        before server-scan reported it, S1 stays locked until this run sees server-scan report it, or the
+        lock expires.</p>
       </div>
       <div class="panel">
         <h3>Who checks what</h3>
@@ -217,13 +218,13 @@
           <tr><td>The allocated server fails a check</td><td class="muted">Gives it back and fails, saying which check</td><td class="muted">released at once</td></tr>
           <tr><td>The Agent appears</td><td class="muted">Installed; then waits (up to 24 h, server-scan read every 5 min) for server-scan to show it <code>INSTALLED_TO_INVENTORY</code> / <code>INSTALLED</code>, and completes</td><td class="muted">held 24 h, then <b>released</b> as soon as server-scan shows it installed (<code>lock_released: true</code>)</td></tr>
           <tr><td>server-scan never shows it installed within the 24 h, cannot be read, or names another MCE</td><td class="muted"><b>Completes</b> all the same &mdash; the Agent proved the install; <code>lock_detail</code> says why</td><td class="muted">kept, expires on its own (<code>lock_released: false</code>)</td></tr>
-          <tr><td>The server is removed from this MCE within that day (remove-server-from-mce)</td><td class="muted">&mdash;</td><td class="muted">released by remove-server-from-mce once nothing of it is left on the MCE and its PXE cleanup did not fail; otherwise it runs to expiry</td></tr>
+          <tr><td>The server is removed from this MCE within that day (remove-server-from-mce)</td><td class="muted">&mdash;</td><td class="muted">runs until this run sees server-scan report the server, or to expiry: remove-server-from-mce releases no lock since 2026-11-17</td></tr>
           <tr><td>No Agent within 1 h</td><td class="muted">Deletes the server&rsquo;s resources, puts it <b>in maintenance</b> in server-scan (so no run draws it again until someone ends that), then fails (<code>AgentNeverAppearedError</code>)</td><td class="muted">released once it is in maintenance; <b>kept</b> to expire (2 h) if server-scan refuses the maintenance</td></tr>
           <tr><td>The lock lapsed mid-install and another run took the machine</td><td class="muted">Deletes <em>its own</em> resources, then fails (<code>ServerReservedError</code>)</td><td class="muted">the other run&rsquo;s, untouched</td></tr>
           <tr><td>An operator cancels it while server-scan is still allocating</td><td class="muted">Ends CANCELED; it never learns which server server-scan may still lock for it</td><td class="muted">that one expires on its own (2 h)</td></tr>
           <tr><td>The allocation&rsquo;s answer is lost and it is retried (a worker died mid-call)</td><td class="muted">The retry is allocated <em>another</em> server: server-scan matches a lock to the request that took it</td><td class="muted">the first one expires on its own (2 h)</td></tr>
           <tr><td>The run crashes or fails while creating resources (e.g. <code>BmhConflictError</code>)</td><td class="muted">Stops; resources are <b>left</b> on the MCE</td><td class="muted">expires after 2 h; a re-run of the same named install extends it</td></tr>
-          <tr><td>An operator <b>cancels</b> the run before the Agent</td><td class="muted"><b>Rolls back</b> the server being installed (since 2026-11-09), then ends CANCELED: waits 2 min for a call already sent to land, then &mdash; anything written on the MCE &mdash; runs <b>remove-server-from-mce</b> for it (powered off, BareMetalHost, NMStateConfig and any Agent deleted, PXE MACs cleared, verified); nothing written &mdash; removes an IPMI PXE mapping itself. <code>progress.cancel_rollback</code> says what was done</td><td class="muted">released (by remove-server-from-mce, or here)</td></tr>
+          <tr><td>An operator <b>cancels</b> the run before the Agent</td><td class="muted"><b>Rolls back</b> the server being installed (since 2026-11-09), then ends CANCELED: waits 2 min for a call already sent to land, then &mdash; anything written on the MCE &mdash; runs <b>remove-server-from-mce</b> for it (powered off, BareMetalHost, NMStateConfig and any Agent deleted, PXE MACs cleared, verified); nothing written &mdash; removes an IPMI PXE mapping itself. <code>progress.cancel_rollback</code> says what was done</td><td class="muted">released here, after remove-server-from-mce when it ran (which releases no lock since 2026-11-17); kept to expiry when its PXE cleanup failed</td></tr>
           <tr><td>An operator cancels it after the Agent (waiting for server-scan)</td><td class="muted">Stops waiting, ends CANCELED; the server <b>stays installed</b></td><td class="muted">kept, expires on its own</td></tr>
           <tr><td>An operator <b>terminates</b> the run</td><td class="muted">Stops at once, no code runs: <b>nothing is rolled back</b>, resources are left. Use Cancel to roll back</td><td class="muted">expires on its own</td></tr>
           <tr><td>No worker is running in that MCE</td><td class="muted">Waits; the <code>progress</code> query names the unserved queue</td><td class="muted">&mdash;</td></tr>

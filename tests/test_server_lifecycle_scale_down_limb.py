@@ -68,6 +68,12 @@ def _machine(name: str, nodepool: str = "np-a", *, node: str | None = None, mark
     return {"metadata": metadata, "status": {"nodeRef": {"name": node}} if node else {}}
 
 
+def _agent(name: str, *, bmh: str | None = None, hostname: str | None = None) -> dict:
+    labels = {"agent-install.openshift.io/bmh": bmh} if bmh else {}
+    return {"metadata": {"name": name, "namespace": "inventory", "labels": labels},
+            "spec": {"hostname": hostname} if hostname else {}}
+
+
 def _node(name: str, *, ready: bool = True, unschedulable: bool = False, cpu: str = "8", memory: str = "32Gi") -> dict:
     return {
         "metadata": {"name": name},
@@ -154,20 +160,46 @@ class TestTheReadings:
         assert machine_selection.mark_patch("7", None)["metadata"]["annotations"] == {
             machine_selection.DELETE_MACHINE_ANNOTATION: None}
 
+    @pytest.mark.parametrize(
+        ("agent", "node", "server"),
+        [
+            # BMAC's link to the BareMetalHost add-server-to-mce named after the server.
+            (_agent("a1", bmh="ocp-r660-hp0001592", hostname="other"), "n1", "ocp-r660-hp0001592"),
+            (_agent("a1", hostname="OCP-R660-HP0001592"), "n1", "ocp-r660-hp0001592"),
+            (_agent("a1"), "ocp-r660-hp0001592", "ocp-r660-hp0001592"),
+            (None, "ocp-r660-hp0001592", "ocp-r660-hp0001592"),
+            (None, None, None),  # still provisioning: nothing says which server yet
+        ],
+    )
+    def test_the_server_a_machine_is(self, agent, node, server):
+        assert machine_selection.machine_server(_machine("m1", node=node), agent) == server
+
+    def test_the_agent_an_agent_machine_names(self):
+        assert machine_selection.agent_ref({"status": {"agentRef": {"namespace": "inventory", "name": "a1"}}}) == (
+            "inventory", "a1")
+        assert machine_selection.agent_ref({"status": {}}) is None and machine_selection.agent_ref(None) is None
+
 
 # --- the activities, against a fake MCE ---------------------------------------------------
 
 
 class _FakeMce:
-    def __init__(self, machines: list[dict]) -> None:
+    def __init__(self, machines: list[dict], *, agent_machines=None, agents=None) -> None:
         self.machines = {m["metadata"]["name"]: m for m in machines}
         self.patches: list[tuple[str, dict]] = []
         self.hosted = {"metadata": {"namespace": HC_NS, "name": HC},
                        "status": {"kubeconfig": {"name": "alpha-admin-kubeconfig"}}}
+        # AgentMachines in the control-plane namespace, Agents in the InfraEnv's.
+        self.agent_machines = {(HCP, am["metadata"]["name"]): am for am in (agent_machines or [])}
+        self.agents = {("inventory", a["metadata"]["name"]): a for a in (agents or [])}
 
     async def read_custom_object(self, *, plural, namespace, name, **_):
         if plural == "hostedclusters":
             return self.hosted if (namespace, name) == (HC_NS, HC) else None
+        if plural == "agentmachines":
+            return self.agent_machines.get((namespace, name))
+        if plural == "agents":
+            return self.agents.get((namespace, name))
         assert (plural, namespace) == ("machines", HCP)
         return self.machines.get(name)
 
@@ -267,6 +299,45 @@ class TestTheCandidates:
         hosted([_node("n1", ready=False)], [], metrics=[])
         machines = (await activities.read_scale_down_candidates(_candidates_request(ScaleDownPolicy.LEAST_UTILIZED))).machines
         assert len(machines) == 2
+
+    async def test_named_servers_read_each_machines_server_and_not_the_hosted_cluster(self, mce, monkeypatch):
+        """`server_names` (2026-11-18): Machine -> AgentMachine -> Agent -> its BareMetalHost; nothing ranks."""
+        def _with_agent_machine(machine: dict, agent_machine: str) -> dict:
+            machine["spec"] = {"infrastructureRef": {"kind": "AgentMachine", "name": agent_machine}}
+            return machine
+
+        mce(_FakeMce(
+            [
+                _with_agent_machine(_machine("m1", node="n1"), "am1"),
+                _with_agent_machine(_machine("m2"), "am2"),  # no Node yet, its Agent says
+                _machine("m3", node="ocp-r660-3"),  # no AgentMachine to follow: its Node
+            ],
+            agent_machines=[
+                {"metadata": {"name": "am1"}, "status": {"agentRef": {"namespace": "inventory", "name": "a1"}}},
+                {"metadata": {"name": "am2"}, "status": {"agentRef": {"namespace": "inventory", "name": "a2"}}},
+            ],
+            agents=[_agent("a1", bmh="ocp-r660-1"), _agent("a2", hostname="OCP-R660-2")],
+        ))
+
+        async def _no_hosted_read(*_args, **_kwargs):
+            raise AssertionError("a named scale-down ranks nothing: the hosted cluster is not read")
+
+        monkeypatch.setattr(hosted_cluster_api, "read_scale_down_objects", _no_hosted_read)
+        candidates = await activities.read_scale_down_candidates(ScaleDownCandidatesRequest(
+            hosted_cluster_namespace=HC_NS, hosted_cluster=HC,
+            nodepools=[ScaleDownNodePoolRef(name="np-a")], with_servers=True,
+        ))
+        assert {m.name: m.server for m in candidates.machines} == {
+            "m1": "ocp-r660-1", "m2": "ocp-r660-2", "m3": "ocp-r660-3",
+        }
+        # The brain refuses a candidate list without the key, so it is always sent.
+        assert '"server"' in candidates.model_dump_json()
+
+    async def test_a_policy_read_names_no_server(self, mce, hosted):
+        mce(_FakeMce([_machine("m1", node="n1")]))
+        hosted([_node("n1")], [])
+        candidates = await activities.read_scale_down_candidates(_candidates_request())
+        assert candidates.machines[0].server is None and '"server":null' in candidates.model_dump_json()
 
 
 class TestTheMark:

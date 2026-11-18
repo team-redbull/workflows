@@ -106,7 +106,7 @@
             <div class="call sm"><span class="verb">GET</span><span class="path">/servers?search=&lt;name&gt; <em>&middot; server-scan, confirmed by exact name</em></span></div>
           </div>
           <p class="note">Any of the three may be missing. <b>None of them found</b>: the run completes here
-          with <code>found: false</code> &mdash; no PXE cleanup and no lock read, because nothing then ties the
+          with <code>found: false</code> &mdash; no PXE cleanup, because nothing then ties the
           machine&rsquo;s MACs to this MCE.</p>
         </div>
       </div>
@@ -255,29 +255,6 @@
         </div>
       </div>
 
-      <!-- 8 -->
-      <div class="step">
-        <div class="marker">8</div>
-        <div class="card">
-          <div class="card-title">
-            <h3>lookup_server_membership &middot; release_server</h3>
-            <span class="phase">phase <b>releasing-server</b></span>
-          </div>
-          <p>Nothing of the host is left on this MCE, so add-server-to-mce&rsquo;s day-long hold on it for
-          <b>this</b> MCE protects nothing any more. The run reads server-scan&rsquo;s install lock and gives
-          it back &mdash; but only when it is that lock (<a href="#lock">the rules</a>). The machine can then
-          be drawn again at once. The operator&rsquo;s decision, 2026-10-31.</p>
-          <div class="calls">
-            <div class="call sm"><span class="verb">GET</span><span class="path">/servers?search=&lt;name&gt; &middot; /servers/{id} <em>&middot; the lock</em></span></div>
-            <div class="call sm"><span class="verb">DELETE</span><span class="path">/servers/{id}/reservation <em>&middot; {holder, workflow_id} as read</em></span></div>
-          </div>
-          <p class="note"><b>Never fails the run</b> &mdash; the removal is done, and the lock expires on its
-          own. <code>lock_released</code> and <code>lock_detail</code> say what was found. Skipped entirely
-          (not even read) when the PXE cleanup failed: the host&rsquo;s MACs may still chain to this
-          MCE&rsquo;s discovery image, so the hold stays.</p>
-        </div>
-      </div>
-
       <!-- done -->
       <div class="step done">
         <div class="marker">&#10003;</div>
@@ -288,8 +265,9 @@
           </div>
           <p><code>found</code>, <code>powered_off</code> (false when there was no BMH to power off through),
           <code>agents_removed</code>, <code>resources_removed</code>, <code>pxe_cleared</code>,
-          <code>pxe_kept</code>, <code>pxe_failed</code>, <code>lock_released</code> and
-          <code>lock_detail</code> &mdash; <a href="#api">example below</a>.</p>
+          <code>pxe_kept</code> and <code>pxe_failed</code> &mdash; <a href="#api">example below</a>.
+          <code>lock_released</code> / <code>lock_detail</code> stay <code>false</code> / <code>null</code>:
+          no lock is touched (<a href="#lock">below</a>).</p>
         </div>
       </div>
 
@@ -312,8 +290,7 @@
           <li>the NMStateConfig <code>nmstate-config-&lt;server&gt;</code>;</li>
           <li>every <b>unbound</b> Agent of the host;</li>
           <li>the host&rsquo;s MACs on its own site&rsquo;s PXE VM, where they chain to this MCE (best
-            effort);</li>
-          <li>add-server-to-mce&rsquo;s install lock in server-scan, when it is for this MCE.</li>
+            effort).</li>
         </ul>
       </div>
       <div class="panel">
@@ -324,9 +301,9 @@
             which every other host of the InfraEnv chains through;</li>
           <li>a MAC on the PXE VM that chains to <b>another</b> MCE (<code>pxe_kept</code>);</li>
           <li>PXE VMs of other sites;</li>
-          <li>another MCE&rsquo;s lock, uninstall-server-from-hc&rsquo;s lock, and any other holder&rsquo;s;</li>
-          <li>everything when nothing of the server is on the MCE (<code>found: false</code>): no PXE write,
-            no lock read;</li>
+          <li>server-scan&rsquo;s install lock, whoever holds it &mdash; never read, never released;</li>
+          <li>everything when nothing of the server is on the MCE (<code>found: false</code>): no PXE
+            write;</li>
           <li>hosted clusters, Machines, Nodes and NodePools &mdash; never read or written.</li>
         </ul>
       </div>
@@ -337,14 +314,19 @@
   <section id="lock">
     <div class="sec-head">
       <div class="eyebrow">server-scan&rsquo;s install lock</div>
-      <h2>Which lock is given back, and which is not</h2>
-      <p class="lede">add-server-to-mce holds its lock after a success until server-scan sees the machine
-      installed &mdash; its run releases it then (since 2026-11-09), or the lock expires after a day. A
-      machine removed before that used to stay undrawable for the rest of the hold.
-      Now this run releases that lock &mdash; and only that one. It releases with the holder and workflow id
-      it just read, so server-scan compares and deletes exactly that lock.</p>
+      <h2>No lock is released here &mdash; it is its holder&rsquo;s</h2>
+      <p class="lede">Since 2026-11-17 (the operator) the run ends at its check and never reads
+      server-scan&rsquo;s install lock. Each caller holding one gives it back itself after this run:
+      <a href="/server-lifecycle/uninstall-server-from-hc.html">uninstall-server-from-hc</a> releases its
+      own once this run, its child, completes, and a <b>cancelled</b>
+      <a href="/server-lifecycle/add-server-to-mce.html">add-server-to-mce</a> releases its own in its
+      rollback &mdash; both keep it when the PXE cleanup failed. add-server-to-mce&rsquo;s hold after a
+      successful install already ends once server-scan sees the machine (5&ndash;15 min). A removal started
+      on its own leaves any lock to its expiry.</p>
     </div>
 
+    <p class="note">From 2026-10-31 to 2026-11-17 the run released add-server-to-mce&rsquo;s lock for this
+    MCE itself (phase <b>releasing-server</b>). A run started in that window still does, by these rules:</p>
     <div class="table-scroll">
       <table>
         <thead><tr><th>what the run finds</th><th>what it does</th><th><code>lock_detail</code> starts with</th></tr></thead>
@@ -384,7 +366,7 @@
         <tbody>
           <tr><td class="k">AgentBoundToClusterError</td><td class="muted">An Agent of the host is bound to a cluster &mdash; found at <code>inspecting</code>, or bound since and caught by the re-check right before the power-off. Nothing was changed. Remove the server from that cluster first (uninstall-server-from-hc does both).</td></tr>
           <tr><td class="k">HostPowerOffTimeoutError</td><td class="muted">The BMH did not report <code>poweredOn: false</code> within 10 min. It is left with <code>online: false</code>; nothing was deleted. Usually an unreachable BMC: check it, then re-run.</td></tr>
-          <tr><td class="k">ServerScanAuthError</td><td class="muted">server-scan rejected the worker&rsquo;s token during the inspection, which reads server-scan&rsquo;s MACs. (At <code>releasing-server</code> the same error is only recorded in <code>lock_detail</code>.)</td></tr>
+          <tr><td class="k">ServerScanAuthError</td><td class="muted">server-scan rejected the worker&rsquo;s token during the inspection, which reads server-scan&rsquo;s MACs.</td></tr>
           <tr><td class="k">InvalidServerNameError</td><td class="muted">The server name cannot be a Kubernetes resource name, even lowercased.</td></tr>
           <tr><td class="k">BmhPrerequisiteMissingError</td><td class="muted">The MCE refused a read or the power-off with 403 (the worker&rsquo;s ServiceAccount lacks the verb) or a 404 meaning the resource type is not installed. Fix the worker&rsquo;s RBAC or the MCE, then re-run.</td></tr>
         </tbody>
@@ -419,8 +401,6 @@
         <ul>
           <li><b>The PXE cleanup</b>: every failure goes into <code>pxe_failed</code>, and the run completes.
             A PXE VM unreachable for 10 min is given up on.</li>
-          <li><b>The lock release</b>: every refusal goes into <code>lock_detail</code>, with
-            <code>lock_released: false</code>; the lock then expires on its own.</li>
         </ul>
       </div>
     </div>
@@ -528,13 +508,12 @@
     "pxe_cleared": [ "bat-yam/0025b5000001", "bat-yam/0025b5000002" ],
     "pxe_kept":    [],                            <span class="c">// MACs that chain to another MCE</span>
     "pxe_failed":  [],                            <span class="c">// why the PXE cleanup could not be done</span>
-    "lock_released": true,
-    "lock_detail": "released 'add-server-to-mce' (run '…', MCE 'ocp4-mce-bat-yam-01')"
+    "lock_released": false,                       <span class="c">// no lock is touched since 2026-11-17</span>
+    "lock_detail": null
   }
 }</pre>
           <p class="note">Run as uninstall-server-from-hc&rsquo;s child, this whole result is embedded in the
-          parent&rsquo;s result as <code>remove_server</code>, and <code>lock_detail</code> reads
-          <code>left to uninstall-server-from-hc: &hellip;</code>.</p>
+          parent&rsquo;s result as <code>remove_server</code>.</p>
         </div>
       </div>
 
@@ -572,7 +551,7 @@
           <tr><td class="k">removing-agent</td><td class="muted">The Agents, each re-checked unbound &mdash; only with Agents</td><td class="muted">seconds</td></tr>
           <tr><td class="k">removing-pxe-boot</td><td class="muted">The host&rsquo;s MACs off its own site&rsquo;s PXE VM &mdash; only with known MACs; best effort</td><td class="muted">&le; 10 min per call</td></tr>
           <tr><td class="k">verifying</td><td class="muted">Re-inspect every 10 s until nothing is left</td><td class="muted">&le; 5 min</td></tr>
-          <tr><td class="k">releasing-server</td><td class="muted">server-scan&rsquo;s lock, released only when it is add-server-to-mce&rsquo;s for this MCE; skipped after a PXE failure</td><td class="muted">seconds</td></tr>
+          <tr><td class="k">releasing-server</td><td class="muted">Only on a run started 2026-10-31 &ndash; 2026-11-17: server-scan&rsquo;s lock, released when it is add-server-to-mce&rsquo;s for this MCE</td><td class="muted">seconds</td></tr>
           <tr><td class="k">completed</td><td class="muted">Nothing of the server is left on the MCE (or nothing was there)</td><td class="muted">&mdash;</td></tr>
         </tbody>
       </table>
@@ -601,18 +580,19 @@
     </div>
 
     <h3 style="margin:28px 0 10px">Runs recorded before a change</h3>
-    <p class="note">Three changes are gated so runs already in flight replay unchanged:
+    <p class="note">Four changes are gated so runs already in flight replay unchanged:
     <code>remove-server-pxe-cleanup</code> (before it, no PXE cleanup),
     <code>remove-server-pxe-own-site</code> (before it, every PXE VM the worker knows was swept, and the first
-    refusal failed the run) and <code>remove-server-release-own-mce-lock</code> (before it, the run ended at
-    <code>verifying</code> and left the lock to its expiry).</p>
+    refusal failed the run), <code>remove-server-release-own-mce-lock</code> (from it, the run released
+    add-server-to-mce&rsquo;s lock for this MCE after <code>verifying</code>) and
+    <code>remove-server-no-lock-release</code> (from it, it no longer does).</p>
 
     <h3 style="margin:28px 0 10px">What it never does</h3>
     <ul>
       <li>No removal of a bound Agent, and no power-off under a cluster &mdash; refused, nothing changed.</li>
       <li>No hosted-cluster work &mdash; that is <a href="/server-lifecycle/uninstall-server-from-hc.html">uninstall-server-from-hc</a>&rsquo;s.</li>
       <li>No removal of the InfraEnv&rsquo;s shared boot entry, or of another MCE&rsquo;s PXE entry.</li>
-      <li>No release of a lock that is not add-server-to-mce&rsquo;s for this MCE.</li>
+      <li>No read or release of server-scan&rsquo;s install lock &mdash; it is its holder&rsquo;s.</li>
       <li>No undo &mdash; a failure leaves everything as it is, and a re-run carries on.</li>
     </ul>
   </section>

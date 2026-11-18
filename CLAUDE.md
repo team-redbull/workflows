@@ -359,9 +359,9 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   `lock_released` / `server_scan_state` / `lock_detail` on the result. The run
   stays RUNNING meanwhile (~5-15 min: server-scan's agents and nodes jobs run every 5 min,
   matching an Agent by its serial, else its hostname — the BMH's server name), so its slot and a named server's id are
-  busy until then. The server leaving the MCE first — remove-server-from-mce then releases
-  it (the operator's decision, 2026-10-31, below); add-server-to-mce otherwise
-  releases it ONLY after a teardown — after the no-Agent one, once the server is
+  busy until then. The server leaving the MCE first does NOT free it: remove-server-from-mce
+  released it from 2026-10-31 until the operator removed that on 2026-11-17 (below);
+  add-server-to-mce otherwise releases it ONLY after a teardown — after the no-Agent one, once the server is
   in maintenance (above) — (a failure elsewhere leaves it to its
   TTL, since half-created resources may still name the machine). A RE-RUN of the
   same named install (same workflow id) after such a failure meets its own lock:
@@ -389,10 +389,12 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   So the rollback first waits `_CANCEL_SETTLE` (one attempt's budget + 30 s),
   then: anything possibly written on the MCE → remove-server-from-mce as an
   awaited child (ABANDON), exactly as uninstall-server-from-hc's inventory half —
-  power off, BMH + NMStateConfig, any Agent, its PXE MACs, verification, and
-  add-server-to-mce's lock for this MCE — never reimplemented here; when the
-  child finds nothing on the MCE, or nothing was written, an IPMI mapping is
-  unmapped and the lock released here. After the Agent (`_installed`) a cancel
+  power off, BMH + NMStateConfig, any Agent, its PXE MACs, verification —
+  never reimplemented here, then the lock released HERE unless the child's
+  `pxe_failed` is set (gated `add-server-cancel-releases-after-removal`, since the
+  child releases no lock from 2026-11-17; a child that still did, `lock_released`,
+  is not released twice); when the child finds nothing on the MCE, or nothing
+  was written, an IPMI mapping is unmapped and the lock released here. After the Agent (`_installed`) a cancel
   undoes NOTHING: the server stays, the wait for server-scan just stops (the
   operator's choice). Before any lock there is nothing to undo. The rollback
   never raises — a failing step is named in `progress.cancel_rollback` — and
@@ -518,18 +520,18 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   found NOWHERE on the MCE touches the PXE map neither (nothing ties its MACs
   to this MCE). The InfraEnv's boot entry is shared and never removed. An OLD
   pxe-map-api ignores `?mce_cluster` and deletes unconditionally — upgrade the
-  PXE VMs first. LAST, server-scan's install lock (`releasing-server`, gated
-  `remove-server-release-own-mce-lock`; the operator's decision, 2026-10-31 —
-  a server removed the day it was installed stayed undrawable for the rest of
-  add-server-to-mce's day-long hold): once nothing is left and `pxe_failed` is
-  empty, the lock is read (`lookup_server_membership`, which returns `lock`
-  now — read by the key's presence, §5) and released with the holder +
-  workflow id read, so server-scan compares and deletes exactly that lock —
-  ONLY when it is live, `add-server-to-mce`'s and for THIS MCE (canonical names).
-  Left alone: another MCE's, `uninstall-server-from-hc`'s (its run releases its own
-  after this child completes — never raced), any other holder's; not read at
-  all on found=false or a PXE failure. Never fails the run: `lock_released`,
-  `lock_detail`. Needs `delete` on agents in the limb's RBAC.
+  PXE VMs first. It ENDS AT THE CHECK and NEVER reads or releases server-scan's
+  install lock — a lock is its holder's (the operator, 2026-11-17: "isn't
+  necessary"; do not re-add it). Each caller holding one releases its own after
+  this run: uninstall-server-from-hc once its child completed, a cancelled
+  add-server-to-mce in its rollback; add-server-to-mce's day-long hold already ends
+  once server-scan sees the install (2026-11-09). Gated `remove-server-no-lock-release`:
+  a run recorded with `remove-server-release-own-mce-lock` (2026-10-31 — a server
+  removed the day it was installed stayed undrawable for the rest of that hold) and
+  not the new patch still ends with `releasing-server`: the lock read
+  (`lookup_server_membership`) and released ONLY when live, `add-server-to-mce`'s
+  and for THIS MCE, never on found=false or a PXE failure, never failing the run
+  (`lock_released`, `lock_detail`). Needs `delete` on agents in the limb's RBAC.
 - **uninstall-server-from-hc takes ONE server all the way out of an MCE, whatever its
   Agent's state** (`workflow_domains/server_lifecycle/uninstall_server_from_hc.py`, own
   queue `uninstall-server-from-hc-workflow`, id `uninstall-server-from-hc-<server lowercased>`,
@@ -579,8 +581,7 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   `NotHostedClusterNodeError` (an ORPHAN binding into a control plane is a
   leftover, next bullet), server-scan INSTALLED naming another cluster or
   INSTALLED_TO_INVENTORY while bound — an unbound Agent contradicts no
-  INSTALLED reading, a re-run's normal view) → `reserving-server` ALWAYS →
-  `marking-agent` (the label, below) → the
+  INSTALLED reading, a re-run's normal view) → `reserving-server` ALWAYS → the
   hosted half: `deleting-machine` (`ensure_machine_deleting`, the one write the
   NORMAL path makes, a no-op when it already has a deletionTimestamp or is gone) →
   `awaiting-machine-deletion` (30 s polls of Machine + Agent: `draining` while the
@@ -608,24 +609,17 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   AgentMachines the run started from (`HostAgent.labelled_agent_machine`,
   `AgentBindingState.agent_machine`, both gated on key presence) and stops with
   `AgentRetakenError`; `release_agent` refuses an Agent whose labelled
-  AgentMachine a live Machine holds (`AgentBindingChangedError`). So, right after
-  the lock and before any other write, the run LABELS every Agent of the server
-  `redbull.io/uninstalling: "true"` (the operator, 2026-11-12: "be sure the server is
-  out of the cluster and the inventory"; `marking-agent`, `mark_agents_uninstalling`,
-  `UNINSTALLING_AGENT_LABEL`, gated `uninstall-server-mark-agents-uninstalling`; never on
-  an old keep_inventory run, which stays a free Agent). A NodePool whose
-  agentLabelSelector carries `matchExpressions: [{key: redbull.io/uninstalling,
-  operator: DoesNotExist}]` then never takes it back — the provider applies the
-  selector only when it picks a FREE Agent (`isValidAgent` + the selector in
-  `findAgent`), so the node runs until its Machine goes. The label goes with the
-  Agent (remove-server-from-mce deletes it; a re-install is a new Agent without it),
-  a failed run leaves it for the re-run (its message names the `oc label … -`
-  that takes it off), and a NodePool WITHOUT the expression still ends in
-  `AgentRetakenError`. Approval was rejected as the mechanism: BMAC re-approves an
-  Agent on every reconcile. The NodePool half — the hostedclusters-setup chart
-  rendering that expression, per NodePool or for all — is NOT BUILT; adding it to a
-  live NodePool changes its template hash (a Replace NodePool rolls every node, an
-  InPlace one does not). THE LOCK even for an uninstall (holder
+  AgentMachine a live Machine holds (`AgentBindingChangedError`). THE RUN LABELS NO
+  AGENT — do not re-add it. From 2026-11-12 (the operator) it labelled every Agent
+  of the server `redbull.io/uninstalling: "true"` right after the lock
+  (`marking-agent`, `mark_agents_uninstalling`, `UNINSTALLING_AGENT_LABEL`, gated
+  `uninstall-server-mark-agents-uninstalling`), for a NodePool whose
+  agentLabelSelector excluded it — whose chart half was never built; the operator
+  removed the step on 2026-11-17 ("no need the step of the labeling the agent").
+  Gated `uninstall-server-no-agent-mark`: a run recorded in between still labels
+  (and its failures name the `oc label … -` that takes it off), so the activity,
+  its registration and the `patch` on agents stay until none can remain; the
+  `patch` also serves `release_agent`. THE LOCK even for an uninstall (holder
   `uninstall-server-from-hc`, TTL = two drains + unbind + three verifications + 10 min): the
   hosted cluster's nodes job frees the server on its Node's absence and the MCE's
   agents job re-claims it INSTALLED_TO_INVENTORY on its own 5-min cadence, so
@@ -714,41 +708,30 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   `update-nodepool-workflow`, id `update-nodepool-<cluster>` — per CLUSTER, not
   per kind: every kind shares one day1 file and one Argo CD Application — API
   `POST /workflows/server-lifecycle/update-nodepool` with `mce_cluster`
-  (canonicalised), `cluster` (the day1 file's name), `replicas` (the TOTAL, 0
-  allowed) and `infra_env_kind`; a 409 too while `upgrade-cluster-<cluster>` is
-  RUNNING, since a replicas commit under an upgrade stops it at its next
-  commit.) Designed with the operator 2026-11-03. The pieces that are
-  decisions:
-  - **Two targets, EXACTLY ONE per request** (a 422 otherwise; the workflow
-    guards it too, `NodePoolTargetInvalidError`): `infra_env_kind` — `replicas`
-    is a TOTAL spread over that kind's NodePools (below) — or `nodepool` (the
-    operator, 2026-11-08) — `replicas` is that ONE NodePool's, set EXACTLY, NO
-    balance rule, whatever its kind, the others untouched (a later run by kind
-    is then refused as unbalanced until they are evened out). A name on neither
-    side is `NodePoolNotFoundError`; on one side only, drift. Both fields are
-    optional on `UpdateNodePoolInput` (history), exactly-one on the request
-    model. Everything after the selection — drift, resume, the child, the
-    scale-down policy — is the same for both.
-  - **The KIND is the live NodePool's selector**:
-    `spec.platform.agent.agentLabelSelector.matchLabels["infraenvs.agent-install.openshift.io"]`
-    is `K`, or `K-` followed by ANYTHING (`nodepool_replicas.belongs_to_kind`).
-    Nothing after the dash is read and no zone label is assumed — so a shorter
-    kind takes the longer ones that start with it; the result lists what was
-    selected. ONLY the cluster's own NodePools (`upgrade_state.nodepools_of`,
-    by `spec.clusterName`), never the rest of the MCE. A kind exists on the
-    AGENT platform only: a KubeVirt NodePool (the sandbox's
-    `ocp4-upgrade-demo`, the only day1 cluster on GitHub with NodePools) has no
-    InfraEnv, so it is set by name.
-  - **Live and day1 must agree BOTH WAYS** (same NodePools, InfraEnvs, replicas)
+  (canonicalised), `cluster` (the day1 file's name), `nodepool` and `replicas`
+  (0 allowed), plus the optional scale-down fields below; a 409 too while
+  `upgrade-cluster-<cluster>` is RUNNING, since a replicas commit under an
+  upgrade stops it at its next commit.) Designed with the operator 2026-11-03.
+  The pieces that are decisions:
+  - **ONE NodePool, by name, ALWAYS** — `replicas` is that NodePool's own, set
+    EXACTLY, NO balance rule, whatever its kind or platform, the others
+    untouched (by name since 2026-11-08; the ONLY target since 2026-11-18, the
+    operator: "no need infraenv kind" — do not re-add the kind). `infra_env_kind`
+    (a TOTAL spread over the cluster's NodePools of one InfraEnv kind, the
+    selector's InfraEnv `K` or `K-*`, refused `NodePoolsUnbalancedError` when
+    already more than one apart, moved one replica at a time by
+    `nodepool_replicas.plan`) is a 422 at the edge (`_refuse_infra_env_kind`)
+    and stays optional on `UpdateNodePoolInput` and in the workflow ONLY so runs
+    recorded with it finish as they began (their goldens replay it); delete the
+    by-kind branch and `nodepool_replicas.py` once none is RUNNING. A name on
+    neither side is `NodePoolNotFoundError`; on one side only, drift. ONLY the
+    cluster's own NodePools (`upgrade_state.nodepools_of`, by
+    `spec.clusterName`), never the rest of the MCE.
+  - **Live and day1 must agree BOTH WAYS** (same NodePool, InfraEnv, replicas)
     or `NodePoolReplicasDriftError` with nothing written. The one exception is
-    the RESUME: day1 already holding a balanced plan for the requested total
-    while the MCE lags (a child that committed and never synced) goes to the
-    child, whose commit is then "already so".
-  - **No two NodePools of a kind more than ONE replica apart.** A start that
-    breaks it is REFUSED (`NodePoolsUnbalancedError`), never repaired. The new
-    total moves one replica at a time — up to the fewest, down from the most,
-    ties by InfraEnv then NodePool name (ascending up, descending down) — so a
-    scale never moves a NodePool the other way (`nodepool_replicas.plan`).
+    the RESUME: day1 already holding the number asked while the MCE lags (a
+    child that committed and never synced) goes to the child, whose commit is
+    then "already so".
   - **The change is ONE day1 commit, then an Argo CD sync — never a NodePool
     write.** The children, scale-up-nodepool / scale-down-nodepool (own queues,
     ids `scale-{up,down}-nodepool-<cluster>`, awaited, ABANDON, NO route):
@@ -759,12 +742,36 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
     `read_hosted_cluster` read back. DONE = the NodePools show the new
     `spec.replicas` — NOT new nodes Ready (the operator: "when it sees the
     nodepools in the MCE configured to the desired state").
-  - **Which servers leave a scale-down is the NodePool's, never the request's**:
-    a label OR annotation `redbull.io/scale-down-policy` — `fewest-pods`,
-    `least-requested` (pod requests / allocatable), `least-utilized`
-    (`metrics.k8s.io`; no API = `NodeMetricsUnavailableError`, a Node without
-    metrics yet is retried). Absent = nothing marked, CAPI picks at random;
-    unknown = `ScaleDownPolicyInvalidError`. The mechanism is CAPI's own
+  - **Which servers leave a scale-down — the REQUEST may say** (the operator,
+    2026-11-18, reversing 2026-11-03's "the NodePool's, never the request's"),
+    the first that applies: `server_names` — EXACTLY those, as many as the
+    replicas removed (the parent checks the count before the child starts),
+    each matched to its Machine by the limb (`read_scale_down_candidates
+    with_servers`: Machine → AgentMachine → `status.agentRef` Agent → its
+    `agent-install.openshift.io/bmh` label, else hostname, else Node,
+    lowercased — add-server-to-mce names all three after the server); else
+    `scale_down_policy`; else the NodePool's own label OR annotation
+    `redbull.io/scale-down-policy`; else nothing marked, CAPI picks at random.
+    Both request fields at once is a 422 (and `ScaleDownServersInvalidError` in
+    the workflow). Both fields are features for OpenShift clusters from version
+    4.19 on ONLY (the operator, 2026-11-18) — a DOCUMENTED limit, not enforced:
+    no code checks the cluster's version. A run that scales UP or changes nothing IGNORES both and
+    lists them in `result.ignored` — never a failure (the operator). Named
+    servers rank nothing, so the hosted cluster is not read; they are refused,
+    nothing written (`ScaleDownServersInvalidError`), for a wrong count, a
+    name twice, a server no Machine of the NodePool is (or two are), a worker
+    that sends no `server` key (gated on its presence), and an UNNAMED
+    CAPI-unhealthy Machine that sorts before a named one — 4.18's CAPI ties a
+    mark with unhealthy and takes the tied ones by name, so it would delete
+    that one instead (`scale_down_selection.server_refusal`;
+    `test_named_servers_that_pass_are_exactly_what_capi_removes` checks every
+    combination at 50, 75 and 80). Plans recorded before carry no
+    `server_names` and take the policy path unchanged. The policies:
+    `fewest-pods`, `least-requested` (pod requests / allocatable),
+    `least-utilized` (`metrics.k8s.io`; no API = `NodeMetricsUnavailableError`,
+    a Node without metrics yet is retried); the NodePool's own value unknown =
+    `ScaleDownPolicyInvalidError` (unless the request names servers or a
+    policy). The mechanism is CAPI's own
     `cluster.x-k8s.io/delete-machine` ANNOTATION (not a label — the CAPI book's
     scaling page says "label", its code and its annotations reference say
     annotation), value = the scale-down's workflow id, set and read back on the
@@ -782,7 +789,8 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
     NAME, then this run's own mark, then a Node our hosted read sees broken,
     then the policy — and `test_capi_removes_exactly_the_marked_machines_in_every_version`
     simulates CAPI's ranking at 50, 75 and 80 to prove the marked set IS what
-    CAPI removes. Do not reorder those tiers. The mark only orders Machines
+    CAPI removes. Do not reorder those tiers. (Named servers are not ranked:
+    their refusal above keeps the same promise.) The mark only orders Machines
     inside ONE MachineSet ("only affects MachineSet scale-down"), so a NodePool
     whose Machines span two MachineSets (a Replace rollout) is refused
     (`ScaleDownRolloutInProgressError`). Refused with nothing written too: a
@@ -798,7 +806,7 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
     three (`allowDeletion` / `maxReplicas` / `minReplicas`); the run still
     reads a label of the key, for one set by hand. The air-gapped GitLab copy
     renders no entry annotations until it gets the same change — annotate the
-    NodePool by hand there.
+    NodePool by hand there, or send `scale_down_policy`.
   - **`maxReplicas` / `minReplicas` are NOT the run's** (the operator,
     2026-11-08): the commit changes `replicas` only. Unwritten, the chart
     derives them from `replicas` on every render, so they follow; written in

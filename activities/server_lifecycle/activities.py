@@ -1828,9 +1828,21 @@ async def commit_day1_replicas(request: Day1ChangeRequest) -> Day1Commit:
     return commit
 
 
+async def _machine_agent(machine: dict) -> dict | None:
+    """The Agent behind a Machine: its infrastructureRef's AgentMachine, then that one's agentRef."""
+    ref = hosted_resources.machine_agent_machine(machine)
+    if ref is None:
+        return None
+    namespace, name = ref.split("/", 1)
+    agent = machine_selection.agent_ref(await _read_agent_machine(namespace, name))
+    if agent is None:
+        return None
+    return await _read(AGENT_GROUP, AGENT_VERSION, AGENT_PLURAL, _AGENT_KIND, agent[0], agent[1])
+
+
 @activity.defn
 async def read_scale_down_candidates(request: ScaleDownCandidatesRequest) -> ScaleDownCandidates:
-    """Every Machine of these NodePools, with what their policies rank by. Reads only."""
+    """Every Machine of these NodePools, with what their policies rank by — and the server each is. Reads only."""
     cluster = HostedClusterRef(
         namespace=request.hosted_cluster_namespace,
         name=request.hosted_cluster,
@@ -1840,27 +1852,36 @@ async def read_scale_down_candidates(request: ScaleDownCandidatesRequest) -> Sca
     )
     label = f"{cluster.namespace}/{cluster.name}"
     machines = await _machines_in(cluster.hcp_namespace)
-    kubeconfig = await _hosted_kubeconfig(cluster)
-    if kubeconfig is None:
-        raise HostedClusterAccessError(
-            f"HostedCluster {label} is not on this MCE, so its Nodes cannot be ranked"
+    # The hosted cluster's Nodes and Pods are what a POLICY ranks by; a
+    # scale-down that names its servers ranks nothing and does not read them.
+    nodes: dict = {}
+    pods: list[dict] = []
+    metrics = None
+    if any(np.policy is not None for np in request.nodepools):
+        kubeconfig = await _hosted_kubeconfig(cluster)
+        if kubeconfig is None:
+            raise HostedClusterAccessError(
+                f"HostedCluster {label} is not on this MCE, so its Nodes cannot be ranked"
+            )
+        with_metrics = any(np.policy is ScaleDownPolicy.LEAST_UTILIZED for np in request.nodepools)
+        objects = await hosted_cluster_api.read_scale_down_objects(
+            kubeconfig, hosted_cluster_api.kas_service_url(cluster.hcp_namespace), label, with_metrics
         )
-    with_metrics = any(np.policy is ScaleDownPolicy.LEAST_UTILIZED for np in request.nodepools)
-    objects = await hosted_cluster_api.read_scale_down_objects(
-        kubeconfig, hosted_cluster_api.kas_service_url(cluster.hcp_namespace), label, with_metrics
-    )
-    nodes = {(n.get("metadata") or {}).get("name"): n for n in objects["nodes"]}
-    metrics = (
-        None if objects["metrics"] is None
-        else {(m.get("metadata") or {}).get("name"): m for m in objects["metrics"]}
-    )
+        nodes = {(n.get("metadata") or {}).get("name"): n for n in objects["nodes"]}
+        pods = objects["pods"]
+        metrics = (
+            None if objects["metrics"] is None
+            else {(m.get("metadata") or {}).get("name"): m for m in objects["metrics"]}
+        )
     found = []
     for nodepool in request.nodepools:
         uses_metrics = nodepool.policy is ScaleDownPolicy.LEAST_UTILIZED
         for machine in machine_selection.machines_of(machines, f"{cluster.namespace}/{nodepool.name}"):
             state = machine_selection.candidate(
-                machine, nodepool.name, nodes, objects["pods"], metrics if uses_metrics else None
+                machine, nodepool.name, nodes, pods, metrics if uses_metrics else None
             )
+            if request.with_servers:
+                state.server = machine_selection.machine_server(machine, await _machine_agent(machine))
             # A Node with no Machine-side problem must be ranked by its use; one
             # with no metrics yet (it just joined) is waited for, not guessed.
             if uses_metrics and state.node_found and state.ready and not state.unschedulable and (
@@ -1875,7 +1896,7 @@ async def read_scale_down_candidates(request: ScaleDownCandidatesRequest) -> Sca
         "Scale-down candidates in %s: %s",
         label,
         [
-            f"{m.nodepool}/{m.name} node={m.node} ready={m.ready} pods={m.workload_pods} "
+            f"{m.nodepool}/{m.name} server={m.server} node={m.node} ready={m.ready} pods={m.workload_pods} "
             f"requested={m.requested_permille} used={m.used_permille} mark={m.delete_mark!r} "
             f"deleting={m.deleting}"
             for m in found

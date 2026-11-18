@@ -82,7 +82,7 @@
         {
           name: "update-nodepool",
           href: "/server-lifecycle/update-nodepool.html",
-          blurb: "set a hosted cluster's workers of one InfraEnv kind"
+          blurb: "set how many workers one NodePool of a hosted cluster runs"
         }
       ]
     },

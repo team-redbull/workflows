@@ -4,8 +4,11 @@ Sandbox-safe like bond_selection.py: the limb reports each Machine of a
 NodePool with what the policies rank by (read_scale_down_candidates), and this
 module decides, on every replay the same way.
 
-The policy is the NodePool's own `redbull.io/scale-down-policy` label or
-annotation, never the request's (decided with the operator, 2026-11-03):
+The request may NAME the servers that leave (`server_names`, the operator,
+2026-11-18): then nothing is ranked — `server_refusal` and `choose_named`
+below. Otherwise the policy is the request's `scale_down_policy`, else the
+NodePool's own `redbull.io/scale-down-policy` label or annotation (the
+NodePool's alone from 2026-11-03 until then):
 
   * absent — no policy: nothing is marked, CAPI's MachineSet picks at random;
   * `fewest-pods` — the fewest workload pods, the least for the drain to move;
@@ -51,10 +54,13 @@ with workflow.unsafe.imports_passed_through():
         ScaleDownMarkConflictError,
         ScaleDownPolicyInvalidError,
         ScaleDownRolloutInProgressError,
+        ScaleDownServersInvalidError,
     )
     from shared.models.server_lifecycle import ScaleDownChoice, ScaleDownMachine, ScaleDownPolicy
 
 _POLICIES = {policy.value: policy for policy in ScaleDownPolicy}
+# ScaleDownChoice.policy of a server the request named.
+NAMED = "named"
 
 
 @dataclass(frozen=True)
@@ -191,4 +197,104 @@ def choose(
                     policy=policy.value, reason=reason,
                 )
             )
+    return chosen
+
+
+# --- the servers the request named (the operator, 2026-11-18) ------------------------------
+
+
+def server_key(name: str) -> str:
+    """How a server name is compared: lowercased, as its BareMetalHost and Node are named."""
+    return name.strip().lower()
+
+
+def _known_as(machine: ScaleDownMachine) -> str:
+    return f"{machine.server} ({machine.name})" if machine.server else f"{machine.name} (server unknown)"
+
+
+def server_refusal(
+    machines: list[ScaleDownMachine],
+    nodepool: str,
+    replicas: int,
+    remove: int,
+    server_names: list[str],
+    mark: str,
+) -> Refusal | None:
+    """Why the named servers cannot be the `remove` the NodePool loses from `replicas`, or None.
+
+    refusal()'s checks first, then: exactly `remove` names, each once; each
+    ONE Machine of the NodePool; and no CAPI-unhealthy Machine left unnamed
+    that CAPI would take in place of a named one. In 4.18's CAPI a mark only
+    TIES with unhealthy and the tied Machines go by name, so the named set
+    must be what that order takes — in every later version the mark wins
+    outright, and the same set holds. Nothing ranks here: the request chose.
+    """
+    general = refusal(machines, {nodepool: (replicas, remove)}, mark)
+    if general is not None:
+        return general
+    listed = ", ".join(server_names) or "none"
+    if len(server_names) != remove:
+        return Refusal(
+            ScaleDownServersInvalidError,
+            f"NodePool {nodepool} goes from {replicas} to {replicas - remove} replicas, so {remove} "
+            f"server(s) leave; `server_names` names {len(server_names)} ({listed}). Name exactly the "
+            "servers that leave; nothing was marked or written",
+        )
+    twice = sorted({n for n in server_names if [server_key(m) for m in server_names].count(server_key(n)) > 1})
+    if twice:
+        return Refusal(
+            ScaleDownServersInvalidError,
+            f"`server_names` names {', '.join(twice)} more than once. Nothing was marked or written",
+        )
+    own = [m for m in machines if m.nodepool == nodepool]
+    by_server: dict[str, list[ScaleDownMachine]] = {}
+    for machine in own:
+        if machine.server:
+            by_server.setdefault(server_key(machine.server), []).append(machine)
+    servers = ", ".join(_known_as(m) for m in sorted(own, key=lambda m: m.name)) or "none"
+    missing = [name for name in server_names if server_key(name) not in by_server]
+    if missing:
+        return Refusal(
+            ScaleDownServersInvalidError,
+            f"no Machine of NodePool {nodepool} is server {', '.join(missing)}; its servers are "
+            f"{servers}. Nothing was marked or written",
+        )
+    doubled = [
+        f"{name} ({', '.join(m.name for m in by_server[server_key(name)])})"
+        for name in server_names if len(by_server[server_key(name)]) > 1
+    ]
+    if doubled:
+        return Refusal(
+            ScaleDownServersInvalidError,
+            f"more than one Machine of NodePool {nodepool} is server {'; '.join(doubled)}: which one "
+            "leaves cannot be told. Nothing was marked or written",
+        )
+    named = {by_server[server_key(name)][0].name for name in server_names}
+    unhealthy = {m.name for m in own if not m.capi_healthy and m.name not in named}
+    taken = set(sorted(named | unhealthy)[:remove])
+    if taken != named:
+        instead = [_known_as(m) for m in own if m.name in taken - named]
+        passed = [_known_as(m) for m in own if m.name in named - taken]
+        return Refusal(
+            ScaleDownServersInvalidError,
+            f"NodePool {nodepool}: Machine {', '.join(instead)} is unhealthy for CAPI, which in OpenShift "
+            "4.18 ranks it level with a marked Machine and takes them by name — it would delete it in "
+            f"place of {', '.join(passed)}. Name its server instead, or bring it back to health first; "
+            "nothing was marked or written",
+        )
+    return None
+
+
+def choose_named(machines: list[ScaleDownMachine], nodepool: str, server_names: list[str]) -> list[ScaleDownChoice]:
+    """The Machines of the named servers, in the request's order — once server_refusal passed."""
+    by_server = {server_key(m.server): m for m in machines if m.nodepool == nodepool and m.server}
+    chosen = []
+    for name in server_names:
+        machine = by_server[server_key(name)]
+        chosen.append(
+            ScaleDownChoice(
+                nodepool=nodepool, machine=machine.name, node=machine.node,
+                policy=NAMED, reason=f"named: {name}", server=machine.server,
+            )
+        )
     return chosen

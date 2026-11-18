@@ -508,10 +508,10 @@ async def _fails(client: Client, **kwargs) -> ApplicationError:
     return cause
 
 
-# remove-server-from-mce's steps, its lock read last (it leaves this run's lock alone),
-# then the parent's release of its own lock.
+# remove-server-from-mce's steps (it reads no lock since 2026-11-17), then the
+# parent's release of its own lock.
 CHILD = ["child-inspect", "child-power-off", "child-teardown", "child-delete-agents",
-         "child-pxe", "child-verify", "child-lock", "release"]
+         "child-pxe", "child-verify", "release"]
 HOSTED_HALF = ["delete-machine", "await-machine", "verify-agentmachine", "verify-node"]
 
 
@@ -521,7 +521,7 @@ class TestAHostedClustersNode:
         async with _Harness(acts) as client:
             result = await _execute(client, workflow_id="uninstall-server-from-hc-test-happy")
 
-        assert calls["order"] == ["lookup", "inspect", "find-nodes", "reserve", "mark-agent",
+        assert calls["order"] == ["lookup", "inspect", "find-nodes", "reserve",
                                   *HOSTED_HALF, "hold", *CHILD]
         assert result.hosted and result.bound_at_start
         assert result.agent_state_at_start == "added-to-existing-cluster"
@@ -615,7 +615,7 @@ class TestAHostedClustersNode:
         assert result.hosted and not result.bound_at_start
         assert result.agent_state_at_start == "unbinding"
         assert result.machine_deleted_by_run is False
-        assert calls["order"] == ["lookup", "inspect", "find-nodes", "reserve", "mark-agent",
+        assert calls["order"] == ["lookup", "inspect", "find-nodes", "reserve",
                                   *HOSTED_HALF, "hold", *CHILD]
         assert calls["release_agent"] == []  # the provider released it: its Machine is there
 
@@ -973,10 +973,29 @@ class TestTheNodePoolTakingTheServerBack:
             update={"agent_machine": None}), started) is None
 
 
-class TestTheServerIsLabelledUninstalling:
-    """Right after the lock, every Agent of the server gets `redbull.io/uninstalling`
-    (the operator, 2026-11-12): a NodePool whose agentLabelSelector excludes it never
-    takes the server back for the replacement of the Machine the run deletes."""
+async def test_a_new_run_labels_no_agent():
+    """The label step was removed (the operator, 2026-11-17): nothing is written between
+    the lock and the hosted-cluster half."""
+    calls, acts = make_mocks()
+    async with _Harness(acts) as client:
+        result = await _execute(client)
+
+    assert calls["order"][:5] == ["lookup", "inspect", "find-nodes", "reserve", "delete-machine"]
+    assert calls["mark_agents_uninstalling"] == [] and result.agents_marked == []
+    assert not any(s.startswith("marking-agent") for s in result.skipped)
+
+
+class TestARunRecordedWithTheLabel:
+    """A run recorded between 2026-11-12 and 2026-11-17: right after the lock, every Agent
+    of the server gets `redbull.io/uninstalling`, so a NodePool whose agentLabelSelector
+    excludes it never takes the server back for the replacement of the deleted Machine."""
+
+    @pytest.fixture(autouse=True)
+    def _recorded_with_the_label(self, monkeypatch):
+        monkeypatch.setattr(
+            workflow, "patched",
+            lambda patch_id: patch_id != uninstall_server_from_hc._NO_MARK_AGENTS_PATCH,
+        )
 
     async def test_a_hosted_node_is_labelled_before_its_machine_is_deleted(self):
         calls, acts = make_mocks()
@@ -1054,7 +1073,9 @@ class TestTheServerIsLabelledUninstalling:
     async def test_a_run_recorded_before_the_label_labels_nothing(self, monkeypatch):
         monkeypatch.setattr(
             workflow, "patched",
-            lambda patch_id: patch_id != uninstall_server_from_hc._MARK_AGENTS_PATCH,
+            lambda patch_id: patch_id not in (
+                uninstall_server_from_hc._MARK_AGENTS_PATCH, uninstall_server_from_hc._NO_MARK_AGENTS_PATCH,
+            ),
         )
         calls, acts = make_mocks()
         async with _Harness(acts) as client:
@@ -1073,7 +1094,7 @@ class TestAnInventoryHost:
 
         # Looked at again, fresh, right before remove-server-from-mce: a free Agent is
         # what any NodePool's new Machine takes.
-        assert calls["order"] == ["lookup", "inspect", "reserve", "mark-agent", "verify-inventory", "hold", *CHILD]
+        assert calls["order"] == ["lookup", "inspect", "reserve", "verify-inventory", "hold", *CHILD]
         assert len(calls["inspect_bound_host"]) == 2
         assert not result.hosted and not result.bound_at_start
         assert result.agent_state_at_start == "known-unbound"
@@ -1157,7 +1178,7 @@ class TestAnInventoryHost:
         async with _Harness(acts) as client:
             result = await _execute(client)
 
-        assert calls["order"] == ["lookup", "inspect", "reserve", "mark-agent", "hold", *CHILD]
+        assert calls["order"] == ["lookup", "inspect", "reserve", "hold", *CHILD]
         assert result.remove_server.found
 
 
@@ -1175,7 +1196,7 @@ class TestEveryUninstallLeavesTheMce:
         async with _Harness(acts) as client:
             result = await _execute(client, KEEP)
 
-        assert calls["order"] == ["lookup", "inspect", "find-nodes", "reserve", "mark-agent",
+        assert calls["order"] == ["lookup", "inspect", "find-nodes", "reserve",
                                   *HOSTED_HALF, "hold", *CHILD]
         assert not result.kept_in_inventory and result.remove_server.found
         assert result.lock_released
@@ -1186,7 +1207,7 @@ class TestEveryUninstallLeavesTheMce:
         async with _Harness(acts) as client:
             result = await _execute(client, KEEP)
 
-        assert calls["order"] == ["lookup", "inspect", "reserve", "mark-agent", "verify-inventory", "hold", *CHILD]
+        assert calls["order"] == ["lookup", "inspect", "reserve", "verify-inventory", "hold", *CHILD]
         assert not result.kept_in_inventory and result.remove_server.found
 
     async def test_the_default_takes_it_out_of_the_mce(self):
@@ -1351,7 +1372,7 @@ class TestTheLockIsGivenBack:
         async with _Harness(acts) as client:
             result = await _execute(client, workflow_id="uninstall-server-from-hc-release")
 
-        assert calls["order"][-3:] == ["child-verify", "child-lock", "release"]
+        assert calls["order"][-2:] == ["child-verify", "release"]
         # Its OWN lock — holder and run — so server-scan's compare-and-delete never
         # clears another run's.
         assert calls["release_server"] == [ReleaseServerRequest(
@@ -1361,18 +1382,17 @@ class TestTheLockIsGivenBack:
         assert result.lock_released is True
         assert not any(s.startswith("releasing-server") for s in result.skipped)
 
-    async def test_the_child_leaves_the_parents_lock_to_the_parent(self):
+    async def test_the_child_reads_no_lock_and_the_parent_releases_its_own(self):
         calls, acts = make_mocks()
         async with _Harness(acts) as client:
             result = await _execute(client, workflow_id="uninstall-server-from-hc-parent")
 
-        # remove-server-from-mce read the lock, saw uninstall-server-from-hc's and released nothing:
-        # the one release is the parent's, after the child completed.
-        assert result.remove_server.lock_released is False
-        assert result.remove_server.lock_detail.startswith("left to uninstall-server-from-hc")
-        assert "uninstall-server-from-hc-parent" in result.remove_server.lock_detail
+        # remove-server-from-mce leaves every lock to its holder (2026-11-17): the one
+        # lookup is the parent's first, the one release the parent's, after the child.
+        assert result.remove_server.lock_released is False and result.remove_server.lock_detail is None
+        assert len(calls["lookup_server_membership"]) == 1
         assert [r.holder for r in calls["release_server"]] == ["uninstall-server-from-hc"]
-        assert calls["order"].index("release") > calls["order"].index("child-lock")
+        assert calls["order"].index("release") > calls["order"].index("child-verify")
 
     async def test_an_inventory_host_has_its_lock_released_too(self):
         calls, acts = make_mocks(membership=IN_INVENTORY, host=INVENTORY_HOST)
@@ -1424,8 +1444,6 @@ class TestTheLockIsGivenBack:
         assert [r.holder for r in calls["release_server"]] == ["uninstall-server-from-hc"]
         assert result.lock_released is False
         assert result.skipped[-1].startswith("releasing-server: not released — left alone, it is not ours")
-        # remove-server-from-mce left another MCE's lock alone as well.
-        assert "another MCE" in result.remove_server.lock_detail
 
     async def test_a_run_recorded_before_the_release_keeps_the_day_long_hold(self, monkeypatch):
         monkeypatch.setattr(
@@ -1435,7 +1453,7 @@ class TestTheLockIsGivenBack:
         async with _Harness(acts) as client:
             result = await _execute(client)
 
-        assert calls["order"][-1] == "child-lock"
+        assert calls["order"][-1] == "child-verify"
         assert calls["release_server"] == [] and result.lock_released is False
         assert result.reservation_expires_at == "2026-10-25T09:00:00Z"
 

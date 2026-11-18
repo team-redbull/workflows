@@ -45,6 +45,16 @@ Shape of the run:
                         ServerStillPresentError naming it — typically an Agent
                         re-registered by a host that had no BMH to power it
                         off through.
+
+NO LOCK IS RELEASED HERE (the operator, 2026-11-17). The run ends at the
+check: server-scan's install lock is its holder's to give back. Each caller
+that holds one releases its own after this run — uninstall-server-from-hc
+once its child completed, a cancelled add-server-to-mce in its rollback — and
+add-server-to-mce's day-long hold after an install already ends as soon as
+server-scan sees the machine (5-15 min). A removal started on its own leaves
+any lock to its TTL. Runs recorded before `remove-server-no-lock-release`
+still end with step 7:
+
   7. releasing-server — server-scan's install lock, once nothing is left and
                         the PXE cleanup had no failure: read from server-scan
                         and released (with the holder and workflow id read, so
@@ -63,13 +73,12 @@ through its BMH stops that, and deleting the Agent only once the host is off
 means nothing is left to bring it back. (The detach in step 4 is then safe: the
 host is already off, so there is nothing for a deprovision to do.)
 
-WHY THE LOCK IS RELEASED (the operator's decision, 2026-10-31). add-server-to-mce
-holds its lock a day after a success, until server-scan sees the machine in a
-cluster, so a machine removed within that day stayed undrawable for the rest
-of it. Once the host is fully out of this MCE that hold protects nothing, and
-it is given back — only this MCE's: nothing here says another MCE's install is
-over. Runs recorded before `remove-server-release-own-mce-lock` leave the lock
-to its TTL.
+WHY STEP 7 EXISTED (the operator's decision, 2026-10-31, reversed 2026-11-17).
+add-server-to-mce then held its lock a full day after a success, so a machine
+removed within that day stayed undrawable for the rest of it. Since 2026-11-09
+that hold ends once server-scan sees the install, which left step 7 mostly
+reading a lock that was already gone or was its parent's. Runs recorded before
+`remove-server-release-own-mce-lock` never had it.
 
 The BMC Secret goes with the BMH (ownerReference, or explicitly). Not touched:
 the InfraEnv's boot entry on the PXE VM (`<mce>/<infraenv>.ipxe`), which every
@@ -200,6 +209,10 @@ _PXE_CLEANUP_DEADLINE = timedelta(minutes=10)
 # Gates releasing add-server-to-mce's lock for this MCE once the host is gone.
 # Runs recorded before it end at the final check and leave the lock to its TTL.
 _RELEASE_LOCK_PATCH = "remove-server-release-own-mce-lock"
+# Retires that release (the operator, 2026-11-17): every run started since ends
+# at the final check and reads no lock. A run recorded with the patch above and
+# without this one still releases.
+_NO_LOCK_RELEASE_PATCH = "remove-server-no-lock-release"
 # The holders server-scan's lock may name: add_server_to_mce's and
 # uninstall_server_from_hc's _RESERVATION_HOLDER, plus the _LEGACY_ one each
 # kept for runs started before the renames (a test keeps them in step; this
@@ -385,11 +398,11 @@ class RemoveServerFromMceWorkflow:
                 type=ServerStillPresentError.__name__,
             )
 
-        # Step 7 — nothing of the host is left here, so add-server-to-mce's hold
-        # on it for THIS MCE protects nothing any more: given back.
+        # Step 7, on a run recorded before it was retired only — add-server-to-mce's
+        # hold on the host for THIS MCE given back. A lock is its holder's now.
         lock_released = False
         lock_detail: str | None = None
-        if workflow.patched(_RELEASE_LOCK_PATCH):
+        if not workflow.patched(_NO_LOCK_RELEASE_PATCH) and workflow.patched(_RELEASE_LOCK_PATCH):
             lock_released, lock_detail = await self._release_own_mce_lock(
                 request, pxe_failed, activity_queue
             )

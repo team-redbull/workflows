@@ -26,7 +26,8 @@ rules:
     resources: [agents]
     # delete: remove-server-from-mce; patch: uninstall-server-from-hc's redbull.io/uninstalling
     # label, and its release of an Agent the provider no longer can (its Machine or
-    # AgentMachine gone)
+    # AgentMachine gone); get: also update-nodepool's scale-down by server_names
+    # (which server a Machine's Agent is)
     verbs: [get, list, delete, patch]
   - apiGroups: [agent-install.openshift.io]
     resources: [infraenvs]
@@ -72,7 +73,8 @@ subjects:
 #                         runs no hosted clusters.
 # update-nodepool uses the same grant: machines list + patch (find a NodePool's
 # Machines, set and take off the `cluster.x-k8s.io/delete-machine` mark),
-# hostedclusters get and the admin kubeconfig (rank the servers that leave), and:
+# hostedclusters get and the admin kubeconfig (rank the servers that leave),
+# agentmachines get (the Agent behind a Machine, for servers named), and:
 #   * nodepools           get + list a HostedCluster's, in its namespace
 #                         (read_hosted_cluster) — read only: a replicas change
 #                         reaches a NodePool as a day1 commit Argo CD applies

@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>update-nodepool — Redbull Workflows</title>
-<meta name="description" content="The update-nodepool workflow: set how many workers of one InfraEnv kind a hosted cluster runs. It spreads the total over the cluster's NodePools of that kind, at most one replica apart, commits it to day1 and syncs Argo CD; on a scale-down a NodePool's own policy picks the servers that leave.">
+<meta name="description" content="The update-nodepool workflow: set how many workers one NodePool of a hosted cluster runs. It commits the replicas to day1 and syncs Argo CD; on a scale-down the servers that leave are the ones you name, or the ones a policy picks, marked before the push.">
 <link rel="icon" href="/assets/favicon.svg?v=__DOC_VERSION__" type="image/svg+xml">
 <link rel="stylesheet" href="/assets/site.css?v=__DOC_VERSION__">
 </head>
@@ -42,19 +42,20 @@
     <div class="eyebrow">Temporal workflow &middot; domain: server-lifecycle</div>
     <h1>update-nodepool<span class="dim"> &mdash; what actually happens</span></h1>
     <p class="lede">
-      One request sets <b>how many workers of one hardware kind a hosted cluster runs</b>. You give the
-      <b>total</b>; the run spreads it over the cluster&rsquo;s NodePools of that kind so that <b>no two are
-      more than one replica apart</b>, writes the new replicas into the cluster&rsquo;s day1 file, has
-      Argo CD apply that commit, and checks that the NodePools on the MCE show it.
+      One request sets <b>how many workers one NodePool of a hosted cluster runs</b>. You name the MCE, the
+      cluster, the <b>NodePool</b> and its <b>replicas</b>; the run checks the NodePool in day1 and on the MCE
+      agree, writes the new replicas into the cluster&rsquo;s day1 file, has Argo CD apply that commit, and
+      checks that the NodePool on the MCE shows it. The number is set <b>exactly</b>: the cluster&rsquo;s
+      other NodePools are left as they are.
     </p>
-    <p class="lede"><b>Or one NodePool, by name.</b> Send <code>nodepool</code> instead of
-    <code>infra_env_kind</code> and <code>replicas</code> is that NodePool&rsquo;s own number, set
-    <b>exactly</b>: no spread and no balance rule, the other NodePools left as they are.</p>
     <p class="lede"><b>The day1 file owns replicas.</b> Nothing on the MCE is written directly: the change is
     one commit to day1 <code>main</code>, synced by Argo CD. The run scales up or down through a child workflow
-    &mdash; <b>scale-up-nodepool</b> or <b>scale-down-nodepool</b> &mdash; and on a scale-down a NodePool that
-    names a <a href="#policy">scale-down policy</a> has the servers that leave <b>chosen and marked first</b>.
-    Without one, CAPI picks at random, as it always has.</p>
+    &mdash; <b>scale-up-nodepool</b> or <b>scale-down-nodepool</b>.</p>
+    <p class="lede"><b>On a scale-down you can say which servers leave</b> (the operator, 2026-11-18):
+    <code>server_names</code> &mdash; exactly those &mdash; or a <code>scale_down_policy</code> that ranks
+    them. Either way they are <b>marked first</b>, and only then is the change pushed. Without either, the
+    NodePool&rsquo;s own policy applies, and without one CAPI picks at random. A run that scales <b>up</b>
+    ignores both fields and says so in its result; it never fails over them.</p>
     <div class="facts">
       <div class="fact"><span class="k">Trigger</span><span class="v">POST /workflows/server-lifecycle/update-nodepool</span></div>
       <div class="fact"><span class="k">Workflow id</span><span class="v">one per cluster: update-nodepool-&lt;cluster&gt;</span></div>
@@ -62,7 +63,7 @@
       <div class="fact"><span class="k">Workflow queues</span><span class="v">update-nodepool-workflow &middot; scale-up-nodepool-workflow &middot; scale-down-nodepool-workflow</span></div>
       <div class="fact"><span class="k">Activity queues</span><span class="v">server-lifecycle-activity-&lt;mce&gt; &mdash; every call, on the MCE&rsquo;s server-lifecycle-worker</span></div>
     </div>
-    <p class="note">Done means the NodePools <b>show the new replicas</b>, not that new nodes are Ready
+    <p class="note">Done means the NodePool <b>shows the new replicas</b>, not that new nodes are Ready
     (decided with the operator, 2026-11-03). After a scale-up HyperShift creates the Machines, and each one
     takes a free Agent of its InfraEnv when there is one. The servers a scale-down removes <b>stay in the
     MCE&rsquo;s inventory</b>, free Agents again.</p>
@@ -71,38 +72,20 @@
 
 <div class="wrap">
 
-  <!-- ============================================================= KIND -->
-  <section id="kind">
+  <!-- ========================================================== TARGET -->
+  <section id="target">
     <div class="sec-head">
-      <div class="eyebrow">Which NodePools</div>
-      <h2>The InfraEnv kind, and only this cluster&rsquo;s NodePools</h2>
+      <div class="eyebrow">Which NodePool</div>
+      <h2>One NodePool of this cluster, by name</h2>
     </div>
-    <p>A NodePool takes Agents from the InfraEnv its selector names:
-    <code>spec.platform.agent.agentLabelSelector.matchLabels["infraenvs.agent-install.openshift.io"]</code>.
-    It is of kind <code>K</code> when that InfraEnv is <b>exactly <code>K</code></b>, or <code>K</code>
-    <b>followed by <code>-</code> and anything</b>. Nothing after the dash is read, and no zone label is
-    needed.</p>
-    <div class="table-scroll">
-      <table>
-        <thead><tr><th>infra_env_kind <code>cisco-m6-bat-yam-64c-512gb</code></th><th>its kind?</th></tr></thead>
-        <tbody>
-          <tr><td class="k">cisco-m6-bat-yam-64c-512gb</td><td class="muted">yes</td></tr>
-          <tr><td class="k">cisco-m6-bat-yam-64c-512gb-zone-a</td><td class="muted">yes</td></tr>
-          <tr><td class="k">cisco-m6-bat-yam-64c-512gb-b2</td><td class="muted">yes</td></tr>
-          <tr><td class="k">cisco-m6-bat-yam-64c-512gbx</td><td class="muted">no &mdash; no dash after the kind</td></tr>
-        </tbody>
-      </table>
-    </div>
-    <p class="note">A <b>shorter</b> kind also takes the longer kinds that start with it: <code>cisco-m6</code>
-    would select every <code>cisco-m6-*</code> NodePool. The result lists every NodePool selected with its
-    InfraEnv, so a kind that is too wide shows there.</p>
-    <p class="note">A kind exists only on the <b>Agent platform</b>. A KubeVirt NodePool
-    (<code>platform: kubevirt</code>, the sandbox&rsquo;s <code>ocp4-upgrade-demo</code>) takes VMs, not
-    Agents: it has no InfraEnv, so no kind selects it (<code>NodePoolKindNotFoundError</code>). Set such a
-    NodePool by name.</p>
-    <p>Only the NodePools <b>of the cluster you name</b> count: those in its HostedCluster&rsquo;s namespace whose
-    <code>spec.clusterName</code> is that HostedCluster. Another cluster&rsquo;s NodePools of the same kind, on
-    the same MCE, are never counted and never changed.</p>
+    <p><code>nodepool</code> is the NodePool&rsquo;s name (<code>oc get nodepool -n &lt;hc namespace&gt;</code>),
+    and <code>replicas</code> its own number. Only the NodePools <b>of the cluster you name</b> count: those in
+    its HostedCluster&rsquo;s namespace whose <code>spec.clusterName</code> is that HostedCluster. Any platform
+    works &mdash; an Agent NodePool or a KubeVirt one.</p>
+    <p class="note"><b><code>infra_env_kind</code> was removed on 2026-11-18</b> (the operator: &ldquo;no need
+    infraenv kind&rdquo;). It set a TOTAL over every NodePool of one InfraEnv kind, spread at most one replica
+    apart. The API now answers it with a 422 saying to name the NodePool. A run <b>recorded</b> with a kind
+    before that day still finishes as it began &mdash; see <a href="#recorded">runs recorded by kind</a>.</p>
   </section>
 
   <!-- ============================================================== FLOW -->
@@ -145,14 +128,11 @@
           </div>
           <p>The HostedCluster&rsquo;s NodePools on the MCE, read by the same worker:
           <code>spec.replicas</code>, the InfraEnv of the selector, and the
-          <code>redbull.io/scale-down-policy</code> label or annotation. The kind&rsquo;s NodePools are selected
-          here.</p>
-          <p>With <code>nodepool</code>, only that NodePool is selected, whatever its kind; one the cluster has
-          on neither side is <code>NodePoolNotFoundError</code>.</p>
-          <p><b>Live and day1 must agree, both ways</b>: every NodePool of the kind on the MCE is in day1 under
-          its name with the same replicas and InfraEnv, and every one of the kind in day1 is on the MCE.
-          Anything else stops the run with <code>NodePoolReplicasDriftError</code>, naming each NodePool, before
-          anything is written &mdash; a NodePool made by hand, one Argo CD has not created yet, replicas
+          <code>redbull.io/scale-down-policy</code> label or annotation. The named NodePool is selected here;
+          one the cluster has on neither side is <code>NodePoolNotFoundError</code>.</p>
+          <p><b>Live and day1 must agree</b>: the NodePool is in day1 under its name with the same replicas and
+          InfraEnv, and on the MCE. Anything else stops the run with <code>NodePoolReplicasDriftError</code>
+          before anything is written &mdash; a NodePool made by hand, one Argo CD has not created yet, replicas
           someone changed on the cluster.</p>
         </div>
       </div>
@@ -164,13 +144,14 @@
             <h3>The plan</h3>
             <span class="phase">phase <b>planning</b></span>
           </div>
-          <p><b>By kind:</b> NodePools already <b>more than one replica apart</b> are refused
-          (<code>NodePoolsUnbalancedError</code>): balancing them is a person&rsquo;s edit, never a side effect.
-          Otherwise the new total is spread <a href="#spread">one replica at a time</a>.
-          <b>By name:</b> the NodePool takes exactly the number asked &mdash; no balance check, even if its kind
-          then ends more than one apart (a later run by kind is refused until they are evened out).</p>
-          <p class="note">Already what was asked: the run completes here, <code>direction: "none"</code>,
-          nothing written.</p>
+          <p>The NodePool takes exactly the number asked. More replicas than now is a <b>scale-up</b>, fewer a
+          <b>scale-down</b>, the same completes here, <code>direction: "none"</code>, nothing written.</p>
+          <p><b>On a scale-down</b>, <code>server_names</code> must name exactly as many servers as the replicas
+          removed (5 &rarr; 3: two), or the run stops with <code>ScaleDownServersInvalidError</code> before the
+          child starts. A <code>scale_down_policy</code> goes on the NodePool&rsquo;s plan, ahead of its own.</p>
+          <p class="note"><b>Not a scale-down</b> (up, or no change): <code>server_names</code> and
+          <code>scale_down_policy</code> are <b>ignored, never refused</b>, whatever they hold. The result lists
+          each in <code>ignored</code>, with why.</p>
         </div>
       </div>
 
@@ -192,19 +173,19 @@
         <div class="card">
           <div class="card-title">
             <h3>read_scale_down_candidates &middot; mark_machines_for_deletion</h3>
-            <span class="phase">phases <b>selecting-servers</b> &middot; <b>marking-machines</b> &mdash; scale-down, with a policy</span>
+            <span class="phase">phases <b>selecting-servers</b> &middot; <b>marking-machines</b> &mdash; scale-down, with names or a policy</span>
           </div>
-          <p>Only when a NodePool that loses replicas names a <a href="#policy">policy</a>. The MCE&rsquo;s
-          server-lifecycle worker reads that NodePool&rsquo;s Machines (by HyperShift&rsquo;s
-          <code>hypershift.openshift.io/nodePool</code> annotation), and through the hosted cluster&rsquo;s admin
-          kubeconfig their Nodes, Pods and &mdash; for <code>least-utilized</code> &mdash; NodeMetrics. The run
-          ranks them, then puts <code>cluster.x-k8s.io/delete-machine: scale-down-nodepool-&lt;cluster&gt;</code>
-          on each chosen Machine and reads it back. CAPI deletes a marked Machine before any other, so the
-          commit that follows removes exactly those.</p>
-          <p class="note">Refused with nothing written: an unknown policy value, a Machine already deleting, a
-          delete mark this run did not write, a Machine count that is not the replicas, Machines in two
-          MachineSets (a rollout). A mark an earlier attempt of this run left on a Machine not chosen now comes
-          off first.</p>
+          <p>The MCE&rsquo;s server-lifecycle worker reads the NodePool&rsquo;s Machines (by HyperShift&rsquo;s
+          <code>hypershift.openshift.io/nodePool</code> annotation) and the run chooses the ones that leave
+          &mdash; <a href="#servers">the named servers&rsquo; Machines, or the ones a policy ranks first</a>. It
+          then puts <code>cluster.x-k8s.io/delete-machine: scale-down-nodepool-&lt;cluster&gt;</code> on each
+          chosen Machine and reads it back. CAPI deletes a marked Machine before any other, so the commit that
+          follows removes exactly those.</p>
+          <p class="note">Refused with nothing written: a Machine already deleting, a delete mark this run did
+          not write, a Machine count that is not the replicas, Machines in two MachineSets (a rollout) &mdash; and
+          what <a href="#servers">each way of choosing</a> refuses. A mark an earlier attempt of this run left on
+          a Machine not chosen now comes off first. With neither names nor a policy this step is skipped:
+          nothing is marked.</p>
         </div>
       </div>
 
@@ -215,9 +196,9 @@
             <h3>commit_day1_replicas</h3>
             <span class="phase">phase <b>committing-day1</b></span>
           </div>
-          <p>The new replicas of every NodePool that moves, in <b>one commit</b> to day1 <code>main</code>,
-          <code>nodepool(&lt;cluster&gt;): replicas a 3&rarr;4, &hellip; [&lt;run id&gt;]</code>. Only those
-          <code>replicas:</code> lines change; comments and quoting stay. <b>Compare-and-set</b> on the blob read
+          <p>The NodePool&rsquo;s new replicas in <b>one commit</b> to day1 <code>main</code>,
+          <code>nodepool(&lt;cluster&gt;): replicas c 3&rarr;2 [&lt;run id&gt;]</code>. Only that
+          <code>replicas:</code> line changes; comments and quoting stay. <b>Compare-and-set</b> on the blob read
           in step 1: a file someone else changed since is never committed over
           (<code>Day1FileChangedError</code>). day1&rsquo;s validator runs first when one is configured.</p>
           <p class="note">On a scale-down, a refused commit takes the run&rsquo;s marks off again
@@ -233,8 +214,8 @@
             <span class="phase">phases <b>syncing-argo</b> &middot; <b>verifying-nodepools</b></span>
           </div>
           <p>The cluster&rsquo;s Argo CD Application synced to <b>exactly that commit</b>. Only the moved
-          NodePools may be out of sync; anything else pending is someone else&rsquo;s change and the sync is
-          refused (<code>ArgoSyncRefusedError</code>). Then the NodePools are read back: each must show its
+          NodePool may be out of sync; anything else pending is someone else&rsquo;s change and the sync is
+          refused (<code>ArgoSyncRefusedError</code>). Then the NodePool is read back: it must show its
           planned <code>spec.replicas</code>, or <code>NodePoolsNotReconciledError</code>.</p>
         </div>
       </div>
@@ -247,7 +228,7 @@
             <span class="phase">phase <b>verifying-machines</b> &mdash; scale-down, with marks</span>
           </div>
           <p>One heartbeating watch, every 15 s for up to <b>10 minutes</b>, until every marked Machine is
-          deleting or gone. An <b>unmarked</b> Machine of those NodePools deleting instead is
+          deleting or gone. An <b>unmarked</b> Machine of the NodePool deleting instead is
           <code>ScaleDownWrongMachineError</code> &mdash; named, and it cannot be undone. The run does not wait
           for the drain or for the Agent to come free.</p>
         </div>
@@ -256,53 +237,64 @@
     </div>
   </section>
 
-  <!-- ============================================================ SPREAD -->
-  <section id="spread">
+  <!-- =========================================================== SERVERS -->
+  <section id="servers">
     <div class="sec-head">
-      <div class="eyebrow">The rule a scale keeps</div>
-      <h2>How the total is spread</h2>
+      <div class="eyebrow">scale-down-nodepool</div>
+      <h2>Which servers leave</h2>
+      <p class="lede">The first of these that applies (the operator, 2026-11-18; until then only the
+      NodePool&rsquo;s own policy, 2026-11-03). <code>server_names</code> and <code>scale_down_policy</code>
+      together are a 422.</p>
     </div>
-    <p>One replica at a time. <b>Up</b>: to the NodePool with the fewest. <b>Down</b>: from the one with the
-    most. Ties go by InfraEnv name, then NodePool name &mdash; ascending going up, descending going down &mdash;
-    so the first NodePool in that order keeps the extra one. From a balanced start every step stays
-    balanced, and no NodePool ever moves the other way.</p>
     <div class="table-scroll">
       <table>
-        <thead><tr><th>zone-a, zone-b, zone-c</th><th>replicas asked</th><th>after</th></tr></thead>
+        <thead><tr><th>the request / the NodePool</th><th>which servers leave</th></tr></thead>
         <tbody>
-          <tr><td class="k">3, 3, 2</td><td class="muted">10</td><td class="muted">4, 3, 3</td></tr>
-          <tr><td class="k">3, 3, 3</td><td class="muted">7</td><td class="muted">3, 2, 2</td></tr>
-          <tr><td class="k">1, 1, 1</td><td class="muted">2</td><td class="muted">1, 1, 0</td></tr>
-          <tr><td class="k">2, 2, 1</td><td class="muted">0</td><td class="muted">0, 0, 0</td></tr>
-          <tr><td class="k">5, 2, 2</td><td class="muted">any</td><td class="muted">refused: <code>NodePoolsUnbalancedError</code></td></tr>
+          <tr><td class="k">server_names</td><td class="muted">Exactly those servers. The NodePool&rsquo;s own policy is not read.</td></tr>
+          <tr><td class="k">scale_down_policy</td><td class="muted">The first ones by that <a href="#policy">policy</a>, whatever the NodePool says &mdash; even a value of its own that is no policy.</td></tr>
+          <tr><td class="k">the NodePool&rsquo;s <code>redbull.io/scale-down-policy</code></td><td class="muted">The first ones by that policy. A value that is no policy is <code>ScaleDownPolicyInvalidError</code>.</td></tr>
+          <tr><td class="k">none of these</td><td class="muted">Nothing is marked. CAPI&rsquo;s MachineSet picks &mdash; at random, HyperShift&rsquo;s default.</td></tr>
         </tbody>
       </table>
     </div>
-  </section>
 
-  <!-- ============================================================ POLICY -->
-  <section id="policy">
-    <div class="sec-head">
-      <div class="eyebrow">scale-down-nodepool</div>
-      <h2>Which servers leave: the NodePool&rsquo;s own policy</h2>
-      <p class="lede">Set <b>on the NodePool, never in the request</b>: a label or an annotation
-      <code>redbull.io/scale-down-policy</code>. The run reads it off the NodePool on the MCE, which is what
-      Argo CD rendered from day1 (or what a person set there). The spread rule decides how many each NodePool
-      loses; the policy decides which of its Machines.</p>
-    </div>
+    <h3 style="margin:24px 0 10px" id="names">Named servers</h3>
+    <p>Server-scan names, one or a list, compared <b>case-insensitively</b>. For each Machine of the NodePool
+    the worker reads which server it is: the Machine&rsquo;s AgentMachine, the Agent its
+    <code>status.agentRef</code> names, and that Agent&rsquo;s <code>agent-install.openshift.io/bmh</code>
+    label &mdash; the BareMetalHost add-server-to-mce named after the server &mdash; else the Agent&rsquo;s
+    hostname, else the Machine&rsquo;s Node. Nothing is ranked, so the hosted cluster is not read at all. Each
+    named server&rsquo;s Machine is marked, in the order you gave.</p>
+    <p class="note">Refused with nothing marked or written (<code>ScaleDownServersInvalidError</code>, the
+    message says which):</p>
+    <ul>
+      <li>the list is not as long as the replicas removed &mdash; checked by update-nodepool itself, before the
+      child starts;</li>
+      <li>a server is named twice;</li>
+      <li>no Machine of the NodePool is a named server &mdash; the message lists the NodePool&rsquo;s servers;</li>
+      <li>two Machines are one named server;</li>
+      <li><b>an unnamed Machine CAPI counts unhealthy would be taken in place of a named one.</b> In
+      OpenShift 4.18&rsquo;s CAPI a marked and an unhealthy Machine <a href="#capi">rank the same</a>, and
+      the tied ones go by Machine name: if such a Machine sorts before a named one, CAPI would delete it
+      instead. Name that server instead, or bring it back to health first. One that sorts after the named
+      ones is no reason to refuse;</li>
+      <li>the MCE&rsquo;s server-lifecycle-worker predates <code>server_names</code> and cannot say which
+      server a Machine is &mdash; upgrade it.</li>
+    </ul>
+
+    <h3 style="margin:24px 0 10px" id="policy">A policy</h3>
     <div class="table-scroll">
       <table>
         <thead><tr><th>value</th><th>which servers leave first</th></tr></thead>
         <tbody>
-          <tr><td class="k">absent</td><td class="muted">Nothing is marked. CAPI&rsquo;s MachineSet picks &mdash; at random, HyperShift&rsquo;s default.</td></tr>
           <tr><td class="k">fewest-pods</td><td class="muted">The fewest workload pods: the least for the drain to move. Workload means not a DaemonSet&rsquo;s, not a mirror pod, not finished &mdash; the drain&rsquo;s own rules.</td></tr>
           <tr><td class="k">least-requested</td><td class="muted">The lowest share of the Node&rsquo;s allocatable its pods request, the larger of CPU and memory. From the pods&rsquo; requests, as the scheduler counts them; no metrics needed.</td></tr>
           <tr><td class="k">least-utilized</td><td class="muted">The lowest live use of allocatable, the larger of CPU and memory, from <code>metrics.k8s.io</code> on the hosted cluster. A cluster with no metrics API fails the run (<code>NodeMetricsUnavailableError</code>); a Node that just joined is waited for until its metrics appear.</td></tr>
-          <tr><td class="k">anything else</td><td class="muted">Refused before anything is marked or written: <code>ScaleDownPolicyInvalidError</code>.</td></tr>
         </tbody>
       </table>
     </div>
-    <p>Under <b>every</b> policy the order is:</p>
+    <p>A policy reads the Machines&rsquo; Nodes, Pods and &mdash; for <code>least-utilized</code> &mdash;
+    NodeMetrics through the hosted cluster&rsquo;s admin kubeconfig. Under <b>every</b> policy the order is:</p>
     <ol>
       <li>Machines <b>CAPI counts unhealthy</b> &mdash; no nodeRef, a failure, or <code>NodeHealthy</code> /
       <code>HealthCheckSucceeded</code> False, read off the Machine exactly as CAPI&rsquo;s
@@ -312,17 +304,17 @@
       Machine healthy;</li>
       <li>the policy&rsquo;s reading. Ties go by Machine name.</li>
     </ol>
-    <p>Different NodePools of one kind may name different policies, or none.</p>
 
-    <div class="panel" style="margin-top:18px">
+    <div class="panel" style="margin-top:18px" id="capi">
       <h3>Why the mark decides which servers go</h3>
       <p>HyperShift backs an <b>InPlace</b> NodePool with one CAPI <b>MachineSet</b> and a <b>Replace</b> one
       with a MachineDeployment, sets their replicas from the NodePool, and sets <b>no delete policy</b> &mdash;
       so CAPI&rsquo;s default, Random, applies. On a scale-down the MachineSet ranks its Machines and removes
       the top ones, ties by name. Under Random a Machine annotated <code>cluster.x-k8s.io/delete-machine</code>
       outranks every healthy one in every CAPI version, and an unhealthy one from CAPI 1.9 on (OpenShift
-      4.19 and later). In 4.18&rsquo;s CAPI a marked and an unhealthy Machine rank the same, which is why
-      CAPI-unhealthy Machines come first, in CAPI&rsquo;s own order: the Machines CAPI removes are then
+      4.19 and later). In 4.18&rsquo;s CAPI a marked and an unhealthy Machine rank the same, which is why a
+      policy takes CAPI-unhealthy Machines first, in CAPI&rsquo;s own order, and why named servers are refused
+      when an unnamed unhealthy one would be taken in their place: the Machines CAPI removes are then
       exactly the marked ones in every version.</p>
       <p class="note">The mark only orders Machines <b>inside one MachineSet</b>. A Replace NodePool in the
       middle of a rollout has two, and its MachineDeployment may scale down the other one: a NodePool whose
@@ -331,10 +323,10 @@
       (<code>machine.cluster.x-k8s.io/exclude-node-draining</code>). The watch after the sync still checks
       that the marked Machines are the ones deleting.</p>
     </div>
-    <p><b>Setting it in day1.</b> As an <b>annotation</b> of the NodePool&rsquo;s <code>nodepool[]</code> entry.
-    The hostedclusters-setup chart renders an entry&rsquo;s <code>annotations</code> onto the NodePool (since
-    2026-11-08, GitHub copy); its labels stay <code>allowDeletion</code>, <code>maxReplicas</code> and
-    <code>minReplicas</code>:</p>
+    <p><b>Setting the NodePool&rsquo;s own policy in day1.</b> As an <b>annotation</b> of the NodePool&rsquo;s
+    <code>nodepool[]</code> entry. The hostedclusters-setup chart renders an entry&rsquo;s
+    <code>annotations</code> onto the NodePool (since 2026-11-08, GitHub copy); its labels stay
+    <code>allowDeletion</code>, <code>maxReplicas</code> and <code>minReplicas</code>:</p>
     <pre><code>nodepool:
   - infraEnvName: dell-r660-128c-1024gb
     replicas: 3
@@ -344,8 +336,9 @@
       redbull.io/scale-down-policy: fewest-pods</code></pre>
     <p class="note">The air-gapped GitLab copy of the chart renders no entry annotations until it gets the
     same change. There, set the key on the NodePool directly (<code>oc annotate nodepool &lt;name&gt; -n
-    hcp-&lt;cluster&gt; redbull.io/scale-down-policy=fewest-pods</code>); Argo CD leaves an annotation it never
-    set alone. The run reads a label of that key too, for one set by hand.</p>
+    hcp-&lt;cluster&gt; redbull.io/scale-down-policy=fewest-pods</code>) or send <code>scale_down_policy</code>;
+    Argo CD leaves an annotation it never set alone. The run reads a label of that key too, for one set by
+    hand.</p>
     <p class="note"><b>The <code>maxReplicas</code> / <code>minReplicas</code> labels are not the run&rsquo;s</b>
     (the operator, 2026-11-08). The commit changes <code>replicas</code> only. Left unwritten, the chart derives
     them from <code>replicas</code> (<code>replicas</code> and <code>replicas &minus; 1</code>), so they follow;
@@ -370,14 +363,14 @@
           <tr><td class="k">ClusterNotOnMceError</td><td class="muted">day1 keeps the cluster under another MCE&rsquo;s folder.</td></tr>
           <tr><td class="k">Day1ClusterProblemsError</td><td class="muted">The cluster file holds what the chart would refuse, or replicas that are not a number.</td></tr>
           <tr><td class="k">NodePoolNotFoundError</td><td class="muted">The NodePool named in <code>nodepool</code> is the cluster&rsquo;s neither on the MCE nor in day1 (the message lists those it has).</td></tr>
-          <tr><td class="k">NodePoolKindNotFoundError</td><td class="muted">No NodePool of the cluster is of the kind (the message lists the InfraEnvs it has) &mdash; or the MCE&rsquo;s server-lifecycle worker predates update-nodepool, which the message names.</td></tr>
+          <tr><td class="k">NodePoolKindNotFoundError</td><td class="muted">The MCE&rsquo;s server-lifecycle worker predates update-nodepool, which the message names. (On a <a href="#recorded">recorded run by kind</a>: no NodePool of the cluster is of the kind.)</td></tr>
           <tr><td class="k">Day1NotConfiguredError</td><td class="muted">The MCE&rsquo;s server-lifecycle worker has no <code>DAY1_REPO_URL</code> or <code>DAY1_GIT_TOKEN</code> (the message names which). Set the chart&rsquo;s <code>day1.*</code> values; nothing was read or written.</td></tr>
-          <tr><td class="k">NodePoolReplicasDriftError</td><td class="muted">Live and day1 disagree; or, on a scale-down by policy, a Machine is already deleting or the Machines are not the replicas.</td></tr>
-          <tr><td class="k">NodePoolsUnbalancedError</td><td class="muted">The kind&rsquo;s NodePools are already more than one replica apart.</td></tr>
+          <tr><td class="k">NodePoolReplicasDriftError</td><td class="muted">Live and day1 disagree; or, on a scale-down that marks servers, a Machine is already deleting or the Machines are not the replicas.</td></tr>
           <tr><td class="k">ScaleNodePoolAlreadyRunningError</td><td class="muted">A scale-up / scale-down of the cluster is already running on the child&rsquo;s id.</td></tr>
-          <tr><td class="k">ScaleDownPolicyInvalidError</td><td class="muted">A shrinking NodePool names a policy that does not exist.</td></tr>
-          <tr><td class="k">ScaleDownMarkConflictError</td><td class="muted">A Machine of a shrinking NodePool carries a delete mark this run did not write.</td></tr>
-          <tr><td class="k">ScaleDownRolloutInProgressError</td><td class="muted">A shrinking NodePool&rsquo;s Machines span two MachineSets: a Replace NodePool mid-rollout, where the mark could be passed by. Run again once the rollout has finished.</td></tr>
+          <tr><td class="k">ScaleDownServersInvalidError</td><td class="muted"><code>server_names</code> cannot be the servers that leave: <a href="#names">a wrong count, a server no Machine is, an unhealthy Machine CAPI would take instead</a>, or a worker that cannot tell; or it came with a <code>scale_down_policy</code>.</td></tr>
+          <tr><td class="k">ScaleDownPolicyInvalidError</td><td class="muted">The shrinking NodePool&rsquo;s own <code>redbull.io/scale-down-policy</code> is no policy, and the request named none.</td></tr>
+          <tr><td class="k">ScaleDownMarkConflictError</td><td class="muted">A Machine of the shrinking NodePool carries a delete mark this run did not write.</td></tr>
+          <tr><td class="k">ScaleDownRolloutInProgressError</td><td class="muted">The shrinking NodePool&rsquo;s Machines span two MachineSets: a Replace NodePool mid-rollout, where the mark could be passed by. Run again once the rollout has finished.</td></tr>
           <tr><td class="k">MachineMarkConflictError</td><td class="muted">A chosen Machine went, started deleting, or got another mark between the choice and the write; the marks already written come off.</td></tr>
           <tr><td class="k">NodeMetricsUnavailableError</td><td class="muted"><code>least-utilized</code> on a hosted cluster with no metrics API.</td></tr>
           <tr><td class="k">Day1FileChangedError &middot; Day1ChangeRejectedError</td><td class="muted">Someone changed the file since it was read, or day1&rsquo;s validator refused the edit. The marks come off; nothing was pushed.</td></tr>
@@ -391,7 +384,7 @@
         <thead><tr><th>error</th><th>when</th></tr></thead>
         <tbody>
           <tr><td class="k">ArgoSyncRefusedError</td><td class="muted">Something else in the Application is out of sync. The marks stay: when the commit is applied, CAPI removes the marked Machines first.</td></tr>
-          <tr><td class="k">NodePoolsNotReconciledError</td><td class="muted">After the sync a NodePool does not show its planned replicas, or a marked Machine is not deleting 10 minutes on.</td></tr>
+          <tr><td class="k">NodePoolsNotReconciledError</td><td class="muted">After the sync the NodePool does not show its planned replicas, or a marked Machine is not deleting 10 minutes on.</td></tr>
           <tr><td class="k">ScaleDownWrongMachineError</td><td class="muted">CAPI is deleting a Machine the run did not mark. Named; it cannot be undone.</td></tr>
         </tbody>
       </table>
@@ -404,6 +397,8 @@
       failed or found another operation in progress. The run sits RUNNING with the failure on the activity. A
       call no worker picks up within 5 minutes &mdash; that worker not deployed, or not on this MCE &mdash;
       fails the run instead.</p>
+      <p class="note">A worker from before 2026-11-18 cannot read a named scale-down&rsquo;s request: that
+      read is retried, RUNNING, until the new worker polls.</p>
     </div>
   </section>
 
@@ -417,10 +412,10 @@
       <table>
         <thead><tr><th>situation</th><th>what a re-run does</th></tr></thead>
         <tbody>
-          <tr><td class="k">a run of that cluster is still running</td><td class="muted">refused with <b>409</b> &mdash; one per cluster, whatever the kind</td></tr>
+          <tr><td class="k">a run of that cluster is still running</td><td class="muted">refused with <b>409</b> &mdash; one per cluster, whichever NodePool</td></tr>
           <tr><td class="k">an upgrade-cluster run of that cluster is running</td><td class="muted">refused with <b>409</b>: both commit to the same file, and the upgrade would stop for a person at its next commit</td></tr>
-          <tr><td class="k">the last run completed</td><td class="muted">finds the total already there and completes with <code>direction: "none"</code></td></tr>
-          <tr><td class="k">the commit landed, the sync did not</td><td class="muted"><b>resumes</b>: day1 already holds a balanced plan for the requested total, so the run hands it to the child, whose commit is then a no-op, and syncs</td></tr>
+          <tr><td class="k">the last run completed</td><td class="muted">finds the replicas already there and completes with <code>direction: "none"</code></td></tr>
+          <tr><td class="k">the commit landed, the sync did not</td><td class="muted"><b>resumes</b>: day1 already holds the number asked, so the run hands the plan to the child, whose commit is then a no-op, and syncs. Its marks are still on the Machines: the same names (or policy) keep them; a different choice takes the old marks off first</td></tr>
           <tr><td class="k">after a refusal</td><td class="muted">refused again until what it named is fixed</td></tr>
         </tbody>
       </table>
@@ -445,29 +440,26 @@
           <span class="ret">202 &middot; 409 while a run or an upgrade of the cluster runs &middot; 422 on a bad body</span>
         </div>
         <div class="endpoint-body">
-          <pre><span class="c">// request — by kind</span>
+          <pre><span class="c">// request</span>
 {
-  "mce_cluster":    "mce-bat-yam-01",              <span class="c">// with or without ocp4-</span>
-  "cluster":        "ocp4-prod-alpha",             <span class="c">// the day1 file's name, without .yaml</span>
-  "replicas":       10,                            <span class="c">// the TOTAL over the kind's NodePools, 0 allowed</span>
-  "infra_env_kind": "cisco-m6-bat-yam-64c-512gb"
-}
+  "mce_cluster": "mce-bat-yam-01",                 <span class="c">// with or without ocp4-</span>
+  "cluster":     "ocp4-prod-alpha",                <span class="c">// the day1 file's name, without .yaml</span>
+  "nodepool":    "prod-alpha-zone-c",
+  "replicas":    3,                                <span class="c">// that NodePool's, set exactly; 0 allowed</span>
 
-<span class="c">// request — one NodePool</span>
-{
-  "mce_cluster": "mce-bat-yam-01",
-  "cluster":     "ocp4-prod-alpha",
-  "replicas":    5,                                <span class="c">// THAT NodePool's replicas, set exactly</span>
-  "nodepool":    "prod-alpha-zone-c"
+  <span class="c">// optional, read only on a scale-down — at most one of:</span>
+  "server_names":      ["ocp-r660-bat-yam-HP0001592", "ocp-r660-bat-yam-HP0001611"],
+  "scale_down_policy": "fewest-pods"               <span class="c">// fewest-pods | least-requested | least-utilized</span>
 }
 
 <span class="c">// 202 response</span>
 { "workflow_id": "update-nodepool-ocp4-prod-alpha", "run_id": "…" }</pre>
-          <p class="note">Send <b>exactly one</b> of <code>infra_env_kind</code> and <code>nodepool</code>:
-          both or neither is a 422. The body <b>forbids unknown fields</b>; <code>cluster</code>,
-          <code>infra_env_kind</code> and <code>nodepool</code> must be Kubernetes names, <code>replicas</code>
-          0 or more. The id is the cluster&rsquo;s either way, so a run by kind and a run by name of one cluster
-          never overlap.</p>
+          <p class="note"><code>mce_cluster</code>, <code>cluster</code>, <code>nodepool</code> and
+          <code>replicas</code> are required; <code>cluster</code> and <code>nodepool</code> must be Kubernetes
+          names, <code>replicas</code> 0 or more. <code>server_names</code> is one name or a list of up to 20,
+          each once (case-insensitively). <code>server_names</code> with <code>scale_down_policy</code>, a
+          policy that does not exist, and <b><code>infra_env_kind</code></b> (removed on 2026-11-18) are each a
+          422 that says why; the body forbids unknown fields.</p>
         </div>
       </div>
 
@@ -478,33 +470,55 @@
           <span class="ret">200 &middot; 404 for an unknown id</span>
         </div>
         <div class="endpoint-body">
-          <pre><span class="c">// 200 once completed — a scale-down by fewest-pods</span>
+          <pre><span class="c">// 200 once completed — a scale-down of two named servers</span>
 {
   "status": "COMPLETED",
   "result": {
     "mce_cluster": "ocp4-mce-bat-yam-01", "cluster": "ocp4-prod-alpha",
-    "infra_env_kind": "cisco-m6-bat-yam-64c-512gb", "nodepool": null,   <span class="c">// as in the request</span>
+    "infra_env_kind": null, "nodepool": "prod-alpha-zone-c",
     "day1_path": "sites/bat-yam/mces/ocp4-mce-bat-yam-01/hostedClusters/ocp4-prod-alpha.yaml",
     "hosted_cluster": "openshift-prod-alpha", "hosted_cluster_namespace": "hcp-prod-alpha",
-    "direction": "down", "total_before": 9, "total_after": 8,
+    "direction": "down", "total_before": 5, "total_after": 3,
     "nodepools": [
-      { "name": "prod-alpha-zone-a", "infra_env": "cisco-m6-bat-yam-64c-512gb-zone-a", "before": 3, "after": 3 },
-      { "name": "prod-alpha-zone-c", "infra_env": "cisco-m6-bat-yam-64c-512gb-zone-c", "before": 3, "after": 2,
-        "scale_down_policy": "fewest-pods" }
+      { "name": "prod-alpha-zone-c", "infra_env": "cisco-m6-bat-yam-64c-512gb-zone-c", "before": 5, "after": 3,
+        "scale_down_policy": null }
     ],
+    "ignored": [],                                  <span class="c">// on a scale-up: "server_names …: the NodePool scales up"</span>
     "child_workflow_id": "scale-down-nodepool-ocp4-prod-alpha",
     "scale": {
       "revision": "9f2c…", "committed": true,
-      "nodepools": [ { "name": "prod-alpha-zone-c", "replicas": 2, "ready_replicas": 3 } ],
+      "nodepools": [ { "name": "prod-alpha-zone-c", "replicas": 3, "ready_replicas": 5 } ],
       "chosen":   [ { "nodepool": "prod-alpha-zone-c", "machine": "prod-alpha-zone-c-7xk2p",
-                      "node": "worker-7", "policy": "fewest-pods", "reason": "1 workload pods" } ],
-      "deleting": [ "prod-alpha-zone-c-7xk2p" ]
+                      "node": "ocp-r660-bat-yam-hp0001592", "policy": "named",
+                      "reason": "named: ocp-r660-bat-yam-HP0001592", "server": "ocp-r660-bat-yam-hp0001592" },
+                    { "nodepool": "prod-alpha-zone-c", "machine": "prod-alpha-zone-c-q4m9d",
+                      "node": "ocp-r660-bat-yam-hp0001611", "policy": "named",
+                      "reason": "named: ocp-r660-bat-yam-HP0001611", "server": "ocp-r660-bat-yam-hp0001611" } ],
+      "deleting": [ "prod-alpha-zone-c-7xk2p", "prod-alpha-zone-c-q4m9d" ]
     }
   }
 }</pre>
+          <p class="note">By a policy, each <code>chosen</code> entry carries the policy and its reading instead
+          (<code>"policy": "fewest-pods", "reason": "1 workload pods"</code>), and the NodePool&rsquo;s
+          <code>scale_down_policy</code> is the one applied.</p>
         </div>
       </div>
     </div>
+  </section>
+
+  <!-- ========================================================= RECORDED -->
+  <section id="recorded">
+    <div class="sec-head">
+      <div class="eyebrow">Before 2026-11-18</div>
+      <h2>Runs recorded by kind</h2>
+    </div>
+    <p>A run started with <code>infra_env_kind</code> before the field was removed still finishes as it began:
+    <code>replicas</code> is the TOTAL over the cluster&rsquo;s NodePools of that kind &mdash; those whose
+    selector&rsquo;s InfraEnv is the kind, or the kind followed by <code>-</code> and anything &mdash; refused
+    when they are already more than one replica apart (<code>NodePoolsUnbalancedError</code>), and spread one
+    replica at a time: up to the NodePool with the fewest, down from the one with the most, ties by InfraEnv
+    then NodePool name. Each shrinking NodePool is scaled down by its own policy. Nothing new can start that
+    way; the code goes once no such run is left.</p>
   </section>
 
   <!-- ========================================================= REFERENCE -->
@@ -532,6 +546,7 @@
           <tr><td class="k">&nbsp;&nbsp;day1 read and commit</td><td class="muted"><code>read_day1_nodepools</code>, <code>commit_day1_replicas</code>: its optional <code>day1.*</code> chart values (<code>DAY1_REPO_URL</code>, <code>DAY1_GIT_TOKEN</code>); the commit changes replicas and nothing else</td></tr>
           <tr><td class="k">&nbsp;&nbsp;NodePools, Argo CD sync</td><td class="muted"><code>read_hosted_cluster</code>, <code>sync_argo_application</code>: cluster-upgrade&rsquo;s activities, registered on this worker too; get/list on NodePools, get/patch on Applications in <code>argo.namespace</code></td></tr>
           <tr><td class="k">&nbsp;&nbsp;Machines, hosted Nodes and Pods, the marks</td><td class="muted">list/patch on Machines and the admin kubeconfig: the <code>rbac.hostedClusters</code> grant</td></tr>
+          <tr><td class="k">&nbsp;&nbsp;which server a Machine is</td><td class="muted">get on AgentMachines (the same grant) and on Agents in the InfraEnv namespace (the <code>rbac.targetNamespaces</code> Role) &mdash; both granted already</td></tr>
         </tbody>
       </table>
     </div>
@@ -543,7 +558,8 @@
     <ul>
       <li>No write to a NodePool, HostedCluster or Node on the MCE &mdash; the change is day1&rsquo;s, applied by Argo CD.</li>
       <li>No commit over someone else&rsquo;s edit, and no sync of someone else&rsquo;s pending change.</li>
-      <li>No balancing of NodePools that are already more than one replica apart.</li>
+      <li>No change to another NodePool of the cluster.</li>
+      <li>No scale-down that could take a server other than the ones named: it is refused instead.</li>
       <li>No removal of a server from the MCE: the servers a scale-down frees stay in the inventory.</li>
       <li>No wait for new nodes to be Ready, or for a drain to finish.</li>
     </ul>

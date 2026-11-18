@@ -1443,11 +1443,12 @@ class UninstallServerFromHcResult(BaseModel):
 
 
 class ScaleDownPolicy(str, Enum):
-    """How a scale-down picks a NodePool's leaving servers — its `redbull.io/scale-down-policy`.
+    """How a scale-down picks a NodePool's leaving servers.
 
-    Absent from the NodePool means no policy: the run marks nothing, and
-    CAPI's MachineSet picks at random. Under every policy a Machine with no
-    Node, then a Node that is NotReady or cordoned, goes first.
+    The request's `scale_down_policy`, else the NodePool's own
+    `redbull.io/scale-down-policy`. Neither means no policy: the run marks
+    nothing, and CAPI's MachineSet picks at random. Under every policy a
+    Machine with no Node, then a Node that is NotReady or cordoned, goes first.
     """
 
     FEWEST_PODS = "fewest-pods"  # the least for the drain to move
@@ -1456,20 +1457,29 @@ class ScaleDownPolicy(str, Enum):
 
 
 class UpdateNodePoolInput(BaseModel):
-    """Input to UpdateNodePoolWorkflow: how many workers a hosted cluster runs, by kind or for one NodePool.
+    """Input to UpdateNodePoolWorkflow: how many workers one NodePool of a hosted cluster runs.
 
     `cluster` is the day1 cluster file's name without `.yaml` (also its Argo
-    CD Application), as upgrade-cluster takes it. EXACTLY ONE target:
+    CD Application), as upgrade-cluster takes it. `nodepool` is the NodePool,
+    `replicas` its own, set exactly as asked whatever its siblings hold (the
+    operator, 2026-11-08); 0 is allowed.
 
-      * `infra_env_kind` — `replicas` is the TOTAL over the cluster's
-        NodePools of that kind, spread so none are more than one apart. A
-        NodePool is of kind K when the InfraEnv its agentLabelSelector names is
-        `K` or starts with `K-`;
-      * `nodepool` — `replicas` is that ONE NodePool's, set exactly as asked,
-        whatever its siblings hold (the operator, 2026-11-08).
+    `infra_env_kind` is HISTORY: until 2026-11-18 a run could name a kind
+    instead — `replicas` the TOTAL over the cluster's NodePools of it, spread
+    so none are more than one apart — and a run recorded so still runs that
+    way. The API takes `nodepool` only and refuses the kind (the operator:
+    "no need infraenv kind"); both stay optional HERE because the first runs
+    were recorded before `nodepool` existed.
 
-    Both optional HERE (the API edge requires exactly one): `nodepool` came
-    after the first runs were recorded. 0 replicas is allowed.
+    Only a SCALE-DOWN reads the last two (the operator, 2026-11-18); a run
+    that scales up, or changes nothing, ignores them and says so in its
+    result. At most one of them (the API refuses both):
+
+      * `scale_down_policy` — picks the servers that leave, ahead of the
+        NodePool's own `redbull.io/scale-down-policy`;
+      * `server_names` — the servers that leave, exactly as many as the
+        replicas removed, each a Machine of the NodePool; they are marked
+        and only then is the change pushed.
     """
 
     mce_cluster: str = Field(min_length=1)
@@ -1477,6 +1487,8 @@ class UpdateNodePoolInput(BaseModel):
     replicas: int = Field(ge=0)
     infra_env_kind: str | None = None
     nodepool: str | None = None
+    scale_down_policy: ScaleDownPolicy | None = None
+    server_names: list[str] | None = None
 
 
 class UpdateNodePoolRunArgs(BaseModel):
@@ -1498,10 +1510,11 @@ class NodePoolProgress(BaseModel):
 
 
 class NodePoolReplicasChange(BaseModel):
-    """One NodePool of the kind: its replicas before and after the run, as planned.
+    """One NodePool of the run: its replicas before and after, as planned.
 
-    `scale_down_policy` is the NodePool's own `redbull.io/scale-down-policy`
-    as written (None: none) — what a scale-down picks its servers by.
+    `scale_down_policy` is what a scale-down picks its servers by (None:
+    none): the request's on the NodePool that shrinks, else the NodePool's
+    own `redbull.io/scale-down-policy` as written.
     """
 
     name: str
@@ -1518,6 +1531,10 @@ class NodePoolScalePlan(BaseModel):
     compare-and-set on it. `hosted_cluster` / `hosted_cluster_namespace` are
     the HostedCluster as day1 renders it (`openshift-<clusterName>` in
     `hcp-<clusterName>`), its NodePools in that namespace.
+
+    `server_names` only on a scale-down whose request named its servers: the
+    one shrinking NodePool loses exactly those, whatever its policy. Empty on
+    every plan recorded before 2026-11-18.
     """
 
     mce_cluster: str
@@ -1528,6 +1545,7 @@ class NodePoolScalePlan(BaseModel):
     hosted_cluster: str
     hosted_cluster_namespace: str
     nodepools: list[NodePoolReplicasChange]
+    server_names: list[str] = Field(default_factory=list)
 
 
 class ScaleUpNodePoolRunArgs(BaseModel):
@@ -1554,7 +1572,8 @@ class ScaleDownChoice(BaseModel):
     """One server a scale-down chose to leave, and what put it first.
 
     `reason` is the policy's reading, e.g. `no Node`, `NotReady`,
-    `3 workload pods`, `requested 41%`, `used 12%`.
+    `3 workload pods`, `requested 41%`, `used 12%`. A server the request named
+    has `policy` `named` and `server` set.
     """
 
     nodepool: str
@@ -1562,6 +1581,7 @@ class ScaleDownChoice(BaseModel):
     node: str | None = None
     policy: str
     reason: str
+    server: str | None = None
 
 
 class NodePoolScaleResult(BaseModel):
@@ -1569,8 +1589,8 @@ class NodePoolScaleResult(BaseModel):
 
     `committed` False: day1 already held the replicas (a re-run), and
     `revision` is then main's HEAD. `chosen` and `deleting` only on a
-    scale-down whose NodePools name a policy: the servers it marked, and the
-    marked Machines it saw deleting.
+    scale-down that marked servers — named in the request, or picked by a
+    policy: the servers it marked, and the marked Machines it saw deleting.
     """
 
     revision: str
@@ -1581,12 +1601,15 @@ class NodePoolScaleResult(BaseModel):
 
 
 class UpdateNodePoolResult(BaseModel):
-    """What update-nodepool did: the kind's NodePools before and after, and its child's own result.
+    """What update-nodepool did: the NodePool before and after, and its child's own result.
 
     `direction` is `up`, `down` or `none` (the replicas were already the
     request: nothing written, no child). `scale` is the child's result, on
     `child_workflow_id`. Exactly one of `infra_env_kind` / `nodepool` is set,
-    as in the request; `nodepools` is then that kind's, or the one NodePool.
+    as in the request (the kind on a run recorded before 2026-11-18 only);
+    `nodepools` is then the one NodePool, or that kind's. `ignored` names a
+    `scale_down_policy` / `server_names` the request sent that a run which
+    did not scale down had no use for.
     """
 
     mce_cluster: str
@@ -1602,16 +1625,23 @@ class UpdateNodePoolResult(BaseModel):
     nodepools: list[NodePoolReplicasChange] = Field(default_factory=list)
     child_workflow_id: str | None = None
     scale: NodePoolScaleResult | None = None
+    ignored: list[str] = Field(default_factory=list)
 
 
 # --- scale-down-nodepool: choosing and marking the servers that leave --------------------
 
 
 class ScaleDownNodePoolRef(BaseModel):
-    """One NodePool a scale-down shrinks by a policy (`name` in the HostedCluster's namespace)."""
+    """One NodePool a scale-down shrinks (`name` in the HostedCluster's namespace).
+
+    `policy` None: the request named the servers, so nothing is ranked and the
+    hosted cluster is not read for this NodePool (a limb from before
+    2026-11-18 cannot decode None, and its read is retried until the new one
+    polls).
+    """
 
     name: str = Field(min_length=1)
-    policy: ScaleDownPolicy
+    policy: ScaleDownPolicy | None = None
 
 
 class ScaleDownCandidatesRequest(BaseModel):
@@ -1619,11 +1649,14 @@ class ScaleDownCandidatesRequest(BaseModel):
 
     The HostedCluster by its namespace and name, as day1 renders it; the limb
     derives its control-plane namespace (HyperShift's rule) and reports it.
+    `with_servers`: also say which server each Machine is (its Agent's
+    BareMetalHost), for a scale-down whose request named its servers.
     """
 
     hosted_cluster_namespace: str = Field(min_length=1)
     hosted_cluster: str = Field(min_length=1)
     nodepools: list[ScaleDownNodePoolRef]
+    with_servers: bool = False
 
 
 class ScaleDownMachine(BaseModel):
@@ -1636,6 +1669,13 @@ class ScaleDownMachine(BaseModel):
     finished). `requested_permille` / `used_permille` are the larger of CPU
     and memory, requested by its Pods / used now, per thousand of the Node's
     allocatable — `used_permille` only for a `least-utilized` NodePool.
+
+    `server` (only when the request asked `with_servers`) is the server the
+    Machine is, lowercased: its Agent's BareMetalHost
+    (`agent-install.openshift.io/bmh`), else the Agent's hostname, else its
+    Node's name — add-server-to-mce names all three after the server. None
+    when none can be read. The limb always sends the key; a worker from
+    before 2026-11-18 does not, and the brain refuses to guess.
     """
 
     nodepool: str
@@ -1656,6 +1696,7 @@ class ScaleDownMachine(BaseModel):
     workload_pods: int = 0
     requested_permille: int | None = None
     used_permille: int | None = None
+    server: str | None = None
 
 
 class ScaleDownCandidates(BaseModel):

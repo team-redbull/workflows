@@ -217,11 +217,10 @@ keeps S1 out of other draws until server-scan can see it in a cluster itself —
 and the run waits for exactly that, then releases it (`awaiting-server-scan`,
 `releasing-lock`; the operator, 2026-11-09): server-scan hides an
 `INSTALLED_TO_INVENTORY` / `INSTALLED` server from every draw on its own.
-A server taken out of that MCE within the day gets it back early: remove-server-from-mce
-releases add-server-to-mce's lock for its MCE once nothing of the server is left
-there and its PXE cleanup did not fail (the operator's decision, 2026-10-31; a failed
-cleanup may leave the host able to boot this MCE's discovery image, so the lock then
-runs to its expiry).
+remove-server-from-mce does not give that lock back (it did from 2026-10-31 until
+the operator removed it on 2026-11-17): a lock is its holder's, so a server taken
+out of the MCE before server-scan reported it stays locked until this run sees the
+report, or the lock expires.
 
 **Who checks what.** server-scan, in the allocation — live, against the vendor
 manager, while the server is locked: unclaimed, not in maintenance, BMC
@@ -246,7 +245,7 @@ before the BareMetalHost or the NMStateConfig is written.
 | cancelled while server-scan is still allocating | ends CANCELED, never learning which server server-scan may still lock for it | that one expires (2 h) |
 | the allocation's answer is lost and it is retried | the retry is allocated *another* server — server-scan ties a lock to the request that took it | the first expires (2 h) |
 | crash/failure while creating resources | stops, resources **left** on the MCE | expires after 2 h; a re-run of the same named install extends it |
-| operator **cancels** before the Agent | **rolls back** (since 2026-11-09): after 2 min for calls in flight, **remove-server-from-mce** takes the server out of the MCE (power off, delete, PXE, verify) — or, nothing written, its PXE mapping is removed here; ends CANCELED, `progress.cancel_rollback` says what was done | released |
+| operator **cancels** before the Agent | **rolls back** (since 2026-11-09): after 2 min for calls in flight, **remove-server-from-mce** takes the server out of the MCE (power off, delete, PXE, verify) — or, nothing written, its PXE mapping is removed here; ends CANCELED, `progress.cancel_rollback` says what was done | released here, after the child (which releases no lock since 2026-11-17); kept to expire if its PXE cleanup failed |
 | operator cancels after the Agent | stops the wait for server-scan, ends CANCELED; the server **stays installed** | expires |
 | operator **terminates** | stops at once — no rollback, resources left (use Cancel to roll back) | expires |
 | no worker in that MCE | waits; `progress` names the queue | — |
@@ -592,24 +591,18 @@ ends as it began, and its result says `kept_in_inventory: true`.
 > NodePool replicas are never changed here (they are the day1 file's, changed
 > only by `update-nodepool`), so the NodePool backfills a new Machine from
 > another free Agent it matches — the node is REPLACED, the cluster keeps its
-> size. To shrink the cluster instead, use `update-nodepool`. If this server is the only
+> size. To shrink the cluster instead, use `update-nodepool` — its scale-down
+> takes exactly the server you name in `server_names`. If this server is the only
 > free Agent, the replacement takes it back: the run stops with
 > `AgentRetakenError` and writes nothing more. A Machine someone else already
 > started deleting is waited on, not deleted again.
 
-**The run labels the server's Agents `redbull.io/uninstalling: "true"`** right
-after the lock, before any other write (`marking-agent`; the operator,
-2026-11-12; `agents_marked` in the result). A NodePool whose
-`agentLabelSelector` carries
-`matchExpressions: [{key: redbull.io/uninstalling, operator: DoesNotExist}]`
-then never takes this server back — the replacement takes another free server,
-or waits for one — while the node keeps running until its Machine goes (the
-Agent provider applies the selector only when it picks a free Agent). The label
-goes with the Agent, which remove-server-from-mce deletes, so a re-install
-starts clean; a failed run leaves it for the re-run (to keep the server
-instead: `oc label agent -n <ns> <agent> redbull.io/uninstalling-`). A NodePool
-without the expression ignores it. The expression itself is the NodePool's,
-written in day1 — the hostedclusters-setup chart does not render it yet.
+**The run labels no Agent.** From 2026-11-12 it labelled the server's Agents
+`redbull.io/uninstalling: "true"` right after the lock (`marking-agent`), so a
+NodePool excluding the label would not take the server back; the operator
+removed that step on 2026-11-17. Only a run started in between still labels
+(`agents_marked` in its result; `oc label agent -n <ns> <agent>
+redbull.io/uninstalling-` takes it off).
 
 Before anything is written it **refuses** on a contradiction: a name
 server-scan does not know (`ServerNotInServerScanError`); server-scan saying
@@ -657,53 +650,58 @@ get/list/delete/patch, HostedClusters get/list, Secrets get cluster-wide — and
 `patch` on Agents in the InfraEnv Role; see
 [the chart README](deploy/charts/server-lifecycle-worker/README.md).
 
-### `update-nodepool` — how many workers of one InfraEnv kind a hosted cluster runs
+### `update-nodepool` — how many workers one NodePool of a hosted cluster runs
 
 `POST /workflows/server-lifecycle/update-nodepool` with `mce_cluster`, `cluster`
-(the day1 file's name), `replicas` (the TOTAL wanted, 0 allowed) and
-`infra_env_kind`. One run per cluster at a time (`update-nodepool-<cluster>`,
-409), and none while an `upgrade-cluster` run of the cluster is running (409):
-both commit to the same day1 file.
-
-A NodePool is of kind `K` when the InfraEnv its
-`agentLabelSelector.matchLabels["infraenvs.agent-install.openshift.io"]` names
-is `K`, or `K-` followed by anything (`K-zone-a`, …). Only the cluster's OWN
-NodePools count, never the rest of the MCE.
-
-**Or one NodePool by name**: send `nodepool` instead of `infra_env_kind`
-(exactly one of the two, else 422) and `replicas` is that NodePool's own,
-set exactly — no spread, no balance rule; the others are left alone. A name
-the cluster does not have is `NodePoolNotFoundError`.
+(the day1 file's name), `nodepool` and `replicas` (that NodePool's own, set
+exactly, 0 allowed; the cluster's other NodePools are left alone). One run per
+cluster at a time (`update-nodepool-<cluster>`, 409), and none while an
+`upgrade-cluster` run of the cluster is running (409): both commit to the same
+day1 file. A name the cluster does not have is `NodePoolNotFoundError`.
+`infra_env_kind` (a total spread over one InfraEnv kind's NodePools) was
+removed on 2026-11-18 — a 422 now; runs recorded with it finish as they began.
 
 **The day1 file owns replicas** (the operator, 2026-11-03), and this is the one
 place that changes them:
 
-1. It reads the cluster file and the HostedCluster's NodePools. They must
-   agree both ways — same NodePools, InfraEnvs and replicas — else
+1. It reads the cluster file and the HostedCluster's NodePool. They must
+   agree — same NodePool, InfraEnv and replicas — else
    `NodePoolReplicasDriftError`, nothing written.
-2. NodePools of the kind already more than one replica apart are refused
-   (`NodePoolsUnbalancedError`). Otherwise the new total is spread one replica
-   at a time — up to the fewest, down from the most, ties by InfraEnv then
-   NodePool name — so no two end more than one replica apart.
-3. A child, **scale-up-nodepool** or **scale-down-nodepool**, commits the new
+2. A child, **scale-up-nodepool** or **scale-down-nodepool**, commits the new
    replicas to day1 `main` (compare-and-set on the file's blob, so a person's
    edit is never committed over), syncs the cluster's Argo CD Application to
-   exactly that commit, and reads the NodePools back. Done is the NodePools
+   exactly that commit, and reads the NodePool back. Done is the NodePool
    showing the new replicas — not new nodes Ready.
 
-**On a scale-down, which servers leave is the NodePool's own choice**, never the
-request's: an annotation `redbull.io/scale-down-policy` on the NodePool, written
-under the day1 entry's `annotations:` (a label of that key, set by hand, is read
-too) — `fewest-pods`, `least-requested` (CPU/memory requested out of allocatable) or
-`least-utilized` (live use, from `metrics.k8s.io`). Under every policy the
-Machines CAPI counts unhealthy go first, by name — CAPI's own order, which is
-what makes the mark decide in 4.18's CAPI as in later ones — then a broken or
-cordoned Node. A NodePool mid-rollout (Machines in two MachineSets) is refused.
-The run marks the chosen Machines
-`cluster.x-k8s.io/delete-machine` **before it pushes**, so CAPI removes exactly those, then watches that they are the ones
-deleting (`ScaleDownWrongMachineError` otherwise). A refused commit takes the
-marks off again. Without the key nothing is marked and CAPI picks at random.
-The servers that leave stay in the MCE's inventory as free Agents.
+**On a scale-down, which servers leave** (the operator, 2026-11-18), the first
+that applies — sending both request fields is a 422:
+
+> `scale_down_policy` and `server_names` are features for **OpenShift clusters
+> from version 4.19 on** only (the operator, 2026-11-18). This is documented,
+> not enforced: the run does not check the cluster's version.
+
+- `server_names` — exactly those (server-scan names, one or a list), as many as
+  the replicas removed, each a Machine of the NodePool: the worker follows each
+  Machine to its Agent's BareMetalHost (else hostname, else Node). Refused,
+  nothing written (`ScaleDownServersInvalidError`): a wrong count, a server no
+  Machine is, or an unnamed CAPI-unhealthy Machine that 4.18's CAPI would take
+  in place of a named one;
+- `scale_down_policy` — `fewest-pods`, `least-requested` (CPU/memory requested
+  out of allocatable) or `least-utilized` (live use, from `metrics.k8s.io`);
+- the NodePool's own `redbull.io/scale-down-policy` annotation, written under
+  the day1 entry's `annotations:` (a label of that key, set by hand, is read
+  too), same values;
+- none: nothing is marked and CAPI picks at random.
+
+A scale-up (or no change) **ignores** both fields and lists them in the
+result's `ignored` — never a failure. Under every policy the Machines CAPI
+counts unhealthy go first, by name — CAPI's own order, which is what makes the
+mark decide in 4.18's CAPI as in later ones — then a broken or cordoned Node.
+A NodePool mid-rollout (Machines in two MachineSets) is refused. The run marks
+the chosen Machines `cluster.x-k8s.io/delete-machine` **before it pushes**, so
+CAPI removes exactly those, then watches that they are the ones deleting
+(`ScaleDownWrongMachineError` otherwise). A refused commit takes the marks off
+again. The servers that leave stay in the MCE's inventory as free Agents.
 
 **Everything runs on the MCE's `server-lifecycle-worker`** (the operator,
 2026-11-08) — no cluster-upgrade worker needs to run. It reads and commits day1
@@ -955,7 +953,7 @@ result.
 | `POST /workflows/server-lifecycle/remove-server-from-mce` | one server out of an MCE's inventory |
 | `POST /workflows/server-lifecycle/uninstall-server-from-hc` | one workflow PER server in `server_names`: out of its hosted cluster (if a node), then out of the MCE (remove-server-from-mce, as a child) |
 | `POST /workflows/server-lifecycle/publish-infraenv-to-pxe-server` | an InfraEnv's current iPXE script onto its site's PXE VM |
-| `POST /workflows/server-lifecycle/update-nodepool` | one replicas change of a hosted cluster: a total over its NodePools of one InfraEnv kind, or one NodePool by name (a scale-up or scale-down child) |
+| `POST /workflows/server-lifecycle/update-nodepool` | one NodePool's replicas, by name (a scale-up or scale-down child); a scale-down may name its `server_names` or a `scale_down_policy` (OpenShift 4.19 and later only) |
 | `POST /workflows/server-provisioning/provision-dell-server` | one Dell server, by iDRAC IP |
 | `POST /workflows/server-provisioning/provision-dell-server/bulk` | one workflow PER iDRAC IP |
 | `POST /workflows/vm-lifecycle/create-vm` | one workflow PER VM for a KubeVirt InfraEnv: one in the first free slot, or `count` in parallel |

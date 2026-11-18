@@ -35,7 +35,7 @@ from shared.consts import UPDATE_NODEPOOL_WORKFLOW_QUEUE
 from shared.exceptions import ArgoSyncRefusedError, Day1FileChangedError
 from shared.workflow_ids import scale_down_nodepool_workflow_id, scale_up_nodepool_workflow_id
 from tests.test_add_server_to_mce_replay import _scrubbed
-from tests.test_update_nodepool_workflow import CLUSTER, _Fleet, _Harness, _policy_fleet, run_args
+from tests.test_update_nodepool_workflow import CLUSTER, _Fleet, _Harness, _named_fleet, _policy_fleet, run_args
 from workflow_domains.server_lifecycle.scale_down_nodepool import ScaleDownNodePoolWorkflow
 from workflow_domains.server_lifecycle.scale_up_nodepool import ScaleUpNodePoolWorkflow
 from workflow_domains.server_lifecycle.update_nodepool import UpdateNodePoolWorkflow
@@ -64,8 +64,12 @@ class Scenario:
     # Which child the run starts: "up", "down" or None.
     child: str | None
     fails: bool = False
-    # One NodePool by name instead of the kind (since 2026-11-08).
+    # One NodePool by name instead of the kind (since 2026-11-08; the API's only
+    # shape since 2026-11-18 — the scenarios without one are recorded runs').
     nodepool: str | None = None
+    # How a scale-down picks its servers, from the request (since 2026-11-18).
+    policy: str | None = None
+    servers: tuple[str, ...] = ()
 
 
 SCENARIOS: dict[str, Scenario] = {
@@ -80,6 +84,18 @@ SCENARIOS: dict[str, Scenario] = {
     "one-nodepool-up": Scenario(lambda: _Fleet((3, 3, 2)), 5, "up", nodepool="alpha-zone-c"),
     "one-nodepool-down-by-policy": Scenario(_policy_fleet, 1, "down", nodepool="alpha-zone-c"),
     "one-nodepool-not-found": Scenario(lambda: _Fleet((3, 3, 2)), 4, None, fails=True, nodepool="alpha-zone-x"),
+    "one-nodepool-down-request-policy": Scenario(
+        _named_fleet, 2, "down", nodepool="alpha-zone-c", policy="fewest-pods"
+    ),
+    "one-nodepool-down-named-servers": Scenario(
+        _named_fleet, 1, "down", nodepool="alpha-zone-c", servers=("ocp-r660-3", "ocp-r660-1")
+    ),
+    "one-nodepool-down-unknown-server": Scenario(
+        _named_fleet, 2, "down", fails=True, nodepool="alpha-zone-c", servers=("ocp-r660-9",)
+    ),
+    "one-nodepool-up-ignores-servers": Scenario(
+        _named_fleet, 5, "up", nodepool="alpha-zone-c", servers=("ocp-r660-1",)
+    ),
 }
 
 
@@ -95,7 +111,11 @@ async def _record(name: str) -> dict[str, WorkflowHistory]:
     async with _Harness(scenario.fleet()) as client:
         client: Client
         handle = await client.start_workflow(
-            UpdateNodePoolWorkflow.run, run_args(scenario.replicas, nodepool=scenario.nodepool),
+            UpdateNodePoolWorkflow.run,
+            run_args(
+                scenario.replicas, nodepool=scenario.nodepool, policy=scenario.policy,
+                servers=list(scenario.servers) or None,
+            ),
             id=f"update-nodepool-replay-{name}", task_queue=UPDATE_NODEPOOL_WORKFLOW_QUEUE,
         )
         if scenario.fails:

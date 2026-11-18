@@ -276,7 +276,7 @@ async def test_an_inventory_host_is_powered_off_then_removed_agent_last():
     async with _Harness(acts) as client:
         result = await _execute(client)
 
-    assert calls["order"] == ["inspect", "power-off", "teardown", "delete-agents", "verify", "lock"]
+    assert calls["order"] == ["inspect", "power-off", "teardown", "delete-agents", "verify"]
     assert result.found and result.powered_off
     assert result.agents_removed == ["agent-1"]
     assert result.resources_removed == [
@@ -345,7 +345,7 @@ async def test_a_host_without_an_agent_still_has_its_resources_removed():
     async with _Harness(acts) as client:
         result = await _execute(client)
 
-    assert calls["order"] == ["inspect", "power-off", "teardown", "verify", "lock"]
+    assert calls["order"] == ["inspect", "power-off", "teardown", "verify"]
     assert result.agents_removed == []
 
 
@@ -362,7 +362,7 @@ async def test_an_agent_left_without_its_bmh_is_still_deleted():
     async with _Harness(acts) as client:
         result = await _execute(client)
 
-    assert calls["order"] == ["inspect", "delete-agents", "segment", "pxe", "verify", "lock"]
+    assert calls["order"] == ["inspect", "delete-agents", "segment", "pxe", "verify"]
     assert result.powered_off is False
     assert result.agents_removed == ["agent-1"]
     # Its MACs are still cleared from the PXE map: found by server-scan's.
@@ -413,7 +413,7 @@ class TestThePxeMapIsCleared:
             result = await _execute(client)
 
         assert calls["order"] == [
-            "inspect", "power-off", "teardown", "delete-agents", "segment", "pxe", "verify", "lock",
+            "inspect", "power-off", "teardown", "delete-agents", "segment", "pxe", "verify",
         ]
         # Every MAC the host is known by, conditional on THIS MCE, and only on
         # the MCE's own site's VM — the one add-server-to-mce mapped it on.
@@ -513,11 +513,38 @@ async def test_every_step_runs_on_the_target_mces_queue():
     assert result.mce_cluster == MCE
     # The first inspection and the final check, both of this server.
     assert calls["inspect_inventory_host"] == [BmhRef(server_name=SERVER, namespace=NS)] * 2
-    assert calls["lookup_server_membership"] == [ServerMembershipRequest(server_name=SERVER)]
 
 
+async def test_no_lock_is_read_or_released():
+    """The operator, 2026-11-17: a lock is its holder's to give back, so the run ends at its check."""
+    calls, acts = make_mocks(state=WITH_MACS, lock=INSTALL_LOCK)
+    async with _Harness(acts) as client:
+        result = await _execute(client)
+
+    assert calls["order"][-1] == "verify"
+    assert calls["lookup_server_membership"] == calls["release_server"] == []
+    assert result.found and not result.lock_released and result.lock_detail is None
+
+
+@pytest.fixture
+def recorded_with_the_release(monkeypatch):
+    """A run recorded between `remove-server-release-own-mce-lock` and its retirement."""
+    monkeypatch.setattr(
+        workflow, "patched",
+        lambda patch_id: patch_id != remove_server_from_mce._NO_LOCK_RELEASE_PATCH,
+    )
+
+
+@pytest.mark.usefixtures("recorded_with_the_release")
 class TestServerScansLock:
-    """Once nothing is left on the MCE, add-server-to-mce's lock FOR THIS MCE goes back (2026-10-31)."""
+    """A run recorded before 2026-11-17: once nothing is left on the MCE,
+    add-server-to-mce's lock FOR THIS MCE goes back (2026-10-31)."""
+
+    async def test_every_step_runs_on_the_target_mces_queue(self):
+        calls, acts = make_mocks()
+        async with _Harness(acts) as client:
+            await _execute(client)
+        assert calls["lookup_server_membership"] == [ServerMembershipRequest(server_name=SERVER)]
 
     async def test_add_server_to_mces_lock_for_this_mce_is_released_after_the_check(self):
         calls, acts = make_mocks(state=WITH_MACS, lock=INSTALL_LOCK)
@@ -629,7 +656,10 @@ class TestServerScansLock:
 
     async def test_a_run_recorded_before_the_release_leaves_the_lock(self, monkeypatch):
         monkeypatch.setattr(
-            workflow, "patched", lambda patch_id: patch_id != remove_server_from_mce._RELEASE_LOCK_PATCH
+            workflow, "patched",
+            lambda patch_id: patch_id not in (
+                remove_server_from_mce._RELEASE_LOCK_PATCH, remove_server_from_mce._NO_LOCK_RELEASE_PATCH,
+            ),
         )
         calls, acts = make_mocks(lock=INSTALL_LOCK)
         async with _Harness(acts) as client:
@@ -652,6 +682,7 @@ def test_the_lock_holders_are_the_workflows_own():
     }
 
 
+@pytest.mark.usefixtures("recorded_with_the_release")
 @pytest.mark.parametrize("holder", ["install-server", "add-server-to-mce"])
 async def test_an_install_lock_under_either_name_is_released(holder):
     """A machine installed before the rename holds `install-server`'s lock: it goes back too."""
@@ -664,6 +695,7 @@ async def test_an_install_lock_under_either_name_is_released(holder):
     assert result.lock_released, result.lock_detail
 
 
+@pytest.mark.usefixtures("recorded_with_the_release")
 @pytest.mark.parametrize("holder", ["uninstall-server", "uninstall-server-from-hc"])
 async def test_an_uninstall_lock_under_either_name_is_left_to_it(holder):
     _, acts = make_mocks(

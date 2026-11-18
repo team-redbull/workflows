@@ -553,8 +553,7 @@ class _FakeNodePoolClient:
 
 class TestUpdateNodePool:
     PATH = "/workflows/server-lifecycle/update-nodepool"
-    BODY = {"mce_cluster": "mce-a", "cluster": "ocp4-prod-alpha", "replicas": 9,
-            "infra_env_kind": "dell-r660-128c"}
+    BODY = {"mce_cluster": "mce-a", "cluster": "ocp4-prod-alpha", "replicas": 9, "nodepool": "prod-alpha-zone-c"}
 
     def _client(self, fake: _FakeNodePoolClient) -> TestClient:
         app = FastAPI()
@@ -571,9 +570,10 @@ class TestUpdateNodePool:
         assert response.json()["workflow_id"] == "update-nodepool-ocp4-prod-alpha"
         [(workflow_id, queue, run_input)] = fake.started
         assert queue == UPDATE_NODEPOOL_WORKFLOW_QUEUE
-        assert (run_input.mce_cluster, run_input.cluster, run_input.replicas, run_input.infra_env_kind) == (
-            "ocp4-mce-a", "ocp4-prod-alpha", 9, "dell-r660-128c",
+        assert (run_input.mce_cluster, run_input.cluster, run_input.replicas, run_input.nodepool) == (
+            "ocp4-mce-a", "ocp4-prod-alpha", 9, "prod-alpha-zone-c",
         )
+        assert (run_input.infra_env_kind, run_input.scale_down_policy, run_input.server_names) == (None, None, None)
 
     def test_zero_replicas_is_allowed(self):
         fake = _FakeNodePoolClient()
@@ -602,35 +602,57 @@ class TestUpdateNodePool:
 
     @pytest.mark.parametrize(
         "change",
-        [{"replicas": -1}, {"infra_env_kind": "Dell_R660"}, {"cluster": "ocp4/prod"}, {"force": True}],
+        [{"replicas": -1}, {"nodepool": "Zone_C"}, {"cluster": "ocp4/prod"}, {"force": True},
+         {"scale_down_policy": "random"}, {"server_names": []}, {"server_names": [""]},
+         {"server_names": ["ocp-a", "OCP-A"]}, {"server_names": [f"ocp-{n}" for n in range(21)]}],
     )
     def test_what_the_edge_refuses(self, change):
         fake = _FakeNodePoolClient()
         assert self._client(fake).post(self.PATH, json={**self.BODY, **change}).status_code == 422
         assert fake.started == []
 
-    @pytest.mark.parametrize("missing", ["mce_cluster", "cluster", "replicas", "infra_env_kind"])
+    @pytest.mark.parametrize("missing", ["mce_cluster", "cluster", "replicas", "nodepool"])
     def test_every_field_is_required(self, missing):
         body = {k: v for k, v in self.BODY.items() if k != missing}
         assert self._client(_FakeNodePoolClient()).post(self.PATH, json=body).status_code == 422
 
-    def test_one_nodepool_by_name_instead_of_a_kind(self):
+    @pytest.mark.parametrize("kind", ["dell-r660-128c", None])
+    def test_an_infraenv_kind_is_refused_saying_name_the_nodepool(self, kind):
+        """Removed on 2026-11-18 (the operator: "no need infraenv kind"), with or without `nodepool`."""
         fake = _FakeNodePoolClient()
-        body = {k: v for k, v in self.BODY.items() if k != "infra_env_kind"} | {"nodepool": "prod-alpha-zone-c"}
-        response = self._client(fake).post(self.PATH, json=body)
-        assert response.status_code == 202
-        [(_id, _queue, run_input)] = fake.started
-        assert (run_input.nodepool, run_input.infra_env_kind, run_input.replicas) == ("prod-alpha-zone-c", None, 9)
-
-    def test_both_targets_are_refused_saying_send_one(self):
-        fake = _FakeNodePoolClient()
-        response = self._client(fake).post(self.PATH, json=self.BODY | {"nodepool": "prod-alpha-zone-c"})
-        assert response.status_code == 422 and "exactly one of `nodepool`" in response.text
+        body = {k: v for k, v in self.BODY.items() if k != "nodepool"} | {"infra_env_kind": kind}
+        for sent in (body, body | {"nodepool": "prod-alpha-zone-c"}):
+            response = self._client(fake).post(self.PATH, json=sent)
+            assert response.status_code == 422 and "`infra_env_kind` was removed" in response.text
         assert fake.started == []
 
-    def test_a_nodepool_name_that_is_not_a_kubernetes_name_is_refused(self):
-        body = {k: v for k, v in self.BODY.items() if k != "infra_env_kind"} | {"nodepool": "Zone_C"}
-        assert self._client(_FakeNodePoolClient()).post(self.PATH, json=body).status_code == 422
+    def test_the_kind_is_out_of_the_schema(self):
+        app = FastAPI()
+        app.include_router(router_module.router)
+        schema = TestClient(app).get("/openapi.json").json()["components"]["schemas"]["UpdateNodePoolRequest"]
+        assert "infra_env_kind" not in schema["properties"]
+        assert {"nodepool", "scale_down_policy", "server_names"} <= set(schema["properties"])
+
+    def test_a_scale_down_policy_reaches_the_run(self):
+        fake = _FakeNodePoolClient()
+        assert self._client(fake).post(self.PATH, json=self.BODY | {"scale_down_policy": "least-utilized"}).status_code == 202
+        [(_id, _queue, run_input)] = fake.started
+        assert run_input.scale_down_policy.value == "least-utilized" and run_input.server_names is None
+
+    @pytest.mark.parametrize(("sent", "run"), [("ocp-R660-1", ["ocp-R660-1"]), (["a", "b"], ["a", "b"])])
+    def test_server_names_reach_the_run_as_a_list(self, sent, run):
+        fake = _FakeNodePoolClient()
+        assert self._client(fake).post(self.PATH, json=self.BODY | {"server_names": sent}).status_code == 202
+        [(_id, _queue, run_input)] = fake.started
+        assert run_input.server_names == run and run_input.scale_down_policy is None
+
+    def test_a_policy_and_names_together_are_refused(self):
+        fake = _FakeNodePoolClient()
+        response = self._client(fake).post(
+            self.PATH, json=self.BODY | {"scale_down_policy": "fewest-pods", "server_names": ["ocp-a"]}
+        )
+        assert response.status_code == 422 and "`scale_down_policy` OR `server_names`" in response.text
+        assert fake.started == []
 
 
 # --- uninstall-server-from-hc -----------------------------------------------------------------

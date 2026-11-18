@@ -472,6 +472,10 @@ _RELEASE_ONCE_INSTALLED_PATCH = "add-server-release-once-installed"
 # Gates the rollback on CANCEL (the operator, 2026-11-09). A run recorded before
 # it stops where it is when cancelled, everything left in place.
 _ROLLBACK_ON_CANCEL_PATCH = "add-server-rollback-on-cancel"
+# The cancel rollback releases its own lock after remove-server-from-mce took the
+# server out, since that child no longer releases any lock (the operator,
+# 2026-11-17). A run recorded before it reported what its child had released.
+_CANCEL_RELEASES_AFTER_REMOVAL_PATCH = "add-server-cancel-releases-after-removal"
 # Gates the ALLOCATION (the operator, 2026-11-17, on server-scan's ADR-0063):
 # the run asks server-scan for ONE server, which server-scan locks for it and
 # live-checks while locked, and installs that one or fails. A run recorded
@@ -1760,8 +1764,9 @@ class AddServerToMceWorkflow:
           * anything possibly written on the MCE is taken out by
             remove-server-from-mce as an awaited child, as uninstall-server-from-hc
             does — host powered off first, BareMetalHost + NMStateConfig, any Agent
-            it registered, its MACs on its site's PXE VM, a verification, and
-            add-server-to-mce's lock for this MCE released;
+            it registered, its MACs on its site's PXE VM, a verification — and
+            then this run's lock released here, unless the child's PXE cleanup
+            failed (the host may still boot this MCE's discovery image);
           * when that child found nothing of it on the MCE — or nothing was
             written — an IPMI mapping this run sent is removed here (the child
             touches the PXE map only for a host it finds), and the lock released
@@ -1825,12 +1830,16 @@ class AddServerToMceWorkflow:
                     "left is still there, and the install lock expires on its own"
                 )
                 return
-        done = (
-            f"{candidate.name} taken out of the MCE by {remove_server_from_mce_workflow_id(candidate.name)}"
-            + ("" if removal.lock_released else f"; lock: {removal.lock_detail or 'kept'}")
-            if removal is not None and removal.found
-            else None
-        )
+        done: str | None = None
+        if removal is not None and removal.found:
+            done = f"{candidate.name} taken out of the MCE by {remove_server_from_mce_workflow_id(candidate.name)}"
+            if removal.lock_released:
+                # A remove-server-from-mce from before 2026-11-17 released it itself.
+                pass
+            elif workflow.patched(_CANCEL_RELEASES_AFTER_REMOVAL_PATCH):
+                done += "; " + await self._release_after_removal(candidate, removal, task_queue)
+            else:
+                done += f"; lock: {removal.lock_detail or 'kept'}"
         if done is None:
             try:
                 if self._pxe_mapped is not None:
@@ -1850,6 +1859,31 @@ class AddServerToMceWorkflow:
         workflow.logger.info("Cancelled run rolled back: %s", done)
         self._phase = "cancelled"
         self._cancel_rollback = done
+
+    async def _release_after_removal(
+        self, candidate: AcquiredServer, removal: RemoveServerFromMceResult, task_queue: str
+    ) -> str:
+        """The cancel rollback's own lock, once remove-server-from-mce took the server out.
+
+        Kept when the child's PXE cleanup failed: the host's MACs may still
+        chain to this MCE's discovery image. Never raises — a refusal leaves the
+        lock to its TTL and says so.
+        """
+        if removal.pxe_failed:
+            return (
+                "lock kept: the PXE cleanup failed ("
+                + "; ".join(removal.pxe_failed)
+                + "), so it expires on its own"
+            )
+        self._phase = "cancel-releasing-lock"
+        try:
+            await self._release(candidate, task_queue)
+        except ActivityError as err:
+            cause = err.cause
+            why = f"{cause.type}: {cause.message}" if isinstance(cause, ApplicationError) else str(cause or err)
+            workflow.logger.warning("Rollback of cancelled %s: lock not released: %s", candidate.name, why)
+            return f"lock not released ({why}); it expires on its own"
+        return "install lock released"
 
     async def _release_once_seen_installed(
         self, candidate: AcquiredServer, install_input: AddServerToMceInput, task_queue: str

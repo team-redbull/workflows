@@ -9,6 +9,7 @@ from shared.exceptions import (
     ScaleDownMarkConflictError,
     ScaleDownPolicyInvalidError,
     ScaleDownRolloutInProgressError,
+    ScaleDownServersInvalidError,
 )
 from shared.models.server_lifecycle import ScaleDownMachine, ScaleDownPolicy
 from workflow_domains.server_lifecycle import scale_down_selection as selection
@@ -189,3 +190,85 @@ def test_a_machine_count_that_is_not_the_replicas_is_refused():
     refusal = selection.refusal([_machine("m1")], {"np-a": (3, 1)}, MARK)
     assert refusal is not None and refusal.error is NodePoolReplicasDriftError
     assert "3 replicas but 1 Machines" in refusal.message
+
+
+# --- the servers the request named (the operator, 2026-11-18) ---------------------------------
+
+
+def _servers(count: int = 4, **fields_by_machine) -> list[ScaleDownMachine]:
+    """m1 … m<count>, each server ocp-srv-<n>."""
+    machines = [_machine(f"m{n}", server=f"ocp-srv-{n}") for n in range(1, count + 1)]
+    return [m.model_copy(update=fields_by_machine.get(m.name, {})) for m in machines]
+
+
+def _named_refusal(machines, names: list[str], remove: int | None = None):
+    remove = len(names) if remove is None else remove
+    return selection.server_refusal(machines, "np-a", len(machines), remove, names, MARK)
+
+
+def test_named_servers_are_their_machines_in_the_requests_order():
+    machines = _servers()
+    names = ["OCP-SRV-3", "ocp-srv-1"]
+    assert _named_refusal(machines, names) is None
+    chosen = selection.choose_named(machines, "np-a", names)
+    assert [(c.machine, c.server, c.policy, c.reason) for c in chosen] == [
+        ("m3", "ocp-srv-3", "named", "named: OCP-SRV-3"), ("m1", "ocp-srv-1", "named", "named: ocp-srv-1"),
+    ]
+
+
+@pytest.mark.parametrize(("names", "remove"), [(["ocp-srv-1"], 2), (["ocp-srv-1", "ocp-srv-2"], 1)])
+def test_as_many_names_as_replicas_removed(names, remove):
+    refusal = _named_refusal(_servers(), names, remove)
+    assert refusal is not None and refusal.error is ScaleDownServersInvalidError
+    assert f"so {remove} server(s) leave; `server_names` names {len(names)}" in refusal.message
+
+
+def test_a_server_named_twice_is_refused():
+    refusal = _named_refusal(_servers(), ["ocp-srv-1", "OCP-SRV-1"])
+    assert refusal is not None and refusal.error is ScaleDownServersInvalidError and "more than once" in refusal.message
+
+
+def test_a_server_no_machine_is_is_refused_listing_the_nodepools():
+    machines = _servers(2) + [_machine("m3", server=None)]
+    refusal = _named_refusal(machines, ["ocp-srv-9"])
+    assert refusal is not None and refusal.error is ScaleDownServersInvalidError
+    assert "no Machine of NodePool np-a is server ocp-srv-9" in refusal.message
+    assert "ocp-srv-1 (m1), ocp-srv-2 (m2), m3 (server unknown)" in refusal.message
+
+
+def test_a_server_two_machines_claim_is_refused():
+    refusal = _named_refusal(_servers(m2={"server": "ocp-srv-1"}), ["ocp-srv-1"])
+    assert refusal is not None and refusal.error is ScaleDownServersInvalidError
+    assert "ocp-srv-1 (m1, m2)" in refusal.message
+
+
+def test_the_general_refusals_come_first():
+    refusal = _named_refusal(_servers(m4={"delete_mark": "yes"}), ["ocp-srv-1"])
+    assert refusal is not None and refusal.error is ScaleDownMarkConflictError
+
+
+def test_an_unhealthy_machine_capi_would_take_instead_is_refused():
+    refusal = _named_refusal(_servers(m1={"capi_healthy": False}), ["ocp-srv-2"])
+    assert refusal is not None and refusal.error is ScaleDownServersInvalidError
+    assert "ocp-srv-1 (m1) is unhealthy for CAPI" in refusal.message and "in place of ocp-srv-2 (m2)" in refusal.message
+
+
+@pytest.mark.parametrize("mark_priority", [50.0, 75.0, 80.0], ids=["4.18", "4.19-4.20", "capi-1.12"])
+def test_named_servers_that_pass_are_exactly_what_capi_removes(mark_priority):
+    """Every unhealthy set, every named set: a pass means CAPI takes the named ones in every version,
+    and a refusal for an unhealthy Machine means 4.18's CAPI would not have."""
+    import itertools
+
+    names = ["m1", "m2", "m3", "m4"]
+    subsets = list(itertools.chain.from_iterable(itertools.combinations(names, k) for k in range(5)))
+    for unhealthy in subsets:
+        machines = _servers(**{name: {"capi_healthy": False} for name in unhealthy})
+        for named in (s for s in subsets if s):
+            servers = [f"ocp-srv-{name[1:]}" for name in named]
+            refusal = _named_refusal(machines, servers)
+            picks = _capi_picks(machines, set(named), len(named), mark_priority)
+            if refusal is None:
+                assert picks == sorted(named), (unhealthy, named)
+            else:
+                assert "unhealthy for CAPI" in refusal.message
+                assert _capi_picks(machines, set(named), len(named), 50.0) != sorted(named), (unhealthy, named)

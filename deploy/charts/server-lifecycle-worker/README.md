@@ -404,16 +404,16 @@ workflow runs as before and update-nodepool fails at once on this MCE with
 
 `rbac.targetNamespaces` gets a Role each: everything add-server-to-mce and
 remove-server-from-mce do happens in an InfraEnv namespace — and uninstall-server-from-hc's
-`patch` on agents: its `redbull.io/uninstalling` label on the server's Agents,
-and the Agent provider's own unbind for an Agent whose Machine or AgentMachine
-a broken HyperShift deletion left behind. uninstall-server-from-hc reaches
+`patch` on agents: the Agent provider's own unbind for an Agent whose Machine
+or AgentMachine a broken HyperShift deletion left behind (and the
+`redbull.io/uninstalling` label a run started 2026-11-12 – 2026-11-17 still writes). uninstall-server-from-hc reaches
 further, so `rbac.hostedClusters` (default `true`) adds a **ClusterRole** —
 **a widening, and the widest grant in this chart**:
 
 | group / resource | verbs | why |
 |---|---|---|
-| `cluster.x-k8s.io` machines | get, list, delete, patch | the Machine behind a hosted node's Agent, found by owner, infrastructureRef or providerID; patch removes the Agent provider's pre-terminate hook from one whose AgentMachine is gone (the provider never can). update-nodepool's scale-down lists a NodePool's Machines (by `hypershift.openshift.io/nodePool`) and patches `cluster.x-k8s.io/delete-machine` onto the ones its policy chose |
-| `capi-provider.agent-install.openshift.io` agentmachines | get, list, delete, patch | found by its `status.agentRef` — the only link once the Agent provider starts unbinding; delete one left with no Machine, patch to drop the provider's finalizer it only drops through a Machine |
+| `cluster.x-k8s.io` machines | get, list, delete, patch | the Machine behind a hosted node's Agent, found by owner, infrastructureRef or providerID; patch removes the Agent provider's pre-terminate hook from one whose AgentMachine is gone (the provider never can). update-nodepool's scale-down lists a NodePool's Machines (by `hypershift.openshift.io/nodePool`) and patches `cluster.x-k8s.io/delete-machine` onto the ones it chose — named in the request or picked by a policy |
+| `capi-provider.agent-install.openshift.io` agentmachines | get, list, delete, patch | found by its `status.agentRef` — the only link once the Agent provider starts unbinding; delete one left with no Machine, patch to drop the provider's finalizer it only drops through a Machine. update-nodepool's scale-down by `server_names` gets each Machine's AgentMachine to reach its Agent (then `get` on that Agent through the InfraEnv namespace's Role) and so the server it is |
 | `hypershift.openshift.io` hostedclusters | get, list | found by its control-plane namespace; its `status.kubeconfig` |
 | `hypershift.openshift.io` nodepools | get, list | update-nodepool reads a HostedCluster's NodePools: replicas, InfraEnv, scale-down policy. Never written: a replicas change reaches a NodePool as a day1 commit Argo CD applies |
 | `""` secrets | get | the HostedCluster's admin kubeconfig — **every Secret on the MCE**; through it update-nodepool's scale-down also reads the hosted cluster's Nodes, Pods and `metrics.k8s.io` NodeMetrics |

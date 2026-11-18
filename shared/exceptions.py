@@ -858,9 +858,10 @@ class NodePoolNotFoundError(OrchestratorError):
 class NodePoolTargetInvalidError(OrchestratorError):
     """WORKFLOW-RAISED. The run names neither a NodePool nor an InfraEnv kind, or both.
 
-    update-nodepool scales EITHER a kind's NodePools to a total OR one NodePool
-    to a number. The API refuses anything else with a 422; this guards a run
-    started some other way. Nothing was read or written.
+    update-nodepool sets ONE NodePool to a number; the API takes `nodepool`
+    only since 2026-11-18, and a run recorded before may still carry an
+    `infra_env_kind` instead (a kind's NodePools to a total). Anything else
+    guards a run started some other way. Nothing was read or written.
     """
 
 
@@ -918,10 +919,24 @@ class ScaleNodePoolFailedError(OrchestratorError):
 class ScaleDownPolicyInvalidError(OrchestratorError):
     """WORKFLOW-RAISED. A NodePool names a scale-down policy that does not exist.
 
-    The NodePool's `redbull.io/scale-down-policy` label or annotation must be
-    `fewest-pods`, `least-requested` or `least-utilized` — or absent, when
-    CAPI picks the servers at random. Any other value is refused before
-    anything is marked or written; the message names the NodePool and value.
+    The NodePool's `redbull.io/scale-down-policy` label or annotation — read
+    when the request names no policy — must be `fewest-pods`,
+    `least-requested` or `least-utilized`, or absent, when CAPI picks the
+    servers at random. Any other value is refused before anything is marked
+    or written; the message names the NodePool and value.
+    """
+
+
+class ScaleDownServersInvalidError(OrchestratorError):
+    """WORKFLOW-RAISED. The servers update-nodepool's `server_names` names cannot be the ones that leave.
+
+    A scale-down that names its servers removes EXACTLY those (the operator,
+    2026-11-18), so it is refused, with nothing marked or written, when the
+    list is not as long as the replicas removed, names a server none of the
+    NodePool's Machines is (or two are), comes with a `scale_down_policy` as
+    well, or leaves a CAPI-unhealthy Machine that 4.18's CAPI would take in
+    place of a named one. Also when the MCE's worker predates the field and
+    cannot say which server a Machine is. The message says which.
     """
 
 

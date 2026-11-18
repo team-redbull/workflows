@@ -3,6 +3,12 @@
 Sandbox-safe like bond_selection.py: no I/O, no clock, nothing iterated in an
 order that is not fixed, because the workflow runs it on every replay.
 
+Only runs recorded with an `infra_env_kind` use it: the API takes one
+NodePool by name since 2026-11-18 (the operator: "no need infraenv kind").
+Delete it with the workflow's by-kind branch once
+`WorkflowType='UpdateNodePoolWorkflow' AND ExecutionStatus='Running'` lists
+no run started before that day — and its goldens with it.
+
   * belongs_to_kind — a NodePool is of InfraEnv kind K when the InfraEnv its
     agentLabelSelector names is `K`, or `K-` followed by anything
     (`K-zone-a`, `K-b2`). Nothing after the dash is interpreted, so a shorter

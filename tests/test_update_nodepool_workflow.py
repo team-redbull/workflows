@@ -5,6 +5,10 @@ call — the day1 read and commit, the NodePool read and Argo CD sync it
 re-registers from cluster-upgrade, and the scale-down's Machines. A small fake
 fleet holds day1, the MCE's NodePools and their Machines, so a commit followed
 by a sync is what moves the replicas the run reads back.
+
+The API takes ONE NodePool by name since 2026-11-18; `run_args` still
+defaults to an `infra_env_kind`, because runs recorded with one replay on
+this code and the by-kind tests below are what keeps that path honest.
 """
 
 from __future__ import annotations
@@ -50,6 +54,7 @@ from shared.models.server_lifecycle import (
     ScaleDownCandidates,
     ScaleDownCandidatesRequest,
     ScaleDownMachine,
+    ScaleDownPolicy,
     UpdateNodePoolInput,
     UpdateNodePoolRunArgs,
 )
@@ -96,6 +101,8 @@ class _Fleet:
         self.argo_applies = True
         self.watch_result = MarkedMachinesOutcome.DONE
         self.only_old_mce_limb = False
+        # A worker from before `server_names`: its candidates carry no `server` key.
+        self.candidates_without_servers = False
 
     def names(self) -> list[str]:
         return [name for name, _ in self.calls]
@@ -157,9 +164,12 @@ class _Fleet:
         async def read_scale_down_candidates(request: ScaleDownCandidatesRequest) -> ScaleDownCandidates:
             fleet.calls.append(("read_scale_down_candidates", request))
             wanted = {np.name for np in request.nodepools}
-            return ScaleDownCandidates(hcp_namespace=HCP, machines=[
-                m for m in fleet.machines.values() if m.nodepool in wanted
-            ])
+            machines = [m for m in fleet.machines.values() if m.nodepool in wanted]
+            if fleet.candidates_without_servers:
+                return _OldScaleDownCandidates(hcp_namespace=HCP, machines=[
+                    _OldScaleDownMachine(**m.model_dump(exclude={"server"})) for m in machines
+                ])
+            return ScaleDownCandidates(hcp_namespace=HCP, machines=machines)
 
         @activity.defn(name="mark_machines_for_deletion")
         async def mark_machines_for_deletion(request: MachineMarkRequest) -> MachineMarks:
@@ -206,6 +216,26 @@ class _OldHostedClusterState(BaseModel):
     nodepools: list[_OldNodePoolState] = Field(default_factory=list)
 
 
+class _OldScaleDownMachine(BaseModel):
+    """A ScaleDownMachine as a worker predating `server_names` sends it: no `server`."""
+
+    nodepool: str
+    namespace: str
+    name: str
+    deleting: bool = False
+    delete_mark: str | None = None
+    capi_healthy: bool = True
+    machine_set: str | None = None
+    node: str | None = None
+    node_found: bool = False
+    ready: bool = False
+
+
+class _OldScaleDownCandidates(BaseModel):
+    hcp_namespace: str
+    machines: list[_OldScaleDownMachine] = Field(default_factory=list)
+
+
 @workflow.defn(name="Blocker")
 class _Blocker:
     """Holds an id open, as a child already running there would."""
@@ -246,18 +276,21 @@ class _Harness:
 
 
 def run_args(
-    replicas: int, *, kind: str | None = KIND, mce: str = MCE, nodepool: str | None = None
+    replicas: int, *, kind: str | None = KIND, mce: str = MCE, nodepool: str | None = None,
+    policy: str | None = None, servers: list[str] | None = None,
 ) -> UpdateNodePoolRunArgs:
-    """By kind (the default), or by `nodepool` — which drops the kind unless one is given too."""
+    """By kind (the default: a recorded run's shape), or by `nodepool` — which drops the kind unless one is given too."""
     if nodepool is not None and kind == KIND:
         kind = None
     return UpdateNodePoolRunArgs(input=UpdateNodePoolInput(
-        mce_cluster=mce, cluster=CLUSTER, replicas=replicas, infra_env_kind=kind, nodepool=nodepool))
+        mce_cluster=mce, cluster=CLUSTER, replicas=replicas, infra_env_kind=kind, nodepool=nodepool,
+        scale_down_policy=ScaleDownPolicy(policy) if policy else None, server_names=servers,
+    ))
 
 
 async def _run(
     fleet: _Fleet, replicas: int, *, kind: str | None = KIND, mce: str = MCE, nodepool: str | None = None,
-    before=None,
+    policy: str | None = None, servers: list[str] | None = None, before=None,
 ):
     async with _Harness(fleet, mce) as client:
         if before is not None:
@@ -265,7 +298,7 @@ async def _run(
         return await asyncio.wait_for(
             client.execute_workflow(
                 UpdateNodePoolWorkflow.run,
-                run_args(replicas, kind=kind, mce=mce, nodepool=nodepool),
+                run_args(replicas, kind=kind, mce=mce, nodepool=nodepool, policy=policy, servers=servers),
                 id=f"update-nodepool-{uuid.uuid4()}",
                 task_queue=UPDATE_NODEPOOL_WORKFLOW_QUEUE,
             ),
@@ -624,3 +657,157 @@ class TestScalingDownByAPolicy:
         fleet = _Fleet((3, 3, 3), policies={"alpha-zone-a": "fewest-pods"})
         result = await _run(fleet, 8)  # zone-c shrinks, and names no policy
         assert "read_scale_down_candidates" not in fleet.names() and result.scale.chosen == []
+
+
+# --- what the request says about a scale-down (the operator, 2026-11-18) --------------------
+
+
+def _named_fleet(**machine_fields) -> _Fleet:
+    """(3, 3, 3): zone-c's Machines c1-c3 are servers ocp-r660-1 … 3 (1, 2, 3 pods); no policy anywhere."""
+    machines = [_machine(f"c{i}", server=f"ocp-r660-{i}", workload_pods=i) for i in (1, 2, 3)]
+    for name, fields in machine_fields.items():
+        machines = [m.model_copy(update=fields) if m.name == name else m for m in machines]
+    return _Fleet((3, 3, 3), machines=machines)
+
+
+class TestTheRequestsPolicy:
+    async def test_it_goes_ahead_of_the_nodepools_own(self):
+        # zone-c's own fewest-pods would take c2; the request's least-requested takes c1.
+        fleet = _policy_fleet(c1={"requested_permille": 100})
+        result = await _run(fleet, 2, nodepool="alpha-zone-c", policy="least-requested")
+        candidates = fleet.first("read_scale_down_candidates")
+        assert [(np.name, np.policy) for np in candidates.nodepools] == [
+            ("alpha-zone-c", ScaleDownPolicy.LEAST_REQUESTED)
+        ]
+        assert not candidates.with_servers
+        assert fleet.first("mark_machines_for_deletion").machines == ["c1"]
+        assert result.nodepools[0].scale_down_policy == "least-requested"
+        assert [(c.machine, c.policy) for c in result.scale.chosen] == [("c1", "least-requested")]
+
+    async def test_a_nodepool_naming_none_is_ranked_by_it(self):
+        fleet = _named_fleet()
+        await _run(fleet, 1, nodepool="alpha-zone-c", policy="fewest-pods")
+        assert fleet.first("mark_machines_for_deletion").machines == ["c1", "c2"]
+
+    async def test_it_stands_in_for_a_nodepool_value_that_is_no_policy(self):
+        fleet = _named_fleet()
+        fleet.policies["alpha-zone-c"] = "random"
+        result = await _run(fleet, 2, nodepool="alpha-zone-c", policy="fewest-pods")
+        assert [c.machine for c in result.scale.chosen] == ["c1"]
+
+
+class TestNamedServers:
+    async def test_exactly_the_named_servers_are_marked_then_pushed(self):
+        fleet = _named_fleet()
+        result = await _run(fleet, 1, nodepool="alpha-zone-c", servers=["OCP-R660-3", "ocp-r660-1"])
+
+        assert fleet.names() == [
+            "read_day1_nodepools", "read_hosted_cluster", "read_scale_down_candidates",
+            "mark_machines_for_deletion", "commit_day1_replicas", "sync_argo_application",
+            "read_hosted_cluster", "watch_marked_machines",
+        ]
+        candidates = fleet.first("read_scale_down_candidates")
+        # Nothing ranks, so no policy is asked for: the hosted cluster is not read.
+        assert candidates.with_servers and [(np.name, np.policy) for np in candidates.nodepools] == [
+            ("alpha-zone-c", None)
+        ]
+        mark = fleet.first("mark_machines_for_deletion")
+        assert (mark.machines, mark.mark) == (["c3", "c1"], DOWN_ID)
+        assert fleet.first("commit_day1_replicas").nodepool_replicas == {"alpha-zone-c": 1}
+        assert fleet.first("watch_marked_machines").marked == ["c3", "c1"]
+        assert [(c.machine, c.server, c.policy) for c in result.scale.chosen] == [
+            ("c3", "ocp-r660-3", "named"), ("c1", "ocp-r660-1", "named"),
+        ]
+        assert result.nodepools[0].scale_down_policy is None and result.ignored == []
+
+    async def test_the_nodepools_own_policy_does_not_apply(self):
+        fleet = _named_fleet()
+        fleet.policies["alpha-zone-c"] = "random"  # would be ScaleDownPolicyInvalidError by policy
+        result = await _run(fleet, 2, nodepool="alpha-zone-c", servers=["ocp-r660-2"])
+        assert [c.machine for c in result.scale.chosen] == ["c2"]
+
+    async def test_a_count_that_is_not_the_replicas_removed_starts_nothing(self):
+        fleet = _named_fleet()
+        error = await _failure(fleet, 1, nodepool="alpha-zone-c", servers=["ocp-r660-1"])
+        assert error.type == "ScaleDownServersInvalidError"
+        assert "alpha-zone-c goes from 3 to 1, so 2 server(s) leave" in error.message
+        assert fleet.names() == ["read_day1_nodepools", "read_hosted_cluster"]
+
+    async def test_a_server_no_machine_of_the_nodepool_is_writes_nothing(self):
+        fleet = _named_fleet()
+        error = await _failure(fleet, 2, nodepool="alpha-zone-c", servers=["ocp-r660-9"])
+        assert error.type == "ScaleNodePoolFailedError" and "ScaleDownServersInvalidError" in error.message
+        assert "server ocp-r660-9" in error.message and "ocp-r660-1 (c1)" in error.message
+        assert "mark_machines_for_deletion" not in fleet.names() and "commit_day1_replicas" not in fleet.names()
+
+    async def test_an_unhealthy_machine_capi_would_take_instead_is_refused(self):
+        fleet = _named_fleet(c1={"capi_healthy": False})
+        error = await _failure(fleet, 2, nodepool="alpha-zone-c", servers=["ocp-r660-2"])
+        assert "ScaleDownServersInvalidError" in error.message and "ocp-r660-1 (c1) is unhealthy" in error.message
+        assert "mark_machines_for_deletion" not in fleet.names() and "commit_day1_replicas" not in fleet.names()
+
+    async def test_naming_the_unhealthy_one_is_fine(self):
+        fleet = _named_fleet(c1={"capi_healthy": False, "node": None, "node_found": False})
+        result = await _run(fleet, 2, nodepool="alpha-zone-c", servers=["ocp-r660-1"])
+        assert [c.machine for c in result.scale.chosen] == ["c1"]
+
+    async def test_an_unhealthy_machine_capi_reaches_after_the_named_one_is_fine(self):
+        fleet = _named_fleet(c3={"capi_healthy": False})
+        result = await _run(fleet, 2, nodepool="alpha-zone-c", servers=["ocp-r660-2"])
+        assert [c.machine for c in result.scale.chosen] == ["c2"]
+
+    async def test_a_worker_that_cannot_say_which_server_is_named(self):
+        fleet = _named_fleet()
+        fleet.candidates_without_servers = True
+        error = await _failure(fleet, 2, nodepool="alpha-zone-c", servers=["ocp-r660-1"])
+        assert "ScaleDownServersInvalidError" in error.message and "predates `server_names`" in error.message
+        assert "mark_machines_for_deletion" not in fleet.names()
+
+    async def test_someone_elses_mark_stops_it_before_anything_is_written(self):
+        fleet = _named_fleet(c3={"delete_mark": "yes"})
+        error = await _failure(fleet, 2, nodepool="alpha-zone-c", servers=["ocp-r660-1"])
+        assert "ScaleDownMarkConflictError" in error.message and "commit_day1_replicas" not in fleet.names()
+
+    async def test_a_refused_commit_takes_the_marks_off_again(self):
+        fleet = _named_fleet()
+        fleet.commit_error = Day1FileChangedError("someone else changed it")
+        await _failure(fleet, 2, nodepool="alpha-zone-c", servers=["ocp-r660-1"])
+        assert fleet.names()[-2:] == ["commit_day1_replicas", "unmark_machines"]
+        assert fleet.machines["c1"].delete_mark is None
+
+    async def test_a_rerun_naming_another_server_takes_the_earlier_mark_off_first(self):
+        fleet = _named_fleet(c1={"delete_mark": DOWN_ID})
+        result = await _run(fleet, 2, nodepool="alpha-zone-c", servers=["ocp-r660-2"])
+        assert [c.machine for c in result.scale.chosen] == ["c2"]
+        names = fleet.names()
+        assert names.index("unmark_machines") < names.index("mark_machines_for_deletion")
+        assert fleet.first("unmark_machines").machines == ["c1"] and fleet.machines["c1"].delete_mark is None
+
+    async def test_with_a_policy_as_well_nothing_is_read(self):
+        fleet = _named_fleet()
+        error = await _failure(fleet, 2, nodepool="alpha-zone-c", policy="fewest-pods", servers=["ocp-r660-1"])
+        assert error.type == "ScaleDownServersInvalidError" and fleet.names() == []
+
+
+class TestScaleDownFieldsWhenNothingScalesDown:
+    """Sent with a scale-up or no change, they are ignored and the result says so — never a failure."""
+
+    async def test_a_scale_up_ignores_named_servers(self):
+        fleet = _named_fleet()
+        result = await _run(fleet, 5, nodepool="alpha-zone-c", servers=["ocp-r660-1"])
+        assert result.direction == "up" and fleet.day1["alpha-zone-c"] == 5
+        assert "read_scale_down_candidates" not in fleet.names() and "mark_machines_for_deletion" not in fleet.names()
+        assert result.ignored == ["server_names ocp-r660-1: the NodePool scales up"]
+
+    async def test_a_scale_up_ignores_a_policy(self):
+        result = await _run(_named_fleet(), 4, nodepool="alpha-zone-c", policy="least-utilized")
+        assert result.direction == "up" and result.ignored == [
+            "scale_down_policy least-utilized: the NodePool scales up"
+        ]
+        assert result.nodepools[0].scale_down_policy is None
+
+    async def test_no_change_ignores_them_whatever_their_count(self):
+        result = await _run(_named_fleet(), 3, nodepool="alpha-zone-c", servers=["ocp-r660-1", "ocp-x"])
+        assert result.direction == "none" and result.ignored == [
+            "server_names ocp-r660-1, ocp-x: nothing scales down, the replicas are already alpha-zone-c 3"
+        ]

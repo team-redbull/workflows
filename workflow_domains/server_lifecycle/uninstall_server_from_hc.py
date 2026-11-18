@@ -52,10 +52,10 @@ Shape of the run (the `progress` query exposes the phase and the MCE's queue):
                            to take the host out of it through).
   4. reserving-server    — server-scan's install lock, holder `uninstall-server-from-hc`,
                            ALWAYS, before any write (below for why).
-     marking-agent       — every Agent of the host labelled
-                           `redbull.io/uninstalling: "true"`, the first write: a
-                           NodePool whose agentLabelSelector excludes it never
-                           takes this server again (below).
+                           (marking-agent — every Agent labelled
+                           `redbull.io/uninstalling: "true"` — ran here from
+                           2026-11-12 and was removed on 2026-11-17, the
+                           operator; only runs recorded in between still label.)
   5. the hosted-cluster half, for a hosted node — or what is left of one —
        draining-node             a Node with NO Machine behind it is drained by
                                  nobody else (CAPI drains only its Machine's
@@ -148,19 +148,15 @@ still wants the same number of nodes: its MachineSet creates a replacement
 Machine and the Agent provider binds ANOTHER free Agent the NodePool matches —
 the hosted cluster keeps its size, on a different server. The provider takes
 ANY free Agent its NodePool's agentLabelSelector matches (`findAgent`), this
-server's own once released — so right after the lock the run labels every
-Agent of the server `redbull.io/uninstalling: "true"` (the operator,
-2026-11-12), and a NodePool whose selector carries
-`matchExpressions: [{key: redbull.io/uninstalling, operator: DoesNotExist}]`
-takes another server, or waits for one. The provider reads the selector only
-when it picks a free Agent, so the node keeps running until its Machine goes;
-the label goes with the Agent, which remove-server-from-mce deletes, and a
-re-install registers a new Agent without it. For a NodePool WITHOUT that
-expression, when this server is its only free Agent, the replacement takes it
-back, and the run stops with AgentRetakenError rather than release it again
-from a Machine the provider is installing. A Machine someone else already
-started deleting is waited on, and step 4's delete is a no-op. Runs recorded
-before `uninstall-server-mark-agents-uninstalling` label nothing.
+server's own once released — so when this server is its only free Agent, the
+replacement takes it back, and the run stops with AgentRetakenError rather
+than release it again from a Machine the provider is installing. A Machine
+someone else already started deleting is waited on, and step 5's delete is a
+no-op. The run does NOT label the Agent to keep NodePools off it: it did,
+`redbull.io/uninstalling: "true"` right after the lock, from 2026-11-12 until
+the operator removed it on 2026-11-17 (`uninstall-server-no-agent-mark`). A run
+recorded with `uninstall-server-mark-agents-uninstalling` and without that
+patch still labels, and its failures still say how to take the label off.
 
 WHY THE LOCK, EVEN FOR AN UNINSTALL. Two server-scan jobs see this machine
 and neither sees the whole move: the hosted cluster's nodes job frees it the
@@ -181,8 +177,7 @@ installed the machine, typically, until its run sees server-scan report the
 machine (usually 5-15 min, at most a day) — fails the run before anything is
 written.
 
-WHAT IS NEVER DONE: no NodePool change (the label is on the Agent; the
-selector that honours it is the NodePool's own, in day1); no drain or Node
+WHAT IS NEVER DONE: no NodePool change; no label of our own; no drain or Node
 delete where CAPI can still do it (only for a Node no Machine stands behind, and a Node is deleted
 only once NotReady); no finalizer or hook of anyone but the Agent provider's;
 no PXE map write (remove-server-from-mce's); no undo — a Machine delete cannot be
@@ -390,6 +385,9 @@ _ALWAYS_REMOVE_PATCH = "uninstall-server-from-hc-always-removes"
 # lock. Runs recorded before it go from the lock straight to the hosted-cluster
 # half (or the inventory recheck).
 _MARK_AGENTS_PATCH = "uninstall-server-mark-agents-uninstalling"
+# Retires that label (the operator, 2026-11-17): every run started since labels
+# nothing. A run recorded with the patch above and without this one still does.
+_NO_MARK_AGENTS_PATCH = "uninstall-server-no-agent-mark"
 # The leftover flow can drain a lost Node AND wait out a Machine drain, and
 # verifies three things after the unbind instead of two.
 _LEFTOVERS_RESERVATION_TTL = (
@@ -578,10 +576,14 @@ class UninstallServerFromHcWorkflow:
             await self._reserve(
                 request, membership, host, activity_queue, ttl=_LEFTOVERS_RESERVATION_TTL
             )
-            # Step 2c — no NodePool that excludes the label takes this server
-            # again. Not on an old run kept in the inventory: it stays a free
-            # Agent there, and the label would keep those NodePools off it.
-            if not self._keep_inventory and workflow.patched(_MARK_AGENTS_PATCH):
+            # Step 2c, on a run recorded while it existed only — the Agents
+            # labelled UNINSTALLING_AGENT_LABEL. Never on an old run kept in
+            # the inventory: it stays a free Agent there.
+            if (
+                not self._keep_inventory
+                and not workflow.patched(_NO_MARK_AGENTS_PATCH)
+                and workflow.patched(_MARK_AGENTS_PATCH)
+            ):
                 await self._mark_agents(host, result, skipped, activity_queue)
             if hosted_agent is not None or nodes:
                 await self._clear_hosted_cluster(
@@ -696,8 +698,13 @@ class UninstallServerFromHcWorkflow:
             raise ApplicationError(
                 f"{request.server_name} was taken while the run was taking it out of the "
                 f"inventory of MCE {request.mce_cluster}: {held}. A free Agent is what a "
-                "NodePool's new Machine takes — unless its agentLabelSelector excludes "
-                f"{UNINSTALLING_AGENT_LABEL}. {nothing} — re-run to take it out of that hosted "
+                "NodePool's new Machine takes"
+                + (
+                    f" — unless its agentLabelSelector excludes {UNINSTALLING_AGENT_LABEL}"
+                    if self._marked
+                    else ""
+                )
+                + f". {nothing} — re-run to take it out of that hosted "
                 "cluster as well, or leave it to install." + self._marked_note(),
                 type=AgentRetakenError.__name__,
             )
@@ -1616,9 +1623,13 @@ class UninstallServerFromHcWorkflow:
                     "other. Nothing further was changed, and the run does not fight the "
                     "NodePool for the host. Free another Agent the NodePool matches (or lower "
                     "its replicas), then re-run: it deletes the replacement Machine and the "
-                    "NodePool takes the other Agent. A NodePool whose agentLabelSelector "
-                    f"excludes {UNINSTALLING_AGENT_LABEL} never takes a server this run "
-                    "labelled",
+                    "NodePool takes the other Agent"
+                    + (
+                        f". A NodePool whose agentLabelSelector excludes "
+                        f"{UNINSTALLING_AGENT_LABEL} never takes a server this run labelled"
+                        if self._marked
+                        else ""
+                    ),
                     type=AgentRetakenError.__name__,
                 )
             released = not agent.cluster_deployment and not agent.agent_machine_label

@@ -112,13 +112,24 @@ The prod charts are vendored into the Argo CD repo, not this one:
 | `redbull-platform/gitops/charts/segment-lifecycle-worker/` | the `segment-lifecycle-worker` limb |
 | `redbull-platform/gitops/charts/server-lifecycle-worker/` | the `server-lifecycle-worker` limb |
 | `redbull-platform/gitops/charts/server-provisioning-worker/` | the `server-provisioning-worker` limb — no `gitops/services/` entry yet, so nothing deploys it |
-| `redbull-platform/gitops/charts/vm-lifecycle-worker/` | the `vm-lifecycle-worker` limb (create-vm) — ONE release on the hub for every zone; needs the `kv-capacity-token` and `kv-vm-api-token` Secrets and reads the shared `redbull-git-token` — not on redbull-platform's `main` yet, so CI's image bump fails until it is |
-| `redbull-platform/gitops/charts/cluster-lifecycle-worker/` | the `cluster-lifecycle-worker` limb (provision-cluster) — ONE release on the hub; reads the shared `redbull-git-token` (day1 push + its provider's merge-request API, the day2 sig repos) and names the `shortcuts-api-token` Secret — not on redbull-platform's `main` yet either |
+| `redbull-platform/gitops/charts/vm-lifecycle-worker/` | the `vm-lifecycle-worker` limb (create-vm) — ONE release on the hub for every zone; needs the `kv-capacity-token` and `kv-vm-api-token` Secrets and reads the shared `redbull-git-token` |
+| `redbull-platform/gitops/charts/cluster-lifecycle-worker/` | the `cluster-lifecycle-worker` limb (provision-cluster) — ONE release on the hub; reads the shared `redbull-git-token` (day1 push + its provider's merge-request API, the day2 sig repos) and names the `shortcuts-api-token` Secret |
 | `redbull-platform/gitops/charts/cluster-upgrade-worker/`, `.../upgrade-agent-worker/` | cluster-upgrade's per-MCE limbs, copied from `deploy/charts/` here by CI (`sync-upgrade-charts`) on every `main` push that changes them — no `gitops/services/` entry yet |
 | `redbull-platform/gitops/charts/upgrade-gitops-worker/` | cluster-upgrade's hub limb (its only copy) — no `gitops/services/` entry yet |
 
 Every image built on `main` is tagged `vX.Y.Z` by the shared build workflow, which writes the
 tag into that chart's `values.yaml`; a branch build is tagged `<branch-slug>-<short sha>`.
+CI (`.github/workflows/build.yml`) builds an image only when a file it loads changed
+(`scripts/image_changes.py`): the brain first, then every other changed image at the same
+time, one job each (`.github/image-builds.json` holds every image's build inputs), so one
+image's failure stops no other. A change that only decides how CI runs (`build.yml`, the
+scripts, their tests) rebuilds nothing, and a change to `.github/image-builds.json`
+rebuilds only the images whose row changed. Each `main` run that changes an image
+publishes a GitHub Release of this repo, `release-<date>-<short sha>`
+(`scripts/release_notes.py`): every image rebuilt since the previous release, with its new
+version, the one it replaces, its digest and the commits that changed it, and every image
+that was not, at the version it stays at. The first release is a baseline: every image at
+its current version. A branch run shows the same page as its run summary.
 
 Worker-file naming convention: the workflow (brain) worker is
 `workflow_domains/main_worker_init.py`; each activity domain's worker is
@@ -825,7 +836,7 @@ they are up, a run waits with every cluster `no-agent`.
 ### `provision-cluster` — a hosted cluster from the YAML a person wrote
 
 The body **is the hosted-cluster file**, as a person would commit it to day1 —
-without `vlanId`, `dhcp_values` or `mcConfigMap`; the cluster and its MCE folder
+without `vlanId`, `dhcp_values`, `mcConfigMap` or `tuningConfigmap`; the cluster and its MCE folder
 are query parameters (Swagger's "Try it out" shows this file pre-filled):
 
 ```
@@ -859,7 +870,8 @@ awaited child** (a /24 at the folder's site, verified), the text plus the
 allocation block is pushed to `provision-cluster/<cluster>` (created from main
 by the push, **no `[skip ci]`**: the day1 CI chain runs on the branch, skips
 allocation, renders the MachineConfigs and pushes its own `mcConfigMap` commit
-on top), the merge request is opened (GitLab's API, with
+on top, with `tuningConfigmap` — the tuning profiles the nodepools'
+`tuningConfig` names, from day1's `tuning/` catalogue), the merge request is opened (GitLab's API, with
 `remove_source_branch`), and the run **waits
 for a person to merge it** — no deadline, a 5-minute durable timer, continued
 as new every 48 polls so history stays short. After the merge it registers the
@@ -873,7 +885,7 @@ is past its merge) — and completes. A merge request closed without merging
 fails the run.
 
 Re-running the same cluster converges: the branch's file is compared
-semantically (the chain's `mcConfigMap` set aside), the open merge request is
+semantically (the chain's `mcConfigMap` and `tuningConfigmap` set aside), the open merge request is
 found, folders already there are success. A cluster already on `main` fails
 `ClusterAlreadyProvisionedError` at once; a second request while a run waits
 for its merge is a 409. See `docs/design/provision-cluster.md` and the
@@ -1106,8 +1118,10 @@ are installed there with plain `-n redbull-workflows` (no `--create-namespace`).
 ## Deploying elsewhere (e.g. air-gapped OpenShift)
 
 In the cluster this is Argo CD's job: the charts are vendored in redbull-platform
-and pushing its `main` deploys. To install by hand, push the two worker images to
-a registry the cluster can pull from, then:
+and pushing its `main` deploys. What to mirror is in this repo's GitHub Releases: each
+lists the images it rebuilt under "To pull" and every image at that release, each as
+`ghcr.io/team-redbull/<image>:<version>@<digest>`. To install by hand, push the two
+worker images to a registry the cluster can pull from, then:
 
 ```bash
 # The brain owns workflows-orchestrator-config (the global values), so install it first.

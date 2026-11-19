@@ -101,8 +101,9 @@ def parse_cluster_file(body: bytes) -> str:
             "required": True,
             "description": (
                 "The hosted-cluster YAML file, as a person would commit it to day1 — WITHOUT vlanId, "
-                "dhcp_values or mcConfigMap: the run appends the allocation, the day1 CI chain the "
-                "MachineConfigs. Sent verbatim; comments and layout reach day1 unchanged."
+                "dhcp_values, mcConfigMap or tuningConfigmap: the run appends the allocation, the day1 "
+                "CI chain the MachineConfigs and the tuning profiles. Sent verbatim; comments and layout "
+                "reach day1 unchanged."
             ),
             "content": {
                 YAML_CONTENT_TYPE: {

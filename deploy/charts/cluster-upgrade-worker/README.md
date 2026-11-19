@@ -41,9 +41,9 @@ helm upgrade --install cluster-upgrade-worker <chart dir> \
 `<chart dir>`: this chart, in the workflows repo at `deploy/charts/cluster-upgrade-worker/` or
 its copy in redbull-platform at `gitops/charts/cluster-upgrade-worker/`.
 
-`<vX.Y.Z>`: a version tag. Every push to `main` that touches `activities/` or `shared/`
-publishes `ghcr.io/team-redbull/cluster-upgrade-worker:vX.Y.Z` (`build-cluster-upgrade-worker`,
-the shared build workflow), writes that tag into redbull-platform's copy
+`<vX.Y.Z>`: a version tag. Every push to `main` that changes a file this limb loads
+publishes `ghcr.io/team-redbull/cluster-upgrade-worker:vX.Y.Z` (its job in CI's `build` matrix,
+on the shared build workflow), writes that tag into redbull-platform's copy
 (`gitops/charts/cluster-upgrade-worker/values.yaml`, `image.tag`) and tags redbull-platform
 `cluster-upgrade-worker/vX.Y.Z`. Installed from redbull-platform's copy, leave `image.tag`
 unset to get the newest. A branch build is tagged `<branch-slug>-<short sha>` and written

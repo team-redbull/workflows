@@ -24,9 +24,9 @@ every teammate; use them in this order and keep them in step:
   can be checked from source (sandbox imports, activity-call options, unbounded retries
   named through exception classes, no whole response body in an activity error,
   `ApplicationError` from workflow code, one `run()`
-  argument, `connect_temporal` only, interface ↔ implementation ↔ worker registration,
-  `_WORKER_SPECS`, router paths and 202s, Dockerfile CMDs, CI jobs each gated on their own
-  image, a settings package that re-exports nothing, a docs page per started workflow). It runs on every Edit/Write through the PostToolUse hook in
+  argument, `connect_temporal` only, git only through `activities/git_repo.py`'s `fresh_clone`, interface ↔ implementation ↔ worker registration,
+  `_WORKER_SPECS`, router paths and 202s, Dockerfile CMDs, each limb's row in CI's build matrix
+  naming its own image and chart, a settings package that re-exports nothing, a docs page per started workflow). It runs on every Edit/Write through the PostToolUse hook in
   `.claude/settings.json` (which also names the docs pages describing the edited file),
   as `tests/test_conventions.py`, and in CI's `test` job, which every image build needs.
 
@@ -89,8 +89,8 @@ all domains), `segment-lifecycle-worker`, `server-lifecycle-worker` and `server-
 and `upgrade-gitops-worker` (since 2026-11-02; with `server-provisioning-worker`, these have no
 `gitops/services/` entry yet, so CI bumps their tags and Argo CD deploys nothing), and
 `vm-lifecycle-worker` (written 2026-11-05) and `cluster-lifecycle-worker` (written 2026-11-11), both
-in redbull-platform's working tree until pushed: CI's bump of each fails until then, so their jobs
-are the LAST two in the chain. One generic ApplicationSet
+on redbull-platform's `main` since (CI's bump of each failed until then; a failing bump now stops
+no other image, §9). One generic ApplicationSet
 sweeps `gitops/services/<service>/app.yaml`, so the service FOLDER NAME is the Argo app name,
 the chart path and the release name at once. There is no per-environment values layer — a
 chart's own `values.yaml` is exactly what the cluster runs — and pushing redbull-platform's
@@ -881,7 +881,7 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
     on it. NOT filtered by day1 `platform: kubevirt` — that key means a cluster whose NODES are VMs.
     The folder is built from VALIDATED tokens and read with `iterdir()`, never globbed with input.
   - **The day1 reader is SHARED, in `activities/day1_repo.py` next to `git_repo.py`, owned by no
-    domain** (clone/head/blob, the layer-merging `load_cluster_values` with its `ClusterValues`,
+    domain** (`fresh_main` — a `git_repo.Clone` of `main` — the layer-merging `load_cluster_values` with its `ClusterValues`,
     `list_cluster_files`): vm-lifecycle's `list_kv_clusters` and upgrade-gitops's `read_cluster`
     both build on it, and neither limb imports the other's domain for it (the operator,
     2026-11-05 — it first sat in `activities/vm_lifecycle/`, "owned by create-vm", which made the
@@ -1075,8 +1075,8 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   queue and `SegmentConversionConflictError`). The per-type things that remain are all about an
   ALLOCATION: the allocate id, the SM's (cluster, site, type) idempotency, the DHCP exclusion policy.
 - **The day1 values repo is reached by git subprocess** (`DAY1_REPO_URL`), never a Python git
-  dependency — see §5. ONE git client, `activities/git_repo.py`, shared by segment-lifecycle
-  (`values_repo.py` keeps its own names for it) and the cluster-upgrade hub limb.
+  dependency — see §5. ONE git client, `activities/git_repo.py`, shared by every limb that clones
+  (cluster-lifecycle, upgrade-gitops, vm-lifecycle; segment-lifecycle no longer touches git).
 - **The cluster-upgrade hub limb (`upgrade-gitops-worker`) works on `main` only**: Argo CD
   renders nothing else. It reads the rules after day1's own `scripts/validate_upgrade_rules.py`
   passed them, and a cluster file the way the hostedclusters-setup chart renders it — the value
@@ -1111,7 +1111,7 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   `sites/*/mces/`, never derived). The run: (1) `inspect_cluster_target` at day1 `main` — the folder,
   no file of that name there yet, and the text judged against the merged value layers the way the
   chart renders them (REQUIRED `mastertag`, non-empty `nodepool`, `owner.{merkaz,anaf,mador}`;
-  FORBIDDEN `vlanId`, `dhcp_values`, `mcConfigMap`, `AutomateAllocation`; `clusterName` only equal to
+  FORBIDDEN `vlanId`, `dhcp_values`, `mcConfigMap`, `tuningConfigmap`, `AutomateAllocation`; `clusterName` only equal to
   the derived one; config names DNS-1123 labels; `configs` OPTIONAL per pool — a KubeVirt pool has
   none) — EVERY reason in one `ClusterValuesRejectedError`; (2) allocate-segment as an AWAITED
   child (§5); (3) the text plus the allocation block (`vlanId`, `dhcp_values` with the type's
@@ -1139,8 +1139,10 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   CI chain's** (the operator, 2026-11-11, deferring the chart-at-sync design in
   `~/.claude/plans/mc-sources-rendered-at-sync.md`): the chain runs on the branch, skips allocation
   (`vlanId` is there), renders the MachineConfigs and pushes `CI: Update mcConfigMap from mc-files
-  [skip ci]` on top — so the workflow NEVER writes `mcConfigMap`, and a re-run's publish compares
-  the branch file SEMANTICALLY (its YAML mapping with `mcConfigMap` dropped) against this run's text,
+  [skip ci]` on top — so the workflow NEVER writes `mcConfigMap`, nor `tuningConfigmap`, the tuning
+  profiles (Tuned, PerformanceProfile) the chain injects in the same commit from day1's `tuning/`
+  catalogue by the nodepools' `tuningConfig` names — and a re-run's publish compares the branch file
+  SEMANTICALLY (its YAML mapping with both chain keys dropped, `CHAIN_APPENDED_KEYS`) against this run's text,
   `changed=False` when equal, `ClusterFileConflictError` otherwise; never byte-for-byte, the
   injector re-spaces blank lines too. Nothing is undone on failure: the allocation is idempotent,
   the branch and the merge request converge on a re-run, day2 folders are "already there = success".
@@ -1332,18 +1334,28 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   add-server-to-mce run failed at `acquire_servers` because `server_scan._detail` copied an error
   answer of more than 2 MiB whole (reproduced on a local dev server; server-scan's own `main` cannot
   send one, so it came from whatever answered at `SERVER_SCAN_URL`).
-- **Git-subprocess activities** (`activities/git_repo.py`, used by cluster-lifecycle's
-  `day1_writer.py` / `day2_sigs.py` and by upgrade-gitops): git runs via
+- **Git-subprocess activities** (checker AC008; `activities/git_repo.py`, THE one git client: cluster-lifecycle's
+  `day1_writer.py` / `day2_sigs.py`, upgrade-gitops's day1/day2/Brain modules and vm-lifecycle, the
+  day1 reads through `activities/day1_repo.py`; no other module runs git): git runs via
   `asyncio.create_subprocess_exec` (no Python git dependency; the limb Dockerfile installs the binary),
-  each command under a timeout below the git activities' 180s `start_to_close_timeout`, every clone in
-  a fresh `TemporaryDirectory` so retries start clean. The push token is injected into the clone URL in
+  each command under a timeout below the git activities' 180s `start_to_close_timeout`. A caller opens
+  ONE `git_repo.fresh_clone(...)` per attempt (day1 `main`: `day1_repo.fresh_main`) — a fresh
+  `TemporaryDirectory`, so retries start clean — and works through the `Clone` it yields (`head`,
+  `blob`, `commit_and_push`, `run_command`). Only what is GIT lives there: which file, and what
+  "already done" means (create-never-overwrite, a blob compare-and-set, a folder present), stays in
+  the limb's own module, inside the same clone as its push. Never generic git ACTIVITIES — a clone
+  cannot cross activities, the check must share the push's clone, and one git worker would hold every
+  limb's token (§2). The push token is injected into the clone URL in
   memory only and SCRUBBED from every error message BEFORE the exception is constructed — activity
   errors are recorded verbatim in Temporal history and the UI, so redacting at the logging layer alone
-  is too late. The branch is a parameter from an unauthenticated API, so every clone first runs
+  is too late. Every clone first runs
   `git ls-remote --exit-code --heads <url> refs/heads/<branch>` (the FULL ref — a bare pattern
-  tail-matches): exit 2 is the deterministic `ValuesBranchNotFoundError`, any other failure the
-  retryable `ValuesRepoGitError` (unreachable is not missing). Without it a mistyped branch would
-  retry forever as a clone failure.
+  tail-matches): exit 2 is `ValuesBranchNotFoundError`, any other failure `ValuesRepoGitError`
+  (unreachable is not missing). The CALLER classifies both: the workflows retry a missing branch
+  (`main`, a sig's default branch, provision-cluster's own branch just checked — a repo to fix, not a
+  run to fail; `tests/test_error_classification.py`), and upgrade-gitops's `write_incident` turns it
+  into a note (Brain never holds a gate). Its non-retryable caller was allocate-segment's
+  caller-named branch, gone since 2026-11-11 (§4).
 - **Cross-workflow orchestration — two shapes, chosen by whether the parent's OUTCOME depends on
   the child.** A FAN-OUT (one run per item, each answering to its own id and failure, the /bulk
   philosophy) starts siblings DETACHED: `workflow.start_child_workflow(...,
@@ -1373,7 +1385,7 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   segments that could not have a live sibling removed the problem outright. Apply the same move to the
   next such interaction rather than adding detection.
 - **Evolving a model that crosses the boundary — history and a lagging limb both hold OLD payloads.**
-  CI ships the brain BEFORE the limb (`build.yml`: the limb job `needs` the brain's), and every
+  CI ships the brain BEFORE the limb (`build.yml`: the limbs' `build` job `needs` the brain's), and every
   in-flight run replays payloads recorded by the previous code. So (a) a field ADDED to a model an
   activity RETURNS is simply absent from those payloads: a workflow check on it gates on
   `"field" in model.model_fields_set` — the key's presence — never on its value, or replay fails the
@@ -1599,8 +1611,7 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   `redbull-git-token` Secret and never renders it) and `gitops/charts/cluster-lifecycle-worker/`
   (provision-cluster's hub limb: ConfigMap + limb + SA, `automountServiceAccountToken: false`; it
   NAMES `redbull-git-token` for `REDBULL_GIT_TOKEN`, the one group token for day1 and the sigs;
-  `build-vm-lifecycle-worker` and `build-cluster-lifecycle-worker` are the last two in CI's
-  sequential chain). This repo ships the PER-MCE limbs' charts, written to be copied into
+  both built by CI's `build` matrix like every limb, §9). This repo ships the PER-MCE limbs' charts, written to be copied into
   redbull-platform for Argo CD (example ApplicationSet in `deploy/argocd/`):
   `deploy/charts/server-lifecycle-worker/`, `deploy/charts/cluster-upgrade-worker/` and
   `deploy/charts/upgrade-agent-worker/` — the last two copied into redbull-platform's
@@ -1623,9 +1634,8 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   (applications get/list/patch — list for a lab cluster's day2 Applications, D27) and one on ConfigMap
   `hypershift/supported-versions`. Never a write to a
   HostedCluster or NodePool (DESIGN D1). **The three cluster-upgrade images are VERSION-TAGGED like
-  every other** (the operator, 2026-11-02: "use tags and not commit sha"): `build-cluster-upgrade-worker`,
-  `build-upgrade-agent-worker` and `build-upgrade-gitops-worker` run the reusable workflow at the
-  end of the sequential chain, so a `main` build publishes `vX.Y.Z`, bumps `image.tag` in
+  every other** (the operator, 2026-11-02: "use tags and not commit sha"): each is a row of
+  `.github/image-builds.json`, built by the reusable workflow in CI's `build` matrix, so a `main` build publishes `vX.Y.Z`, bumps `image.tag` in
   redbull-platform's `gitops/charts/<limb>-worker/values.yaml` and tags `<limb>-worker/vX.Y.Z`
   there. Until 2026-11-02 they were image-only jobs tagged `<branch-slug>-<short sha>` with the tag
   set by hand; do not go back to that. None of the three has a `gitops/services/` entry yet, so
@@ -1641,16 +1651,75 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   requirements; `tests/test_image_changes.py` imports each entrypoint in a fresh interpreter and
   checks that everything really loaded is in that set, so the script can over-build, never
   under-build. WHEN IT CANNOT TELL, IT BUILDS WIDE: a data file in a copied folder (the UI pages'
-  `index.html`), a deleted or renamed path, a module that does not parse, the script itself,
-  `build.yml`, `.dockerignore`, a crash of the script. An interface (`shared/interfaces/<limb>.py`)
+  `index.html`), a deleted or renamed path, a module that does not parse, `.dockerignore`, a crash
+  of the script. **What only decides how CI runs is NO image's input** (the operator, 2026-11-16,
+  narrowing the rule above: until then `build.yml`, the build rows and the script itself rebuilt
+  every image, so a CI-only change gave all ten a new version with the same contents, ten images
+  to mirror for nothing): `build.yml`, `image_changes.py`, `release_notes.py` and their tests
+  rebuild nothing, and `.github/image-builds.json` rebuilds the images whose ROW changed, the
+  base's rows against today's, as data (`--base`; a reformat or reorder changes no row; a base
+  from before that file is read from its `build.yml`, whose jobs then held the same inputs; rows
+  unreadable at the base build every image). That holds because every input an image's build
+  gets is in its row, `build.yml` none (`tests/test_image_builds.py`). So a fix to how the script
+  finds an image's files rebuilds nothing by itself: the image it under-built waits for its next
+  change; change `.dockerignore` to rebuild every image on purpose. An interface (`shared/interfaces/<limb>.py`)
   is loaded by the BRAIN only — the limb registers by name and never imports it. Each limb image
   still CONTAINS the whole `activities/` tree (the Dockerfile's COPY); it is not rebuilt for files
-  it never imports. Each build job asks for its OWN image name in the one `images` list (checker
-  DL002), so a new limb is found from its Dockerfile and registers nowhere. **The diff base is the
+  it never imports. Every image is a row of `.github/image-builds.json` (the reusable workflow's
+  five inputs for it, `chart-repo` included); `image_changes.py --first` hands
+  `build-workflow-brain` the brain's row and `--matrix` hands the `build` job every other listed
+  image's, so the workflow never decides a second time (checker DL002: a limb's row names its own
+  image and chart). A new limb is found from its Dockerfile and adds only that row. **The diff base is the
   last push on the branch whose WHOLE run succeeded**, not the previous push: with per-image
   precision an image whose build failed, or whose push GitHub skipped (a CI-skip marker in the
   message), would otherwise stay stale until its own files changed again. `python3
   scripts/image_changes.py --table` prints which images load each file.
+- **CI builds the brain FIRST, then every other changed image AT ONCE** (the operator's request,
+  2026-11-16; until then
+  ten jobs in one sequential chain, each waiting for the one before: a run that built every image
+  took the sum of their builds, and one failure skipped every image behind it). `build-workflow-brain`
+  runs alone because the brain is deployed before any limb (§5); `sync-upgrade-charts` runs beside
+  it, so a chart still lands before its image (§8); then `build`, one matrix job per changed
+  image, `fail-fast: false`: a failing image stops no other and is rebuilt by a later push (the
+  diff base above). A brain or a chart sync that FAILED keeps every other image back; one that was
+  SKIPPED (not in the push) does not. **At most three at a time**: each job ends by pushing its
+  bump to the same redbull-platform `main`, and the reusable workflow retries a rejected push only
+  five times — with n jobs pushing together one loses at most n-1 times — so raising it waits on a
+  sturdier retry in `team-redbull/.github`. Runs of `build.yml` on one branch are serialized
+  (`concurrency`), because two `main` runs at once would read the same latest `<chart>/vX.Y.Z` and
+  publish one version twice; a waiting run GitHub cancels loses nothing, its change is in the next
+  run's range.
+- **Every `main` run that changes an image is a GitHub Release of this repo, naming every image**
+  (the operator's request, 2026-11-16: nothing said which images a merge changed, and the air-gap
+  mirrors only what it is told to). `release-notes` (`scripts/release_notes.py`) runs after the
+  builds, whatever they did, on every branch that built something and on every `main` push, and
+  writes the run's summary page: each image REBUILT since the previous release with its new
+  version, the one it replaces, its digest and the commits that changed it, and each one that was
+  NOT at the version it stays at, so the list to pull is complete. **A release is measured from the
+  previous release**: each one's notes end with a comment GitHub does not show, its commit and
+  every image's version, and the next lists every image whose version differs and the commits
+  since, so a release whose publishing failed is caught up by the next push. **The first is a
+  baseline** (the operator, same day): with no release before it, every image is listed at its
+  current version and digest, unchanged, with the whole set to pull, and nothing is rebuilt for it
+  (merging the change that brought the notes rebuilt nothing, by the rule above). It never
+  decides again which images were built — it takes `changes`' list — and attributes each commit
+  of the range to the images that commit affects with `image_changes.affected_images`, the
+  decision's own rule. Versions are redbull-platform's `<chart>/vX.Y.Z` tags (each chart directory
+  is named after its image, `tests/test_image_builds.py`), recorded by `changes` before anything
+  builds and read again after, so a built image whose tag did not move is listed NOT RELEASED at
+  the version it stays at; digests are ghcr.io's, asked anonymously (the packages are public). On
+  `main`, `release` publishes the notes as release `release-<commit date>-<short sha>` on the built
+  commit when they list a changed image or are the baseline (a re-run of failed jobs rewrites the
+  same release: a commit's own release is never its previous one) and runs none of the repo's code, so
+  the one job there with a write token executes nothing from the checkout. **Neither ever fails
+  the run** (`continue-on-error`): the diff base is the last run that SUCCEEDED, so a red notes job
+  would rebuild, and re-version, every image the run already shipped. A run that changed nothing
+  since the previous release publishes nothing; a branch run's page lists what it built as
+  `<branch-slug>-<sha>`. If the previous release cannot be read, the notes compare with the
+  versions before the run and no baseline is published. Known gap,
+  the reusable workflow's: an image job checks out the branch's head when it STARTS (`ref:
+  github.ref_name`), not the run's commit, so an image can hold a commit pushed after its run
+  began; that commit is listed by the next run, which builds it again.
 - Assumed already running: a Temporal server and the Segments Manager (via OpenShift routes or
   localhost — no port assumptions in code).
 - Trigger via the unified API: `uvicorn workflow_domains.api:app --port 8080`, Swagger at `/docs`.

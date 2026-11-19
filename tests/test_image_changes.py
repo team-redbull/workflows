@@ -6,9 +6,12 @@ so what is pinned here is SAFETY first, precision second:
   * everything each entrypoint REALLY loads (a fresh interpreter, sys.modules)
     is in the set the script derives statically — the script may over-build,
     never under-build;
-  * what it cannot read as a Python module is built wide; the files that decide
-    every build affect every image;
-  * the names it answers with are the names build.yml's jobs ask for;
+  * what it cannot read as a Python module is built wide; .dockerignore, which
+    shapes every build's context, affects every image;
+  * what only decides how CI runs (build.yml, this script, the notes) affects no
+    image, and a change to .github/image-builds.json affects the images whose row
+    changed, compared as data;
+  * the names it answers with are the rows build.yml's two matrices build;
   * and the precision itself, on representative files: one worker's settings
     or activity code is that worker's image only.
 """
@@ -20,6 +23,7 @@ import os
 import re
 import subprocess
 import sys
+from pathlib import Path as _Path
 from pathlib import Path
 
 import pytest
@@ -55,15 +59,18 @@ def test_every_image_of_the_repo_is_found():
 
 
 def test_the_names_are_the_ones_build_yml_asks_for():
-    """Each build job asks `contains(fromJSON(...images...), '<name>')`: a name the script
-    never answers is an image that is never built."""
+    """Every image is a row of .github/image-builds.json, which build.yml's two matrices
+    build (`--first`: the brain's row, `--matrix`: every other): a name the script answers
+    without a row is an image that is never built. The cleanup jobs name every image."""
     build_yml = (REPO_ROOT / ".github" / "workflows" / "build.yml").read_text(encoding="utf-8")
-    asked = set(re.findall(r"contains\(fromJSON\(needs\.changes\.outputs\.images \|\| '\[\]'\), '([a-z0-9-]+)'\)", build_yml))
-    built = {
+    rows = {row["image-name"] for row in image_changes.load_builds(REPO_ROOT)}
+    cleaned = {
         name for name in re.findall(r"^      image-name: ([a-z0-9-]+)$", build_yml, re.M)
     }
-    assert asked == built == set(BY_NAME)
-    # No job is left on the retired per-folder flags.
+    assert rows == cleaned == set(BY_NAME)
+    # No job asks for an image by name any more, and none is left on the retired
+    # per-folder flags.
+    assert "contains(fromJSON(needs.changes.outputs.images" not in build_yml
     assert not re.search(r"outputs\.(brain|limb|docs)\b", build_yml)
 
 
@@ -150,6 +157,129 @@ def test_what_decides_every_build_affects_every_image(path):
     assert _affected(path) == sorted(BY_NAME)
 
 
+def test_dockerignore_is_the_one_file_that_rebuilds_every_image():
+    assert image_changes.GLOBAL_TRIGGERS == (".dockerignore",)
+
+
+# --- what only decides how CI runs is no image's input ------------------------------------
+
+
+@pytest.mark.parametrize("path", [
+    ".github/workflows/build.yml", "scripts/image_changes.py", "scripts/release_notes.py",
+    "tests/test_image_changes.py", "tests/test_image_builds.py", "tests/test_release_notes.py",
+])
+def test_a_ci_only_change_rebuilds_no_image(path):
+    """Until 2026-11-16 build.yml and this script rebuilt every image: a CI-only change gave
+    all ten a new version with the same contents."""
+    assert _affected(path) == []
+
+
+def test_a_build_yml_only_change_rebuilds_nothing_even_with_the_rows_unread():
+    assert image_changes.affected_images([".github/workflows/build.yml"], IMAGES, REPO_ROOT) == {}
+
+
+_BUILDS = image_changes.BUILDS_FILE
+
+
+def test_a_changed_build_row_rebuilds_its_image_only():
+    affected = image_changes.affected_images([_BUILDS], IMAGES, REPO_ROOT, changed_rows={"vm-lifecycle-worker"})
+    assert sorted(affected) == ["vm-lifecycle-worker"] and "its build row changed" in affected["vm-lifecycle-worker"][0]
+    assert image_changes.affected_images([_BUILDS], IMAGES, REPO_ROOT, changed_rows=set()) == {}
+
+
+def test_build_rows_that_cannot_be_compared_build_wide():
+    assert _affected(_BUILDS) == sorted(BY_NAME)              # changed_rows=None: unknown
+
+
+def _git(root: _Path, *args: str) -> str:
+    env = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+           "HOME": str(root), "PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+    return subprocess.run(["git", "-c", "init.defaultBranch=main", "-c", "commit.gpgsign=false", *args], cwd=root,
+                          env=env, capture_output=True, text=True, check=True).stdout.strip()
+
+
+def _commit_files(root: _Path, files: dict[str, str], message: str) -> str:
+    for path, text in files.items():
+        (root / path).parent.mkdir(parents=True, exist_ok=True)
+        (root / path).write_text(text)
+    _git(root, "add", "-A")
+    _git(root, "commit", "-qm", message)
+    return _git(root, "rev-parse", "HEAD")
+
+
+ROWS = image_changes.load_builds(REPO_ROOT)
+
+
+@pytest.fixture
+def rows_repo(tmp_path):
+    _git(tmp_path, "init", "-q")
+    return tmp_path
+
+
+def test_one_changed_row_is_that_image_and_a_reformat_is_none(rows_repo):
+    first = _commit_files(rows_repo, {_BUILDS: json.dumps(ROWS, indent=2)}, "rows")
+    changed = [dict(row) for row in ROWS]
+    vm = next(row for row in changed if row["image-name"] == "vm-lifecycle-worker")
+    vm["helm-image-path"] = "image"
+    one_row = _commit_files(rows_repo, {_BUILDS: json.dumps(changed, indent=2)}, "one row")
+    assert image_changes.changed_build_rows(first, rows_repo, head=one_row) == {"vm-lifecycle-worker"}
+    # The same rows, reordered, re-indented and with their keys shuffled: no row changed.
+    reformatted = json.dumps([dict(reversed(list(row.items()))) for row in reversed(ROWS)], indent=4)
+    again = _commit_files(rows_repo, {_BUILDS: reformatted}, "reformat")
+    assert image_changes.changed_build_rows(first, rows_repo, head=again) == set()
+
+
+def test_an_added_or_removed_row_is_that_images_change(rows_repo):
+    first = _commit_files(rows_repo, {_BUILDS: json.dumps(ROWS[1:])}, "without the first row")
+    second = _commit_files(rows_repo, {_BUILDS: json.dumps(ROWS)}, "every row")
+    assert image_changes.changed_build_rows(first, rows_repo, head=second) == {ROWS[0]["image-name"]}
+    assert image_changes.changed_build_rows(second, rows_repo, head=first) == {ROWS[0]["image-name"]}
+
+
+def test_rows_that_cannot_be_read_at_the_base_are_unknown(rows_repo):
+    broken = _commit_files(rows_repo, {_BUILDS: "{not json"}, "broken")
+    good = _commit_files(rows_repo, {_BUILDS: json.dumps(ROWS)}, "rows")
+    assert image_changes.changed_build_rows(broken, rows_repo, head=good) is None
+    assert image_changes.changed_build_rows("no-such-commit", rows_repo, head=good) is None
+
+
+def _legacy_build_yml(rows: list[dict]) -> str:
+    """build.yml as it was before .github/image-builds.json: one job per image, with
+    comments between its inputs (the brain's had them) and a cleanup job that is no row."""
+    jobs = []
+    for row in rows:
+        jobs.append(f"  build-{row['image-name']}:\n"
+                    "    needs: [changes, test]\n"
+                    "    uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main\n"
+                    "    with:\n"
+                    "      # Named for the Argo service it becomes.\n"
+                    + "".join(f"      {key}: {row[key]}\n" for key in image_changes.BUILD_KEYS)
+                    + "    secrets: inherit\n")
+        jobs.append(f"  cleanup-{row['image-name']}-on-delete:\n"
+                    "    uses: team-redbull/.github/.github/workflows/ghcr-cleanup-on-delete.yml@main\n"
+                    f"    with:\n      image-name: {row['image-name']}\n")
+    return "name: Build and Push\n\njobs:\n" + "\n".join(jobs)
+
+
+def test_a_base_of_the_old_layout_is_read_from_its_build_yml(rows_repo):
+    """The diff that merges .github/image-builds.json starts from a commit without it: its
+    build.yml's jobs held the same inputs, so equal ones are no change."""
+    assert image_changes.legacy_build_rows(_legacy_build_yml(ROWS)) == {row["image-name"]: row for row in ROWS}
+    old = _commit_files(rows_repo, {image_changes.BUILD_YML: _legacy_build_yml(ROWS)}, "old layout")
+    new = _commit_files(rows_repo, {_BUILDS: json.dumps(ROWS, indent=2)}, "the rows file")
+    assert image_changes.changed_build_rows(old, rows_repo, head=new) == set()
+    moved = [dict(row) for row in ROWS]
+    moved[0]["dockerfile"] = "elsewhere/Dockerfile"
+    newer = _commit_files(rows_repo, {_BUILDS: json.dumps(moved)}, "a moved Dockerfile")
+    assert image_changes.changed_build_rows(old, rows_repo, head=newer) == {ROWS[0]["image-name"]}
+
+
+def test_a_job_whose_inputs_are_expressions_is_no_old_row():
+    matrix_job = ("  build:\n    uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main\n    with:\n"
+                  + "".join(f"      {key}: ${{{{ matrix.{key} }}}}\n" for key in image_changes.BUILD_KEYS))
+    assert image_changes.legacy_build_rows("jobs:\n" + matrix_job) == {}
+
+
 def test_a_data_file_in_a_copied_folder_is_built_wide():
     # The temporary UI pages are read from disk at run time: no import names them.
     assert _affected("workflow_domains/cluster_upgrade/ui/index.html") == [BRAIN]
@@ -230,6 +360,8 @@ def test_a_workers_own_files_build_that_worker_only(limb):
     ("CLAUDE.md", []),
     ("tests/test_settings.py", []),
     ("scripts/check_conventions.py", []),
+    ("scripts/image_changes.py", []),
+    (".github/workflows/build.yml", []),
     ("deploy/charts/cluster-upgrade-worker/values.yaml", []),
     (".env.example", []),
 ])
@@ -272,6 +404,19 @@ def test_the_cli_answers_a_json_list_on_stdout_and_its_reasons_on_stderr():
 
 def test_the_cli_answers_an_empty_list_for_no_change():
     assert json.loads(_run(stdin="").stdout) == []
+
+
+def test_the_cli_compares_the_rows_with_the_base():
+    """The `changes` job passes its diff base: the answer is the images whose row differs
+    from the base's (in a clean checkout of HEAD, none); without --base, every image."""
+    stdin = f"{image_changes.BUILDS_FILE}\n.github/workflows/build.yml\nscripts/image_changes.py\n"
+    rows = image_changes.changed_build_rows("HEAD", REPO_ROOT)
+    assert rows is not None
+    assert sorted(json.loads(_run("--base", "HEAD", stdin=stdin).stdout)) == sorted(set(BY_NAME) & rows)
+    clean = subprocess.run(["git", "diff", "--quiet", "HEAD", "--", image_changes.BUILDS_FILE], cwd=REPO_ROOT).returncode == 0
+    if clean:
+        assert rows == set()
+    assert sorted(json.loads(_run(stdin=stdin).stdout)) == sorted(BY_NAME)
 
 
 def test_the_cli_lists_every_image_and_the_table():

@@ -22,13 +22,30 @@ Checker ids in brackets.
   a push touches: `scripts/image_changes.py` builds an image only when a file IT LOADS
   changed (the imports followed from its entrypoint; its Dockerfile and requirements),
   measured since the last fully successful run on the branch, and builds WIDE whenever it
-  cannot tell (a data file, a deletion, the script or `build.yml` itself). Each build job
-  is gated on its OWN image name in that list. [DL002] Every image job uses the reusable
-  `ghcr-build-push.yml` (it bumps redbull-platform `main`, which deploys) and they form one sequential chain guarded by
-  `!cancelled() && !failure()`. So a `main` build is tagged `vX.Y.Z`, never by commit sha:
-  no image-only job (the operator, 2026-11-02); vendor a new limb's chart in
-  redbull-platform first. A new limb adds `build-<limb>-worker` and
+  cannot tell (a data file, a deletion, `.dockerignore`). What only decides how CI runs is
+  no image's input: `build.yml`, the script, the notes and their tests rebuild nothing, and
+  `.github/image-builds.json` rebuilds the images whose ROW changed (compared with the
+  base's, as data). So every input of an image's build stays in its row, never in
+  `build.yml`. Every image is a row; `image_changes.py --first` gives
+  `build-workflow-brain` the brain's and `--matrix` the `build` job every other listed
+  image's — never a second decision in YAML or shell. [DL002] Every
+  image is built by the reusable `ghcr-build-push.yml` (it bumps redbull-platform `main`,
+  which deploys): the brain FIRST and alone, `sync-upgrade-charts` beside it, then the
+  `build` matrix, one job per image, `fail-fast: false`, `max-parallel: 3` (each pushes
+  to that one `main`), behind `!cancelled() && !failure()`. So a `main` build is tagged
+  `vX.Y.Z`, never by commit sha: no image-only job (the operator, 2026-11-02); vendor a
+  new limb's chart in redbull-platform first. A new limb adds its row (its own image
+  name, Dockerfile, `chart-repo` and `gitops/charts/<limb>-worker/values.yaml`) and
   `cleanup-<limb>-worker-on-delete`. [DL002]
+- **Release notes** (`release-notes`, `scripts/release_notes.py`): after the builds, on
+  every branch that built something and every `main` push, never failing the run (a red
+  run would rebuild what shipped). They take `changes`' list, never a second decision,
+  attribute commits with `image_changes.affected_images`, and measure each release from
+  the previous one (the comment its notes end with); the first is a baseline of every
+  image at its current version. On `main`, `release` publishes them as the GitHub Release
+  `release-<date>-<short sha>`, from a job that runs no repo code. A new image
+  needs nothing there: the notes list every image `image_changes.py` finds, at the version
+  of its `<chart>/vX.Y.Z` tags, so its chart directory stays named after the image.
 - **Order that keeps prod up**: brain image before limbs; a chart ships a new key before
   the image needs it and drops one only after the image stopped needing it; the brain
   release installs before any hub limb.

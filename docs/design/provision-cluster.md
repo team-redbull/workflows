@@ -52,12 +52,12 @@ rejected push reaches `publish_cluster_file` with the branch already there. By
 then the branch's file is commit 2's: the person's text, the allocation block,
 `inject_configs.py`'s blank-line normalisation (it collapses runs of blank
 lines and adds one before every top-level key) and the appended `mcConfigMap`
-section. A byte comparison would call every re-run a conflict.
+section, followed by `tuningConfigmap` when a nodepool names tuning profiles. A byte comparison would call every re-run a conflict.
 
 So `cluster_values.same_cluster_file` parses both texts (`day1_repo.load_yaml`,
 duplicate keys reported) and compares the branch file's mapping, with the
-`mcConfigMap` key dropped, against the assembled text's. Whitespace, comments
-and the chain's section are not differences; a different `vlanId`, `network`,
+`mcConfigMap` and `tuningConfigmap` keys dropped (`CHAIN_APPENDED_KEYS`), against
+the assembled text's. Whitespace, comments and the chain's sections are not differences; a different `vlanId`, `network`,
 `mastertag` or nodepool is `ClusterFileConflictError`, naming the key. Once the
 chart renders MachineConfigs at sync time (the deferred
 `mc-sources-rendered-at-sync` plan) and the chain's injector goes, the compare

@@ -117,6 +117,18 @@ INTERFACE_ALLOWED_TOP_LEVEL = {"temporalio", "shared", "typing", "datetime", "en
 
 GLOBAL_CONFIGMAP_KEYS = {"TEMPORAL_HOST", "TEMPORAL_NAMESPACE", "SEGMENTS_MANAGER_URL"}
 TEMPORAL_CLIENT_MODULE = ("shared", "temporal_client.py")
+GIT_CLIENT_MODULE = ("activities", "git_repo.py")
+# git_repo's one-command and one-step functions: a caller opens a fresh_clone and
+# works through the Clone it yields (CLAUDE.md §5), so none is called from outside.
+GIT_REPO_LOW_LEVEL = {"exec_git", "run_git", "clone", "commit_and_push", "run_command"}
+# Python git libraries: git runs as a subprocess, never through a dependency (§5).
+PYTHON_GIT_LIBRARIES = {"git", "pygit2", "dulwich"}
+# What starts a process, by the dotted origin of the called name.
+PROCESS_STARTERS = {
+    "asyncio.create_subprocess_exec", "asyncio.create_subprocess_shell",
+    "subprocess.run", "subprocess.Popen", "subprocess.call", "subprocess.check_call",
+    "subprocess.check_output", "os.system", "os.popen",
+}
 
 _PRAGMA = re.compile(
     r"#\s*conventions:\s*allow\s+((?:[A-Z]{2}\d{3})(?:\s*,\s*[A-Z]{2}\d{3})*)\s*(?:—|–|-|:)+\s*\S"
@@ -825,6 +837,60 @@ def check_client_connect(path: Path, tree: ast.Module, report: _Report) -> None:
                 report.error(path, node.lineno, "EP001", "`Client.connect(...)` without `data_converter=pydantic_data_converter` (§5)")
 
 
+def _starts_git(node: ast.Call) -> bool:
+    """The call's command is literally git: `"git"`, `"git ..."` or `["git", ...]`."""
+    if not node.args:
+        return False
+    first = node.args[0]
+    if isinstance(first, (ast.List, ast.Tuple)) and first.elts:
+        first = first.elts[0]
+    return isinstance(first, ast.Constant) and isinstance(first.value, str) and (
+        first.value == "git" or first.value.startswith("git ")
+    )
+
+
+def check_git_client(path: Path, tree: ast.Module, report: _Report) -> None:
+    """AC008 — CLAUDE.md §5: git runs ONLY in activities/git_repo.py, and a caller
+    works through `fresh_clone` and its `Clone`, never git_repo's one-command
+    functions — so the token scrubbing, the timeouts and the one-clean-clone-per-
+    attempt rule hold for every limb."""
+    parts = _relparts(path) or tuple(path.parts[-2:])
+    if tuple(parts[-2:]) == GIT_CLIENT_MODULE:
+        return
+    imported = _imported_names(tree)
+    for package, line in _top_level_imports(tree):
+        if package in PYTHON_GIT_LIBRARIES:
+            report.error(
+                path, line, "AC008",
+                f"`{package}` is a Python git library — git runs as a subprocess, through "
+                "activities/git_repo.py (§5)",
+            )
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Name):
+            origin = imported.get(func.id, "")
+        else:
+            dotted = _dotted(func)
+            head, _, rest = dotted.partition(".")
+            origin = f"{imported[head]}.{rest}" if head in imported and rest else dotted
+        if origin in PROCESS_STARTERS and _starts_git(node):
+            report.error(
+                path, node.lineno, "AC008",
+                "git started outside activities/git_repo.py — add what you need there, where the "
+                "token is scrubbed and every command has its timeout (§5)",
+            )
+        module, _, name = origin.rpartition(".")
+        if module == "activities.git_repo" and name in GIT_REPO_LOW_LEVEL:
+            report.error(
+                path, node.lineno, "AC008",
+                f"`git_repo.{name}` called outside activities/git_repo.py — open ONE "
+                "`git_repo.fresh_clone(...)` (day1 main: `day1_repo.fresh_main`) per attempt and "
+                "work through its `Clone`; a missing git step belongs in git_repo.py (§5)",
+            )
+
+
 # --- per-file dispatch --------------------------------------------------------------
 
 
@@ -854,6 +920,7 @@ def check_tree(path: Path, parts: tuple[str, ...], tree: ast.Module, report: _Re
         return
 
     check_client_connect(path, tree, report)
+    check_git_client(path, tree, report)
 
     if parts[0] == SHARED_DIR:
         check_shared_module(path, tree, report)
@@ -1098,9 +1165,13 @@ def _pages_for_limb(limb: str) -> list[Path]:
 
 
 def check_delivery(report: _Report) -> None:
-    """DL rules — §1/§9: Dockerfile CMDs, CI jobs, docs pages, .env.example."""
+    """DL rules — §1/§9: Dockerfile CMDs, CI builds, docs pages, .env.example."""
     build_yml = REPO_ROOT / ".github" / "workflows" / "build.yml"
     build_text = _read(build_yml) or ""
+    builds_file = REPO_ROOT / IMAGE_BUILDS
+    builds, builds_error = image_builds(_read(builds_file))
+    if build_text and builds_error:
+        report.error(builds_file, 1, "DL002", builds_error)
     brain_docker = REPO_ROOT / WORKFLOW_DOMAINS_DIR / "Dockerfile"
     if brain_docker.exists() and f"{WORKFLOW_DOMAINS_DIR}.main_worker_init" not in (_read(brain_docker) or ""):
         report.error(brain_docker, 1, "DL001", "brain Dockerfile CMD must run `workflow_domains.main_worker_init` (§1)")
@@ -1116,8 +1187,8 @@ def check_delivery(report: _Report) -> None:
             report.error(REPO_ROOT / ACTIVITIES_DIR / domain / "requirements.txt", 1, "DL001", f"activities/{domain}/ has no requirements.txt — the limb owns its dependency set (§2)")
         if not build_text:
             continue
-        for message in limb_build_problems(domain, build_text):
-            report.error(build_yml, 1, "DL002", message)
+        for message in limb_build_problems(domain, build_text, builds):
+            report.error(builds_file, 1, "DL002", message)
 
     nav = REPO_ROOT / "docs" / "site" / "assets" / "nav.js"
     nav_text = _read(nav) or ""
@@ -1165,46 +1236,52 @@ def undocumented_settings_keys(classes: list[ast.ClassDef], env_example_text: st
     return problems
 
 
-def limb_build_problems(domain: str, build_text: str) -> list[str]:
-    """DL002 for one limb, from build.yml's text: a job on the reusable workflow, so a
-    main build gets a vX.Y.Z tag and its redbull-platform bump (§9). An image-only job
-    (`docker/build-push-action` straight on the Dockerfile, tagged by commit sha) is
-    refused: the operator's rule since 2026-11-02 is version tags, never commit shas."""
+# The `build` matrix job's rows (scripts/image_changes.py --matrix): every image but the brain.
+IMAGE_BUILDS = ".github/image-builds.json"
+
+
+def image_builds(text: str | None) -> tuple[list[dict], str | None]:
+    """(the rows of .github/image-builds.json, why they cannot be read — or None)."""
+    if text is None:
+        return [], f"{IMAGE_BUILDS} is missing — the `build` job's matrix rows: every image but the brain (§9)"
+    try:
+        rows = json.loads(text)
+    except json.JSONDecodeError as exc:
+        return [], f"{IMAGE_BUILDS} is not JSON: {exc}"
+    if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+        return [], f"{IMAGE_BUILDS} must be a JSON list of rows"
+    return rows, None
+
+
+def limb_build_problems(domain: str, build_text: str, builds: list[dict]) -> list[str]:
+    """DL002 for one limb: its row in .github/image-builds.json, which the `build` matrix
+    job hands to the reusable workflow, so a main build gets a vX.Y.Z tag and its
+    redbull-platform bump (§9), and which scripts/image_changes.py --matrix picks by the
+    image's own name. An image-only job in build.yml (`docker/build-push-action` straight
+    on the Dockerfile, tagged by commit sha) is refused: the operator's rule since
+    2026-11-02 is version tags, never commit shas."""
     kebab = _kebab(domain)
-    reusable = re.search(rf"dockerfile:\s*{ACTIVITIES_DIR}/{domain}/Dockerfile\b", build_text)
+    dockerfile = f"{ACTIVITIES_DIR}/{domain}/Dockerfile"
     image_only = re.search(rf"\bfile:\s*{ACTIVITIES_DIR}/{domain}/Dockerfile\b", build_text)
-    if not (reusable or image_only):
-        return [f"no build job for activities/{domain}/Dockerfile — add `build-{kebab}-worker` (§1, §9)"]
+    rows = [row for row in builds if row.get("dockerfile") == dockerfile]
     problems = []
     if image_only:
         problems.append(
-            f"activities/{domain}/Dockerfile is built image-only (a commit-sha tag) — use the reusable "
-            f"ghcr-build-push.yml so main builds are tagged vX.Y.Z; vendor its chart in redbull-platform first (§9)"
+            f"{dockerfile} is built image-only (a commit-sha tag) — give it a row in {IMAGE_BUILDS} so the "
+            f"reusable ghcr-build-push.yml tags main builds vX.Y.Z; vendor its chart in redbull-platform first (§9)"
         )
-    if not re.search(rf"(image-name:\s*{kebab}-worker\b|/{kebab}-worker:)", build_text):
-        problems.append(f"the {domain} limb image is named `{kebab}-worker` (§2)")
-    if reusable and f"helm-values-path: gitops/charts/{kebab}-worker/values.yaml" not in build_text:
+    if not rows:
+        if not image_only:
+            problems.append(f"no build for {dockerfile} — add its row to {IMAGE_BUILDS} (§1, §9)")
+        return problems
+    row = rows[0]
+    # A row copied from another limb and left on that limb's name: the script answers
+    # with THIS limb's name, finds no row for it and fails the `changes` job.
+    if row.get("image-name") != f"{kebab}-worker":
+        problems.append(f"the {domain} limb image is named `{kebab}-worker` in its {IMAGE_BUILDS} row (§2)")
+    if row.get("helm-values-path") != f"gitops/charts/{kebab}-worker/values.yaml":
         problems.append(f"the reusable build bumps the tag into redbull-platform `gitops/charts/{kebab}-worker/values.yaml` (§1)")
-    if reusable:
-        # The job that builds this Dockerfile must be gated on THIS image's name in
-        # the `changes` job's list (scripts/image_changes.py): a job copied from
-        # another limb and left on that limb's name builds on the wrong pushes.
-        job = _job_block(build_text, reusable.start())
-        wanted = f"contains(fromJSON(needs.changes.outputs.images || '[]'), '{kebab}-worker')"
-        if wanted not in job:
-            problems.append(
-                f"the job building activities/{domain}/Dockerfile must run `if: ... {wanted}` — an image is "
-                "built when a file IT loads changed, by its own name (§9)"
-            )
     return problems
-
-
-def _job_block(build_text: str, offset: int) -> str:
-    """The text of the build.yml job containing `offset`: from its 2-space key to the next one."""
-    starts = [m.start() for m in re.finditer(r"^  [A-Za-z0-9_-]+:\s*$", build_text, re.M)]
-    begin = max((s for s in starts if s <= offset), default=0)
-    end = min((s for s in starts if s > offset), default=len(build_text))
-    return build_text[begin:end]
 
 
 def _check_workflow_docs(module_path: Path, domain: str, cls: ast.ClassDef, nav: Path, nav_text: str, report: _Report) -> None:

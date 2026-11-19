@@ -14,7 +14,7 @@ needs it carries it.
 Plain parameters, no settings and no Temporal (CLAUDE.md §1). The git client
 is activities/git_repo.py: the token is injected in memory only, scrubbed
 from every error, kept out of every file of the clone, and every clone is a
-fresh TemporaryDirectory — ONE per activity attempt, owned by the caller.
+fresh TemporaryDirectory — ONE per activity attempt (`fresh_main`).
 `main` only: Argo CD renders main and nothing else.
 
 READING a cluster file (`load_cluster_values`) follows the production
@@ -42,6 +42,7 @@ them; a missing folder is an empty list.
 
 from __future__ import annotations
 
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -59,17 +60,9 @@ DEFAULT_CLUSTER_FILE_PREFIX = "ocp4-"
 # --- git -------------------------------------------------------------------------------
 
 
-async def clone_main(*, repo_url: str, token: str, dest: Path) -> None:
-    await git_repo.clone_main(repo_url=repo_url, token=token, dest=dest, repo="day1")
-
-
-async def head(clone: Path, *, token: str) -> str:
-    return (await git_repo.run_git(["rev-parse", "HEAD"], cwd=clone, secrets=[token])).strip()
-
-
-async def blob(clone: Path, path: str, *, token: str) -> str:
-    """The git blob id of `path` at HEAD: what compare-and-set compares."""
-    return (await git_repo.run_git(["rev-parse", f"HEAD:{path}"], cwd=clone, secrets=[token])).strip()
+def fresh_main(*, repo_url: str, token: str, prefix: str) -> AbstractAsyncContextManager[git_repo.Clone]:
+    """A fresh clone of day1 `main` (git_repo.fresh_clone), for one activity attempt."""
+    return git_repo.fresh_clone(repo_url=repo_url, token=token, repo="day1", prefix=prefix)
 
 
 # --- YAML ---------------------------------------------------------------------

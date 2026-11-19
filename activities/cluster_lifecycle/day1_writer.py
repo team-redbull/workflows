@@ -26,19 +26,17 @@ What is provision-cluster's:
 from __future__ import annotations
 
 import re
-import tempfile
 from pathlib import Path
 
 from activities import git_repo
 from activities.cluster_lifecycle import cluster_values
-from activities.day1_repo import clone_main, head
+from activities.day1_repo import fresh_main
 from shared.cluster_names import provision_cluster_branch
 from shared.exceptions import (
     AmbiguousMceFolderError,
     ClusterAlreadyProvisionedError,
     ClusterFileConflictError,
     MceFolderNotFoundError,
-    ValuesBranchNotFoundError,
 )
 from shared.models.cluster_lifecycle import ClusterFilePublishRequest, ClusterFileRef, ClusterTarget
 from shared.models.segment_lifecycle import DhcpValues
@@ -96,9 +94,8 @@ def find_mce_dir(clone: Path, mce: str) -> tuple[str, str]:
 async def inspect(*, repo_url: str, token: str, cluster: str, mce: str, values: str) -> ClusterTarget:
     """Where the cluster goes at day1 `main`, and whether its text would render there."""
     _require_name(cluster, "cluster")
-    with tempfile.TemporaryDirectory(prefix="day1-inspect-") as tmp:
-        clone = Path(tmp) / "repo"
-        await clone_main(repo_url=repo_url, token=token, dest=clone)
+    async with fresh_main(repo_url=repo_url, token=token, prefix="day1-inspect-") as day1:
+        clone = day1.path
         site, mce_dir = find_mce_dir(clone, mce)
         path = cluster_file_path(mce_dir, cluster)
         if (clone / path).exists():
@@ -116,18 +113,8 @@ async def inspect(*, repo_url: str, token: str, cluster: str, mce: str, values: 
             config_names=validated.config_names,
             day2_env=validated.day2_env,
             day2_sigs=validated.day2_sigs,
-            revision=await head(clone, token=token),
+            revision=await day1.head(),
         )
-
-
-async def branch_exists(*, repo_url: str, branch: str, token: str) -> bool:
-    """Whether the remote has the branch (git_repo.require_branch's classification:
-    absent is deterministic, unreachable stays the retryable ValuesRepoGitError)."""
-    try:
-        await git_repo.require_branch(repo_url=repo_url, branch=branch, token=token, missing_message="absent")
-    except ValuesBranchNotFoundError:
-        return False
-    return True
 
 
 async def publish(
@@ -141,10 +128,9 @@ async def publish(
     path = cluster_file_path(request.mce_dir, request.cluster)
     text = cluster_values.assemble_cluster_file(request.values, request.vlan_id, dhcp_values)
 
-    if not await branch_exists(repo_url=repo_url, branch=branch, token=token):
-        with tempfile.TemporaryDirectory(prefix="day1-publish-") as tmp:
-            clone = Path(tmp) / "repo"
-            await clone_main(repo_url=repo_url, token=token, dest=clone)
+    if not await git_repo.branch_exists(repo_url=repo_url, branch=branch, token=token):
+        async with fresh_main(repo_url=repo_url, token=token, prefix="day1-publish-") as day1:
+            clone = day1.path
             if not (clone / request.mce_dir).is_dir():
                 raise MceFolderNotFoundError(f"{request.mce_dir} is no longer at day1 main — it was there when this run inspected it")
             file = clone / path
@@ -154,24 +140,19 @@ async def publish(
                 )
             file.parent.mkdir(parents=True, exist_ok=True)
             file.write_text(text, encoding="utf-8")
-            sha = await git_repo.commit_and_push(
-                clone,
-                repo_url=repo_url,
-                token=token,
-                branch=branch,
+            sha = await day1.commit_and_push(
                 paths=[path],
                 message=f"feat: provision hosted cluster {request.cluster} [provision-cluster-workflow]",
                 author=PROVISION_AUTHOR,
+                branch=branch,
             )
             return ClusterFileRef(relative_path=path, branch=branch, commit_sha=sha, changed=True, dhcp_values=dhcp_values)
 
-    with tempfile.TemporaryDirectory(prefix="day1-rerun-") as tmp:
-        clone = Path(tmp) / "repo"
-        await git_repo.clone(
-            repo_url=repo_url, branch=branch, token=token, dest=clone,
-            missing_message=f"branch {branch} vanished between the check and the clone",
-        )
-        file = clone / path
+    async with git_repo.fresh_clone(
+        repo_url=repo_url, token=token, repo="day1", prefix="day1-rerun-", branch=branch,
+        missing_message=f"branch {branch} vanished between the check and the clone",
+    ) as day1:
+        file = day1.path / path
         if not file.is_file():
             raise ClusterFileConflictError(
                 f"branch {branch} exists at day1 but has no {path}: not this workflow's branch, or one "

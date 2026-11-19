@@ -86,8 +86,8 @@
           creates cluster files and never rewrites one. Then your text is judged the way the chart would render it,
           merged with the value layers (<code>configValues.yaml</code> → site → MCE → your file):
           <code>mastertag</code>, a non-empty <code>nodepool</code>, <code>owner.{merkaz,anaf,mador}</code> required;
-          <code>vlanId</code>, <code>dhcp_values</code>, <code>mcConfigMap</code>, <code>AutomateAllocation</code>
-          forbidden (the run and the day1 chain write those); a <code>clusterName</code> only if it equals the one the
+          <code>vlanId</code>, <code>dhcp_values</code>, <code>mcConfigMap</code>, <code>tuningConfigmap</code>,
+          <code>AutomateAllocation</code> forbidden (the run and the day1 chain write those); a <code>clusterName</code> only if it equals the one the
           file name derives; config names must be DNS-1123 labels; no key written twice. A nodepool without
           <code>configs</code> is fine (a KubeVirt pool has none). <b>Every reason lands in one failure</b>.</p>
           <div class="calls">
@@ -133,14 +133,15 @@
           <code>main</code>. The commit is <code>feat: provision hosted cluster … [provision-cluster-workflow]</code>
           with <b>no <code>[skip ci]</code></b>: the day1 CI chain must run on the branch. It skips allocation (the
           file carries <code>vlanId</code>), renders the MachineConfigs from the config names and pushes its own
-          <code>CI: Update mcConfigMap from mc-files [skip ci]</code> commit on top. The workflow never writes
-          <code>mcConfigMap</code>.</p>
+          <code>CI: Update mcConfigMap from mc-files [skip ci]</code> commit on top, which also carries
+          <code>tuningConfigmap</code>: the tuning profiles (Tuned, PerformanceProfile) the nodepools'
+          <code>tuningConfig</code> names, from day1's <code>tuning/</code> catalogue. The workflow writes neither.</p>
           <div class="calls">
             <div class="call nxt"><span class="verb">GIT</span><span class="path">ls-remote refs/heads/provision-cluster/&lt;stem&gt; → clone main → write → commit → push HEAD:refs/heads/&lt;branch&gt;</span></div>
           </div>
           <p class="note"><b>Safe to run twice.</b> A branch already there is a re-run: its file is compared
-          <em>semantically</em> — its YAML mapping, with the <code>mcConfigMap</code> key the chain appended set
-          aside, must equal this run's text — then nothing is pushed (<code>file_changed: false</code>). A different
+          <em>semantically</em> — its YAML mapping, with the <code>mcConfigMap</code> and
+          <code>tuningConfigmap</code> keys the chain appended set aside, must equal this run's text — then nothing is pushed (<code>file_changed: false</code>). A different
           spec, vlan or network, a branch without the file, or one that does not parse is
           <code>ClusterFileConflictError</code>: a human decides, the workflow never overwrites.</p>
         </div>
@@ -471,7 +472,7 @@ curl -X POST -H 'Content-Type: application/yaml' --data-binary @cluster.yaml \
         <tbody>
           <tr><td class="k">query</td><td class="k">cluster</td><td class="muted">required; DNS-1123 label ≤ 24 chars, with or without <code>ocp4-</code></td><td class="muted">The cluster: the day1 file <code>ocp4-&lt;name&gt;.yaml</code>, the Argo CD Application, the Segments Manager's cluster, the run's id.</td></tr>
           <tr><td class="k">query</td><td class="k">mce</td><td class="muted">required; a folder name (lowercase, digits, dashes)</td><td class="muted">The MCE folder under <code>sites/&lt;site&gt;/mces/</code>, verbatim; the site is read from where it is.</td></tr>
-          <tr><td class="k">body</td><td class="k">the cluster file</td><td class="muted">required; <code>application/yaml</code>; one mapping, ≤ 256 KiB</td><td class="muted">Sent verbatim. Must carry <code>mastertag</code>, <code>nodepool</code>, <code>owner.{merkaz,anaf,mador}</code>; must not carry <code>vlanId</code>, <code>dhcp_values</code>, <code>mcConfigMap</code>, <code>AutomateAllocation</code>.</td></tr>
+          <tr><td class="k">body</td><td class="k">the cluster file</td><td class="muted">required; <code>application/yaml</code>; one mapping, ≤ 256 KiB</td><td class="muted">Sent verbatim. Must carry <code>mastertag</code>, <code>nodepool</code>, <code>owner.{merkaz,anaf,mador}</code>; must not carry <code>vlanId</code>, <code>dhcp_values</code>, <code>mcConfigMap</code>, <code>tuningConfigmap</code>, <code>AutomateAllocation</code>.</td></tr>
         </tbody>
       </table>
     </div>
@@ -526,7 +527,8 @@ curl -X POST -H 'Content-Type: application/yaml' --data-binary @cluster.yaml \
       <div class="panel ok">
         <h3>Re-run after a failure, or after completion — it converges</h3>
         <p>The child returns the <em>same</em> allocation (idempotent per cluster/site/type), the branch's file is
-        recognised as this run's — the chain's <code>mcConfigMap</code> and its blank-line re-spacing set aside — and
+        recognised as this run's — the chain's <code>mcConfigMap</code>, <code>tuningConfigmap</code> and its
+        blank-line re-spacing set aside — and
         nothing is pushed (<code>file_changed: false</code>), the open merge request is found
         (<code>merge_request_created: false</code>), folders already in the sig repos are success, and a shortcut
         already held by <code>SHORTCUT_OWNER</code> is success (<code>created: false</code>; the check reports no URL,

@@ -101,10 +101,26 @@ def nodepool_state(nodepool: dict[str, Any]) -> NodePoolState:
 
 
 def nodepool_infra_env(nodepool: dict[str, Any]) -> str | None:
-    """The InfraEnv the NodePool takes Agents from: its agentLabelSelector's INFRAENV_LABEL matchLabel."""
+    """The InfraEnv the NodePool takes Agents from, and is named after: its agentLabelSelector's
+    INFRAENV_LABEL matchLabel, else the FIRST value of an `In` expression on that key.
+
+    The hostedclusters-setup chart renders a nodepool with `additionalInfraEnvNames` as
+    `matchExpressions: [{key: INFRAENV_LABEL, operator: In, values: [infraEnvName, ...]}]`
+    and no matchLabels, `infraEnvName` first; the day1 read reports that `infraEnvName`.
+    `DoesNotExist` expressions next to either (`excludeAgentLabels`) name no InfraEnv.
+    """
     selector = ((((nodepool.get("spec") or {}).get("platform") or {}).get("agent") or {})
                 .get("agentLabelSelector") or {})
     value = (selector.get("matchLabels") or {}).get(_INFRAENV_LABEL)
+    if not value:
+        value = next(
+            (
+                (expression.get("values") or [None])[0]
+                for expression in selector.get("matchExpressions") or []
+                if expression.get("key") == _INFRAENV_LABEL and expression.get("operator") == "In"
+            ),
+            None,
+        )
     return str(value) if value else None
 
 

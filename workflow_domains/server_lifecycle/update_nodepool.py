@@ -34,7 +34,7 @@ Phases:
                           `problems` is refused.
   2. reading-nodepools  — the HostedCluster's NodePools on the MCE: the one
                           named (a recorded run: the kind's, by their
-                          matchLabel). Live and git must agree BOTH ways —
+                          selector's InfraEnv). Live and git must agree BOTH ways —
                           same NodePools, InfraEnvs and replicas — else
                           NodePoolReplicasDriftError, nothing written. A named
                           NodePool on neither side is NodePoolNotFoundError.

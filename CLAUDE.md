@@ -728,7 +728,13 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
     cluster's own NodePools (`upgrade_state.nodepools_of`, by
     `spec.clusterName`), never the rest of the MCE.
   - **Live and day1 must agree BOTH WAYS** (same NodePool, InfraEnv, replicas)
-    or `NodePoolReplicasDriftError` with nothing written. The one exception is
+    or `NodePoolReplicasDriftError` with nothing written. The live InfraEnv is
+    the selector's `matchLabels` InfraEnv label, else the FIRST value of its
+    `In` expression on that label (`upgrade_state.nodepool_infra_env`): the
+    hostedclusters-setup chart renders a nodepool with `additionalInfraEnvNames`
+    as `In [infraEnvName, ...]` with no matchLabels, and day1's InfraEnv is
+    that `infraEnvName`; the additional ones are not compared, and
+    `DoesNotExist` expressions (`excludeAgentLabels`) are ignored. The one exception is
     the RESUME: day1 already holding the number asked while the MCE lags (a
     child that committed and never synced) goes to the child, whose commit is
     then "already so".

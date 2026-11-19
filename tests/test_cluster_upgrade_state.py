@@ -174,6 +174,37 @@ class TestHostedCluster:
             (state,) = upgrade_state.hosted_cluster_state(self.HC, [nodepool]).nodepools
             assert (state.infra_env, state.scale_down_policy) == ("dell-r660-128c-zone-a", policy)
 
+    INFRAENV = "infraenvs.agent-install.openshift.io"
+
+    def _selecting(self, selector: dict) -> dict:
+        return {"metadata": {"name": "np"}, "spec": {**self.NODEPOOL["spec"], "platform": {
+            "type": "Agent", "agent": {"agentLabelSelector": selector}}}}
+
+    def test_the_infraenv_of_every_selector_the_chart_renders(self):
+        """hostedclusters-setup's three shapes: one InfraEnv, several (`additionalInfraEnvNames`),
+        and either with Agents left out (`excludeAgentLabels`). Each names `infraEnvName`, the day1 read's."""
+        claimed = {"key": "redbull.io/claimed", "operator": "DoesNotExist"}
+        several = {"key": self.INFRAENV, "operator": "In", "values": ["dell-r660-site1", "dell-r760-site1"]}
+        for selector in (
+            {"matchLabels": {self.INFRAENV: "dell-r660-site1"}},
+            {"matchLabels": {self.INFRAENV: "dell-r660-site1"}, "matchExpressions": [claimed]},
+            {"matchExpressions": [several]},
+            {"matchExpressions": [several, claimed]},
+            {"matchExpressions": [claimed, several]},
+        ):
+            (state,) = upgrade_state.hosted_cluster_state(self.HC, [self._selecting(selector)]).nodepools
+            assert state.infra_env == "dell-r660-site1", selector
+
+    def test_a_selector_naming_no_infraenv_reads_none(self):
+        for selector in (
+            {"matchExpressions": [{"key": "redbull.io/claimed", "operator": "DoesNotExist"}]},
+            {"matchExpressions": [{"key": self.INFRAENV, "operator": "NotIn", "values": ["dell-r660-site1"]}]},
+            {"matchExpressions": [{"key": self.INFRAENV, "operator": "In", "values": []}]},
+            {"matchExpressions": [{"key": "other", "operator": "In", "values": ["dell-r660-site1"]}]},
+        ):
+            (state,) = upgrade_state.hosted_cluster_state(self.HC, [self._selecting(selector)]).nodepools
+            assert state.infra_env is None, selector
+
     def test_without_them_both_are_none_and_still_reported(self):
         (state,) = upgrade_state.hosted_cluster_state(self.HC, [self.NODEPOOL]).nodepools
         assert (state.infra_env, state.scale_down_policy) == (None, None)

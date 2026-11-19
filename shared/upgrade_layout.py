@@ -45,8 +45,10 @@ ZONE_LABEL = "topology.kubernetes.io/zone"
 
 # The NodePool's `spec.platform.agent.agentLabelSelector.matchLabels` key whose
 # value is the InfraEnv it takes Agents from — the label assisted-service puts
-# on every Agent of that InfraEnv. update-nodepool's InfraEnv kind is matched
-# against it.
+# on every Agent of that InfraEnv. A NodePool drawing from several InfraEnvs
+# (hostedclusters-setup's `additionalInfraEnvNames`) has instead an `In`
+# expression on this key, `infraEnvName` first: that first value is its
+# InfraEnv. update-nodepool's InfraEnv kind is matched against it.
 INFRAENV_LABEL = "infraenvs.agent-install.openshift.io"
 
 # A NodePool label OR annotation naming how a scale-down picks the servers that

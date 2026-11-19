@@ -666,7 +666,9 @@ place that changes them:
 
 1. It reads the cluster file and the HostedCluster's NodePool. They must
    agree — same NodePool, InfraEnv and replicas — else
-   `NodePoolReplicasDriftError`, nothing written.
+   `NodePoolReplicasDriftError`, nothing written. A NodePool drawing from
+   several InfraEnvs (`additionalInfraEnvNames`, an `In` selector) is compared
+   by its first, its `infraEnvName`.
 2. A child, **scale-up-nodepool** or **scale-down-nodepool**, commits the new
    replicas to day1 `main` (compare-and-set on the file's blob, so a person's
    edit is never committed over), syncs the cluster's Argo CD Application to

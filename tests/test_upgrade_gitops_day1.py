@@ -665,6 +665,13 @@ class TestReplicasCommits:
         # Always reported, so update-nodepool can tell this limb from an older one.
         assert all("infra_env" in np.model_fields_set for np in prod.nodepools + slim.nodepools)
 
+    def test_extra_infraenvs_and_left_out_agents_keep_the_infraenv_it_is_named_after(self):
+        """`additionalInfraEnvNames` / `excludeAgentLabels` change the selector the chart renders,
+        not `infraEnvName`: the one the live read finds first (upgrade_state.nodepool_infra_env)."""
+        entry = {"infraEnvName": "dell-r660-site1", "additionalInfraEnvNames": ["dell-r760-site1"],
+                 "excludeAgentLabels": ["redbull.io/claimed"], "replicas": 2}
+        assert day1_values.entry_infra_env(entry) == "dell-r660-site1"
+
     async def test_the_replicas_lines_move_and_nothing_else(self, origin, tmp_path):
         before = _main_file(origin, tmp_path, PROD_PATH, "before")
         commit = await _commit(origin, self._replicas(**{"alpha-zone-a": 4, "alpha-zone-b": 4}))

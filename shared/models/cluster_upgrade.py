@@ -660,7 +660,8 @@ class NodePoolState(BaseModel):
     conditions: dict[str, str] = Field(default_factory=dict)  # type -> status
     # For server-lifecycle's update-nodepool; the limb always sends both keys
     # (a None included), so a payload without them is an older limb's.
-    # The InfraEnv its agentLabelSelector's matchLabels name (INFRAENV_LABEL).
+    # The InfraEnv its agentLabelSelector's matchLabels name (INFRAENV_LABEL),
+    # else the first value of its `In` expression on that key (several InfraEnvs).
     infra_env: str | None = None
     # Its `redbull.io/scale-down-policy` label, else annotation, as written.
     scale_down_policy: str | None = None

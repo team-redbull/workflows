@@ -130,6 +130,11 @@
           <code>spec.replicas</code>, the InfraEnv of the selector, and the
           <code>redbull.io/scale-down-policy</code> label or annotation. The named NodePool is selected here;
           one the cluster has on neither side is <code>NodePoolNotFoundError</code>.</p>
+          <p>The selector&rsquo;s InfraEnv is its <code>matchLabels</code> InfraEnv label, else the first value
+          of its <code>In</code> expression on that label: the shape the hostedclusters-setup chart renders for a
+          nodepool with <code>additionalInfraEnvNames</code>, <code>infraEnvName</code> first. That first one is
+          the InfraEnv compared with day1; the additional ones are not compared. <code>DoesNotExist</code>
+          expressions (<code>excludeAgentLabels</code>) name no InfraEnv and change nothing here.</p>
           <p><b>Live and day1 must agree</b>: the NodePool is in day1 under its name with the same replicas and
           InfraEnv, and on the MCE. Anything else stops the run with <code>NodePoolReplicasDriftError</code>
           before anything is written &mdash; a NodePool made by hand, one Argo CD has not created yet, replicas

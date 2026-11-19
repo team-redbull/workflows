@@ -1,4 +1,13 @@
-"""uninstall-server-from-hc — takes ONE server all the way out of an MCE, whatever state its Agent is in.
+"""uninstall-server-from-hc — takes ONE server out of its hosted cluster and leaves it a free Agent.
+
+Whatever state its Agent is in, the run ends once the Agent is bound to no
+cluster and verified clean: the server stays in its MCE's InfraEnv, its
+BareMetalHost, NMStateConfig, Agent and PXE mapping as they are, and taking it
+out of the MCE is remove-server-from-mce's own route (the operator,
+2026-11-19). It takes NO server-scan lock: the server is never AVAILABLE in
+server-scan while it moves (the operator). Runs recorded before
+`uninstall-server-from-hc-ends-at-free-agent` still lock it and end in
+remove-server-from-mce, as below.
 
 A server on an MCE is in one of two shapes, and the run picks its path by the
 BINDING it observes at inspection — never by the Agent's state string:
@@ -15,14 +24,14 @@ BINDING it observes at inspection — never by the Agent's state string:
     with both gone, a Node with neither — is this shape too, and cleared.
   * AN INVENTORY HOST: nothing links it to a hosted cluster. The
     hosted-cluster half is skipped (but for a stale Node server-scan's cluster
-    still has of it).
+    still has of it), and a new run completes at once: its Agent is already
+    free.
 
-Every path then ends by running remove-server-from-mce as an AWAITED CHILD
-(`remove-server-from-mce-<server>`, its own queue), so the inventory half — power off,
-BareMetalHost, NMStateConfig, the Agent last, the PXE map of the MCE's own site —
-is never reimplemented here, and remove-server-from-mce's own route keeps working alone.
-A server with nothing on the MCE completes as a no-op through the child's
-`found: false`.
+A run recorded before 2026-11-19 then ends by running remove-server-from-mce as an
+AWAITED CHILD (`remove-server-from-mce-<server>`, its own queue), so the inventory
+half — power off, BareMetalHost, NMStateConfig, the Agent last, the PXE map of
+the MCE's own site — is never reimplemented here. A server with nothing on the
+MCE completes there as a no-op through the child's `found: false`.
 
 Shape of the run (the `progress` query exposes the phase and the MCE's queue):
 
@@ -50,8 +59,9 @@ Shape of the run (the `progress` query exposes the phase and the MCE's queue):
                            MCE links the host any more. Refused: two such
                            Nodes; a Ready one nothing on the MCE links (nothing
                            to take the host out of it through).
-  4. reserving-server    — server-scan's install lock, holder `uninstall-server-from-hc`,
-                           ALWAYS, before any write (below for why).
+  4. reserving-server    — RECORDED RUNS ONLY (none since 2026-11-19): server-scan's
+                           install lock, holder `uninstall-server-from-hc`,
+                           before any write (below for why).
                            (marking-agent — every Agent labelled
                            `redbull.io/uninstalling: "true"` — ran here from
                            2026-11-12 and was removed on 2026-11-17, the
@@ -95,16 +105,18 @@ Shape of the run (the `progress` query exposes the phase and the MCE's queue):
                                  Bounded 5 min.
        verifying-agent           unbound, no agentMachineRef label,
                                  known-unbound, approved, BMH present and not
-                                 in error (bounded 5 min) — what remove-server-from-mce
-                                 needs to take it.
+                                 in error (bounded 5 min) — a clean free Agent.
+                                 A new run COMPLETES here.
        Every awaiting pass also stops (AgentRetakenError) when ANOTHER
        AgentMachine holds the Agent: the NodePool replacing the deleted Machine
        with this same server.
-     For an INVENTORY HOST, only verifying-agentmachine: inspected again,
+     For an INVENTORY HOST a new run completes after step 3. A recorded run
+       has only verifying-agentmachine: inspected again,
        fresh, by step 2's links — its Agent is free, so any NodePool may take
        it. Bound or labelled = AgentRetakenError; any other AgentMachine,
        Machine or control-plane link = ServerStillPresentError. Nothing written
        but the label.
+  Steps 6-8 are RECORDED RUNS' only:
   6. holding-server     — the lock extended to 24 h BEFORE the child starts,
                            so the hold covers the inventory half too.
   7. removing-from-inventory — remove-server-from-mce, awaited; its result is embedded.
@@ -117,12 +129,15 @@ Shape of the run (the `progress` query exposes the phase and the MCE's queue):
                            this MCE's discovery image), and never reached when
                            the child failed.
 
-EVERY RUN ENDS IN remove-server-from-mce (the operator, 2026-11-02). The
-`keep_inventory` option — stop after the hosted cluster and leave the server a
-free Agent — was removed: the API refuses it, and a run started since
-`uninstall-server-from-hc-always-removes` ignores it. A run recorded before
-that with `keep_inventory: true` still ends as it began, kept in the
-inventory with its lock left to expire (`_keep_inventory`).
+EVERY NEW RUN ENDS AT A FREE AGENT, NEVER IN remove-server-from-mce (the
+operator, 2026-11-19, reversing 2026-11-02's "every run ends in
+remove-server-from-mce"; `_ends_at_free_agent`). Do not re-add the child: a
+server leaves the MCE through remove-server-from-mce's own route. The
+`keep_inventory` option stays refused by the API — there is nothing left for
+it to choose. Runs recorded between 2026-11-02 and 2026-11-19 end in the
+child whatever their input says (`uninstall-server-from-hc-always-removes`);
+one recorded before 2026-11-02 with `keep_inventory: true` still ends as it
+began, kept in the inventory with its lock left to expire (`_keep_inventory`).
 
 Every skipped step is named in the result's `skipped`; what HyperShift had
 left is in `leftovers_at_start`, and every write the run made on a
@@ -158,7 +173,10 @@ the operator removed it on 2026-11-17 (`uninstall-server-no-agent-mark`). A run
 recorded with `uninstall-server-mark-agents-uninstalling` and without that
 patch still labels, and its failures still say how to take the label off.
 
-WHY THE LOCK, EVEN FOR AN UNINSTALL. Two server-scan jobs see this machine
+WHY A RECORDED RUN TOOK A LOCK — and why a new one takes none. The operator
+(2026-11-19): the server is never AVAILABLE in server-scan at any step of
+the flow, so nothing could draw it and the lock guards nothing. A recorded
+run keeps the lock it took, for the reason it was taken: Two server-scan jobs see this machine
 and neither sees the whole move: the hosted cluster's nodes job frees it the
 moment its Node disappears, and the MCE's agents job re-claims it as
 INSTALLED_TO_INVENTORY on its own 5-minute cadence. Between the two the
@@ -180,7 +198,8 @@ written.
 WHAT IS NEVER DONE: no NodePool change; no label of our own; no drain or Node
 delete where CAPI can still do it (only for a Node no Machine stands behind, and a Node is deleted
 only once NotReady); no finalizer or hook of anyone but the Agent provider's;
-no PXE map write (remove-server-from-mce's); no undo — a Machine delete cannot be
+no power-off, BareMetalHost, NMStateConfig or Agent delete, and no PXE map
+write (all remove-server-from-mce's); no undo — a Machine delete cannot be
 undone, so a failure after it leaves everything as it is and a re-run of the
 same id RESUMES.
 
@@ -388,6 +407,10 @@ _MARK_AGENTS_PATCH = "uninstall-server-mark-agents-uninstalling"
 # Retires that label (the operator, 2026-11-17): every run started since labels
 # nothing. A run recorded with the patch above and without this one still does.
 _NO_MARK_AGENTS_PATCH = "uninstall-server-no-agent-mark"
+# Every run started since ends once the Agent is a clean free Agent: no lock,
+# no hold, no remove-server-from-mce, no release (the operator, 2026-11-19). A
+# run recorded before it locks the server and ends in the child.
+_FREE_AGENT_PATCH = "uninstall-server-from-hc-ends-at-free-agent"
 # The leftover flow can drain a lost Node AND wait out a Machine drain, and
 # verifies three things after the unbind instead of two.
 _LEFTOVERS_RESERVATION_TTL = (
@@ -445,7 +468,7 @@ def _retaken_by(binding: AgentBindingState, started_from: frozenset[str] | None)
 
 
 def _agent_problems(agent: AgentBindingState, bmh: BmhState) -> list[str]:
-    """Why the Agent is not yet the clean inventory host remove-server-from-mce takes."""
+    """Why the Agent is not yet a clean free Agent in the inventory."""
     if not agent.found:
         return ["the Agent no longer exists"]
     problems = []
@@ -458,7 +481,7 @@ def _agent_problems(agent: AgentBindingState, bmh: BmhState) -> list[str]:
     if agent.approved is not True:
         problems.append("it is not approved")
     if not bmh.found:
-        problems.append("its BareMetalHost is gone, so remove-server-from-mce could not power the host off")
+        problems.append("its BareMetalHost is gone, so nothing could power the host off")
     elif bmh.is_errored():
         problems.append(
             f"its BareMetalHost is in error ({bmh.error_type or 'no type'}: "
@@ -485,6 +508,8 @@ class UninstallServerFromHcWorkflow:
         self._activity_queue: str | None = None
         self._agent_state: str | None = None
         self._keep_inventory = False
+        # Ends at a free Agent, with no lock and no remove-server-from-mce (_FREE_AGENT_PATCH).
+        self._ends_at_free_agent = False
         # The Agents carrying UNINSTALLING_AGENT_LABEL since the run labelled them.
         self._marked: list[str] = []
 
@@ -502,10 +527,14 @@ class UninstallServerFromHcWorkflow:
         request = run_args.input
         activity_queue = server_lifecycle_activity_queue(request.mce_cluster)
         self._activity_queue = activity_queue
-        # Only a run recorded before the option was removed still keeps the
-        # server in the inventory; every other run ends in remove-server-from-mce.
-        self._keep_inventory = request.keep_inventory and not workflow.patched(
-            _ALWAYS_REMOVE_PATCH
+        # A run started since 2026-11-19 ends at a free Agent. Of the runs
+        # recorded before, only one recorded before the option was removed still
+        # keeps the server in the inventory; the rest end in remove-server-from-mce.
+        self._ends_at_free_agent = workflow.patched(_FREE_AGENT_PATCH)
+        self._keep_inventory = (
+            not self._ends_at_free_agent
+            and request.keep_inventory
+            and not workflow.patched(_ALWAYS_REMOVE_PATCH)
         )
         skipped: list[str] = []
 
@@ -553,6 +582,14 @@ class UninstallServerFromHcWorkflow:
             )
             result.leftovers_at_start = self._leftovers(host, hosted_agent, nodes)
 
+            if self._ends_at_free_agent and hosted_agent is None and not nodes:
+                # Already free: nothing links the host to a hosted cluster.
+                skipped.append(
+                    "hosted-cluster half: nothing links the host to a hosted cluster — no "
+                    "AgentMachine, no Machine, no binding into a control plane, and no Node"
+                )
+                return self._end_at_free_agent(request, host, result, skipped)
+
             if self._keep_inventory and hosted_agent is None and not nodes:
                 # Already only inventory, and asked to stay there: nothing to
                 # write, so no lock either.
@@ -572,15 +609,19 @@ class UninstallServerFromHcWorkflow:
                 )
                 return result
 
-            self._phase = "reserving-server"
-            await self._reserve(
-                request, membership, host, activity_queue, ttl=_LEFTOVERS_RESERVATION_TTL
-            )
+            # No lock on a new run: the server is never AVAILABLE in
+            # server-scan while it moves (the operator, 2026-11-19).
+            if not self._ends_at_free_agent:
+                self._phase = "reserving-server"
+                await self._reserve(
+                    request, membership, host, activity_queue, ttl=_LEFTOVERS_RESERVATION_TTL
+                )
             # Step 2c, on a run recorded while it existed only — the Agents
             # labelled UNINSTALLING_AGENT_LABEL. Never on an old run kept in
             # the inventory: it stays a free Agent there.
             if (
-                not self._keep_inventory
+                not self._ends_at_free_agent
+                and not self._keep_inventory
                 and not workflow.patched(_NO_MARK_AGENTS_PATCH)
                 and workflow.patched(_MARK_AGENTS_PATCH)
             ):
@@ -597,6 +638,8 @@ class UninstallServerFromHcWorkflow:
                 )
                 if workflow.patched(_INVENTORY_VERIFY_PATCH):
                     await self._verify_still_inventory(request, activity_queue)
+            if self._ends_at_free_agent:
+                return self._end_at_free_agent(request, host, result, skipped)
             return await self._remove_and_finish(request, membership, host, result, skipped, activity_queue)
 
         # Step 3 — the lock, before anything is written.
@@ -726,6 +769,45 @@ class UninstallServerFromHcWorkflow:
                 "takes the server out of the hosted cluster first." + self._marked_note(),
                 type=ServerStillPresentError.__name__,
             )
+
+    def _end_at_free_agent(
+        self,
+        request: UninstallServerFromHcInput,
+        host: BoundHostState,
+        result: UninstallServerFromHcResult,
+        skipped: list[str],
+    ) -> UninstallServerFromHcResult:
+        """A new run's end: the server out of its hosted cluster, left a free Agent on the MCE.
+
+        Nothing of the inventory half is done — no power-off, no delete, no PXE
+        map change, no remove-server-from-mce — and no lock was ever taken
+        (the operator, 2026-11-19). `skipped` says what was left where.
+        """
+        where = f"InfraEnv {host.infra_env}" if host.infra_env else f"namespace {request.namespace}"
+        left = (
+            f"Agent {result.agent_name} stays a free Agent in {where}"
+            if result.agent_name
+            else f"the host has no Agent there; whatever else of it is in {where} stays"
+        )
+        skipped.append(
+            f"removing-from-inventory: not this workflow's — {left} of MCE "
+            f"{request.mce_cluster}, its BareMetalHost, NMStateConfig and PXE mapping as they "
+            "are. remove-server-from-mce takes a server out of the MCE"
+        )
+        result.kept_in_inventory = True
+        result.skipped = skipped
+        self._phase = "completed"
+        workflow.logger.info(
+            "Took %s out of its hosted cluster on MCE %s: hosted=%s hosted_cluster=%s "
+            "machine=%s node=%s — it stays a free Agent there",
+            request.server_name,
+            request.mce_cluster,
+            result.hosted,
+            result.hosted_cluster,
+            result.machine,
+            result.node_name,
+        )
+        return result
 
     async def _remove_and_finish(
         self,
@@ -870,11 +952,15 @@ class UninstallServerFromHcWorkflow:
         """Step 1's refusals: what server-scan alone can contradict. Nothing is written yet."""
         server = request.server_name
         if not membership.found:
+            why = (
+                "The run checks where server-scan places a server before touching it"
+                if self._ends_at_free_agent
+                else "The install lock that keeps it out of other MCEs' draws cannot be "
+                "taken on a machine it does not know"
+            )
             raise ApplicationError(
-                f"server-scan has no server named {server}. The install lock that "
-                "keeps it out of other MCEs' draws cannot be taken on a machine it "
-                "does not know. Nothing was changed. A host that is only on the MCE "
-                "is remove-server-from-mce's",
+                f"server-scan has no server named {server}. {why}. Nothing was changed. "
+                "A host that is only on the MCE is remove-server-from-mce's",
                 type=ServerNotInServerScanError.__name__,
             )
         if membership.maintenance:
@@ -1238,7 +1324,7 @@ class UninstallServerFromHcWorkflow:
     async def _verify_agent(
         self, request: UninstallServerFromHcInput, agent_ref: AgentNameRef, task_queue: str
     ) -> None:
-        """Until the Agent is the clean inventory host remove-server-from-mce takes (bounded)."""
+        """Until the Agent is a clean free Agent (bounded) — where a new run ends."""
         bmh_ref = BmhRef(server_name=request.server_name, namespace=request.namespace)
         started_at = workflow.now()
         while True:
@@ -1253,7 +1339,7 @@ class UninstallServerFromHcWorkflow:
                     f"Agent {agent_ref.name} of {request.server_name} is not a clean "
                     f"inventory host {_VERIFY_DEADLINE} after its Machine went: "
                     + "; ".join(problems)
-                    + ". remove-server-from-mce was not started",
+                    + ("" if self._ends_at_free_agent else ". remove-server-from-mce was not started"),
                     type=AgentStillBoundError.__name__,
                 )
             await workflow.sleep(_VERIFY_POLL_INTERVAL)  # durable, replay-safe
@@ -1520,7 +1606,8 @@ class UninstallServerFromHcWorkflow:
         if cluster is not None:
             await self._clear_nodes(request, cluster, followed, node_name, result, task_queue)
 
-        # 6. The clean inventory host remove-server-from-mce takes.
+        # 6. A clean free Agent: where a new run ends (a recorded one hands it to
+        #    remove-server-from-mce).
         if agent is not None and cluster is not None:
             self._phase = "verifying-agent"
             await self._verify_agent(
@@ -1841,8 +1928,8 @@ class UninstallServerFromHcWorkflow:
                     f"Hosted cluster {label} still has a Node that is {request.server_name} "
                     f"{_VERIFY_DEADLINE} after the host left it: "
                     f"{', '.join(n.name for n in found.nodes)} (still Ready: {ready} — "
-                    "something still runs as it). Nothing further was changed; "
-                    "remove-server-from-mce was not started",
+                    "something still runs as it). Nothing further was changed"
+                    + ("" if self._ends_at_free_agent else "; remove-server-from-mce was not started"),
                     type=HostedNodeStillPresentError.__name__,
                 )
             await workflow.sleep(_VERIFY_POLL_INTERVAL)  # durable, replay-safe

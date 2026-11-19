@@ -163,13 +163,14 @@ def _refuse_candidate_count(data: Any) -> Any:
 
 
 def _refuse_keep_inventory(data: Any) -> Any:
-    """`keep_inventory` was removed on 2026-11-02: every uninstall also takes the
-    server out of the MCE. A caller still sending it is told so, whatever its
-    value, rather than given a bare "extra field"."""
+    """`keep_inventory` was removed on 2026-11-02, and since 2026-11-19 every
+    uninstall leaves the server in the MCE as a free Agent: there is nothing
+    for it to choose. A caller still sending it is told so, whatever its value,
+    rather than given a bare "extra field"."""
     if isinstance(data, dict) and "keep_inventory" in data:
         raise ValueError(
-            "`keep_inventory` was removed: every uninstall now also takes the server out "
-            "of the MCE, through remove-server-from-mce — drop the field"
+            "`keep_inventory` was removed: every uninstall now leaves the server in the "
+            "MCE as a free Agent; take it out with remove-server-from-mce — drop the field"
         )
     return data
 
@@ -727,13 +728,15 @@ async def start_uninstall_server_from_hc(
     uninstall_request: UninstallServerFromHcRequest,
     client: Client = Depends(get_temporal_client),
 ) -> StartWorkflowResponse | UninstallServerFromHcBatchResponse:
-    """Take servers all the way out of an MCE — returns immediately (202).
+    """Take servers out of their hosted cluster — returns immediately (202).
 
-    Whatever state each server is in. A hosted cluster's node first leaves the
+    Whatever state each server is in. A hosted cluster's node leaves the
     hosted cluster — its CAPI Machine is deleted, CAPI drains the Node, the
-    Agent provider unbinds the Agent — and then, like a host that was only
-    inventory, leaves the MCE through remove-server-from-mce, run as the uninstall's
-    child (`remove-server-from-mce-<server>`).
+    Agent provider unbinds the Agent — and the run ends once the Agent is
+    unbound, back in discovery and verified clean: the server stays in the
+    MCE's InfraEnv as a free Agent. A server whose Agent is already free
+    completes at once. To take a server out of the MCE as well, call
+    remove-server-from-mce afterwards. No server-scan lock is taken.
 
     **Nothing has to be done first: the run deletes the node's Machine itself.**
     NodePool replicas are never touched, so the NodePool backfills a new
@@ -742,8 +745,8 @@ async def start_uninstall_server_from_hc(
     replacement takes it back and the run stops (AgentRetakenError) without
     writing anything more.
 
-    Every uninstall ends there: there is no option to keep the server in the
-    MCE's inventory (`keep_inventory` was removed on 2026-11-02 and is a 422).
+    `keep_inventory` is a 422: removed on 2026-11-02, and every uninstall now
+    keeps the server in the inventory anyway.
 
     The reply follows what was sent: one name is `{workflow_id, run_id}` on
     `uninstall-server-from-hc-<server>` and a 409 while that server is uninstalling;
@@ -751,8 +754,8 @@ async def start_uninstall_server_from_hc(
 
     Poll GET /workflows/runs/{workflow_id} (one per server) for progress and
     result. server-scan disagreeing with the MCE, an Agent bound with no
-    AgentMachine, a lock another run holds, a drain stuck for 20 minutes or an
-    orphaned Node all surface there as a FAILED run — not as a 4xx here.
+    AgentMachine, a drain stuck for 20 minutes or an orphaned Node all surface
+    there as a FAILED run — not as a 4xx here.
     """
     names = uninstall_request.server_names
     if isinstance(names, list):

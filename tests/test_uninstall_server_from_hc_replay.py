@@ -34,6 +34,11 @@ type, are in tests/histories/uninstall_server_from_hc/.
 Every golden but the two `*-agent-labelled` ones was recorded before the run
 labelled the server's Agents (`uninstall-server-mark-agents-uninstalling`,
 2026-11-12), so they prove a run in flight then replays without the label.
+
+Every golden but the two `*-free-agent` ones was recorded before a run ended
+at a free Agent (`uninstall-server-from-hc-ends-at-free-agent`, 2026-11-19):
+they lock the server and end in remove-server-from-mce, and their scenarios
+still record that shape (`before_free_agent`).
 """
 
 from __future__ import annotations
@@ -47,6 +52,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
+from temporalio import workflow
 from temporalio.client import WorkflowFailureError, WorkflowHistory
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.exceptions import ActivityError, ApplicationError
@@ -77,6 +83,7 @@ from workflow_domains.server_lifecycle.remove_server_from_mce import (
     RemoveServerWorkflow,
 )
 from workflow_domains.server_lifecycle.uninstall_server_from_hc import (
+    _FREE_AGENT_PATCH,
     UninstallServerFromHcWorkflow,
     UninstallServerWorkflow,
 )
@@ -99,6 +106,9 @@ class Scenario:
     input: UninstallServerFromHcInput = field(default_factory=lambda: INPUT)
     # The ApplicationError type the run fails with; None = it completes.
     fails_with: str | None = None
+    # Recorded as a run started before 2026-11-19 (locks, ends in the child);
+    # False = a run started since (ends at a free Agent).
+    before_free_agent: bool = True
 
 
 SCENARIOS: dict[str, Callable[[], Scenario]] = {
@@ -149,6 +159,13 @@ SCENARIOS: dict[str, Callable[[], Scenario]] = {
     "inventory-host-agent-labelled": lambda: Scenario(
         mocks={"membership": IN_INVENTORY, "host": INVENTORY_HOST}
     ),
+    # Since 2026-11-19: no lock, out of the hosted cluster, the Agent verified
+    # free, and done — no remove-server-from-mce.
+    "hosted-node-free-agent": lambda: Scenario(before_free_agent=False),
+    # ... and an Agent already free completes at once.
+    "inventory-host-free-agent": lambda: Scenario(
+        mocks={"membership": IN_INVENTORY, "host": INVENTORY_HOST}, before_free_agent=False
+    ),
 }
 
 
@@ -192,7 +209,9 @@ async def _record(name: str) -> WorkflowHistory:
 
 
 @pytest.mark.parametrize("scenario", sorted(SCENARIOS))
-async def test_every_run_a_scenario_records_replays(scenario):
+async def test_every_run_a_scenario_records_replays(scenario, monkeypatch):
+    if SCENARIOS[scenario]().before_free_agent:
+        monkeypatch.setattr(workflow, "patched", lambda patch_id: patch_id != _FREE_AGENT_PATCH)
     history = await _record(scenario)
     await _replayer().replay_workflow(history)
     golden = GOLDEN / f"{scenario}.json"

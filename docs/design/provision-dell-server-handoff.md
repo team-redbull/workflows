@@ -45,7 +45,8 @@ later.
 3. **`128c`** is hyperthreaded cores (threads). **`1024gb`** is memory.
    **`10tb`** is all disks combined, rounded up by the naming service. The serial
    is the Dell service tag. The name must match the InfraEnv tokens add-server-to-mce
-   searches on (`^ocp-<infraEnv>-`).
+   searches on (`^ocp-<infraEnv>-` when written; since 2026-11-19 the InfraEnv's
+   first three words, `^ocp-dell-<model>-<region>-`).
 4. **Storage:** RAID 1 on the **BOSS** pair; every **PERC** drive **Non-RAID**.
 5. **The workflow runs the OME discovery itself.**
 6. **The template is per server type AND per firmware version.** It is picked from

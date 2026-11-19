@@ -280,8 +280,12 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   (`SERVER_SCAN_URL`), and it ALLOCATES each run ONE server (server-scan's
   ADR-0063, 2026-11-16; adopted here 2026-11-17, the operator: "every workflow
   will ask for one server, no need for candidate"). `allocate_server` =
-  `POST /servers/available` {pattern `^ocp-<infraEnv>-` (the trailing `-` is
-  load-bearing, the operator 2026-11-17: `…-512gb` must not draw `…-512gbx-…`) | name, `max_health:
+  `POST /servers/available` {pattern `^ocp-<the InfraEnv's FIRST THREE words>-`
+  (the operator, 2026-11-19: `c200-mtl-haifa-az1` → `^ocp-c200-mtl-haifa-`; ALWAYS
+  three, so a longer-style name like `cisco-m6-bat-yam-64c-512gb` draws
+  `^ocp-cisco-m6-bat-`, size and the rest of the site dropped — accepted; fewer
+  words = the whole name; `server_pool_prefix`, `_POOL_WORDS`. The trailing `-`
+  is load-bearing, the operator 2026-11-17: `…-haifa` must not draw `…-haifa2-…`) | name, `max_health:
   HEALTHY`, `min_nic_macs: 2`, holder, workflow id, mce_cluster, infra_env,
   namespace, `ttl_seconds` = the install TTL}: server-scan draws a candidate,
   LOCKS it for the run, live-rechecks it against its vendor manager WHILE locked
@@ -388,7 +392,7 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   found by the cancel tests).
   So the rollback first waits `_CANCEL_SETTLE` (one attempt's budget + 30 s),
   then: anything possibly written on the MCE → remove-server-from-mce as an
-  awaited child (ABANDON), exactly as uninstall-server-from-hc's inventory half —
+  awaited child (ABANDON), as a recorded uninstall-server-from-hc's inventory half —
   power off, BMH + NMStateConfig, any Agent, its PXE MACs, verification —
   never reimplemented here, then the lock released HERE unless the child's
   `pxe_failed` is set (gated `add-server-cancel-releases-after-removal`, since the
@@ -523,8 +527,8 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   PXE VMs first. It ENDS AT THE CHECK and NEVER reads or releases server-scan's
   install lock — a lock is its holder's (the operator, 2026-11-17: "isn't
   necessary"; do not re-add it). Each caller holding one releases its own after
-  this run: uninstall-server-from-hc once its child completed, a cancelled
-  add-server-to-mce in its rollback; add-server-to-mce's day-long hold already ends
+  this run: a cancelled add-server-to-mce in its rollback, an uninstall-server-from-hc
+  recorded before 2026-11-19 once its child completed (a new one starts no child); add-server-to-mce's day-long hold already ends
   once server-scan sees the install (2026-11-09). Gated `remove-server-no-lock-release`:
   a run recorded with `remove-server-release-own-mce-lock` (2026-10-31 — a server
   removed the day it was installed stayed undrawable for the rest of that hold) and
@@ -532,18 +536,30 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   (`lookup_server_membership`) and released ONLY when live, `add-server-to-mce`'s
   and for THIS MCE, never on found=false or a PXE failure, never failing the run
   (`lock_released`, `lock_detail`). Needs `delete` on agents in the limb's RBAC.
-- **uninstall-server-from-hc takes ONE server all the way out of an MCE, whatever its
-  Agent's state** (`workflow_domains/server_lifecycle/uninstall_server_from_hc.py`, own
+- **uninstall-server-from-hc takes ONE server out of its hosted cluster and ENDS AT A
+  FREE AGENT, whatever its Agent's state** (`workflow_domains/server_lifecycle/uninstall_server_from_hc.py`, own
   queue `uninstall-server-from-hc-workflow`, id `uninstall-server-from-hc-<server lowercased>`,
   API `POST /workflows/server-lifecycle/uninstall-server-from-hc` — `server_names` ONLY,
   a string or a list of 1-20, each once case-insensitively, plus `mce_cluster`
-  canonicalised and `namespace` defaulting to `inventory`. EVERY UNINSTALL ENDS IN
-  remove-server-from-mce: `keep_inventory` (added 2026-10-24 — stop after the hosted
-  half, the server left in the InfraEnv as a free Agent) was REMOVED by the
-  operator on 2026-11-02; do not re-add it. The request answers it with a 422
-  saying so; a run started since `uninstall-server-from-hc-always-removes` ignores it
-  in its input; a run recorded before still ends as it began (`_keep_inventory`,
-  `kept_in_inventory: true`, the `keep-inventory` goldens). NO `count`, NodePool or
+  canonicalised and `namespace` defaulting to `inventory`. EVERY NEW RUN ENDS ONCE
+  THE AGENT IS UNBOUND AND VERIFIED CLEAN, the server left in its MCE's InfraEnv
+  (`kept_in_inventory: true`), and TAKES NO server-scan LOCK (the operator,
+  2026-11-19: "don't call remove-server-from-mce and finish when it see the agent
+  is not bound to cluster"; no lock "because the server not be in available status
+  in server scanner on all the steps of the flow"; gated
+  `uninstall-server-from-hc-ends-at-free-agent`, `_ends_at_free_agent`). This
+  REVERSES 2026-11-02's "every uninstall ends in remove-server-from-mce" — do not
+  re-add the child or the lock: a server leaves the MCE through remove-server-from-mce's
+  own route. An Agent already free at inspection (an INVENTORY HOST) completes at
+  once, nothing written. `keep_inventory` (added 2026-10-24, REMOVED 2026-11-02)
+  stays a 422 — nothing is left for it to choose. A run recorded before
+  2026-11-19 ends as it began: from 2026-11-02 in the child whatever its input
+  (`uninstall-server-from-hc-always-removes`), before that kept in the inventory
+  when started with it (`_keep_inventory`, the `keep-inventory` goldens). The
+  rest of this bullet down to HOSTED-CLUSTER ACCESS — the inventory host's
+  re-inspection, the child, `reserving-server`, `holding-server`,
+  `removing-from-inventory`, `releasing-server`, THE LOCK — describes those
+  recorded runs only. NO `count`, NodePool or
   HostedCluster field: server-scan and the Agent's binding say where it is. A
   string is `{workflow_id, run_id}` and a 409 while it runs, a list the per-run
   report add-server-to-mce's named list uses (`ServerRunItem`); `UninstallServerFromHcRequest`
@@ -557,12 +573,12 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   `pre-terminate.delete.hook.machine.cluster.x-k8s.io/agentmachine` until the
   Agent is unbound), so without the agentRef match a re-run mid-unbinding would
   skip the hosted half instead of resuming it. Anything else is an INVENTORY HOST
-  and skips that half — but is INSPECTED AGAIN, fresh, right before remove-server-from-mce
+  and skips that half — a new run then completes; a recorded one is INSPECTED AGAIN, fresh, right before remove-server-from-mce
   (`verifying-agentmachine`, gated `uninstall-server-inventory-verify`; the
   operator, 2026-10-24: "should still verify no AgentMachine, Machine"): a free
   Agent is what ANY NodePool's new AgentMachine takes, so one now bound or
   labelled fails `AgentRetakenError`, any other AgentMachine / Machine /
-  control-plane link `ServerStillPresentError`, nothing on the MCE written. EVERY path ends in remove-server-from-mce as an AWAITED CHILD
+  control-plane link `ServerStillPresentError`, nothing on the MCE written. A recorded run's every path ends in remove-server-from-mce as an AWAITED CHILD
   (`remove_server_from_mce_workflow_id`, `REMOVE_SERVER_FROM_MCE_WORKFLOW_QUEUE`, ABANDON on parent
   close) — the inventory half, PXE cleanup included, is never reimplemented here
   and remove-server-from-mce's own route keeps working alone; `WorkflowAlreadyStartedError`
@@ -581,8 +597,8 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   `NotHostedClusterNodeError` (an ORPHAN binding into a control plane is a
   leftover, next bullet), server-scan INSTALLED naming another cluster or
   INSTALLED_TO_INVENTORY while bound — an unbound Agent contradicts no
-  INSTALLED reading, a re-run's normal view) → `reserving-server` ALWAYS → the
-  hosted half: `deleting-machine` (`ensure_machine_deleting`, the one write the
+  INSTALLED reading, a re-run's normal view) → (`reserving-server`, recorded
+  runs only) → the hosted half: `deleting-machine` (`ensure_machine_deleting`, the one write the
   NORMAL path makes, a no-op when it already has a deletionTimestamp or is gone) →
   `awaiting-machine-deletion` (30 s polls of Machine + Agent: `draining` while the
   Agent is bound, 20 min from the first deleting observation, then
@@ -594,7 +610,8 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   providerID, nodeRef or hostname, NEVER skipped for a missing nodeRef) →
   `verifying-agent` (no
   binding, no label, known-unbound, approved, BMH present and not in error; 5 min,
-  `AgentStillBoundError`) → `holding-server` (24 h BEFORE the child, so the hold
+  `AgentStillBoundError`) — where a NEW RUN COMPLETES; a recorded one goes on →
+  `holding-server` (24 h BEFORE the child, so the hold
   covers the inventory half) → `removing-from-inventory` → `releasing-server`
   (the lock given back, below). Every skip goes into
   `result.skipped`. NOTHING IS UNDONE after the Machine delete — it cannot be —
@@ -619,7 +636,7 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   Gated `uninstall-server-no-agent-mark`: a run recorded in between still labels
   (and its failures name the `oc label … -` that takes it off), so the activity,
   its registration and the `patch` on agents stay until none can remain; the
-  `patch` also serves `release_agent`. THE LOCK even for an uninstall (holder
+  `patch` also serves `release_agent`. THE LOCK of a RECORDED run (a new one takes none, above; holder
   `uninstall-server-from-hc`, TTL = two drains + unbind + three verifications + 10 min): the
   hosted cluster's nodes job frees the server on its Node's absence and the MCE's
   agents job re-claims it INSTALLED_TO_INVENTORY on its own 5-min cadence, so
@@ -940,7 +957,10 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
     **kubevirt-redfish runs `systemIdConvention: legacy`** (the operator, 2026-11-05, before any
     production VM exists): the Redfish system id IS the VM name, so the id, the VM and the server
     name server-scan lists are one string, `ocp-<infraenv>-<suffix>`, and add-server-to-mce's
-    `^ocp-<infraEnv>-` match holds. `enhanced` (`<ns>.<vm>`) was the chart's setting until then;
+    match holds (since 2026-11-19 on the InfraEnv's first three words only — which for a
+    KubeVirt InfraEnv `<conf>[-<letter>]-zone-<zone>-<cpu>` stops before the zone and size:
+    the pool then spans the conf's VMs of every zone and size, to settle before the KubeVirt
+    branch is built). `enhanced` (`<ns>.<vm>`) was the chart's setting until then;
     its one advantage, duplicate names across chassis namespaces, cannot arise for create-vm's
     VMs (the suffix is the MAC's, unique zone-wide). Changed in redbull-platform's chart values
     and lab manifests; each cluster's out-of-band config Secret is re-rendered by the operator.
@@ -1334,8 +1354,10 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   id=<its own id from shared/workflow_ids.py>, task_queue=<its own queue>,
   parent_close_policy=ParentClosePolicy.ABANDON)`, `WorkflowAlreadyStartedError` mapped to a named
   WORKFLOW-RAISED `<Child>AlreadyRunningError`, `ChildWorkflowError` to `<Child>FailedError` carrying
-  the child's own type and message (unwrapping an `ActivityError` behind it) — uninstall-server-from-hc
-  → remove-server-from-mce and provision-cluster → allocate-segment. ABANDON either way: a child
+  the child's own type and message (unwrapping an `ActivityError` behind it) — provision-cluster
+  → allocate-segment, add-server-to-mce's cancel rollback → remove-server-from-mce, and
+  uninstall-server-from-hc → remove-server-from-mce for runs recorded before 2026-11-19
+  (a new uninstall starts no child, §4). ABANDON either way: a child
   verifies by read-back and must never be cut off between the mutation and the verify; its id is
   the dedup key a re-run or a manual start meets. The builders-in-`shared/workflow_ids.py`
   arrangement is what makes both possible (a workflow can never import a router).
@@ -1637,7 +1659,7 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   (`cisco-m6-bat-yam-64c-512gb`) and server names carry the same tokens behind an `ocp-` prefix,
   so the InfraEnv IS the server query. EVERY POOL RUN IS ON A SLOT of its HUB's CANDIDATE POOL — the
   MCE and the InfraEnv. The MCE is in the id (since 2026-10-25) so a hub finds only its own runs;
-  the machines the pool draws from (`^ocp-<infraEnv>-`) are still shared by every hub, so a run
+  the machines the pool draws from (`^ocp-<the InfraEnv's first three words>-`) are still shared by every hub, so a run
   sizing its spares no longer counts another hub's runs, and the install lock keeps two hubs off
   one machine. The install lock (§4) guards the machine itself, so draws are PARALLEL: a request
   without `count` starts ONE new run and `count` (1-20, on the request ONLY — never in a run's

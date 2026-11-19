@@ -124,7 +124,9 @@ for the operator.
 kubevirt-redfish runs `systemIdConvention: legacy` (decided 2026-11-05): the
 Redfish system id is the bare VM name, so `ocp-<infraenv>-<suffix>` is the
 VM, the Redfish system and the server server-scan lists — one string, and the
-one add-server-to-mce's `^ocp-<infraEnv>-` pool match needs. Under `legacy` the
+one add-server-to-mce's pool match needs (`^ocp-<infraEnv>-` when written; since
+2026-11-19 only the InfraEnv's first three words, which stop before a KubeVirt
+InfraEnv's zone and size). Under `legacy` the
 server resolves a name across every chassis the Redfish user may see, so VM
 names must be unique across them; create-vm's are (the suffix is the MAC's,
 unique zone-wide).

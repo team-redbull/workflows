@@ -11,8 +11,9 @@ another machine.
 
     ocp-dell-r660-<region>-128c-1024gb-10tb-<service tag>
 
-The model/region/cores/memory prefix is also what add-server-to-mce matches an
-InfraEnv name against (`^ocp-<infraEnv>-`), so this shape is load-bearing.
+Its leading words are also what add-server-to-mce matches an InfraEnv against
+(`^ocp-<the InfraEnv's first three words>-`, i.e. `ocp-dell-<model>-<region>-`),
+so this shape is load-bearing.
 """
 
 from __future__ import annotations

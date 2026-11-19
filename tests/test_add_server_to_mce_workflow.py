@@ -83,6 +83,7 @@ from shared.models.server_lifecycle import (
     TeardownResult,
     mac_is_valid,
 )
+from workflow_domains.server_lifecycle import add_server_to_mce
 from workflow_domains.server_lifecycle.add_server_to_mce import AddServerToMceWorkflow, InstallServerWorkflow
 
 INFRA_ENV = "cisco-m6-bat-yam-64c-512gb"
@@ -804,6 +805,22 @@ async def test_happy_path_resolves_vlan_acquires_creates_and_awaits_the_agent():
     assert len(calls["find_agent_for_host"]) == 1
 
 
+@pytest.mark.parametrize(
+    ("infra_env", "prefix"),
+    [
+        ("c200-mtl-haifa-az1", "c200-mtl-haifa"),
+        ("cisco-m6-bat-yam-64c-512gb", "cisco-m6-bat"),
+        ("dell-r660-tlv", "dell-r660-tlv"),
+        ("dell-r660", "dell-r660"),  # fewer than three words: the whole name
+    ],
+)
+def test_the_pool_is_the_infraenvs_first_three_words(infra_env, prefix):
+    assert add_server_to_mce.server_pool_prefix(infra_env) == prefix
+    pool = re.compile(f"^ocp-{re.escape(prefix)}-")
+    assert pool.match(f"ocp-{prefix}-anything-FCH0001")
+    assert not pool.match(f"ocp-{prefix}2-FCH0001")
+
+
 async def test_the_infraenv_becomes_the_server_query():
     calls, segment_acts, server_acts = make_mock_activities()
     async with _Harness(segment_acts, server_acts) as client:
@@ -813,17 +830,18 @@ async def test_the_infraenv_becomes_the_server_query():
     # only for runs recorded before the allocation.
     [request] = calls["allocate_server"]
     assert calls["acquire_servers"] == []
-    # Escaped, because the InfraEnv name is caller data going into a regex that
+    # The InfraEnv's FIRST THREE words (the operator, 2026-11-19), escaped,
+    # because the InfraEnv name is caller data going into a regex that
     # server-scan hands to Mongo. `\-` is a literal `-`, so the pool is the
     # same; an unescaped `.` or `+` in a future name would not be.
-    # The `-` after the InfraEnv is load-bearing (the operator, 2026-11-17): the
-    # InfraEnv must END where the server's own part begins.
-    assert request.pattern == f"^ocp-{re.escape(INFRA_ENV)}-"
+    # The `-` after the third word is load-bearing (the operator, 2026-11-17).
+    assert request.pattern == f"^ocp-{re.escape('cisco-m6-bat')}-"
     pool = re.compile(request.pattern)
     assert pool.match(f"ocp-{INFRA_ENV}-FCH0001")
-    assert not pool.match(f"ocp-{INFRA_ENV}x-FCH0001")
-    assert not pool.match(f"ocp-{INFRA_ENV}2-FCH0001")
-    assert not pool.match(f"ocp-{INFRA_ENV}")
+    assert pool.match("ocp-cisco-m6-bat-yam-64c-256gb-FCH0002")  # size is no longer part of it
+    assert not pool.match("ocp-cisco-m6-batx-FCH0001")
+    assert not pool.match("ocp-cisco-m6-bat2-FCH0001")
+    assert not pool.match("ocp-cisco-m6-bat")
     assert request.name is None
     assert (request.max_health, request.min_nic_macs) == ("HEALTHY", 2)
     # The lock server-scan takes as it allocates IS this run's: its holder and

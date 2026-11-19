@@ -2,10 +2,14 @@
 
 Every limb activity is registered ONLY on the target MCE's queue — as in
 production, a dispatch anywhere else would hang the run — and remove-server-from-mce's
-inventory-segment read on the segment-lifecycle queue. The child is the REAL
-RemoveServerFromMceWorkflow on its own queue, so "every path ends in remove-server-from-mce" is
-exercised end to end. The time-skipping environment collapses the 30 s Machine
-poll and the 20-minute / 1-hour deadlines.
+inventory-segment read on the segment-lifecycle queue. The time-skipping
+environment collapses the 30 s Machine poll and the 20-minute / 1-hour deadlines.
+
+A run started since 2026-11-19 ends once the Agent is a clean free Agent, with
+no lock and no child (TestANewRunEndsAtAFreeAgent). Every other test is a run
+RECORDED BEFORE that (`_recorded_before_the_free_agent_end`, autouse): it
+locks the server and ends in the REAL RemoveServerFromMceWorkflow on its own
+queue. The hosted-cluster half they pin is the same code for both.
 """
 
 from __future__ import annotations
@@ -331,7 +335,8 @@ def make_mocks(
     @activity.defn
     async def find_hosted_nodes(query: HostedNodeQuery) -> HostedNodes:
         calls["find_hosted_nodes"].append(query)
-        _mark("verify-node" if "reserve" in calls["order"] else "find-nodes")
+        # The first look is before any write; every later one is the last check.
+        _mark("find-nodes" if len(calls["find_hosted_nodes"]) == 1 else "verify-node")
         if nodes_unresolved is not None:
             return HostedNodes(reason=nodes_unresolved)
         return HostedNodes(hosted_cluster=query.hosted_cluster or HC,
@@ -508,11 +513,160 @@ async def _fails(client: Client, **kwargs) -> ApplicationError:
     return cause
 
 
+_REAL_PATCHED = workflow.patched
+
+
+def _recorded_without(*patch_ids: str):
+    """`workflow.patched` as a run recorded before these patches — and before the free-Agent end — sees it."""
+    retired = {uninstall_server_from_hc._FREE_AGENT_PATCH, *patch_ids}
+    return lambda patch_id: patch_id not in retired
+
+
+@pytest.fixture(autouse=True)
+def _recorded_before_the_free_agent_end(monkeypatch):
+    """Every test here but TestANewRunEndsAtAFreeAgent's: a run that locks and ends in the child."""
+    monkeypatch.setattr(workflow, "patched", _recorded_without())
+
+
 # remove-server-from-mce's steps (it reads no lock since 2026-11-17), then the
 # parent's release of its own lock.
 CHILD = ["child-inspect", "child-power-off", "child-teardown", "child-delete-agents",
          "child-pxe", "child-verify", "release"]
 HOSTED_HALF = ["delete-machine", "await-machine", "verify-agentmachine", "verify-node"]
+
+
+_NOT_THIS_WORKFLOWS = (
+    "removing-from-inventory: not this workflow's — Agent agent-1 stays a free Agent in "
+    f"InfraEnv cisco-m6-bat-yam-64c-512gb of MCE {MCE}, its BareMetalHost, NMStateConfig and "
+    "PXE mapping as they are. remove-server-from-mce takes a server out of the MCE"
+)
+# Everything a run writes or locks besides the hosted-cluster half: none of it is a new run's.
+_NEVER_TOUCHED = (
+    "reserve_server", "release_server", "mark_agents_uninstalling", "inspect_inventory_host",
+    "set_host_online", "teardown_bmh_resources", "delete_agents", "remove_host_pxe_entries",
+)
+
+
+class TestANewRunEndsAtAFreeAgent:
+    """Since 2026-11-19 (the operator): out of the hosted cluster, the Agent verified free,
+    and done — no server-scan lock (the server is never AVAILABLE in server-scan while it
+    moves) and no remove-server-from-mce."""
+
+    @pytest.fixture(autouse=True)
+    def _started_since(self, monkeypatch):
+        monkeypatch.setattr(workflow, "patched", _REAL_PATCHED)
+
+    async def test_a_hosted_node_leaves_its_cluster_and_stays_a_free_agent(self):
+        calls, acts = make_mocks()
+        async with _Harness(acts) as client:
+            result = await _execute(client)
+
+        assert calls["order"] == ["lookup", "inspect", "find-nodes", *HOSTED_HALF]
+        assert result.hosted and result.machine_deleted_by_run
+        # It ends on the Agent verified: unbound, known-unbound, approved, its BMH there.
+        assert calls["get_agent_binding"] and calls["get_baremetal_host"]
+        assert result.kept_in_inventory
+        assert result.remove_server is None and result.remove_server_workflow_id is None
+        assert result.reservation_expires_at is None and result.lock_released is False
+        for untouched in _NEVER_TOUCHED:
+            assert calls[untouched] == [], untouched
+        assert result.skipped == [_NOT_THIS_WORKFLOWS]
+
+    async def test_an_agent_already_free_completes_at_once(self):
+        calls, acts = make_mocks(membership=IN_INVENTORY, host=INVENTORY_HOST)
+        async with _Harness(acts) as client:
+            result = await _execute(client)
+
+        assert calls["order"] == ["lookup", "inspect"]
+        assert len(calls["inspect_bound_host"]) == 1  # no last look: nothing is written
+        assert result.kept_in_inventory and not result.hosted
+        assert [s.split(":")[0] for s in result.skipped] == [
+            "checking-hosted-node", "hosted-cluster half", "removing-from-inventory",
+        ]
+        assert result.skipped[-1] == _NOT_THIS_WORKFLOWS
+        for untouched in _NEVER_TOUCHED:
+            assert calls[untouched] == [], untouched
+
+    async def test_a_stale_installed_reading_still_asks_its_cluster_for_a_node(self):
+        calls, acts = make_mocks(membership=INSTALLED, host=INVENTORY_HOST)
+        async with _Harness(acts) as client:
+            result = await _execute(client)
+
+        assert calls["order"] == ["lookup", "inspect", "find-nodes"]
+        assert result.kept_in_inventory and not result.hosted
+
+    async def test_nothing_on_the_mce_completes_too(self):
+        available = INSTALLED.model_copy(update={
+            "lifecycle_state": "AVAILABLE", "cluster_name": None, "mce_name": None,
+        })
+        calls, acts = make_mocks(membership=available, host=BoundHostState())
+        async with _Harness(acts) as client:
+            result = await _execute(client)
+
+        assert calls["order"] == ["lookup", "inspect"]
+        assert "the host has no Agent there" in result.skipped[-1]
+
+    async def test_a_stale_node_nothing_links_is_still_cleared_first(self):
+        stale = THE_NODE.model_copy(update={"ready": False, "matched_by": ["name"]})
+        calls, acts = make_mocks(membership=INSTALLED, host=INVENTORY_HOST,
+                                 nodes=[[stale], [stale], []])
+        async with _Harness(acts) as client:
+            result = await _execute(client)
+
+        assert result.hosted and calls["delete_hosted_node"]
+        assert result.kept_in_inventory and calls["reserve_server"] == []
+
+    async def test_a_lock_another_run_holds_does_not_stop_it(self):
+        calls, acts = make_mocks(reserve_error=ServerReservedError(
+            f"{SERVER} is reserved by 'add-server-to-mce' for MCE 'ocp4-mce-bat-yam-01'"
+        ))
+        async with _Harness(acts) as client:
+            result = await _execute(client)
+
+        assert calls["reserve_server"] == [] and result.kept_in_inventory
+
+    async def test_the_nodepool_taking_it_back_still_stops_the_run(self):
+        labelled = HOSTED_NODE.model_copy(update={
+            "agents": [BOUND_AGENT.model_copy(update={"labelled_agent_machine": AM})],
+        })
+        calls, acts = make_mocks(
+            host=labelled,
+            machines=[DELETING, GONE],
+            agents=[AGENT_BOUND.model_copy(update={"agent_machine": AM}), AGENT_UNBINDING, RETAKEN],
+        )
+        async with _Harness(acts) as client:
+            error = await _fails(client)
+
+        assert error.type == "AgentRetakenError" and NEW_AM in error.message
+        assert calls["release_agent"] == [] and calls["reserve_server"] == []
+
+    async def test_an_agent_left_unclean_fails_and_names_no_removal(self):
+        not_approved = AGENT_FREE.model_copy(update={"approved": False})
+        _calls, acts = make_mocks(agents=[AGENT_BOUND, AGENT_UNBINDING, AGENT_FREE, not_approved])
+        async with _Harness(acts) as client:
+            error = await _fails(client)
+
+        assert error.type == "AgentStillBoundError" and "not approved" in error.message
+        assert "remove-server-from-mce" not in error.message
+
+    async def test_a_node_still_ready_fails_and_names_no_removal(self):
+        calls, acts = make_mocks(nodes=[[THE_NODE]])
+        async with _Harness(acts) as client:
+            error = await _fails(client)
+
+        assert error.type == "HostedNodeStillPresentError"
+        assert "remove-server-from-mce" not in error.message
+        assert calls["delete_hosted_node"] == []
+
+    async def test_an_unknown_server_is_refused_before_anything(self):
+        calls, acts = make_mocks(membership=ServerMembership(found=False))
+        async with _Harness(acts) as client:
+            error = await _fails(client)
+
+        assert error.type == "ServerNotInServerScanError"
+        assert "checks where server-scan places a server" in error.message
+        assert "lock" not in error.message
+        assert calls["order"] == ["lookup"]
 
 
 class TestAHostedClustersNode:
@@ -993,8 +1147,7 @@ class TestARunRecordedWithTheLabel:
     @pytest.fixture(autouse=True)
     def _recorded_with_the_label(self, monkeypatch):
         monkeypatch.setattr(
-            workflow, "patched",
-            lambda patch_id: patch_id != uninstall_server_from_hc._NO_MARK_AGENTS_PATCH,
+            workflow, "patched", _recorded_without(uninstall_server_from_hc._NO_MARK_AGENTS_PATCH)
         )
 
     async def test_a_hosted_node_is_labelled_before_its_machine_is_deleted(self):
@@ -1073,7 +1226,7 @@ class TestARunRecordedWithTheLabel:
     async def test_a_run_recorded_before_the_label_labels_nothing(self, monkeypatch):
         monkeypatch.setattr(
             workflow, "patched",
-            lambda patch_id: patch_id not in (
+            _recorded_without(
                 uninstall_server_from_hc._MARK_AGENTS_PATCH, uninstall_server_from_hc._NO_MARK_AGENTS_PATCH,
             ),
         )
@@ -1171,8 +1324,7 @@ class TestAnInventoryHost:
 
     async def test_a_run_recorded_before_the_recheck_goes_straight_to_the_hold(self, monkeypatch):
         monkeypatch.setattr(
-            workflow, "patched",
-            lambda patch_id: patch_id != uninstall_server_from_hc._INVENTORY_VERIFY_PATCH,
+            workflow, "patched", _recorded_without(uninstall_server_from_hc._INVENTORY_VERIFY_PATCH)
         )
         calls, acts = make_mocks(membership=IN_INVENTORY, host=INVENTORY_HOST)
         async with _Harness(acts) as client:
@@ -1226,8 +1378,7 @@ class TestARunRecordedWithKeepInventory:
     @pytest.fixture(autouse=True)
     def _recorded_before_the_removal(self, monkeypatch):
         monkeypatch.setattr(
-            workflow, "patched",
-            lambda patch_id: patch_id != uninstall_server_from_hc._ALWAYS_REMOVE_PATCH,
+            workflow, "patched", _recorded_without(uninstall_server_from_hc._ALWAYS_REMOVE_PATCH)
         )
 
     async def test_a_hosted_node_leaves_its_cluster_and_stays_in_the_inventory(self):
@@ -1447,7 +1598,7 @@ class TestTheLockIsGivenBack:
 
     async def test_a_run_recorded_before_the_release_keeps_the_day_long_hold(self, monkeypatch):
         monkeypatch.setattr(
-            workflow, "patched", lambda patch_id: patch_id != uninstall_server_from_hc._RELEASE_PATCH
+            workflow, "patched", _recorded_without(uninstall_server_from_hc._RELEASE_PATCH)
         )
         calls, acts = make_mocks()
         async with _Harness(acts) as client:
@@ -1461,8 +1612,7 @@ class TestTheLockIsGivenBack:
 async def test_a_run_recorded_before_the_leftover_patch_keeps_its_flow(monkeypatch):
     """`workflow.patched` False — a run replaying from older history — takes the old path."""
     monkeypatch.setattr(
-        workflow, "patched",
-        lambda patch_id: patch_id != uninstall_server_from_hc._LEFTOVERS_PATCH,
+        workflow, "patched", _recorded_without(uninstall_server_from_hc._LEFTOVERS_PATCH)
     )
     calls, acts = make_mocks(machines=[DELETING, GONE], agents=[AGENT_BOUND, AGENT_FREE])
     async with _Harness(acts) as client:

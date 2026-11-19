@@ -84,7 +84,7 @@
         <thead><tr><th></th><th><code>server_names</code> omitted</th><th><code>server_names</code> given</th></tr></thead>
         <tbody>
           <tr><td class="k">reads as</td><td class="muted"><em>&ldquo;fill this InfraEnv&rdquo;</em></td><td class="muted"><em>&ldquo;install this machine&rdquo;</em></td></tr>
-          <tr><td class="k">server-scan allocation</td><td class="muted"><code>POST /servers/available {"pattern": "^ocp-&lt;infraEnv&gt;-", …}</code></td><td class="muted"><code>POST /servers/available {"name": "&lt;server&gt;", …}</code></td></tr>
+          <tr><td class="k">server-scan allocation</td><td class="muted"><code>POST /servers/available {"pattern": "^ocp-&lt;first 3 words of infraEnv&gt;-", …}</code></td><td class="muted"><code>POST /servers/available {"name": "&lt;server&gt;", …}</code></td></tr>
           <tr><td class="k">servers per run</td><td class="muted">one &mdash; server-scan picks it, locks it for the run and live-checks it</td><td class="muted">one &mdash; that one</td></tr>
           <tr><td class="k">already has a BareMetalHost</td><td class="muted">its lock <b>given back</b>, the run fails</td><td class="muted"><b>converged</b> &mdash; that is the point</td></tr>
           <tr><td class="k">workflow id</td><td class="muted"><code>add-server-to-mce-&lt;mce&gt;_&lt;infraEnv&gt;_&lt;slot&gt;</code>, the first free slot</td><td class="muted"><code>add-server-to-mce-&lt;mce&gt;_&lt;server&gt;</code></td></tr>
@@ -106,14 +106,16 @@
         expected state rather than a reason to give the server back.</p>
       </div>
       <div class="panel">
-        <h3>Why the pattern is just a prefix</h3>
-        <p>An InfraEnv&rsquo;s name states which hardware it is for &mdash;
-        <code>cisco-m6-bat-yam-64c-512gb</code> is vendor, model, site, cores, memory &mdash; and
-        server-scan names carry the same tokens behind an <code>ocp-</code> prefix. So the query is
-        <code>^ocp-&lt;infraEnv&gt;-</code>: neither name is parsed apart, and there is no mapping table
-        to keep in step with either. The trailing <code>-</code> is load-bearing (the operator,
-        2026-11-17): the InfraEnv must end where the server&rsquo;s own part begins, so
-        <code>…-512gb</code> never draws a server of <code>…-512gbx</code> or <code>…-512gb2</code>.</p>
+        <h3>The pool: the InfraEnv&rsquo;s first three words</h3>
+        <p>server-scan names carry the InfraEnv&rsquo;s leading words behind an <code>ocp-</code> prefix,
+        so the query is the InfraEnv name&rsquo;s <b>first three <code>-</code>-separated words</b>
+        (the operator, 2026-11-19): <code>c200-mtl-haifa-az1</code> draws from
+        <code>^ocp-c200-mtl-haifa-</code>. Always three, whatever the name &mdash; a longer name such as
+        <code>cisco-m6-bat-yam-64c-512gb</code> draws from <code>^ocp-cisco-m6-bat-</code>, any size; a
+        name of fewer words is used whole. There is no mapping table to keep in step. The trailing
+        <code>-</code> is load-bearing (the operator, 2026-11-17): the third word must end where the
+        server&rsquo;s next word begins, so <code>c200-mtl-haifa</code> never draws a server of
+        <code>c200-mtl-haifa2</code> or <code>c200-mtl-haifax</code>.</p>
         <p class="note">The InfraEnv name is caller data going into a regex, so it is escaped. Today&rsquo;s
         names are <code>[a-z0-9-]</code> and it changes nothing &mdash; a <code>.</code> would silently
         widen the pool without it.</p>
@@ -693,7 +695,7 @@
       <div class="panel">
         <h3>The id names a slot of the POOL; the probe and the lock cover the rest</h3>
         <p><code>add-server-to-mce-&lt;mce&gt;_&lt;infraEnv&gt;_&lt;slot&gt;</code> keys on the hub and its
-        <b>pool</b> (<code>^ocp-&lt;infraEnv&gt;-</code>), not on the machine &mdash; which server-scan
+        <b>pool</b> (<code>^ocp-&lt;first 3 words of infraEnv&gt;-</code>), not on the machine &mdash; which server-scan
         allocates inside the run &mdash; and not on the target. Each hub has its own slots, so it finds only its own runs;
         the machines themselves are shared by every hub and the install lock keeps them apart. A second trigger while one is in flight takes the next slot: it is a <b>second
         install</b>, never a 409, because asking the pool again is asking for one more server. A
@@ -890,7 +892,7 @@
       <table>
         <thead><tr><th>Field</th><th>Type</th><th>Rules</th><th>What it&rsquo;s for</th></tr></thead>
         <tbody>
-          <tr><td class="k">infra_env</td><td class="k">str</td><td class="muted">required, non-empty</td><td class="muted">The InfraEnv to fill. Labels both resources <b>and</b> is the server query (<code>^ocp-&lt;infra_env&gt;-</code>). Must already exist, in <code>namespace</code>.</td></tr>
+          <tr><td class="k">infra_env</td><td class="k">str</td><td class="muted">required, non-empty</td><td class="muted">The InfraEnv to fill. Labels both resources, <b>and</b> its first three words are the server query (<code>c200-mtl-haifa-az1</code> &rarr; <code>^ocp-c200-mtl-haifa-</code>). Must already exist, in <code>namespace</code>.</td></tr>
           <tr><td class="k">mce_cluster</td><td class="k">str</td><td class="muted">required, non-empty</td><td class="muted">Which MCE. Selects the <code>INVENTORY</code> segment the VLAN comes from <b>and</b> the activity queue the cluster writes go to.</td></tr>
           <tr><td class="k">namespace</td><td class="k">str</td><td class="muted">non-empty, default <code>inventory</code></td><td class="muted">Where the three resources go. Must be the InfraEnv&rsquo;s own namespace.</td></tr>
           <tr><td class="k">server_names</td><td class="k">str | list | null</td><td class="muted">default <code>null</code>; a list is 1&ndash;20 names, each once</td><td class="muted">Install these machines instead of letting the pool pick: one name, or a list &mdash; one run per name. Turns the already-installed refusal off; changes the workflow id.</td></tr>

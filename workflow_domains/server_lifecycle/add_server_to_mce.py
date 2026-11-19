@@ -323,7 +323,7 @@ with workflow.unsafe.imports_passed_through():
     )
 
 # A cancelled install is taken back out of the MCE through remove-server-from-mce,
-# as uninstall-server-from-hc's inventory half is — never reimplemented here.
+# never reimplemented here.
 from workflow_domains.server_lifecycle.remove_server_from_mce import RemoveServerFromMceWorkflow
 
 # Same budget rules as the segment-lifecycle workflows: a bounded per-attempt
@@ -544,6 +544,20 @@ def _acquire_request(
     )
 
 
+# How many of the InfraEnv name's `-`-separated words its servers' names carry
+# after `ocp-` (the operator, 2026-11-19): `c200-mtl-haifa-az1` draws from
+# `ocp-c200-mtl-haifa-…`. ALWAYS the first three, whatever the name's style —
+# a longer name (`cisco-m6-bat-yam-64c-512gb`) draws from its first three words
+# too, size and the rest of the site dropped; the operator accepted that. A
+# name of fewer words is used whole.
+_POOL_WORDS = 3
+
+
+def server_pool_prefix(infra_env: str) -> str:
+    """What the names of an InfraEnv's servers start with after `ocp-`: its first three words."""
+    return "-".join(infra_env.split("-")[:_POOL_WORDS])
+
+
 def _allocation_request(install_input: AddServerToMceInput) -> AllocateServerRequest:
     """What to ask server-scan to allocate: the named machine, or one from the InfraEnv's pool.
 
@@ -553,12 +567,17 @@ def _allocation_request(install_input: AddServerToMceInput) -> AllocateServerReq
     server_name = install_input.server_name
     return AllocateServerRequest(
         name=server_name or None,
-        # Escaped: the InfraEnv name is caller data going into a regex (see
+        # The InfraEnv's first three words (server_pool_prefix). Escaped: the
+        # InfraEnv name is caller data going into a regex (see
         # _acquire_request). The trailing `-` is load-bearing (the operator,
-        # 2026-11-17): the InfraEnv name must END where the server name's own
-        # part begins, or InfraEnv `…-512gb` would also draw servers of
-        # `…-512gbx` / `…-512gb2`.
-        pattern=None if server_name else f"^ocp-{re.escape(install_input.infra_env)}-",
+        # 2026-11-17, kept 2026-11-19): the prefix must END where the server
+        # name's next word begins, or `c200-mtl-haifa` would also draw servers
+        # of `c200-mtl-haifa2` / `c200-mtl-haifax`.
+        pattern=(
+            None
+            if server_name
+            else f"^ocp-{re.escape(server_pool_prefix(install_input.infra_env))}-"
+        ),
         max_health=_REQUIRED_HEALTH,
         min_nic_macs=_BOND_NIC_MACS,
         holder=_reservation_holder(),
@@ -1762,8 +1781,7 @@ class AddServerToMceWorkflow:
         Otherwise, after _CANCEL_SETTLE (a call the cancel cut off may still land):
 
           * anything possibly written on the MCE is taken out by
-            remove-server-from-mce as an awaited child, as uninstall-server-from-hc
-            does — host powered off first, BareMetalHost + NMStateConfig, any Agent
+            remove-server-from-mce as an awaited child — host powered off first, BareMetalHost + NMStateConfig, any Agent
             it registered, its MACs on its site's PXE VM, a verification — and
             then this run's lock released here, unless the child's PXE cleanup
             failed (the host may still boot this MCE's discovery image);

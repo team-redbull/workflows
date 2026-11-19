@@ -168,10 +168,9 @@ class AcquireServerRequest(BaseModel):
     """What to ask server-scan's `GET /servers/available` for — runs recorded before allocation only.
 
     Exactly one of `pattern`/`name`, mirroring the endpoint's own contract.
-    `pattern` is how an InfraEnv resolves to hardware: the InfraEnv name encodes
-    vendor, model, site and spec (`cisco-m6-bat-yam-64c-512gb`) and server names
-    carry the same tokens after an `ocp-` prefix, so the pattern is built by
-    prefixing rather than by parsing either apart.
+    `pattern` is how an InfraEnv resolved to hardware for these runs: the whole
+    InfraEnv name after an `ocp-` prefix. (A run since the allocation sends
+    AllocateServerRequest, built from the InfraEnv's first three words.)
 
     `health` is sent as `max_health` since server-scan's ADR-0063 (2026-11-16):
     `health` is a 400 there now, and HEALTHY means the same in both — that
@@ -1354,11 +1353,12 @@ class UninstallServerFromHcInput(BaseModel):
     server_name: str = Field(min_length=1)
     mce_cluster: str = Field(min_length=1)
     namespace: str = Field(min_length=1)
-    # REMOVED as an option on 2026-11-02: every uninstall ends in
-    # remove-server-from-mce. Kept on this model only because runs recorded
-    # before then carry it — one of those started with True still stops after
-    # the hosted cluster and keeps the server in the inventory. The API refuses
-    # the field, and a run started since ignores it.
+    # REMOVED as an option on 2026-11-02. Kept on this model only because runs
+    # recorded before then carry it — one of those started with True still
+    # stops after the hosted cluster and keeps the server in the inventory. The
+    # API refuses the field, and a run started since ignores it: one started
+    # between 2026-11-02 and 2026-11-19 ends in remove-server-from-mce, one
+    # started since always leaves the server a free Agent.
     keep_inventory: bool = False
 
 
@@ -1386,13 +1386,15 @@ class UninstallServerFromHcProgress(BaseModel):
 
 
 class UninstallServerFromHcResult(BaseModel):
-    """What the uninstall did, both halves.
+    """What the uninstall did.
 
     `hosted` says whether the hosted-cluster half ran (the host was a hosted
     cluster's node, or still going away as one). `skipped` names every step
     that did not need doing and why — a Machine already deleting, a Node
     check with no Node to check, the whole hosted-cluster half for an
-    inventory host. `remove_server` is the awaited remove-server-from-mce child's own
+    inventory host. A run started since 2026-11-19 ends there, the server a
+    free Agent on the MCE (`kept_in_inventory`), with no lock and no child.
+    `remove_server` is a recorded run's awaited remove-server-from-mce child's own
     result, on `remove_server_workflow_id` — None with `kept_in_inventory`. `leftovers_at_start` and
     `cleaned_up` say what HyperShift had left behind and what the run did
     about it.
@@ -1431,9 +1433,9 @@ class UninstallServerFromHcResult(BaseModel):
     # which) and on runs
     # recorded before the release: the hold then runs to `reservation_expires_at`.
     lock_released: bool = False
-    # Only on a run recorded before 2026-11-02 that was started with
-    # keep_inventory: the server was left in the MCE's inventory, and
-    # remove-server-from-mce never started (remove_server* stay None).
+    # The server was left in the MCE's inventory, and remove-server-from-mce
+    # never started (remove_server* stay None): every run started since
+    # 2026-11-19, and one recorded before 2026-11-02 with keep_inventory.
     kept_in_inventory: bool = False
     remove_server_workflow_id: str | None = None
     remove_server: RemoveServerFromMceResult | None = None

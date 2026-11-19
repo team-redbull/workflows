@@ -372,13 +372,13 @@ const FLOWS = {
     steps: [
       ["Ask server-scan where it is", ["checking-inventory"]],
       ["Inspect the MCE", ["inspecting", "checking-hosted-node"]],
-      ["Lock it in server-scan", ["reserving-server"]],
+      ["Lock it in server-scan (older runs only)", ["reserving-server"]],
       ["Label its Agents (older runs only)", ["marking-agent"]],
       ["Leave the hosted cluster", ["draining-node", "deleting-machine", "awaiting-machine-deletion"]],
       ["Verify AgentMachine, Node, Agent", ["verifying-agentmachine", "verifying-node", "verifying-agent"]],
-      ["Hold the lock a day", ["holding-server"]],
-      ["Remove from the inventory (remove-server-from-mce)", ["removing-from-inventory"]],
-      ["Release the lock", ["releasing-server"]],
+      ["Hold the lock a day (older runs only)", ["holding-server"]],
+      ["Remove from the inventory (older runs only)", ["removing-from-inventory"]],
+      ["Release the lock (older runs only)", ["releasing-server"]],
     ],
   },
   publish: {
@@ -647,23 +647,27 @@ function steps(v) {
   } else if (v.flow === FLOWS.uninstall) {
     if (r) {
       s.forEach((x) => (x.state = "done"));
-      const nothing = r.kept_in_inventory && !r.hosted && !r.reservation_expires_at;
+      // Since 2026-11-19 a run ends at a free Agent: no lock, no remove-server-from-mce.
+      const noLock = r.kept_in_inventory && !r.reservation_expires_at;
+      const nothing = noLock && !r.hosted;
       note(0, r.lifecycle_state_at_start || "");
       note(1, r.hosted ? `A node of ${r.hosted_cluster || "a hosted cluster"}` : "An inventory host");
-      if (nothing) skip(2, "Nothing to write, so no lock");
-      if (r.hosted || arr(r.cleaned_up).length) note(3, r.machine_deleted_by_run ? `Deleted Machine ${r.machine}` : r.machine ? `Machine ${r.machine} was already going` : "");
-      else skip(3, "Not a hosted cluster's node");
-      if (nothing) skip(4, "Nothing to verify");
-      if (r.reservation_expires_at) note(5, r.lock_released ? "Held until the server was out of the MCE" : `Until ${clock(r.reservation_expires_at)}`);
-      else if (nothing) skip(5, "No lock taken"); else note(5, "Not extended: the run's log says why");
-      if (r.kept_in_inventory) skip(6, "keep_inventory: left in the MCE's inventory");
-      else if (r.remove_server) note(6, r.remove_server.found ? `Removed by ${r.remove_server_workflow_id}` : "Nothing of it was left on the MCE");
+      if (noLock) skip(2, nothing ? "Nothing to write, so no lock" : "No lock: the server is never AVAILABLE in server-scan while it moves");
+      if (arr(r.agents_marked).length) note(3, `Labelled ${arr(r.agents_marked).join(", ")}`);
+      else skip(3, "No label");
+      if (r.hosted || arr(r.cleaned_up).length) note(4, r.machine_deleted_by_run ? `Deleted Machine ${r.machine}` : r.machine ? `Machine ${r.machine} was already going` : "");
+      else skip(4, "Not a hosted cluster's node");
+      if (nothing) skip(5, "Nothing to verify: the Agent was already free");
+      if (r.reservation_expires_at) note(6, r.lock_released ? "Held until the server was out of the MCE" : `Until ${clock(r.reservation_expires_at)}`);
+      else if (noLock) skip(6, "No lock taken"); else note(6, "Not extended: the run's log says why");
+      if (r.kept_in_inventory) skip(7, "Left in the MCE as a free Agent: remove-server-from-mce takes it out");
+      else if (r.remove_server) note(7, r.remove_server.found ? `Removed by ${r.remove_server_workflow_id}` : "Nothing of it was left on the MCE");
       const kept = arr(r.skipped).find((x) => x.startsWith("releasing-server: "));
-      if (r.lock_released) note(7, "Released: it can be installed again");
-      else if (nothing) skip(7, "No lock taken");
-      else skip(7, kept ? kept.slice("releasing-server: ".length) : "Left to its expiry: a run from before the release");
+      if (r.lock_released) note(8, "Released: it can be installed again");
+      else if (noLock) skip(8, "No lock taken");
+      else skip(8, kept ? kept.slice("releasing-server: ".length) : "Left to its expiry: a run from before the release");
     } else if (p.phase === "awaiting-machine-deletion") {
-      note(3, [v.flow.sub[p.sub_phase] || p.sub_phase, p.agent_state && `Agent ${p.agent_state}`].filter(Boolean).join(" · "));
+      note(4, [v.flow.sub[p.sub_phase] || p.sub_phase, p.agent_state && `Agent ${p.agent_state}`].filter(Boolean).join(" · "));
     }
   } else if (v.flow === FLOWS.publish && r) {
     s.forEach((x) => (x.state = "done"));
@@ -1041,13 +1045,13 @@ function uninstallDialog() {
   const names = (form) => form.querySelector("#f-names").value.split(/[\s,]+/).filter(Boolean);
   openDialog({
     title: "Uninstall servers", path: UNINSTALL, route: "uninstall-server-from-hc", danger: true, action: "Uninstall",
-    explain: "Whatever state each server is in, and nothing has to be done first. A hosted cluster's node leaves its cluster: the run deletes its Machine, CAPI drains the Node, and the NodePool backfills a replacement from another free Agent (replicas are never touched). Then the server leaves the MCE through remove-server-from-mce. Every server is its own run.",
+    explain: "Whatever state each server is in, and nothing has to be done first. A hosted cluster's node leaves its cluster: the run deletes its Machine, CAPI drains the Node, and the NodePool backfills a replacement from another free Agent (replicas are never touched). The run ends once the Agent is free: the server stays in the MCE (remove-server-from-mce takes it out). Every server is its own run.",
     fields: `
       <label for="f-names">Server names <span class="hint">server-scan's names, one per line, up to 20</span></label>
       <textarea id="f-names" rows="4" required spellcheck="false" data-send="uninstall-server-from-hc:server_names"></textarea>
       <label for="f-mce">MCE <span class="hint">with or without its ocp4- prefix</span></label>
       <input id="f-mce" data-send="uninstall-server-from-hc:mce_cluster" required autocomplete="off" spellcheck="false">
-      <div class="confirm"><p><b>This cannot be undone.</b> A node leaves its hosted cluster; then the host is powered off, its BareMetalHost, NMStateConfig and Agent are deleted and its MACs cleared from the site's PXE VM.</p>
+      <div class="confirm"><p><b>This cannot be undone.</b> A node leaves its hosted cluster: its Machine is deleted and the host reboots into discovery, a free Agent of the InfraEnv.</p>
         <label for="f-confirm" id="f-confirm-label">Type the server name again to confirm</label>
         <input id="f-confirm" autocomplete="off" spellcheck="false"></div>`,
     ready: (form) => {

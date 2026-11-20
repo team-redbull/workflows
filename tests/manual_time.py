@@ -34,8 +34,17 @@ _MAX_SLEEP_CALLS = 12
 
 
 class ManualTime:
+    # True: a REAL Temporal dev server on the wall clock instead (`start_local`), for what the
+    # time-skipping test server does not do as Temporal does — it never times out an activity
+    # whose worker died while running it, and never lets a cached run go from a workflow
+    # worker that is gone. `advance` then really waits, so such tests shrink the workflow's waits.
+    real_time = False
+
     async def __aenter__(self) -> ManualTime:
-        self.env = await WorkflowEnvironment.start_time_skipping()
+        if self.real_time:
+            self.env = await WorkflowEnvironment.start_local()
+        else:
+            self.env = await WorkflowEnvironment.start_time_skipping()
         config = self.env.client.config()
         config["data_converter"] = pydantic_data_converter
         self.client = Client(**config)
@@ -68,6 +77,9 @@ class ManualTime:
         Never more calls than are seen to be needed: with nothing outstanding
         a second sleep call is refused by the server, or jumps a second time.
         """
+        if self.real_time:
+            await asyncio.sleep(duration.total_seconds())
+            return
         target = await self.env.get_current_time() + duration
         calls = [asyncio.ensure_future(self.env.sleep(duration))]
         loop = asyncio.get_running_loop()
@@ -109,7 +121,7 @@ class ManualTime:
                     break
                 if loop.time() >= deadline:
                     raise AssertionError(f"{len(pending)} of {len(tasks)} runs were still going after {limit:g}s")
-                if step > timedelta(0):
+                if step > timedelta(0) and not self.real_time:
                     await self.advance(step)
         finally:
             for task in tasks:

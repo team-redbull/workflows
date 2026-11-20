@@ -20,7 +20,9 @@ depends on it:
   * a root disk binds after a few polls (an Immediate storage class) or never
     (WaitForFirstConsumer), and a deleted VM and its DataVolume are gone;
   * any call can be made to fail (5xx, 403, a timeout) or to hang, a set number
-    of times; a cluster's worker can be absent, stopped and started again.
+    of times; a cluster's worker can be absent, stopped and started again while
+    a run is going — and so can the hub's own three workers (the brain's for
+    create-vm and for the zone locks, the day1 reader).
 
 The same fleet can be attached to a REAL Temporal server next to one real
 cluster's worker (`python -m tests.kv_fleet`, docs/lab/create-vm-per-kv-cluster/),
@@ -34,7 +36,7 @@ import copy
 import random
 import uuid
 from collections.abc import AsyncIterator, Callable
-from contextlib import AsyncExitStack, asynccontextmanager
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -389,8 +391,13 @@ class KvFleet:
         # Seconds the fleet's clusters' clocks run ahead of this process's (a lease-expiry knob).
         self.skew = timedelta(0)
         self.poll_seconds = 0.0  # how long the ready wait really sleeps between polls
+        self.graceful_shutdown_seconds = 1.0
+        # False: the brain's workers keep no run in memory, so EVERY workflow task replays the
+        # run from its history — what a restarted brain does once — and a run is never "sticky"
+        # to a worker that is gone (the time-skipping test server never lets go of one).
+        self.cache_workflows = True
+        self.waited: dict[tuple[str, str, str], float] = {}  # seconds each VM's ready wait has run, across attempts
         self._workers: dict[str, Worker] = {}
-        self._stack: AsyncExitStack | None = None
         self._client: Client | None = None
         self._runner = None
 
@@ -480,16 +487,19 @@ class KvFleet:
             if details and isinstance(details[0], dict):
                 started_at, polls = datetime.fromisoformat(details[0]["started_at"]), int(details[0].get("polls", 0))
             # The wait's own clock: every poll's sleep moves it on at once, so a
-            # ten-minute deadline takes seventy-five polls, not ten minutes.
-            elapsed = {"seconds": 0.0}
+            # ten-minute deadline takes seventy-five polls, not ten minutes. It is the
+            # CLUSTER's clock, not the attempt's: a wait resumed on a restarted worker
+            # finds the time that has already passed, as it would on a wall clock.
+            key = (cluster.name, request.namespace, request.name)
+            fleet.waited.setdefault(key, 0.0)
 
             async def sleep(seconds: float) -> None:
-                elapsed["seconds"] += seconds
+                fleet.waited[key] += seconds
                 await asyncio.sleep(fleet.poll_seconds)
 
             return await vm_operations.wait_ready(
                 cluster, cluster.values, request, started_at=started_at, polls=polls,
-                now=lambda: datetime.now(UTC) + timedelta(seconds=elapsed["seconds"]),
+                now=lambda: datetime.now(UTC) + timedelta(seconds=fleet.waited[key]),
                 heartbeat=lambda started, count: activity.heartbeat({"started_at": started.isoformat(), "polls": count}),
                 sleep=sleep,
             )
@@ -502,62 +512,73 @@ class KvFleet:
 
     # --- the workers ---------------------------------------------------------------------------
 
+    # The hub's three workers, by the name tests take them away under.
+    CREATE_VM = "create-vm"      # the brain's worker for the create-vm workflow
+    ZONE_LOCK = "kv-zone-lock"   # the brain's worker for the zone locks
+    DAY1 = "day1"                # the cluster-lifecycle worker (list_kv_clusters)
+
     @asynccontextmanager
     async def running(
         self, client: Client, *, down: set[str] | None = None, brain: bool = True, workflow_runner: Any = None,
         list_worker: bool = True, lock_worker: bool = True,
     ) -> AsyncIterator[KvFleet]:
         """The brain's two workflow workers, the cluster-lifecycle queue's `list_kv_clusters`,
-        and one worker per cluster (none for those in `down`), all in this process."""
+        and one worker per cluster (none for those in `down`), all in this process. Any of
+        them can be stopped and started again while runs are going (stop_worker / start_worker)."""
         self._client, self._runner = client, workflow_runner
-        async with AsyncExitStack() as stack:
-            self._stack = stack
-            runner = {"workflow_runner": workflow_runner} if workflow_runner is not None else {}
+        try:
             if brain:
-                await stack.enter_async_context(
-                    Worker(client, task_queue=CREATE_VM_WORKFLOW_QUEUE, workflows=[CreateVmWorkflow], **runner)
-                )
+                await self.start_worker(self.CREATE_VM)
                 if lock_worker:
-                    await self.start_lock_worker()
+                    await self.start_worker(self.ZONE_LOCK)
             if list_worker:
-                await stack.enter_async_context(
-                    Worker(client, task_queue=CLUSTER_LIFECYCLE_ACTIVITY_QUEUE, activities=[self.list_activity()])
-                )
+                await self.start_worker(self.DAY1)
             for name in self.clusters:
                 if name not in (down or set()):
                     await self.start_worker(name)
-            try:
-                yield self
-            finally:
-                for name in list(self._workers):
-                    await self.stop_worker(name)
-                self._stack = None
+            yield self
+        finally:
+            for name in list(self._workers):
+                await self.stop_worker(name)
 
-    async def start_lock_worker(self) -> None:
-        """The brain's worker for the zone locks (left out to see what runs do without one)."""
-        runner = {"workflow_runner": self._runner} if self._runner is not None else {}
-        assert self._stack is not None and self._client is not None
-        await self._stack.enter_async_context(
-            Worker(self._client, task_queue=KV_ZONE_LOCK_WORKFLOW_QUEUE, workflows=[KvZoneLockWorkflow], **runner)
+    def _worker(self, name: str) -> Worker:
+        assert self._client is not None
+        runner: dict[str, Any] = {"workflow_runner": self._runner} if self._runner is not None else {}
+        if not self.cache_workflows:
+            runner["max_cached_workflows"] = 0
+        if name == self.CREATE_VM:
+            return Worker(self._client, task_queue=CREATE_VM_WORKFLOW_QUEUE, workflows=[CreateVmWorkflow], **runner)
+        if name == self.ZONE_LOCK:
+            return Worker(self._client, task_queue=KV_ZONE_LOCK_WORKFLOW_QUEUE, workflows=[KvZoneLockWorkflow], **runner)
+        if name == self.DAY1:
+            return Worker(self._client, task_queue=CLUSTER_LIFECYCLE_ACTIVITY_QUEUE, activities=[self.list_activity()])
+        return Worker(
+            self._client, task_queue=vm_lifecycle_activity_queue(name),
+            activities=self.cluster_activities(self.clusters[name]),
+            graceful_shutdown_timeout=timedelta(seconds=self.graceful_shutdown_seconds),
         )
 
     async def start_worker(self, name: str) -> None:
-        """Bring a cluster's worker up (it was down, or was stopped)."""
+        """Bring a worker up: a cluster's (by the cluster's name), or one of the hub's three."""
         if name in self._workers or self._client is None:
             return
-        worker = Worker(
-            self._client, task_queue=vm_lifecycle_activity_queue(name),
-            activities=self.cluster_activities(self.clusters[name]),
-            graceful_shutdown_timeout=timedelta(seconds=1),
-        )
+        worker = self._worker(name)
         await worker.__aenter__()
         self._workers[name] = worker
 
     async def stop_worker(self, name: str) -> None:
-        """Take a cluster's worker away: its queue is then polled by nobody."""
+        """Take a worker away: its queue is then polled by nobody. What it was running is cut
+        off after `graceful_shutdown_seconds`, as a pod is at the end of its grace period."""
         worker = self._workers.pop(name, None)
         if worker is not None:
             await worker.__aexit__(None, None, None)
+
+    async def restart_worker(self, name: str) -> None:
+        await self.stop_worker(name)
+        await self.start_worker(name)
+
+    async def start_lock_worker(self) -> None:
+        await self.start_worker(self.ZONE_LOCK)
 
 
 # --- attach the fleet to a real Temporal server (the lab) ---------------------------------------

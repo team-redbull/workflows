@@ -19,10 +19,10 @@ from datetime import timedelta
 import pytest
 from temporalio import activity
 from temporalio.client import WorkflowExecutionStatus, WorkflowFailureError, WorkflowHandle
-from temporalio.exceptions import ActivityError, ApplicationError, CancelledError
+from temporalio.exceptions import ActivityError, ApplicationError, CancelledError, TimeoutError as TemporalTimeoutError, TimeoutType
 from temporalio.worker import UnsandboxedWorkflowRunner, Worker
 
-from activities.vm_lifecycle import vm_spec
+from activities.vm_lifecycle import vm_operations, vm_spec
 from activities.vm_lifecycle.kubevirt_api import MacRefused, NameTaken
 from shared.consts import CREATE_VM_WORKFLOW_QUEUE, vm_lifecycle_activity_queue
 from shared.exceptions import (
@@ -78,10 +78,13 @@ def big(name: str) -> list[dict]:
 
 class Harness(ManualTime):
     def __init__(self, fleet: KvFleet, *, down: set[str] | None = None, lock_worker: bool = True,
-                 quick: bool = False) -> None:
+                 day1_worker: bool = True, quick: bool = False, real_time: bool = False) -> None:
+        # real_time: a real Temporal dev server (tests/manual_time.py says for what); with `quick`.
+        self.real_time = real_time
         self.fleet = fleet
         self._down = down
         self._lock_worker = lock_worker
+        self._day1_worker = day1_worker
         # With the `quick` fixture's shrunk timeouts the workflows must see the patched module
         # constants, which the sandbox (re-importing the workflow modules) would not.
         self._runner = UnsandboxedWorkflowRunner() if quick else None
@@ -90,7 +93,8 @@ class Harness(ManualTime):
     async def __aenter__(self) -> Harness:
         await super().__aenter__()
         self._running = self.fleet.running(
-            self.client, down=self._down, lock_worker=self._lock_worker, workflow_runner=self._runner
+            self.client, down=self._down, lock_worker=self._lock_worker, list_worker=self._day1_worker,
+            workflow_runner=self._runner,
         )
         await self._running.__aenter__()
         return self
@@ -98,6 +102,13 @@ class Harness(ManualTime):
     async def __aexit__(self, *exc) -> None:
         await self._running.__aexit__(*exc)
         await super().__aexit__(*exc)
+
+    async def advance(self, duration: timedelta) -> None:
+        """The server's clock AND the fake clusters': a KV cluster's worker checks the lease's
+        end against its own clock, which in production is the same wall clock."""
+        await super().advance(duration)
+        if not self.real_time:
+            self.fleet.skew += duration
 
     async def start(self, request: CreateVmInput | None = None, *, workflow_id: str | None = None) -> WorkflowHandle:
         request = request or vm_input()
@@ -190,8 +201,12 @@ def cause(error: WorkflowFailureError) -> ApplicationError:
     return failure
 
 
-def fleet_of(*names: str, zone: str = "az1", buffer_percent: int = 15, **cluster_kwargs) -> KvFleet:
+def fleet_of(*names: str, zone: str = "az1", buffer_percent: int = 15, replaying: bool = False, **cluster_kwargs) -> KvFleet:
+    """`replaying`: the brain keeps no run in memory, so every workflow task replays the run
+    from its history, as a restarted brain does — and its workers can be restarted mid-run
+    (the test server never lets a cached run go from a worker that is gone)."""
     fleet = KvFleet(buffer_percent=buffer_percent)
+    fleet.cache_workflows = not replaying
     for name in names:
         fleet.add(name, zone, nodes=big(name), **cluster_kwargs)
     return fleet
@@ -201,8 +216,9 @@ def fleet_of(*names: str, zone: str = "az1", buffer_percent: int = 15, **cluster
 
 
 class TestOneVm:
-    async def test_the_vm_is_created_halted_on_the_zones_cluster_and_the_zone_is_free_again(self):
-        fleet = fleet_of(A)
+    @pytest.mark.parametrize("replaying", [False, True], ids=["cached", "every-task-replays"])
+    async def test_the_vm_is_created_halted_on_the_zones_cluster_and_the_zone_is_free_again(self, replaying):
+        fleet = fleet_of(A, replaying=replaying)
         async with Harness(fleet) as h:
             handle = await h.start()
             result = await h.result(handle)
@@ -296,9 +312,10 @@ class TestOneVm:
 
 
 class TestParallelRuns:
-    async def test_ten_runs_at_once_fill_a_then_b_then_find_no_capacity(self):
+    @pytest.mark.parametrize("replaying", [False, True], ids=["cached", "every-task-replays"])
+    async def test_ten_runs_at_once_fill_a_then_b_then_find_no_capacity(self, replaying):
         """The design's example (§6.5): two 100-core clusters, the 15% buffer, ten 32-vCPU VMs."""
-        fleet = fleet_of(A, B)
+        fleet = fleet_of(A, B, replaying=replaying)
         async with Harness(fleet) as h:
             handles = [await h.start() for _ in range(10)]
             outcomes = await h.results(*handles, return_exceptions=True, limit=120)
@@ -991,6 +1008,387 @@ class TestCancel:
             await handle.cancel()  # a cancel of a closed run is accepted by Temporal and does nothing
             assert (await handle.describe()).status == WorkflowExecutionStatus.COMPLETED
             assert fleet.clusters[A].vm_names == [first.vm_name]
+
+
+# --- components falling while a run is going -----------------------------------------------------------
+
+
+async def until(condition, *, tries: int = 400, what: str = "the state waited for") -> None:
+    for _ in range(tries):
+        if condition():
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError(f"never reached {what}")
+
+
+class TestTheDay1ReaderFalling:
+    async def test_with_no_day1_reader_the_run_fails_after_five_minutes_and_has_touched_nothing(self):
+        fleet = fleet_of(A)
+        async with Harness(fleet, day1_worker=False) as h:
+            handle = await h.start()
+            await h.until_phase(handle, "listing-kv-clusters")
+            await h.advance(timedelta(minutes=4, seconds=50))
+            assert (await handle.describe()).status == WorkflowExecutionStatus.RUNNING
+            await h.advance(timedelta(seconds=20))
+            failed = await h.failure(handle)
+            timeout = failed.cause.cause
+            assert isinstance(failed.cause, ActivityError) and isinstance(timeout, TemporalTimeoutError)
+            assert timeout.type == TimeoutType.SCHEDULE_TO_START
+            assert fleet.clusters[A].calls == [] and fleet.listed == []
+            with pytest.raises(Exception):  # noqa: B017, PT011 — the zone's lock was never even asked for
+                await h.lock()
+
+    async def test_a_day1_reader_that_comes_back_within_the_five_minutes_is_waited_for(self):
+        fleet = fleet_of(A)
+        async with Harness(fleet, day1_worker=False) as h:
+            handle = await h.start()
+            await h.until_phase(handle, "listing-kv-clusters")
+            await h.advance(timedelta(minutes=3))
+            await fleet.start_worker(fleet.DAY1)
+            result = await h.result(handle)
+        assert result.kv_cluster == A and len(fleet.listed) == 1
+
+    async def test_the_day1_reader_dying_does_not_touch_a_run_that_already_has_its_list(self):
+        fleet = fleet_of(A)
+        fleet.clusters[A].delays["list_nodes"] = 1.0
+        async with Harness(fleet) as h:
+            handle = await h.start()
+            await h.until_phase(handle, "choosing-kv-cluster")
+            await fleet.stop_worker(fleet.DAY1)
+            result = await h.result(handle)
+        assert result.kv_cluster == A
+
+
+class TestTheBrainFalling:
+    async def test_the_brain_restarting_in_every_phase_of_a_run_changes_nothing(self):
+        """A restarted brain replays the run from its history and carries on: one list, one
+        grant, one create, one VM."""
+        fleet = fleet_of(A, bind_after_polls=6, replaying=True)
+        cluster = fleet.clusters[A]
+        fleet.poll_seconds = 0.3
+        cluster.delays.update({"list_nodes": 1.0, "create_vm": 1.0})
+        async with Harness(fleet) as h:
+            handle = await h.start()
+            for phase in ("choosing-kv-cluster", "creating-vm", "awaiting-root-disk"):
+                await h.until_phase(handle, phase)
+                await fleet.restart_worker(fleet.CREATE_VM)
+                await fleet.restart_worker(fleet.ZONE_LOCK)
+            result = await h.result(handle)
+            assert result.kv_cluster == A and result.created is True and result.leases == 1
+            assert cluster.vm_names == [result.vm_name] and cluster.calls.count("create_vm") == 1
+            assert len(fleet.listed) == 1
+            lock = await h.lock_is_free()
+            assert (lock.grants, lock.expired, lock.skipped) == (1, 0, 0)
+
+    async def test_the_brain_down_while_a_run_waits_in_line_keeps_its_place(self):
+        fleet = fleet_of(A, replaying=True)
+        fleet.clusters[A].delays["create_vm"] = 1.5
+        async with Harness(fleet) as h:
+            holder = await h.start()
+            await h.until_phase(holder, "creating-vm")
+            waiting = await h.start()
+            await h.until_phase(waiting, "awaiting-zone-lock")
+            await h.until_lock(lambda p: p.waiting == 1)
+            await fleet.stop_worker(fleet.CREATE_VM)   # the whole brain goes: both workflows' workers
+            await fleet.stop_worker(fleet.ZONE_LOCK)
+            await asyncio.sleep(2.0)                   # …while the holder's create finishes on the cluster
+            await fleet.start_worker(fleet.ZONE_LOCK)
+            await fleet.start_worker(fleet.CREATE_VM)
+            first, second = await h.results(holder, waiting)
+            assert first.vm_name != second.vm_name and len(fleet.clusters[A].vms) == 2
+            assert second.table[0].figures.stopped_vms == 1  # it still saw the first run's VM
+            lock = await h.lock_is_free()
+            assert (lock.grants, lock.skipped) == (2, 0)
+
+    async def test_a_brain_down_past_a_lease_costs_that_run_its_lease_not_the_zone_its_safety(self):
+        """The holder's brain is down while its lease ends: the lock (down too) passes on when it
+        is back, and the holder's create — sent before it went down — was bounded by the lease."""
+        fleet = fleet_of(A, B, replaying=True)
+        fleet.clusters[A].delays["namespace_exists"] = 1.0
+        async with Harness(fleet) as h:
+            handle = await h.start()
+            await h.until_phase(handle, "creating-vm")
+            await fleet.stop_worker(fleet.CREATE_VM)
+            await fleet.stop_worker(fleet.ZONE_LOCK)
+            await until(lambda: len(fleet.clusters[A].vms) == 1, what="the create landing with the brain down")
+            await asyncio.sleep(0.3)
+            await h.advance(kv_zone_lock._LEASE + timedelta(minutes=1))
+            await fleet.start_worker(fleet.ZONE_LOCK)
+            await fleet.start_worker(fleet.CREATE_VM)
+            result = await h.result(handle)  # the create had answered in time: the run just carries on
+            assert result.kv_cluster == A and fleet.clusters[A].vm_names == [result.vm_name]
+            await h.lock_is_free()
+
+
+    async def test_on_a_real_server_a_restarted_brain_takes_its_cached_runs_back(self, quick):
+        """With the runs CACHED on the worker that went away (the production setting): Temporal
+        hands them to the new worker once the old one's sticky queue goes unanswered."""
+        fleet = fleet_of(A)
+        fleet.clusters[A].delays["create_vm"] = 1.5
+        small = vm_input("c200-kv8-five-az1")
+        async with Harness(fleet, quick=True, real_time=True) as h:
+            holder = await h.start(small)
+            await h.until_phase(holder, "creating-vm")
+            waiters = [await h.start(small) for _ in range(3)]
+            await h.until_lock(lambda p: p.waiting == 3)
+            fleet.clusters[A].delays.clear()
+            await fleet.restart_worker(fleet.ZONE_LOCK)
+            await fleet.restart_worker(fleet.CREATE_VM)
+            results = await h.results(holder, *waiters, limit=60)
+            assert len({r.vm_name for r in results}) == 4 == len(fleet.clusters[A].vms)
+            lock = await h.lock_is_free()
+            assert (lock.grants, lock.expired, lock.skipped) == (4, 0, 0)
+
+
+class TestTheLockFalling:
+    async def test_the_lock_workers_restart_in_the_middle_of_a_lease_loses_neither_holder_nor_line(self):
+        fleet = fleet_of(A, replaying=True)
+        fleet.clusters[A].delays["create_vm"] = 1.5
+        async with Harness(fleet) as h:
+            small = vm_input("c200-kv8-five-az1")  # four of them fit on the one cluster
+            holder = await h.start(small)
+            await h.until_phase(holder, "creating-vm")
+            waiters = [await h.start(small) for _ in range(3)]
+            await h.until_lock(lambda p: p.waiting == 3)
+            fleet.clusters[A].delays.clear()
+            await fleet.restart_worker(fleet.ZONE_LOCK)
+            results = await h.results(holder, *waiters)
+            assert len({r.vm_name for r in results}) == 4 == len(fleet.clusters[A].vms)
+            lock = await h.lock_is_free()
+            assert (lock.grants, lock.expired, lock.skipped) == (4, 0, 0)
+
+    async def test_a_lock_terminated_under_its_holder_does_not_stop_the_holder(self):
+        fleet = fleet_of(A)
+        fleet.clusters[A].delays["create_vm"] = 1.0
+        async with Harness(fleet) as h:
+            handle = await h.start()
+            await h.until_phase(handle, "creating-vm")
+            lock_handle = h.client.get_workflow_handle(kv_zone_lock_workflow_id(SITE, "az1"))
+            first_lock = (await lock_handle.describe()).run_id
+            await lock_handle.terminate()  # the release will find nobody to tell: best effort, not a failure
+            result = await h.result(handle)
+            assert result.kv_cluster == A and len(fleet.clusters[A].vms) == 1
+            # The next run starts the zone's lock afresh and is served by it.
+            again = await h.create()
+            assert again.vm_name != result.vm_name
+            assert (await lock_handle.describe()).run_id != first_lock
+            assert (await h.lock_is_free()).grants == 1
+
+    async def test_a_lock_terminated_under_holder_and_line_strands_nobody(self):
+        fleet = fleet_of(A)
+        fleet.clusters[A].delays["create_vm"] = 1.0
+        async with Harness(fleet) as h:
+            holder = await h.start()
+            await h.until_phase(holder, "creating-vm")
+            waiting = await h.start()
+            await h.until_lock(lambda p: p.waiting == 1)
+            await h.client.get_workflow_handle(kv_zone_lock_workflow_id(SITE, "az1")).terminate()
+            first = await h.result(holder)
+            assert (await h.progress(waiting)).phase == "awaiting-zone-lock"
+            await h.advance(create_vm._LOCK_REASK + timedelta(seconds=5))  # its next ask starts a new lock
+            second = await h.result(waiting)
+            assert first.vm_name != second.vm_name and len(fleet.clusters[A].vms) == 2
+
+
+class TestAClustersWorkerFalling:
+    async def test_dying_during_its_figures_read_makes_the_cluster_a_row_and_the_next_is_tried(self, quick, monkeypatch):
+        """On a REAL Temporal server: the read was running on a worker that is gone. Its attempt
+        times out, the retry finds nobody polling, and the whole read is bounded besides — the
+        run holding the zone's lock is never stuck on it."""
+        monkeypatch.setattr(create_vm, "_FIGURES_TIMEOUT", timedelta(seconds=2))
+        fleet = fleet_of(A, B)
+        fleet.clusters[A].delays["list_nodes"] = 30.0
+        async with Harness(fleet, quick=True, real_time=True) as h:
+            handle = await h.start()
+            await until(lambda: "list_nodes" in fleet.clusters[A].calls, what="the figures read starting on A")
+            await fleet.stop_worker(A)  # mid-read
+            result = await h.result(handle, limit=30)
+        assert result.kv_cluster == B and fleet.clusters[A].vms == {} and result.leases == 1
+        assert result.table[0].name == A and result.table[0].skip_reason in ("no-worker", "unreachable")
+
+    async def test_a_read_that_hangs_on_a_live_worker_is_given_up_on_too(self, quick, monkeypatch):
+        """The worker is there but never answers (its own bound failed it): start-to-close ends
+        each attempt and schedule-to-close ends the read."""
+        monkeypatch.setattr(create_vm, "_FIGURES_TIMEOUT", timedelta(seconds=1))
+        monkeypatch.setattr(create_vm, "_FIGURES_SCHEDULE_TO_CLOSE_TIMEOUT", timedelta(seconds=4))
+        monkeypatch.setattr(vm_operations, "FIGURES_TIMEOUT_SECONDS", 60.0)
+        fleet = fleet_of(A, B)
+        fleet.clusters[A].delays["list_nodes"] = 30.0
+        async with Harness(fleet, quick=True, real_time=True) as h:
+            result = await h.result(await h.start(), limit=30)
+        assert result.kv_cluster == B
+        assert result.table[0].skip_reason == "unreachable" and "gave no figures" in result.table[0].skip_detail
+
+    async def test_dying_before_the_create_and_back_inside_the_lease_the_vm_is_created_once(self):
+        fleet = fleet_of(A, B)
+        cluster = fleet.clusters[A]
+        cluster.delays["namespace_exists"] = 5.0  # the create attempt is cut off before it creates anything
+        async with Harness(fleet) as h:
+            handle = await h.start()
+            await h.until_phase(handle, "creating-vm")
+            await until(lambda: "namespace_exists" in cluster.calls, what="the create starting on A")
+            await fleet.stop_worker(A)
+            cluster.delays.clear()
+            assert cluster.vms == {}
+            await h.advance(timedelta(minutes=2))  # the pod is away for two minutes of a five-minute lease
+            assert (await h.progress(handle)).phase == "creating-vm"  # out-waited: no schedule-to-start limit
+            await fleet.start_worker(A)
+            result = await h.result(handle, step=timedelta(seconds=5))
+            assert result.kv_cluster == A and cluster.vm_names == [result.vm_name]
+            assert fleet.clusters[B].calls == []  # never moved to another cluster
+            assert (await h.lock_is_free()).expired == 0
+
+    async def test_dying_before_the_create_and_back_after_the_lease_nothing_is_created(self):
+        fleet = fleet_of(A, B)
+        cluster = fleet.clusters[A]
+        cluster.delays["namespace_exists"] = 5.0
+        async with Harness(fleet) as h:
+            handle = await h.start()
+            await h.until_phase(handle, "creating-vm")
+            await until(lambda: "namespace_exists" in cluster.calls, what="the create starting on A")
+            await fleet.stop_worker(A)
+            cluster.delays.clear()
+            # Meanwhile the zone is not stuck: when the dead holder's lease ends, the next run is
+            # served — it finds A without a worker and places its VM on B.
+            other = await h.start()
+            await h.until_phase(other, "awaiting-zone-lock")
+            await h.advance(kv_zone_lock._LEASE + timedelta(seconds=40))
+            placed = await h.result(other, step=timedelta(seconds=5))
+            assert placed.kv_cluster == B and placed.table[0].skip_reason == "no-worker"
+            # The first run's create reaches A's worker only now, after its lease: refused.
+            await fleet.start_worker(A)
+            failed = await h.failure(handle, step=timedelta(seconds=5))
+            assert cause(failed).type == VmLeaseExpiredError.__name__
+            assert cluster.vms == {} and "create_vm" not in cluster.calls
+            assert (await h.lock_is_free()).expired == 1
+
+    async def test_dying_right_after_the_vm_was_created_never_makes_a_second_one(self):
+        """The create landed on the cluster; the worker died before it could say so."""
+        fleet = fleet_of(A)
+        cluster = fleet.clusters[A]
+        original = cluster.create_vm
+        hold = asyncio.Event()
+
+        async def created_then_the_pod_dies(namespace, body):
+            created = await original(namespace, body)
+            if not hold.is_set():
+                hold.set()
+                await asyncio.sleep(30)  # the answer never leaves the pod
+            return created
+
+        cluster.create_vm = created_then_the_pod_dies
+        async with Harness(fleet) as h:
+            handle = await h.start()
+            await asyncio.wait_for(hold.wait(), 20)
+            await fleet.stop_worker(A)
+            assert len(cluster.vms) == 1
+            await fleet.start_worker(A)
+            result = await h.result(handle, step=timedelta(seconds=5))
+            assert cluster.vm_names == [result.vm_name] and result.created is False and result.draws == 0
+            run_id = (await handle.describe()).run_id
+            assert vm_spec.created_by(cluster.vms[("inventory", result.vm_name)]) == run_id
+
+    async def test_dying_during_the_disk_wait_the_wait_resumes_its_clock_instead_of_starting_again(self):
+        fleet = fleet_of(A, storage="wffc")  # the disk never binds: the wait runs to its ten-minute deadline
+        cluster = fleet.clusters[A]
+        fleet.poll_seconds = 0.05
+        async with Harness(fleet) as h:
+            handle = await h.start()
+            await h.until_phase(handle, "awaiting-root-disk")
+            await until(lambda: cluster.calls.count("get_vm") >= 30, what="thirty polls, four minutes of the wait")
+            await fleet.stop_worker(A)
+            polls_before = cluster.calls.count("get_vm")
+            await fleet.start_worker(A)
+            failed = await h.failure(handle, step=timedelta(seconds=10), limit=120)
+            assert cause(failed).type == VmRootDiskNotBoundError.__name__
+            # Ten minutes at one poll per 8 s is about 76 polls IN ALL — not 76 more after the restart.
+            total = cluster.calls.count("get_vm")
+            assert polls_before <= total <= 85, (polls_before, total)
+            assert cluster.vms == {} and cluster.deleted == cluster.created
+
+    async def test_gone_for_an_hour_during_the_disk_wait_it_is_out_waited_and_the_zone_is_not_held(self):
+        fleet = fleet_of(A, B)
+        cluster = fleet.clusters[A]
+        fleet.poll_seconds = 0.3
+        cluster.bind_after_polls = 1000  # not yet…
+        async with Harness(fleet) as h:
+            handle = await h.start()
+            await h.until_phase(handle, "awaiting-root-disk")
+            await fleet.stop_worker(A)
+            await asyncio.sleep(1.3)  # the worker is gone, its cut-off wait with it
+            await h.advance(timedelta(hours=1))
+            assert (await handle.describe()).status == WorkflowExecutionStatus.RUNNING  # waited out, not failed
+            assert (await h.lock_is_free()).grants == 1                                # and the zone is free
+            other = await h.result(await h.start(), step=timedelta(seconds=10))        # A has no worker: B
+            assert other.kv_cluster == B
+            cluster.bind_after_polls = 1  # …and when the cluster is back, its disk is long bound
+            await fleet.start_worker(A)
+            result = await h.result(handle, step=timedelta(seconds=10))
+            assert result.kv_cluster == A and cluster.vm_names == [result.vm_name]
+
+    async def test_dying_before_the_rollbacks_delete_the_removal_is_out_waited_then_done(self):
+        fleet = fleet_of(A, storage="wffc")
+        cluster = fleet.clusters[A]
+        cluster.delays["delete_vm"] = 5.0
+        async with Harness(fleet) as h:
+            handle = await h.start()
+            await h.until_phase(handle, "removing-vm")
+            await until(lambda: "delete_vm" in cluster.calls, what="the rollback's delete starting")
+            await fleet.stop_worker(A)  # cut off before the VM is gone
+            cluster.delays.clear()
+            assert len(cluster.vms) == 1
+            await h.advance(timedelta(minutes=30))
+            assert (await handle.describe()).status == WorkflowExecutionStatus.RUNNING  # it does not give its VM up
+            await fleet.start_worker(A)
+            failed = await h.failure(handle, step=timedelta(seconds=10))
+            assert cause(failed).type == VmRootDiskNotBoundError.__name__
+            assert cluster.vms == {} and cluster.datavolumes == {}
+
+
+class TestAClustersApiFalling:
+    async def test_failing_during_the_disk_wait_is_retried_until_the_disk_is_seen(self):
+        fleet = fleet_of(A)
+        cluster = fleet.clusters[A]
+        cluster.fail("get_vm", *[KvClusterApiError("this cluster's API failed while reading (503): etcd leader changed")] * 4)
+        async with Harness(fleet) as h:
+            result = await h.create()
+        assert result.kv_cluster == A and cluster.vm_names == [result.vm_name] and cluster.calls.count("get_vm") >= 5
+
+    async def test_failing_during_the_rollbacks_delete_is_retried_until_the_vm_is_gone(self):
+        fleet = fleet_of(A, storage="wffc")
+        cluster = fleet.clusters[A]
+        cluster.fail("delete_vm", KvClusterApiError("503"), KvClusterApiError("500"), KvClusterApiError("503"))
+        async with Harness(fleet) as h:
+            failed = await h.failure(await h.start(), limit=120)
+            assert cause(failed).type == VmRootDiskNotBoundError.__name__
+            assert cluster.vms == {} and cluster.calls.count("delete_vm") == 4
+
+    async def test_down_for_the_whole_figures_read_and_back_for_the_next_run(self):
+        fleet = fleet_of(A, B)
+        cluster = fleet.clusters[A]
+        for method in ("list_nodes", "list_unfinished_pods", "list_vms", "list_vmis"):
+            cluster.fail(method, KvClusterApiError("connection refused"))
+        async with Harness(fleet) as h:
+            first = await h.create()   # A's API is down: unreachable, B takes the VM
+            second = await h.create()  # A's API is back: A, the oldest, takes the next
+        assert (first.kv_cluster, first.table[0].skip_reason) == (B, "unreachable")
+        assert second.kv_cluster == A
+
+    async def test_everything_restarting_at_once_in_the_middle_of_a_create(self):
+        fleet = fleet_of(A, replaying=True)
+        cluster = fleet.clusters[A]
+        cluster.delays["create_vm"] = 1.0
+        async with Harness(fleet) as h:
+            handle = await h.start()
+            await h.until_phase(handle, "creating-vm")
+            for name in (fleet.CREATE_VM, fleet.ZONE_LOCK, fleet.DAY1, A):
+                await fleet.stop_worker(name)
+            cluster.delays.clear()
+            for name in (A, fleet.DAY1, fleet.ZONE_LOCK, fleet.CREATE_VM):
+                await fleet.start_worker(name)
+            result = await h.result(handle, step=timedelta(seconds=5))
+            assert cluster.vm_names == [result.vm_name] and len(cluster.created) == 1
+            await h.lock_is_free()
 
 
 # --- slots ------------------------------------------------------------------------------------------

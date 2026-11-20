@@ -220,7 +220,7 @@ def test_one_changed_row_is_that_image_and_a_reformat_is_none(rows_repo):
     first = _commit_files(rows_repo, {_BUILDS: json.dumps(ROWS, indent=2)}, "rows")
     changed = [dict(row) for row in ROWS]
     vm = next(row for row in changed if row["image-name"] == "vm-lifecycle-worker")
-    vm["helm-image-path"] = "image"
+    vm["helm-image-path"] = "somewhere.else.image"  # any value the row does not hold
     one_row = _commit_files(rows_repo, {_BUILDS: json.dumps(changed, indent=2)}, "one row")
     assert image_changes.changed_build_rows(first, rows_repo, head=one_row) == {"vm-lifecycle-worker"}
     # The same rows, reordered, re-indented and with their keys shuffled: no row changed.

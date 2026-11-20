@@ -2,17 +2,19 @@
 
 Plain parameters, no settings and no Temporal (CLAUDE.md §1). The git client
 is activities/git_repo.py and the reader activities/day1_repo.py — the
-monorepo's one day1 reader, shared with vm-lifecycle and upgrade-gitops and
-owned by none of them: the token injected in memory only, scrubbed from every
-error, kept out of every file of the clone, every clone a fresh
-TemporaryDirectory — ONE per activity attempt.
+monorepo's one day1 reader, shared with upgrade-gitops and server-lifecycle
+and owned by none of them: the token injected in memory only, scrubbed from
+every error, kept out of every file of a clone. The day1 layout itself (which
+folder, which file) is day1_repo's: this module asks `Day1` and builds the
+path it writes with day1_repo's helpers (checker AC009).
 
 What is provision-cluster's:
 
-  * inspect — `main` is read: the MCE folder is found by NAME among
-    `sites/*/mces/` (iterated, never globbed with input), the cluster must not
-    have a file there yet, and the text is judged against the merged value
-    layers (cluster_values.validate_cluster_values).
+  * inspect — a READ of `main`, on day1_repo.main_snapshot (the remote asked
+    for its head, a clone only when it moved): the MCE folder is found by
+    NAME among the sites' folders (iterated, never globbed with input), the
+    cluster must not have a file there yet, and the text is judged against
+    the merged value layers (cluster_values.validate_cluster_values).
   * publish — the cluster file goes on `provision-cluster/<cluster>`, created
     from `main` by the push itself (git_repo.commit_and_push pushes
     `HEAD:refs/heads/<branch>`). The commit carries NO `[skip ci]`: the day1
@@ -20,17 +22,17 @@ What is provision-cluster's:
     `vlanId`), renders the MachineConfigs and pushes its own `[skip ci]`
     commit with the `mcConfigMap` section on top. A branch already there is a
     re-run: its file must mean the same as this run's (same_cluster_file),
-    and then nothing is pushed.
+    and then nothing is pushed. A WRITE: every clone a fresh
+    TemporaryDirectory, ONE per activity attempt.
 """
 
 from __future__ import annotations
 
 import re
-from pathlib import Path
 
 from activities import git_repo
 from activities.cluster_lifecycle import cluster_values
-from activities.day1_repo import fresh_main
+from activities.day1_repo import Day1, cluster_file_path, fresh_main, main_snapshot, parse_mce_dir
 from shared.cluster_names import provision_cluster_branch
 from shared.exceptions import (
     AmbiguousMceFolderError,
@@ -40,10 +42,6 @@ from shared.exceptions import (
 )
 from shared.models.cluster_lifecycle import ClusterFilePublishRequest, ClusterFileRef, ClusterTarget
 from shared.models.segment_lifecycle import DhcpValues
-
-SITES_ROOT = "sites"
-MCES = "mces"
-HOSTED_CLUSTERS = "hostedClusters"
 
 # Who the cluster file's commit is by. Hard-coded, not configured, like every
 # other writer's identity here: it names THIS workflow in day1's history.
@@ -55,7 +53,6 @@ PROVISION_AUTHOR = git_repo.GitIdentity(
 # or the filesystem could read as more. Re-checked here because the limb must
 # not trust a request to have come through the router.
 _NAME = re.compile(r"^[a-z0-9]+(?:[-.a-z0-9]*[a-z0-9])?$")
-_MCE_DIR = re.compile(rf"^{SITES_ROOT}/(?P<site>[^/]+)/{MCES}/(?P<mce>[^/]+)$")
 
 
 def _require_name(value: str, what: str) -> str:
@@ -64,47 +61,40 @@ def _require_name(value: str, what: str) -> str:
     return value
 
 
-def cluster_file_path(mce_dir: str, cluster: str) -> str:
-    return f"{mce_dir}/{HOSTED_CLUSTERS}/{cluster}.yaml"
+def find_mce_dir(day1: Day1, mce: str) -> tuple[str, str]:
+    """(site, the MCE folder's path) for the ONE site holding that MCE folder.
 
-
-def find_mce_dir(clone: Path, mce: str) -> tuple[str, str]:
-    """(site, `sites/<site>/mces/<mce>`) for the ONE site holding that MCE folder.
-
-    The sites are iterated, and `mce` compared as a name: it comes from an
-    unauthenticated API, so it is never a glob and never a path.
+    The sites are iterated, and `mce` compared as a name (Day1.mce_folders): it
+    comes from an unauthenticated API, so it is never a glob and never a path.
     """
     _require_name(mce, "MCE folder")
-    sites_root = clone / SITES_ROOT
-    sites = sorted(path.name for path in sites_root.iterdir() if path.is_dir()) if sites_root.is_dir() else []
-    matches = [site for site in sites if (sites_root / site / MCES / mce).is_dir()]
+    matches = day1.mce_folders(mce)
     if not matches:
         raise MceFolderNotFoundError(
-            f"no {SITES_ROOT}/<site>/{MCES}/{mce} folder at day1 main (sites: {', '.join(sites) or 'none'}): "
+            f"no sites/<site>/mces/{mce} folder at day1 main (sites: {', '.join(day1.sites()) or 'none'}): "
             "the MCE is named by its folder, exactly"
         )
     if len(matches) > 1:
         raise AmbiguousMceFolderError(
-            f"{MCES}/{mce} exists under {len(matches)} sites at day1 main ({', '.join(matches)}): "
+            f"mces/{mce} exists under {len(matches)} sites at day1 main ({', '.join(site for site, _ in matches)}): "
             "an MCE lives at one site, a human must resolve which"
         )
-    return matches[0], f"{SITES_ROOT}/{matches[0]}/{MCES}/{mce}"
+    return matches[0]
 
 
 async def inspect(*, repo_url: str, token: str, cluster: str, mce: str, values: str) -> ClusterTarget:
     """Where the cluster goes at day1 `main`, and whether its text would render there."""
     _require_name(cluster, "cluster")
-    async with fresh_main(repo_url=repo_url, token=token, prefix="day1-inspect-") as day1:
-        clone = day1.path
-        site, mce_dir = find_mce_dir(clone, mce)
+    async with main_snapshot(repo_url=repo_url, token=token) as day1:
+        site, mce_dir = find_mce_dir(day1, mce)
         path = cluster_file_path(mce_dir, cluster)
-        if (clone / path).exists():
+        if day1.has_file(path):
             raise ClusterAlreadyProvisionedError(
                 f"{path} already exists at day1 main: the cluster is provisioned (or a file of its "
                 "name is). This workflow creates cluster files and never rewrites one; changing a "
                 "cluster is an edit on day1"
             )
-        validated = cluster_values.validate_cluster_values(clone, path, values, mce=mce)
+        validated = cluster_values.validate_cluster_values(day1.root, path, values, mce=mce)
         return ClusterTarget(
             site=site,
             mce_dir=mce_dir,
@@ -113,7 +103,7 @@ async def inspect(*, repo_url: str, token: str, cluster: str, mce: str, values: 
             config_names=validated.config_names,
             day2_env=validated.day2_env,
             day2_sigs=validated.day2_sigs,
-            revision=await day1.head(),
+            revision=day1.revision,
         )
 
 
@@ -122,7 +112,7 @@ async def publish(
 ) -> ClusterFileRef:
     """The cluster file on `provision-cluster/<cluster>`: pushed, or already there."""
     _require_name(request.cluster, "cluster")
-    if not _MCE_DIR.fullmatch(request.mce_dir) or ".." in request.mce_dir.split("/"):
+    if parse_mce_dir(request.mce_dir) is None:
         raise MceFolderNotFoundError(f"{request.mce_dir!r} is not a day1 MCE folder path (sites/<site>/mces/<mce>)")
     branch = request.branch or provision_cluster_branch(request.cluster)
     path = cluster_file_path(request.mce_dir, request.cluster)
@@ -148,6 +138,9 @@ async def publish(
             )
             return ClusterFileRef(relative_path=path, branch=branch, commit_sha=sha, changed=True, dhcp_values=dhcp_values)
 
+    # conventions: allow AC008 — the writer's own "already there" half: a re-run reads the
+    # branch this workflow pushed, once. One branch per cluster, so a snapshot of each would
+    # stay in the cache for as long as the pod lives.
     async with git_repo.fresh_clone(
         repo_url=repo_url, token=token, repo="day1", prefix="day1-rerun-", branch=branch,
         missing_message=f"branch {branch} vanished between the check and the clone",

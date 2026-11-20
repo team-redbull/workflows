@@ -10,8 +10,9 @@ side under `sigs/<sig>/` (day2 `ARCHITECTURE.md` §3):
 Without the layer the chart falls back to the team default when mastertag
 moves (R1, `ARCHITECTURE.md:857-883`), so every step's version needs one.
 
-Plain parameters, no settings and no Temporal (CLAUDE.md §1); clones through
-activities/git_repo.py, read-only.
+Plain parameters, no settings and no Temporal (CLAUDE.md §1). A READ, so it
+takes activities/git_repo.py's snapshot: the remote is asked for its head
+every time and day2 is cloned only when it moved.
 """
 
 from __future__ import annotations
@@ -29,8 +30,11 @@ def cluster_charts(root: Path, cluster: str) -> list[tuple[str, str]]:
     if not sigs.is_dir():
         return []
     for sig in sorted(path for path in sigs.iterdir() if path.is_dir()):
+        # conventions: allow AC009 — day2's tree (`sites/<site>/<env>/mces/<mce>/<cluster>/`
+        # under each sig), not day1's: `Day1` does not walk it.
+        day2_cluster_folders = "sites/*/*/mces/*/*"
         folders = [
-            path for path in sig.glob("sites/*/*/mces/*/*")
+            path for path in sig.glob(day2_cluster_folders)
             if path.is_dir() and path.name == cluster
         ]
         folders.append(sig / "defaults" / "hosted-clusters")
@@ -55,5 +59,5 @@ def layer_gaps(root: Path, cluster: str, versions: list[str]) -> list[Day2LayerG
 
 
 async def check_layers(*, repo_url: str, token: str, cluster: str, versions: list[str]) -> Day2Layers:
-    async with git_repo.fresh_clone(repo_url=repo_url, token=token, repo="day2", prefix="day2-layers-") as day2:
+    async with git_repo.snapshot(repo_url=repo_url, token=token, repo="day2") as day2:
         return Day2Layers(missing=layer_gaps(day2.path, cluster, versions))

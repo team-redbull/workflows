@@ -26,6 +26,8 @@ VALIDATOR = "scripts/validate_upgrade_rules.py"
 
 
 def mce_file(mce_cluster: str) -> str:
+    # conventions: allow AC009 — the upgrade rules' own file under `upgrade/`, which this
+    # module owns; not the cluster tree (`sites/…`) that `Day1` walks.
     return f"upgrade/mces/{mce_cluster}.yaml"
 
 

@@ -1,13 +1,20 @@
 """The day1 values repo for the upgrade: read the rules and a cluster file, commit one change — at `main`.
 
-Plain parameters, no settings and no Temporal (CLAUDE.md §1). The clone and
-the generic cluster-file reader are activities/day1_repo.py's — the monorepo's
-one day1 reader, shared with vm-lifecycle and owned by neither limb — on
-activities/git_repo.py:
-the token injected in memory only, scrubbed from every error, kept out of
-every file of the clone, every clone a fresh TemporaryDirectory — ONE per
-activity attempt. `main` only: Argo CD renders main and nothing else
-(hcAppset.yaml pins it), and this limb has no branch input to check.
+Plain parameters, no settings and no Temporal (CLAUDE.md §1). The clone, the
+snapshot and the generic cluster-file reader are activities/day1_repo.py's —
+the monorepo's one day1 reader, shared with cluster-lifecycle and owned by no
+limb — on activities/git_repo.py: the token injected in memory only, scrubbed
+from every error, kept out of every file of a clone. `main` only: Argo CD
+renders main and nothing else (hcAppset.yaml pins it), and this limb has no
+branch input to check.
+  * the two READS (`read_rules`, `read_cluster`) take day1_repo.main_snapshot:
+    the remote is asked for its head every time and a clone is made only when
+    it moved. The snapshot is shared, so day1's rules validator runs in a
+    throwaway COPY of it (`Day1.scratch`): whatever the script writes is
+    discarded with the copy and no later reader sees it.
+  * the WRITE (`commit_change`) takes day1_repo.fresh_main: every clone a
+    fresh TemporaryDirectory, ONE per activity attempt, the compare-and-set
+    and the push in the same clone.
 
 What the YAML means is day1_values.py and upgrade_rules.py; this module only
 moves files between git and them, and runs day1's own validators
@@ -20,11 +27,10 @@ from __future__ import annotations
 
 import shlex
 import sys
-from pathlib import Path
 
 from activities import git_repo
 from activities.upgrade_gitops import day1_values, upgrade_rules
-from activities.day1_repo import fresh_main  # the monorepo's day1 reader
+from activities.day1_repo import Day1, fresh_main, main_snapshot  # the monorepo's day1 reader
 from shared.exceptions import (
     AmbiguousClusterFileError,
     ClusterFileNotFoundError,
@@ -43,24 +49,25 @@ VALIDATOR_TIMEOUT_SECONDS = 90.0
 
 async def read_rules(*, repo_url: str, token: str, mce_cluster: str) -> UpgradeRules:
     """`upgrade/ladder.yaml` + `upgrade/mces/<mce>.yaml` at main, after day1's validator passed them."""
-    async with fresh_main(repo_url=repo_url, token=token, prefix="day1-rules-") as day1:
-        clone = day1.path
-        ladder = clone / upgrade_rules.LADDER_FILE
-        mce = clone / upgrade_rules.mce_file(mce_cluster)
-        missing = [str(path.relative_to(clone)) for path in (ladder, mce) if not path.is_file()]
+    async with main_snapshot(repo_url=repo_url, token=token) as day1:
+        root = day1.root
+        ladder = root / upgrade_rules.LADDER_FILE
+        mce = root / upgrade_rules.mce_file(mce_cluster)
+        missing = [str(path.relative_to(root)) for path in (ladder, mce) if not path.is_file()]
         if missing:
             raise UpgradeRulesInvalidError(f"day1 main has no {' and no '.join(missing)}")
-        validator = clone / upgrade_rules.VALIDATOR
-        if not validator.is_file():
+        if not (root / upgrade_rules.VALIDATOR).is_file():
             raise UpgradeRulesInvalidError(f"day1 main has no {upgrade_rules.VALIDATOR} to validate the rules with")
-        code, output = await day1.run_command(
-            [sys.executable, upgrade_rules.VALIDATOR, "--repo-root", str(clone)],
-            timeout=VALIDATOR_TIMEOUT_SECONDS,
-        )
+        # day1's script runs in a private copy: the snapshot is every reader's.
+        async with day1.scratch(prefix="day1-rules-") as scratch:
+            code, output = await scratch.run_command(
+                [sys.executable, upgrade_rules.VALIDATOR, "--repo-root", str(scratch.path)],
+                timeout=VALIDATOR_TIMEOUT_SECONDS,
+            )
         if code != 0:
             raise UpgradeRulesInvalidError(f"{upgrade_rules.VALIDATOR} refused the rules:\n{git_repo.tail(output)}")
         return upgrade_rules.parse_rules(
-            revision=await day1.head(),
+            revision=day1.revision,
             ladder_text=ladder.read_text(encoding="utf-8"),
             mce_text=mce.read_text(encoding="utf-8"),
             mce_cluster=mce_cluster,
@@ -70,18 +77,14 @@ async def read_rules(*, repo_url: str, token: str, mce_cluster: str) -> UpgradeR
 # --- read_day1_cluster ------------------------------------------------------------------
 
 
-def find_cluster_file(clone: Path, cluster: str) -> str:
-    """The one `sites/*/mces/*/hostedClusters/<cluster>.yaml`; names are unique in day1 (D18).
+def find_cluster_file(day1: Day1, cluster: str) -> str:
+    """The one cluster file named `<cluster>.yaml` in day1; names are unique there (D18).
 
-    Compared by name, never globbed with it: the name comes from an
-    unauthenticated API, and a `*` in it must not match other clusters.
+    Compared by name, never globbed with it (Day1.cluster_paths): the name
+    comes from an unauthenticated API, and a `*` in it must not match other
+    clusters.
     """
-    sites = clone / "sites"
-    matches = sorted(
-        str(path.relative_to(clone))
-        for path in (sites.glob("*/mces/*/hostedClusters/*.yaml") if sites.is_dir() else [])
-        if path.name == f"{cluster}.yaml" and path.is_file()
-    )
+    matches = day1.cluster_paths(cluster)
     if not matches:
         raise ClusterFileNotFoundError(
             f"no {cluster}.yaml under sites/*/mces/*/hostedClusters/ in day1 main: "
@@ -96,9 +99,9 @@ def find_cluster_file(clone: Path, cluster: str) -> str:
 
 
 async def read_cluster(*, repo_url: str, token: str, cluster: str) -> Day1Cluster:
-    async with fresh_main(repo_url=repo_url, token=token, prefix="day1-cluster-") as day1:
-        path = find_cluster_file(day1.path, cluster)
-        return day1_values.read_cluster(day1.path, path, revision=await day1.head(), blob=await day1.blob(path))
+    async with main_snapshot(repo_url=repo_url, token=token) as day1:
+        path = find_cluster_file(day1, cluster)
+        return day1_values.read_cluster(day1.root, path, revision=day1.revision, blob=await day1.blob(path))
 
 
 # --- commit_day1_change ---------------------------------------------------------------------

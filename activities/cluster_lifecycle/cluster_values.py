@@ -32,8 +32,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from activities.day1_repo import load_cluster_values, load_yaml
-from shared.cluster_names import env_of_hosted_cluster, env_of_mce_folder
+from activities.day1_repo import cluster_env, load_cluster_values, load_yaml
+from shared.cluster_names import env_of_mce_folder
 from shared.exceptions import ClusterValuesRejectedError
 from shared.models.segment_lifecycle import DhcpValues
 
@@ -141,7 +141,7 @@ def _day2(merged: dict, stem: str, mce: str) -> tuple[str | None, list[str], lis
     if explicit is not None and not isinstance(explicit, str):
         reasons.append("`day2.env` must be a string")
         explicit = None
-    env = explicit or env_of_hosted_cluster(stem)
+    env = cluster_env(merged, stem)  # THE rule (day1_repo): day2.env, else the name's first field
     mce_env = env_of_mce_folder(mce)
     if explicit is None and mce_env is not None and env != mce_env:
         reasons.append(

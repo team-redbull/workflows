@@ -5,7 +5,8 @@ deployment because its dependency and credential set is its own (CLAUDE.md
 §2): the day1 git token used for a push AND for the repo's git provider API
 (the merge request), plus the day2 sig repos' push token and the shortcuts service's bearer
 token — no Kubernetes
-credential at all, so nothing to run per MCE.
+credential at all, so nothing to run per MCE. Because it holds the day1 token,
+it also answers other domains' questions about day1 (list_day1_clusters).
 
 Connects with the Pydantic data converter so that Pydantic models serialize
 correctly across the workflow boundary.
@@ -24,6 +25,7 @@ from activities.cluster_lifecycle.activities import (
     ensure_merge_request,
     get_merge_request_state,
     inspect_cluster_target,
+    list_day1_clusters,
     publish_cluster_file,
     register_cluster_in_day2_sig,
 )
@@ -51,6 +53,8 @@ async def main() -> None:
             get_merge_request_state,
             register_cluster_in_day2_sig,
             ensure_cluster_shortcut,
+            # Shared with other domains: day1's clusters, read with this limb's token.
+            list_day1_clusters,
         ],
         # A clone or a push in flight gets this long to finish after shutdown
         # starts; a cut push is re-done from a fresh clone by Temporal's retry.

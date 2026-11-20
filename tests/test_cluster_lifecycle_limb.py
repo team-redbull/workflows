@@ -5,21 +5,30 @@ module with plain parameters; these tests run the real activities through
 ActivityEnvironment with the modules replaced, and pin the wiring the module
 tests cannot see: which policy ranges the publish picks per type, how the day2
 URL template is filled, that the merge request goes to GitLab, and
-that the answers come back as the models the workflow expects.
+that the answers come back as the models the workflow expects. list_day1_clusters,
+the one activity other domains call here, is also run whole against a local bare day1.
 """
 
 from __future__ import annotations
+
+import subprocess
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from temporalio.testing import ActivityEnvironment
 
 from activities.cluster_lifecycle import activities as limb
-from activities.cluster_lifecycle import day1_writer, day2_sigs, git_provider
+from activities.cluster_lifecycle import day1_clusters, day1_writer, day2_sigs, git_provider
+from shared.exceptions import Day1QueryInvalidError
 from shared.models.cluster_lifecycle import (
     ClusterFilePublishRequest,
     ClusterFileRef,
     ClusterTarget,
     ClusterTargetRequest,
+    Day1ClusterEntry,
+    Day1ClusterList,
+    Day1ClusterQuery,
     Day2SigRegistration,
     Day2SigRegistrationRequest,
     MergeRequestRef,
@@ -160,3 +169,108 @@ async def test_a_day2_token_is_honoured(env, monkeypatch):
     await env.run(limb.register_cluster_in_day2_sig, Day2SigRegistrationRequest(sig="redbull", site="s", env="prep", mce="m", cluster="c"))
     assert seen["repo_url"] == "https://git.test/redbull/gitops-day2-prod/sigs/redbull.git"
     assert seen["token"] == "sig-token"
+
+
+# --- list_day1_clusters: shared with other domains ----------------------------------------------
+
+
+async def test_list_day1_clusters_hands_the_settings_and_the_query_to_the_reader(env, monkeypatch):
+    seen = {}
+
+    async def fake_list(**kwargs):
+        seen.update(kwargs)
+        return Day1ClusterList(clusters=[], revision="r")
+
+    monkeypatch.setattr(day1_clusters, "list_clusters", fake_list)
+    query = Day1ClusterQuery(site="five", kind="kv", zone="az1")
+    listed = await env.run(limb.list_day1_clusters, query)
+    assert listed == Day1ClusterList(clusters=[], revision="r")
+    assert seen == {
+        "repo_url": "https://git.test/team/gitops-day1-platform-config.git", "token": "test-git-token", "query": query,
+    }
+
+
+@pytest.mark.parametrize("query", [
+    Day1ClusterQuery(site="../five"),
+    Day1ClusterQuery(site="five/mces"),
+    Day1ClusterQuery(env="*"),
+    Day1ClusterQuery(zone="1"),
+    Day1ClusterQuery(zone="az1/.."),
+    Day1ClusterQuery(kind="kubevirt"),
+])
+async def test_a_query_that_could_shape_a_path_is_refused_for_good_before_any_git(env, monkeypatch, query):
+    from temporalio.exceptions import ApplicationError
+
+    async def forbidden(**_kwargs):
+        raise AssertionError("day1 was read for a refused query")
+
+    monkeypatch.setattr(day1_clusters, "list_clusters", forbidden)
+    with pytest.raises(ApplicationError) as caught:
+        await env.run(limb.list_day1_clusters, query)
+    assert caught.value.type == Day1QueryInvalidError.__name__ and caught.value.non_retryable
+    assert caught.value.message.startswith("day1 cluster query refused: ")
+
+
+def _run_git(*args: str, cwd: Path) -> str:
+    return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True).stdout
+
+
+def _day1_origin(tmp_path: Path, files: dict[str, str]) -> tuple[Path, str]:
+    """A local bare day1 whose `main` holds `files`; (its path, main's commit)."""
+    bare, seed = tmp_path / "day1.git", tmp_path / "seed"
+    _run_git("init", "-q", "--bare", "--initial-branch=main", str(bare), cwd=tmp_path)
+    _run_git("clone", "-q", str(bare), str(seed), cwd=tmp_path)
+    for relative, content in files.items():
+        (seed / relative).parent.mkdir(parents=True, exist_ok=True)
+        (seed / relative).write_text(content)
+    _run_git("add", "-A", cwd=seed)
+    _run_git("-c", "user.name=seed", "-c", "user.email=seed@test", "commit", "-q", "-m", "seed", cwd=seed)
+    _run_git("push", "-q", "origin", "HEAD:main", cwd=seed)
+    return bare, _run_git("rev-parse", "main", cwd=bare).strip()
+
+
+_ZONED = 'nodepool:\n  - name: workers\n    nodeLabels:\n      topology.kubernetes.io/zone: "{zone}"\n'
+
+
+async def test_list_day1_clusters_answers_from_day1_main_with_the_commit_it_read(env, monkeypatch, tmp_path):
+    """The real activity over the real reader, against a local bare day1."""
+    seed, mce = "sites/five/mces/ocp4-seed-five-1/hostedClusters", "sites/five/mces/ocp4-prod-mce-five-a/hostedClusters"
+    origin, head = _day1_origin(tmp_path, {
+        f"{seed}/ocp4-prod-kv-five-b.yaml": _ZONED.format(zone="az1"),
+        f"{seed}/ocp4-prod-kv-five-a.yaml": _ZONED.format(zone="az2"),
+        f"{mce}/ocp4-prod-iac-five-a.yaml": "mastertag: 4.19.1\n",
+        "sites/six/mces/ocp4-seed-six-1/hostedClusters/ocp4-prod-kv-six-a.yaml": _ZONED.format(zone="az1"),
+    })
+    # The settings accept only an https URL; the activity reads these two keys.
+    monkeypatch.setattr(limb, "_settings", SimpleNamespace(day1_repo_url=str(origin), redbull_git_token=""))
+
+    listed = await env.run(limb.list_day1_clusters, Day1ClusterQuery(site="five", kind="kv", zone="az1"))
+    assert listed.revision == head
+    assert [(c.name, c.id, c.zone, c.kind, c.site, c.folder) for c in listed.clusters] == [
+        ("ocp4-prod-kv-five-a", "a", "az1", "kv", "five", "ocp4-seed-five-1"),
+        ("ocp4-prod-kv-five-b", "b", "az1", "kv", "five", "ocp4-seed-five-1"),
+    ]
+    first, second = listed.clusters
+    assert second.problems == [] and len(first.problems) == 1 and "zone 'az2'" in first.problems[0]  # listed, with its problem
+    assert (first.cluster_name, first.hosted_cluster, first.hosted_cluster_namespace, first.path) == (
+        "prod-kv-five-a", "openshift-prod-kv-five-a", "hcp-prod-kv-five-a", f"{seed}/ocp4-prod-kv-five-a.yaml")
+
+    everything = await env.run(limb.list_day1_clusters, Day1ClusterQuery())
+    assert [c.name for c in everything.clusters] == [
+        "ocp4-prod-iac-five-a", "ocp4-prod-kv-five-a", "ocp4-prod-kv-five-b", "ocp4-prod-kv-six-a",
+    ]
+    by_env = await env.run(limb.list_day1_clusters, Day1ClusterQuery(kind="hc", env="prod"))
+    assert [c.name for c in by_env.clusters] == ["ocp4-prod-iac-five-a"]
+    assert (await env.run(limb.list_day1_clusters, Day1ClusterQuery(site="nowhere"))).clusters == []
+    nothing = await env.run(limb.list_day1_clusters, Day1ClusterQuery(site="five", zone="az7"))
+    assert nothing == Day1ClusterList(clusters=[], revision=head)
+
+
+def test_the_boundary_models_take_what_an_older_or_newer_side_sends():
+    """Decoded from history: an unknown field is ignored, an absent one defaults (CLAUDE.md §5)."""
+    assert Day1ClusterQuery.model_validate({"future": 1}) == Day1ClusterQuery()
+    entry = Day1ClusterEntry.model_validate({
+        "name": "n", "site": "s", "folder": "f", "kind": "kv", "cluster_name": "c", "hosted_cluster": "h",
+        "hosted_cluster_namespace": "ns", "path": "p", "future": True,
+    })
+    assert (entry.env, entry.zone, entry.id, entry.problems) == (None, None, None, [])

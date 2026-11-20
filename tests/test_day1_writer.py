@@ -159,6 +159,30 @@ class TestInspect:
         with pytest.raises(ValuesRepoGitError):
             await _inspect(tmp_path / "no-such.git")
 
+    async def test_main_is_cloned_once_while_it_stands_still_and_again_when_it_moves(self, origin, tmp_path, monkeypatch):
+        """inspect is a READ: the remote is asked every time, cloned only when main moved — and a
+        commit that landed in between is seen, never the snapshot from before it."""
+        real_exec = day1_writer.git_repo.exec_git
+        ran: list[str] = []
+
+        async def counting_exec(args, **kwargs):
+            ran.append(args[0])
+            return await real_exec(args, **kwargs)
+
+        monkeypatch.setattr(day1_writer.git_repo, "exec_git", counting_exec)
+        first = await _inspect(origin)
+        second = await _inspect(origin, cluster="ocp4-prep-other-site2-a")
+        assert first.revision == second.revision == _git("rev-parse", "main", cwd=origin).strip()
+        assert ran.count("clone") == 1 and ran.count("ls-remote") == 2
+
+        _push_onto_branch(
+            origin, tmp_path, "merged", lambda c: (c / PATH).write_text("mastertag: 4.22.8\n"),
+            "the cluster's merge request was merged", branch="main",
+        )
+        with pytest.raises(ClusterAlreadyProvisionedError, match=f"{CLUSTER}.yaml already exists"):
+            await _inspect(origin)
+        assert ran.count("clone") == 2
+
 
 # --- publish ---------------------------------------------------------------------------
 

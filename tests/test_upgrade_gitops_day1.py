@@ -301,6 +301,38 @@ class TestReadingTheRules:
         with pytest.raises(UpgradeRulesInvalidError, match="'maxWorkerSkew' is written twice"):
             await day1_repo.read_rules(repo_url=str(origin), token="", mce_cluster=MCE)
 
+    async def test_what_the_validator_writes_never_reaches_the_next_reader(self, origin, tmp_path, monkeypatch):
+        """The reads share one snapshot of main, so day1's script runs in a copy of it.
+
+        A validator that rewrites the ladder to something it would refuse, and
+        litters the tree, changes nothing for the reads that follow: they are
+        served the commit, and clone nothing while main stands still."""
+        checkout = tmp_path / "litter"
+        _git("clone", "-q", str(origin), str(checkout), cwd=tmp_path)
+        (checkout / "scripts/validate_upgrade_rules.py").write_text(RULES_VALIDATOR + (
+            '(root / "upgrade/ladder.yaml").write_text("REFUSE\\n")\n'
+            '(root / "sites" / "left-behind.yaml").write_text("x: 1\\n")\n'
+        ))
+        _commit_all(checkout, "a validator that writes into its repo root")
+        clones: list[str] = []
+        real_exec = day1_repo.git_repo.exec_git
+
+        async def counting_exec(args, **kwargs):
+            if args[0] == "clone":
+                clones.append(args[-1])
+            return await real_exec(args, **kwargs)
+
+        monkeypatch.setattr(day1_repo.git_repo, "exec_git", counting_exec)
+        first = await day1_repo.read_rules(repo_url=str(origin), token="", mce_cluster=MCE)
+        again = await day1_repo.read_rules(repo_url=str(origin), token="", mce_cluster=MCE)
+        assert again == first and first.revision == _git("rev-parse", "main", cwd=origin).strip()
+        cluster = await day1_repo.read_cluster(repo_url=str(origin), token="", cluster=PROD)
+        assert cluster.revision == first.revision and cluster.problems == []
+        assert len(clones) == 1
+        snapshot = Path(clones[0])
+        assert not (snapshot / "sites" / "left-behind.yaml").exists()
+        assert (snapshot / "upgrade/ladder.yaml").read_text() == LADDER
+
 
 # --- read_day1_cluster ---------------------------------------------------------------------------
 

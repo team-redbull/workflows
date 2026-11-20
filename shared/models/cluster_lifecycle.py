@@ -234,3 +234,65 @@ class ClusterShortcutRequest(BaseModel):
 
     shortcut: str = Field(min_length=1)
     cluster: str = Field(min_length=1)
+
+
+# --- shared with other domains: questions about day1 ------------------------------------------
+#
+# day1 is where every OpenShift cluster is described, and this limb holds its
+# token, so a workflow of ANY domain whose own limb has none asks here
+# (list_day1_clusters) instead of getting a second copy of the credential —
+# the get_inventory_segment precedent. A new question is a new filter on the
+# query, never a new activity. The reading itself is activities/day1_repo.py's
+# `Day1`, which defines every field below.
+
+
+class Day1ClusterQuery(BaseModel):
+    """Input to list_day1_clusters: which hosted clusters of day1 `main` to list.
+
+    Every filter is optional and they combine: `site` (a `sites/<site>` folder),
+    `env` (`day2.env` else the cluster name's first field), `kind` (`all`,
+    `hc` — under an MCE folder — or `kv` — under a seed folder, never by name),
+    `zone` (`az<N>`: the clusters under that zone's seed, so only `kv` ones).
+    `kind` is a plain string here on purpose: this model is decoded from
+    history, and the limb refuses an unknown one with Day1QueryInvalidError
+    instead of the payload failing to decode."""
+
+    site: str | None = None
+    env: str | None = None
+    kind: str = "all"
+    zone: str | None = None
+
+
+class Day1ClusterEntry(BaseModel):
+    """One hosted cluster as day1 `main` describes it.
+
+    `name` is the file stem — the cluster's name everywhere (the Argo CD
+    Application, queue names); `folder` the MCE or seed folder it is under;
+    `kind` `hc` or `kv`; `zone` (kv only) the seed folder's; `id` (kv only) the
+    sequence letter its name ends with, None when the name is off the
+    convention; `problems` everything the chart would refuse plus, for a kv
+    cluster, every way the file disagrees with its seed folder (a NodePool
+    naming another zone or none, a name or a seed of another site). An entry
+    with problems is LISTED: whether it may be used is the caller's rule."""
+
+    name: str = Field(min_length=1)
+    site: str = Field(min_length=1)
+    folder: str = Field(min_length=1)
+    kind: str = Field(min_length=1)
+    env: str | None = None
+    zone: str | None = None
+    id: str | None = None
+    cluster_name: str = Field(min_length=1)
+    hosted_cluster: str = Field(min_length=1)
+    hosted_cluster_namespace: str = Field(min_length=1)
+    path: str = Field(min_length=1)
+    problems: list[str] = Field(default_factory=list)
+
+
+class Day1ClusterList(BaseModel):
+    """Answer of list_day1_clusters: the clusters the query kept, sorted by site, folder,
+    then oldest first (the id letter, a name without one last, ties by name), and
+    `revision`, the day1 `main` commit all of it was read at."""
+
+    clusters: list[Day1ClusterEntry] = Field(default_factory=list)
+    revision: str = Field(min_length=1)

@@ -344,6 +344,22 @@ def _zone_problems(merged: dict, zone: str, path: str) -> list[str]:
     return problems
 
 
+def check_filters(*, site: str | None = None, env: str | None = None, kind: str = KIND_ALL, zone: str | None = None) -> None:
+    """Refuse (ValueError) a query filter that is not what the naming convention spells:
+    a `site` or `env` that is not a token, a `zone` that is not `az<N>`, an unknown `kind`.
+
+    What `Day1.clusters` checks before it reads a folder; on its own so a limb
+    can refuse a request before it asks the remote for anything."""
+    if kind not in KINDS:
+        raise ValueError(f"kind {kind!r} is not one of {', '.join(KINDS)}")
+    if site is not None:
+        name_token(site, "site")
+    if env is not None:
+        name_token(env, "env")
+    if zone is not None:
+        zone_number(zone)
+
+
 def _order(record: ClusterRecord) -> tuple:
     """Site, folder, then oldest first: the id letter, a name without one last, ties by name."""
     return (record.site, record.folder, record.id is None, record.id or "", record.name)
@@ -392,14 +408,7 @@ class Day1:
         convention, or an unknown `kind`, is refused (ValueError) before any
         folder is read. `zone` keeps the clusters under that zone's seed, so
         with it only `kv` records remain."""
-        if kind not in KINDS:
-            raise ValueError(f"kind {kind!r} is not one of {', '.join(KINDS)}")
-        if site is not None:
-            name_token(site, "site")
-        if env is not None:
-            name_token(env, "env")
-        if zone is not None:
-            zone_number(zone)
+        check_filters(site=site, env=env, kind=kind, zone=zone)
         records: list[ClusterRecord] = []
         for found, folder in self._site_folders(site):
             folder_zone = seed_zone(folder)

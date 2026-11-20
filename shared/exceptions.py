@@ -1565,3 +1565,13 @@ class ShortcutTakenError(OrchestratorError):
     SHORTCUT_OWNER, so it cannot be pointed at this cluster's console. The owner
     the service reports is named. Deterministic — non-retryable: a person
     decides whether the existing shortcut is removed or kept."""
+
+
+class Day1QueryInvalidError(OrchestratorError):
+    """`list_day1_clusters` was asked with a filter that could shape a path or
+    name nothing: a `site` or `env` that is not a token of the naming convention,
+    a `zone` that is not `az<N>`, a `kind` that is not all/hc/kv. Refused before
+    day1 is read. Deterministic — and raised by the activity itself as a
+    NON-RETRYABLE ApplicationError of this type, so no calling workflow has to
+    list it: the activity is shared by other domains, and each would otherwise
+    have to remember to."""

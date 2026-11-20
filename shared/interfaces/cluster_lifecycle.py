@@ -16,6 +16,8 @@ from shared.models.cluster_lifecycle import (
     ClusterShortcutRequest,
     ClusterTarget,
     ClusterTargetRequest,
+    Day1ClusterList,
+    Day1ClusterQuery,
     Day2SigRegistration,
     Day2SigRegistrationRequest,
     MergeRequestRef,
@@ -122,6 +124,38 @@ async def ensure_cluster_shortcut(request: ClusterShortcutRequest) -> ClusterSho
     nothing posted. Raises ShortcutTakenError (another owner holds the name —
     deterministic, non-retryable); EVERY other failure, refusals included, is the
     retryable ShortcutsApiError (the run is past its merge and cannot be re-run).
+    """
+    ...
+
+
+# --- shared with other domains ----------------------------------------------------------
+
+
+@activity.defn
+async def list_day1_clusters(query: Day1ClusterQuery) -> Day1ClusterList:
+    """The hosted clusters day1 `main` describes, filtered by site, env, kind and zone.
+
+    Lives in THIS limb because it reads the day1 repo — whose URL and token
+    already sit on the cluster-lifecycle limb. A workflow of another domain
+    calls it with task_queue=CLUSTER_LIFECYCLE_ACTIVITY_QUEUE rather than a
+    second deployment holding a copy of that credential. A new question about
+    day1 is a new filter on the query (and a method of activities/day1_repo.py's
+    `Day1`), never a new activity. Not a generic git activity: no clone crosses
+    it and it writes nothing; it answers typed facts about one commit, and the
+    answer carries that commit (`revision`).
+
+    `kind` `kv` is a cluster under a SEED folder (`ocp4-seed-<site>-<N>`, zone
+    `az<N>`), never one named kubevirt; `hc` is one under any other folder. A
+    kv entry whose NodePools do not all label their nodes with the seed's zone,
+    or whose name is off the convention, is listed WITH its `problems`.
+
+    Observe-only, so trivially idempotent. The remote is asked for `main`'s
+    head on every call and cloned only when it moved (git_repo.snapshot), so
+    calls arriving together cause one clone. A filter that matches nothing is
+    an empty list. Raises a NON-RETRYABLE ApplicationError of type
+    Day1QueryInvalidError for a filter that is not a token of the naming
+    convention (refused before any git call); a clone failure is the
+    retryable ValuesRepoGitError, a day1 without `main` ValuesBranchNotFoundError.
     """
     ...
 

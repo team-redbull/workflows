@@ -9,6 +9,10 @@ day1_writer.py, git_provider.py) and the day2 sig repos with the day2 token
 one module per dependency; what a cluster file must look like is
 cluster_values.py, and the DHCP block it gets is dhcp_values.py.
 
+One activity is not provision-cluster's: list_day1_clusters answers other
+domains' questions about day1 (day1_clusters.py over activities/day1_repo.py's
+`Day1`), here because this limb holds the day1 token (CLAUDE.md §2).
+
 Budgets, all under the workflow's timeouts (workflow_domains/cluster_lifecycle/
 provision_cluster.py): git under the 180 s start_to_close (git_repo's 150 s
 per command), GitLab's HTTP calls at 60 s under the 90 s start_to_close, the
@@ -18,9 +22,12 @@ shortcuts service's three calls at 20 s each under its 90 s.
 from __future__ import annotations
 
 from temporalio import activity
+from temporalio.exceptions import ApplicationError
 
-from activities.cluster_lifecycle import day1_writer, day2_sigs, git_provider, shortcuts_api
+from activities import day1_repo
+from activities.cluster_lifecycle import day1_clusters, day1_writer, day2_sigs, git_provider, shortcuts_api
 from activities.cluster_lifecycle.dhcp_values import build_dhcp_values
+from shared.exceptions import Day1QueryInvalidError
 from shared.models.cluster_lifecycle import (
     ClusterFilePublishRequest,
     ClusterFileRef,
@@ -28,6 +35,8 @@ from shared.models.cluster_lifecycle import (
     ClusterShortcutRequest,
     ClusterTarget,
     ClusterTargetRequest,
+    Day1ClusterList,
+    Day1ClusterQuery,
     Day2SigRegistration,
     Day2SigRegistrationRequest,
     MergeRequestRef,
@@ -117,3 +126,27 @@ async def ensure_cluster_shortcut(request: ClusterShortcutRequest) -> ClusterSho
         "created" if shortcut.created else "already there", shortcut.owner,
     )
     return shortcut
+
+
+# --- shared with other domains ----------------------------------------------------------
+
+
+@activity.defn
+async def list_day1_clusters(query: Day1ClusterQuery) -> Day1ClusterList:
+    try:
+        day1_repo.check_filters(site=query.site, env=query.env, kind=query.kind, zone=query.zone)
+    except ValueError as err:
+        # Refused before any git call, and permanently for every caller: the
+        # activity is shared, so the classification travels with the error.
+        raise ApplicationError(
+            f"day1 cluster query refused: {err}", type=Day1QueryInvalidError.__name__, non_retryable=True
+        ) from None
+    listed = await day1_clusters.list_clusters(
+        repo_url=_settings.day1_repo_url, token=_settings.redbull_git_token, query=query
+    )
+    activity.logger.info(
+        "day1 %s: %d clusters for site=%s env=%s kind=%s zone=%s (%d with problems)",
+        listed.revision, len(listed.clusters), query.site or "*", query.env or "*", query.kind, query.zone or "*",
+        sum(1 for cluster in listed.clusters if cluster.problems),
+    )
+    return listed

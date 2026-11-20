@@ -60,7 +60,9 @@ retries every minute forever with the run RUNNING.
   every message before the exception is built (history records it verbatim);
   `activities/git_repo.py` holds the shared pieces, `activities/day1_repo.py` the day1 reader
   on top of it — code two limbs need lives there, in no domain, never in one limb for the
-  other to import.
+  other to import. A git WRITE is one `fresh_clone` per attempt; a git READ is
+  `git_repo.snapshot` (cloned only when the remote moved); anything read from day1 goes
+  through `Day1` — [day1-reads.md](day1-reads.md).
 - `activity.logger.info` for each call's outcome, with the identifiers an operator searches for.
 
 ## Settings for a new endpoint, credential or knob

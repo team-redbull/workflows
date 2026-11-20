@@ -1,8 +1,9 @@
 """Git by subprocess, THE git client of every limb that clones a repo — kept out of each limb's activities.py.
 
-Used by cluster-lifecycle (day1_writer.py, day2_sigs.py), upgrade-gitops
-(day1, day2, Brain) and vm-lifecycle, the day1 reads through
-activities/day1_repo.py. No other module runs git. What a limb does with a
+Used by cluster-lifecycle (day1_writer.py, day2_sigs.py, list_day1_clusters),
+upgrade-gitops (day1, day2, Brain) and server-lifecycle (update-nodepool's
+day1 read and commit), everything about day1 through activities/day1_repo.py.
+No other module runs git. What a limb does with a
 clone — which file, and what "already done" means for it — stays the limb's;
 everything that is just git lives here. First extracted from
 segment-lifecycle's values_repo.py (DESIGN O15, since removed).

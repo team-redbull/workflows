@@ -5,7 +5,7 @@ reads text and returns text, so every rule here is a plain unit test.
 
 READING (`read_cluster`) starts from activities/day1_repo.py's
 `load_cluster_values` — the monorepo's one reader of a cluster file with its
-value layers and its clusterName, shared with vm-lifecycle — and adds what
+value layers and its clusterName, shared by every limb that reads day1 — and adds what
 only the upgrade reads:
   * a NodePool is `.name`, else `<clusterName>-<infraEnv>` with infraEnv =
     `.infraEnvName`, else `.agentLabelSelector.nodeLabelValue`
@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-# The monorepo's day1 reader (shared with vm-lifecycle). The names not used
+# The monorepo's day1 reader (shared by every limb that reads day1). The names not used
 # below are re-exported on purpose: upgrade_rules.py reads load_yaml from here.
 from activities.day1_repo import (  # noqa: F401
     CONFIG_VALUES,

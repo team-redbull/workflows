@@ -83,6 +83,7 @@ and the checker in the same commit.
 | a new workflow in an EXISTING domain | [references/new-workflow.md](references/new-workflow.md) |
 | a new DOMAIN or a new LIMB (dependency set, credentials, RBAC, per-MCE reach) | [references/new-domain.md](references/new-domain.md) |
 | add or change an activity (a new external call, a new classification) | [references/activities.md](references/activities.md) |
+| a workflow needs something from day1 (a cluster, a site's or a zone's clusters, a file) | [references/day1-reads.md](references/day1-reads.md) |
 | change or RENAME a workflow that may have runs in flight, or a boundary model | [references/modify-workflow.md](references/modify-workflow.md) |
 | a config key, operator knob, secret or chart | [references/platform-chart.md](references/platform-chart.md) |
 | tests for any of the above | [references/testing.md](references/testing.md) |

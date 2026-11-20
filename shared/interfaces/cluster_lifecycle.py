@@ -31,7 +31,8 @@ from shared.models.vm_lifecycle import KvClusterList, KvClusterListRequest
 async def inspect_cluster_target(request: ClusterTargetRequest) -> ClusterTarget:
     """Read day1 `main` for where the cluster goes, and refuse what the chart would.
 
-    Clones `main`, finds the ONE `sites/<site>/mces/<mce>` folder named exactly
+    Reads `main` at its head (cloned only when it moved since this worker last
+    read it), finds the ONE `sites/<site>/mces/<mce>` folder named exactly
     `request.mce` (iterated, never globbed with input), refuses a cluster whose
     `hostedClusters/<cluster>.yaml` already exists there, and validates the
     YAML text against the merged value layers the way the hostedclusters-setup

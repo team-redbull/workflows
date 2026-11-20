@@ -66,18 +66,24 @@ A `-mtl-` InfraEnv is bare metal, not a VM pool, and is refused. The MCE is a cl
 refused. Memory is not in the name: it is **vCPUs × 8 GiB** (section 6.1).
 
 **Where the clusters are.** A KV cluster is a hosted cluster whose control plane runs on its
-zone's **seed** cluster (one seed per zone, AD17). So the zone's KV clusters are the files of the
-site's seed folders in the day1 repo's `main`, read by the `cluster-lifecycle-worker` on the hub:
+zone's **seed** cluster (one seed per zone, AD17). The convention reserves two cluster flavors for
+them: a seed is `ocp4-<lifecycle>-seed-<site>-<id>`, a KV cluster `ocp4-<lifecycle>-kv-<site>-<id>`.
+So the zone's KV clusters are the files of the site's seed folders in the day1 repo's `main`,
+read by the `cluster-lifecycle-worker` on the hub:
 
 ```
 sites/<site>/mces/<seed cluster>/hostedClusters/<kv cluster>.yaml
+sites/five/mces/ocp4-prod-seed-five-a/hostedClusters/ocp4-prod-kv-five-a.yaml
 ```
 
+- **A seed's folder is told apart by its flavor**, `seed`; an MCE's folder holds tenant clusters,
+  never KV clusters.
 - **The zone is read from the file, not from a name.** Under the naming convention no cluster
   name carries a zone. A KV cluster's zone is the `topology.kubernetes.io/zone` its NodePools set
-  on their nodes (`nodeLabels`, convention §4.b), which is in its day1 file. A KV cluster is
-  single-zone (AD8), so every NodePool of the file must name the same zone; a file whose
-  NodePools disagree, or name none, is listed with a problem and never chosen.
+  on their nodes (`nodeLabels`), which the convention requires on every KV NodePool and which is
+  in its day1 file. A KV cluster is single-zone (AD8), so every NodePool of the file must name the
+  same zone; a file whose NodePools disagree, or name none, is listed with a problem and never
+  chosen.
 - **The file's name (without `.yaml`) is the cluster's name everywhere.** It is the queue name and
   the `kvCluster` value the worker is deployed with. Both must be the same string.
 - **Oldest first.** The clusters are sorted by their `id`, the sequence letter the convention ends
@@ -116,6 +122,16 @@ is released, so it does not hold up the zone.
 **A lock that is never released.** Each holder gets the lock for at most **5 minutes**. If the
 run dies or hangs, the lock passes to the next run after that time. A late release from the old
 holder is then ignored.
+
+**A create can never land after the lease.** The lock tells its holder when the lease ends, and
+the run passes that time with its VM create. The cluster's worker creates nothing after it: the
+run fails instead, with nothing created. So a create that was held up (the worker restarting, for
+example) cannot add a VM to a cluster that the next run has already measured without it.
+
+**A waiting run that is gone is skipped at once.** A run can be terminated while it waits, or
+give up after 30 minutes (section 8). When the lock comes to it, the lock notices the run is
+closed and hands the lock to the next run straight away, so a dead waiter costs the zone no time.
+A run that gives up also takes itself out of the line on its way out.
 
 **The cost.** Runs of the same zone choose and create one after another. With several requests
 at once, a run waits behind the ones ahead of it, each a few seconds. Runs in different zones
@@ -158,9 +174,9 @@ sequenceDiagram
 | phase | what happens | sent to |
 | --- | --- | --- |
 | `listing-kv-clusters` | Read the zone's clusters from day1. If there are none, the run fails. | `cluster-lifecycle-worker` |
-| `awaiting-zone-lock` | Wait for the zone's lock. | the zone lock |
+| `awaiting-zone-lock` | Wait for the zone's lock, at most 30 minutes. | the zone lock |
 | `choosing-kv-cluster` | Read each cluster's figures, oldest first, and stop at the first that fits. If none fits, release the lock and fail, listing every cluster and why it was skipped. | each cluster's worker, one after another |
-| `creating-vm` | Send what the VM is: flavor, vCPUs, memory, site, zone, MCE, namespace, and the run's id. The worker draws the MAC, builds the name and the VM, and creates it Halted; a taken MAC is drawn again **by the worker**, at most 3 draws, with no round trip to the hub. | the chosen cluster's worker |
+| `creating-vm` | Send what the VM is: flavor, vCPUs, memory, site, zone, MCE, namespace, the run's id, and the lease's end. The worker draws the MAC, builds the name and the VM, and creates it Halted; a taken MAC is drawn again **by the worker**, at most 3 draws, with no round trip to the hub. After the lease's end it creates nothing. | the chosen cluster's worker |
 | `releasing-zone-lock` | Give the lock back. This happens on every path, success or failure. | the zone lock |
 | `awaiting-root-disk` | Wait until the root disk is ready, up to 10 minutes. | the chosen cluster's worker |
 | `removing-vm` | Only if the disk never became ready: delete the VM, then fail. | the chosen cluster's worker |
@@ -501,9 +517,11 @@ already taken is therefore drawn again inside the cluster, without asking the hu
 | `mce` | `ocp4-prod-mce-five-a` | the request |
 | `namespace` | `inventory` | the request, defaulted at the API (section 11) |
 | `request_id` | the run's workflow id | the run |
+| `create_before` | the lease's end | the zone lock, when it granted the lock |
 
 Everything else is the cluster's: its MAC prefix, and the VM template's values (storage class,
-network, node selector), all in the worker's ConfigMap.
+network, node selector), all in the worker's ConfigMap. The worker refuses a request whose site
+is not its own cluster's (read from its name, `ocp4-<lifecycle>-kv-<site>-<id>`).
 
 ### 7.2 The MAC: half the cluster's, half random
 
@@ -562,13 +580,16 @@ All inside one activity on the chosen cluster, while the run holds the zone's lo
    id. If one exists, an earlier attempt of the same activity created it and its answer was lost
    (a pod restart, a timed-out response); the worker returns that VM and draws nothing. Without
    this step a retry would draw a new MAC, hence a new name, and create a second VM.
-2. **Draw** 3 random bytes, build the MAC and the name.
-3. **Is the MAC taken?** The worker checks it against every VM on its cluster, in every
+2. **Is the lease over?** If `create_before` has passed, the worker creates nothing and the
+   activity fails ("the zone's lease ended before the create"). Step 1 comes first, so a retry
+   still finds the VM it already created, whatever the time.
+3. **Draw** 3 random bytes, build the MAC and the name.
+4. **Is the MAC taken?** The worker checks it against every VM on its cluster, in every
    namespace. The name alone is not enough: Kubernetes refuses a duplicate name only within one
-   namespace. A taken MAC is drawn again (back to 2).
-4. **Create** the VM Halted. If the API answers `AlreadyExists` (a VM of that name appeared),
-   draw again (back to 2).
-5. **At most 3 draws**, then the activity fails with "no free MAC after 3 draws", which fails the
+   namespace. A taken MAC is drawn again (back to 3).
+5. **Create** the VM Halted. If the API answers `AlreadyExists` (a VM of that name appeared),
+   draw again (back to 3).
+6. **At most 3 draws**, then the activity fails with "no free MAC after 3 draws", which fails the
    run after the lock is released.
 
 Because the zone's lock is held, no other run of ours creates a VM on that cluster at the same
@@ -588,6 +609,9 @@ namespace; the run needs the MAC for the BareMetalHost.
 | The MAC or name is already used | The worker draws again by itself, on the same cluster, at most 3 draws in total. The hub is not involved. |
 | The cluster refuses the VM for another reason (namespace missing, invalid request) | The run releases the lock and fails. |
 | The run dies while holding the lock | The lock passes to the next run after 5 minutes. |
+| The create is held up past the lease (the worker restarting) | The worker creates nothing after the lease's end, and the run fails with nothing created. The caller asks again. |
+| A run waits more than 30 minutes for the lock | It gives up, takes itself out of the line, and fails. |
+| A waiting run was terminated | When its turn comes, the lock goes straight to the next run. |
 | The root disk is not ready in 10 minutes | The VM is deleted, and the run fails. |
 | The worker's pod restarts during the create | Temporal retries. The worker finds the VM labelled with the run's id and returns it, and the disk wait resumes its own clock. |
 | The zone lock workflow is restarted | Its line of waiting runs is part of its Temporal state; it carries on where it was. |
@@ -598,14 +622,15 @@ namespace; the run needs the MAC for the BareMetalHost.
 
 All of this happens **when the KV cluster is created**; nothing is set on the hub.
 
-1. **Its day1 file**, in its zone's seed folder, named `ocp4-<lifecycle>-<flavor>-<site>-<id>`. Its
+1. **Its day1 file**, in its zone's seed folder, named `ocp4-<lifecycle>-kv-<site>-<id>`. Its
    name is the cluster's name from then on. Its NodePools set `topology.kubernetes.io/zone` in
    their `nodeLabels`: that is how create-vm knows its zone (section 3). Its `vlanId` is the
    VLAN the Segments Manager allocated to it.
 2. **The `vm-lifecycle-worker` chart** on the cluster, with its ConfigMap holding:
-   - `kvCluster`: exactly the day1 file's name
+   - `kvCluster`: exactly the day1 file's name. The worker reads its site from it.
    - `VM_MAC_PREFIX`: `0e` + the cluster's VLAN ID (section 7.2), computed from the same
-     allocation, never typed in by hand
+     allocation, never typed in by hand. It is the only place the prefix is set; the VLAN ID
+     itself is not stored beside it.
    - the VM template's values: storage class, network, node selector
    - and, beside it, the hub Temporal address and its CA
 3. **Its permissions**, all on its own cluster:
@@ -641,10 +666,9 @@ lab found that otherwise every root disk stays unbound and every run ends in the
 
 ## 11. Known limits and open points
 
-1. **The naming convention is still a draft** and does not name the seed and KV clusters'
-   flavors. This page assumes a seed folder can be told from an MCE's folder in day1 (for
-   example by a `seed` flavor), and that every KV cluster's day1 file labels its NodePools'
-   nodes with their zone. Both need confirming before the listing is built.
+1. **The naming convention is still a draft.** Since 2026-11-19 it reserves the `seed` and `kv`
+   cluster flavors and requires the zone label on every KV NodePool, which is all the listing
+   (section 3) relies on. A change to either would change the listing.
 2. **Memory is `vCPUs × 8` GiB.** The InfraEnv name carries the vCPUs only. If a flavor ever has
    another ratio, the ratio must come from the flavor, not from this rule.
 3. **A VLAN freed by a deleted KV cluster can be given to a new one**, which then gets the old
@@ -652,10 +676,9 @@ lab found that otherwise every root disk stays unbound and every run ends in the
    and Agent records on the MCE.
 4. **Existing KV clusters need their ConfigMap written once** (the same prefix, from their
    VLAN). Until then their worker does not start, and they are skipped as `no-worker`.
-5. **A lock that expires before the VM exists.** If a run holds the lock for more than 5
-   minutes and its VM appears only after that, for example because the cluster's worker
-   restarted during the create, the next run may not see that VM yet. This is rare, and the
-   cluster ends up one VM over its buffer at most.
+5. **A create held up past the lease fails the run.** Closing the overbooking gap (section 4)
+   means a run whose create is delayed more than 5 minutes fails, with nothing created, and the
+   caller must ask again. Under AD29 that caller is add-server-to-mce, which retries the pool.
 6. **Halted VMs are on no node**, so the "one node can hold it" check cannot see them. Ten nodes
    of 64 cores can really run ten 32-vCPU VMs, but a 15% buffer admits more than that. The extra
    VMs would be created and then fail to start.

@@ -36,7 +36,7 @@ vm:
   # VM of the cluster boots on (the site's inventory network). In production:
   #   network:
   #     multus:
-  #       networkName: openshift-cnv/vm-external-network
+  #       networkName: <namespace>/<NetworkAttachmentDefinition>
   # NO default here on purpose: Helm MERGES maps, so a default `multus` would stay
   # beside an override's `pod` and KubeVirt refuses a network of two types (found in
   # the lab, 2026-11-20). The render fails unless exactly one type is given.

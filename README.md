@@ -1091,7 +1091,8 @@ would hide which segments actually got a workflow.
 | `KV_CLUSTER` | `vm-lifecycle-config` (in each KV cluster) | the KV cluster this worker runs in: EXACTLY its day1 file name (`ocp4-<lifecycle>-kv-<site>-<id>`), never abbreviated — it names the queue; the site is read from it |
 | `VM_MAC_PREFIX` | `vm-lifecycle-config` | the first three octets of every MAC this cluster's VMs get: `0e` + the cluster's VLAN ID; required, no default; the worker draws the last three |
 | `VM_STORAGE_CLASS_NAME` | `vm-lifecycle-config` | the root disk's storage class; must bind Immediately and allow RWX + Filesystem |
-| `VM_NETWORK`, `VM_NODE_SELECTOR` | `vm-lifecycle-config` | JSON: the VM's `networks[0]` body and its nodeSelector (`{}` for none) |
+| `VM_NETWORK` | `vm-lifecycle-config` | JSON, REQUIRED, no default: the VM's `networks[0]` body, exactly ONE network type (`{"multus": {"networkName": "<ns>/<name>"}}` or `{"pod": {}}`) |
+| `VM_NODE_SELECTOR` | `vm-lifecycle-config` | JSON: the VM template's nodeSelector (`{}` for none) |
 | `VM_REDFISH_LABEL`, `VM_ROOT_DISK_SIZE` | `vm-lifecycle-config` | `redfish-enabled=true` and `120Gi` by default |
 
 server-scan holds no BMC credentials by design, so those live here; a vendor

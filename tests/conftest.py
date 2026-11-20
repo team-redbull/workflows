@@ -89,5 +89,6 @@ os.environ.update(
         "KV_CLUSTER": "ocp4-prod-kv-five-a",
         "VM_MAC_PREFIX": "0e:03:f2",
         "VM_STORAGE_CLASS_NAME": "test-cephfs",
+        "VM_NETWORK": '{"multus": {"networkName": "inventory/test-network"}}',
     }
 )

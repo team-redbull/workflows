@@ -1075,8 +1075,8 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
     missing is `VmNamespaceNotFoundError`. The cluster's VM values are the worker's own:
     `VM_STORAGE_CLASS_NAME` (REQUIRED: it must bind Immediately and allow ReadWriteMany +
     Filesystem — ceph-rbd refuses that pair, found in the 2026-11-05 lab), `VM_NETWORK`
-    (exactly ONE network type, `multus` or `pod`, checked at worker start; the CHART has no
-    default for `vm.network` and does not render without it — a chart default is MERGED by Helm
+    (REQUIRED, exactly ONE network type, `multus` or `pod`, checked at worker start; neither the
+    settings nor the CHART has a default, and the chart does not render without `vm.network` — a chart default is MERGED by Helm
     with a cluster's own value into a network of two types, which KubeVirt refuses on every
     create: the first run of the 2026-11-20 lab),
     `VM_NODE_SELECTOR`, `VM_REDFISH_LABEL`, and `VM_ROOT_DISK_SIZE` (the lead's, default `120Gi`).
@@ -1766,7 +1766,7 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   worker only; this one is the worker INSIDE a KV cluster and holds only that cluster's own values:
   `KV_CLUSTER`, REQUIRED and NEVER canonicalised — it must equal the day1 file name — parsed at start
   as `ocp4-<lifecycle>-kv-<site>-<id>`, the site read from it; `VM_MAC_PREFIX`, REQUIRED, three
-  octets, the first `0e`, no default; `VM_STORAGE_CLASS_NAME`, REQUIRED; `VM_NETWORK` and
+  octets, the first `0e`, no default; `VM_STORAGE_CLASS_NAME`, REQUIRED; `VM_NETWORK`, REQUIRED, exactly one network type, and
   `VM_NODE_SELECTOR`, JSON; `VM_REDFISH_LABEL`; `VM_ROOT_DISK_SIZE`. No day1 key, no token, no
   buffer since 2026-11-20) and
   `ClusterLifecycleActivitySettings` (`HEADROOM_BUFFER_PERCENT`, create-vm's placement buffer, ONE

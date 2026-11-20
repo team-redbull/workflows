@@ -207,6 +207,14 @@ The lab's day1 (`./day1`, pushed as `redbull/day1`) is what makes the zones:
 | `sites/bat-yam/mces/ocp4-seed-bat-yam-1` (zone az1) | `…-bat-yam-a` … `-c` | three fake clusters of three 64-core nodes |
 | `sites/five/mces/ocp4-prod-mce-five-a` | `ocp4-test-kubevirt-site4` | an ordinary hosted cluster under an MCE: not a KV cluster, whatever its name |
 
+### What of `workers.sh` has run
+
+`up` end to end once on the empty namespace, then `images`, `charts`, `day1` and `apps`
+several times each as the code changed; `status` and `fleet` as written. **`down` was never
+run** (the lab is still standing), so "run it before `lab.sh down`" is the intended order,
+not a tested one. `api` was used from the laptop for the first runs; the later ones were
+started from inside the API pod.
+
 ### What ran, and how it ended
 
 Every run was started through the trigger API and read back from `GET /workflows/runs/<id>`
@@ -238,9 +246,13 @@ and from the cluster.
   went five, five, five and one no capacity, in 24 s. Runs of an earlier attempt were terminated
   by hand while they stood in az2's line: the lock passed the seven it still held over in one
   step.
-- **A node rebooted by itself** (the control-plane node, not the lab's doing) while nothing
-  was in flight; every pod of the lab restarted, the four lock workflows carried on, and the
-  next create on the real cluster completed in 41 s, the next ten on az2 landed as before.
+- **The control-plane node rebooted** (a `Rebooted` event at 13:57 UTC; cause not
+  established — no MachineConfig changed, both pools are on the config of 19 hours before)
+  while no create-vm run was in flight. Every pod of the lab restarted, some after failing
+  to reach the internal registry for a few minutes; the four lock workflows stayed RUNNING,
+  and afterwards a create on the real cluster completed in 41 s and ten on az2 ended eight
+  Completed (`e`–`h`, two each, as the simulator's log shows) and two Failed. Not a test of
+  a reboot UNDER a run: that is the pod kills above and the suite's dead-worker cases.
 - **Seven of these histories are committed as replay goldens**:
   `tests/histories/create_vm/lab-cluster-qcl8n-{create,waited-in-line,no-capacity,cancel,rollback}.json`
   and `tests/histories/kv_zone_lock/lab-cluster-qcl8n-lock-{az1,az2}.json`, worker identities

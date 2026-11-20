@@ -56,8 +56,10 @@ class VmLifecycleActivitySettings(BaseSettings):
     vm_storage_class_name: str
     # The VM's `networks[0]` body, JSON, exactly ONE network type (`multus` or
     # `pod`): the network every VM of the cluster boots on (the site's
-    # inventory network).
-    vm_network: dict = {"multus": {"networkName": "openshift-cnv/vm-external-network"}}
+    # inventory network). REQUIRED, no default: KubeVirt admits a Halted VM on
+    # a network that does not exist, so a default naming another platform's
+    # network would make VMs that never boot, with nothing saying why.
+    vm_network: dict
     # The VM template's nodeSelector, JSON; `{}` for none.
     vm_node_selector: dict[str, str] = {}
     # `key=value`: the label kubevirt-redfish exposes a VM by, and the one the

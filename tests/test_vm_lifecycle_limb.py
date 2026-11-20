@@ -6,7 +6,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from datetime import UTC, datetime, timedelta
+from unittest import mock
 
 import pytest
 from kubernetes import client as k8s_client
@@ -977,9 +979,17 @@ class TestTheActivities:
 
 
 def settings(**overrides) -> VmLifecycleActivitySettings:
-    values = dict(kv_cluster="ocp4-prod-kv-five-a", vm_mac_prefix="0e:03:f2", vm_storage_class_name="cephfs")
+    values = dict(
+        kv_cluster="ocp4-prod-kv-five-a", vm_mac_prefix="0e:03:f2", vm_storage_class_name="cephfs",
+        vm_network={"multus": {"networkName": "inventory/vlan1010"}},
+    )
     values.update(overrides)
-    return VmLifecycleActivitySettings(**values)
+    # pydantic-settings MERGES a dict given here with the same key's dict from the environment
+    # (tests/conftest.py sets VM_NETWORK), which would turn `{"pod": {}}` into a network of two
+    # types. A worker only ever has the environment, so the test takes it away.
+    with mock.patch.dict(os.environ):
+        os.environ.pop("VM_NETWORK", None)
+        return VmLifecycleActivitySettings(**values)
 
 
 class TestSettings:
@@ -997,12 +1007,14 @@ class TestSettings:
         with pytest.raises(ValidationError):
             settings(kv_cluster=name)
 
-    def test_the_three_required_keys_have_no_default(self, monkeypatch):
-        for key in ("KV_CLUSTER", "VM_MAC_PREFIX", "VM_STORAGE_CLASS_NAME"):
+    def test_the_four_required_keys_have_no_default(self, monkeypatch):
+        for key in ("KV_CLUSTER", "VM_MAC_PREFIX", "VM_STORAGE_CLASS_NAME", "VM_NETWORK"):
             monkeypatch.delenv(key)
         with pytest.raises(ValidationError) as raised:
             VmLifecycleActivitySettings()
-        assert {error["loc"][0] for error in raised.value.errors()} == {"kv_cluster", "vm_mac_prefix", "vm_storage_class_name"}
+        assert {error["loc"][0] for error in raised.value.errors()} == {
+            "kv_cluster", "vm_mac_prefix", "vm_storage_class_name", "vm_network",
+        }
 
     @pytest.mark.parametrize(("prefix", "stored"), [("0e:03:f2", "0e:03:f2"), ("0E:00:02", "0e:00:02"), (" 0e:0f:ff ", "0e:0f:ff")])
     def test_the_prefix_is_three_octets_behind_0e(self, prefix, stored):
@@ -1027,7 +1039,6 @@ class TestSettings:
 
     def test_the_defaults_are_the_platforms_vm(self):
         parsed = settings()
-        assert parsed.vm_network == {"multus": {"networkName": "openshift-cnv/vm-external-network"}}
         assert parsed.vm_node_selector == {} and parsed.vm_root_disk_size == "120Gi"
         assert parsed.redfish_label == ("redfish-enabled", "true")
 

@@ -15,6 +15,7 @@ import it too.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 
 MCE_CLUSTER_PREFIX = "ocp4-"
 
@@ -27,26 +28,53 @@ def canonical_mce_cluster(name: str) -> str:
     return f"{MCE_CLUSTER_PREFIX}{name}"
 
 
-# --- the naming convention: MCE -> site, (site, zone) -> seed and KV clusters ----------
+# --- the platform naming convention: clusters, seeds, zones ------------------------------
 #
-# Under the convention an MCE is `ocp4-<env>-mce-<site>-<letter>`
-# (`ocp4-prod-mce-bat-yam-a`): the site is what the MCE's segment, PXE VM and
-# seed cluster are found by. Per zone of a site one SEED cluster,
-# `ocp4-seed-<site>-<zone>`, hosts that zone's KubeVirt clusters, whose names
-# start with `ocp4-kubevirt-<site>-<zone>`. A seed is a "seed", never an
-# "mce": it hosts the platform's own KubeVirt clusters, not clients' clusters.
+# Every cluster is `ocp4-<lifecycle>-<flavor>-<site>-<id>` (`ocp4-prod-mce-five-a`,
+# `ocp4-prod-kv-five-a`): `<id>` is a sequence letter given in creation order, so
+# sorting a flavor's clusters by it is oldest first. Two flavors are reserved:
+# `mce` (an MCE) and `kv` (a KubeVirt cluster, a "KV cluster": the hosted
+# cluster whose nodes run the warm-pool VMs).
+#
+# A zone is `az<N>`. Per zone of a site ONE seed cluster, `ocp4-seed-<site>-<N>`,
+# hosts that zone's KV clusters (decided 2026-11-20: the seed is one per zone
+# and immutable, so its name carries the zone, where a KV cluster's does not).
+# A seed is a "seed", never an "mce": it hosts the platform's own KV clusters,
+# not clients' clusters.
+#
 # Pure, so workflow code may import these too; the tokens are validated so a
 # day1 path built from them can hold no `/`, `..` or glob character.
 
-_MCE = re.compile(r"^ocp4-(?P<env>[a-z0-9]+)-mce-(?P<site>[a-z0-9]+(?:-[a-z0-9]+)*)-(?P<letter>[a-z])$")
+_SITE = r"[a-z0-9]+(?:-[a-z0-9]+)*"
+_MCE = re.compile(rf"^ocp4-(?P<env>[a-z0-9]+)-mce-(?P<site>{_SITE})-(?P<letter>[a-z])$")
+_CLUSTER = re.compile(rf"^ocp4-(?P<lifecycle>[a-z0-9]+)-(?P<flavor>[a-z0-9]+)-(?P<site>{_SITE})-(?P<id>[a-z])$")
+_SEED = re.compile(rf"^ocp4-seed-(?P<site>{_SITE})-(?P<number>[1-9][0-9]*)$")
+_ZONE = re.compile(r"^az(?P<number>[1-9][0-9]*)$")
 _TOKEN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 SEED_CLUSTER_PREFIX = "ocp4-seed-"
-KV_CLUSTER_PREFIX = "ocp4-kubevirt-"
+MCE_FLAVOR = "mce"
+KV_FLAVOR = "kv"
 
 
 class MceNameError(ValueError):
     """The MCE name is not `ocp4-<env>-mce-<site>-<letter>`. A ValueError too, so a
     Pydantic validator turns it into a 422 at the API edge."""
+
+
+class ClusterNameError(ValueError):
+    """The name is not `ocp4-<lifecycle>-<flavor>-<site>-<id>` (or not of the flavor
+    asked for). A ValueError too, so a Pydantic validator turns it into a 422."""
+
+
+@dataclass(frozen=True)
+class ParsedClusterName:
+    """What a cluster name says under the convention."""
+
+    name: str
+    lifecycle: str
+    flavor: str
+    site: str
+    id: str
 
 
 def site_of_mce_cluster(name: str) -> str:
@@ -58,20 +86,60 @@ def site_of_mce_cluster(name: str) -> str:
 
 
 def name_token(value: str, what: str) -> str:
-    """A site or zone token as the convention spells it; refused otherwise (MceNameError)."""
+    """A site token as the convention spells it; refused otherwise (MceNameError)."""
     if not _TOKEN.fullmatch(value):
         raise MceNameError(f"{what} {value!r} must be lowercase letters, digits and single dashes")
     return value
 
 
+def parse_cluster_name(name: str) -> ParsedClusterName:
+    """`ocp4-prod-kv-five-a` -> lifecycle prod, flavor kv, site five, id a.
+
+    The lifecycle and the flavor are one field each and the id one letter, so
+    a site of several fields (`bat-yam`) is everything between them.
+    """
+    match = _CLUSTER.fullmatch(name)
+    if match is None:
+        raise ClusterNameError(f"cluster {name!r} is not named `ocp4-<lifecycle>-<flavor>-<site>-<id>`")
+    return ParsedClusterName(
+        name=name, lifecycle=match.group("lifecycle"), flavor=match.group("flavor"),
+        site=match.group("site"), id=match.group("id"),
+    )
+
+
+def parse_kv_cluster(name: str) -> ParsedClusterName:
+    """A KV cluster's name, `ocp4-<lifecycle>-kv-<site>-<id>`; ClusterNameError for anything else."""
+    parsed = parse_cluster_name(name)
+    if parsed.flavor != KV_FLAVOR:
+        raise ClusterNameError(
+            f"cluster {name!r} is of flavor {parsed.flavor!r}: a KV cluster is `ocp4-<lifecycle>-{KV_FLAVOR}-<site>-<id>`"
+        )
+    return parsed
+
+
+def zone_number(zone: str) -> int:
+    """`az1` -> 1. A zone is `az<N>`, N from 1; anything else is refused (MceNameError)."""
+    match = _ZONE.fullmatch(zone)
+    if match is None:
+        raise MceNameError(f"zone {zone!r} is not `az<N>` (az1, az2, …)")
+    return int(match.group("number"))
+
+
 def seed_cluster(site: str, zone: str) -> str:
-    """`ocp4-seed-<site>-<zone>`: the zone's seed cluster, whose day1 folder lists its KV clusters."""
-    return f"{SEED_CLUSTER_PREFIX}{name_token(site, "site")}-{name_token(zone, "zone")}"
+    """`ocp4-seed-<site>-<N>` for zone `az<N>`: the zone's seed, whose day1 folder lists its KV clusters."""
+    return f"{SEED_CLUSTER_PREFIX}{name_token(site, 'site')}-{zone_number(zone)}"
 
 
-def kv_cluster_prefix(site: str, zone: str) -> str:
-    """`ocp4-kubevirt-<site>-<zone>`: what every KubeVirt cluster of the zone is named after."""
-    return f"{KV_CLUSTER_PREFIX}{name_token(site, "site")}-{name_token(zone, "zone")}"
+def seed_zone(folder: str) -> str | None:
+    """`ocp4-seed-five-1` -> `az1`: the zone of a seed's day1 folder; None for any other folder."""
+    match = _SEED.fullmatch(folder)
+    return f"az{match.group('number')}" if match else None
+
+
+def seed_site(folder: str) -> str | None:
+    """`ocp4-seed-bat-yam-2` -> `bat-yam`: the site a seed's name carries; None for any other folder."""
+    match = _SEED.fullmatch(folder)
+    return match.group("site") if match else None
 
 
 # --- hosted clusters: the day1 file stem and its parts ---------------------------------
@@ -148,19 +216,3 @@ def env_of_mce_folder(mce: str) -> str | None:
     (`ocp4-mce-site2`, `ocp4-mce-site4-prep` carry no environment)."""
     match = _MCE_FOLDER_ENV.match(mce)
     return match.group("env") if match else None
-
-
-def is_kv_cluster_of(name: str, site: str, zone: str) -> bool:
-    """True when `name` is one of (site, zone)'s KubeVirt clusters.
-
-    A prefix match on a VALIDATED name: after `ocp4-kubevirt-<site>-<zone>` the
-    name ends, or goes on with `-` or a digit (`…-a1`, `…-a-1`), so zone `a`
-    never claims zone `ab`'s clusters.
-    """
-    if not _TOKEN.fullmatch(name):
-        return False
-    prefix = kv_cluster_prefix(site, zone)
-    if not name.startswith(prefix):
-        return False
-    rest = name[len(prefix):]
-    return rest == "" or rest[0] == "-" or rest[0].isdigit()

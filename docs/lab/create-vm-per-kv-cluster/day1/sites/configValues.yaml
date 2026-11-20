@@ -1,0 +1,4 @@
+# The lab's mock of the day1 values repo (gitops-day1/platform-config): only what
+# create-vm reads. Every KV cluster is a file under its zone's seed folder,
+# sites/<site>/mces/ocp4-seed-<site>-<zone number>/hostedClusters/<kv cluster>.yaml
+mastertag: 4.19.1

@@ -1,0 +1,7 @@
+# A KV cluster of zone az2 (mock: only the NodePools' zone label is read).
+mastertag: 4.19.1
+nodepool:
+  - name: workers
+    replicas: 3
+    nodeLabels:
+      topology.kubernetes.io/zone: "az2"

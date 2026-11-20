@@ -1,0 +1,48 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: lab-create-vm-vm-lifecycle-worker-i
+  namespace: openshift-gitops
+  labels:
+    redbull.io/lab: create-vm
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: lab-create-vm
+  source:
+    repoURL: http://gitea-http.lab-git.svc.cluster.local:3000/redbull/platform.git
+    targetRevision: main
+    path: gitops/charts/vm-lifecycle-worker
+    helm:
+      releaseName: vm-lifecycle-worker-i
+      valuesObject:
+        # The same real cluster under a second name (zone az3), on a WaitForFirstConsumer class: a Halted VM's disk never binds there, which is the rollback scenario.
+        kvCluster: ocp4-lab-kv-five-i
+        config:
+          vmMacPrefix: "0e:00:64"
+        vm:
+          storageClassName: ocs-external-storagecluster-ceph-rbd
+          # The pod network: this cluster has no VM bridge network. Bridge binding on it is admitted.
+          network:
+            pod: {}
+          rootDiskSize: 2Gi
+        replicaCount: 1
+        image:
+          repository: image-registry.openshift-image-registry.svc:5000/redbull-workflows/vm-lifecycle-worker
+          tag: lab
+          pullPolicy: Always
+        temporal:
+          host: temporal-frontend.temporal.svc.cluster.local:7233
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: redbull-workflows
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    retry:
+      limit: 10
+      backoff:
+        duration: 15s
+        factor: 2
+        maxDuration: 5m

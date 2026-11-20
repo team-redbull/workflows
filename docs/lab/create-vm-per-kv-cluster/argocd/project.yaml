@@ -1,0 +1,24 @@
+# The lab's own AppProject. Nothing here edits `default` (the workshop's Applications
+# live there). Sources: the in-cluster Gitea and the one public chart that deploys it.
+# Destinations and kinds are open on THIS cluster only, as the platform repo's
+# `redbull-platform` project is, so the workers' Applications can be added later
+# without a project change.
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: lab-create-vm
+  namespace: openshift-gitops
+  labels:
+    redbull.io/lab: create-vm
+spec:
+  description: create-vm end-to-end lab (docs/lab/create-vm-per-kv-cluster in the workflows repo)
+  sourceRepos:
+    # `**`: a project glob's `*` stops at a `/`, and a repo is <owner>/<repo>.git.
+    - http://gitea-http.lab-git.svc.cluster.local:3000/**
+    - https://dl.gitea.com/charts/
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: "*"
+  clusterResourceWhitelist:
+    - group: "*"
+      kind: "*"

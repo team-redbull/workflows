@@ -1,0 +1,47 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: lab-create-vm-cluster-lifecycle-worker
+  namespace: openshift-gitops
+  labels:
+    redbull.io/lab: create-vm
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: lab-create-vm
+  source:
+    repoURL: http://gitea-http.lab-git.svc.cluster.local:3000/redbull/platform.git
+    targetRevision: main
+    path: gitops/charts/cluster-lifecycle-worker
+    helm:
+      releaseName: cluster-lifecycle-worker
+      valuesObject:
+        # The hub limb that reads day1 for create-vm (list_kv_clusters) and hands it the buffer.
+        # day1 is the lab's mock in Gitea (https Route: the limb injects its token into https
+        # URLs only). provision-cluster's own keys get placeholders: it is not run here.
+        config:
+          day1RepoUrl: https://gitea-lab-git.apps.cluster-qcl8n.dyn.redhatworkshops.io/redbull/day1.git
+          day2SigRepoUrlTemplate: https://gitea-lab-git.apps.cluster-qcl8n.dyn.redhatworkshops.io/redbull/sig-{sig}.git
+          shortcutsApiUrl: https://shortcuts.invalid
+          shortcutOwner: lab
+          clusterConsoleUrlTemplate: https://console.{cluster}.invalid
+          headroomBufferPercent: 15
+        activityWorker:
+          image:
+            repository: image-registry.openshift-image-registry.svc:5000/redbull-workflows/cluster-lifecycle-worker
+            tag: lab
+            pullPolicy: Always
+          replicas: 1
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: redbull-workflows
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    retry:
+      limit: 10
+      backoff:
+        duration: 15s
+        factor: 2
+        maxDuration: 5m

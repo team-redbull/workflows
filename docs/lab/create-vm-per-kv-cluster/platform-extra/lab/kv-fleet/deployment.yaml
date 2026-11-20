@@ -1,0 +1,49 @@
+# The lab's FAKE KV clusters: zone az2 of site five (four clusters of one 100-core node)
+# and zone az1 of site bat-yam (three clusters of three 64-core nodes), as ./day1 lists
+# them. One pod; every fake cluster has its own worker on its own queue inside it.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kv-fleet
+  namespace: redbull-workflows
+  labels:
+    app: kv-fleet
+    redbull.io/lab: create-vm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kv-fleet
+  template:
+    metadata:
+      labels:
+        app: kv-fleet
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: kv-fleet
+          image: image-registry.openshift-image-registry.svc:5000/redbull-workflows/kv-fleet:lab
+          imagePullPolicy: Always
+          args:
+            - --temporal=temporal-frontend.temporal.svc.cluster.local:7233
+            - --cluster=ocp4-lab-kv-five-e:100:1024
+            - --cluster=ocp4-lab-kv-five-f:100:1024
+            - --cluster=ocp4-lab-kv-five-g:100:1024
+            - --cluster=ocp4-lab-kv-five-h:100:1024
+            - --cluster=ocp4-lab-kv-bat-yam-a:64:512:3
+            - --cluster=ocp4-lab-kv-bat-yam-b:64:512:3
+            - --cluster=ocp4-lab-kv-bat-yam-c:64:512:3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault

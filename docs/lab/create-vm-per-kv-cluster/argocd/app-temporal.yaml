@@ -1,0 +1,92 @@
+# Temporal (frontend/history/matching/worker + UI + its PostgreSQL), from the platform
+# repo's own chart, gitops/charts/temporal at redbull-platform origin/main 203bbf3,
+# byte-identical in the lab repo. Release name `temporal`, as the platform's
+# ApplicationSet gives it, so every resource and DNS name is the platform's.
+#
+# In-cluster gRPC:  temporal-frontend.temporal.svc.cluster.local:7233   (namespace `default`)
+# UI:               oc -n temporal port-forward svc/temporal-ui 8080:8080
+#
+# The overrides, and why:
+#   ui.auth.enabled=false   the chart allowlists the platform's `ocpadmin` and renders a
+#                           random cookie Secret on every Argo CD render (its README) —
+#                           the Application would never settle.
+#   ui.route.enabled=false  with no login in front, a Route on a public workshop domain
+#                           would let anyone start or terminate workflows.
+#   postgresql.global.compatibility.openshift.adaptSecurityContext=force
+#                           the chart's `auto` asks Helm whether the cluster serves
+#                           security.openshift.io/v1. Argo CD answers from its cluster
+#                           cache, and this cluster's controller built that cache while
+#                           the aggregated APIs were still stale after a resume (its log:
+#                           "Partial success when performing preferred resource discovery
+#                           … stale GroupVersion discovery"), so the group is missing, the
+#                           pod kept runAsUser/fsGroup 1001 and restricted-v2 refused it.
+#                           `force` strips them whatever the cache holds.
+#   temporal.services.*.replicaCount=1  and  postgresql max_connections=200
+#                           the chart's eight server pods (two per role) each pool up to
+#                           20 connections per store, against PostgreSQL's default 100:
+#                           within fifteen minutes all 100 were held, and PostgreSQL
+#                           refused 321 connections in the next thirty ("sorry, too many
+#                           clients already"), a superuser's psql included. One pod per
+#                           role is 4 x 40 = 160 at the very worst, under 200 — and four
+#                           pods fewer on a control-plane node that is short of disk.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: lab-create-vm-temporal
+  namespace: openshift-gitops
+  labels:
+    redbull.io/lab: create-vm
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: lab-create-vm
+  source:
+    repoURL: http://gitea-http.lab-git.svc.cluster.local:3000/redbull/platform.git
+    targetRevision: main
+    path: gitops/charts/temporal
+    helm:
+      releaseName: temporal
+      valuesObject:
+        ui:
+          auth:
+            enabled: false
+          route:
+            enabled: false
+        temporal:
+          services:
+            frontend:
+              replicaCount: 1
+            history:
+              replicaCount: 1
+            matching:
+              replicaCount: 1
+            worker:
+              replicaCount: 1
+        postgresql:
+          global:
+            compatibility:
+              openshift:
+                adaptSecurityContext: force
+          primary:
+            extendedConfiguration: |
+              max_connections = 200
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: temporal
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    # The platform pre-creates namespaces with its `namespaces` Helmfile release; the lab
+    # has no Helmfile layer, so Argo CD creates (and labels) the namespace instead.
+    managedNamespaceMetadata:
+      labels:
+        redbull.io/lab: create-vm
+    syncOptions:
+      - CreateNamespace=true
+    retry:
+      limit: 10
+      backoff:
+        duration: 15s
+        factor: 2
+        maxDuration: 5m

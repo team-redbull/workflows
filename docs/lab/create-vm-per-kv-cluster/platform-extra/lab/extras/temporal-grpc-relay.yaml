@@ -1,0 +1,56 @@
+# A TCP relay in front of the Temporal frontend, for the LAPTOP only.
+#
+# `oc port-forward` dials localhost inside the pod, and the platform chart's frontend
+# binds its gRPC port on the POD IP only (BIND_ON_IP), so a port-forward to
+# svc/temporal-frontend is refused ("dial tcp [::1]:7233: connect: connection refused").
+# This pod listens on every address and forwards to the frontend Service:
+#
+#   oc -n temporal port-forward deploy/temporal-grpc-relay 7233:7233
+#   temporal operator namespace describe -n default --address 127.0.0.1:7233
+#
+# In-cluster clients do NOT use it: temporal-frontend.temporal.svc.cluster.local:7233.
+# The image is the cluster's own `tools` (socat), from the internal registry.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: temporal-grpc-relay
+  namespace: temporal
+  labels:
+    redbull.io/lab: create-vm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: temporal-grpc-relay
+  template:
+    metadata:
+      labels:
+        app: temporal-grpc-relay
+        redbull.io/lab: create-vm
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: relay
+          image: image-registry.openshift-image-registry.svc:5000/openshift/tools:latest
+          command:
+            - socat
+            - TCP-LISTEN:7233,fork,reuseaddr
+            - TCP:temporal-frontend.temporal.svc.cluster.local:7233
+          ports:
+            - name: grpc
+              containerPort: 7233
+          readinessProbe:
+            tcpSocket:
+              port: grpc
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits: { cpu: 200m, memory: 64Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]

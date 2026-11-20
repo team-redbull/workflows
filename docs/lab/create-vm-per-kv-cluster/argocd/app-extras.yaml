@@ -1,0 +1,30 @@
+# What the lab adds that no platform chart owns — plain manifests, lab/extras/ in the lab
+# repo (platform-extra/lab/extras/ in this folder):
+#   - Namespace `inventory`, where create-vm puts its VMs
+#   - Deployment temporal/temporal-grpc-relay, the laptop's way to the Temporal frontend
+# No prune and no finalizer on purpose: `inventory` is kept across test runs, and removing
+# this Application must not take the namespace (and every VM in it) with it.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: lab-create-vm-extras
+  namespace: openshift-gitops
+  labels:
+    redbull.io/lab: create-vm
+spec:
+  project: lab-create-vm
+  source:
+    repoURL: http://gitea-http.lab-git.svc.cluster.local:3000/redbull/platform.git
+    targetRevision: main
+    path: lab/extras
+  destination:
+    server: https://kubernetes.default.svc
+  syncPolicy:
+    automated:
+      selfHeal: true
+    retry:
+      limit: 10
+      backoff:
+        duration: 15s
+        factor: 2
+        maxDuration: 5m

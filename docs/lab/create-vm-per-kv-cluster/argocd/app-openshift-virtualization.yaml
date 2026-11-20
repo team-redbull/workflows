@@ -1,0 +1,77 @@
+# OpenShift Virtualization (CNV): the OLM install and the HyperConverged, from the
+# platform repo's own chart, gitops/charts/openshift-virtualization at redbull-platform
+# origin/main 203bbf3, byte-identical in the lab repo.
+#
+# The three overrides, and why:
+#   operator-olm.subscription.source=redhat-operators
+#       the chart resolves from the air-gap's mirrored `generic-cs` catalog; this cluster
+#       is connected and `redhat-operators` carries kubevirt-hyperconverged (stable).
+#   operator-olm.operatorGroup.name=openshift-cnv-og
+#       the WORKSHOP's own `kubevirt` Application (OutOfSync, untouched) would create an
+#       OperatorGroup of that name in openshift-cnv if it ever synced. A second
+#       OperatorGroup in a namespace is TooManyOperatorGroups and breaks every CSV there;
+#       the same name is one shared object. The Subscription and the HyperConverged
+#       already share the workshop's names (both are fixed: the OLM package name, and the
+#       only name HCO accepts).
+#   vmBridge.enabled=false
+#       the NNCP enslaves `bond0` on every worker and needs kubernetes-nmstate; this
+#       cluster has neither, and create-vm's Halted VMs attach to the pod network.
+#
+# Plus one `ignoreDifferences`: the chart's HyperConverged sets
+# `featureGates.disableMdevConfiguration: false`, a gate HCO 4.22.16 no longer has. The
+# API server prunes the field on every apply, so the live object never shows it, the
+# Application stays OutOfSync and selfHeal re-applies it every few seconds for ever
+# (96 syncs in the lab's first ten minutes). Nothing is lost by ignoring it.
+#
+# And ONE patch to the chart itself, made by lab.sh when it builds the lab repo:
+# `uninstallStrategy: BlockUninstallIfWorkloadExist` -> `...WorkloadsExist` (lab.sh says why).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: lab-create-vm-openshift-virtualization
+  namespace: openshift-gitops
+  labels:
+    redbull.io/lab: create-vm
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: lab-create-vm
+  source:
+    repoURL: http://gitea-http.lab-git.svc.cluster.local:3000/redbull/platform.git
+    targetRevision: main
+    path: gitops/charts/openshift-virtualization
+    helm:
+      releaseName: openshift-virtualization
+      valuesObject:
+        operator-olm:
+          subscription:
+            source: redhat-operators
+          operatorGroup:
+            name: openshift-cnv-og
+        vmBridge:
+          enabled: false
+  ignoreDifferences:
+    - group: hco.kubevirt.io
+      kind: HyperConverged
+      jsonPointers:
+        - /spec/featureGates/disableMdevConfiguration
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: openshift-cnv
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    # The platform pre-creates namespaces with its `namespaces` Helmfile release; the lab
+    # has no Helmfile layer, so Argo CD creates (and labels) the namespace instead.
+    managedNamespaceMetadata:
+      labels:
+        redbull.io/lab: create-vm
+    syncOptions:
+      - CreateNamespace=true
+    retry:
+      limit: 10
+      backoff:
+        duration: 15s
+        factor: 2
+        maxDuration: 5m

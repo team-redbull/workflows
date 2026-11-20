@@ -232,6 +232,12 @@ and from the cluster.
   eight `NoKvClusterFitsError`, each naming `a` as `fit-buffer`, `b` as `no-worker`, and the
   two day1 problems. 248 s for all ten, because every run waits 30 s for `b`'s worker that
   does not exist, one run at a time. The zone's lock granted twelve times, no lease expired.
+- **How long a run holds its zone** (from the committed histories): 0.3 s when the first
+  cluster it reads fits (figures 0.1 s, create 0.1 s), and 30 s MORE for every cluster ahead
+  of the fitting one that is in day1 with no worker. So a burst is cheap on a healthy zone
+  and slow behind a dead one: at 30 s a run, about sixty runs get through one zone inside
+  the 30-minute lock wait and the rest fail `KvZoneLockTimeoutError`. A cluster in day1
+  without a running worker is worth fixing, or taking out of day1, before a large `count`.
 - **The worker pod killed during the disk wait**: the run waited for the new pod and
   completed. **The brain pod killed mid-run**: completed. **Temporal's frontend and history
   pods killed mid-run**: completed.

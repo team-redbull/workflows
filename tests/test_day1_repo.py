@@ -284,6 +284,24 @@ class TestTheZoneOfAKvCluster:
             f"{by_folder.path}: seed folder ocp4-seed-five-3 is named for site 'five', but is under sites/bat-yam"
         ]
 
+    def test_a_zones_order_does_not_depend_on_which_seed_folder_a_file_is_in(self, tmp_path):
+        """Two seed folders of one zone under a site (one named for another site): still oldest first."""
+        _write(tmp_path, {
+            _hc("five", "ocp4-seed-five-1", "ocp4-prod-kv-five-b"): _nodepools("az1"),
+            _hc("five", "ocp4-seed-bat-yam-1", "ocp4-prod-kv-five-a"): _nodepools("az1"),
+            _hc("five", "ocp4-seed-five-1", "ocp4-prod-kv-five-c"): _nodepools("az1"),
+            _hc("five", "ocp4-seed-five-2", "ocp4-prod-kv-five-a"): _nodepools("az2"),
+            _hc("five", "ocp4-zzz-mce-five-a", "ocp4-prod-iac-five-a"): "mastertag: 4.19.1\n",
+        })
+        day1 = Day1(tmp_path, revision=REVISION)
+        assert [(r.id, r.folder) for r in day1.kv_clusters("five", "az1")] == [
+            ("a", "ocp4-seed-bat-yam-1"), ("b", "ocp4-seed-five-1"), ("c", "ocp4-seed-five-1"),
+        ]
+        # A site's hosted clusters first, then its KV clusters zone by zone.
+        assert [(r.kind, r.zone, r.id) for r in day1.clusters(site="five")] == [
+            ("hc", None, None), ("kv", "az1", "a"), ("kv", "az1", "b"), ("kv", "az1", "c"), ("kv", "az2", "a"),
+        ]
+
     def test_a_site_with_dashes(self, day1):
         records = day1.kv_clusters(site="bat-yam", zone="az1")
         assert [(r.name, r.site, r.zone, r.id, r.problems) for r in records] == [
@@ -339,6 +357,17 @@ class TestTheRecord:
         _write(tmp_path, {_hc("five", "ocp4-prod-mce-five-a", "ocp4-prod-iac-five-a"): "mastertag: 1\nmastertag: 2\n"})
         assert "written twice" in day1.cluster("ocp4-prod-iac-five-a").problems[0]
 
+    def test_one_unreadable_or_nameless_file_is_a_problem_of_that_record_not_a_failed_listing(self, day1, tmp_path):
+        folder = tmp_path / "sites/five/mces/ocp4-prod-mce-five-a/hostedClusters"
+        (folder / "ocp4-prod-bin-five-a.yaml").write_bytes(b"mastertag: \xff\xfe\n")
+        (folder / "ocp4-.yaml").write_text("mastertag: 4.19.1\n")
+        by_name = {record.name: record for record in day1.hosted_clusters(site="five")}
+        assert len(by_name) == 6
+        assert "not UTF-8 text" in by_name["ocp4-prod-bin-five-a"].problems[0]
+        nameless = by_name["ocp4-"]
+        assert nameless.cluster_name == "" and "no clusterName" in nameless.problems[0]
+        assert by_name["ocp4-prod-iac-five-a"].problems == []
+
     def test_values_are_the_merged_layers(self, day1):
         record = day1.cluster("ocp4-prod-iac-five-a")
         values = day1.values(record.path)
@@ -365,6 +394,8 @@ class TestFindingByName:
 
     def test_the_folders_of_a_name_and_the_sites(self, day1, tmp_path):
         assert day1.sites() == ["bat-yam", "five"]
+        for not_a_site in ("../five", "five/mces/ocp4-mce-site2", "five/..", "nowhere", "*", ""):
+            assert day1.folders(not_a_site) == []
         assert day1.folders("bat-yam") == [
             "ocp4-prep-mce-bat-yam-a", "ocp4-prep-mce-bat-yam-b", "ocp4-seed-bat-yam-1", "ocp4-seed-five-3",
         ]

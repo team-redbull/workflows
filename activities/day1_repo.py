@@ -252,7 +252,13 @@ def load_cluster_values(root: Path, path: str, *, text: str | None = None) -> Cl
             file = root / layer
             if not file.is_file():
                 continue
-            content = file.read_text(encoding="utf-8")
+            try:
+                content = file.read_text(encoding="utf-8")
+            except UnicodeDecodeError as err:
+                # A problem of that file, never an exception: one unreadable
+                # file must not fail a listing of every cluster around it.
+                problems.append(f"{layer}: not UTF-8 text ({err.reason} at byte {err.start})")
+                content = ""
         data, found = load_yaml(content, layer)
         problems += found
         if data is None:
@@ -361,8 +367,12 @@ def check_filters(*, site: str | None = None, env: str | None = None, kind: str 
 
 
 def _order(record: ClusterRecord) -> tuple:
-    """Site, folder, then oldest first: the id letter, a name without one last, ties by name."""
-    return (record.site, record.folder, record.id is None, record.id or "", record.name)
+    """Site; its hosted clusters by folder and name; then its KV clusters by zone, oldest first:
+    the id letter, a name without one last, ties by name. A zone's order never depends on
+    which folder a file is in (a seed folder named for another site is still that zone's)."""
+    if record.zone is None:
+        return (record.site, 0, record.folder, True, "", record.name)
+    return (record.site, zone_number(record.zone), "", record.id is None, record.id or "", record.name)
 
 
 @dataclass(frozen=True)
@@ -384,8 +394,9 @@ class Day1:
         return self._folders_of(self.root / SITES)
 
     def folders(self, site: str) -> list[str]:
-        """Every MCE and seed folder of a site (one of `sites()`), sorted."""
-        return self._folders_of(self.root / SITES / site / MCES)
+        """Every MCE and seed folder of a site, sorted; [] for a name that is not one of `sites()`
+        (compared, so nothing a caller passes is ever joined into a path)."""
+        return self._folders_of(self.root / SITES / site / MCES) if site in self.sites() else []
 
     @staticmethod
     def _folders_of(parent: Path) -> list[str]:
@@ -402,8 +413,9 @@ class Day1:
     ) -> list[ClusterRecord]:
         """Every hosted cluster the filters keep. Every other query is this one, filtered.
 
-        Sorted by site, folder, then oldest first (the id letter, a name
-        without one last, ties by name). A filter naming nothing in day1 is an
+        Sorted by site; within it the hosted clusters by folder and name, then
+        the KV clusters by zone, oldest first (the id letter, a name without
+        one last, ties by name). A filter naming nothing in day1 is an
         empty list; a `site`, `env` or `zone` that is not a token of the naming
         convention, or an unknown `kind`, is refused (ValueError) before any
         folder is read. `zone` keeps the clusters under that zone's seed, so
@@ -494,6 +506,8 @@ class Day1:
                 if parsed.site != site:
                     problems.append(f"{path}: the name says site {parsed.site!r}, but the file is under {SITES}/{site}")
             problems += _zone_problems(values.merged, zone, path)
+        if not values.cluster_name:
+            problems.append(f"{path}: no clusterName in the file and none left in its name")
         return ClusterRecord(
             name=name,
             site=site,

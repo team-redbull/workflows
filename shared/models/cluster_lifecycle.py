@@ -282,17 +282,20 @@ class Day1ClusterEntry(BaseModel):
     env: str | None = None
     zone: str | None = None
     id: str | None = None
-    cluster_name: str = Field(min_length=1)
-    hosted_cluster: str = Field(min_length=1)
-    hosted_cluster_namespace: str = Field(min_length=1)
+    # No minimum length: a file whose name leaves no clusterName is LISTED with
+    # that problem, never an answer that fails to build for every other cluster.
+    cluster_name: str
+    hosted_cluster: str
+    hosted_cluster_namespace: str
     path: str = Field(min_length=1)
     problems: list[str] = Field(default_factory=list)
 
 
 class Day1ClusterList(BaseModel):
-    """Answer of list_day1_clusters: the clusters the query kept, sorted by site, folder,
-    then oldest first (the id letter, a name without one last, ties by name), and
-    `revision`, the day1 `main` commit all of it was read at."""
+    """Answer of list_day1_clusters: the clusters the query kept and `revision`, the day1
+    `main` commit all of it was read at. Sorted by site; within it the hosted
+    clusters by folder and name, then the KV clusters by zone, oldest first (the
+    id letter, a name without one last, ties by name)."""
 
     clusters: list[Day1ClusterEntry] = Field(default_factory=list)
     revision: str = Field(min_length=1)

@@ -25,12 +25,29 @@ FAILS the test instead of hanging it. Pin:
 6. Updates: the validator refuses with a 409-shaped error when the run is not waiting;
 7. waits: what the run does at its deadline; stops: nothing acts after a stop flag.
 
+### A fleet, a lock, a long-lived workflow
+
+When the workflow reaches many clusters, copy `tests/kv_fleet.py` rather than mocking
+activities one by one: an in-memory API per fake cluster with the surface of the limb's
+technology module, one Worker per cluster queue running the REAL limb code, and knobs to
+make any call fail or hang and to take a worker away. A thing created there is on the
+next read, which is what the workflow's logic stands on.
+
+When any workflow of the test is long-lived or idle (a lock), or a task is left unserved
+on purpose (a dead queue), use `tests/manual_time.py` instead of awaiting results on the
+time-skipping server: automatic skipping is off, `advance(duration)` jumps the clock
+exactly (releasing one more of the server's time-skipping locks per outstanding task),
+and `results(...)` waits for runs while nudging the clock. Keep the production
+constants; shrink them (unsandboxed runner + `monkeypatch`) only where many runs wait on
+unserved tasks at once.
+
 ## Replay tests: `tests/test_<workflow>_replay.py`
 
 Histories recorded from scenarios replay with `temporalio.worker.Replayer`, and the
 GOLDEN histories under `tests/histories/<workflow>/` replay on the current code. Add a
 golden once a workflow ships. A failing golden means `workflow.patched()`, never a
-re-record (see modify-workflow.md).
+re-record (see modify-workflow.md). Record with the production constants: a workflow
+whose flow depends on a constant does not replay a history recorded with it patched.
 
 ## Activity and technology-module tests
 

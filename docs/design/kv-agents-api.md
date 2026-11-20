@@ -1,5 +1,11 @@
 # The KubeVirt clusters' agents — kv-capacity and kv-vm-api
 
+> **SUPERSEDED, 2026-11-20.** The two agents (`kv-capacity`, `kv-vm-api`) ran only in the
+> 2026-11-05 lab and are not part of create-vm: a `vm-lifecycle-worker` inside each KV cluster reads its
+> figures and creates the VM with its own ServiceAccount. The design is
+> `create-vm-placement.md`, next to this file. The limb modules, the vendored contract and
+> `tests/test_kv_agents_contract.py` named below are gone. Kept as a record only.
+
 Status: **contract fixed 2026-11-05, with create-vm; the agents' repo
 (`team-redbull/kv-agents`) is to be created.** This page is what the
 vm-lifecycle limb (`activities/vm_lifecycle/kv_capacity_api.py`,

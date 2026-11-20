@@ -15,8 +15,9 @@ The typed API between brain and limbs. Rationale: CLAUDE.md §1, §2, §5, §8. 
   docstring (what, idempotency, classified errors), `...`. [IF001-IF004]
 - **`consts.py`**: `<NAME>_WORKFLOW_QUEUE = "<name>-workflow"` per workflow;
   `<LIMB>_ACTIVITY_QUEUE = "<limb>-activity"` per hub limb or a
-  `<limb>_activity_queue(mce)` builder per per-MCE limb; `LEGACY_*` queues only while
-  old runs replay. [SH003]
+  `<limb>_activity_queue(mce)` builder per per-MCE limb (per KV cluster:
+  `vm_lifecycle_activity_queue(kv_cluster)`); `LEGACY_*` queues only while old runs
+  replay. [SH003]
 - **`workflow_ids.py`**: one `<name>_workflow_id(...)` per scheme, carrying every
   dimension that scopes a run. Routers and workflows both import it. [SH004]
 - **`exceptions.py`**: `OrchestratorError` subclasses whose docstring says

@@ -79,7 +79,8 @@
             <h3>inspect_cluster_target</h3>
             <span class="phase">phase <b>inspecting-target</b></span>
           </div>
-          <p>A fresh clone of day1 <code>main</code>. The MCE folder is found <b>by name</b> among
+          <p>A read of day1 <code>main</code> on its cached snapshot (the remote is asked for its head every
+          time; a clone happens only when the head moved). The MCE folder is found <b>by name</b> among
           <code>sites/*/mces/</code> — iterated, never globbed with your input, because real folders
           (<code>ocp4-mce-site2</code>, <code>ocp4-mce-site4-prep</code>) follow no convention a parser could
           trust. Exactly one site must hold it. The cluster must have <em>no file there yet</em>: this workflow
@@ -91,7 +92,7 @@
           file name derives; config names must be DNS-1123 labels; no key written twice. A nodepool without
           <code>configs</code> is fine (a KubeVirt pool has none). <b>Every reason lands in one failure</b>.</p>
           <div class="calls">
-            <div class="call nxt"><span class="verb">GIT</span><span class="path">clone --depth 1 --branch main <em>· fresh temp clone, always discarded</em></span></div>
+            <div class="call nxt"><span class="verb">GIT</span><span class="path">ls-remote refs/heads/main → the cached snapshot of that commit <em>· clone --depth 1 only when main moved; read-only</em></span></div>
           </div>
           <p class="note">Also derived here: the config names (for the merge request's description), the day2 sigs the
           value layers list under <code>day2.copy_to_sigs</code>, and their environment folder (<code>day2.env</code>,

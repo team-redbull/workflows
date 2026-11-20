@@ -34,6 +34,13 @@ procedure for new or running workflows is the `redbull-workflows` skill.
 - **People decide through Updates with validators**, code stops a child through signals,
   and a stop flag is checked before every act (`_checkpoint()`), because cancellation
   does not stop work in flight (§5).
+- **Runs that must not act at once take a lock workflow** (`vm_lifecycle/kv_zone_lock.py`,
+  §5): it holds only the line and a lease, is asked by start-child-or-signal, knows a
+  run by its RUN id, skips a waiter that is gone, never fails and calls no activity.
+- **An exit path that awaits** (a cancel rollback, a signal, `all_handlers_finished`)
+  runs only for a real cancel — `workflow.in_workflow() and
+  workflow.cancellation_reason() is not None` — or an ordinary `Exception`; never in a
+  bare `finally`: a cache eviction cancels the tasks too, and may call no workflow API (§5).
 - **Progress**: `self._phase` and `@workflow.query def progress`. [WF014]
 - **Logging**: `workflow.logger` only. [WF013]
 - **Verify after mutate**: read back before recording; strict, absolute checks (§6, §7).

@@ -600,3 +600,18 @@ lab found that otherwise every root disk stays unbound and every run ends in the
 10. **Making the new VM installable is not part of this design.** Under AD29, add-server-to-mce
     runs create-vm as a child for a VM InfraEnv and then installs exactly that VM; that branch
     is add-server-to-mce's, not this page's.
+
+## As implemented (2026-11-20)
+
+Implemented on branch `feat/vm-lifecycle-per-kv-cluster`. The sections above are the design as
+reviewed; the code differs in these points. The full list, with what was added beyond the
+design, ends `create-vm-placement-plan.md`; the current description is
+`docs/site/vm-lifecycle/create-vm.html`.
+
+| Section | The design says | The code does |
+|---|---|---|
+| 7.1, 7.4, 7.5 | `request_id` is the run's workflow id; `redbull.io/created-by` carries it | Both carry the RUN id. A create-vm workflow id is a slot the next run reuses, so a VM keyed on it would be taken by the slot's next run as its own. The workflow id is the VM's annotation `redbull.io/workflow-id`. |
+| 7.2 | The `0e` prefix keeps clear of KubeMacPool's range | Unchanged, and uniqueness does NOT depend on KubeMacPool at all (the operator, 2026-11-20: the KV clusters will run upstream KubeVirt). The worker lists the cluster's VMs and compares MACs before every draw; a duplicate it is told of by the API afterwards only draws again. |
+| 7.5 | A retried create finds its own VM | And a create that finds TWO VMs of its request keeps the oldest and deletes the other. An attempt ends inside its timeout, and one reaching the worker after `create_before` is refused. |
+| 8 | A failed run leaves no VM | A CANCELLED run leaves none either: it deletes the VM carrying its run id, then leaves the line or releases the lock. A terminated run runs no code and can leave one, found by its label. |
+| 4 | The lock's lease | A run takes at most three leases for one placement, then fails `KvZoneLeaseExpiredError`. |

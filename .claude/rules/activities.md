@@ -46,7 +46,8 @@ CLAUDE.md §1, §2, §5, §6, §7. Checker ids in brackets.
 - **Settings**: `<Limb>ActivitySettings()` at module level (fail-fast). A new key goes in
   the limb's OWN module `shared/settings/<limb>.py` (imported from that module, never from
   the package), `.env.example`, `tests/conftest.py` and the chart, which ships first.
-- **RBAC** (per-MCE limbs): a new verb or resource is a row in the chart README's table.
+- **RBAC** (per-MCE and per-KV-cluster limbs): a new verb or resource is a row in the chart
+  README's table and a rule in the chart's `rbac.yaml`, each from a call in the code.
 - **Dependencies** go in this limb's `requirements.txt` and Dockerfile, never in `shared/`.
 - **Docs in the same change**: the page of every workflow that calls the activity
   (dependencies and failures sections), the chart README, CLAUDE.md §4 for a new dependency.

@@ -1,5 +1,11 @@
 # Lab: create-vm end to end on one OpenShift Virtualization cluster
 
+> **STALE, 2026-11-20.** This is the lab of 2026-11-05, for the design with two agents per KV
+> cluster and one hub limb. That design was replaced (`docs/design/create-vm-placement.md`);
+> the scripts and charts here no longer match the code. The lab for the current design is
+> `docs/lab/create-vm-per-kv-cluster/`. Kept for what it measured (the launcher pod's
+> overhead, the cephfs storage class).
+
 ## Purpose
 
 Prove the create-vm workflow, the vm-lifecycle limb, the two KubeVirt agents (`kv-capacity`,

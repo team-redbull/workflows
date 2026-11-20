@@ -1,0 +1,182 @@
+# vm-lifecycle-worker
+
+The vm-lifecycle domain's activity worker. **One release per KV cluster, installed inside
+that KubeVirt cluster.** It dials out to the hub's Temporal, polls
+`vm-lifecycle-activity-<kvCluster>`, and works on its own cluster as its own ServiceAccount.
+The KV cluster exposes nothing, and nothing on the hub holds a credential for it or its MAC
+prefix. The chart holds **no Secret at all**.
+
+What it does there, all from `activities/vm_lifecycle/activities.py`, for
+[create-vm](../../../docs/site/vm-lifecycle/create-vm.html):
+
+- **measures** its cluster when a create-vm run asks (`read_kv_cluster_figures`): the usable
+  nodes' allocatable, what pods request, what the stopped `redfish-enabled` VMs will request,
+  each usable node's headroom as a CPU and memory pair. It only measures; the run on the hub
+  decides, with one placement buffer for every cluster;
+- **creates** one Halted VirtualMachine per request (`create_vm_on_cluster`): it draws the MAC
+  behind this cluster's prefix, derives the name `ocp-<flavor>-kv<cpu>-<site>-<MAC>`, builds
+  the VirtualMachine with this cluster's own storage class, network and node selector, and
+  creates it, drawing again by itself when a MAC or a name is taken (3 draws);
+- **waits** for the VM's root disk to bind (`await_vm_ready`, one heartbeating activity);
+- **deletes** a run's own VM and its root DataVolume when that run will not complete
+  (`delete_vm_on_cluster`): only the VM labelled with the run's id, only by the UID it read.
+
+It never starts, stops or patches a VM (kubevirt-redfish owns the power state), never
+creates a namespace, and never relies on KubeMacPool: a MAC is kept unique on the cluster by
+the worker's own check against every VM, in every namespace.
+
+The zone's list of KV clusters is not this worker's: it is day1's, read on the hub by the
+`cluster-lifecycle-worker`, which also holds the placement buffer
+(`HEADROOM_BUFFER_PERCENT`).
+
+## `kvCluster` is the day1 file name
+
+A create-vm run reads its zone's KV clusters from day1,
+`sites/<site>/mces/ocp4-seed-<site>-<zone number>/hostedClusters/<kv cluster>.yaml`, and sends
+each cluster's work to `vm-lifecycle-activity-<that file's name>`. This worker polls
+`vm-lifecycle-activity-<kvCluster>`. **The two must be the same string**, so `kvCluster` is
+exactly the day1 file's name without `.yaml` (`ocp4-prod-kv-five-a`), never abbreviated and
+never canonicalised. It must be `ocp4-<lifecycle>-kv-<site>-<id>`: the worker reads its site
+from it and refuses a VM of another site.
+
+A wrong value is not silent. The render fails on a name of another shape; a name of the right
+shape that is not the day1 file's leaves the cluster a `no-worker` row in every run of its
+zone, and a worker reached under another cluster's queue answers `readable: false` naming
+the cluster it is for.
+
+## Install
+
+The brain must run first (it owns the workflow queues); this worker only polls its activity
+queue. Everything under `kvCluster`, `config` and `vm` is the cluster's own and is rendered
+when the KV cluster is created, through day2, never typed in by hand:
+
+```bash
+helm upgrade --install vm-lifecycle-worker <chart dir> \
+  -n redbull-workflows \
+  --set kvCluster=ocp4-prod-kv-five-a \
+  --set config.vmMacPrefix=0e:03:f2 \
+  --set vm.storageClassName=<an Immediate, RWX-Filesystem class> \
+  --set temporal.host=<the hub's Temporal Route>:443 \
+  --set temporal.tls.enabled=true \
+  --set-file temporal.tls.caCert=<the Route's CA> \
+  --set image.tag=<vX.Y.Z>
+```
+
+`<chart dir>`: this chart, in the workflows repo at `deploy/charts/vm-lifecycle-worker/` or its
+copy in redbull-platform at `gitops/charts/vm-lifecycle-worker/`.
+
+`config.vmMacPrefix`: `0e` followed by the cluster's VLAN ID over two octets, from the Segments
+Manager's allocation for the cluster: VLAN 1010 = 0x3f2 gives `0e:03:f2`, VLAN 2 gives
+`0e:00:02`. The Segments Manager never gives one VLAN to two clusters of a site, so two
+clusters that share a network never share a prefix. It is the only place the prefix is set.
+
+`<vX.Y.Z>`: a version tag. Every push to `main` that changes a file this limb loads publishes
+`ghcr.io/team-redbull/vm-lifecycle-worker:vX.Y.Z` (its job in CI's `build` matrix), writes that
+tag into redbull-platform's copy (`gitops/charts/vm-lifecycle-worker/values.yaml`, `image.tag`)
+and tags redbull-platform `vm-lifecycle-worker/vX.Y.Z`. Installed from redbull-platform's copy,
+leave `image.tag` unset to get the newest.
+
+Temporal is reached through the hub's TLS Route: set `temporal.host` to `<route-host>:443`,
+`temporal.tls.enabled: true` and the CA, exactly as
+`deploy/charts/server-lifecycle-worker/README.md` describes for an MCE (steps 1–6 there; the
+Route and its certificate are the same ones). Only a worker on the hub itself (a lab) uses the
+in-cluster Service with TLS off.
+
+Check the worker polls its queue:
+
+```bash
+temporal task-queue describe --task-queue vm-lifecycle-activity-<kvCluster> --task-queue-type activity
+```
+
+CI's `sync-upgrade-charts` copies this chart into redbull-platform as
+`gitops/charts/vm-lifecycle-worker/` on every push to `main` that changes it
+(`scripts/sync_platform_charts.sh`, keeping the tag CI wrote), so edit it here, never there.
+Until 2026-11-20 redbull-platform held a hub chart of this name (one release for every zone,
+reaching each KV cluster through two HTTP agents); the first sync replaces it. There is no
+`gitops/services/` entry for this chart: each KV cluster gets it through day2.
+
+## The storage class
+
+`vm.storageClassName` must **bind immediately** and allow a **`ReadWriteMany` + `Filesystem`**
+volume. The VM is created Halted, so nothing ever consumes its disk: with a
+`WaitForFirstConsumer` class the root disk never binds, and every create-vm run ends, ten
+minutes later, by deleting its VM again (`VmRootDiskNotBoundError`). ceph-rbd refuses
+`ReadWriteMany` + `Filesystem` (multi-node access is for block volumes only); cephfs allows it.
+
+## Configuration
+
+| Value | Env | Default | Meaning |
+|---|---|---|---|
+| `kvCluster` | `KV_CLUSTER` | — (required) | The KV cluster this worker runs in: exactly its day1 file name; names its queue |
+| `config.vmMacPrefix` | `VM_MAC_PREFIX` | — (required) | The first three octets of every VM's MAC: `0e` + the cluster's VLAN ID |
+| `vm.storageClassName` | `VM_STORAGE_CLASS_NAME` | — (required) | The root disk's storage class (Immediate binding, RWX + Filesystem) |
+| `vm.network` | `VM_NETWORK` (JSON) | `{multus: {networkName: openshift-cnv/vm-external-network}}` | The VM's `networks[0]` body: the network every VM of the cluster boots on |
+| `vm.nodeSelector` | `VM_NODE_SELECTOR` (JSON) | `{}` | The VM template's nodeSelector. Capacity is measured on the nodes matching it only |
+| `vm.redfishLabel` | `VM_REDFISH_LABEL` | `redfish-enabled=true` | The label kubevirt-redfish exposes a VM by, and the one stopped VMs are counted by |
+| `vm.rootDiskSize` | `VM_ROOT_DISK_SIZE` | `120Gi` | The root disk's size |
+| `temporal.host` | `TEMPORAL_HOST` | — (required) | Temporal as reachable from this KV cluster |
+| `temporal.namespace` | `TEMPORAL_NAMESPACE` | `default` | The Temporal namespace; must match the hub |
+| `temporal.tls.*` | `TEMPORAL_TLS_CA`, `TEMPORAL_TLS_SERVER_NAME` | off | TLS to Temporal (a Route) |
+| `rbac.create` | | `true` | Render the RBAC below |
+| `replicaCount` | | `2` | Pods polling the queue (load sharing and failover) |
+| `image.repository` / `image.tag` | | ghcr / appVersion | Mirror path and tag in a disconnected environment |
+
+The render fails (and so does the worker's start, on the same rules) without `kvCluster`,
+`config.vmMacPrefix`, `vm.storageClassName`, `vm.network` or `temporal.host`; on a `kvCluster`
+that is not `ocp4-<lifecycle>-kv-<site>-<id>`; and on a prefix that is not three hex octets
+starting with `0e`. A KV cluster whose worker does not start is skipped as `no-worker` by
+every run of its zone, 30 seconds each.
+
+There is no placement buffer here. It is one value for every KV cluster,
+`HEADROOM_BUFFER_PERCENT` of the hub's `cluster-lifecycle-worker` (15 by default).
+
+Every key above is in the ConfigMap `vm-lifecycle-config` (`<domain>-config`, CLAUDE.md §8).
+The pod runs as a non-root UID (`USER 1001` in the image; any UID OpenShift assigns works)
+with a read-only root filesystem, no privilege escalation and no capabilities. It writes
+nothing to disk; `/tmp` is an emptyDir for Python and the Temporal core.
+
+Two pods share the queue. Every activity is idempotent across them: a create first looks for
+the VM its run already made (by the `redbull.io/created-by` label), and the disk wait resumes
+from its last heartbeat.
+
+## RBAC
+
+Every grant comes from a call in `activities/vm_lifecycle/kubevirt_api.py`; nothing else is
+granted. All of it is cluster-wide, on this KV cluster only: the capacity figures count pods
+and stopped VMs in every namespace, a VM's MAC must be free in every namespace, and the VM
+namespace is the request's.
+
+| Group / resource | Verbs | The call |
+|---|---|---|
+| `""` nodes | list | `list_nodes`: allocatable, Ready, cordoned, taints, labels (the figures) |
+| `""` pods | list | `list_unfinished_pods`: every unfinished pod's requests and node (the figures) |
+| `""` namespaces | get | `namespace_exists`: the VM namespace must exist; the worker never creates one |
+| `""` persistentvolumeclaims | get | `pvc_phase`: is the root disk's claim Bound (the ready wait) |
+| `kubevirt.io` virtualmachines | get, list, create, delete | `list_vms` (the figures; the MAC check and the run-id lookup of a create; the delete's lookup), `get_vm` (the ready wait; the delete's identity check), `create_vm`, `delete_vm` (a run's own VM, by UID) |
+| `kubevirt.io` virtualmachineinstances | list | `list_vmis`: which VMs have a launcher pod on a node (the figures) |
+| `cdi.kubevirt.io` datavolumes | get, delete | `get_datavolume` (the root disk's phase), `delete_datavolume` (with its VM) |
+
+Not granted, on purpose: any update or patch of a VirtualMachine, the `start`/`stop`
+subresources, any write to a node, pod, namespace or claim, Secrets, `pods/exec`.
+
+A missing verb is `KvClusterAccessError` (403, permanent) on the create, the wait or the
+delete, and an `unreachable` row on the figures read.
+
+## Network
+
+The worker only makes **outbound** connections; nothing connects to it and the chart has no
+Service and no Route. Its pods need, from the worker's namespace:
+
+| To | Port | Why |
+|---|---|---|
+| this cluster's own API server (`kubernetes.default.svc`) | TCP 443 | every call in the RBAC table |
+| the hub's Temporal frontend, through its Route | TCP 443 (gRPC over TLS, HTTP/2) | long-polling `vm-lifecycle-activity-<kvCluster>`, heartbeats, results |
+| cluster DNS | UDP/TCP 53 | resolving both |
+
+Only a NetworkPolicy of your own on the worker's namespace that restricts egress must allow
+the above. A worker that cannot reach Temporal exits and restarts; one that cannot read its
+own API answers `readable: false` on the figures read and retries its other calls.
+
+The hub and the KV cluster must keep their clocks in step (NTP): the worker creates nothing
+after the `create_before` the run sends, which is 45 seconds before the zone's lock moves on;
+25 of them cover one API call in flight, 20 a difference between the two clocks.

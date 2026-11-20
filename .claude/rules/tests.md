@@ -11,6 +11,18 @@ skill's references/testing.md.
 - **Workflow tests** run the REAL workflow with mock activities on one Worker per queue
   (per-MCE queues included), in the time-skipping environment, every result under
   `asyncio.wait_for(..., 60)` so a misclassified error fails instead of hanging.
+- **A test with a LONG-LIVED or idle workflow, or with a task nobody serves, moves the
+  clock by hand** (`tests/manual_time.py`; create-vm, kv-zone-lock): left to skip by
+  itself the test server jumps an idle run to its ten-year timeout, and it skips no time
+  at all under an outstanding task (an activity on a queue nobody polls, an unserved
+  workflow task). `tests/test_manual_time.py` pins both habits.
+- **Shrinking a workflow's constants** (an unsandboxed runner plus `monkeypatch`) is for
+  logic only, never for a golden: a history recorded under other constants does not
+  replay on the real ones.
+- **A fleet is faked behind the API, not above it** (`tests/kv_fleet.py`): each fake
+  cluster gets its own worker on its own queue running the REAL technology code over an
+  in-memory API that behaves where the logic depends on it (what was created is there on
+  the next read).
 - **Pin classification, not sequence**: each permanent error FAILS the run with its type
   after one attempt; a transient one is retried; each workflow-raised type; each gate.
 - **Replay goldens** under `tests/histories/<workflow>/` are never re-recorded to make a

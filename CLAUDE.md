@@ -52,6 +52,10 @@ shared/                      Contract layer — the API between brain and limbs
   models/                    Pydantic data classes (typed state across boundaries)
   interfaces/                Activity signatures ONLY (@activity.defn, no body)
   exceptions.py  consts.py   Shared errors / constants (e.g. task-queue names)
+  <rule>.py                  A pure rule BOTH sides apply, in one place: bmc_address.py,
+                               cluster_names.py and infraenv_names.py (the naming
+                               convention), vm_requests.py (a VM's size as the
+                               scheduler counts it), upgrade_layout.py
   settings/<limb>.py         pydantic-settings BaseSettings (fail-fast typed config),
                                ONE module per worker + temporal.py; __init__ imports nothing
   logging_config.py          Shared worker logging setup
@@ -60,7 +64,8 @@ workflow_domains/            The orchestration "brain" (one lightweight deployme
     <workflow>.py            Workflow logic (one file per workflow) — the SHAPE of
                                the run: phases, dispatches, timeouts, failures
     <policy>.py              Pure sandbox-safe rules that workflow needs and no
-                               limb does (server_lifecycle/bond_selection.py)
+                               limb does (server_lifecycle/bond_selection.py,
+                               vm_lifecycle/placement.py — create-vm's fit rule)
     router.py                That domain's APIRouter (prefix /workflows/<domain>)
   routers/                   API pieces owned by NO domain: deps, shared models,
                                runs.py (domain-agnostic run status), slots.py (the
@@ -79,13 +84,22 @@ activities/<domain>/         The execution "limbs" (one deployment per domain)
                                cluster_api.py (the Kubernetes API, its idempotency
                                rule and its error classification),
                                hosted_cluster_api.py (a HOSTED cluster's API, read
-                               through its admin kubeconfig)
+                               through its admin kubeconfig), and the worker inside
+                               a KV cluster: kubevirt_api.py (its own cluster's API),
+                               cluster_figures.py (the capacity arithmetic),
+                               vm_spec.py (the VirtualMachine it builds),
+                               vm_operations.py (each activity's whole body, over an
+                               `api` object — what lets tests/kv_fleet.py run the
+                               real limb code for dozens of fake clusters)
   worker_init.py             Registers activities, polls that queue
-activities/git_repo.py       Shared by limbs, owned by no domain: the git client (clone,
-activities/day1_repo.py        push, token scrubbing) and THE day1 repo reader (a
-                               cluster file with its value layers, an MCE folder's
-                               files) — cluster-lifecycle, vm-lifecycle and upgrade-gitops
-                               all read day1 through it, none through another's domain
+activities/git_repo.py       Shared by limbs, owned by no domain: the git client (a fresh
+activities/day1_repo.py        clone for a writer, a snapshot cached by commit for a
+                               reader, token scrubbing) and THE day1 repo reader — the
+                               `Day1` query library (a cluster file with its value
+                               layers; day1's clusters by site, env, kind and zone).
+                               cluster-lifecycle, upgrade-gitops and server-lifecycle
+                               all read day1 through it, none through another's
+                               domain; create-vm asks the cluster-lifecycle limb
 docs/                             The static documentation site (its own image, no code)
 ```
 
@@ -94,10 +108,12 @@ Prod charts are VENDORED into the Argo CD repo, at
 all domains), `segment-lifecycle-worker`, `server-lifecycle-worker` and `server-provisioning-worker`
 (limbs: one per domain), cluster-upgrade's `cluster-upgrade-worker`, `upgrade-agent-worker`
 and `upgrade-gitops-worker` (since 2026-11-02; with `server-provisioning-worker`, these have no
-`gitops/services/` entry yet, so CI bumps their tags and Argo CD deploys nothing), and
-`vm-lifecycle-worker` (written 2026-11-05) and `cluster-lifecycle-worker` (written 2026-11-11), both
-on redbull-platform's `main` since (CI's bump of each failed until then; a failing bump now stops
-no other image, §9). One generic ApplicationSet
+`gitops/services/` entry yet, so CI bumps their tags and Argo CD deploys nothing),
+`cluster-lifecycle-worker` (written 2026-11-11), and `vm-lifecycle-worker` — since 2026-11-20 a
+PER-KV-CLUSTER chart, a copy of `deploy/charts/vm-lifecycle-worker/` here that CI keeps equal
+(§9), with no `gitops/services/` entry: each KV cluster gets it through day2. (From 2026-11-05
+until then it was a hub chart, one release for every zone; its `gitops/services/` entry and the
+`kv-capacity` / `kv-vm-api` agent charts go from redbull-platform with it.) One generic ApplicationSet
 sweeps `gitops/services/<service>/app.yaml`, so the service FOLDER NAME is the Argo app name,
 the chart path and the release name at once. There is no per-environment values layer — a
 chart's own `values.yaml` is exactly what the cluster runs — and pushing redbull-platform's
@@ -145,19 +161,28 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   server-lifecycle, with `ARGO_NAMESPACE` / `ARGO_VALUES_REF` as its only other config; the
   workflows reach it through `dispatch.on_mce` / `start_watch`, and
   `tests/test_worker_registration.py` checks every activity sent that way is registered there.
-- **vm-lifecycle is ONE hub limb for every zone, holding no Kubernetes credential.** create-vm
-  reaches each KubeVirt cluster through the two agents the platform deploys there behind Routes
-  (`kv-capacity`, read-only facts; `kv-vm-api`, the idempotent VM create/read/delete — their own
-  repo `kv-agents`, charts in redbull-platform, one fleet bearer token each) and lists a zone's
-  clusters from the day1 repo with the day1 git token. So there is nothing to run per MCE and
-  nothing per KubeVirt cluster: `activities/vm_lifecycle/`, queue `vm-lifecycle-activity`, chart
-  `gitops/charts/vm-lifecycle-worker/`, domain `workflow_domains/vm_lifecycle/` with ONE workflow,
-  `create-vm`, on `create-vm-workflow`. Its id is a SLOT of the InfraEnv on its MCE
+- **vm-lifecycle is ONE WORKER INSIDE EACH KV CLUSTER, holding no Secret at all** (2026-11-20,
+  with the operator; it REVERSES 2026-11-04/05's "ONE hub limb for every zone", §4). A
+  `vm-lifecycle-worker` runs inside each KubeVirt (KV) cluster, polls
+  `vm_lifecycle_activity_queue(<kv cluster>)` = `vm-lifecycle-activity-<KV_CLUSTER>`, acts on its own
+  API server as its own ServiceAccount and dials OUT to the hub's Temporal (gRPC, TLS through the
+  Route) — the per-MCE `server-lifecycle-worker` pattern, for the same reason: the queue name IS the
+  target, the KV cluster exposes nothing, and nothing on the hub holds a credential for it.
+  `KV_CLUSTER` is EXACTLY the cluster's day1 file name and is NEVER canonicalised: the hub builds the
+  same queue name from the list it reads in day1. `activities/vm_lifecycle/`, chart
+  `deploy/charts/vm-lifecycle-worker/` (copied to redbull-platform by CI), domain
+  `workflow_domains/vm_lifecycle/` with TWO workflows: `create-vm`, on `create-vm-workflow`, and
+  `kv-zone-lock`, on `kv-zone-lock-workflow`, id `kv-zone-lock-<site>-<zone>` — one long-lived run per
+  (site, zone) that hands the zone to one create-vm run at a time; it has NO route and no docs page
+  of its own (create-vm starts it or signals it, and describes it). The zone's cluster list is NOT
+  this limb's: it is day1's, so `list_kv_clusters` lives on the cluster-lifecycle limb, which holds
+  the day1 token (next bullet). create-vm's id is a SLOT of the InfraEnv on its MCE
   (`create-vm-<mce>_<infraEnv>_<slot>`, `shared/workflow_ids.py`): the VM's name is drawn inside the
   run, so nothing known at the edge identifies it — add-server-to-mce's pool-draw shape, with the walk
   itself extracted to `workflow_domains/routers/slots.py` (add-server-to-mce keeps its own until a
   follow-up migrates it: it reports its own item model; what tied it to the busy count,
-  `candidate_count`, went with the allocation on 2026-11-17).
+  `candidate_count`, went with the allocation on 2026-11-17). A slot id is REUSED by later runs, so
+  it never identifies a VM or a waiter: the VM's label and the lock's line carry the RUN id.
 - **cluster-lifecycle is ONE hub limb holding git tokens only.** provision-cluster reads day1 `main`
   (the shared `activities/day1_repo.py` reader), pushes a branch per cluster, opens the merge request
   through GitLab's API on the day1 repo's host (GitLab is the ONLY provider, §4 — same token as
@@ -169,7 +194,12 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   workflow, `provision-cluster`, on `provision-cluster-workflow`, id `provision-cluster-<stem>`
   (`shared/workflow_ids.py`). The segment comes from the segment-lifecycle limb, through
   allocate-segment as an AWAITED CHILD on its own id — never a second copy of the Segments Manager
-  token here (§5).
+  token here (§5). Because it holds the day1 token, it also answers OTHER domains' questions about
+  day1 (2026-11-20; the `get_inventory_segment` precedent above — an activity lives where its
+  credential is): `list_day1_clusters` (day1's clusters by site, env, kind and zone, for any
+  workflow whose own limb has no day1 token) and `list_kv_clusters` (a zone's KV clusters oldest
+  first, for create-vm, with the placement buffer — `HEADROOM_BUFFER_PERCENT`, this worker's, §4).
+  Both under a "shared with…" header in `shared/interfaces/cluster_lifecycle.py`.
 - **Brain is ONE deployment for every domain**, not one per workflow — the `workflows-orchestrator`
   chart is standalone, deployed once. Each new domain adds `activities/<domain>/` + a
   `gitops/charts/<domain>-worker/` chart folder (plus its `gitops/services/` app.yaml) and registers
@@ -864,130 +894,222 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
     the day1 activities (retried until the new one polls) and reports no
     `infra_env` (the run fails naming it, gated on the key's presence).
 - **create-vm (domain `vm-lifecycle`) makes ONE Halted VirtualMachine for a KubeVirt InfraEnv, on the
-  best-fitting KubeVirt cluster of the InfraEnv's zone — the step before add-server-to-mce for an
-  InfraEnv whose hosts are VMs.** Designed with the operator 2026-11-04/05 (plan file
-  `~/.claude/plans/let-s-plan-create-vm-workflow-harmonic-penguin.md`; `docs/design/kubevirt-vm-placement.md`
-  and `docs/design/kv-agents-api.md`). The decisions, none to reopen:
+  OLDEST KV cluster of the InfraEnv's zone that has room — the step before add-server-to-mce for an
+  InfraEnv whose hosts are VMs. THE ZONE'S CLUSTERS COME FROM DAY1, THEIR NUMBERS FROM THE CLUSTERS
+  THEMSELVES, ONLY ONE RUN AT A TIME CHOOSES IN A ZONE, AND THE CHOSEN CLUSTER BUILDS THE VM.**
+  Redesigned with the operator 2026-11-19/20 (`docs/design/create-vm-placement.md`, the design, and
+  `docs/design/create-vm-placement-plan.md`, both ending in "As implemented"), implemented
+  2026-11-20. **This REVERSES the 2026-11-04/05 design, whose decisions were recorded here as "none
+  to reopen"** — the operator reopened them, for two reasons: every KV cluster needed two extra
+  services, Routes, fleet tokens and the repo's one unverified-TLS exception; and nothing
+  coordinated two runs, so parallel creates all picked the same cluster (seen in the 2026-11-05
+  lab). What went, and must not come back:
+  - **The two agents on each KV cluster — do not re-add them.** `kv-capacity` and `kv-vm-api` (repo
+    `kv-agents`, charts in redbull-platform), their Routes, their fleet tokens
+    (`KV_CAPACITY_TOKEN`, `KV_VM_API_TOKEN`), the URL templates, `KV_AGENT_CA` (TLS to the agents, not
+    verified by default), the vendored wire contract and
+    `tests/test_kv_agents_contract.py`, `KvAgentAuthError`, `KvCapacityUnavailableError`,
+    `KvVmApiUnavailableError`.
+  - **The hub vm-lifecycle limb — do not re-add it.** One release for every zone, its own day1
+    clone (`activities/vm_lifecycle/day1_repo.py`), queue `vm-lifecycle-activity` polled on the hub.
+  - **Best-fit ranking across the zone (`rank_kv_clusters`, `KvPlacement`) — do not re-add it.** It
+    read every cluster at once and took the fullest-after; the order is now oldest first, first fit
+    (AD28: the active cluster fills before the standby one), and later clusters are not read.
+  - **The run drawing the VM's suffix — do not re-add it.** `workflow.uuid4()`, `known_macs`, the
+    MAC-tail check, `suffix_hex`, `_MAX_DRAWS` in the workflow and `VmNameExhaustedError`: the run
+    never sees a MAC until the cluster's worker answers with it.
+  - **A fleet-wide `VM_MAC_PREFIX` (`02:a1:b2`) and the 30% buffer on the vm-lifecycle limb.**
+  - **The 2026-11-04 naming** (`<conf>[-<letter>]-zone-<zone>-<cpu>` / `…-metal`, seed
+    `ocp4-seed-<site>-<zone>`, KV clusters `ocp4-kubevirt-<site>-<zone>…`, VM
+    `ocp-<infraenv>-<6 hex>`). No VM of that shape was ever created in production (the agents were
+    never deployed), so nothing is patched: the workflow was rewritten without
+    `workflow.patched()`, its goldens deleted, and any run of the old shape is terminated by the
+    operator before the brain is replaced.
+
+  The decisions now, with the operator unless marked otherwise:
   - **THE NAMING CONVENTION says everything, parsed ONCE at the API edge** (`shared/infraenv_names.py`,
     `shared/cluster_names.py`) and carried in the input, never re-derived on replay (the
-    provision-dell-server region precedent). An InfraEnv is `<conf>[-<letter>]-zone-<zone>-metal`
-    (bare metal) or `<conf>[-<letter>]-zone-<zone>-<cpu>` (KubeVirt: `<cpu>` vCPUs, `<cpu> × 8` GiB —
-    `MEMORY_GIB_PER_CPU`, the ONE place the ratio lives). An MCE is `ocp4-<env>-mce-<site>-<letter>`:
-    the SITE comes from it. Per (site, zone) ONE seed cluster `ocp4-seed-<site>-<zone>` hosts that
-    zone's KubeVirt clusters, named `ocp4-kubevirt-<site>-<zone>…`. VOCABULARY the operator insists on:
-    "day1" names only the REPO; a seed cluster is a "seed", never an "mce"; the convention's KubeVirt
-    clusters are "kv clusters"; a list of all clusters would be just "clusters".
-  - **The zone's clusters are the FILES of the seed folder**
-    `sites/<site>/mces/ocp4-seed-<site>-<zone>/hostedClusters/` at day1 `main`, read by the
-    vm-lifecycle limb ITSELF (`list_kv_clusters`, its own clone, the shared `activities/git_repo.py`
-    client, and the `redbull-git-token` Secret its own chart deploys in the namespace, which
-    upgrade-gitops reads too: key `REDBULL_GIT_TOKEN`, mapped by each chart onto the
-    `DAY1_GIT_TOKEN` the limb reads, so the images did not change; segment-lifecycle still renders
-    its own `day1-git-token`). The operator REJECTED putting the read on the
-    upgrade-gitops limb (2026-11-05): upgrade-gitops is not production, and create-vm must not depend
-    on it. NOT filtered by day1 `platform: kubevirt` — that key means a cluster whose NODES are VMs.
-    The folder is built from VALIDATED tokens and read with `iterdir()`, never globbed with input.
-  - **The day1 reader is SHARED, in `activities/day1_repo.py` next to `git_repo.py`, owned by no
-    domain** (`fresh_main` — a `git_repo.Clone` of `main` — the layer-merging `load_cluster_values` with its `ClusterValues`,
-    `list_cluster_files`): vm-lifecycle's `list_kv_clusters` and upgrade-gitops's `read_cluster`
-    both build on it, and neither limb imports the other's domain for it (the operator,
-    2026-11-05 — it first sat in `activities/vm_lifecycle/`, "owned by create-vm", which made the
-    upgrade limb look dependent on create-vm; `tests/test_day1_repo.py` pins the one-object
-    guarantee). `shared/` cannot hold it (the contract layer, SH001; it needs PyYAML and git).
-    `find_cluster_file`, `read_rules`, `read_cluster`, the NodePool parsing and every edit stay in
-    `activities/upgrade_gitops/`; the seed-folder walk stays in `activities/vm_lifecycle/`.
-  - **Reaching a KV cluster = our own agents, NOT a kubeconfig, NOT Thanos.** Per cluster TWO
-    services behind Routes, one fleet bearer token each: `kv-capacity` (GET `/v1/capacity`: nodes
-    with allocatable and the Pending|Running requests, our Halted launcher-less VMs' would-be
-    requests, every VM's MAC) and `kv-vm-api` (PUT/GET/DELETE `/v1/vms/{name}`, rendering
-    `vm.yaml` server-side; storage class, network and node selector are its per-cluster values).
-    Two, not one, by §2's rule (different RBAC and blast radius ⇒ different deployments); DUMB on
-    purpose — the fit test, the buffer and the ranking live HERE (`activities/vm_lifecycle/placement.py`),
-    so the policy has one home. The wire contract is vendored in `shared/models/vm_lifecycle.py` and
-    pinned by `tests/test_kv_agents_contract.py` (`UPDATE_KV_AGENTS_CONTRACT=1`,
-    `KV_AGENTS_SERVICE_DIR`), as the upgrade agent's is. **TLS to the agents is NOT VERIFIED by
-    default** (`KV_AGENT_CA` empty) — the operator's explicit choice, 2026-11-04: the Routes carry
-    the ingress wildcard certificate, whose CA the image cannot carry; the one place in the repo
-    verification is off by default, and a CA path turns it on.
-  - **Placement: fit PER NODE, buffer PER CLUSTER, best-fit on the dominant resource.** The VM's
-    size in the scheduler's terms is what `vm.yaml` makes the launcher pod request — CPU
-    `cpu × 15 / 16` cores (integer division), memory the guest's plus 1 GiB — defined ONCE in
-    `placement.py`. One schedulable node must hold the pod; the cluster's fill AFTER placing (active
-    requests + Halted reservations + this VM, over the schedulable allocatable) stays ≤ `1 − B` on
-    CPU and memory (`HEADROOM_BUFFER_PERCENT`, our policy, unprefixed, per cluster never per node);
-    the fullest-after wins, ties by name. **Halted VMs with no launcher pod COUNT toward the cluster
-    fill** (reversing the design doc's first draft, 2026-11-04): kubevirt-redfish will start them, and
-    two creates in a row must not both see an empty cluster. Every reason a cluster is skipped is a
-    ROW in the table (`SKIP_REASONS`, mirrored by the workflow's `_SKIP_SUMMARY`, a test keeps them
-    equal — the `_REJECTION_SUMMARY` precedent), never an exception; the rank activity raises only
-    when NO cluster could be read (`KvCapacityUnavailableError`, retried) or EVERY reachable one
-    refused the token (`KvAgentAuthError`, permanent).
-  - **Identity: the run draws the suffix, the limb composes the MAC, name and MAC agree by
-    construction.** Six hex digits from `workflow.uuid4()` (replay-safe), VM
-    `ocp-<infraenv>-<6 hex>`, MAC `VM_MAC_PREFIX:xx:xx:xx` from the same digits — KubeVirt
-    re-randomises an unset MAC on restart and the BareMetalHost needs a fixed boot MAC. A draw whose
-    MAC TAIL is any VM's in the zone (`known_macs`, unioned from every reachable report; compared on
-    the last three octets because the workflow never sees the prefix) is dropped without a call; a
-    409 from kv-vm-api (born in between) redraws; `_MAX_DRAWS` = 3, then `VmNameExhaustedError`. The
-    PUT is idempotent by name AND identity (200 for the same namespace/MAC/size/labels, `created`
-    False — an in-run retry artifact, never something a re-run relies on; `runStrategy` is never
-    compared).
-  - **NO candidate loop on the create; a root disk unbound after 10 min is ROLLED BACK, then the run
-    fails.** The PUT on the chosen cluster is out-waited and never moved to another (Halted, the
-    scheduler is not consulted; a move after an ambiguous failure could leave two VMs). The wait is
-    ONE heartbeating activity (`await_vm_ready`, every 8 s — the operator, 2026-11-05 — its clock in
-    the heartbeat details), `deadline` on its own clock; then `delete_vm_on_cluster` by name AND MAC
-    (404 = success; a 409 means someone replaced the VM — left alone, `VmIdentityConflictError`) and
-    `VmRootDiskNotBoundError`, which says a WaitForFirstConsumer storage class never binds a Halted
-    VM's disk. Why delete: a re-run of the slot is a NEW execution with a NEW suffix, so it cannot
-    converge on the orphan — it would add one per attempt (add-server-to-mce's rule: nothing survives
-    on a cluster that did not take it).
-  - **End state Halted** (`runStrategy: Halted`, label `redfish-enabled: "true"`): kubevirt-redfish
-    owns the power state and Ironic starts it. **The VM namespace is add-server-to-mce's `namespace`,
-    verbatim** (default `inventory` on the edge only), a kubevirt-redfish chassis namespace the
-    platform created — never created here; missing is `VmNamespaceNotFoundError`.
-  - **`schedule_to_start_timeout` on the two READS only** (`list_kv_clusters`, `rank_kv_clusters`,
-    the short-run "no worker" signal); NONE on the create, the wait or the delete — Temporal never
-    retries that timeout, and after the PUT a limb pod away for five minutes must not fail the run,
-    or its rollback, and orphan the VM (§5).
-  - **Deploy order**: the agents on every KV cluster of a zone (Routes up, two fleet tokens issued,
-    `vm.yaml` with a `macAddress` — a redbull-platform change) → the brain → the `kv-capacity-token`
-    / `kv-vm-api-token` Secrets out of band → the `vm-lifecycle-worker` chart + app.yaml, CI bumps
-    its tag. Until the agents are up a run waits with every cluster `no-agent`. add-server-to-mce's
-    KubeVirt branch (starting create-vm as an awaited child when the InfraEnv is KubeVirt) is the
-    operator's LATER step; the input and result are shaped for it, and NO branch exists yet.
-  - **Settled with the operator 2026-11-05**: the CPU request is FLOORED AT ONE CORE
-    (`max(1, cpu × 15 // 16)` in `placement.py` AND in the kv-vm-api template — vm.yaml's bare
-    formula makes a 1-vCPU VM request 0; the parser keeps 1..256); the apps domain is
-    `apps.<clusterName>.<base>`, so the URL templates use `{cluster}` (the other placeholders stay
-    available); NO extra VM labels for now (`labels` is in the contract, sent empty).
-    **kubevirt-redfish runs `systemIdConvention: legacy`** (the operator, 2026-11-05, before any
-    production VM exists): the Redfish system id IS the VM name, so the id, the VM and the server
-    name server-scan lists are one string, `ocp-<infraenv>-<suffix>`, and add-server-to-mce's
-    match holds (since 2026-11-19 on the InfraEnv's first three words only — which for a
-    KubeVirt InfraEnv `<conf>[-<letter>]-zone-<zone>-<cpu>` stops before the zone and size:
-    the pool then spans the conf's VMs of every zone and size, to settle before the KubeVirt
-    branch is built). `enhanced` (`<ns>.<vm>`) was the chart's setting until then;
-    its one advantage, duplicate names across chassis namespaces, cannot arise for create-vm's
-    VMs (the suffix is the MAC's, unique zone-wide). Changed in redbull-platform's chart values
-    and lab manifests; each cluster's out-of-band config Secret is re-rendered by the operator.
-    **Proven in the lab 2026-11-05** (`docs/lab/create-vm/`: cluster-64spr, OCP/CNV 4.22, nine
-    simulated KV clusters = agent release pairs pinned to nodes, a mock day1 served locally, the brain
-    and the limb from source): the create, Halted with the MAC and the label; best-fit among three
-    fitting clusters on real numbers; a Halted reservation tipping the next create elsewhere; every
-    skip reason as a row; `NoKvClusterFitsError` / `NoKvClusterError` / `KvAgentAuthError`; the
-    10 min rollback (`VmRootDiskNotBoundError`, VM and DataVolume gone) with the wait resumed from
-    its heartbeat on a restarted limb. Measured there: a 16 GiB guest's launcher pod requests
-    308 MiB over the guest, so the 1 GiB pad is conservative (kept); the Routes answer in well
-    under the 10 s probe (kept). FOUND there: vm.yaml's root disk is `ReadWriteMany` +
-    `Filesystem`, which ceph-rbd REFUSES (`multi node access modes are only supported on rbd
-    block type volumes`) — a cluster's `vm.storageClassName` must be a class whose StorageProfile
-    allows that pair (cephfs in the lab), or every run ends in the rollback; and `count` runs in
-    PARALLEL all rank BEFORE any creates, so they land on the same cluster — Halted reservations
-    protect SEQUENTIAL creates only (observed, not redesigned). The simulator
-    `tests/kv_agents_simulator.py` + `tests/test_create_vm_e2e.py` run the real workflow and the
-    real limb over a fleet in every state (the dell_simulator precedent); goldens in
-    `tests/histories/create_vm/` include the lab's first real run.
+    provision-dell-server region precedent). It is the platform convention
+    (`kubevirt-workflows/docs/review/naming-convention-draft.md`, a draft). A cluster is
+    `ocp4-<lifecycle>-<flavor>-<site>-<id>`, `<id>` a letter given in creation order, flavors `mce`
+    and `kv` reserved (a KV cluster: `ocp4-prod-kv-five-a`). An InfraEnv is
+    `<flavor>-mtl-<site>-<zone>` (bare metal) or `<flavor>-kv<cpu>-<site>-<zone>` (KubeVirt:
+    `<cpu>` vCPUs, `<cpu> × 8` GiB — `MEMORY_GIB_PER_CPU`, the ONE place the ratio lives), the
+    zone `az<N>`, the flavor carrying its optional variant letter. A VM is
+    `ocp-<flavor>-kv<cpu>-<site>-<its MAC, 12 hex>` (`ocp-c200-kv32-five-0e03f2a1b2c3`): the zone
+    is a label, never in the name. **A seed is `ocp4-seed-<site>-<zone number>`** for zone
+    `az<N>` (the operator, 2026-11-20, AGAINST the draft's `ocp4-<lifecycle>-seed-<site>-<id>`,
+    which is to be updated): one seed per zone and immutable, so its name can carry the zone,
+    where a KV cluster's does not. The route refuses an MCE whose site is not the InfraEnv's (a VM
+    boots on its own site's inventory network). VOCABULARY the operator insists on: "day1" names
+    only the REPO; a seed cluster is a "seed", never an "mce"; a KubeVirt cluster is a "KV
+    cluster"; in day1 the two kinds are `hc` and `kv`.
+  - **The zone's clusters are the FILES of its ONE seed folder**,
+    `sites/<site>/mces/ocp4-seed-<site>-<zone number>/hostedClusters/` at day1 `main`, read by the
+    **cluster-lifecycle limb** (`list_kv_clusters`, §2: it holds the day1 token) through the `Day1`
+    query library (`activities/day1_repo.py`: `Day1.kv_clusters(site, zone)`) on the snapshot of
+    `main` cached by commit (§5), sorted by the name's `id` letter: OLDEST FIRST. `kv` is decided by
+    FOLDER (under a seed), never by name — day1 has `ocp4-test-kubevirt-site4` under an MCE, an
+    ordinary `hc` — and never by `platform: kubevirt`. A file is USABLE only when day1 CONFIRMS it
+    for the zone: every NodePool labels its nodes `topology.kubernetes.io/zone` with the seed's zone,
+    the seed folder and the cluster's name are of this site, and the name is
+    `ocp4-<lifecycle>-kv-<site>-<id>` (`ClusterRecord.blocking` / `confirmed_zone`;
+    `KvClusterEntry.zone` and `.id`; `create_vm.usable`). Any other file is a `day1-problem` row and
+    NEVER read. **A YAML warning every cluster shares blocks none of them**: a key written twice in
+    `sites/configValues.yaml` is in every record's `problems`, and treating `problems` as
+    disqualifying would take the whole fleet out for one typo — hence `blocking`, a subset. The
+    list is read BEFORE the lock, so the locked part stays short, and carries the commit
+    (`day1_revision` in the result).
+  - **ONE RUN AT A TIME CHOOSES AND CREATES IN A ZONE: the zone lock**
+    (`workflow_domains/vm_lifecycle/kv_zone_lock.py`, `KvZoneLockWorkflow`, §5). The run takes its
+    zone's lock, reads figures, chooses, has the VM created, and **releases as soon as the VM OBJECT
+    exists** (and on every other path). The next run's figures then already count that VM, as a
+    stopped VM — so NOTHING IS REMEMBERED BETWEEN RUNS: there is no pending list, no reservation,
+    and server-scan takes no part (`docs/design/kv-placement-server-scan.md` was rejected
+    2026-11-17). The lock holds only the line and the lease; it never reads a cluster. **The lease
+    is 5 minutes**: a holder that died is passed over at its end, its late release ignored. The
+    10-minute disk wait happens AFTER the release, in parallel with every other run.
+  - **The create can never land after the lease.** The run sends `create_before` with the create and
+    the cluster's worker creates nothing after it (`VmLeaseExpiredError`, permanent, "nothing was
+    created; ask again") — though a retry still returns the VM it already made, whatever the time
+    (the lookup comes first). So the create needs no schedule-to-start limit (a worker that
+    restarts must not fail the run) and still cannot add a VM to a cluster the next run measured
+    without it. `create_before` is the lease's end less `_LEASE_GUARD`, **45 s** (the lead's number,
+    to confirm): 25 s for one API call in flight when the worker checks, 20 s for the hub's and the
+    KV cluster's clocks to disagree.
+  - **Oldest first, FIRST fit, the clusters after it NOT read.** The fit rule is
+    `workflow_domains/vm_lifecycle/placement.py` (pure, beside the workflow, the `bond_selection.py`
+    precedent), on ONE cluster's figures, in this order: `unreachable` (the worker could not read
+    its cluster), `no-nodes`, `fit-node` (no single node has room for the VM's CPU AND memory — the
+    largest free CPU and the largest free memory can be on two nodes), `fit-buffer` (requested +
+    the VM past `1 − buffer` of the allocatable, CPU then memory). In INTEGERS (millicores, bytes,
+    percent): `(requested + vm) × 100 <= allocatable × (100 − buffer)`, so it is exact and replays
+    identically. The run adds `day1-problem` and `no-worker`. Every reason is a ROW of the run's
+    table (`SKIP_REASONS`, one dict, a test keeps the workflow from recording a reason by a literal),
+    never an exception. The run never chooses a node. THE SPLIT IS ON PURPOSE: a worker only knows
+    its own cluster and only MEASURES; "the oldest that fits" is decided by whoever sees them all.
+  - **The buffer is ONE value for every KV cluster, 15% by default**: `HEADROOM_BUFFER_PERCENT`
+    (ours, unprefixed, 0..90) on the hub `cluster-lifecycle-worker`, handed to the run with the
+    cluster list, so a run records the buffer it used and a changed value applies to runs started
+    after it. Per cluster, never per node. NOT a setting of each cluster's worker.
+  - **The figures** (`read_kv_cluster_figures`, `activities/vm_lifecycle/cluster_figures.py`, pure):
+    allocatable over the USABLE nodes; unfinished pods' requests as the kube-scheduler counts them
+    (init and sidecar containers, overhead, a pod-level request); STOPPED VMs — labelled
+    `redfish-enabled=true`, in ANY namespace, with ANY run strategy, whose VMI is not
+    Scheduled/Running/Unknown — at what their pod WILL request; each usable node's headroom as a
+    CPU and memory PAIR. A VM's size in request terms (CPU `vCPUs × 15 // 16` floored at ONE core,
+    memory the guest's plus 1 GiB) is defined ONCE, in `shared/vm_requests.py`, read on both sides.
+    Every number an integer; `parse_quantity` at the worker and nowhere else. An unreadable cluster,
+    or a request naming another cluster than the worker's own, is `readable: false` — a VALUE,
+    never an exception: the caller holds the zone's lock and must neither retry nor wait. A
+    "usable" node is Ready and not cordoned (the design) AND carries no `NoSchedule`/`NoExecute`
+    taint AND matches `VM_NODE_SELECTOR` when the cluster has one (the lead's additions, to confirm:
+    a node a VM's pod cannot go to is not room; stopped VMs are still counted cluster-wide, which
+    errs on the full side).
+  - **The cluster's worker builds the VM** (`vm_spec.py`, `vm_operations.create_vm`). The run sends
+    only what the VM IS — flavor, cpu, memory, site, zone, MCE, namespace, its id, `create_before`.
+    The MAC is the cluster's `VM_MAC_PREFIX` (`0e` + the cluster's VLAN ID, three octets, in the
+    worker's ConfigMap, REQUIRED, set when the KV cluster is created and never on the hub) + 3
+    random bytes: the Segments Manager never gives one VLAN to two clusters of a site, so two
+    clusters that share a network never share a prefix; `0e` is locally administered and neither
+    KubeMacPool's `02` nor OVN-Kubernetes' `0a`. The worker refuses a request for another cluster
+    or another site (`KvClusterMismatchError`). A taken MAC or name is drawn again BY THE WORKER,
+    3 draws (`MAX_DRAWS`), with no round trip to the hub; then `VmMacExhaustedError`.
+  - **MAC uniqueness NEVER relies on KubeMacPool** (the operator, 2026-11-20: "the workflow can't
+    rely on KubeMacPool cuz in the future we will use open source kubevirt and not openshift
+    virtualization"). The guard is the worker's OWN check: the drawn MAC against every VM of the
+    cluster, in every namespace, before the create — Kubernetes refuses a duplicate NAME only
+    within one namespace. Nothing races it: the run holds the zone's lock. A KubeMacPool refusal,
+    where one runs, is handled as one more draw and nothing depends on it. The same goes for any
+    other OpenShift-Virtualization-only behaviour: plain `kubevirt.io` and `cdi.kubevirt.io` only.
+  - **A run is known by its RUN ID, not its workflow id** (the lead's change to the design's
+    `request_id`, forced by the slot scheme: a slot's workflow id is reused by later runs, and
+    holds characters a label value cannot). The VM is labelled `redbull.io/created-by: <run id>`
+    (the workflow id is the annotation `redbull.io/workflow-id`); the lock's line carries
+    (workflow id, run id) and a grant is signalled to exactly that run. A retried create finds its
+    own VM by the label and returns it (`created` False) instead of drawing a second one.
+  - **One create attempt ends inside its timeout, and a run holds ONE VM** (the lead's, after a
+    review found two attempts could overlap). An attempt starts no call to the cluster's API past
+    `CREATE_BUDGET_SECONDS` (55 s; one call is at most 25 s), so it is over before the 90 s
+    `start_to_close` lets Temporal start the next beside it, and before a cancel's settle wait
+    ends. After the create the VMs carrying the run's id are READ BACK (§6): more than one — a
+    create the API server finished after its caller gave up — converges on the OLDEST, whichever
+    attempt meets them, and the rest are deleted.
+  - **A run that does not complete leaves no VM.** The root disk unbound after 10 min
+    (`await_vm_ready`, ONE heartbeating activity, every 8 s — the operator, 2026-11-05 — its clock
+    in the heartbeat details): `delete_vm_on_cluster`, then `VmRootDiskNotBoundError`, which says a
+    WaitForFirstConsumer storage class never binds a Halted VM's disk. A wait that fails for good
+    (403, a mismatch): the same removal, bounded, then the wait's own error. Why delete: a re-run
+    of the slot is a NEW execution with a NEW MAC, so it cannot converge on the orphan, and a
+    stopped orphan is counted against its cluster for ever. The delete finds the VM by the run-id
+    label and deletes by the UID it read; with the name and MAC it also checks them
+    (`VmIdentityConflictError` for a VM that is someone else's, left alone).
+  - **A CANCEL ROLLS BACK** (the lead's addition, to confirm; add-server-to-mce's precedent):
+    waiting, the run leaves the line (`withdraw`); holding, it releases; after the create was
+    sent, it removes the VM by its run-id label — after `_CANCEL_SETTLE` (2 min) when the create's
+    answer was cut off, since a cancel stops waiting for a call, not the call — and ends
+    CANCELED. The rollback's delete is bounded (10 min, a caught `schedule_to_close_timeout`) and
+    never raises; `progress.cancel_rollback` says what it did. TERMINATE runs no code: the lock
+    passes on at the lease's end, and a VM is found by its label. A workflow RESET to before the
+    create is a new run id and makes a second VM (a known limit).
+  - **The lease also bounds the scan** (the lead's addition, to confirm; the design left it open).
+    A cluster with no worker costs 30 s, so ten are a whole lease. The run never acts on figures
+    once its lease is spent: it checks the clock before every read and before the create, gives a
+    spent lease up, asks for the lock again and carries on FROM THE CLUSTER IT HAD REACHED, which
+    it reads afresh — at most `_MAX_LEASES` (3), then `KvZoneLeaseExpiredError`
+    (WORKFLOW-RAISED). The lock wait itself is bounded at 30 min (`KvZoneLockTimeoutError`), and a
+    waiting run asks again every 2 min, which is what brings it back if a person terminates the
+    lock workflow.
+  - **Timeouts, each a decision.** `schedule_to_start_timeout` on the day1 list only (5 min, the
+    short-run "no worker" signal, nothing held yet). The figures read: 30 s to be picked up — none
+    is a `no-worker` ROW, Temporal never retries that timeout — 60 s to answer (the worker cuts its
+    four list calls off together at 20 s), and 120 s `schedule_to_close` as a whole (the lead's, to
+    confirm: whatever keeps a read from answering, a worker of a wrong image included, the cluster
+    ends as an `unreachable` row instead of holding the zone). NONE on the create, the wait or the
+    delete: after the create a worker pod away for five minutes must not fail the run, or its
+    rollback, and orphan the VM (§5).
+  - **End state Halted** (`runStrategy: Halted`, the redfish label): kubevirt-redfish owns the power
+    state and Ironic starts it; the worker's RBAC has no verb that starts, stops or patches a VM.
+    **The VM namespace is add-server-to-mce's `namespace`, verbatim** (default `inventory` on the
+    edge only), a kubevirt-redfish chassis namespace the platform created — never created here;
+    missing is `VmNamespaceNotFoundError`. The cluster's VM values are the worker's own:
+    `VM_STORAGE_CLASS_NAME` (REQUIRED: it must bind Immediately and allow ReadWriteMany +
+    Filesystem — ceph-rbd refuses that pair, found in the 2026-11-05 lab), `VM_NETWORK`,
+    `VM_NODE_SELECTOR`, `VM_REDFISH_LABEL`, and `VM_ROOT_DISK_SIZE` (the lead's, default `120Gi`).
+  - **kubevirt-redfish runs `systemIdConvention: legacy`** (the operator, 2026-11-05): the Redfish
+    system id IS the VM name, so the id, the VM and the server name server-scan lists are one
+    string, now `ocp-<flavor>-kv<cpu>-<site>-<MAC>`. add-server-to-mce's pool match (the
+    InfraEnv's first three words, 2026-11-19) is then `^ocp-<flavor>-kv<cpu>-<site>-`: the VMs of
+    that flavor and size at that site, of every zone — to settle before the KubeVirt branch is built.
+  - **Deploy order**: terminate any old-shape run → redbull-platform's cleanup (the hub limb's
+    `gitops/services/` entry, the two agent charts) → the brain → the cluster-lifecycle limb (the
+    listing; `HEADROOM_BUFFER_PERCENT` has a default, so the chart need not ship first) → the
+    chart sync → the vm-lifecycle image. Per zone its seed folder in day1; per KV cluster, at its
+    creation, its day1 file (NodePools labelling the zone) and, through day2, the
+    `vm-lifecycle-worker` chart (`kvCluster` = the day1 file name, `config.vmMacPrefix` = `0e` +
+    its VLAN ID, the Temporal Route and CA, the storage class, the network). A cluster in day1
+    without a running worker is skipped as `no-worker`. add-server-to-mce's KubeVirt branch
+    (starting create-vm as an awaited child when the InfraEnv is KubeVirt, AD29) is the operator's
+    LATER step; the input and result are shaped for it, and NO branch exists yet.
+  - **What the lead added beyond the reviewed plan, awaiting the operator's confirmation** (each is
+    marked above): the 45 s lease guard; the lease re-acquire, `_MAX_LEASES` and
+    `KvZoneLeaseExpiredError`; the cancel rollback and the delete by run id; usable nodes without
+    repelling taints and under `VM_NODE_SELECTOR`; the figures read's 120 s bound;
+    `VM_ROOT_DISK_SIZE`; `KvClusterMismatchError`; the create budget and the read-back; the
+    brain's `temporalio>=1.32` floor (`workflow.cancellation_reason()`, §5); and `flavor` REQUIRED
+    on the history-decoded `CreateVmInput` (against §5's "defaults to None" rule, because no run
+    of the old shape can be replayed by the rewritten workflow anyway).
+  - **How it is tested without dozens of KV clusters**: `tests/kv_fleet.py` gives every fake KV
+    cluster an in-memory Kubernetes API (with the surface of `kubevirt_api.KubevirtApi`) and its
+    OWN worker on its OWN queue, running the REAL limb code (`vm_operations`) under the REAL
+    workflows — only the cluster behind the API is fake, and a VM created there IS in the next
+    figures. `tests/manual_time.py` moves the test server's clock by hand (§5). Goldens for both
+    workflows are recorded with the production waits. `python -m tests.kv_fleet` attaches fake
+    clusters to a real Temporal next to a real cluster's worker (`docs/lab/create-vm-per-kv-cluster/`).
+    The 2026-11-05 lab (`docs/lab/create-vm/`, cluster-64spr) proved the AGENT-era design and is
+    history; two of its findings still hold: a 16 GiB guest's launcher pod requests about 308 MiB
+    over the guest, so the 1 GiB pad is conservative (kept), and ceph-rbd refuses the root disk's
+    ReadWriteMany + Filesystem.
 - **Select bond members from `interfaces[]`, NEVER from `nic_macs`.**
   server-scan reduces Dell NPAR partitions to one entry per physical port in
   `interfaces` but leaves `nic_macs` whole on purpose, so a 4-port partitioned
@@ -1083,7 +1205,9 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   ALLOCATION: the allocate id, the SM's (cluster, site, type) idempotency, the DHCP exclusion policy.
 - **The day1 values repo is reached by git subprocess** (`DAY1_REPO_URL`), never a Python git
   dependency — see §5. ONE git client, `activities/git_repo.py`, shared by every limb that clones
-  (cluster-lifecycle, upgrade-gitops, vm-lifecycle; segment-lifecycle no longer touches git).
+  (cluster-lifecycle, upgrade-gitops, server-lifecycle for update-nodepool; segment-lifecycle no
+  longer touches git, and neither does vm-lifecycle since 2026-11-20 — its worker runs inside a KV
+  cluster and create-vm's day1 list is read on the cluster-lifecycle limb).
 - **The cluster-upgrade hub limb (`upgrade-gitops-worker`) works on `main` only**: Argo CD
   renders nothing else. It reads the rules after day1's own `scripts/validate_upgrade_rules.py`
   passed them, and a cluster file the way the hostedclusters-setup chart renders it — the value
@@ -1286,6 +1410,12 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   error must be in `non_retryable_error_types` (e.g. `SegmentNotFoundError`, `SegmentsManagerAuthError`)
   or raised by the activity as `ApplicationError(..., non_retryable=True)`. Unclassified permanent errors
   retry every minute forever — run sits RUNNING (not FAILED) with the failure on the activity in the UI.
+  The ONE shape that carries a `schedule_to_close_timeout` is a BEST-EFFORT call whose
+  `ActivityError` the workflow catches and answers itself (checker WF005 allows only that):
+  add-server-to-mce's reads of server-scan after the install, remove-server-from-mce's PXE cleanup,
+  and create-vm's two — the figures read of one KV cluster (120 s: whatever keeps it from
+  answering, the cluster becomes a row of the table instead of holding its zone's lock) and the
+  cancel rollback's delete (10 min, then the run still ends CANCELED and says where the VM is).
 - **Name an error type ONCE — build the non-retryable list from the CLASSES.** Temporal matches
   `non_retryable_error_types` against the error's type NAME, so a string literal with a typo in it
   reads as "retryable" and there is nothing to notice. add-server-to-mce keeps a
@@ -1342,8 +1472,9 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   answer of more than 2 MiB whole (reproduced on a local dev server; server-scan's own `main` cannot
   send one, so it came from whatever answered at `SERVER_SCAN_URL`).
 - **Git-subprocess activities** (checker AC008; `activities/git_repo.py`, THE one git client: cluster-lifecycle's
-  `day1_writer.py` / `day2_sigs.py`, upgrade-gitops's day1/day2/Brain modules and vm-lifecycle, the
-  day1 reads through `activities/day1_repo.py`; no other module runs git): git runs via
+  `day1_writer.py` / `day2_sigs.py` / `day1_clusters.py`, upgrade-gitops's day1/day2/Brain modules and
+  server-lifecycle's update-nodepool activities, the day1 reads through `activities/day1_repo.py`; no
+  other module runs git): git runs via
   `asyncio.create_subprocess_exec` (no Python git dependency; the limb Dockerfile installs the binary),
   each command under a timeout below the git activities' 180s `start_to_close_timeout`. A WRITER opens
   ONE `git_repo.fresh_clone(...)` per attempt (day1 `main`: `day1_repo.fresh_main`) — a fresh
@@ -1401,6 +1532,48 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   gated the cancel on status was correct but kept the machinery — while restricting the SELECTION to
   segments that could not have a live sibling removed the problem outright. Apply the same move to the
   next such interaction rather than adding detection.
+- **Runs that must not act at the same time take a LOCK WORKFLOW — the per-zone lock is THE
+  serialization precedent** (`workflow_domains/vm_lifecycle/kv_zone_lock.py`, create-vm, 2026-11-20).
+  When two runs deciding from the same live state would decide the same thing (ten create-vm runs
+  all seeing one empty cluster), neither a workflow id (they are legitimately separate runs) nor
+  narrowing the input (the bullet above) helps: one long-lived workflow per contended thing hands
+  it to one run at a time. The shape, each part there for a reason:
+  - **It holds only the line and the lease — never the state the runs decide on.** The state stays
+    where it is true (each KV cluster's own figures); the holder keeps the lock until what it did
+    is VISIBLE there (the VM object exists), so the next holder reads it and nothing is remembered
+    between runs. A lock that remembered a "pending" list would be a second copy to keep in step.
+  - **Code talks to code by SIGNALS** (Updates are for people, below): `request_lock`,
+    `lock_granted`, `release`, `withdraw`. Workflow code cannot signal-with-start, so a run asks by
+    `start_child_workflow(..., parent_close_policy=ABANDON)` with itself as the first of the line
+    and, on `WorkflowAlreadyStartedError`, signals the lock that already runs. The lock sets its
+    state in `@workflow.init`: a signal delivered with the first task is handled before `run()`.
+  - **A run is known by its RUN id**, and a grant is signalled to exactly that run
+    (`get_external_workflow_handle(id, run_id=…)`): workflow ids are reused (slots), and a later run
+    must never receive a grant it did not ask for.
+  - **A waiter that is gone costs nothing.** Signalling a closed run fails (an `ApplicationError`,
+    `ExternalWorkflowExecutionNotFound` — measured, also for a run id whose workflow id a newer run
+    now uses): the lock catches it and grants the next in the same task.
+  - **Every grant is a LEASE** (5 min, a durable timer), its end sent with the grant; a release
+    carrying another lease's id is ignored. What must not happen after the lease is enforced where
+    it would happen: the holder passes the lease's end on, and the worker refuses to act after it.
+  - **A waiter asks again** on a timer (2 min) and the lock keeps a run in its line once: a lock a
+    person terminated is started afresh by the next ask, so nothing strands. A run that gives up
+    (its own bound, a cancel) sends `withdraw`; a grant a run is not waiting for is released by
+    its signal handler at once.
+  - **The lock never fails and calls no activity** (tests pin both): a plain exception there would
+    hang it and stop every run of its zone. History is bounded by `continue_as_new` every N grants,
+    carrying the line and the lease, after `all_handlers_finished`; signals go to the workflow id,
+    never a run id, so they reach the continued run.
+- **A workflow exit path that AWAITS must tell a real cancel from a cache eviction.** A worker
+  dropping a run from its cache (a shutdown, a full cache) cancels the run's tasks exactly as a
+  cancel request does, and then no workflow API may be called: an `except BaseException:` or a
+  `finally:` that awaits a rollback, a signal or `wait_condition(all_handlers_finished)` there
+  raises inside the SDK's teardown. So such a path runs only when
+  `workflow.in_workflow() and workflow.cancellation_reason() is not None` (a cancel a PERSON
+  asked for — `cancellation_reason()` is not set by an eviction; temporalio ≥ 1.32, the brain's
+  floor since create-vm), or when the exception is an ordinary `Exception`. Never put the await in
+  a bare `finally`. Found on create-vm (2026-11-20), whose cancel rollback and whose "a grant given
+  straight back must be on its way before the run closes" both await on the way out.
 - **Evolving a model that crosses the boundary — history and a lagging limb both hold OLD payloads.**
   CI ships the brain BEFORE the limb (`build.yml`: the limbs' `build` job `needs` the brain's), and every
   in-flight run replays payloads recorded by the previous code. So (a) a field ADDED to a model an
@@ -1470,7 +1643,15 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   from scenarios on the fake fleet replay at once with `temporalio.worker.Replayer`, and GOLDEN
   histories committed under `tests/histories/cluster_upgrade/` replay on the current code. A golden
   replay failing means the change needs `workflow.patched()` — never re-record to make it pass;
-  re-record (`UPDATE_REPLAY_HISTORIES=1`) only while no run of the old shape can exist.
+  re-record (`UPDATE_REPLAY_HISTORIES=1`) only while no run of the old shape can exist. **A golden
+  is recorded with the PRODUCTION constants**: a workflow whose flow depends on a constant (a
+  lease's length, a guard, a re-ask interval, a continue-as-new threshold) does not replay a
+  history recorded with that constant patched — create-vm's dead-worker scenarios failed exactly so
+  when first recorded under shrunk waits. `tests/manual_time.py` is how they are recorded on the
+  real waits: it moves the test server's clock by hand, past tasks nobody serves (the server never
+  skips time by itself under one, and left to skip freely it jumps an idle long-lived workflow to
+  its ten-year timeout). kv-zone-lock is ALWAYS in flight, so its goldens
+  (`tests/histories/kv_zone_lock/`) matter on every deploy.
 
 ## 6. Idempotency (required for all activities)
 
@@ -1498,7 +1679,15 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   never record a vlan the Segments Manager does not confirm. A mutation whose outcome another system
   will act on gets a read-back check between the mutation and the recording. release-segment reads
   the scope back after its DELETE (before the segment returns to the pool) and the segment back
-  after its release.
+  after its release. create-vm's worker reads back the VMs carrying the run's id after its create,
+  before the VM's name is recorded: the run must hold exactly ONE, and a second (a create the API
+  server finished after its caller gave up on it) is converged on the oldest by whichever attempt
+  meets the pair (§4).
+- **Idempotent by the RUN's id when nothing else identifies the thing** (create-vm, 2026-11-20): the
+  VM's name is drawn inside the activity, so a retry cannot find "its" VM by name. The request
+  carries the run id, the worker labels the VM with it, and every attempt looks for that label
+  FIRST — before any time bound, so a retry after the lease still returns what it made. Not the
+  workflow id: a slot's id is reused by later runs, which must each get a new VM.
 - Workflow IDs are deterministic (`initialize-segment-<network address, CIDR mask dropped>`,
   e.g. `initialize-segment-130.154.20.0`; `allocate-segment-<TYPE>-<cluster>`;
   `release-segment-<TYPE>-<cluster>`) for natural dedup — a
@@ -1531,11 +1720,15 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   `TEMPORAL_NAMESPACE`, `SEGMENTS_MANAGER_URL`. `<domain>-config` (owned by that domain's
   chart) holds its own endpoints/policy — e.g. `cluster-lifecycle-config` = provision-cluster's keys
   (`DAY1_REPO_URL`, `DHCP_EXCLUSION_OCTET_RANGES`, `DAY2_SIG_REPO_URL_TEMPLATE`, `SHORTCUTS_API_URL`,
-  `SHORTCUT_OWNER`, `CLUSTER_CONSOLE_URL_TEMPLATE`; the credentials from the shared `redbull-git-token`
+  `SHORTCUT_OWNER`, `CLUSTER_CONSOLE_URL_TEMPLATE`, and create-vm's `HEADROOM_BUFFER_PERCENT` when it is
+  to differ from its default; the credentials from the shared `redbull-git-token`
   Secret under its own key, `REDBULL_GIT_TOKEN` — the group token, day1 and the sigs alike — and
   `SHORTCUTS_API_TOKEN` from the out-of-band `shortcuts-api-token` Secret) and `segment-lifecycle-config` = release-segment's
   `DHCP_API_URL` (its token in the `dhcp-api-token` Secret) — the day1 and DHCP-policy keys it
-  rendered for allocate-segment are dropped only once its image stops reading them. A
+  rendered for allocate-segment are dropped only once its image stops reading them. `vm-lifecycle-config`
+  is the exception to "a limb mounts the global ConfigMap": it lives in a KV cluster, where no brain
+  release exists, so (like the per-MCE limbs' charts) it renders its own `TEMPORAL_*` next to the
+  cluster's own values (`KV_CLUSTER`, `VM_MAC_PREFIX`, `VM_*`). A
   domain worker mounts BOTH + its Secrets, so the
   brain release must install before any limb (else `CreateContainerConfigError` on the missing
   global ConfigMap) — and the chart must ship the new keys BEFORE (or with) an image that requires
@@ -1554,10 +1747,15 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   The classes: `TemporalSettings` (workers + api.py),
   `SegmentLifecycleActivitySettings`, `ServerLifecycleActivitySettings`,
   `ServerProvisioningActivitySettings`, `VmLifecycleActivitySettings` (each that domain's activity
-  worker only; this one: `DAY1_REPO_URL`/`DAY1_GIT_TOKEN` again, `KV_CAPACITY_URL_TEMPLATE` /
-  `KV_VM_API_URL_TEMPLATE` with their placeholders checked at startup, the two tokens, `KV_AGENT_CA`,
-  `HEADROOM_BUFFER_PERCENT` 0..90 and `VM_MAC_PREFIX` — locally administered unicast, checked) and
-  `ClusterLifecycleActivitySettings` (`DAY1_REPO_URL`, `REDBULL_GIT_TOKEN` — the air-gap Secret's key, the
+  worker only; this one is the worker INSIDE a KV cluster and holds only that cluster's own values:
+  `KV_CLUSTER`, REQUIRED and NEVER canonicalised — it must equal the day1 file name — parsed at start
+  as `ocp4-<lifecycle>-kv-<site>-<id>`, the site read from it; `VM_MAC_PREFIX`, REQUIRED, three
+  octets, the first `0e`, no default; `VM_STORAGE_CLASS_NAME`, REQUIRED; `VM_NETWORK` and
+  `VM_NODE_SELECTOR`, JSON; `VM_REDFISH_LABEL`; `VM_ROOT_DISK_SIZE`. No day1 key, no token, no
+  buffer since 2026-11-20) and
+  `ClusterLifecycleActivitySettings` (`HEADROOM_BUFFER_PERCENT`, create-vm's placement buffer, ONE
+  value for every KV cluster, 0..90, default 15 — optional, so the image may ship before the chart
+  renders it; `DAY1_REPO_URL`, `REDBULL_GIT_TOKEN` — the air-gap Secret's key, the
   operator 2026-11-11; `DAY1_GIT_TOKEN` accepted as an alias, the air-gap name winning,
   `DHCP_EXCLUSION_OCTET_RANGES` with its validator — moved here from segment-lifecycle 2026-11-11 —
   `DAY2_SIG_REPO_URL_TEMPLATE`, which must name `{sig}` (one GitLab project per sig),
@@ -1569,7 +1767,8 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   cluster-upgrade activities it re-registers, from the same pod env. Field names = Helm ConfigMap/Secret keys
   lowercased — keep aligned with redbull-platform's `gitops/charts/workflows-orchestrator/templates/config.yaml`
   (global), `gitops/charts/cluster-lifecycle-worker/templates/config.yaml` (day1 URL +
-  DHCP policy + day2 sig URL template) and `gitops/charts/segment-lifecycle-worker/templates/config.yaml`
+  DHCP policy + day2 sig URL template, and `HEADROOM_BUFFER_PERCENT` when it is to differ from 15),
+  `deploy/charts/vm-lifecycle-worker/templates/configmap.yaml` (a KV cluster's own values) and `gitops/charts/segment-lifecycle-worker/templates/config.yaml`
   (DHCP API URL + the credential Secrets). Which ConfigMap
   a key lives in is INDEPENDENT of which settings class declares it (pydantic reads the flat merged pod
   env — `SEGMENTS_MANAGER_URL` sits in the global ConfigMap yet stays a
@@ -1622,23 +1821,35 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   `gitops/charts/server-provisioning-worker/` (each: ConfigMap + Secrets + limb +
   SA; the provisioning one needs no RBAC, only egress to the iDRACs, OME, the naming service and
   server-scan), `gitops/charts/upgrade-gitops-worker/` (the cluster-upgrade hub limb; its only
-  copy, moved from `deploy/charts/` on 2026-11-02) and `gitops/charts/vm-lifecycle-worker/`
-  (create-vm's hub limb: ConfigMap + the two agent-token Secrets behind `existing*` hooks + limb +
-  SA, `automountServiceAccountToken: false`, an optional CA ConfigMap; it NAMES the
-  `redbull-git-token` Secret and never renders it) and `gitops/charts/cluster-lifecycle-worker/`
-  (provision-cluster's hub limb: ConfigMap + limb + SA, `automountServiceAccountToken: false`; it
+  copy, moved from `deploy/charts/` on 2026-11-02) and `gitops/charts/cluster-lifecycle-worker/`
+  (provision-cluster's hub limb, which also lists day1's clusters for other domains and holds
+  create-vm's placement buffer: ConfigMap + limb + SA, `automountServiceAccountToken: false`; it
   NAMES `redbull-git-token` for `REDBULL_GIT_TOKEN`, the one group token for day1 and the sigs;
-  both built by CI's `build` matrix like every limb, §9). This repo ships the PER-MCE limbs' charts, written to be copied into
+  built by CI's `build` matrix like every limb, §9). This repo ships the charts of the limbs that
+  run OUTSIDE the hub — per MCE, per KV cluster — written to be copied into
   redbull-platform for Argo CD (example ApplicationSet in `deploy/argocd/`):
-  `deploy/charts/server-lifecycle-worker/`, `deploy/charts/cluster-upgrade-worker/` and
-  `deploy/charts/upgrade-agent-worker/` — the last two copied into redbull-platform's
+  `deploy/charts/server-lifecycle-worker/`, `deploy/charts/cluster-upgrade-worker/`,
+  `deploy/charts/upgrade-agent-worker/` and `deploy/charts/vm-lifecycle-worker/` (2026-11-20:
+  one release INSIDE each KV cluster, its ConfigMap that cluster's own values, a ClusterRole of
+  exactly the verbs `activities/vm_lifecycle/kubevirt_api.py` uses — list nodes and pods, get
+  namespaces and PVCs, get/list/create/delete VirtualMachines, list VMIs, get/delete DataVolumes
+  — and NO Secret; the render fails without `kvCluster`, the MAC prefix or the storage class;
+  until then `gitops/charts/vm-lifecycle-worker/` was a hub chart with two agent-token Secrets)
+  — the last three copied into redbull-platform's
   `gitops/charts/<same name>/` BY CI (`sync-upgrade-charts`, `scripts/sync_platform_charts.sh`,
   the operator's request 2026-11-02): on every `main` push that changes them, the whole chart,
   keeping the image tag and chart version the build jobs wrote there, rendered, committed and
-  pushed before the image jobs run. Edit them HERE only; a hand edit there is overwritten.
+  pushed before the image jobs run. Edit them HERE only; a hand edit there is overwritten. The
+  script keeps a destination's image only when the image sits where the chart keeps it
+  (`.image.repository`): redbull-platform's old hub `vm-lifecycle-worker` had it under
+  `activityWorker.image`, and yq's `null` for the missing field would have been written back as
+  the repository and the tag — a destination of another shape is REPLACED, keeping only its chart
+  version and appVersion (the `<chart>/vX.Y.Z` tags go on from them), and its image tag is
+  written by the image's next build (`.github/image-builds.json`: `helm-image-path: image`).
   server-lifecycle-worker's redbull-platform chart is its own reshaped chart, not synced. On a
-  remote MCE each renders its own Temporal endpoint, since no brain ConfigMap exists there;
-  `deploy/` is in `.dockerignore` and triggers no image build (those two charts trigger the sync). The server-lifecycle limb is the first to need real RBAC: it creates
+  remote MCE or KV cluster each renders its own Temporal endpoint, since no brain ConfigMap exists
+  there; `deploy/` is in `.dockerignore` and triggers no image build (those three charts trigger
+  the sync). The server-lifecycle limb is the first to need real RBAC: it creates
   secrets, metal3.io/baremetalhosts and agent-install.openshift.io/nmstateconfigs in the target
   namespace, where segment-lifecycle only makes HTTP and git calls — and, for uninstall-server-from-hc,
   a ClusterRole over CAPI Machines, AgentMachines, HostedClusters and Secrets (§4) — the same
@@ -1816,8 +2027,14 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   `POST /workflows/vm-lifecycle/create-vm` is ASYNC too and is ALSO a slot draw: without `count`
   one run in the first free slot (`create-vm-<mce>_<infraEnv>_<slot>`, never a 409 unless all 100
   slots run), with `count` (1-20) one run per free slot and a per-run report — the VM's name is drawn
-  inside the run, so nothing at the edge can key it (§4). `mce_cluster` must parse as
-  `ocp4-<env>-mce-<site>-<letter>` and `infra_env` as a KubeVirt InfraEnv, each a 422 otherwise.
+  inside the run, so nothing at the edge can key it (§4). `infra_env` must parse as a KubeVirt
+  InfraEnv of the convention, `<flavor>-kv<cpu>-<site>-<zone>` (zone `az<N>`, 1..256 vCPUs; a
+  `-mtl-` InfraEnv and the 2026-11-04 `…-zone-<zone>-<cpu>` form are refused), `mce_cluster` as
+  `ocp4-<lifecycle>-mce-<site>-<id>` AT THE INFRAENV'S SITE (a VM boots on its own site's inventory
+  network), and the VM name the cluster's worker will build must fit a Kubernetes name with its
+  `-root` DataVolume — each a 422 otherwise. The flavor, site, zone, cpu and memory are derived
+  here once and carried. `count` runs are ordinary parallel runs: each takes its zone's lock in
+  turn, so they no longer all land on one cluster.
   `POST /workflows/segment-lifecycle/initialize-segment` is ASYNC (202 + workflow id) and takes
   the full segment definition; poll `GET /workflows/runs/{workflow_id}` for progress/result. The
   `/bulk` variant takes a list and starts ONE WORKFLOW PER SEGMENT (never one batch workflow — each

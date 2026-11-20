@@ -1,5 +1,11 @@
 # KubeVirt cluster placement for create-vm — the metric and the choice rule
 
+> **SUPERSEDED, 2026-11-20.** create-vm no longer ranks clusters through agents: it takes its
+> zone's lock, asks the worker inside each KV cluster, oldest first, and creates on the first
+> with room. The design is `create-vm-placement.md`, next to this file;
+> `activities/vm_lifecycle/placement.py`, `rank_kv_clusters` and best-fit ranking as described
+> below are gone (the fit rule is now `workflow_domains/vm_lifecycle/placement.py`). Kept for the reasoning that led here; nothing below describes the code.
+
 Status: **implemented, 2026-11-05** — `activities/vm_lifecycle/placement.py`
 is this document's one implementation, called by create-vm's `rank_kv_clusters`
 activity. First written 2026-11-04, before the workflow was designed; the

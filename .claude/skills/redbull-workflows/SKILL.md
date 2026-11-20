@@ -14,9 +14,11 @@ paths:
 A Temporal-based OpenShift cluster-lifecycle orchestrator. ONE "brain" deployment runs
 every workflow of every domain; each "limb" deployment runs one credential set's
 activities (a domain may need several limbs: cluster-upgrade has a hub limb and two
-per-MCE limbs); `shared/` is the typed contract between them. Hub limbs' charts are
-vendored in the sibling **redbull-platform** repo (`gitops/charts/<service>/`, where
-pushing `main` deploys); per-MCE limbs' charts live here in `deploy/charts/`.
+per-MCE limbs; vm-lifecycle's one limb runs inside each KV cluster, and its day1 read is
+on the cluster-lifecycle limb); `shared/` is the typed contract between them. Hub limbs'
+charts are vendored in the sibling **redbull-platform** repo (`gitops/charts/<service>/`,
+where pushing `main` deploys); the charts of limbs that run outside the hub (per MCE, per
+KV cluster) live here in `deploy/charts/`.
 
 Four layers keep the architecture true for everyone. Use them in this order:
 
@@ -69,12 +71,16 @@ and the checker in the same commit.
    | multi-step workflow, read-back gate, git write | `workflow_domains/segment_lifecycle/allocate_segment.py` |
    | per-MCE routing, permanent-error tuple, patches, legacy rename | `workflow_domains/server_lifecycle/add_server_to_mce.py` |
    | Updates, heartbeating watches, child driven by signals, dispatch helpers | `workflow_domains/cluster_upgrade/upgrade_cluster.py`, `dispatch.py` |
-   | pure sandbox policy module | `workflow_domains/server_lifecycle/bond_selection.py` |
+   | pure sandbox policy module | `workflow_domains/server_lifecycle/bond_selection.py`, `workflow_domains/vm_lifecycle/placement.py` |
+   | a lock between runs: code-to-code signals, start-child-or-signal, leases, run-id identity, continue-as-new | `workflow_domains/vm_lifecycle/kv_zone_lock.py` + `create_vm.py` (`_acquire`, `_release`) |
+   | cancel rollback that tells a cancel from a cache eviction | `workflow_domains/vm_lifecycle/create_vm.py` (`run`) |
    | routes: single, bulk, slots, decisions, 410 for renamed paths, synchronous question | the domain `router.py` files |
    | temporary page | `workflow_domains/<domain>/ui.py` + `tests/test_<domain>_ui.py` |
-   | thin activity surface over technology modules | `activities/server_lifecycle/activities.py` + `cluster_api.py` |
+   | thin activity surface over technology modules | `activities/server_lifecycle/activities.py` + `cluster_api.py`; `activities/vm_lifecycle/activities.py` + `vm_operations.py` (each activity's whole body over an `api` object) |
    | per-MCE limb entrypoint + chart | `activities/server_lifecycle/worker_init.py`, `deploy/charts/server-lifecycle-worker/` |
+   | per-KV-cluster limb entrypoint + chart, no Secret | `activities/vm_lifecycle/worker_init.py`, `deploy/charts/vm-lifecycle-worker/` |
    | workflow tests, replay goldens | `tests/test_allocate_segment_workflow.py`, `tests/test_upgrade_cluster_replay.py` |
+   | a fake fleet running the real limb code, a clock moved by hand | `tests/kv_fleet.py`, `tests/manual_time.py`, `tests/test_create_vm_workflow.py` |
 
 ## Step 1 — pick the procedure
 

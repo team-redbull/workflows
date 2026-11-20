@@ -23,7 +23,8 @@ settings class (`<Limb>ActivitySettings`) and the chart name from them.
 3. **Limb** — `activities/<limb>/`: `activities.py` (the `@activity.defn` surface only:
    settings, `activity.logger`, a call into a technology module), one
    `<technology>.py` per dependency taking PLAIN parameters (no settings, no Temporal),
-   `worker_init.py` (copy `activities/server_lifecycle/worker_init.py` for a per-MCE limb:
+   `worker_init.py` (copy `activities/server_lifecycle/worker_init.py` for a per-MCE limb, or
+   `activities/vm_lifecycle/worker_init.py` for one that runs inside another cluster and holds no Secret:
    `connect_temporal`, `graceful_shutdown_timeout`, `install_shutdown_handler`, the queue
    from `shared/consts.py`), `requirements.txt` (this limb's deps only, also pulled into
    `requirements-dev.txt` so tests can import it), and a `Dockerfile` whose CMD runs
@@ -44,8 +45,10 @@ settings class (`<Limb>ActivitySettings`) and the chart name from them.
    the bump fails — that image only; no image-only job with a `<branch-slug>-<sha>` tag
    (removed 2026-11-02). Add a `cleanup-<limb>-worker-on-delete` job in `build.yml`. A
    limb rebuilds only when a file it LOADS changes; a module of `shared/` it imports is one.
-6. **Chart** — per-MCE limb: `deploy/charts/<limb>-worker/` here, with a README whose
-   RBAC table is derived call by call from `activities.py`; hub limb:
+6. **Chart** — a limb that runs outside the hub (per MCE, per KV cluster):
+   `deploy/charts/<limb>-worker/` here, with a README whose RBAC table is derived call by
+   call from the code, and its name in `scripts/sync_platform_charts.sh` if CI is to copy
+   it into redbull-platform; hub limb:
    redbull-platform, per [platform-chart.md](platform-chart.md).
 
 ## B. A new domain (adds to A)

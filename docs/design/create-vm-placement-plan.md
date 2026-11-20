@@ -4,7 +4,8 @@ The design is `docs/design/create-vm-placement.md`, next to this file. **The des
 authoritative.** This file is the implementation plan for it. It was first written as
 `i-want-to-make-optimized-shamir.md`, corrected in review (2026-11-19) wherever it still described
 the earlier design, then amended (2026-11-20). Both rounds are listed at the end.
-**Nothing is implemented until the operator approves.**
+**Implemented on branch `feat/vm-lifecycle-per-kv-cluster` on 2026-11-20**; where the code
+differs from or adds to this text is listed in the last section, "As implemented".
 
 ## Context
 
@@ -519,3 +520,53 @@ replaces it; removing it first breaks the next tag bump). Update its CLAUDE.md/R
 | File | `i-want-to-make-optimized-shamir.md` | `create-vm-placement-plan.md`, next to the design |
 | §1.4a (new), §1.5, §1.6, §1.7 | create-vm's listing remembered the day1 list for one commit, as its own cache | One cache for every git READ in the repo: `git_repo.snapshot` asks the remote's head every time and clones only when it moved; writes keep `fresh_clone`. The existing day1 and day2 readers migrate; AC008 enforces it; CLAUDE.md §5 and `.claude/rules/activities.md` state it |
 | Context 3, §1.3, §1.4, §1.4b (new), §1.6 | KV clusters found by walking every seed folder of the site, the zone read from each file's NodePools; a create-vm module for the walk | The seed is `ocp4-seed-<site>-<zone number>` (2026-11-20), so a zone's clusters are ONE folder and the NodePools' zone only cross-checks it. Every day1 read goes through one `Day1` query library (`clusters`, `kv_clusters`, `hosted_clusters`, `cluster`; kinds `hc` / `kv`), a `list_day1_clusters` activity on the cluster-lifecycle limb for other domains, AC009 refusing a day1 walk elsewhere, and a skill page for adding a query |
+
+## As implemented (2026-11-20)
+
+Branch `feat/vm-lifecycle-per-kv-cluster`. The text above is the plan as reviewed; this section
+lists where the code differs from it or adds to it. The current description of the workflow is
+`docs/site/vm-lifecycle/create-vm.html` and CLAUDE.md §4.
+
+### Differs from the plan
+
+| Section | The plan said | The code does |
+|---|---|---|
+| §1.2, §1.3 | `request_id` = the workflow id | `request_id` = the RUN id. A create-vm id is a slot, reused by the next run once this one closed; keyed on the workflow id, the next run of the slot would find the last run's VM as "its own" and create nothing. The run id is one execution's. The workflow id is on the VM as the annotation `redbull.io/workflow-id`. |
+| §1.4 | KubeMacPool's refusal of a duplicate MAC is one of the answers that draws again | Still handled when it comes, and NEVER relied on (the operator, 2026-11-20: the KV clusters will run upstream KubeVirt, with no KubeMacPool). The worker lists every VM of the cluster before it draws and compares MACs itself; that list is the uniqueness check. |
+| §1.4a | `snapshot(repo_url, token, branch, repo, prefix)`; "ONE shallow clone of exactly that SHA" | `snapshot(repo_url, token, repo, branch, missing_message, cache_root)`: no `prefix`. It clones `--depth 1 --branch <branch> --single-branch` and keys the snapshot by the commit the clone actually holds (`rev-parse HEAD`): a branch that moved since the `ls-remote` gives the newer head, and the next read finds it already held. |
+| §1.4b | `Day1Cluster` records | `ClusterRecord` in `activities/day1_repo.py` (`Day1Cluster` is already cluster-upgrade's model), with `blocking` (problems that take the file out of a listing) apart from warnings, and `confirmed_zone`. On the wire: `Day1ClusterEntry` in a `Day1ClusterList`. |
+| §1.4a | Reads take the snapshot | So does `read_rules`, whose validator is one of day1's own scripts: it runs in a `scratch` copy of the snapshot, never in the tree other readers hold. |
+| §1.6 | Workflow tests in the time-skipping environment | create-vm's and the lock's move the clock by hand (`tests/manual_time.py`): left alone the test server jumps an idle lock to its run timeout, and skips no time under an outstanding task. Goldens are recorded with the production constants. |
+
+### Added beyond the plan (awaiting the operator's confirmation, CLAUDE.md §4)
+
+- **`flavor` on `CreateVmInput`**, parsed at the edge with the rest of the InfraEnv's name, and
+  REQUIRED on the model, against CLAUDE.md §5's "a field added to a history-decoded model
+  defaults to None": a run of the earlier shape cannot be replayed by the rewritten workflow
+  anyway. Also added: the 45 s lease guard, usable nodes without repelling taints and under
+  `VM_NODE_SELECTOR`, the figures read's 120 s bound, `VM_ROOT_DISK_SIZE`,
+  `KvClusterMismatchError`, and the brain's `temporalio>=1.32` floor.
+- **A cancel rolls back.** A cancelled run waits for its create to settle, deletes the VM that
+  carries its run id on the chosen cluster, withdraws from the line or releases the lock, and
+  ends CANCELED. Terminate runs no code.
+- **A run holds ONE VM.** A create that finds two VMs of its request keeps the oldest and
+  deletes the other, before and after its own write.
+- **A create attempt ends inside its timeout** (`CREATE_BUDGET_SECONDS`, 55 s of the 90 s
+  `start_to_close_timeout`), and the worker refuses a create that reaches it after
+  `create_before` (`VmLeaseExpiredError`).
+- **The lease bounds the scan.** A run takes at most three leases (`_MAX_LEASES`), then
+  `KvZoneLeaseExpiredError`; a cluster with no worker costs one 30 s schedule-to-start.
+- **Checker rule AC009**: day1's folder layout is spelled in `activities/day1_repo.py` only.
+  Three marked exceptions, none of them day1's tree: `upgrade_gitops/day2_repo.py`,
+  `cluster_lifecycle/day2_sigs.py` (day2's tree) and `upgrade_gitops/upgrade_rules.py` (the
+  rules' own file).
+- **The chart sync** (`scripts/sync_platform_charts.sh`) copies `vm-lifecycle-worker` too, and
+  replaces a destination chart of another shape (the hub chart of the earlier design).
+
+### Replay goldens as recorded
+
+`tests/histories/create_vm/`: create, second-cluster, no-capacity, no-cluster, no-kv-worker,
+mac-redraw, draws-exhausted, lease-expired-at-the-worker, rollback, waited-for-the-lock,
+second-lease, leases-exhausted, lock-timeout, cancel-removes-the-vm, cancel-in-the-line.
+`tests/histories/kv_zone_lock/`: two-runs, lease-expiry, dead-waiter-skipped, withdraw,
+continue-as-new, continued.

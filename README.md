@@ -58,8 +58,10 @@ shared/                           Contract layer (temporalio + pydantic only)
   models/<domain>.py              Typed state across the workflow/activity boundary
   interfaces/<domain>.py          Activity signatures (no bodies)
   bmc_address.py                  Pure naming/address logic BOTH sides need
-  infraenv_names.py               The naming convention: an InfraEnv's zone and VM size
-  cluster_names.py                Canonical MCE names; site, seed and KV-cluster names
+  infraenv_names.py               The naming convention: an InfraEnv's flavor, VM size,
+                                    site and zone; a VM's name
+  cluster_names.py                Canonical MCE names; cluster, seed, zone and KV-cluster names
+  vm_requests.py                  A VM's size as the scheduler counts it (read on both sides)
   settings/<limb>.py              One settings module per worker (+ temporal.py); never re-exported
   exceptions.py / consts.py / workflow_ids.py / logging_config.py
 workflow_domains/                 The brain — one folder per domain, plus main_worker_init.py + api.py
@@ -74,7 +76,8 @@ workflow_domains/                 The brain — one folder per domain, plus main
                                     per-MCE slot child), upgrade_path.py and gates.py
                                     (its pure rules), dispatch.py, router.py (not
                                     mounted yet)
-  vm_lifecycle/                   create_vm.py, router.py
+  vm_lifecycle/                   create_vm.py, kv_zone_lock.py (the per-zone lock it
+                                    takes), placement.py (the pure fit rule), router.py
   cluster_lifecycle/              provision_cluster.py, router.py (the body is the
                                     hosted-cluster YAML itself)
   routers/                        What no domain owns: deps, shared models, runs.py
@@ -95,11 +98,13 @@ activities/<domain>/              The limbs
                                     bmh_resources.py (the resource bodies),
                                     idrac.py (Redfish), ome.py (OpenManage),
                                     server_namer.py (the naming service),
-                                    vm_lifecycle/day1_repo.py (a zone's KubeVirt
-                                    clusters from the seed folder),
-                                    kv_capacity_api.py + kv_vm_api.py (the
-                                    KubeVirt clusters' agents), placement.py
-                                    (best-fit under the buffer)
+                                    cluster_lifecycle/day1_clusters.py (day1's
+                                    clusters, a zone's KV clusters), and, for the
+                                    worker inside a KV cluster,
+                                    vm_lifecycle/kubevirt_api.py (its cluster's
+                                    API), cluster_figures.py (the capacity
+                                    arithmetic), vm_spec.py (the VirtualMachine it
+                                    builds), vm_operations.py (each activity's body)
   worker_init.py                  Registers this domain's activities, polls its queue
 docs/                             The static documentation site (its own image)
 ```
@@ -112,9 +117,9 @@ The prod charts are vendored into the Argo CD repo, not this one:
 | `redbull-platform/gitops/charts/segment-lifecycle-worker/` | the `segment-lifecycle-worker` limb |
 | `redbull-platform/gitops/charts/server-lifecycle-worker/` | the `server-lifecycle-worker` limb |
 | `redbull-platform/gitops/charts/server-provisioning-worker/` | the `server-provisioning-worker` limb — no `gitops/services/` entry yet, so nothing deploys it |
-| `redbull-platform/gitops/charts/vm-lifecycle-worker/` | the `vm-lifecycle-worker` limb (create-vm) — ONE release on the hub for every zone; needs the `kv-capacity-token` and `kv-vm-api-token` Secrets and reads the shared `redbull-git-token` |
-| `redbull-platform/gitops/charts/cluster-lifecycle-worker/` | the `cluster-lifecycle-worker` limb (provision-cluster) — ONE release on the hub; reads the shared `redbull-git-token` (day1 push + its provider's merge-request API, the day2 sig repos) and names the `shortcuts-api-token` Secret |
+| `redbull-platform/gitops/charts/cluster-lifecycle-worker/` | the `cluster-lifecycle-worker` limb (provision-cluster; create-vm's list of a zone's KV clusters and the placement buffer) — ONE release on the hub; reads the shared `redbull-git-token` (day1 push + its provider's merge-request API, the day2 sig repos) and names the `shortcuts-api-token` Secret |
 | `redbull-platform/gitops/charts/cluster-upgrade-worker/`, `.../upgrade-agent-worker/` | cluster-upgrade's per-MCE limbs, copied from `deploy/charts/` here by CI (`sync-upgrade-charts`) on every `main` push that changes them — no `gitops/services/` entry yet |
+| `redbull-platform/gitops/charts/vm-lifecycle-worker/` | the `vm-lifecycle-worker` limb (create-vm) — one release INSIDE each KV cluster, no Secret; copied from `deploy/charts/vm-lifecycle-worker/` here by the same CI job. No `gitops/services/` entry: each KV cluster gets it through day2. (Until 2026-11-20 this was a hub chart reaching each cluster through two HTTP agents) |
 | `redbull-platform/gitops/charts/upgrade-gitops-worker/` | cluster-upgrade's hub limb (its only copy) — no `gitops/services/` entry yet |
 
 Every image built on `main` is tagged `vX.Y.Z` by the shared build workflow, which writes the
@@ -142,7 +147,11 @@ segment-lifecycle workflows share the one `segment-lifecycle-activity` queue and
 therefore the one limb deployment; `add-server-to-mce` runs on
 `server-lifecycle-activity` and reaches back to the segment-lifecycle queue for
 one activity (below); `provision-cluster` runs on `cluster-lifecycle-activity`
-and starts `allocate-segment` as an awaited child.
+and starts `allocate-segment` as an awaited child; `create-vm` reads its zone's
+KV clusters on `cluster-lifecycle-activity`, takes its zone's lock (`kv-zone-lock`,
+an internal workflow on its own queue, one run per site and zone) and asks
+everything else of the worker inside the chosen KV cluster, on
+`vm-lifecycle-activity-<kv cluster>`.
 
 **The server-lifecycle workflows were renamed on 2026-11-01**, so each name says
 what it does to what:
@@ -793,45 +802,69 @@ against a Dell simulator built from them (`tests/dell_simulator.py`).
 
 ### `create-vm` — one VirtualMachine for a KubeVirt InfraEnv
 
-Under the naming convention an InfraEnv `<conf>[-<letter>]-zone-<zone>-<cpu>`
-(`x201-zone-a-8`) holds VMs of `<cpu>` vCPUs and `<cpu> × 8` GiB on one of the
-zone's KubeVirt hosted clusters; a `-metal` InfraEnv holds physical servers. A
-KubeVirt InfraEnv has nothing to install until a VM exists, and `create-vm` is
-that step. Full page: `docs/site/vm-lifecycle/create-vm.html`.
+Under the platform naming convention an InfraEnv `<flavor>-kv<cpu>-<site>-<zone>`
+(`c200-kv32-five-az1`) holds VMs of `<cpu>` vCPUs and `<cpu> × 8` GiB on one of the
+zone's KV clusters (the hosted clusters whose nodes run the warm-pool VMs); a
+`<flavor>-mtl-<site>-<zone>` InfraEnv holds physical servers. A KubeVirt InfraEnv has
+nothing to install until a VM exists, and `create-vm` is that step. Full page:
+`docs/site/vm-lifecycle/create-vm.html`; the design: `docs/design/create-vm-placement.md`.
 
-Input: `mce_cluster` (named `ocp4-<env>-mce-<site>-<letter>`: the **site** comes
-from it), `infra_env` (the **zone** and the **size** come from it), `namespace`
-(default `inventory` — the VM's namespace on the KubeVirt cluster, verbatim, a
-kubevirt-redfish chassis namespace the platform created) and an optional
-`count`. The API derives site, zone, cpu and memory once; the run carries them.
+**The zone's clusters come from day1, their numbers from the clusters themselves, only
+one run at a time chooses in a zone, and the chosen cluster builds the VM.**
 
-1. **listing-kv-clusters** — the zone's KubeVirt clusters from the day1 repo's
-   seed folder `sites/<site>/mces/ocp4-seed-<site>-<zone>/hostedClusters/`
-   (read at `main` by the vm-lifecycle limb itself). None: `NoKvClusterError`.
-2. **ranking-kv-clusters** — every cluster's **kv-capacity** agent read at once;
-   best-fit bin packing under `HEADROOM_BUFFER_PERCENT`
-   (`docs/design/kubevirt-vm-placement.md`): fit per node, buffer per cluster,
-   our Halted not-yet-started VMs counted. Nothing fits: `NoKvClusterFitsError`
-   with the table summarised per reason.
-3. **creating-vm** — a six-hex suffix drawn by the run, skipped while its MAC
-   tail is any VM's in the zone, then ONE PUT on the chosen cluster's
-   **kv-vm-api**: `ocp-<infraenv>-<suffix>`, MAC `<VM_MAC_PREFIX>:xx:xx:xx`,
-   Halted, labelled `redfish-enabled: "true"`. A 409 redraws (3 draws, then
-   `VmNameExhaustedError`). Out-waited on the chosen cluster, never moved.
-4. **awaiting-root-disk** — one heartbeating activity, every 8 s, until the root
-   disk is bound and the VM admitted; bounded, 10 min.
-5. **removing-vm** — only on that deadline: the run deletes ITS OWN VM (by name
-   and MAC), then fails with `VmRootDiskNotBoundError`. A re-run draws a new
-   suffix, so an orphan would only multiply.
+Input: `mce_cluster` (named `ocp4-<lifecycle>-mce-<site>-<id>`, at the InfraEnv's site),
+`infra_env` (the **flavor**, the **size**, the **site** and the **zone** come from it),
+`namespace` (default `inventory` — the VM's namespace on the KV cluster, verbatim, a
+kubevirt-redfish chassis namespace the platform created) and an optional `count`. The
+API derives flavor, site, zone, cpu and memory once; the run carries them.
 
-The result carries the VM's name and MAC, the chosen cluster and the whole
-ranking table. Every run is a **slot** of its InfraEnv on its MCE
-(`create-vm-<mce>_<infraEnv>_<slot>`): asking again starts one more VM, never a
-409; `count` fills N free slots with a per-run report. The limb holds **no
-Kubernetes credential**: each KubeVirt cluster is reached through the two
-agents the platform deploys there behind Routes (`kv-capacity`, `kv-vm-api`;
-their contract is `docs/design/kv-agents-api.md`), one fleet token each. Until
-they are up, a run waits with every cluster `no-agent`.
+1. **listing-kv-clusters** — the zone's KV clusters, oldest first, from the day1 folder
+   of the zone's ONE seed, `sites/<site>/mces/ocp4-seed-<site>-<zone number>/hostedClusters/`,
+   with the placement buffer — read at `main` by the **cluster-lifecycle worker** (it
+   holds the day1 token) on the snapshot cached by commit. A file whose NodePools do not
+   all label the zone, or whose name is off the convention, is listed and never used.
+   None usable: `NoKvClusterError`.
+2. **awaiting-zone-lock** — the run asks the zone's lock (`kv-zone-lock`, one long-lived
+   workflow per (site, zone), no route) and waits for its grant, at most 30 min
+   (`KvZoneLockTimeoutError`). One holder at a time, in arrival order, a 5-minute lease.
+3. **choosing-kv-cluster** — holding the lock: each cluster's figures from the
+   `vm-lifecycle-worker` INSIDE it, on that cluster's own queue, one at a time, oldest
+   first; the fit rule (`workflow_domains/vm_lifecycle/placement.py`: one node must hold
+   the VM on CPU and memory; requested + the VM must stay under `1 − buffer` of the
+   cluster, stopped VMs counted). **The first that fits is chosen; the later ones are not
+   read.** No worker on a queue within 30 s is a `no-worker` row, never a failure.
+   Nothing fits: `NoKvClusterFitsError` with the table summarised per reason.
+4. **creating-vm** — what the VM is (flavor, vCPUs, memory, site, zone, MCE, namespace,
+   the run's id, the lease's end) goes to the chosen cluster's worker, which draws the MAC
+   behind its cluster's prefix (`0e` + the cluster's VLAN ID + 3 random bytes), names the
+   VM `ocp-<flavor>-kv<cpu>-<site>-<MAC>`, builds the VirtualMachine and creates it
+   Halted, labelled `redfish-enabled: "true"`. A taken MAC or name is drawn again by the
+   worker (3 draws, then `VmMacExhaustedError`); nothing is created after the lease
+   (`VmLeaseExpiredError`). Out-waited on the chosen cluster, never moved.
+5. **releasing-zone-lock** — as soon as the VM object exists, and on every other path.
+   The next run's figures already count the VM, as a stopped VM: nothing is remembered
+   between runs.
+6. **awaiting-root-disk** — one heartbeating activity, every 8 s, until the root disk is
+   bound and the VM admitted; bounded, 10 min; after the lock, in parallel with other runs.
+7. **removing-vm** — only when the run will not complete: that deadline
+   (`VmRootDiskNotBoundError`), a wait that fails for good, or a cancel. The run deletes
+   ITS OWN VM, found by the run-id label it was created with. A re-run draws a new MAC,
+   so an orphan would only multiply.
+
+The result carries the VM's name and MAC, the chosen cluster and the per-cluster table.
+Every run is a **slot** of its InfraEnv on its MCE (`create-vm-<mce>_<infraEnv>_<slot>`):
+asking again starts one more VM, never a 409; `count` fills N free slots with a per-run
+report. Parallel runs never overbook a cluster: ten 32-vCPU VMs asked at once over two
+100-core clusters with the 15% buffer land two on each, and six runs fail saying why.
+
+A `vm-lifecycle-worker` runs **inside each KV cluster** (chart
+`deploy/charts/vm-lifecycle-worker/`), polls `vm-lifecycle-activity-<its day1 file name>`,
+acts as its own ServiceAccount and dials out to the hub's Temporal: the KV cluster
+exposes nothing, the chart holds no Secret, and nothing on the hub holds a credential for
+it. A MAC is kept unique by the worker's own check against every VM of its cluster; it
+does not rely on KubeMacPool. A cluster in day1 without a running worker is skipped.
+This design replaced the hub limb and its two HTTP agents (`kv-capacity`, `kv-vm-api`)
+on 2026-11-20; `docs/design/kubevirt-vm-placement.md` and `kv-agents-api.md` are superseded.
 
 ### `provision-cluster` — a hosted cluster from the YAML a person wrote
 
@@ -958,7 +991,7 @@ result.
 | `POST /workflows/server-lifecycle/update-nodepool` | one NodePool's replicas, by name (a scale-up or scale-down child); a scale-down may name its `server_names` or a `scale_down_policy` (OpenShift 4.19 and later only) |
 | `POST /workflows/server-provisioning/provision-dell-server` | one Dell server, by iDRAC IP |
 | `POST /workflows/server-provisioning/provision-dell-server/bulk` | one workflow PER iDRAC IP |
-| `POST /workflows/vm-lifecycle/create-vm` | one workflow PER VM for a KubeVirt InfraEnv: one in the first free slot, or `count` in parallel |
+| `POST /workflows/vm-lifecycle/create-vm` | one workflow PER VM for a KubeVirt InfraEnv (`<flavor>-kv<cpu>-<site>-<zone>`, at the MCE's site): one in the first free slot, or `count` of them; runs of one zone choose and create one after another |
 | `POST /workflows/cluster-lifecycle/provision-cluster?cluster=&mce=` | one hosted cluster from the YAML in the body (`application/yaml`): segment, day1 branch, merge request, the wait for the merge, day2, the console shortcut |
 | `GET  /workflows/runs/{workflow_id}` | (status, every domain) |
 
@@ -1029,7 +1062,7 @@ would hide which segments actually got a workflow.
 | `DHCP_API_URL` | `segment-lifecycle-config` | release-segment's DHCP scope API (GETs anonymous) |
 | `SEGMENTS_MANAGER_API_TOKEN` | Secret | mutating calls only; GETs are public |
 | `DHCP_API_TOKEN` | Secret `dhcp-api-token` | the scope DELETE; a copy of the DHCP API's own token — rotate together |
-| `DAY1_REPO_URL` | `cluster-lifecycle-config` | provision-cluster's day1 repo: read at `main`, pushed on `provision-cluster/<cluster>` (the same repo the vm-lifecycle and upgrade-gitops charts name). GitLab: the merge request is opened through the API on this URL's host, the project being the URL's path (subgroups included) |
+| `DAY1_REPO_URL` | `cluster-lifecycle-config` | provision-cluster's day1 repo: read at `main`, pushed on `provision-cluster/<cluster>` (the same repo the upgrade-gitops chart names); create-vm's list of a zone's KV clusters is read from it too. GitLab: the merge request is opened through the API on this URL's host, the project being the URL's path (subgroups included) |
 | `DHCP_EXCLUSION_OCTET_RANGES` | `cluster-lifecycle-config` | the DHCP policy written into every cluster file (was segment-lifecycle's until 2026-11-11) |
 | `DAY2_SIG_REPO_URL_TEMPLATE` | `cluster-lifecycle-config` | the day2 sig repos: the URL with `{sig}`, one GitLab project per sig, the tree at its root |
 | `REDBULL_GIT_TOKEN` | Secret `redbull-git-token`, key `REDBULL_GIT_TOKEN`, under its own name | push rights AND GitLab's API (`api` + `write_repository`), with a role that may push each sig project's protected default branch (Maintainer); `DAY1_GIT_TOKEN` is accepted too (a cluster with only `day1-git-token`), `REDBULL_GIT_TOKEN` wins; scrubbed from every error |
@@ -1038,6 +1071,7 @@ would hide which segments actually got a workflow.
 | `SHORTCUTS_API_TOKEN` | Secret `shortcuts-api-token`, key `SHORTCUTS_API_TOKEN` | its bearer token, created out of band; a rejected one holds runs at `creating-shortcut` (retried) |
 | `SHORTCUT_OWNER` | `cluster-lifecycle-config` | the `username` every shortcut is created with; the service reports it back as the owner, which is how a re-run knows a taken name is its own |
 | `CLUSTER_CONSOLE_URL_TEMPLATE` | `cluster-lifecycle-config` | the console URL a shortcut points at, `{cluster}` = the day1 file stem: `https://console-openshift-console.apps.{cluster}.<base domain>` |
+| `HEADROOM_BUFFER_PERCENT` | `cluster-lifecycle-config`, optional | create-vm's placement policy, ONE value for every KV cluster: the share of each cluster's usable allocatable kept unrequested after placing a VM, 0–90, default 15. Handed to each run with its zone's cluster list |
 | `MCE_CLUSTER` | `server-lifecycle-config` | which MCE this worker serves — names its queue, so it must match callers' `mce_cluster` |
 | `SERVER_SCAN_URL` | `server-lifecycle-config` | inventory API base, INCLUDING `/api/v1` |
 | `SERVER_SCAN_API_TOKEN` | Secret | an **admin** token — add-server-to-mce takes and releases the install lock, and puts a server with no Agent in maintenance |
@@ -1054,12 +1088,11 @@ would hide which segments actually got a workflow.
 | `SERVER_NAMER_URL` | `server-provisioning-config` | the naming service |
 | `SERVER_NAMER_API_TOKEN` | Secret | optional bearer token |
 | `SERVER_SCAN_URL`/`_API_TOKEN` | as above | the provisioning worker reads it too (a viewer token) |
-| `DAY1_REPO_URL` | `vm-lifecycle-config` | create-vm lists a zone's KubeVirt clusters from it (read only); the shared `redbull-git-token` is mapped onto `DAY1_GIT_TOKEN` here too |
-| `KV_CAPACITY_URL_TEMPLATE`, `KV_VM_API_URL_TEMPLATE` | `vm-lifecycle-config` | the agents' Routes per KubeVirt cluster: `{cluster}`, `{name}`, `{hosted_cluster}`, `{site}`, `{zone}` |
-| `KV_CAPACITY_TOKEN`, `KV_VM_API_TOKEN` | Secrets `kv-capacity-token`, `kv-vm-api-token` | the agents' fleet tokens; rotate each with its agents |
-| `KV_AGENT_CA` | chart value `kvAgentCa` | PEM CA for the agents' Routes; empty = **not verified** (the operator's decision) |
-| `HEADROOM_BUFFER_PERCENT` | `vm-lifecycle-config` | our placement policy: the share of each cluster kept free after placing, 0–90 |
-| `VM_MAC_PREFIX` | `vm-lifecycle-config` | `xx:xx:xx`, locally administered unicast; the run draws the last three octets |
+| `KV_CLUSTER` | `vm-lifecycle-config` (in each KV cluster) | the KV cluster this worker runs in: EXACTLY its day1 file name (`ocp4-<lifecycle>-kv-<site>-<id>`), never abbreviated — it names the queue; the site is read from it |
+| `VM_MAC_PREFIX` | `vm-lifecycle-config` | the first three octets of every MAC this cluster's VMs get: `0e` + the cluster's VLAN ID; required, no default; the worker draws the last three |
+| `VM_STORAGE_CLASS_NAME` | `vm-lifecycle-config` | the root disk's storage class; must bind Immediately and allow RWX + Filesystem |
+| `VM_NETWORK`, `VM_NODE_SELECTOR` | `vm-lifecycle-config` | JSON: the VM's `networks[0]` body and its nodeSelector (`{}` for none) |
+| `VM_REDFISH_LABEL`, `VM_ROOT_DISK_SIZE` | `vm-lifecycle-config` | `redfish-enabled=true` and `120Gi` by default |
 
 server-scan holds no BMC credentials by design, so those live here; a vendor
 with none configured fails that server's install rather than writing a Secret
@@ -1078,7 +1111,13 @@ cp .env.example .env    # then point it at your Temporal / Segments Manager
 pip install -r activities/segment_lifecycle/requirements.txt -r activities/cluster_lifecycle/requirements.txt
 PYTHONPATH=. python -m workflow_domains.main_worker_init &
 PYTHONPATH=. python -m activities.segment_lifecycle.worker_init &
-PYTHONPATH=. python -m activities.cluster_lifecycle.worker_init &     # provision-cluster (git + the provider's API)
+PYTHONPATH=. python -m activities.cluster_lifecycle.worker_init &     # provision-cluster (git + the provider's API); create-vm's day1 list
+# create-vm also needs a worker per KV cluster of the zone. The real one runs INSIDE a KV
+# cluster (activities.vm_lifecycle.worker_init, KV_CLUSTER=<the day1 file name>, a kubeconfig
+# for a developer). To see a zone of many without the clusters, attach fake ones to the same
+# Temporal — the fleet the tests use, real limb code over an in-memory cluster API:
+#   PYTHONPATH=. python -m tests.kv_fleet --temporal localhost:7233 \
+#     --cluster ocp4-prod-kv-five-a:100:1024 --cluster ocp4-prod-kv-five-b:100:1024
 
 # Unified API
 pip install -r requirements.txt

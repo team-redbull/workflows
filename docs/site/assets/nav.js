@@ -122,15 +122,17 @@
     },
     {
       domain: "vm-lifecycle",
-      // One hub limb for every zone: it holds no Kubernetes credential and
-      // reaches each KubeVirt cluster through the two agents the platform
-      // deploys there (kv-capacity, kv-vm-api), behind Routes.
-      queue: "vm-lifecycle-activity",
+      // One worker INSIDE each KV cluster, on that cluster's own queue: it acts
+      // on its own API server as its own ServiceAccount and dials out to the
+      // hub's Temporal. The zone's cluster list is day1's, read on
+      // cluster-lifecycle-activity. kv-zone-lock, the per-zone lock, has no
+      // route and is described on create-vm's page.
+      queue: "vm-lifecycle-activity-<kv cluster>",
       workflows: [
         {
           name: "create-vm",
           href: "/vm-lifecycle/create-vm.html",
-          blurb: "one Halted VM, fixed MAC, on the best-fitting KubeVirt cluster of a zone"
+          blurb: "one Halted VM, fixed MAC, on the oldest KV cluster of a zone with room · one run per zone at a time"
         }
       ]
     }

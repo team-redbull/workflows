@@ -49,9 +49,12 @@ Checker ids in brackets.
 - **Order that keeps prod up**: brain image before limbs; a chart ships a new key before
   the image needs it and drops one only after the image stopped needing it; the brain
   release installs before any hub limb.
-- **Charts**: per-MCE limbs in `deploy/charts/<limb>-worker/` (README with config and
-  RBAC tables), cluster-upgrade's two copied into redbull-platform by CI's
-  `sync-upgrade-charts` (edit them here only); the brain and hub limbs in redbull-platform
+- **Charts**: the limbs that run outside the hub (per MCE; per KV cluster:
+  `vm-lifecycle-worker`) in `deploy/charts/<limb>-worker/` (README with config, RBAC and
+  network tables); cluster-upgrade's two and vm-lifecycle's copied into redbull-platform by
+  CI's `sync-upgrade-charts` (`scripts/sync_platform_charts.sh`: edit them here only; a
+  destination of another shape is replaced, never given a `null` image); the brain and hub
+  limbs in redbull-platform
   `gitops/charts/`. Each renders
   every REQUIRED settings key of its limb (a field without a default); none templates a
   Namespace. [DL005]

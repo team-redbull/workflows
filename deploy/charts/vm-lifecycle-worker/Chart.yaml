@@ -1,0 +1,12 @@
+apiVersion: v2
+name: vm-lifecycle-worker
+description: >-
+  The vm-lifecycle domain's activity worker ("limb"), one release PER KV CLUSTER,
+  installed INSIDE that KubeVirt cluster. It dials out to the hub's Temporal
+  frontend, polls vm-lifecycle-activity-<kvCluster>, measures its own cluster's
+  capacity and creates, reads and deletes the Halted VirtualMachines create-vm
+  asks for, as its own ServiceAccount — so the KV cluster exposes nothing and no
+  credential for it is stored anywhere. It holds no Secret.
+type: application
+version: 0.1.0
+appVersion: "v1.0.0"

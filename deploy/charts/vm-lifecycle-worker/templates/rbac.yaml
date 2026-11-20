@@ -1,0 +1,54 @@
+{{- if .Values.rbac.create }}
+# Exactly the verbs activities/vm_lifecycle/kubevirt_api.py uses on THIS KV
+# cluster, each from a call in the code (README "RBAC"). Cluster-wide because
+# the figures count pods and stopped VMs in EVERY namespace, a VM's MAC must be
+# free in every namespace, and the VM namespace is the request's.
+#   * nodes                    list: allocatable, Ready, cordoned, taints (the figures)
+#   * pods                     list: every unfinished pod's requests (the figures)
+#   * namespaces               get: the VM namespace must exist; the run never creates one
+#   * persistentvolumeclaims   get: is the root disk's claim Bound (the ready wait)
+#   * virtualmachines          list (the figures; the MAC and request-id lookups),
+#                              get (the ready wait; the delete's identity check),
+#                              create (the VM), delete (a run's own VM only: the
+#                              one labelled with its run id, by UID)
+#   * virtualmachineinstances  list: which VMs have a launcher pod (the figures)
+#   * datavolumes              get (the root disk's phase), delete (with its VM)
+# Nothing here starts, stops or patches a VM: kubevirt-redfish owns the power state.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "vlw.fullname" . }}
+  labels:
+    {{- include "vlw.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: [nodes, pods]
+    verbs: [list]
+  - apiGroups: [""]
+    resources: [namespaces, persistentvolumeclaims]
+    verbs: [get]
+  - apiGroups: [kubevirt.io]
+    resources: [virtualmachines]
+    verbs: [get, list, create, delete]
+  - apiGroups: [kubevirt.io]
+    resources: [virtualmachineinstances]
+    verbs: [list]
+  - apiGroups: [cdi.kubevirt.io]
+    resources: [datavolumes]
+    verbs: [get, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "vlw.fullname" . }}
+  labels:
+    {{- include "vlw.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "vlw.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "vlw.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

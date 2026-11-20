@@ -1,0 +1,27 @@
+{{- include "vlw.validate" . -}}
+# Everything this worker reads (shared/settings/vm_lifecycle.py
+# VmLifecycleActivitySettings and TemporalSettings). A KV cluster has no
+# brain, so the Temporal endpoint is rendered here and this one ConfigMap is
+# self-sufficient. No credential: the worker's ServiceAccount is its identity.
+# No placement buffer either: that is ONE value for every KV cluster, on the
+# hub (the cluster-lifecycle-worker's HEADROOM_BUFFER_PERCENT).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "vlw.configName" . }}
+  labels:
+    {{- include "vlw.labels" . | nindent 4 }}
+data:
+  TEMPORAL_HOST: {{ .Values.temporal.host | quote }}
+  TEMPORAL_NAMESPACE: {{ .Values.temporal.namespace | quote }}
+  KV_CLUSTER: {{ .Values.kvCluster | quote }}
+  VM_MAC_PREFIX: {{ .Values.config.vmMacPrefix | lower | quote }}
+  VM_STORAGE_CLASS_NAME: {{ .Values.vm.storageClassName | quote }}
+  VM_NETWORK: {{ .Values.vm.network | toJson | quote }}
+  VM_NODE_SELECTOR: {{ .Values.vm.nodeSelector | default dict | toJson | quote }}
+  VM_REDFISH_LABEL: {{ .Values.vm.redfishLabel | quote }}
+  VM_ROOT_DISK_SIZE: {{ .Values.vm.rootDiskSize | quote }}
+  {{- if .Values.temporal.tls.enabled }}
+  TEMPORAL_TLS_CA: /etc/temporal-tls/ca.crt
+  TEMPORAL_TLS_SERVER_NAME: {{ .Values.temporal.tls.serverName | default (first (splitList ":" .Values.temporal.host)) | quote }}
+  {{- end }}

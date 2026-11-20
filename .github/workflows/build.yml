@@ -186,7 +186,7 @@ jobs:
           # `charts` is no image: the per-MCE charts sync-upgrade-charts copies
           # into redbull-platform, and the script that copies them.
           charts=false
-          if [ "${all}" = true ] || grep -qE '^(deploy/charts/(cluster-upgrade-worker|upgrade-agent-worker)/|scripts/sync_platform_charts\.sh$|\.github/workflows/build\.yml$)' <<<"${changed}"; then
+          if [ "${all}" = true ] || grep -qE '^(deploy/charts/(cluster-upgrade-worker|upgrade-agent-worker|vm-lifecycle-worker)/|scripts/sync_platform_charts\.sh$|\.github/workflows/build\.yml$)' <<<"${changed}"; then
             charts=true
           fi
           {
@@ -269,7 +269,8 @@ jobs:
   # <branch-slug>-<short sha>. None of the three has a gitops/services/ entry yet, so
   # their bumps deploy nothing. All three are rows of the `build` matrix.
   sync-upgrade-charts:
-    # Copies deploy/charts/{cluster-upgrade-worker,upgrade-agent-worker} into
+    # Copies deploy/charts/{cluster-upgrade-worker,upgrade-agent-worker,vm-lifecycle-worker}
+    # (the limbs that run outside the hub: per MCE, per KV cluster) into
     # redbull-platform on a main push that changes them, so nobody keeps the two
     # copies equal by hand (scripts/sync_platform_charts.sh: the whole chart, keeping
     # the image tag and chart version the build jobs wrote there). Renders both the way
@@ -307,11 +308,15 @@ jobs:
           helm template cluster-upgrade-worker cluster-upgrade-worker "${common[@]}" >/dev/null
           helm lint upgrade-agent-worker "${common[@]}" --set upgradeAgent.url=http://upgrade-agent:8080
           helm template upgrade-agent-worker upgrade-agent-worker "${common[@]}" --set upgradeAgent.url=http://upgrade-agent:8080 >/dev/null
+          kv=(--set kvCluster=ocp4-ci-kv-ci-a --set config.vmMacPrefix=0e:00:01 --set vm.storageClassName=ci
+              --set temporal.host=temporal-frontend:7233)
+          helm lint vm-lifecycle-worker "${kv[@]}"
+          helm template vm-lifecycle-worker vm-lifecycle-worker "${kv[@]}" >/dev/null
       - name: Commit and push
         run: |
           set -euo pipefail
           cd _platform
-          git add gitops/charts/cluster-upgrade-worker gitops/charts/upgrade-agent-worker
+          git add gitops/charts/cluster-upgrade-worker gitops/charts/upgrade-agent-worker gitops/charts/vm-lifecycle-worker
           if git diff --cached --quiet; then
             echo "redbull-platform's copies already match ${GITHUB_SHA::7}"
             exit 0
@@ -319,7 +324,7 @@ jobs:
           git diff --cached --stat
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git commit -m "chore: sync cluster-upgrade per-MCE charts from workflows@${GITHUB_SHA::7}"
+          git commit -m "chore: sync the per-MCE and per-KV-cluster charts from workflows@${GITHUB_SHA::7}"
           for attempt in 1 2 3 4 5; do
             if git push origin HEAD:main; then exit 0; fi
             echo "push rejected (attempt ${attempt}) — rebasing onto origin/main and retrying"

@@ -60,7 +60,7 @@
     "dockerfile": "activities/vm_lifecycle/Dockerfile",
     "chart-repo": "team-redbull/redbull-platform",
     "helm-values-path": "gitops/charts/vm-lifecycle-worker/values.yaml",
-    "helm-image-path": "activityWorker.image"
+    "helm-image-path": "image"
   },
   {
     "image-name": "workflows-docs",

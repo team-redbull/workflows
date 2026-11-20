@@ -1,0 +1,102 @@
+# vm-lifecycle-worker — one release per KV cluster, installed in that cluster.
+#
+# Everything under `kvCluster`, `config` and `vm` is THE CLUSTER'S OWN: rendered
+# when the KV cluster is created (through day2) and never typed in by hand. The
+# chart creates no Namespace, runs no hooks and renders deterministically, so
+# Argo CD can sync and diff it as plain manifests. It needs no Secret: the
+# worker's ServiceAccount is its whole identity (rbac.yaml).
+
+# REQUIRED. The KV cluster this worker runs in: EXACTLY the name of its day1
+# file, `sites/<site>/mces/ocp4-seed-<site>-<zone number>/hostedClusters/<kvCluster>.yaml`,
+# e.g. ocp4-prod-kv-five-a. It names the queue the worker polls
+# (vm-lifecycle-activity-<kvCluster>), and a create-vm run builds the same queue
+# name from the list it reads in day1 — so it is NEVER canonicalised or
+# abbreviated. The worker reads its SITE from it (`ocp4-<lifecycle>-kv-<site>-<id>`)
+# and refuses to start on any other shape. A wrong value is not silent: the
+# cluster shows as `no-worker` in every run of its zone.
+kvCluster: ""
+
+config:
+  # REQUIRED. The first three octets of every MAC this cluster's VMs get:
+  # `0e` + the cluster's VLAN ID over the next two octets (12 bits) — VLAN 1010
+  # = 0x3f2 -> "0e:03:f2", VLAN 2 -> "0e:00:02". Computed from the Segments
+  # Manager's allocation when the cluster is created. The worker draws the
+  # other three octets. No default and no other place it is set: two clusters
+  # that share a network never share a VLAN, so they never share a prefix.
+  vmMacPrefix: ""
+
+# The VirtualMachine this cluster's worker builds (the platform's vm.yaml).
+vm:
+  # REQUIRED. The root disk's storage class. It MUST bind immediately and allow
+  # a ReadWriteMany + Filesystem volume: with a WaitForFirstConsumer class a
+  # Halted VM's disk never binds and every create-vm run ends in its rollback
+  # (ceph-rbd refuses RWX + Filesystem too; cephfs does not).
+  storageClassName: ""
+  # The VM's `networks[0]` body: the network every VM of the cluster boots on.
+  network:
+    multus:
+      networkName: openshift-cnv/vm-external-network
+  # The VM template's nodeSelector; {} for none. The worker also measures
+  # capacity on the nodes matching it only: a node a VM cannot go to is not room.
+  nodeSelector: {}
+  # `key=value`: the label kubevirt-redfish exposes a VM by, and the one the
+  # capacity figures count stopped VMs by.
+  redfishLabel: redfish-enabled=true
+  # The root disk's size.
+  rootDiskSize: 120Gi
+
+# Two pods share the queue, so one dying (a node drain, an upgrade of this
+# chart) never leaves the cluster without a worker: every activity is
+# idempotent — a create finds the VM its run already made, by its label — and
+# the disk wait resumes from its last heartbeat on the other pod.
+replicaCount: 2
+
+image:
+  # Disconnected production: the mirror of ghcr.io/team-redbull/vm-lifecycle-worker.
+  repository: ghcr.io/team-redbull/vm-lifecycle-worker
+  tag: ""            # defaults to the chart's appVersion
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+# The hub's Temporal frontend, as reachable FROM THIS KV CLUSTER: the TLS Route
+# that exposes the frontend across clusters (the one server-lifecycle-worker's
+# README describes). The worker dials OUT, so the hub needs no access to the
+# KV cluster and the KV cluster exposes nothing.
+temporal:
+  host: ""           # REQUIRED, host:port, e.g. temporal-frontend.apps.hub.example.net:443
+  namespace: default # the TEMPORAL namespace (not the OpenShift project); must match the hub
+  # TLS to the frontend. Required when `host` is a Route (it carries TLS only);
+  # off only for a worker on the hub itself (a lab). The CA is PUBLIC, so it lives here.
+  tls:
+    enabled: false
+    serverName: ""   # defaults to the host part of `host`
+    caCert: ""
+    #  -----BEGIN CERTIFICATE-----
+    #  ...
+    #  -----END CERTIFICATE-----
+
+# rbac.yaml: exactly the verbs the activities use, derived from the code
+# (README "RBAC"). `create: false` leaves it to whoever manages RBAC; the
+# ServiceAccount then needs the same grants.
+rbac:
+  create: true
+
+serviceAccount:
+  create: true
+  name: ""           # defaults to the release's full name
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    memory: 512Mi
+
+# In-flight activities get 20s to finish after SIGTERM (worker_init.py); keep
+# the pod's grace period above it.
+terminationGracePeriodSeconds: 30
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}

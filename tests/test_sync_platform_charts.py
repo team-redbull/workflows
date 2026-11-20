@@ -1,5 +1,6 @@
-"""scripts/sync_platform_charts.sh: redbull-platform's copies of cluster-upgrade's per-MCE
-charts follow deploy/charts/, and keep the image tag and chart version CI's bump wrote.
+"""scripts/sync_platform_charts.sh: redbull-platform's copies of the charts of the limbs that
+run outside the hub (cluster-upgrade's per-MCE ones, vm-lifecycle's per-KV-cluster one) follow
+deploy/charts/, and keep the image tag and chart version CI's bump wrote.
 
 Needs mikefarah yq v4, as the script does: GitHub's runners have it, so CI's `test` job
 (which gates every image and every push to redbull-platform) always runs these.
@@ -15,7 +16,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "scripts" / "sync_platform_charts.sh"
-CHARTS = ("cluster-upgrade-worker", "upgrade-agent-worker")
+CHARTS = ("cluster-upgrade-worker", "upgrade-agent-worker", "vm-lifecycle-worker")
 
 
 def _has_mikefarah_yq() -> bool:
@@ -98,6 +99,44 @@ def test_a_changed_chart_is_replaced_and_keeps_the_tag_and_version(platform):
         assert 'tag: "v1.0.7"' in values
         assert f"repository: ghcr.io/team-redbull/{chart}" in values
         assert "version: 1.0.7" in chart_yaml and 'appVersion: "v1.0.7"' in chart_yaml
+
+
+@needs_yq
+def test_a_destination_of_the_old_hub_shape_is_replaced_and_never_gets_a_null_image(platform):
+    """redbull-platform's vm-lifecycle-worker was a HUB chart, its image under
+    `activityWorker.image`: there is no `.image.repository` to keep, and yq's `null`
+    must not be written back as one."""
+    old = _copy(platform, "vm-lifecycle-worker")
+    (old / "templates").mkdir(parents=True)
+    (old / "Chart.yaml").write_text('apiVersion: v2\nname: vm-lifecycle-worker\nversion: 1.0.9\nappVersion: "v1.0.9"\n')
+    (old / "values.yaml").write_text(
+        "config:\n  headroomBufferPercent: 30\nactivityWorker:\n  image:\n"
+        "    repository: ghcr.io/team-redbull/vm-lifecycle-worker\n    tag: v1.0.9\n"
+    )
+    (old / "templates" / "activity-worker.yaml").write_text("kind: Deployment\n")
+    out = _sync(platform)
+    assert "vm-lifecycle-worker: replaced a chart of another shape" in out
+    source = REPO_ROOT / "deploy" / "charts" / "vm-lifecycle-worker"
+    assert not (old / "templates" / "activity-worker.yaml").exists()
+    assert sorted(p.name for p in (old / "templates").iterdir()) == sorted(p.name for p in (source / "templates").iterdir())
+    values, chart_yaml = (old / "values.yaml").read_text(), (old / "Chart.yaml").read_text()
+    assert "null" not in values and "activityWorker" not in values and "headroomBufferPercent" not in values
+    assert values == (source / "values.yaml").read_text()  # untouched: the chart's own image defaults
+    # The versions the build's tags go on from are kept.
+    assert "version: 1.0.9" in chart_yaml and 'appVersion: "v1.0.9"' in chart_yaml
+    # …and from the next bump on it is an owned chart like the others.
+    _bump(old, "v1.0.10")
+    again = _sync(platform)
+    assert "vm-lifecycle-worker: synced, kept ghcr.io/team-redbull/vm-lifecycle-worker:v1.0.10 and chart 1.0.10" in again
+
+
+@needs_yq
+def test_no_synced_chart_ever_holds_a_null(platform):
+    _sync(platform)
+    _sync(platform)
+    for chart in CHARTS:
+        for name in ("values.yaml", "Chart.yaml"):
+            assert "null" not in (_copy(platform, chart) / name).read_text(), f"{chart}/{name}"
 
 
 def test_the_script_refuses_a_directory_that_is_not_redbull_platform(tmp_path):

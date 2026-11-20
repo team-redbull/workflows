@@ -99,6 +99,23 @@ class ClusterLifecycleActivitySettings(BaseSettings):
     # because day1 records no base domain the run could read.
     cluster_console_url_template: str
 
+    # --- create-vm's placement policy (no service prefix: it is ours, CLAUDE.md §3) ------
+    # The share of EVERY KV cluster's usable allocatable that must stay unrequested
+    # after a VM is placed, on CPU and on memory — per cluster, never per node: the
+    # room live migration needs when a node is drained. ONE value for the whole
+    # fleet, here on the hub, handed to each create-vm run with its zone's cluster
+    # list (list_kv_clusters), so a run records the buffer it decided with and a
+    # changed value applies to the runs started after it. Not a setting of the
+    # worker inside a KV cluster (docs/design/create-vm-placement.md §6.4).
+    headroom_buffer_percent: int = 15
+
+    @field_validator("headroom_buffer_percent")
+    @classmethod
+    def _buffer(cls, value: int) -> int:
+        if not 0 <= value <= 90:
+            raise ValueError(f"headroom_buffer_percent must be 0..90 (got {value})")
+        return value
+
     @field_validator("day1_repo_url")
     @classmethod
     def _require_https_day1_repo_url(cls, url: str) -> str:

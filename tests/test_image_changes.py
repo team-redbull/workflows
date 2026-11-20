@@ -332,14 +332,21 @@ def test_a_workers_own_files_build_that_worker_only(limb):
 @pytest.mark.parametrize(("path", "expected"), [
     # one worker's activity code: that worker
     ("activities/cluster_lifecycle/git_provider.py", ["cluster-lifecycle-worker"]),
-    ("activities/vm_lifecycle/placement.py", ["vm-lifecycle-worker"]),
+    ("activities/vm_lifecycle/cluster_figures.py", ["vm-lifecycle-worker"]),
+    ("activities/vm_lifecycle/kubevirt_api.py", ["vm-lifecycle-worker"]),
     ("activities/segment_lifecycle/dhcp_api.py", ["segment-lifecycle-worker"]),
-    # the shared git client: the four workers that use git (server-lifecycle for
-    # update-nodepool's day1 read and replicas commit, through upgrade-gitops's day1_repo)
-    ("activities/git_repo.py", ["cluster-lifecycle-worker", "server-lifecycle-worker",
-                                "upgrade-gitops-worker", "vm-lifecycle-worker"]),
-    ("activities/day1_repo.py", ["cluster-lifecycle-worker", "server-lifecycle-worker",
-                                 "upgrade-gitops-worker", "vm-lifecycle-worker"]),
+    # the shared git client: the three workers that use git (server-lifecycle for
+    # update-nodepool's day1 read and replicas commit, through upgrade-gitops's day1_repo).
+    # NOT the vm-lifecycle worker: it runs inside a KV cluster and reads no repo — the
+    # zone's cluster list is the cluster-lifecycle worker's read.
+    ("activities/git_repo.py", ["cluster-lifecycle-worker", "server-lifecycle-worker", "upgrade-gitops-worker"]),
+    ("activities/day1_repo.py", ["cluster-lifecycle-worker", "server-lifecycle-worker", "upgrade-gitops-worker"]),
+    ("activities/cluster_lifecycle/day1_clusters.py", ["cluster-lifecycle-worker"]),
+    # create-vm's fit rule is workflow-side: the brain. The VM's size in request terms is
+    # read on both sides: the brain and the worker inside the KV cluster.
+    ("workflow_domains/vm_lifecycle/placement.py", ["workflows-orchestrator"]),
+    ("workflow_domains/vm_lifecycle/kv_zone_lock.py", ["workflows-orchestrator"]),
+    ("shared/vm_requests.py", ["vm-lifecycle-worker", "workflows-orchestrator"]),
     ("activities/upgrade_gitops/day1_repo.py", ["server-lifecycle-worker", "upgrade-gitops-worker"]),
     # one limb's models: the brain (it builds the requests) and that limb
     ("shared/models/cluster_lifecycle.py", ["cluster-lifecycle-worker", "workflows-orchestrator"]),
@@ -395,10 +402,10 @@ def _run(*args: str, stdin: str = "") -> subprocess.CompletedProcess:
 
 
 def test_the_cli_answers_a_json_list_on_stdout_and_its_reasons_on_stderr():
-    result = _run(stdin="activities/vm_lifecycle/placement.py\nREADME.md\n")
+    result = _run(stdin="activities/vm_lifecycle/vm_spec.py\nREADME.md\n")
     assert result.returncode == 0
     assert json.loads(result.stdout) == ["vm-lifecycle-worker"]          # stdout is the list and nothing else
-    assert "vm-lifecycle-worker: BUILD" in result.stderr and "placement.py (loaded)" in result.stderr
+    assert "vm-lifecycle-worker: BUILD" in result.stderr and "vm_spec.py (loaded)" in result.stderr
     assert "workflows-orchestrator: unaffected" in result.stderr
 
 

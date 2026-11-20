@@ -10,8 +10,10 @@ attaches the commit they were read at.
 
 from __future__ import annotations
 
-from activities.day1_repo import ClusterRecord, main_snapshot
+from activities.day1_repo import ClusterRecord, hosted_clusters_dir, main_snapshot
+from shared.cluster_names import seed_cluster
 from shared.models.cluster_lifecycle import Day1ClusterEntry, Day1ClusterList, Day1ClusterQuery
+from shared.models.vm_lifecycle import KvClusterEntry, KvClusterList
 
 
 def entry(record: ClusterRecord) -> Day1ClusterEntry:
@@ -40,3 +42,33 @@ async def list_clusters(*, repo_url: str, token: str, query: Day1ClusterQuery) -
     async with main_snapshot(repo_url=repo_url, token=token) as day1:
         records = day1.clusters(site=query.site, env=query.env, kind=query.kind, zone=query.zone)
         return Day1ClusterList(clusters=[entry(record) for record in records], revision=day1.revision)
+
+
+def kv_entry(record: ClusterRecord) -> KvClusterEntry:
+    """A KV cluster as create-vm reads it: `zone` only when day1 CONFIRMS it for its seed's zone
+    (ClusterRecord.confirmed_zone), `id` only when its name carries one."""
+    return KvClusterEntry(
+        name=record.name,
+        cluster_name=record.cluster_name,
+        hosted_cluster=record.hosted_cluster,
+        path=record.path,
+        zone=record.confirmed_zone,
+        id=record.id,
+        problems=list(record.problems),
+    )
+
+
+async def list_kv_clusters(*, repo_url: str, token: str, site: str, zone: str, buffer_percent: int) -> KvClusterList:
+    """The KV clusters of (site, zone) at day1 `main`, oldest first, with the placement buffer.
+
+    Observe-only, on the snapshot of `main`. The order, the zone check and the
+    kinds are `Day1.kv_clusters`'s; a zone whose seed folder does not exist is
+    an empty list. `site` and `zone` are validated tokens (the request model's).
+    """
+    async with main_snapshot(repo_url=repo_url, token=token) as day1:
+        return KvClusterList(
+            clusters=[kv_entry(record) for record in day1.kv_clusters(site=site, zone=zone)],
+            buffer_percent=buffer_percent,
+            revision=day1.revision,
+            folder=hosted_clusters_dir(site, seed_cluster(site, zone)),
+        )

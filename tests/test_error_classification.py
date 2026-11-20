@@ -320,8 +320,9 @@ class TestCreateVmClassification:
     """The same invariants for create-vm (workflow_domains/vm_lifecycle/create_vm.py) and its limb."""
 
     _CREATE_VM = pathlib.Path(__file__).resolve().parent.parent / "workflow_domains/vm_lifecycle/create_vm.py"
-    # Retried by design: an agent outage, a day1 clone that fails (unreachable is not missing).
-    RETRIED = {"KvCapacityUnavailableError", "KvVmApiUnavailableError", "ValuesRepoGitError", "ValuesBranchNotFoundError"}
+    # Retried by design: the KV cluster's own API rolling, a day1 that cannot be reached
+    # (unreachable is not missing) — the listing runs on the cluster-lifecycle limb.
+    RETRIED = {"KvClusterApiError", "ValuesRepoGitError", "ValuesBranchNotFoundError"}
 
     def test_every_entry_names_a_real_error_class_and_none_is_workflow_raised(self):
         from workflow_domains.vm_lifecycle.create_vm import _RETRY_POLICY as policy
@@ -351,19 +352,36 @@ class TestCreateVmClassification:
             for keyword in node.keywords
             if keyword.arg == "type" and isinstance(keyword.value, ast.Attribute) and keyword.value.attr == "__name__"
         }
-        assert used == {"NoKvClusterError", "NoKvClusterFitsError", "VmNameExhaustedError", "VmRootDiskNotBoundError"}
+        assert used == {
+            "NoKvClusterError", "NoKvClusterFitsError", "KvZoneLockTimeoutError", "KvZoneLeaseExpiredError",
+            "VmRootDiskNotBoundError",
+        }
         assert used <= _workflow_raised_errors()
 
+    def test_the_zone_lock_raises_nothing_and_calls_no_activity(self):
+        """The lock must never fail: a failure there stops every create-vm run of its zone."""
+        lock = pathlib.Path(__file__).resolve().parent.parent / "workflow_domains/vm_lifecycle/kv_zone_lock.py"
+        tree = ast.parse(lock.read_text())
+        assert not [node for node in ast.walk(tree) if isinstance(node, ast.Raise)]
+        called = {node.func.attr for node in ast.walk(tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)}
+        assert not called & {"execute_activity", "start_activity", "execute_local_activity", "execute_child_workflow", "start_child_workflow"}
+
     def _raised_by_the_limb(self) -> set[str]:
+        """Every shared error the limb CONSTRUCTS: raised on the spot, or built by
+        kubevirt_api.classify and raised by its caller."""
         root = pathlib.Path(__file__).resolve().parent.parent / "activities"
-        modules = [*sorted((root / "vm_lifecycle").glob("*.py")), root / "git_repo.py"]
+        # The worker inside the KV cluster, and what the cluster-lifecycle limb's listing runs on.
+        modules = [*sorted((root / "vm_lifecycle").glob("*.py")), root / "git_repo.py", root / "day1_repo.py",
+                   root / "cluster_lifecycle" / "day1_clusters.py"]
         names = set()
         for module in modules:
             for node in ast.walk(ast.parse(module.read_text())):
-                call = node.exc if isinstance(node, ast.Raise) else None
-                if isinstance(call, ast.Call) and isinstance(call.func, ast.Name):
-                    names.add(call.func.id)
-        return {name for name in names if isinstance(getattr(exceptions, name, None), type)}
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                    names.add(node.func.id)
+        return {
+            name for name in names
+            if isinstance(getattr(exceptions, name, None), type) and issubclass(getattr(exceptions, name), Exception)
+        }
 
     def test_every_error_the_limb_raises_is_permanent_or_retried_on_purpose(self):
         from workflow_domains.vm_lifecycle.create_vm import _PERMANENT_ACTIVITY_ERRORS
@@ -373,8 +391,10 @@ class TestCreateVmClassification:
         assert raised, "the scan found no shared error raised by the vm-lifecycle limb"
         assert raised <= permanent | self.RETRIED, sorted(raised - permanent - self.RETRIED)
         assert not self.RETRIED & permanent
-        assert {"KvAgentAuthError", "VmIdentityConflictError", "VmNamespaceNotFoundError", "VmRequestRejectedError",
-                "VmDisappearedError"} <= permanent
+        assert {"KvClusterAccessError", "KvClusterMismatchError", "VmIdentityConflictError", "VmNamespaceNotFoundError",
+                "VmRequestRejectedError", "VmDisappearedError", "VmMacExhaustedError", "VmLeaseExpiredError"} == permanent
+        # Every one of them is really raised by the limb: an entry nothing raises reads as a protection.
+        assert permanent <= raised, sorted(permanent - raised)
 
 
 class TestProvisionClusterClassification:

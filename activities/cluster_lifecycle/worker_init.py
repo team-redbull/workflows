@@ -6,7 +6,8 @@ deployment because its dependency and credential set is its own (CLAUDE.md
 (the merge request), plus the day2 sig repos' push token and the shortcuts service's bearer
 token — no Kubernetes
 credential at all, so nothing to run per MCE. Because it holds the day1 token,
-it also answers other domains' questions about day1 (list_day1_clusters).
+it also answers other domains' questions about day1 (list_day1_clusters) and gives create-vm
+a zone's KV clusters with the placement buffer (list_kv_clusters).
 
 Connects with the Pydantic data converter so that Pydantic models serialize
 correctly across the workflow boundary.
@@ -26,6 +27,7 @@ from activities.cluster_lifecycle.activities import (
     get_merge_request_state,
     inspect_cluster_target,
     list_day1_clusters,
+    list_kv_clusters,
     publish_cluster_file,
     register_cluster_in_day2_sig,
 )
@@ -55,6 +57,7 @@ async def main() -> None:
             ensure_cluster_shortcut,
             # Shared with other domains: day1's clusters, read with this limb's token.
             list_day1_clusters,
+            list_kv_clusters,
         ],
         # A clone or a push in flight gets this long to finish after shutdown
         # starts; a cut push is re-done from a fresh clone by Temporal's retry.

@@ -324,6 +324,43 @@ class TestTheZoneOfAKvCluster:
         assert day1.clusters(kind="hc", zone="az1") == []
 
 
+class TestWhatMakesAKvClusterUnusable:
+    """create-vm never places a VM on a cluster day1 does not CONFIRM for its seed's zone —
+    and a YAML warning that is every cluster's alike must not take the whole fleet out."""
+
+    def test_a_clean_file_is_confirmed_for_its_seeds_zone(self, day1):
+        record = day1.cluster("ocp4-prod-kv-five-a")
+        assert (record.zone, record.confirmed_zone, record.blocking, record.problems) == ("az1", "az1", [], [])
+
+    @pytest.mark.parametrize(
+        "name",
+        ["ocp4-prod-kv-five-e", "ocp4-prod-kv-five-f", "ocp4-prod-kv-five-g", "ocp4-prod-kv-five-h",
+         "ocp4-kubevirt-five-az2-1", "ocp4-prod-kv-six-a", "ocp4-prep-kv-bat-yam-b"],
+    )
+    def test_a_zone_a_name_or_a_site_that_disagrees_blocks_it(self, day1, name):
+        record = day1.cluster(name)
+        assert record.zone is not None  # still listed under its seed's zone…
+        assert record.blocking and record.confirmed_zone is None  # …and never confirmed for it
+        assert set(record.blocking) <= set(record.problems)
+
+    def test_a_key_written_twice_in_a_layer_every_cluster_shares_blocks_none_of_them(self, tmp_path):
+        _write(tmp_path, {**TREE, "sites/configValues.yaml": "mastertag: 4.18.56\nmastertag: 4.18.57\n"})
+        records = Day1(tmp_path, revision=REVISION).kv_clusters(site="five", zone="az1")
+        assert _names(records) == ["ocp4-prod-kv-five-a", "ocp4-prod-kv-five-b", "ocp4-prod-kv-five-c"]
+        for record in records:
+            assert record.problems and "written twice" in record.problems[0]  # reported…
+            assert record.blocking == [] and record.confirmed_zone == "az1"   # …and still usable
+
+    def test_a_hosted_cluster_under_an_mce_has_no_zone_to_confirm(self, day1):
+        record = day1.cluster("ocp4-test-kubevirt-site4")
+        assert (record.kind, record.zone, record.confirmed_zone, record.blocking) == ("hc", None, None, [])
+
+    def test_the_folder_of_a_zones_clusters_is_spelled_in_one_place(self):
+        from activities.day1_repo import hosted_clusters_dir
+
+        assert hosted_clusters_dir("five", "ocp4-seed-five-1") == "sites/five/mces/ocp4-seed-five-1/hostedClusters/"
+
+
 class TestTheRecord:
     def test_what_one_record_says(self, day1):
         record = day1.cluster("ocp4-prod-kv-five-a")

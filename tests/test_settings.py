@@ -170,55 +170,26 @@ class TestClusterUpgradeActivitySettings:
 
 
 class TestVmLifecycleSettings:
-    """The vm-lifecycle limb's knobs fail at worker start, never on the first run."""
+    """The worker inside a KV cluster starts only with its cluster's name, MAC prefix and storage
+    class (the knobs themselves: tests/test_vm_lifecycle_limb.py::TestSettings)."""
 
-    def _settings(self, monkeypatch, **env):
+    def test_the_agents_the_day1_repo_and_the_buffer_are_no_longer_this_workers(self, monkeypatch):
         from shared.settings.vm_lifecycle import VmLifecycleActivitySettings
 
-        for key, value in env.items():
+        # A chart still rendering the hub limb's old keys (the image ships first) changes nothing.
+        for key, value in {"KV_CAPACITY_URL_TEMPLATE": "not a url", "KV_VM_API_TOKEN": "x", "KV_AGENT_CA": "/nowhere",
+                           "HEADROOM_BUFFER_PERCENT": "999", "DAY1_REPO_URL": "git@x:y.git"}.items():
             monkeypatch.setenv(key, value)
-        return VmLifecycleActivitySettings()
+        parsed = VmLifecycleActivitySettings()
+        assert parsed.kv_cluster == "ocp4-prod-kv-five-a"
+        for gone in ("kv_capacity_url_template", "kv_vm_api_token", "kv_agent_ca", "headroom_buffer_percent", "day1_repo_url"):
+            assert not hasattr(parsed, gone)
 
-    def test_the_url_templates_render_every_placeholder(self, monkeypatch):
-        from shared.models.vm_lifecycle import KvClusterRef
+    def test_the_queue_is_built_from_the_name_exactly_as_day1_spells_it(self):
+        from shared.consts import vm_lifecycle_activity_queue
+        from shared.settings.vm_lifecycle import VmLifecycleActivitySettings
 
-        s = self._settings(
-            monkeypatch,
-            KV_CAPACITY_URL_TEMPLATE="https://kv-capacity.apps.{hosted_cluster}.{site}-{zone}.example/",
-            KV_VM_API_URL_TEMPLATE="http://{name}.example",
-        )
-        ref = KvClusterRef(name="ocp4-kubevirt-s-a1", cluster_name="kubevirt-s-a1", hosted_cluster="openshift-kubevirt-s-a1",
-                           site="s", zone="a")
-        assert s.kv_capacity_url(ref) == "https://kv-capacity.apps.openshift-kubevirt-s-a1.s-a.example"
-        assert s.kv_vm_api_url(ref) == "http://ocp4-kubevirt-s-a1.example"
-
-    @pytest.mark.parametrize(
-        "template",
-        ["https://kv.{clustr}.example", "https://kv.{}.example", "kv-capacity.apps.{cluster}.example", "https://kv.{cluster.name}.x",
-         "https://kv.{0}.example"],
-    )
-    def test_a_template_with_an_unknown_placeholder_or_no_scheme_is_refused(self, monkeypatch, template):
-        with pytest.raises(ValidationError):
-            self._settings(monkeypatch, KV_CAPACITY_URL_TEMPLATE=template)
-
-    @pytest.mark.parametrize("value", ["-1", "91", "x"])
-    def test_the_buffer_is_a_percentage_up_to_90(self, monkeypatch, value):
-        with pytest.raises(ValidationError):
-            self._settings(monkeypatch, HEADROOM_BUFFER_PERCENT=value)
-        assert self._settings(monkeypatch, HEADROOM_BUFFER_PERCENT="0").headroom_buffer_percent == 0
-
-    @pytest.mark.parametrize("prefix", ["00:a1:b2", "01:a1:b2", "03:a1:b2", "02:a1", "02-a1-b2", "zz:a1:b2", "02:a1:b2:00"])
-    def test_the_mac_prefix_is_three_locally_administered_unicast_octets(self, monkeypatch, prefix):
-        with pytest.raises(ValidationError):
-            self._settings(monkeypatch, VM_MAC_PREFIX=prefix)
-
-    @pytest.mark.parametrize("prefix", ["02:A1:B2", " 0a:00:00 ", "fe:00:01"])
-    def test_a_valid_prefix_is_lowercased(self, monkeypatch, prefix):
-        assert self._settings(monkeypatch, VM_MAC_PREFIX=prefix).vm_mac_prefix == prefix.strip().lower()
-
-    def test_the_day1_url_must_be_https(self, monkeypatch):
-        with pytest.raises(ValidationError, match="https://"):
-            self._settings(monkeypatch, DAY1_REPO_URL="git@x:y.git")
+        assert vm_lifecycle_activity_queue(VmLifecycleActivitySettings().kv_cluster) == "vm-lifecycle-activity-ocp4-prod-kv-five-a"
 
 
 class TestClusterLifecycleSettings:
@@ -255,6 +226,18 @@ class TestClusterLifecycleSettings:
     def test_the_sig_url_must_be_https(self, monkeypatch, template):
         with pytest.raises(ValidationError, match="https://"):
             self._settings(monkeypatch, DAY2_SIG_REPO_URL_TEMPLATE=template)
+
+    def test_the_placement_buffer_is_one_value_here_fifteen_percent_unless_set(self, monkeypatch):
+        """create-vm's buffer is this hub worker's, for every KV cluster — not each cluster's."""
+        monkeypatch.delenv("HEADROOM_BUFFER_PERCENT", raising=False)
+        assert self._settings(monkeypatch).headroom_buffer_percent == 15
+        assert self._settings(monkeypatch, HEADROOM_BUFFER_PERCENT="0").headroom_buffer_percent == 0
+        assert self._settings(monkeypatch, HEADROOM_BUFFER_PERCENT="90").headroom_buffer_percent == 90
+
+    @pytest.mark.parametrize("value", ["-1", "91", "x", "15.5"])
+    def test_the_placement_buffer_is_a_whole_percentage_up_to_90(self, monkeypatch, value):
+        with pytest.raises(ValidationError):
+            self._settings(monkeypatch, HEADROOM_BUFFER_PERCENT=value)
 
     def test_the_day2_token_falls_back_to_the_day1_token(self, monkeypatch):
         monkeypatch.delenv("DAY2_GIT_TOKEN", raising=False)

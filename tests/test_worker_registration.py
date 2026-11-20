@@ -31,7 +31,7 @@ _WORKERS = {
     "SERVER_PROVISIONING_ACTIVITY_QUEUE": "activities/server_provisioning/worker_init.py",
     "upgrade_agent_activity_queue": "activities/upgrade_agent/worker_init.py",
     "UPGRADE_GITOPS_ACTIVITY_QUEUE": "activities/upgrade_gitops/worker_init.py",
-    "VM_LIFECYCLE_ACTIVITY_QUEUE": "activities/vm_lifecycle/worker_init.py",
+    "vm_lifecycle_activity_queue": "activities/vm_lifecycle/worker_init.py",
     "CLUSTER_LIFECYCLE_ACTIVITY_QUEUE": "activities/cluster_lifecycle/worker_init.py",
 }
 
@@ -509,3 +509,48 @@ def test_runs_started_under_the_old_names_still_have_a_worker():
         assert (const, workflow_type) in pairs, f"{workflow_type} is not polled on {const}"
         # The names every in-flight run's history points at: never to be "tidied".
         assert getattr(consts, const) == queue
+
+
+def test_create_vm_reaches_the_day1_reader_on_the_hub_and_the_worker_inside_a_kv_cluster_and_nothing_else():
+    """The zone's list is day1's (the cluster-lifecycle worker holds that token); everything
+    about a KV cluster is asked of the worker INSIDE it, on that cluster's own queue."""
+    sent = dict(_dispatched("workflow_domains/vm_lifecycle/create_vm.py"))
+    assert sent == {
+        "list_kv_clusters": "CLUSTER_LIFECYCLE_ACTIVITY_QUEUE",
+        "read_kv_cluster_figures": "vm_lifecycle_activity_queue",
+        "create_vm_on_cluster": "vm_lifecycle_activity_queue",
+        "await_vm_ready": "vm_lifecycle_activity_queue",
+        "delete_vm_on_cluster": "vm_lifecycle_activity_queue",
+    }
+    # The worker inside a KV cluster registers its whole interface and nothing of another limb's.
+    import shared.interfaces.vm_lifecycle as kv_interface
+
+    interface = {name for name, value in vars(kv_interface).items() if hasattr(value, "__temporal_activity_definition")}
+    assert _registered_activities(_WORKERS["vm_lifecycle_activity_queue"]) == interface
+    assert "list_kv_clusters" in _registered_activities(_WORKERS["CLUSTER_LIFECYCLE_ACTIVITY_QUEUE"])
+    assert "list_kv_clusters" not in interface
+
+
+def test_the_kv_worker_polls_the_queue_built_from_its_own_cluster_name():
+    """The hub builds the queue from the day1 file name; the worker from KV_CLUSTER. One builder."""
+    tree = _tree("activities/vm_lifecycle/worker_init.py")
+    assigned = next(
+        node.value for node in ast.walk(tree)
+        if isinstance(node, ast.Assign) and any(getattr(t, "id", None) == "_TASK_QUEUE" for t in node.targets)
+    )
+    assert isinstance(assigned, ast.Call) and assigned.func.id == "vm_lifecycle_activity_queue"
+    assert ast.unparse(assigned.args[0]) == "_activity_settings.kv_cluster"
+
+
+def test_the_zone_lock_dispatches_no_activity_and_has_its_own_queue():
+    """It only holds the line: it never reads a cluster, so no limb can ever stall a zone's lock."""
+    tree = _tree("workflow_domains/vm_lifecycle/kv_zone_lock.py")
+    calls = {node.func.attr for node in ast.walk(tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)}
+    assert not calls & {"execute_activity", "start_activity", "execute_local_activity"}
+    registry = next(
+        node.value for node in ast.walk(_tree("workflow_domains/main_worker_init.py"))
+        if isinstance(node, ast.AnnAssign) and getattr(node.target, "id", None) == "_WORKER_SPECS"
+    )
+    pairs = {(spec.elts[0].id, element.id) for spec in registry.elts for element in spec.elts[1].elts}
+    assert ("KV_ZONE_LOCK_WORKFLOW_QUEUE", "KvZoneLockWorkflow") in pairs
+    assert ("CREATE_VM_WORKFLOW_QUEUE", "CreateVmWorkflow") in pairs

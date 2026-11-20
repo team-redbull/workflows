@@ -613,6 +613,7 @@ class CreateVmWorkflow:
         if self._kv_cluster is None:
             return "nothing was sent to any cluster"
         previous, self._phase = self._phase, "removing-vm"
+        queue = vm_lifecycle_activity_queue(self._kv_cluster)
         try:
             deleted: VmDeleted = await workflow.execute_activity(
                 delete_vm_on_cluster,
@@ -621,7 +622,7 @@ class CreateVmWorkflow:
                     request_id=me.run_id, name=created.name if created else None,
                     mac=created.mac if created else None,
                 ),
-                task_queue=vm_lifecycle_activity_queue(self._kv_cluster),
+                task_queue=queue,
                 start_to_close_timeout=_DELETE_TIMEOUT,
                 schedule_to_close_timeout=_ROLLBACK_DELETE_DEADLINE,
                 retry_policy=_RETRY_POLICY,

@@ -9,9 +9,12 @@ day1_writer.py, git_provider.py) and the day2 sig repos with the day2 token
 one module per dependency; what a cluster file must look like is
 cluster_values.py, and the DHCP block it gets is dhcp_values.py.
 
-One activity is not provision-cluster's: list_day1_clusters answers other
-domains' questions about day1 (day1_clusters.py over activities/day1_repo.py's
-`Day1`), here because this limb holds the day1 token (CLAUDE.md §2).
+Two activities are not provision-cluster's, and are here because this limb
+holds the day1 token (CLAUDE.md §2), both in day1_clusters.py over
+activities/day1_repo.py's `Day1`: list_day1_clusters answers other domains'
+questions about day1, and list_kv_clusters gives create-vm a zone's KV
+clusters, oldest first, together with the placement buffer
+(HEADROOM_BUFFER_PERCENT: ONE value for every KV cluster, this worker's).
 
 Budgets, all under the workflow's timeouts (workflow_domains/cluster_lifecycle/
 provision_cluster.py): git under the 180 s start_to_close (git_repo's 150 s
@@ -43,6 +46,7 @@ from shared.models.cluster_lifecycle import (
     MergeRequestRequest,
     MergeRequestState,
 )
+from shared.models.vm_lifecycle import KvClusterList, KvClusterListRequest
 from shared.settings.cluster_lifecycle import ClusterLifecycleActivitySettings
 
 _settings = ClusterLifecycleActivitySettings()
@@ -148,5 +152,20 @@ async def list_day1_clusters(query: Day1ClusterQuery) -> Day1ClusterList:
         "day1 %s: %d clusters for site=%s env=%s kind=%s zone=%s (%d with problems)",
         listed.revision, len(listed.clusters), query.site or "*", query.env or "*", query.kind, query.zone or "*",
         sum(1 for cluster in listed.clusters if cluster.problems),
+    )
+    return listed
+
+
+@activity.defn
+async def list_kv_clusters(request: KvClusterListRequest) -> KvClusterList:
+    listed = await day1_clusters.list_kv_clusters(
+        repo_url=_settings.day1_repo_url, token=_settings.redbull_git_token, site=request.site, zone=request.zone,
+        buffer_percent=_settings.headroom_buffer_percent,
+    )
+    usable = [entry.name for entry in listed.clusters if entry.zone == request.zone and entry.id]
+    activity.logger.info(
+        "day1 %s lists %d KV clusters for site %s zone %s in %s (buffer %d%%): %s; %d not usable",
+        listed.revision, len(listed.clusters), request.site, request.zone, listed.folder, listed.buffer_percent,
+        ", ".join(usable) or "none usable", len(listed.clusters) - len(usable),
     )
     return listed

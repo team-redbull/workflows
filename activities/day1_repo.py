@@ -136,6 +136,11 @@ def parse_mce_dir(path: str) -> tuple[str, str] | None:
     return match.group("site"), match.group("folder")
 
 
+def hosted_clusters_dir(site: str, folder: str) -> str:
+    """`sites/<site>/mces/<folder>/hostedClusters/`: where a folder's cluster files are."""
+    return f"{mce_dir(site, folder)}/{HOSTED_CLUSTERS}/"
+
+
 def cluster_file_path(folder_dir: str, cluster: str) -> str:
     """`<folder_dir>/hostedClusters/<cluster>.yaml`: where a cluster's file is, or goes."""
     return f"{folder_dir}/{HOSTED_CLUSTERS}/{cluster}.yaml"
@@ -328,6 +333,16 @@ class ClusterRecord:
     path: str
     problems: list[str]
     revision: str
+    # kv only: the lines of `problems` that make the file UNUSABLE as a KV cluster of its
+    # seed's zone — a seed folder under another site, a name off the convention or of
+    # another site, NodePools that do not all label the zone. A key written twice in a
+    # value layer is a problem too, but not one of these: it is every cluster's alike.
+    blocking: list[str] = field(default_factory=list)
+
+    @property
+    def confirmed_zone(self) -> str | None:
+        """The zone day1 CONFIRMS the cluster for: its seed's, when nothing blocks it."""
+        return self.zone if self.zone is not None and not self.blocking else None
 
 
 def _zone_problems(merged: dict, zone: str, path: str) -> list[str]:
@@ -487,25 +502,27 @@ class Day1:
         values = self.values(path)
         name = Path(path).stem
         problems = list(values.problems)
+        blocking: list[str] = []
         zone = seed_zone(folder)
         identifier: str | None = None
         if zone is not None:
             if seed_site(folder) != site:
-                problems.append(
+                blocking.append(
                     f"{path}: seed folder {folder} is named for site {seed_site(folder)!r}, but is under {SITES}/{site}"
                 )
             try:
                 parsed = parse_kv_cluster(name)
             except ClusterNameError:
-                problems.append(
+                blocking.append(
                     f"{path}: a KV cluster is named `ocp4-<lifecycle>-kv-<site>-<id>`; {name!r} is not, "
                     "so its place in the zone's order is unknown"
                 )
             else:
                 identifier = parsed.id
                 if parsed.site != site:
-                    problems.append(f"{path}: the name says site {parsed.site!r}, but the file is under {SITES}/{site}")
-            problems += _zone_problems(values.merged, zone, path)
+                    blocking.append(f"{path}: the name says site {parsed.site!r}, but the file is under {SITES}/{site}")
+            blocking += _zone_problems(values.merged, zone, path)
+            problems += blocking
         if not values.cluster_name:
             problems.append(f"{path}: no clusterName in the file and none left in its name")
         return ClusterRecord(
@@ -522,6 +539,7 @@ class Day1:
             path=path,
             problems=problems,
             revision=self.revision,
+            blocking=blocking,
         )
 
     # --- what only git answers ------------------------------------------------------------

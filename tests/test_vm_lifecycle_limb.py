@@ -207,6 +207,35 @@ class TestCreateVm:
         assert (created.mac, created.draws) == ("0e:03:f2:04:05:06", 2)
         assert kv.calls.count("create_vm") == 1  # the taken MAC cost no round trip to the API
 
+    async def test_mac_uniqueness_never_depends_on_kubemacpool(self):
+        """Plain KubeVirt has no KubeMacPool, and OpenShift Virtualization's lets a duplicate MAC
+        through on a Halted VM: the worker's own check is the only guard, in every namespace."""
+        kv = cluster(kubemacpool=False, namespaces=("inventory", "other", "server-scan-vms"))
+        kv.add_vm(stopped_vm("in-another-namespace", 8, 64, namespace="other", mac="0e:03:f2:0a:0a:0a", labels={}))
+        kv.add_vm(stopped_vm("running-somewhere", 8, 64, namespace="server-scan-vms", mac="0E:03:F2:0B:0B:0B"))
+        kv.start("server-scan-vms", "running-somewhere", "n1")
+        kv.draws = [bytes([0x0A, 0x0A, 0x0A]), bytes([0x0B, 0x0B, 0x0B]), bytes([0x0C, 0x0C, 0x0C])]
+        created = await create(kv)
+        assert (created.mac, created.draws) == ("0e:03:f2:0c:0c:0c", 3)
+        assert kv.calls.count("create_vm") == 1  # the API was never asked to take a used MAC
+        assert len(set(kv.macs())) == len(kv.macs()) == 3
+
+    async def test_without_kubemacpool_a_hundred_creates_on_a_crowded_prefix_never_share_a_mac(self):
+        import random
+
+        kv = cluster(kubemacpool=False)
+        # A tiny random space (the last octet only), so draws collide all the time.
+        rng = random.Random(7)
+        kv.random_bytes = lambda count: bytes([0, 0, rng.randrange(256)])
+        made = 0
+        for index in range(150):
+            try:
+                await create(kv, create_request(request_id=f"run-{index}"))
+                made += 1
+            except VmMacExhaustedError:
+                pass  # three taken draws in a row: nothing created, never a duplicate
+        assert made > 100 and len(kv.macs()) == made == len(set(kv.macs())) == len(kv.vms)
+
     async def test_an_already_exists_is_drawn_again(self):
         kv = cluster()
         kv.fail("create_vm", NameTaken("already exists"))
@@ -320,6 +349,108 @@ class TestCreateVm:
         assert created.mac.startswith("0e:0f:ff:")
         assert vm["spec"]["template"]["spec"]["nodeSelector"] == {"role": "vm"}
         assert vm["spec"]["dataVolumeTemplates"][0]["spec"]["storage"]["storageClassName"] == "cephfs"
+
+    async def test_an_attempt_starts_no_call_to_the_api_past_its_budget(self):
+        """So an attempt is over before Temporal may start the next one beside it."""
+        kv = cluster()
+        clock = {"seconds": 0.0}
+        original = kv.list_vms
+
+        async def slow_list(label_selector=None):
+            clock["seconds"] += vm_operations.CREATE_BUDGET_SECONDS + 1  # the first call ate the whole budget
+            return await original(label_selector)
+
+        kv.list_vms = slow_list
+        with pytest.raises(KvClusterApiError, match="stops before reading the VM namespace"):
+            await vm_operations.create_vm(kv, kv.values, create_request(), now=lambda: NOW, random_bytes=kv.random_bytes,
+                                          monotonic=lambda: clock["seconds"])
+        assert kv.vms == {} and "namespace_exists" not in kv.calls and "create_vm" not in kv.calls
+
+    async def test_the_budget_is_checked_right_before_the_create_too(self):
+        kv = cluster()
+        clock = {"seconds": 0.0}
+        original = kv.namespace_exists
+
+        async def slow_namespace_read(namespace):
+            clock["seconds"] += vm_operations.CREATE_BUDGET_SECONDS + 1
+            return await original(namespace)
+
+        kv.namespace_exists = slow_namespace_read
+        with pytest.raises(KvClusterApiError, match="stops before creating the VM"):
+            await vm_operations.create_vm(kv, kv.values, create_request(), now=lambda: NOW, random_bytes=kv.random_bytes,
+                                          monotonic=lambda: clock["seconds"])
+        assert kv.vms == {} and "create_vm" not in kv.calls
+        # The retry, on a healthy API, simply creates it.
+        assert (await create(kv)).created is True
+
+    async def test_a_budget_spent_after_the_create_is_made_good_by_the_retry(self):
+        kv = cluster()
+        clock = {"seconds": 0.0}
+        original = kv.create_vm
+
+        async def slow_create(namespace, body):
+            clock["seconds"] += vm_operations.CREATE_BUDGET_SECONDS + 1
+            return await original(namespace, body)
+
+        kv.create_vm = slow_create
+        with pytest.raises(KvClusterApiError, match="stops before reading the run's VMs back"):
+            await vm_operations.create_vm(kv, kv.values, create_request(), now=lambda: NOW, random_bytes=kv.random_bytes,
+                                          monotonic=lambda: clock["seconds"])
+        assert len(kv.vms) == 1  # it landed; the attempt just could not confirm it in time
+        kv.create_vm = original
+        again = await create(kv)
+        assert again.created is False and len(kv.vms) == 1
+
+    async def test_the_run_holds_exactly_one_vm_before_its_name_is_recorded(self):
+        """Read-back: after the create, the VMs carrying the run's id are listed again."""
+        kv = cluster()
+        selectors = []
+        original = kv.list_vms
+
+        async def spy(label_selector=None):
+            selectors.append(label_selector)
+            return await original(label_selector)
+
+        kv.list_vms = spy
+        created = await create(kv)
+        assert selectors == [None, f"redbull.io/created-by={RUN}"] and created.created is True
+
+    async def test_a_create_that_landed_after_its_caller_gave_up_is_met_by_the_read_back(self):
+        """Attempt 1's create reached the API server late; attempt 2 saw no VM and made its own.
+        Attempt 2's read-back finds both, keeps the OLDER and deletes its own."""
+        kv = cluster()
+        original = kv.create_vm
+        late = {}
+
+        async def the_first_attempts_vm_lands_first(namespace, body):
+            if not late:
+                earlier = vm_spec.build(
+                    namespace="inventory", flavor="c200", cpu=32, memory_gib=256, site="five", zone="az1",
+                    mce="ocp4-prod-mce-five-a", mac="0e:03:f2:00:00:01", request_id=RUN, workflow_id=None,
+                    redfish_label=kv.values.redfish_label, storage_class_name="cephfs", network=kv.values.network,
+                    node_selector={}, root_disk_size="120Gi",
+                )
+                late["name"] = (await original(namespace, earlier))["metadata"]["name"]
+            return await original(namespace, body)
+
+        kv.create_vm = the_first_attempts_vm_lands_first
+        answered = await create(kv)
+        assert (answered.name, answered.mac, answered.created) == (late["name"], "0e:03:f2:00:00:01", False)
+        assert kv.vm_names == [late["name"]] and len(kv.datavolumes) == 1  # the surplus VM and its disk are gone
+        assert (await kv.figures()).stopped_vms == 1
+
+    async def test_two_vms_of_one_run_met_at_the_lookup_converge_on_the_oldest(self):
+        kv = cluster()
+        first = await create(kv, create_request(request_id="twice"))
+        # A second VM of the same run, made by an attempt that never saw the first.
+        twin = dict(kv.vms[("inventory", first.name)])
+        twin = {**twin, "metadata": {**twin["metadata"], "name": "ocp-c200-kv32-five-0e03f2ffffff", "uid": "twin",
+                                    "creationTimestamp": "2099-01-01T00:00:00+00:00"}}
+        kv.vms[("inventory", "ocp-c200-kv32-five-0e03f2ffffff")] = twin
+        for _ in range(2):  # whichever attempt meets them, and however often
+            answered = await create(kv, create_request(request_id="twice"))
+            assert (answered.name, answered.created, answered.draws) == (first.name, False, 0)
+        assert kv.vm_names == [first.name]
 
     async def test_ten_thousand_draws_never_leave_the_prefix_or_repeat_a_name(self):
         kv = cluster()
@@ -828,8 +959,16 @@ class TestTheActivities:
         # One figures attempt (pick-up + run) fits the bound of the whole call, and that fits a lease.
         attempt = create_vm._FIGURES_SCHEDULE_TO_START_TIMEOUT + create_vm._FIGURES_TIMEOUT
         assert attempt <= create_vm._FIGURES_SCHEDULE_TO_CLOSE_TIMEOUT
-        # The create's own calls: a list, two namespace reads and three creates at most.
-        assert kubevirt_api.REQUEST_TIMEOUT[1] * 2 < create_vm._LEASE_GUARD.total_seconds() + kubevirt_api.REQUEST_TIMEOUT[1]
+        # One call to the cluster's API, at its worst: connect + read.
+        one_call = sum(kubevirt_api.REQUEST_TIMEOUT)
+        # A create attempt starts no call past its budget, so it is over — whatever its last
+        # call does — before Temporal may start the next attempt beside it…
+        assert vm_operations.CREATE_BUDGET_SECONDS + one_call < create_vm._CREATE_TIMEOUT.total_seconds()
+        # …and before a cancel's rollback stops waiting for it to settle.
+        assert vm_operations.CREATE_BUDGET_SECONDS + one_call < create_vm._CANCEL_SETTLE.total_seconds()
+        # The lease is checked right before the create call: that call ends inside the guard,
+        # with room left for the two clusters' clocks to disagree.
+        assert one_call + 15 <= create_vm._LEASE_GUARD.total_seconds()
         assert vm_operations.READY_POLL_SECONDS < create_vm._READY_HEARTBEAT_TIMEOUT.total_seconds()
         assert create_vm._READY_DEADLINE_MINUTES * 60 < create_vm._READY_TIMEOUT.total_seconds()
 

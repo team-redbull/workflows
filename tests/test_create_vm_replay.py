@@ -70,10 +70,9 @@ class Scenario:
     down: Callable[[KvFleet], set[str]] = lambda fleet: set()
     lock_worker: bool = True
     drive: Callable[[Harness], Awaitable[WorkflowHandle]] = _just_start
-    # Tasks nobody serves while the run waits (a figures read on a dead cluster's queue, the
-    # lock's own workflow task): the clock is jumped past that many (tests/manual_time.py),
-    # in steps of `step`. EVERY scenario records with the production waits.
-    outstanding: int = 0
+    # How far the clock is nudged while the run is still going (tests/manual_time.py jumps it
+    # past a figures read nobody picks up, or the lock's own unserved workflow task).
+    # EVERY scenario records with the production waits.
     step: timedelta = timedelta(seconds=1)
 
 
@@ -148,7 +147,7 @@ SCENARIOS: dict[str, Scenario] = {
     # day1 lists no cluster for the zone: fails before the lock is even asked for.
     "no-cluster": Scenario(fleet=lambda: KvFleet(), ends=NoKvClusterError.__name__),
     # The oldest cluster has no worker: a `no-worker` row, then the next cluster.
-    "no-kv-worker": Scenario(fleet=lambda: fleet_of(A, B), down=lambda fleet: {A}, outstanding=1, step=timedelta(seconds=10)),
+    "no-kv-worker": Scenario(fleet=lambda: fleet_of(A, B), down=lambda fleet: {A}, step=timedelta(seconds=10)),
     # A name taken on the first draw: the WORKER draws again; the run sees one create.
     "mac-redraw": Scenario(fleet=_redraw),
     # Three draws taken: the worker's permanent error, after the release.
@@ -162,18 +161,16 @@ SCENARIOS: dict[str, Scenario] = {
     # Dead workers outlast the first lease: a second lease, the scan carried on.
     # (Eleven clusters at 30 s each against a 5-minute lease; the twelfth has a worker.)
     "second-lease": Scenario(
-        fleet=lambda: dead_and_alive(11)[0], down=lambda fleet: set(dead_and_alive(11)[1]), outstanding=1,
-        step=timedelta(seconds=10),
+        fleet=lambda: dead_and_alive(11)[0], down=lambda fleet: set(dead_and_alive(11)[1]), step=timedelta(seconds=10),
     ),
     # Dead workers outlast every lease: thirty-one of them against three leases.
     "leases-exhausted": Scenario(
-        fleet=lambda: dead_and_alive(31)[0], down=lambda fleet: set(dead_and_alive(31)[1]), outstanding=1,
-        step=timedelta(seconds=15), ends=KvZoneLeaseExpiredError.__name__,
+        fleet=lambda: dead_and_alive(31)[0], down=lambda fleet: set(dead_and_alive(31)[1]), step=timedelta(seconds=15), ends=KvZoneLeaseExpiredError.__name__,
     ),
     # The lock is never granted (nobody serves its workflow): the run asks again every two
     # minutes, then withdraws and fails at its thirty-minute bound.
     "lock-timeout": Scenario(
-        fleet=lambda: fleet_of(A), lock_worker=False, outstanding=1, step=timedelta(seconds=60),
+        fleet=lambda: fleet_of(A), lock_worker=False, step=timedelta(seconds=60),
         ends=KvZoneLockTimeoutError.__name__,
     ),
     # Cancelled while its VM's disk is awaited: the VM is removed, the run ends CANCELED.
@@ -192,7 +189,7 @@ async def _record(name: str) -> WorkflowHistory:
     fleet = scenario.fleet()
     async with Harness(fleet, down=scenario.down(fleet), lock_worker=scenario.lock_worker) as h:
         handle = await scenario.drive(h)
-        waits = {"limit": 180, "step": scenario.step, "outstanding": scenario.outstanding}
+        waits = {"limit": 180, "step": scenario.step}
         if scenario.ends is None:
             await h.result(handle, **waits)
         else:

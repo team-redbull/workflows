@@ -15,6 +15,7 @@ docs/design/create-vm-placement.md is the design: §6.3.3 for the figures,
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -47,6 +48,12 @@ from shared.models.vm_lifecycle import (
 # MACs drawn per create attempt: a used MAC, an AlreadyExists and a KubeMacPool
 # refusal each spend one.
 MAX_DRAWS = 3
+# One create ATTEMPT starts no call to the cluster's API after this many seconds.
+# With one call's own bound on top (kubevirt_api.REQUEST_TIMEOUT) the attempt is
+# over before the workflow's start_to_close (90 s) lets Temporal start the next
+# one — two attempts of one create never run side by side — and before the
+# cancel rollback's settle wait ends. What is left undone is the retry's.
+CREATE_BUDGET_SECONDS = 55.0
 # The four list calls of a figures read are cut off here, together: the bound
 # the hub's 60 s start_to_close and its zone lease are sized against.
 FIGURES_TIMEOUT_SECONDS = 20.0
@@ -128,6 +135,41 @@ def _created(cluster: ClusterValues, vm: dict, *, created: bool, draws: int) -> 
     )
 
 
+def _oldest_first(vm: dict) -> tuple[str, str, str]:
+    return (
+        str(cluster_figures.get(vm, "metadata", "creationTimestamp", default="")),
+        vm_spec.namespace_of(vm), vm_spec.name_of(vm),
+    )
+
+
+async def _the_one_vm_of(
+    api: Any, cluster: ClusterValues, request_id: str, found: list[dict], spend: Callable[[str], None],
+    log: Callable[[str], None],
+) -> dict | None:
+    """The run's ONE VM among `found` (every VM labelled with its request id): the oldest.
+
+    More than one can only come from a create the API server finished after
+    its caller had given up on it — the caller's retry then saw no VM of the
+    run and made another. Whichever attempt meets them converges on the
+    oldest and deletes the rest (each by the UID read), so two attempts that
+    met the same pair return the same VM, and no stopped VM of this run is
+    left to weigh on the cluster for ever.
+    """
+    mine = sorted((vm for vm in found if vm_spec.created_by(vm) == request_id), key=_oldest_first)
+    if not mine:
+        return None
+    for extra in mine[1:]:
+        namespace, name = vm_spec.namespace_of(extra), vm_spec.name_of(extra)
+        log(f"request {request_id} has {len(mine)} VMs on {cluster.kv_cluster}; keeping {vm_spec.name_of(mine[0])}, deleting {namespace}/{name}")
+        spend(f"deleting the surplus VM {namespace}/{name}")
+        await api.delete_vm(namespace, name, vm_spec.uid_of(extra))
+        root = vm_spec.root_disk_name(extra)
+        if root:
+            spend(f"deleting the surplus VM's root disk {namespace}/{root}")
+            await api.delete_datavolume(namespace, root)
+    return mine[0]
+
+
 async def create_vm(
     api: Any,
     cluster: ClusterValues,
@@ -136,6 +178,7 @@ async def create_vm(
     now: Callable[[], datetime],
     random_bytes: Callable[[int], bytes],
     log: Callable[[str], None] = lambda _message: None,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> VmCreated:
     """ONE Halted VM for the request: found (a retry), or drawn, named, built and created."""
     _require_own_cluster(cluster, request.kv_cluster, "create a VM")
@@ -149,24 +192,37 @@ async def create_vm(
     except InfraEnvNameError as err:
         raise VmRequestRejectedError(f"the request cannot name a VM: {err}") from None
 
-    # 1 — has this run already created its VM? An earlier attempt may have, its
-    # answer lost. Checked BEFORE the lease, so a retry finds it whatever the time.
-    everything = await api.list_vms()
-    mine = sorted((vm for vm in everything if vm_spec.created_by(vm) == request.request_id), key=vm_spec.name_of)
-    if mine:
-        log(f"VM {vm_spec.namespace_of(mine[0])}/{vm_spec.name_of(mine[0])} already carries request {request.request_id}")
-        return _created(cluster, mine[0], created=False, draws=0)
+    started = monotonic()
+
+    def spend(doing: str) -> None:
+        """Before EVERY call to the cluster's API: this attempt starts none past its budget."""
+        if monotonic() - started >= CREATE_BUDGET_SECONDS:
+            raise KvClusterApiError(
+                f"this create attempt on {cluster.kv_cluster} has run {CREATE_BUDGET_SECONDS:g}s and stops before "
+                f"{doing}: the cluster's API is slow. The next attempt first looks for the VM this one may have made"
+            )
 
     def require_lease() -> None:
-        # 2 — the zone's lease: after it the lock has moved on and the next run
-        # has measured this cluster without this VM, so nothing is created.
+        # The zone's lease: after it the lock has moved on and the next run has
+        # measured this cluster without this VM, so nothing is created.
         if now() >= request.create_before:
             raise VmLeaseExpiredError(
                 f"the zone lease this create was sent under ended at {request.create_before.isoformat()} "
                 f"before the VM existed on {cluster.kv_cluster}: nothing was created. Ask again"
             )
 
+    # 1 — has this run already created its VM? An earlier attempt may have, its
+    # answer lost. Checked BEFORE the lease, so a retry finds it whatever the time.
+    spend("listing the cluster's VMs")
+    everything = await api.list_vms()
+    existing = await _the_one_vm_of(api, cluster, request.request_id, everything, spend, log)
+    if existing is not None:
+        log(f"VM {vm_spec.namespace_of(existing)}/{vm_spec.name_of(existing)} already carries request {request.request_id}")
+        return _created(cluster, existing, created=False, draws=0)
+
+    # 2 — the lease, then the namespace.
     require_lease()
+    spend("reading the VM namespace")
     if not await api.namespace_exists(request.namespace):
         raise VmNamespaceNotFoundError(
             f"namespace {request.namespace} does not exist on KV cluster {cluster.kv_cluster}: the platform "
@@ -175,6 +231,11 @@ async def create_vm(
 
     # 3-5 — draw, check the MAC against every VM of the cluster (any namespace:
     # Kubernetes refuses a duplicate NAME only within one), create Halted.
+    # THIS check is what keeps a MAC unique on the cluster — never KubeMacPool:
+    # plain KubeVirt has none, and OpenShift Virtualization's does not refuse a
+    # duplicate on a Halted VM (seen in the lab, 2026-11-20). Nothing races it:
+    # the run holds the zone's lock, so no other create of ours is under way
+    # here. Should a KubeMacPool refuse a MAC all the same, that is one more draw.
     taken = {mac for vm in everything for mac in vm_spec.macs(vm)}
     spent: list[str] = []
     for draw in range(1, MAX_DRAWS + 1):
@@ -190,6 +251,7 @@ async def create_vm(
             storage_class_name=cluster.storage_class_name, network=cluster.network,
             node_selector=cluster.node_selector, root_disk_size=cluster.root_disk_size,
         )
+        spend("creating the VM")
         require_lease()
         try:
             created = await api.create_vm(request.namespace, body)
@@ -212,6 +274,14 @@ async def create_vm(
                 f"KV cluster {cluster.kv_cluster} does not serve VirtualMachines (404: {err}): "
                 "OpenShift Virtualization is not installed or not ready there"
             ) from None
+        # 6 — read back (CLAUDE.md §6): the run must hold exactly ONE VM here before its
+        # name is recorded. A create this run's EARLIER attempt was cut off from may have
+        # landed since the lookup above; then the older of the two is the run's.
+        spend("reading the run's VMs back")
+        labelled = await api.list_vms(f"{vm_spec.CREATED_BY_LABEL}={request.request_id}")
+        kept = await _the_one_vm_of(api, cluster, request.request_id, labelled, spend, log)
+        if kept is not None and vm_spec.name_of(kept) != vm_spec.name_of(body):
+            return _created(cluster, kept, created=False, draws=draw)
         # The API echoes the object; fall back to what was sent if it echoed less.
         return _created(cluster, created if vm_spec.mac_of(created) else body, created=True, draws=draw)
     raise VmMacExhaustedError(

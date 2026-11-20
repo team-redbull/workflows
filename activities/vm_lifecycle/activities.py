@@ -10,12 +10,15 @@ fake clusters); cluster_figures.py and vm_spec.py are the arithmetic and the
 VirtualMachine it builds.
 
 Budgets, all under the workflow's timeouts (workflow_domains/vm_lifecycle/create_vm.py):
-  * one call to the cluster's API: 20 s (kubevirt_api.REQUEST_TIMEOUT);
+  * one call to the cluster's API: 5 s to connect, 20 s to answer (kubevirt_api.REQUEST_TIMEOUT);
   * the figures read: its four list calls together cut at 20 s, under the
     60 s start_to_close — an unreadable cluster is `readable: false`, never
     an exception, because the caller holds the zone's lock;
-  * the create: a list, a namespace read and at most three creates, under the
-    90 s start_to_close, and nothing after the request's `create_before`;
+  * the create: a list, a namespace read, at most three creates and a
+    read-back; an attempt starts no call after 55 s
+    (vm_operations.CREATE_BUDGET_SECONDS), so with one call's own bound it is
+    over inside the 90 s start_to_close and two attempts never overlap; and
+    nothing is created after the request's `create_before`;
   * the ready wait: one heartbeating activity polling every 8 s (the
     operator, 2026-11-05), its clock in the heartbeat details so a retry on a
     restarted worker resumes it, `deadline` on its own clock, under the

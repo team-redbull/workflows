@@ -61,7 +61,8 @@ and the lock asked for again, the scan carrying on from the cluster it had
 reached (and reading that one afresh) — at most _MAX_LEASES leases, then
 KvZoneLeaseExpiredError. Only a zone where many clusters have no worker gets
 there: each costs 30 s. The create itself is sent with `create_before`, the
-lease's end less _LEASE_GUARD, and the cluster's worker enforces it.
+lease's end less _LEASE_GUARD (45 s: one API call in flight, and the clock
+skew between the hub and a KV cluster), and the cluster's worker enforces it.
 
 A RUN IS KNOWN BY ITS RUN ID: the slot's workflow id is reused by later runs,
 so the VM's label and the lock's line both carry the run id.
@@ -161,9 +162,11 @@ _LIST_SCHEDULE_TO_START_TIMEOUT = timedelta(minutes=5)
 _FIGURES_SCHEDULE_TO_START_TIMEOUT = timedelta(seconds=30)
 _FIGURES_TIMEOUT = timedelta(seconds=60)
 _FIGURES_SCHEDULE_TO_CLOSE_TIMEOUT = timedelta(seconds=120)
-# The create: a list, a namespace read and at most three creates on the
-# cluster's API. NO schedule_to_start: a worker that restarts must not fail
-# the run — the request's `create_before` bounds it instead.
+# The create: a list, a namespace read, at most three creates and a read-back on
+# the cluster's API. The worker ends an attempt by itself well inside this
+# (vm_operations.CREATE_BUDGET_SECONDS + one call), so Temporal never starts a
+# second attempt beside a first. NO schedule_to_start: a worker that restarts
+# must not fail the run — the request's `create_before` bounds it instead.
 _CREATE_TIMEOUT = timedelta(seconds=90)
 _DELETE_TIMEOUT = timedelta(seconds=90)
 # The ready wait is ONE heartbeating activity on its own clock (CLAUDE.md §5):
@@ -178,9 +181,10 @@ _LOCK_WAIT = timedelta(minutes=30)
 _LOCK_REASK = timedelta(minutes=2)
 _MAX_LEASES = 3
 # The cluster's worker stops creating this long BEFORE the lock moves on: one
-# call to its API may still be in flight when it checks (20 s), and its clock
-# is another machine's.
-_LEASE_GUARD = timedelta(seconds=30)
+# call to its API may still be in flight when it checks (25 s at most), and its
+# clock is another machine's — what is left of the guard, 20 s, is the clock
+# skew between the hub and a KV cluster that is tolerated.
+_LEASE_GUARD = timedelta(seconds=45)
 # A create is not sent with less than this left before `create_before`.
 _CREATE_MARGIN = timedelta(seconds=10)
 # After a cancel cut the create's answer off: the attempt in flight may still

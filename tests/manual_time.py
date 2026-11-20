@@ -13,9 +13,9 @@ is off for the whole test, and time advances in two explicit ways:
 
 The test server never skips time while a task is outstanding (an activity on
 a queue nobody polls or still running, a workflow task nobody serves): a jump
-asked for then takes its whole length on the wall clock. `advance` jumps past
-the tasks it is told of (`outstanding=`) and fails rather than hide one it was
-not told of.
+asked for then just waits. `advance` jumps past them all the same, by
+releasing one more of the server's time-skipping locks per task it finds in its
+way (its docstring says how).
 """
 
 from __future__ import annotations
@@ -26,11 +26,11 @@ from typing import Any
 
 from temporalio.client import Client, WorkflowFailureError, WorkflowHandle
 from temporalio.contrib.pydantic import pydantic_data_converter
-from temporalio.service import RPCError
 from temporalio.testing import WorkflowEnvironment
 
-_ADVANCE_ATTEMPT_SECONDS = 5.0
-_NUDGE = timedelta(seconds=2)
+_ADVANCE_POLL_SECONDS = 0.15
+_ADVANCE_PATIENCE_SECONDS = 20.0
+_MAX_SLEEP_CALLS = 12
 
 
 class ManualTime:
@@ -50,44 +50,54 @@ class ManualTime:
     async def now(self) -> datetime:
         return await self.env.get_current_time()
 
-    async def advance(self, duration: timedelta, *, outstanding: int = 0) -> None:
+    async def advance(self, duration: timedelta) -> None:
         """Jump the server's clock by `duration`, exactly.
 
         THE TEST SERVER DOES NOT SKIP TIME WHILE A TASK IS OUTSTANDING — an
-        activity scheduled on a queue nobody polls or still running, a workflow
-        task nobody serves. Each holds one lock on its time skipping, and a
-        sleep call releases only one: the call then takes its whole duration
-        on the wall clock. Say how many tasks are `outstanding` and that many
-        MORE sleep calls are sent at once, each releasing one lock for the same
-        span and taking it back on the server at its end — so the clock jumps,
-        and is locked again with nothing for the client to restore (observed
-        on the SDK's test server, 2026-11-20; `tests/test_manual_time.py` pins it).
+        activity scheduled on a queue nobody polls or still running or between
+        two attempts, a workflow task nobody serves. Each holds one lock on its
+        time skipping, and a sleep call releases only one: the call then just
+        waits, the clock moving at the wall clock's pace. So while a jump has
+        NOT landed, one more sleep call is sent, for what is still missing —
+        each releases one more lock until its own end, which is the same
+        instant for all of them, and takes it back on the server there. The
+        clock jumps exactly to the target and is locked again, with nothing
+        for the client to restore and no call ever cut off (observed on the
+        SDK's test server, 2026-11-20; tests/test_manual_time.py pins it).
 
-        A jump that still hangs FAILS here rather than being cut off: a sleep
-        call given up on leaves its lock released for the rest of the test.
+        Never more calls than are seen to be needed: with nothing outstanding
+        a second sleep call is refused by the server, or jumps a second time.
         """
-        before = await self.env.get_current_time()
-        # A nudge of a second or two is let run its length on the wall clock, never cut off.
-        patience = _ADVANCE_ATTEMPT_SECONDS * 3 if duration <= _NUDGE else _ADVANCE_ATTEMPT_SECONDS
+        target = await self.env.get_current_time() + duration
+        calls = [asyncio.ensure_future(self.env.sleep(duration))]
+        loop = asyncio.get_running_loop()
+        give_up = loop.time() + _ADVANCE_PATIENCE_SECONDS
         try:
-            await asyncio.wait_for(
-                asyncio.gather(*(self.env.sleep(duration) for _ in range(outstanding + 1))), patience
-            )
-        except (TimeoutError, RPCError) as err:
-            moved = await self.env.get_current_time() - before
-            raise AssertionError(
-                f"the test server did not jump {duration} (it moved {moved} at the wall clock's pace): more than "
-                f"{outstanding} task(s) are outstanding, and it never skips time under one it was not told of"
-            ) from err
+            while True:
+                done, _ = await asyncio.wait(calls, timeout=_ADVANCE_POLL_SECONDS)
+                if done:
+                    break  # a call ran its whole span (or the server refused it): look at the clock below
+                remaining = target - await self.env.get_current_time()
+                if remaining <= timedelta(0):
+                    break
+                if len(calls) >= _MAX_SLEEP_CALLS or loop.time() >= give_up:
+                    raise AssertionError(
+                        f"the test server did not jump {duration}: {len(calls)} sleep calls are waiting and "
+                        f"{remaining} is still missing — more tasks are outstanding than a test should have"
+                    )
+                calls.append(asyncio.ensure_future(self.env.sleep(remaining)))
+        finally:
+            # Every call ends at the target, on the server; none is cancelled (a cancelled
+            # one would keep its lock released there until its span had passed anyway).
+            await asyncio.gather(*calls, return_exceptions=True)
 
     async def results(
         self, *handles: WorkflowHandle, step: timedelta = timedelta(seconds=1), settle: float = 0.1,
-        limit: float = 60.0, return_exceptions: bool = False, outstanding: int = 0,
+        limit: float = 60.0, return_exceptions: bool = False,
     ) -> list[Any]:
         """Every run's result, in order; the clock is nudged by `step` while any is still going.
 
         `limit` is REAL seconds: a run that never ends fails the test instead of hanging it.
-        `outstanding` is `advance`'s: how many tasks nobody serves the nudges must jump past.
         """
         tasks = [asyncio.ensure_future(handle.result()) for handle in handles]
         loop = asyncio.get_running_loop()
@@ -100,7 +110,7 @@ class ManualTime:
                 if loop.time() >= deadline:
                     raise AssertionError(f"{len(pending)} of {len(tasks)} runs were still going after {limit:g}s")
                 if step > timedelta(0):
-                    await self.advance(step, outstanding=outstanding)
+                    await self.advance(step)
         finally:
             for task in tasks:
                 if not task.done():

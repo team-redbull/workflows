@@ -309,7 +309,7 @@ jobs:
           helm lint upgrade-agent-worker "${common[@]}" --set upgradeAgent.url=http://upgrade-agent:8080
           helm template upgrade-agent-worker upgrade-agent-worker "${common[@]}" --set upgradeAgent.url=http://upgrade-agent:8080 >/dev/null
           kv=(--set kvCluster=ocp4-ci-kv-ci-a --set config.vmMacPrefix=0e:00:01 --set vm.storageClassName=ci
-              --set temporal.host=temporal-frontend:7233)
+              --set vm.network.multus.networkName=ci/vm-network --set temporal.host=temporal-frontend:7233)
           helm lint vm-lifecycle-worker "${kv[@]}"
           helm template vm-lifecycle-worker vm-lifecycle-worker "${kv[@]}" >/dev/null
       - name: Commit and push

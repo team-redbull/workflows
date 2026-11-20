@@ -45,5 +45,7 @@ at start (shared/settings/vm_lifecycle.py). */}}
 {{- if not (regexMatch "^0[eE](:[0-9a-fA-F]{2}){2}$" .Values.config.vmMacPrefix) -}}{{- fail (printf "config.vmMacPrefix %q must be three hex octets starting with 0e (0e:xx:xx): locally administered, and neither KubeMacPool's 02 nor OVN-Kubernetes' 0a" .Values.config.vmMacPrefix) -}}{{- end -}}
 {{- if not .Values.vm.storageClassName -}}{{- fail "vm.storageClassName is required: the root disk's storage class (Immediate binding, ReadWriteMany + Filesystem)" -}}{{- end -}}
 {{- if not .Values.vm.network -}}{{- fail "vm.network is required: the VM's networks[0] body, e.g. {multus: {networkName: ns/name}}" -}}{{- end -}}
+{{- if ne (len .Values.vm.network) 1 -}}{{- fail (printf "vm.network must name exactly ONE network type (multus or pod), got %s: KubeVirt refuses a network of two" (keys .Values.vm.network | sortAlpha | join ", ")) -}}{{- end -}}
+{{- if not (or (hasKey .Values.vm.network "multus") (hasKey .Values.vm.network "pod")) -}}{{- fail (printf "vm.network must be `multus` or `pod`, got %s" (keys .Values.vm.network | join ", ")) -}}{{- end -}}
 {{- if not .Values.temporal.host -}}{{- fail "temporal.host is required: the hub's Temporal frontend as reachable from this KV cluster" -}}{{- end -}}
 {{- end -}}

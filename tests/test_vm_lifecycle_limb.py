@@ -1033,12 +1033,39 @@ class TestSettings:
 
     @pytest.mark.parametrize(
         ("key", "value"),
-        [("vm_network", {}), ("vm_redfish_label", "redfish-enabled"), ("vm_redfish_label", "a=b,c=d"),
+        [("vm_network", {}), ("vm_network", {"multus": {"networkName": "a/b"}, "pod": {}}), ("vm_network", {"sriov": {}}),
+         ("vm_network", {"multus": {}}), ("vm_redfish_label", "redfish-enabled"), ("vm_redfish_label", "a=b,c=d"),
          ("vm_root_disk_size", "120"), ("vm_root_disk_size", "0Gi"), ("vm_root_disk_size", "big"), ("vm_storage_class_name", "  ")],
     )
     def test_a_value_that_could_not_build_a_vm_stops_the_worker(self, key, value):
         with pytest.raises(ValidationError):
             settings(**{key: value})
+
+    def test_a_pod_network_is_one_type_too(self):
+        assert settings(vm_network={"pod": {}}).vm_network == {"pod": {}}
+
+    def test_the_chart_gives_the_network_no_default_to_merge_with(self):
+        """Helm merges maps: a default `multus` beside an override's `pod` is a VM KubeVirt refuses
+        (the lab, 2026-11-20). The chart must leave the network empty and fail the render without one."""
+        import pathlib
+        import shutil
+        import subprocess
+
+        chart = pathlib.Path(__file__).resolve().parent.parent / "deploy" / "charts" / "vm-lifecycle-worker"
+        values = (chart / "values.yaml").read_text()
+        assert "\n  network: {}\n" in values
+        if shutil.which("helm") is None:
+            pytest.skip("needs helm")
+        base = ["helm", "template", "x", str(chart), "--set", "kvCluster=ocp4-prod-kv-five-a", "--set",
+                "config.vmMacPrefix=0e:03:f2", "--set", "vm.storageClassName=cephfs", "--set", "temporal.host=t:7233"]
+        none = subprocess.run(base, capture_output=True, text=True)
+        assert none.returncode != 0 and "vm.network is required" in none.stderr
+        two = subprocess.run([*base, "--set-json", 'vm.network={"multus":{"networkName":"a/b"},"pod":{}}'], capture_output=True, text=True)
+        assert two.returncode != 0 and "exactly ONE network type" in two.stderr
+        pod = subprocess.run([*base, "--set-json", 'vm.network={"pod":{}}'], capture_output=True, text=True)
+        assert pod.returncode == 0 and 'VM_NETWORK: "{\\"pod\\":{}}"' in pod.stdout
+        multus = subprocess.run([*base, "--set", "vm.network.multus.networkName=openshift-cnv/vm-external-network"], capture_output=True, text=True)
+        assert multus.returncode == 0 and "vm-external-network" in multus.stdout
 
     def test_the_buffer_is_not_this_workers(self):
         assert "headroom_buffer_percent" not in VmLifecycleActivitySettings.model_fields

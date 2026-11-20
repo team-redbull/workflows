@@ -110,7 +110,7 @@ minutes later, by deleting its VM again (`VmRootDiskNotBoundError`). ceph-rbd re
 | `kvCluster` | `KV_CLUSTER` | — (required) | The KV cluster this worker runs in: exactly its day1 file name; names its queue |
 | `config.vmMacPrefix` | `VM_MAC_PREFIX` | — (required) | The first three octets of every VM's MAC: `0e` + the cluster's VLAN ID |
 | `vm.storageClassName` | `VM_STORAGE_CLASS_NAME` | — (required) | The root disk's storage class (Immediate binding, RWX + Filesystem) |
-| `vm.network` | `VM_NETWORK` (JSON) | `{multus: {networkName: openshift-cnv/vm-external-network}}` | The VM's `networks[0]` body: the network every VM of the cluster boots on |
+| `vm.network` | `VM_NETWORK` (JSON) | none, **required** | The VM's `networks[0]` body, exactly ONE network type (`multus` or `pod`): the network every VM of the cluster boots on. In production `{multus: {networkName: openshift-cnv/vm-external-network}}`. No chart default on purpose: Helm merges maps, and a default beside an override is a VM of two network types, which KubeVirt refuses |
 | `vm.nodeSelector` | `VM_NODE_SELECTOR` (JSON) | `{}` | The VM template's nodeSelector. Capacity is measured on the nodes matching it only |
 | `vm.redfishLabel` | `VM_REDFISH_LABEL` | `redfish-enabled=true` | The label kubevirt-redfish exposes a VM by, and the one stopped VMs are counted by |
 | `vm.rootDiskSize` | `VM_ROOT_DISK_SIZE` | `120Gi` | The root disk's size |

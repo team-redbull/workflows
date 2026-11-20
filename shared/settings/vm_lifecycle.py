@@ -19,6 +19,7 @@ _LABEL = re.compile(r"^(?P<key>[A-Za-z0-9]([-A-Za-z0-9_./]*[A-Za-z0-9])?)=(?P<va
 # The first octet every VM MAC of ours starts with: locally administered and
 # unicast, and deliberately not `02` (KubeMacPool's range) nor `0a` (OVN-Kubernetes').
 MAC_FIRST_OCTET = "0e"
+_NETWORK_TYPES = frozenset({"multus", "pod"})
 
 
 class VmLifecycleActivitySettings(BaseSettings):
@@ -53,8 +54,9 @@ class VmLifecycleActivitySettings(BaseSettings):
     # ReadWriteMany + Filesystem volume: a WaitForFirstConsumer class never
     # binds a Halted VM's disk, and every run would end in the rollback.
     vm_storage_class_name: str
-    # The VM's `networks[0]` body, JSON: the network every VM of the cluster
-    # boots on (the site's inventory network).
+    # The VM's `networks[0]` body, JSON, exactly ONE network type (`multus` or
+    # `pod`): the network every VM of the cluster boots on (the site's
+    # inventory network).
     vm_network: dict = {"multus": {"networkName": "openshift-cnv/vm-external-network"}}
     # The VM template's nodeSelector, JSON; `{}` for none.
     vm_node_selector: dict[str, str] = {}
@@ -95,6 +97,16 @@ class VmLifecycleActivitySettings(BaseSettings):
     def _network(cls, value: dict) -> dict:
         if not value:
             raise ValueError('vm_network must be the VM\'s `networks[0]` body, e.g. {"multus": {"networkName": "ns/name"}}')
+        # KubeVirt's admission refuses a network of two types ("should have only one network
+        # type") — which is what a chart default merged with an override produces. Refused
+        # here, at worker start, not on the first run of a zone.
+        if len(value) != 1 or not set(value) <= _NETWORK_TYPES:
+            raise ValueError(
+                f"vm_network must name exactly ONE network type of {sorted(_NETWORK_TYPES)} (got {sorted(value)}): "
+                "KubeVirt refuses a network of two"
+            )
+        if "multus" in value and not (isinstance(value["multus"], dict) and value["multus"].get("networkName")):
+            raise ValueError("vm_network.multus must name its NetworkAttachmentDefinition: {\"multus\": {\"networkName\": \"ns/name\"}}")
         return value
 
     @field_validator("vm_redfish_label")

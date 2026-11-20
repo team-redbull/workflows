@@ -1074,7 +1074,11 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
     edge only), a kubevirt-redfish chassis namespace the platform created — never created here;
     missing is `VmNamespaceNotFoundError`. The cluster's VM values are the worker's own:
     `VM_STORAGE_CLASS_NAME` (REQUIRED: it must bind Immediately and allow ReadWriteMany +
-    Filesystem — ceph-rbd refuses that pair, found in the 2026-11-05 lab), `VM_NETWORK`,
+    Filesystem — ceph-rbd refuses that pair, found in the 2026-11-05 lab), `VM_NETWORK`
+    (exactly ONE network type, `multus` or `pod`, checked at worker start; the CHART has no
+    default for `vm.network` and does not render without it — a chart default is MERGED by Helm
+    with a cluster's own value into a network of two types, which KubeVirt refuses on every
+    create: the first run of the 2026-11-20 lab),
     `VM_NODE_SELECTOR`, `VM_REDFISH_LABEL`, and `VM_ROOT_DISK_SIZE` (the lead's, default `120Gi`).
   - **kubevirt-redfish runs `systemIdConvention: legacy`** (the operator, 2026-11-05): the Redfish
     system id IS the VM name, so the id, the VM and the server name server-scan lists are one
@@ -1106,6 +1110,18 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
     figures. `tests/manual_time.py` moves the test server's clock by hand (§5). Goldens for both
     workflows are recorded with the production waits. `python -m tests.kv_fleet` attaches fake
     clusters to a real Temporal next to a real cluster's worker (`docs/lab/create-vm-per-kv-cluster/`).
+    **The 2026-11-20 lab** (cluster-qcl8n, its README has every number) ran THIS design on a real
+    cluster through Argo CD: one real KV cluster's worker plus seven fake clusters in a pod, the
+    real brain, Temporal and a day1 mock. What it found or confirmed: the worker's figures equal the
+    nodes' own accounting to the millicore and the byte; a create is Halted with its disk bound in
+    about half a minute; ten runs on one zone are placed one at a time and the rest fail
+    `NoKvClusterFitsError` (a cluster in day1 with no worker costs each run 30 s); a run survives
+    its cluster's worker pod, the brain pod and Temporal's frontend and history pods being killed
+    under it; a cancel during the disk wait and the 10-minute rollback on a WaitForFirstConsumer
+    class both leave no VM (its DataVolume sits in `PendingPopulation`); and KubeMacPool on
+    OpenShift Virtualization does NOT refuse a duplicate MAC on Halted VMs — one more reason the
+    worker's own check is the guard. Seven of its histories are goldens
+    (`tests/histories/{create_vm,kv_zone_lock}/lab-cluster-qcl8n-*.json`).
     The 2026-11-05 lab (`docs/lab/create-vm/`, cluster-64spr) proved the AGENT-era design and is
     history; two of its findings still hold: a 16 GiB guest's launcher pod requests about 308 MiB
     over the guest, so the 1 GiB pad is conservative (kept), and ceph-rbd refuses the root disk's
@@ -1833,7 +1849,7 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   one release INSIDE each KV cluster, its ConfigMap that cluster's own values, a ClusterRole of
   exactly the verbs `activities/vm_lifecycle/kubevirt_api.py` uses — list nodes and pods, get
   namespaces and PVCs, get/list/create/delete VirtualMachines, list VMIs, get/delete DataVolumes
-  — and NO Secret; the render fails without `kvCluster`, the MAC prefix or the storage class;
+  — and NO Secret; the render fails without `kvCluster`, the MAC prefix, the storage class or the ONE network type;
   until then `gitops/charts/vm-lifecycle-worker/` was a hub chart with two agent-token Secrets)
   — the last three copied into redbull-platform's
   `gitops/charts/<same name>/` BY CI (`sync-upgrade-charts`, `scripts/sync_platform_charts.sh`,

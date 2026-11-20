@@ -22,13 +22,17 @@ Decided with the operator (reversing CLAUDE.md §4's "none to reopen" block):
    pattern). It reports its cluster's figures AND creates/reads/deletes VMs. The agents, their
    Routes and tokens, `KV_AGENT_CA`, the vendored agent contract and the hub vm-lifecycle limb go.
 2. **server-scan takes no part** in placement or creation. No server-scan change at all.
-3. **The zone's clusters come from day1**: the hosted clusters of the site's seed folders
-   (`sites/<site>/mces/<seed>/hostedClusters/`), kept when their NodePools' `nodeLabels` name the
-   requested `topology.kubernetes.io/zone`, sorted by the cluster name's `id` letter (oldest
-   first). Read on the **cluster-lifecycle limb** with `redbull-git-token`, cached per day1 commit.
+3. **The zone's clusters come from day1**: the hosted clusters of the zone's ONE seed folder,
+   `sites/<site>/mces/ocp4-seed-<site>-<zone number>/hostedClusters/` (InfraEnv zone `az<N>` = seed
+   `ocp4-seed-<site>-<N>`, decided 2026-11-20), each file's NodePools' `nodeLabels` zone checked
+   against it, sorted by the cluster name's `id` letter (oldest first). Read on the
+   **cluster-lifecycle limb** with `redbull-git-token`, through the shared day1 query library (1.4b)
+   on the commit-keyed snapshot (1.4a).
 4. **Names follow the platform naming convention**
    (`kubevirt-workflows/docs/review/naming-convention-draft.md`): clusters
-   `ocp4-<lifecycle>-<flavor>-<site>-<id>` (`kv` for a KV cluster, `seed` for a seed), InfraEnvs
+   `ocp4-<lifecycle>-<flavor>-<site>-<id>` (`kv` for a KV cluster), a seed
+   `ocp4-seed-<site>-<zone number>` (where the draft still differs, `ocp4-<lifecycle>-seed-<site>-<id>`;
+   the draft is to be updated), InfraEnvs
    `<flavor>-kv<cpu>-<site>-<zone>` (`c200-kv32-five-az1`), VMs
    `ocp-<flavor>-kv<cpu>-<site>-<full MAC, 12 hex>` (`ocp-c200-kv32-five-0e03f2a1b2c3`), VM labels
    per its §4.b.
@@ -182,20 +186,22 @@ completed             name, MAC, namespace, size, cluster, the per-cluster table
   there is no `VLAN_ID` to keep in step with it), `VM_STORAGE_CLASS_NAME`, `VM_NETWORK` (JSON),
   `VM_NODE_SELECTOR` (JSON), `VM_REDFISH_LABEL`. − day1, `KV_*` URL templates, tokens, CA,
   `HEADROOM_BUFFER_PERCENT`.
-- `shared/cluster_names.py`: `seed_cluster`, `kv_cluster_prefix`, `is_kv_cluster_of` go (the
-  convention puts no zone in a cluster name); + a parser for `ocp4-<lifecycle>-<flavor>-<site>-<id>`
-  (site and `id` letter).
+- `shared/cluster_names.py`: `seed_cluster(site, zone)` stays, now `ocp4-seed-<site>-<N>` for zone
+  `az<N>`, with its inverse `seed_zone(folder)` (the zone of a seed folder, None for any other
+  folder); `kv_cluster_prefix`, `is_kv_cluster_of` go (a KV cluster's name carries no zone); + a
+  parser for `ocp4-<lifecycle>-<flavor>-<site>-<id>` (site, `id` letter). Pure, so the API edge,
+  the workflow and the day1 library (1.4b) share one definition.
 
 ### 1.4 Limbs
 
-- **cluster-lifecycle**: `activities/cluster_lifecycle/kv_clusters.py` (the walk of the site's
-  seed folders over the shared `activities/day1_repo.py`, replacing
-  `activities/vm_lifecycle/day1_repo.py`: each file's zone from its NodePools' `nodeLabels`
-  `topology.kubernetes.io/zone`, none or two zones = a `problems` line and never a candidate,
-  sorted by the name's `id` letter; the list remembered for the latest day1 commit only, so runs
-  at the same moment cause one clone); a thin `list_kv_clusters` in its `activities.py`, answering
-  the list and `HEADROOM_BUFFER_PERCENT`; registered in its `worker_init.py`.
-  `tests/test_day1_repo.py` and CLAUDE.md §4 updated (the walk moves limbs).
+- **cluster-lifecycle**: a thin `list_kv_clusters` in its `activities.py`, registered in its
+  `worker_init.py`: `Day1.kv_clusters(site, zone)` from the day1 query library (1.4b) plus the
+  limb's `HEADROOM_BUFFER_PERCENT`, as `KvClusterList`. The library reads the one seed folder; a
+  file whose NodePools' `nodeLabels` zone does not match (or is absent) is a `problems` line and
+  never a candidate; sorted by the name's `id` letter. Through the cached snapshot of 1.4a, so runs
+  at the same moment cause one clone and a run on an unchanged `main` causes none. No KV-specific
+  module: the reading is the library's, the buffer is the limb's setting, and the activity only
+  joins them. `activities/vm_lifecycle/day1_repo.py` is deleted; CLAUDE.md §4 updated.
 - **vm-lifecycle** (`activities/vm_lifecycle/`, rewritten, runs inside a KV cluster):
   - `kubevirt_api.py`: in-cluster config, the sync client in `to_thread`, a request timeout on
     every call (the PATTERN of `activities/server_lifecycle/cluster_api.py`, own classification:
@@ -229,6 +235,111 @@ completed             name, MAC, namespace, size, cluster, the per-cluster table
     − httpx/PyYAML; Dockerfile without git.
   - Deleted: `kv_capacity_api.py`, `kv_vm_api.py`, `day1_repo.py`, `placement.py` (moved, 1.2).
 
+### 1.4a Git reads: a snapshot cached by commit (every limb that reads a git repo)
+
+Built for create-vm's listing, but as THE way every limb reads any git repo, not as a create-vm
+special case. Today every read is a full clone per activity attempt; a run on an unchanged repo
+pays the whole clone again.
+
+- **`activities/git_repo.py`** (the one git client, AC008) gains `snapshot(repo_url, token,
+  branch, repo, prefix)`, an async context manager yielding a READ-ONLY tree:
+  1. `git ls-remote --exit-code --heads <url> refs/heads/<branch>` (the call every clone already
+     makes first): the remote head's SHA. Exit 2 is still `ValuesBranchNotFoundError`, any other
+     failure still `ValuesRepoGitError`. **The remote is asked every time**: a cache never answers
+     for the remote, so an unreachable repo fails exactly as today and is never served stale.
+  2. The SHA equals the snapshot cached for (repo URL without token, branch) → that snapshot,
+     no clone. Git is content-addressed: the same SHA is the same tree, so the answer is
+     identical to a fresh clone's.
+  3. Otherwise ONE shallow clone of exactly that SHA into a new directory under the pod's cache
+     root, `origin` reset to the URL without the token (as `clone()` does today), then swapped in
+     as the cached snapshot.
+- **Concurrency**: one `asyncio.Lock` per (repo, branch): thirty runs arriving together cause
+  one clone; the others wait for it and read it.
+- **Lifetime**: one snapshot per (repo, branch). The one it replaces is deleted only once no
+  read still holds it (a reference count), so a read never loses its files mid-way. The cache is
+  per pod, in an `emptyDir`, and empty after a restart: the first read clones.
+- **Reads only.** A WRITE keeps `fresh_clone`, one per attempt, in a `TemporaryDirectory`:
+  retries must start clean, and the "already done" check must share the push's clone (CLAUDE.md
+  §5). A read that decides a later write in ANOTHER activity is fine on a snapshot: that write
+  re-checks in its own fresh clone, as it does today (the blob compare-and-set).
+- **Every read result carries the SHA it read** (`revision`, as `KvClusterList` already does), so
+  a run's history says which commit it decided on.
+- **`activities/day1_repo.py`** gains `main_snapshot()` beside `fresh_main()`. Migrated to it, the
+  reads only:
+
+  | caller | today | then |
+  | --- | --- | --- |
+  | cluster-lifecycle `list_kv_clusters` (new) | — | `main_snapshot()` |
+  | cluster-lifecycle `day1_writer.inspect` | `fresh_main` | `main_snapshot()` |
+  | upgrade-gitops `read_rules`, `read_cluster` (`upgrade_gitops/day1_repo.py`) | `fresh_main` | `main_snapshot()` |
+  | upgrade-gitops day2 layers (`upgrade_gitops/day2_repo.py`) | `fresh_clone` | `git_repo.snapshot()` |
+  | `day1_writer.publish`, the branch push, `day2_sigs`, upgrade-gitops commits, `brain_repo` | `fresh_clone` / `fresh_main` | unchanged: they write |
+- **Enforced by the checker, not by memory**: AC008 already sends every git call through
+  `git_repo.py`; it gains a rule that a `fresh_clone`/`fresh_main` block must reach
+  `commit_and_push` (a write), so a new read can only be written with `snapshot`.
+- Each limb chart that reads git gets the `emptyDir` volume for the cache root (cluster-lifecycle,
+  upgrade-gitops), with a size limit.
+
+### 1.4b The day1 query library (every workflow that reads day1)
+
+day1 is where every OpenShift cluster is described, so many workflows will ask it questions. They
+ask through ONE library, not each its own walk of the folders. Built here for create-vm, written
+for all.
+
+**The repo it reads** (inspected 2026-11-20, `gitops-day1/platform-config`): every cluster file is
+`sites/<site>/mces/<folder>/hostedClusters/<cluster>.yaml`, rendered with the layers
+`sites/configValues.yaml` → `sites/<site>/values.yaml` → `sites/<site>/mces/<folder>/values.yaml`
+→ the file. A `<folder>` is an MCE (`ocp4-<env>-mce-<site>-<letter>`, or a legacy name such as
+`ocp4-mce-site2`) or a seed (`ocp4-seed-<site>-<zone number>`). There is no env folder.
+
+- **`activities/day1_repo.py`** (already the shared reader, in no domain) grows a `Day1` class:
+  one read-only view of day1 at one commit, opened with `async with day1_repo.main_snapshot(...) as
+  day1:` (1.4a). Pure over a directory, no settings, no Temporal: tested on a fixture tree.
+
+  ```python
+  day1.clusters(site=None, env=None, kind="all" | "hc" | "kv")  # every query is this one, filtered
+  day1.kv_clusters(site=None, zone=None)                         # kind="kv"
+  day1.hosted_clusters(site=None, env=None, include_kv=False)    # kind="hc", or "all"
+  day1.cluster(name)                                             # one cluster, its values merged
+  ```
+
+  Each returns `Day1Cluster` records: `name` (the file stem), `site`, `folder`, `kind`, `env`,
+  `zone` (KV only), `cluster_name`, `hosted_cluster` and its namespace, `problems`, and `revision`
+  (the commit). Values are merged only when a query needs them (`load_cluster_values`, unchanged).
+- **The definitions, each in one place:**
+
+  | | rule |
+  | --- | --- |
+  | `kv` | a hosted cluster under a SEED folder. Never by name: day1 has `ocp4-test-kubevirt-site4` under an MCE, and it is an `hc` |
+  | `hc` | a hosted cluster under an MCE folder (KV clusters are hosted clusters too, so `hc` means "not under a seed", stated in the docstring) |
+  | `zone` | the seed folder's zone (`seed_zone`, 1.3), checked against the NodePools' `nodeLabels`; a mismatch is a `problems` line |
+  | `env` | provision-cluster's existing rule, moved here so it has one home: `day2.env` from the merged values, else the cluster name's first field after `ocp4-`. Never the MCE folder's name: legacy folders carry none |
+  | `site` | the `sites/<site>` folder |
+
+- **The activity, for workflows whose own limb has no day1 token**: `list_day1_clusters(
+  Day1ClusterQuery) -> Day1ClusterList` on the cluster-lifecycle limb (it holds the token, §2's
+  rule), models and signature under a "shared with other domains" header in
+  `shared/models/cluster_lifecycle.py` / `shared/interfaces/cluster_lifecycle.py` (the
+  `get_inventory_segment` precedent). The query carries the filters (`site`, `env`, `kind`,
+  `zone`); the list carries `revision`. A new question is a new filter or method, not a new
+  activity. It is not a "generic git activity" (CLAUDE.md §5): no clone crosses it and it writes
+  nothing; it answers typed facts about one commit.
+- **A limb that already holds the day1 token** and reads inside its own step (upgrade-gitops before
+  an edit, provision-cluster's inspect) uses `Day1` directly, no cross-limb call. Their own walks
+  (`find_mce_dir`, `find_cluster_file`) move onto `Day1` where they are reads.
+- **Enforced**: a checker rule (AC009) refuses day1 path literals (`hostedClusters`, `sites/`,
+  `mces/`) outside `activities/day1_repo.py`, so a domain module cannot grow its own walk.
+- **Tests**: `tests/test_day1_repo.py` extended on a fixture tree shaped like the real repo: MCE
+  and seed folders, a legacy MCE folder, a `kubevirt`-named `hc`, a KV file whose NodePools name
+  another zone, `env` from `day2.env` and from the name, `kind` filters, `revision` carried.
+- **Skill**: `.claude/skills/redbull-workflows/references/day1-reads.md`, linked from the skill's
+  SKILL.md — the procedure when a workflow needs day1 data: (1) find the `Day1` query that answers
+  it; (2) none does → add a `Day1` method (pure, a fixture test) and, if a workflow must reach it
+  across limbs, a `Day1ClusterQuery` filter; (3) call `list_day1_clusters`, or `Day1` directly
+  in a limb that holds the token; (4) never parse a day1 path or YAML in a domain module (AC009);
+  (5) carry `revision` in the result. Plus one line in `.claude/rules/activities.md`: "day1 is
+  read only through `Day1`".
+
 ### 1.5 Chart and CI
 
 - new `deploy/charts/vm-lifecycle-worker/` on the `cluster-upgrade-worker` model. Its ConfigMap
@@ -242,7 +353,8 @@ completed             name, MAC, namespace, size, cluster, the per-cluster table
   get/list/create/delete; datavolumes: get/delete); README with config, RBAC, network tables and
   "`kvCluster` = the day1 file name".
 - `cluster-lifecycle-worker` chart: `config.headroomBufferPercent` (default 15) into
-  `HEADROOM_BUFFER_PERCENT`.
+  `HEADROOM_BUFFER_PERCENT`; the git snapshot cache's `emptyDir` (1.4a). The same volume in the
+  `upgrade-gitops-worker` chart.
 - `scripts/sync_platform_charts.sh` + the chart, **hardened** so a destination of the old hub
   shape (no `.image.repository`) is not "owned" (today it would write `null` as repository and
   tag); `tests/test_sync_platform_charts.py`.
@@ -277,10 +389,19 @@ completed             name, MAC, namespace, size, cluster, the per-cluster table
   id labels without drawing, a request for another cluster or site refused, a create after
   `create_before` → `VmLeaseExpiredError` with nothing created, while a retry after it still
   returns the VM it created);
-  `tests/test_vm_lifecycle_day1.py` moved to the cluster-lifecycle limb (zone from `nodeLabels`,
-  none/two zones, `id` order, one clone per commit); `tests/test_infraenv_names.py` for the new
+  `tests/test_vm_lifecycle_day1.py` deleted: its cases (the zone's ONE seed folder, a NodePool
+  zone that disagrees or is absent, `id` order) move to `tests/test_day1_repo.py` (1.4b), and
+  `list_kv_clusters` gets a limb test (the library's list + the buffer); `tests/test_cluster_names.py`
+  for `seed_cluster` / `seed_zone` (`az1` ↔ `ocp4-seed-five-1`); `tests/test_infraenv_names.py` for the new
   InfraEnv form; settings tests for `VM_MAC_PREFIX` (3 octets, `0e` first) and the site parsed
   from `KV_CLUSTER`.
+- new `tests/test_git_snapshot.py`, on a local bare repo: an unchanged head clones once and
+  serves the snapshot after (`ls-remote` still called each time); a new commit clones again and
+  replaces it; concurrent reads of one head cause one clone; a replaced snapshot survives while a
+  read holds it, then is deleted; a missing branch / unreachable remote raise exactly as
+  `fresh_clone` does and serve nothing cached; no file of a snapshot contains the token; the
+  result's `revision` is the head read. The migrated readers' tests unchanged in what they
+  assert. `tests/test_conventions.py`: AC008's new read-through-`fresh_clone` case.
 - edits: `test_worker_registration.py` (`_WORKERS`; create-vm reaches exactly
   `CLUSTER_LIFECYCLE_ACTIVITY_QUEUE` + `vm_lifecycle_activity_queue`; the zone lock reaches no
   activity queue), `test_contract.py`, `test_error_classification.py`, `test_image_changes.py`,
@@ -295,6 +416,19 @@ create-vm block rewritten with the dated reversals; §5 gains the per-zone lock 
 serialization precedent), `.claude/rules/delivery.md` + the skill's synced-charts rows,
 `kubevirt-vm-placement.md`, `kv-agents-api.md`, `kv-placement-server-scan.md` → superseded by
 `create-vm-placement.md` (the latter rejected 2026-11-17), `docs/lab/create-vm/` → stale.
+
+The git snapshot rule (1.4a) is a repo-wide invariant, so it goes in the three committed layers
+together, per CLAUDE.md §0, and nowhere else:
+- **CLAUDE.md §5**, the existing "Git-subprocess activities" bullet: a WRITER opens one
+  `fresh_clone` per attempt; a READER takes `git_repo.snapshot`, which asks the remote for its
+  head every time and clones only when the head moved. A few lines inside the existing bullet,
+  no new section.
+- **`.claude/rules/activities.md`**, the "Git only through `activities/git_repo.py`" line: the same
+  rule in one line, with its checker id. It loads whenever an activity is edited, which is
+  exactly when a new git read is written.
+- **`scripts/check_conventions.py`**: AC008 extended (1.4a).
+Not the skill: the skill is the procedure for a change, and this is an invariant every change
+must keep.
 
 **Gate**: `python3 scripts/check_conventions.py` (0 errors); `UPDATE_REPLAY_HISTORIES=1 …` once
 for the two replay files; `.venv/bin/python -m pytest -q`; `helm lint` + `helm template` of the new chart.
@@ -337,9 +471,10 @@ replaces it; removing it first breaks the next tag bump). Update its CLAUDE.md/R
 
 ## Open points (the design's §11)
 
-- **Seed and KV cluster flavors**: settled. The convention reserves `seed` and `kv`
-  (2026-11-19); the listing tells a seed folder apart by its flavor, and requires the zone label
-  on every KV NodePool.
+- **The seed's name**: `ocp4-seed-<site>-<zone number>` (decided 2026-11-20), the number matching
+  the InfraEnv's `az<N>`. The naming draft still says `ocp4-<lifecycle>-seed-<site>-<id>` and must
+  be updated to match. The `kv` flavor and the zone label on every KV NodePool stand as the draft
+  has them.
 - **Memory = cpu × 8 GiB**: the InfraEnv carries vCPUs only.
 - **A released VLAN reused by a new KV cluster** inherits the old prefix: safe only once the old
   cluster's VMs, BareMetalHosts and Agents are gone.
@@ -382,3 +517,5 @@ replaces it; removing it first breaks the next tag bump). Update its CLAUDE.md/R
 | §1.1, §1.2, §1.3 | The create has no schedule-to-start limit, so it can land after the lease expired and the lock moved on (an open point: one VM over the buffer) | The grant carries `lease_ends_at`; the create carries it as `create_before`, and the worker refuses to create after it (`VmLeaseExpiredError`, nothing created). The open point is closed |
 | §1.3, §1.5 | `SITE`, `VLAN_ID` and `VM_MAC_PREFIX` in the worker's settings and ConfigMap, the prefix checked against the VLAN | `VM_MAC_PREFIX` only, the one place the prefix is set; the site is parsed from `KV_CLUSTER` (`ocp4-<lifecycle>-kv-<site>-<id>`, now that the convention reserves `kv`) |
 | File | `i-want-to-make-optimized-shamir.md` | `create-vm-placement-plan.md`, next to the design |
+| §1.4a (new), §1.5, §1.6, §1.7 | create-vm's listing remembered the day1 list for one commit, as its own cache | One cache for every git READ in the repo: `git_repo.snapshot` asks the remote's head every time and clones only when it moved; writes keep `fresh_clone`. The existing day1 and day2 readers migrate; AC008 enforces it; CLAUDE.md §5 and `.claude/rules/activities.md` state it |
+| Context 3, §1.3, §1.4, §1.4b (new), §1.6 | KV clusters found by walking every seed folder of the site, the zone read from each file's NodePools; a create-vm module for the walk | The seed is `ocp4-seed-<site>-<zone number>` (2026-11-20), so a zone's clusters are ONE folder and the NodePools' zone only cross-checks it. Every day1 read goes through one `Day1` query library (`clusters`, `kv_clusters`, `hosted_clusters`, `cluster`; kinds `hc` / `kv`), a `list_day1_clusters` activity on the cluster-lifecycle limb for other domains, AC009 refusing a day1 walk elsewhere, and a skill page for adding a query |

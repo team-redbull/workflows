@@ -66,24 +66,25 @@ A `-mtl-` InfraEnv is bare metal, not a VM pool, and is refused. The MCE is a cl
 refused. Memory is not in the name: it is **vCPUs × 8 GiB** (section 6.1).
 
 **Where the clusters are.** A KV cluster is a hosted cluster whose control plane runs on its
-zone's **seed** cluster (one seed per zone, AD17). The convention reserves two cluster flavors for
-them: a seed is `ocp4-<lifecycle>-seed-<site>-<id>`, a KV cluster `ocp4-<lifecycle>-kv-<site>-<id>`.
-So the zone's KV clusters are the files of the site's seed folders in the day1 repo's `main`,
-read by the `cluster-lifecycle-worker` on the hub:
+zone's **seed** cluster (one seed per zone, AD17). A seed is named after its site and zone,
+**`ocp4-seed-<site>-<zone number>`** (decided 2026-11-20), and a KV cluster
+`ocp4-<lifecycle>-kv-<site>-<id>`. So a zone's KV clusters are the files of ONE folder, its
+seed's, in the day1 repo's `main`, read by the `cluster-lifecycle-worker` on the hub:
 
 ```
-sites/<site>/mces/<seed cluster>/hostedClusters/<kv cluster>.yaml
-sites/five/mces/ocp4-prod-seed-five-a/hostedClusters/ocp4-prod-kv-five-a.yaml
+sites/<site>/mces/ocp4-seed-<site>-<zone number>/hostedClusters/<kv cluster>.yaml
+sites/five/mces/ocp4-seed-five-1/hostedClusters/ocp4-prod-kv-five-a.yaml      (zone az1)
 ```
 
-- **A seed's folder is told apart by its flavor**, `seed`; an MCE's folder holds tenant clusters,
-  never KV clusters.
-- **The zone is read from the file, not from a name.** Under the naming convention no cluster
-  name carries a zone. A KV cluster's zone is the `topology.kubernetes.io/zone` its NodePools set
-  on their nodes (`nodeLabels`), which the convention requires on every KV NodePool and which is
-  in its day1 file. A KV cluster is single-zone (AD8), so every NodePool of the file must name the
-  same zone; a file whose NodePools disagree, or name none, is listed with a problem and never
-  chosen.
+- **The zone comes from the seed folder's name.** InfraEnv zone `az<N>` is seed
+  `ocp4-seed-<site>-<N>`, so the run goes straight to that folder; no other folder is read. A seed
+  is immutable and one per zone, so its name can carry the zone, while KV cluster names do not.
+- **An MCE's folder never holds KV clusters**, even one whose name says `kubevirt` (day1 has
+  `ocp4-test-kubevirt-site4` under `ocp4-prep-mce-site4-a`, an ordinary hosted cluster).
+- **The NodePools must agree.** The convention requires every KV NodePool to label its nodes
+  `topology.kubernetes.io/zone` (`nodeLabels`). A file under the seed of `az1` whose NodePools name
+  another zone, or none, is listed with a problem and never chosen: its VMs would carry the wrong
+  zone.
 - **The file's name (without `.yaml`) is the cluster's name everywhere.** It is the queue name and
   the `kvCluster` value the worker is deployed with. Both must be the same string.
 - **Oldest first.** The clusters are sorted by their `id`, the sequence letter the convention ends
@@ -94,8 +95,9 @@ sites/five/mces/ocp4-prod-seed-five-a/hostedClusters/ocp4-prod-kv-five-a.yaml
 - **The same read is not repeated for nothing.** The worker remembers the list for one commit
   only, the latest one it read. Each run first asks git which commit `main` is on, which is one
   small call. If it is the remembered commit, the list is the same by definition and no clone is
-  needed. If `main` moved (for example, someone added a cluster file), the worker clones once,
-  lists every site's seed folders, and replaces what it remembered. Thirty runs at the same moment
+  needed. If `main` moved (for example, someone added a cluster file), the worker clones once and
+  replaces what it remembered. This is the repo-wide git read cache (the plan's §1.4a), not
+  something of create-vm's own. Thirty runs at the same moment
   cause one clone. Git stays the only source of truth: a new cluster is seen by the first run
   after its commit lands.
 
@@ -271,56 +273,31 @@ While the run holds the zone's lock, it asks one cluster at a time, oldest first
 the first that fits. The request goes to **that cluster's queue**: Temporal delivers it to the
 worker running inside that cluster.
 
-```python
-_FIGURES_TIMEOUT = timedelta(seconds=60)      # one attempt; the worker bounds its own reads at 20 s
-_NO_WORKER_TIMEOUT = timedelta(seconds=30)    # nobody polls the queue -> `no-worker`
+For each cluster in the list, which is already oldest first (section 3):
 
-# phase: choosing-kv-cluster (zone lock held)
-vm_cpu = pod_cpu_millicores(request.cpu)
-vm_memory = pod_memory_bytes(request.memory_gib * GIB)
-chosen: str | None = None
-for cluster in listed.clusters:                   # already oldest first (section 3)
-    try:
-        figures: KvClusterFigures = await workflow.execute_activity(
-            read_kv_cluster_figures,
-            KvFiguresRequest(kv_cluster=cluster.name),
-            task_queue=vm_lifecycle_activity_queue(cluster.name),
-            start_to_close_timeout=_FIGURES_TIMEOUT,
-            schedule_to_start_timeout=_NO_WORKER_TIMEOUT,
-            retry_policy=_RETRY_POLICY,
-        )
-    except ActivityError as err:
-        # Temporal does not retry a schedule-to-start timeout: it means no worker
-        # polled this cluster's queue for 30 s. That is a skip, not a failure.
-        if isinstance(err.cause, TimeoutError) and err.cause.type == TimeoutType.SCHEDULE_TO_START:
-            self._skip(cluster.name, "no-worker")
-            continue
-        raise
-    reason = skip_reason(figures, vm_cpu, vm_memory, listed.buffer_percent)
-    self._record(cluster.name, figures, reason)   # every cluster tried is a row in progress/result
-    if reason is None:
-        chosen = cluster.name
-        break                                     # the clusters after it are not read (6.4)
-```
+1. **Ask for its figures** on `vm-lifecycle-activity-<cluster>`, with two time limits:
+   - **30 seconds for a worker to pick the request up.** If none does, the cluster is a
+     `no-worker` row and the run moves to the next cluster. Temporal does not retry this
+     timeout, so it is a skip, never a failure.
+   - **60 seconds for the worker to answer** once it has picked the request up. The worker
+     bounds its own reads of its cluster at 20 seconds.
+2. **Apply the fit rule** (6.4) to the figures: the VM's request in scheduler terms (6.1) and the
+   buffer the cluster list came with.
+3. **Record the cluster as a row** of the run's progress and result, with its figures and its skip
+   reason, if any.
+4. **Stop at the first cluster that fits.** The clusters after it are not read.
 
-`skip_reason` is the fit rule of 6.4, pure and next to the workflow
-(`workflow_domains/vm_lifecycle/placement.py`, as `server_lifecycle/bond_selection.py` is):
+The fit rule is a pure function next to the workflow
+(`workflow_domains/vm_lifecycle/placement.py`, as `server_lifecycle/bond_selection.py` is). It
+returns the first reason that applies, in this order, or none when the VM fits:
 
-```python
-def skip_reason(f: KvClusterFigures, vm_cpu: int, vm_memory: int, buffer_percent: int) -> str | None:
-    if not f.readable:
-        return "unreachable"
-    if not f.node_headroom:
-        return "no-nodes"
-    if not any(n.cpu_millicores >= vm_cpu and n.memory_bytes >= vm_memory for n in f.node_headroom):
-        return "fit-node"
-    limit = (100 - buffer_percent) / 100
-    if (f.requested_cpu_millicores + vm_cpu) > limit * f.allocatable_cpu_millicores:
-        return "fit-buffer"
-    if (f.requested_memory_bytes + vm_memory) > limit * f.allocatable_memory_bytes:
-        return "fit-buffer"
-    return None
-```
+| check | reason |
+| --- | --- |
+| the worker could not read its cluster | `unreachable` |
+| the cluster has no usable node | `no-nodes` |
+| no single node has room for the VM's CPU **and** memory | `fit-node` |
+| requested CPU + the VM's CPU is over `(1 − buffer)` × allocatable CPU | `fit-buffer` |
+| the same, for memory | `fit-buffer` |
 
 One attempt takes at most 30 s waiting for a worker plus 60 s running. If the worker dies
 mid-read, the retry waits for a worker again (the schedule-to-start limit applies to each
@@ -333,112 +310,41 @@ The activity stays thin (`activities/vm_lifecycle/activities.py`). The reading a
 in a plain module with no Temporal and no settings
 (`activities/vm_lifecycle/cluster_figures.py`), tested with fake API objects.
 
-```python
-# activities/vm_lifecycle/activities.py
-@activity.defn
-async def read_kv_cluster_figures(request: KvFiguresRequest) -> KvClusterFigures:
-    settings = _settings()                        # KV_CLUSTER: the cluster this worker is deployed in
-    if request.kv_cluster != settings.kv_cluster:
-        return KvClusterFigures(
-            kv_cluster=request.kv_cluster, readable=False,
-            detail=f"the worker on this queue is deployed for {settings.kv_cluster}",
-        )
-    try:
-        return await cluster_figures.read(settings.kv_cluster, timeout_seconds=20)
-    except cluster_figures.ClusterReadError as err:
-        activity.logger.warning("cannot read %s: %s", settings.kv_cluster, err)
-        return KvClusterFigures(kv_cluster=settings.kv_cluster, readable=False, detail=str(err)[:500])
-```
+**The activity, `read_kv_cluster_figures`:**
 
-```python
-# activities/vm_lifecycle/cluster_figures.py
-REDFISH_LABEL = "redfish-enabled=true"
-_POD_ON_A_NODE = {"Scheduled", "Running", "Unknown"}   # VMI phases whose launcher pod is already counted
+- **A request for another cluster** than the one the worker was deployed for (`KV_CLUSTER`) is
+  answered `readable: false`, naming the cluster the worker is for. A worker on the wrong queue
+  never reports its own cluster's numbers under another name.
+- **A cluster API it cannot read** is also answered `readable: false`, with the reason cut to a
+  few hundred characters and logged. It is never an exception, so Temporal does not retry it.
+- Otherwise it answers the figures computed below.
 
+**The reads.** Four list calls to the cluster's own API, as the worker's ServiceAccount, all at
+the same time, each cut off at 20 seconds. The Kubernetes client is synchronous, so each call
+runs in a thread, as the server-lifecycle worker's calls do.
 
-async def read(kv_cluster: str, *, timeout_seconds: int) -> KvClusterFigures:
-    """Four list calls, each bounded; the kubernetes client is synchronous, so
-    each runs in a thread (the server-lifecycle precedent)."""
-    core, custom = _clients()                     # in-cluster config, this worker's ServiceAccount
-    t = {"_request_timeout": timeout_seconds}
-    try:
-        nodes, pods, vms, vmis = await asyncio.gather(
-            asyncio.to_thread(core.list_node, **t),
-            asyncio.to_thread(core.list_pod_for_all_namespaces,
-                              field_selector="status.phase!=Succeeded,status.phase!=Failed", **t),
-            asyncio.to_thread(custom.list_cluster_custom_object, "kubevirt.io", "v1",
-                              "virtualmachines", label_selector=REDFISH_LABEL, **t),
-            asyncio.to_thread(custom.list_cluster_custom_object, "kubevirt.io", "v1",
-                              "virtualmachineinstances", **t),
-        )
-    except (ApiException, urllib3.exceptions.HTTPError) as err:
-        raise ClusterReadError(_bounded(err)) from err
-    return figures(kv_cluster, nodes.items, pods.items, vms["items"], vmis["items"])
+| call | filter |
+| --- | --- |
+| nodes | none |
+| pods, in every namespace | finished pods (`Succeeded`, `Failed`) left out by the API server |
+| VirtualMachines, in every namespace | only those labelled `redfish-enabled=true` |
+| VirtualMachineInstances, in every namespace | none: the worker checks their phase itself |
 
+**The arithmetic**, a pure function from those four lists to the figures:
 
-def figures(kv_cluster, nodes, pods, vms, vmis) -> KvClusterFigures:
-    """Pure: the API objects in, the figures out."""
-    usable = {n.metadata.name: n for n in nodes if _ready(n) and not n.spec.unschedulable}
-
-    # Pods: what each one requests, summed per node, on usable nodes only.
-    on_node: dict[str, tuple[int, int]] = {name: (0, 0) for name in usable}
-    for pod in pods:
-        if pod.spec.node_name in on_node:
-            cpu, mem = pod_request(pod.spec)
-            c, m = on_node[pod.spec.node_name]
-            on_node[pod.spec.node_name] = (c + cpu, m + mem)
-
-    # Stopped VMs: labelled for kubevirt-redfish, with no launcher pod on a node.
-    # Their pod does not exist yet, so the request is computed from the VM itself.
-    running = {(i["metadata"]["namespace"], i["metadata"]["name"])
-               for i in vmis if i.get("status", {}).get("phase") in _POD_ON_A_NODE}
-    stopped = [vm for vm in vms
-               if (vm["metadata"]["namespace"], vm["metadata"]["name"]) not in running]
-    stopped_cpu = sum(pod_cpu_millicores(_vcpu(vm)) for vm in stopped)
-    stopped_mem = sum(pod_memory_bytes(_guest_memory_bytes(vm)) for vm in stopped)
-
-    alloc = {name: (_millicores(n.status.allocatable["cpu"]), _bytes(n.status.allocatable["memory"]))
-             for name, n in usable.items()}
-    return KvClusterFigures(
-        kv_cluster=kv_cluster,
-        readable=True,
-        allocatable_cpu_millicores=sum(c for c, _ in alloc.values()),
-        allocatable_memory_bytes=sum(m for _, m in alloc.values()),
-        pods_cpu_millicores=sum(c for c, _ in on_node.values()),
-        pods_memory_bytes=sum(m for _, m in on_node.values()),
-        stopped_vms=len(stopped),
-        stopped_vms_cpu_millicores=stopped_cpu,
-        stopped_vms_memory_bytes=stopped_mem,
-        node_headroom=[
-            KvNodeHeadroom(node=name, cpu_millicores=alloc[name][0] - on_node[name][0],
-                           memory_bytes=alloc[name][1] - on_node[name][1])
-            for name in sorted(usable)
-        ],
-    )
-
-
-def pod_request(spec) -> tuple[int, int]:
-    """A pod's request the way the scheduler counts it: the larger of (its
-    containers + sidecar init containers) and its largest ordinary init container,
-    plus the pod's overhead. 6.2 says "sum of its containers' requests"; this
-    is that sum, with the cases where the scheduler counts more."""
-    app = _sum(spec.containers) + _sum(c for c in spec.init_containers or [] if c.restart_policy == "Always")
-    init = max((_req(c) for c in spec.init_containers or [] if c.restart_policy != "Always"),
-               default=(0, 0), key=lambda r: r[0])
-    overhead = _from_quantities(spec.overhead or {})
-    return (max(app[0], init[0]) + overhead[0], max(app[1], init[1]) + overhead[1])
-
-
-def _vcpu(vm: dict) -> int:
-    cpu = vm["spec"]["template"]["spec"]["domain"].get("cpu", {})
-    return cpu.get("cores", 1) * cpu.get("sockets", 1) * cpu.get("threads", 1)
-
-
-def _guest_memory_bytes(vm: dict) -> int:
-    domain = vm["spec"]["template"]["spec"]["domain"]
-    guest = domain.get("memory", {}).get("guest") or domain["resources"]["requests"]["memory"]
-    return _bytes(guest)
-```
+1. **Usable nodes:** Ready and not cordoned. Nothing else counts.
+2. **Pods:** each pod's request, added to the node it runs on, for usable nodes only. A pod's
+   request is counted the way the scheduler counts it: the larger of (its containers plus its
+   sidecar init containers) and its largest ordinary init container, plus the pod's overhead.
+   6.2 calls this "the sum of its containers' requests"; it is that sum, with the cases where the
+   scheduler counts more.
+3. **Stopped VMs:** every labelled VM whose VMI is not `Scheduled`, `Running` or `Unknown`. Those
+   three phases have a launcher pod on a node, already counted in step 2. A stopped VM has no pod
+   yet, so its request is computed from the VM itself, with the formulas of 6.1: vCPUs = cores ×
+   sockets × threads, guest memory from `memory.guest`, else the memory request.
+4. **The figures:** allocatable summed over usable nodes; pods summed; stopped VMs counted and
+   summed; and for each usable node, its allocatable minus its pods' requests, as a CPU and
+   memory pair.
 
 Quantities are parsed with the client's own `kubernetes.utils.parse_quantity` (`"500m"`, `"64Gi"`,
 `"1.5"`), converted to integer millicores and bytes right there, and never sent on as strings.
@@ -622,10 +528,11 @@ namespace; the run needs the MAC for the BareMetalHost.
 
 All of this happens **when the KV cluster is created**; nothing is set on the hub.
 
-1. **Its day1 file**, in its zone's seed folder, named `ocp4-<lifecycle>-kv-<site>-<id>`. Its
-   name is the cluster's name from then on. Its NodePools set `topology.kubernetes.io/zone` in
-   their `nodeLabels`: that is how create-vm knows its zone (section 3). Its `vlanId` is the
-   VLAN the Segments Manager allocated to it.
+1. **Its day1 file**, in its zone's seed folder (`ocp4-seed-<site>-<zone number>`), named
+   `ocp4-<lifecycle>-kv-<site>-<id>`. Its name is the cluster's name from then on. The seed folder
+   is how create-vm knows its zone (section 3); its NodePools set the same zone as
+   `topology.kubernetes.io/zone` in their `nodeLabels`. Its `vlanId` is the VLAN the Segments
+   Manager allocated to it.
 2. **The `vm-lifecycle-worker` chart** on the cluster, with its ConfigMap holding:
    - `kvCluster`: exactly the day1 file's name. The worker reads its site from it.
    - `VM_MAC_PREFIX`: `0e` + the cluster's VLAN ID (section 7.2), computed from the same
@@ -650,7 +557,7 @@ lab found that otherwise every root disk stays unbound and every run ends in the
 
 | | today | this design |
 | --- | --- | --- |
-| Which clusters exist | the day1 seed folder, read by the hub vm-lifecycle worker | the site's seed folders in day1, filtered by the zone each cluster's NodePools label, read by the `cluster-lifecycle-worker` with provision-cluster's token |
+| Which clusters exist | the day1 seed folder, read by the hub vm-lifecycle worker | the zone's seed folder in day1 (`ocp4-seed-<site>-<zone number>`), read by the `cluster-lifecycle-worker` with provision-cluster's token, through the shared day1 reader |
 | Where the figures come from | an HTTP agent (`kv-capacity`) on each cluster | the worker inside each cluster |
 | Order | best fit across all clusters | oldest first (the cluster's `id` letter), first that fits |
 | Two runs at once | can pick the same cluster and overbook it | cannot: one run per zone chooses and creates at a time |
@@ -666,9 +573,10 @@ lab found that otherwise every root disk stays unbound and every run ends in the
 
 ## 11. Known limits and open points
 
-1. **The naming convention is still a draft.** Since 2026-11-19 it reserves the `seed` and `kv`
-   cluster flavors and requires the zone label on every KV NodePool, which is all the listing
-   (section 3) relies on. A change to either would change the listing.
+1. **The naming convention is still a draft, and differs on the seed.** The listing (section 3)
+   relies on the seed being `ocp4-seed-<site>-<zone number>` (decided 2026-11-20), the zone
+   number matching the InfraEnv's `az<N>`, and the zone label on every KV NodePool. The draft
+   still names a seed `ocp4-<lifecycle>-seed-<site>-<id>` and must be updated to match.
 2. **Memory is `vCPUs × 8` GiB.** The InfraEnv name carries the vCPUs only. If a flavor ever has
    another ratio, the ratio must come from the flavor, not from this rule.
 3. **A VLAN freed by a deleted KV cluster can be given to a new one**, which then gets the old

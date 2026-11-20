@@ -166,6 +166,135 @@ async def publish(repo_url, token):
     assert "AC008" not in _rules(checker.run_source("activities/git_repo.py", slips))
 
 
+def test_a_fresh_clone_is_the_writers_and_a_read_takes_the_snapshot(checker):
+    # CLAUDE.md §5: a fresh_clone / fresh_main block must reach commit_and_push; a read is a snapshot.
+    reads = '''
+from activities import git_repo
+from activities.day1_repo import fresh_main
+
+
+async def read_day2(repo_url, token):
+    async with git_repo.fresh_clone(repo_url=repo_url, token=token, repo="day2", prefix="r-") as day2:
+        return (day2.path / "a").read_text()
+
+
+async def read_day1(repo_url, token):
+    async with fresh_main(repo_url=repo_url, token=token, prefix="r-") as day1:
+        return await day1.head()
+
+
+async def read_then_write_elsewhere(repo_url, token):
+    async with fresh_main(repo_url=repo_url, token=token, prefix="r-") as day1:
+        text = (day1.path / "a").read_text()
+    async with fresh_main(repo_url=repo_url, token=token, prefix="w-") as day1:
+        await day1.commit_and_push(paths=["a"], message=text, author=git_repo.UPGRADE_AUTHOR)
+'''
+    violations = checker.run_source("activities/probe/repo.py", reads)
+    assert sorted(v.line for v in violations if v.rule == "AC008") == [7, 12, 17]
+    assert all("snapshot" in v.message for v in violations if v.rule == "AC008")
+
+    canonical = '''
+from activities import day1_repo, git_repo
+
+
+async def read_day2(repo_url, token):
+    async with git_repo.snapshot(repo_url=repo_url, token=token, repo="day2") as day2:
+        return (day2.path / "a").read_text()
+
+
+async def read_day1(repo_url, token):
+    async with day1_repo.main_snapshot(repo_url=repo_url, token=token) as day1:
+        return day1.revision
+
+
+async def write(repo_url, token, already):
+    async with day1_repo.fresh_main(repo_url=repo_url, token=token, prefix="w-") as day1:
+        if already(day1.path):
+            return None
+        return await day1.commit_and_push(paths=["a"], message="m", author=git_repo.UPGRADE_AUTHOR)
+
+
+async def rerun_check(repo_url, token, branch):
+    # conventions: allow AC008 — the writer's own "already there" half, on its per-cluster branch
+    async with git_repo.fresh_clone(repo_url=repo_url, token=token, repo="day1", prefix="c-", branch=branch) as day1:
+        return (day1.path / "a").is_file()
+'''
+    assert "AC008" not in _rules(checker.run_source("activities/probe/repo.py", canonical))
+
+
+def test_day1s_layout_is_written_down_only_in_the_day1_reader(checker):
+    # CLAUDE.md §5: a module that spells day1's folders is growing its own walk of day1.
+    walks = '''
+import re
+from pathlib import Path
+
+SITES_ROOT = "sites"
+HOSTED_CLUSTERS = "hostedClusters"
+_FILE = re.compile(r"sites/(?P<site>[^/]+)/mces/(?P<mce>[^/]+)/hostedClusters/(?P<name>[^/]+)[.]yaml")
+
+
+def seed_folder(clone: Path, site: str, seed: str) -> Path:
+    return clone / "sites" / site / "mces" / seed
+
+
+def cluster_file(site: str, mce: str, cluster: str) -> str:
+    return f"sites/{site}/mces/{mce}/hostedClusters/{cluster}.yaml"
+
+
+def every_cluster(clone: Path):
+    return clone.glob("sites/*/mces/*/hostedClusters/*.yaml")
+
+
+def folder(site: str, mce: str) -> str:
+    return "/".join(["sites", site, "mces", mce])
+'''
+    violations = [v for v in checker.run_source("activities/probe/day1.py", walks) if v.rule == "AC009"]
+    assert sorted(v.line for v in violations) == [5, 6, 7, 11, 11, 15, 19, 23]
+    assert all("Day1" in v.message and "cluster_file_path" in v.message for v in violations)
+    in_a_workflow = [v for v in checker.run_source("workflow_domains/probe/place_vm.py", walks) if v.rule == "AC009"]
+    assert len(in_a_workflow) == len(violations)
+
+    # The reader itself, and code outside the limbs and the brain, may spell it.
+    assert "AC009" not in _rules(checker.run_source("activities/day1_repo.py", walks))
+    assert "AC009" not in _rules(checker.run_source("shared/upgrade_layout.py", walks))
+
+    canonical = '''
+"""Reads `sites/<site>/mces/<mce>/hostedClusters/<cluster>.yaml` through Day1."""
+from activities import day1_repo
+
+
+class Reader:
+    """Knows `sites/` only by name."""
+
+    async def kv_clusters(self, repo_url, token, site, zone):
+        """The zone's clusters, from `sites/<site>/mces/ocp4-seed-<site>-<N>/hostedClusters/`."""
+        async with day1_repo.main_snapshot(repo_url=repo_url, token=token) as day1:
+            return day1.kv_clusters(site=site, zone=zone)
+
+
+def where(site, mce, cluster):
+    return day1_repo.cluster_file_path(day1_repo.mce_dir(site, mce), cluster)
+
+
+def refuse(path):
+    raise ValueError(f"{path} is not under sites/<site>/mces/<mce>/hostedClusters/: no MCE to run on")
+
+
+def not_day1(response, text):
+    sites = response.json().get("sites")
+    websites = "websites/index.html"
+    return sites, websites, text.split("/"), "a/b".join(["sites", "mces"])
+
+
+def day2_folder(sig, cluster):
+    # conventions: allow AC009 — day2's tree, not day1's
+    return sig.glob("sites/*/*/mces/*/" + cluster)
+'''
+    assert "AC009" not in _rules(checker.run_source("activities/probe/day1.py", canonical))
+    bare = canonical.replace("# conventions: allow AC009 — day2's tree, not day1's", "# conventions: allow AC009")
+    assert "AC009" in _rules(checker.run_source("activities/probe/day1.py", bare))
+
+
 def test_checker_catches_router_slips(checker):
     source = '''
 from fastapi import APIRouter

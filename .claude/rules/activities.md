@@ -32,9 +32,17 @@ CLAUDE.md §1, §2, §5, §6, §7. Checker ids in brackets.
 - **Subprocesses and secrets**: `asyncio.create_subprocess_exec` under a timeout, a fresh
   `TemporaryDirectory` per attempt, every token scrubbed from error text BEFORE the
   exception is built.
-- **Git only through `activities/git_repo.py`**: one `fresh_clone` (day1 `main`:
-  `day1_repo.fresh_main`) per attempt, worked through its `Clone`; the limb's module keeps
-  only its file and its "already done" rule. No generic git activities (CLAUDE.md §5). [AC008]
+- **Git only through `activities/git_repo.py`**: a WRITER opens one `fresh_clone` (day1
+  `main`: `day1_repo.fresh_main`) per attempt, worked through its `Clone`, and its block
+  reaches `commit_and_push`; a READER takes `git_repo.snapshot` (day1 `main`:
+  `day1_repo.main_snapshot`), which asks the remote for its head every time and clones only
+  when it moved, and returns the `revision` it read. The limb's module keeps only its file
+  and its "already done" rule. No generic git activities (CLAUDE.md §5). [AC008]
+- **day1 is read only through `Day1`** (`activities/day1_repo.py`): no day1 path literal
+  (`sites/`, `mces/`, `hostedClusters`) in any other module of `activities/` or
+  `workflow_domains/`; a write builds its path with `day1_repo.mce_dir` /
+  `cluster_file_path`; a workflow whose limb has no day1 token calls `list_day1_clusters`.
+  Procedure: the skill's references/day1-reads.md. [AC009]
 - **Settings**: `<Limb>ActivitySettings()` at module level (fail-fast). A new key goes in
   the limb's OWN module `shared/settings/<limb>.py` (imported from that module, never from
   the package), `.env.example`, `tests/conftest.py` and the chart, which ships first.

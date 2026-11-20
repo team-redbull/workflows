@@ -44,6 +44,8 @@ def _segment(value: str, what: str) -> str:
 
 def cluster_folder(request: Day2SigRegistrationRequest) -> str:
     """`sites/<site>/<env>/mces/<mce>/<cluster>`, from the root of the sig's own project."""
+    # conventions: allow AC009 — day2's tree (it has an env folder, day1's has none) in a
+    # sig's own project, the folder this module creates; not day1's, which `Day1` walks.
     return "/".join([
         "sites", _segment(request.site, "site"), _segment(request.env, "env"),
         "mces", _segment(request.mce, "MCE"), _segment(request.cluster, "cluster"),

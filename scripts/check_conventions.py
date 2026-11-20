@@ -121,6 +121,18 @@ GIT_CLIENT_MODULE = ("activities", "git_repo.py")
 # git_repo's one-command and one-step functions: a caller opens a fresh_clone and
 # works through the Clone it yields (CLAUDE.md §5), so none is called from outside.
 GIT_REPO_LOW_LEVEL = {"exec_git", "run_git", "clone", "commit_and_push", "run_command"}
+# The WRITER's clones: one per attempt, so its block must reach a push. A read
+# takes `git_repo.snapshot` / `day1_repo.main_snapshot` instead (§5).
+GIT_WRITER_CLONES = {"fresh_clone", "fresh_main"}
+GIT_PUSH = "commit_and_push"
+# The one module that writes day1's layout down (§5): everything else asks its
+# `Day1`, or builds the path it writes with its helpers.
+DAY1_READER_MODULE = ("activities", "day1_repo.py")
+# A day1 cluster-tree path inside a string: the folder names of
+# `sites/<site>/mces/<folder>/hostedClusters/<cluster>.yaml`.
+_DAY1_PATH = re.compile(r"hostedClusters|(?<![A-Za-z0-9_])(?:sites|mces)/")
+# The same folder names alone, where a path is being put together.
+DAY1_PATH_SEGMENTS = {"sites", "mces"}
 # Python git libraries: git runs as a subprocess, never through a dependency (§5).
 PYTHON_GIT_LIBRARIES = {"git", "pygit2", "dulwich"}
 # What starts a process, by the dotted origin of the called name.
@@ -853,7 +865,9 @@ def check_git_client(path: Path, tree: ast.Module, report: _Report) -> None:
     """AC008 — CLAUDE.md §5: git runs ONLY in activities/git_repo.py, and a caller
     works through `fresh_clone` and its `Clone`, never git_repo's one-command
     functions — so the token scrubbing, the timeouts and the one-clean-clone-per-
-    attempt rule hold for every limb."""
+    attempt rule hold for every limb. A `fresh_clone` / `fresh_main` block is a
+    WRITER's: it must reach `commit_and_push`, so a new read can only be written
+    with `snapshot` / `main_snapshot`, which clones only when the remote moved."""
     parts = _relparts(path) or tuple(path.parts[-2:])
     if tuple(parts[-2:]) == GIT_CLIENT_MODULE:
         return
@@ -889,6 +903,91 @@ def check_git_client(path: Path, tree: ast.Module, report: _Report) -> None:
                 "`git_repo.fresh_clone(...)` (day1 main: `day1_repo.fresh_main`) per attempt and "
                 "work through its `Clone`; a missing git step belongs in git_repo.py (§5)",
             )
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.AsyncWith, ast.With)):
+            continue
+        opened = [
+            _call_name(item.context_expr) for item in node.items
+            if isinstance(item.context_expr, ast.Call) and _call_name(item.context_expr) in GIT_WRITER_CLONES
+        ]
+        pushes = any(
+            isinstance(inner, ast.Call) and _call_name(inner) == GIT_PUSH
+            for statement in node.body for inner in ast.walk(statement)
+        )
+        if opened and not pushes:
+            report.error(
+                path, node.lineno, "AC008",
+                f"`{opened[0]}(...)` block that never reaches `{GIT_PUSH}` — a fresh clone per attempt is "
+                "the WRITER's; a READ takes `git_repo.snapshot(...)` (day1 main: `day1_repo.main_snapshot`), "
+                "which asks the remote for its head every time and clones only when it moved (§5)",
+            )
+
+
+def _string_literal(node: ast.AST) -> str | None:
+    """The text of a string literal; an f-string's with `{}` where it interpolates."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.JoinedStr):
+        return "".join(
+            part.value if isinstance(part, ast.Constant) and isinstance(part.value, str) else "{}"
+            for part in node.values
+        )
+    return None
+
+
+def _is_day1_segment(node: ast.AST | None) -> bool:
+    return isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value in DAY1_PATH_SEGMENTS
+
+
+def check_day1_paths(path: Path, tree: ast.Module, report: _Report) -> None:
+    """AC009 — CLAUDE.md §5: day1's layout (`sites/<site>/mces/<folder>/hostedClusters/`)
+    is written down ONLY in activities/day1_repo.py. A limb or workflow module that
+    spells it is growing its own walk of day1: it asks `Day1` instead, or builds
+    the path it writes with day1_repo's helpers.
+
+    A path literal is a string (or f-string) WITHOUT whitespace that holds one
+    of the folder names as a path, or the bare `sites` / `mces` where a path is
+    put together (`/`, `"/".join([...])`, a constant). Docstrings and prose —
+    an error message, a field description — are not paths."""
+    parts = _relparts(path) or tuple(path.parts[-2:])
+    if tuple(parts) == DAY1_READER_MODULE:
+        return
+    skipped: set[int] = set()  # docstrings, and the pieces of an f-string (judged whole)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            first = node.body[0] if node.body else None
+            if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant):
+                skipped.add(id(first.value))
+        elif isinstance(node, ast.JoinedStr):
+            skipped.update(id(part) for part in node.values)
+
+    def flag(line: int, text: str) -> None:
+        report.error(
+            path, line, "AC009",
+            f"day1 path literal {text!r} outside activities/day1_repo.py — a READ asks `Day1` "
+            "(`day1_repo.main_snapshot()`: clusters, kv_clusters, cluster_paths, mce_folders), a WRITE "
+            "builds its path with `day1_repo.mce_dir` / `cluster_file_path`; no module walks day1 itself (§5)",
+        )
+
+    for node in ast.walk(tree):
+        text = _string_literal(node)
+        if text is not None and id(node) not in skipped and not any(ch.isspace() for ch in text):
+            if _DAY1_PATH.search(text):
+                flag(node.lineno, text)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+            for operand in (node.left, node.right):
+                if _is_day1_segment(operand):
+                    flag(operand.lineno, operand.value)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)) and _is_day1_segment(node.value):
+            flag(node.lineno, node.value.value)
+        elif (
+            isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "join"
+            and isinstance(node.func.value, ast.Constant) and node.func.value.value == "/" and node.args
+            and isinstance(node.args[0], (ast.List, ast.Tuple))
+        ):
+            segments = [element.value for element in node.args[0].elts if _is_day1_segment(element)]
+            if segments:
+                flag(node.lineno, "/".join(segments))
 
 
 # --- per-file dispatch --------------------------------------------------------------
@@ -921,6 +1020,8 @@ def check_tree(path: Path, parts: tuple[str, ...], tree: ast.Module, report: _Re
 
     check_client_connect(path, tree, report)
     check_git_client(path, tree, report)
+    if parts[0] in (ACTIVITIES_DIR, WORKFLOW_DOMAINS_DIR):
+        check_day1_paths(path, tree, report)
 
     if parts[0] == SHARED_DIR:
         check_shared_module(path, tree, report)

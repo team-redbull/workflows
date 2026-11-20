@@ -24,7 +24,9 @@ every teammate; use them in this order and keep them in step:
   can be checked from source (sandbox imports, activity-call options, unbounded retries
   named through exception classes, no whole response body in an activity error,
   `ApplicationError` from workflow code, one `run()`
-  argument, `connect_temporal` only, git only through `activities/git_repo.py`'s `fresh_clone`, interface ↔ implementation ↔ worker registration,
+  argument, `connect_temporal` only, git only through `activities/git_repo.py` — a `fresh_clone`
+  that pushes, a `snapshot` for every read — day1's layout spelled only in `activities/day1_repo.py`,
+  interface ↔ implementation ↔ worker registration,
   `_WORKER_SPECS`, router paths and 202s, Dockerfile CMDs, each limb's row in CI's build matrix
   naming its own image and chart, a settings package that re-exports nothing, a docs page per started workflow). It runs on every Edit/Write through the PostToolUse hook in
   `.claude/settings.json` (which also names the docs pages describing the edited file),
@@ -34,9 +36,14 @@ A rule that can be checked belongs in the checker; one that cannot belongs here 
 the matching rules file. When a rule changes, all three move in ONE commit. The checker
 is the tie-breaker: an edit it flags is wrong until the rule itself is changed. A
 documented exception is marked where it lives, `# conventions: allow <RULE> — <reason>`,
-and recorded here. Two today: the agent call's bounded retry in `cluster_upgrade/dispatch.py`
-(WF007, §5) and upgrade-targets' missing progress query (WF014: a synchronous question
-answered in the response, §2, so nothing polls it).
+and recorded here. Five today: the agent call's bounded retry in `cluster_upgrade/dispatch.py`
+(WF007, §5); upgrade-targets' missing progress query (WF014: a synchronous question
+answered in the response, §2, so nothing polls it); `day1_writer.publish`'s re-run check, a
+fresh clone that only reads (AC008: the writer's own "already there" half, on a branch per
+cluster that a snapshot would keep cached for the pod's life); and two paths that look like
+day1's and are not (AC009): day2's tree in `upgrade_gitops/day2_repo.py` and
+`cluster_lifecycle/day2_sigs.py`, and the upgrade rules' `upgrade/mces/<mce>.yaml` in
+`upgrade_gitops/upgrade_rules.py`.
 
 ## 1. Domain-driven monorepo: three layers, strictly separated
 
@@ -1338,10 +1345,20 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   `day1_writer.py` / `day2_sigs.py`, upgrade-gitops's day1/day2/Brain modules and vm-lifecycle, the
   day1 reads through `activities/day1_repo.py`; no other module runs git): git runs via
   `asyncio.create_subprocess_exec` (no Python git dependency; the limb Dockerfile installs the binary),
-  each command under a timeout below the git activities' 180s `start_to_close_timeout`. A caller opens
+  each command under a timeout below the git activities' 180s `start_to_close_timeout`. A WRITER opens
   ONE `git_repo.fresh_clone(...)` per attempt (day1 `main`: `day1_repo.fresh_main`) — a fresh
   `TemporaryDirectory`, so retries start clean — and works through the `Clone` it yields (`head`,
-  `blob`, `commit_and_push`, `run_command`). Only what is GIT lives there: which file, and what
+  `blob`, `commit_and_push`, `run_command`). A READER takes `git_repo.snapshot(...)` (day1 `main`:
+  `day1_repo.main_snapshot`, which yields `Day1`): it asks the remote for the branch's head EVERY
+  time and clones only when that head is not the commit this process already holds — the same
+  commit is the same tree, so nothing cached ever answers for the remote, and an unreachable one
+  fails as a clone does. The snapshot is shared and read-only (a repo's own script runs in a
+  throwaway copy, `scratch`), and every read result carries the commit it read (`revision`). A
+  `fresh_clone` block must reach `commit_and_push` (AC008). day1's layout
+  (`sites/<site>/mces/<folder>/hostedClusters/`) is written down in `activities/day1_repo.py` ONLY
+  (AC009): a read asks `Day1`, a write builds its path with that module's helpers, and a workflow
+  whose limb holds no day1 token calls `list_day1_clusters` on the cluster-lifecycle limb — typed
+  facts about one commit, not a generic git activity. Only what is GIT lives there: which file, and what
   "already done" means (create-never-overwrite, a blob compare-and-set, a folder present), stays in
   the limb's own module, inside the same clone as its push. Never generic git ACTIVITIES — a clone
   cannot cross activities, the check must share the push's clone, and one git worker would hold every

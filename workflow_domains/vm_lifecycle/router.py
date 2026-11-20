@@ -6,17 +6,19 @@ progress and the result. PATHS ARE `/workflows/<domain>/<workflow>`: the
 domain prefix lives here, and every workflow of the domain adds its own path.
 
 The request is the smallest thing that names the work — the MCE and the
-InfraEnv — and the edge derives what the run carries: the site from the MCE's
-name, the zone and the VM's size from the InfraEnv's (CLAUDE.md §4: derived
-ONCE here, never on replay). A VM's name is drawn inside the run, so a run is
-a SLOT of its InfraEnv on its MCE (shared/workflow_ids.py), filled by
-workflow_domains/routers/slots.py exactly as add-server-to-mce's pool draws.
+InfraEnv — and the edge derives what the run carries from the InfraEnv's name,
+`<flavor>-kv<cpu>-<site>-<zone>`: the flavor, the VM's size, the site and the
+zone (CLAUDE.md §4: derived ONCE here, never on replay). The MCE's own site
+must be the InfraEnv's. A VM's name is drawn inside the run (by the worker in
+the chosen KV cluster), so a run is a SLOT of its InfraEnv on its MCE
+(shared/workflow_ids.py), filled by workflow_domains/routers/slots.py exactly
+as add-server-to-mce's pool draws.
 """
 
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from temporalio.client import Client
 
 from shared.cluster_names import canonical_mce_cluster, site_of_mce_cluster
@@ -55,23 +57,23 @@ class CreateVmRequest(BaseModel):
         min_length=1,
         description=(
             "The MCE whose InfraEnv the VM is for, with or without its `ocp4-` prefix — "
-            "`prod-mce-bat-yam-a` and `ocp4-prod-mce-bat-yam-a` name the same cluster. Must be "
-            "named `ocp4-<env>-mce-<site>-<letter>`: the site is read from it."
+            "`prod-mce-five-a` and `ocp4-prod-mce-five-a` name the same cluster. Must be "
+            "named `ocp4-<lifecycle>-mce-<site>-<id>`, and its site must be the InfraEnv's."
         ),
     )
     infra_env: str = Field(
         min_length=1,
         description=(
-            "A KubeVirt InfraEnv, `<conf>[-<letter>]-zone-<zone>-<cpu>` (`x201-zone-a-8`): the zone "
-            "picks the KubeVirt clusters, the number the VM's vCPUs (memory is cpu × 8 GiB). A "
-            "`-metal` InfraEnv has servers, not VMs, and is refused."
+            "A KubeVirt InfraEnv, `<flavor>-kv<cpu>-<site>-<zone>` (`c200-kv32-five-az1`): the site "
+            "and zone pick the KV clusters, `kv<cpu>` the VM's vCPUs (memory is cpu × 8 GiB). A "
+            "`-mtl-` InfraEnv has servers, not VMs, and is refused."
         ),
     )
     namespace: str = Field(
         default=_DEFAULT_NAMESPACE,
         min_length=1,
         description=(
-            f"The VM's namespace on the KubeVirt cluster — the InfraEnv's namespace on the MCE, "
+            f"The VM's namespace on the KV cluster — the InfraEnv's namespace on the MCE, "
             f"verbatim; must exist there as a kubevirt-redfish chassis namespace. Defaults to `{_DEFAULT_NAMESPACE}`."
         ),
     )
@@ -98,21 +100,32 @@ class CreateVmRequest(BaseModel):
         parsed = parse_infraenv(value)  # InfraEnvNameError is a ValueError: a 422
         if parsed.kind is not InfraEnvKind.KUBEVIRT:
             raise ValueError(
-                f"InfraEnv {value!r} is bare metal (`-metal`): it takes servers from server-scan "
+                f"InfraEnv {value!r} is bare metal (`-mtl-`): it takes servers from server-scan "
                 "through add-server-to-mce, not VMs"
             )
-        # The VM name the run will build must be a Kubernetes name: refused HERE,
-        # because inside the run it would be a plain ValueError and hang the task (§5).
-        vm_name(value, "000000")
+        assert parsed.cpu is not None  # a KubeVirt InfraEnv always has its vCPUs
+        # The VM name the cluster's worker will build must be a Kubernetes name:
+        # refused HERE, where it is a 422, not there, where it fails the run.
+        vm_name(parsed.flavor, parsed.cpu, parsed.site, "00:00:00:00:00:00")
         return value
 
+    @model_validator(mode="after")
+    def _the_mce_is_at_the_infraenvs_site(self) -> CreateVmRequest:
+        mce_site, infraenv_site = site_of_mce_cluster(self.mce_cluster), parse_infraenv(self.infra_env).site
+        if mce_site != infraenv_site:
+            raise ValueError(
+                f"MCE {self.mce_cluster} is at site {mce_site!r} and InfraEnv {self.infra_env} at "
+                f"{infraenv_site!r}: a VM boots on its own site's inventory network"
+            )
+        return self
+
     def run_input(self) -> CreateVmInput:
-        """What ONE run carries: the request plus the site, zone and size derived here."""
+        """What ONE run carries: the request plus the flavor, site, zone and size derived here."""
         parsed = parse_infraenv(self.infra_env)
         assert parsed.cpu is not None and parsed.memory_gib is not None  # validated above
         return CreateVmInput(
             mce_cluster=self.mce_cluster, infra_env=self.infra_env, namespace=self.namespace,
-            site=site_of_mce_cluster(self.mce_cluster), zone=parsed.zone,
+            flavor=parsed.flavor, site=parsed.site, zone=parsed.zone,
             cpu=parsed.cpu, memory_gib=parsed.memory_gib,
         )
 
@@ -142,14 +155,17 @@ async def start_create_vm(
     VM, never a 409 (only when all 100 slots are busy). With `count: N`: N runs
     in parallel, one per free slot, answered with a per-run report.
 
-    Each run lists the zone's KubeVirt clusters from the day1 repo, reads
-    every one's capacity, picks the best-fitting cluster under the headroom
-    buffer, creates ONE Halted VM with a fixed MAC there and waits (bounded,
-    10 min) for its root disk to bind. Nothing fitting, or a disk that never
-    binds (the VM is deleted again), is a FAILED run — not a 4xx here.
+    Each run lists the zone's KV clusters from the day1 repo, takes the
+    zone's lock (runs of one zone choose one after another, so parallel
+    requests never overbook a cluster), asks each cluster's own worker for
+    its figures, oldest cluster first, and has the FIRST that fits under the
+    placement buffer create ONE Halted VM with a fixed MAC; then, the lock
+    released, it waits (bounded, 10 min) for the root disk to bind. Nothing
+    fitting, or a disk that never binds (the VM is deleted again), is a
+    FAILED run — not a 4xx here.
 
     Poll GET /workflows/runs/{workflow_id} (one per run) for progress/result;
-    the result carries the VM's name and MAC, the cluster and the ranking table.
+    the result carries the VM's name and MAC, the cluster and the per-cluster table.
     """
     run_args = CreateVmRunArgs(input=create_request.run_input())
 

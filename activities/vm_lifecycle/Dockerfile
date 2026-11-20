@@ -1,14 +1,11 @@
-# VM-lifecycle activity worker "limb" image. Build from the REPO ROOT so shared/ is in context:
+# VM-lifecycle activity worker "limb" image: it runs INSIDE each KV cluster.
+# Build from the REPO ROOT so shared/ is in context:
 #   docker build -f activities/vm_lifecycle/Dockerfile -t vm-lifecycle-worker:dev .
 FROM python:3.12-slim
 
-# git: list_kv_clusters clones the day1 values repo via subprocess
-# (activities/vm_lifecycle/day1_repo.py on activities/day1_repo.py and git_repo.py).
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends git \
-    && rm -rf /var/lib/apt/lists/*
-
-# HTTP only otherwise: the KubeVirt clusters' agents. No Kubernetes client.
+# The Kubernetes client only: this worker talks to its own cluster's API as its
+# ServiceAccount. No git (the zone's cluster list is the cluster-lifecycle
+# limb's read) and no HTTP client.
 WORKDIR /app
 
 COPY activities/vm_lifecycle/requirements.txt /app/activities/vm_lifecycle/requirements.txt

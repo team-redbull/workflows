@@ -290,17 +290,31 @@ def create_vm_slot_workflow_id(mce_cluster: str, infra_env: str, slot: int) -> s
     """`create-vm-<mce>_<infraEnv>_<slot>`: one of the PARALLEL creates for an InfraEnv.
 
     The mirror of add_server_to_mce_slot_workflow_id, for the same reason: the
-    VM's name is drawn INSIDE the run (the random suffix that also makes its
-    MAC), so nothing known at the API edge identifies the VM. A run is a slot
-    of the InfraEnv on its MCE instead: `count: N` fills N free ones, a request
-    without `count` fills one, a finished slot is free again, and two requests
-    at once cannot start one slot twice (Temporal allows one running workflow
-    per id). `_` follows the MCE for the reason add_server_to_mce_name_workflow_id
-    gives: a Kubernetes name cannot contain it, so where the MCE ends is
-    unambiguous.
+    VM's name is drawn INSIDE the run (by the worker in the chosen KV cluster,
+    from the MAC it draws), so nothing known at the API edge identifies the
+    VM. A run is a slot of the InfraEnv on its MCE instead: `count: N` fills N
+    free ones, a request without `count` fills one, a finished slot is free
+    again, and two requests at once cannot start one slot twice (Temporal
+    allows one running workflow per id). `_` follows the MCE for the reason
+    add_server_to_mce_name_workflow_id gives: a Kubernetes name cannot contain
+    it, so where the MCE ends is unambiguous.
 
-    A re-run of a slot is a NEW execution with a NEW suffix — it never resumes
-    a VM an earlier run left behind, which is why an unbound root disk is
-    rolled back before the run fails (CLAUDE.md §4).
+    A SLOT ID IS REUSED by later runs, so it never identifies a VM: what a run
+    labels its VM with, and what the zone lock knows a waiter by, is the RUN id
+    (workflow_domains/vm_lifecycle/create_vm.py). A re-run of a slot is a NEW
+    execution that never resumes a VM an earlier run left behind, which is why
+    a run that does not complete removes its own VM first (CLAUDE.md §4).
     """
     return f"create-vm-{mce_cluster}_{infra_env}_{slot}"
+
+
+def kv_zone_lock_workflow_id(site: str, zone: str) -> str:
+    """`kv-zone-lock-<site>-<zone>`: THE lock of one zone of one site.
+
+    One long-lived KvZoneLockWorkflow per (site, zone): every create-vm run of
+    that zone starts it or, when it already runs, signals it, so the id is the
+    meeting point and must be derivable by every run from its own input. A
+    zone is `az<N>` (no dash), so where the site ends is unambiguous even for
+    a site of several fields (`kv-zone-lock-bat-yam-az1`).
+    """
+    return f"kv-zone-lock-{site}-{zone}"

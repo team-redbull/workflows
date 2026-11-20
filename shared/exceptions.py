@@ -1337,30 +1337,48 @@ class UpgradeAgentRefusedError(OrchestratorError):
     """
 
 
-# --- vm-lifecycle (create-vm) ------------------------------------------------------------
+# --- vm-lifecycle (create-vm, kv-zone-lock) ----------------------------------------------
 
 
-class KvAgentAuthError(OrchestratorError):
-    """A KubeVirt cluster's agent (kv-capacity or kv-vm-api) refused the fleet token (401/403).
+class KvClusterApiError(OrchestratorError):
+    """A KV cluster's own API server could not answer its vm-lifecycle worker: 5xx, 401, 429, a timeout, a dropped connection.
 
-    Deterministic, non-retryable: a rotated or wrong token is fixed in the
-    limb's Secret, never by a retry. The rank fan-out raises it only when EVERY
-    reachable cluster refused; one cluster refusing is a skip in the table.
+    Transient, retried without bound: the worker is inside the cluster, so
+    this is that cluster's API rolling or overloaded. (401 is here, not with
+    403: a ServiceAccount token is rotated under a running pod and the next
+    call carries the new one.) The figures read never raises it — an
+    unreadable cluster is answered `readable: false`.
+    """
+
+
+class KvClusterAccessError(OrchestratorError):
+    """A KV cluster's API server refused its vm-lifecycle worker's ServiceAccount (403).
+
+    Deterministic, non-retryable: the chart's ClusterRole is missing a verb,
+    which a retry does not grant.
+    """
+
+
+class KvClusterMismatchError(OrchestratorError):
+    """A vm-lifecycle worker was asked to act for another KV cluster, or another site, than its own.
+
+    Deterministic, non-retryable: the worker's `KV_CLUSTER` is not the day1
+    file name its queue was built from (a chart value typed wrong), or a VM of
+    one site was sent to a cluster of another. Nothing was created.
     """
 
 
 class VmIdentityConflictError(OrchestratorError):
-    """kv-vm-api holds a VM under this name whose identity is not this run's (409).
+    """The VM under this name is not this run's: its MAC or its `redbull.io/created-by` label differs.
 
-    Deterministic, non-retryable. On the create it is the race backstop: a VM
-    born between the zone-wide MAC read and the PUT — the workflow redraws its
-    suffix. On the delete it means someone replaced the run's VM, which the
-    run then leaves alone and fails.
+    Deterministic, non-retryable. Raised on the DELETE only: someone replaced
+    the run's VM, which the run then leaves alone. (On the create a taken name
+    or MAC is drawn again by the worker and never reaches the workflow.)
     """
 
 
 class VmNamespaceNotFoundError(OrchestratorError):
-    """The VM namespace does not exist on the chosen KubeVirt cluster (404 from kv-vm-api).
+    """The VM namespace does not exist on the chosen KV cluster.
 
     Deterministic, non-retryable: a namespace is created by the platform (a
     kubevirt-redfish chassis namespace), never by this run.
@@ -1368,57 +1386,70 @@ class VmNamespaceNotFoundError(OrchestratorError):
 
 
 class VmRequestRejectedError(OrchestratorError):
-    """kv-vm-api refused the VM request (422): a shape its template cannot render.
+    """The KV cluster's API server, or an admission webhook, refused the VirtualMachine (400/422).
 
-    Deterministic, non-retryable; the message carries the agent's own wording.
+    Deterministic, non-retryable: the same object is refused again. The
+    message carries the API's own sentence, bounded.
     """
 
 
 class VmDisappearedError(OrchestratorError):
-    """The VM this run created is gone before its root disk bound (404 while waiting).
+    """The VM this run created is gone before its root disk bound.
 
     Deterministic, non-retryable: something else deleted it, and creating it
     again would be a second VM under a name the run no longer owns.
     """
 
 
-class KvCapacityUnavailableError(OrchestratorError):
-    """No KubeVirt cluster of the zone answered its kv-capacity agent: unreachable, no agent, timed out.
+class VmMacExhaustedError(OrchestratorError):
+    """Every MAC the KV cluster's worker drew for the VM was taken, MAX_DRAWS times over.
 
-    Transient, retried without bound (the agents may be rolling out). One
-    cluster unreachable is a skip in the table; this is raised only when none
-    could be read.
+    Deterministic, non-retryable: three draws out of 16.7 million landing on a
+    used MAC or name means the cluster's prefix is wrong or shared, not bad
+    luck. Nothing of this run was created.
     """
 
 
-class KvVmApiUnavailableError(OrchestratorError):
-    """kv-vm-api on the chosen cluster could not answer: unreachable, timed out, 5xx.
+class VmLeaseExpiredError(OrchestratorError):
+    """The create reached the KV cluster's worker after the zone lease it was sent under had ended.
 
-    Transient, retried without bound; the PUT is idempotent by name and MAC,
-    so a retry after a lost response finds its own VM.
+    Deterministic, non-retryable: the lock has moved on and the next run has
+    measured the cluster without this VM, so the worker creates nothing. The
+    caller asks again.
     """
 
 
 class NoKvClusterError(OrchestratorError):
-    """WORKFLOW-RAISED. The zone's seed folder in day1 lists no KubeVirt cluster.
+    """WORKFLOW-RAISED. The zone's seed folder in day1 lists no usable KV cluster.
 
-    Names the folder and the prefix looked for. Nothing was read from or written
-    to any cluster.
+    Names the folder, the day1 commit and every file listed with a problem.
+    Nothing was read from or written to any cluster.
     """
 
 
 class NoKvClusterFitsError(OrchestratorError):
-    """WORKFLOW-RAISED. No KubeVirt cluster of the zone takes a VM of this size under the buffer.
+    """WORKFLOW-RAISED. No KV cluster of the zone takes a VM of this size under the buffer.
 
-    Summarises the ranking table per skip reason (no node with the headroom,
-    the buffer, unreachable, no agent, token refused). Nothing was written.
+    Summarises the per-cluster table per skip reason (no worker, unreadable,
+    no usable node, no node with the room, the buffer). Nothing was created.
     """
 
 
-class VmNameExhaustedError(OrchestratorError):
-    """WORKFLOW-RAISED. Every drawn suffix was taken (a 409 from kv-vm-api, or a MAC
-    already in the zone), `_MAX_DRAWS` times over. Nothing of this run survives
-    on the cluster."""
+class KvZoneLockTimeoutError(OrchestratorError):
+    """WORKFLOW-RAISED. The run waited for its zone's lock longer than the bound and gave up.
+
+    It took itself out of the line first. Nothing was created.
+    """
+
+
+class KvZoneLeaseExpiredError(OrchestratorError):
+    """WORKFLOW-RAISED. The run's zone leases ran out while it was still reading clusters.
+
+    Each lease is five minutes and a cluster with no worker costs thirty
+    seconds, so a zone with many dead workers can outlast one; the run asks
+    for the lock again and carries on from the cluster it had reached, a
+    bounded number of times. Names the clusters skipped. Nothing was created.
+    """
 
 
 class VmRootDiskNotBoundError(OrchestratorError):
@@ -1426,7 +1457,7 @@ class VmRootDiskNotBoundError(OrchestratorError):
 
     Quotes the last root-disk phase, whether the VM was admitted, and says that a
     WaitForFirstConsumer storage class never binds a Halted VM's disk. The run
-    deleted its own VM first (phase `removing-vm`): a re-run draws a new suffix
+    deleted its own VM first (phase `removing-vm`): a re-run draws a new MAC
     and could never converge on the orphan.
     """
 

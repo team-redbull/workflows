@@ -119,15 +119,32 @@ def upgrade_agent_activity_queue(mce_cluster: str) -> str:
     return f"{UPGRADE_AGENT_ACTIVITY_QUEUE}-{mce_cluster}"
 
 # -- VM-lifecycle domain --
-# ONE workflow today, create-vm, on its own queue as everywhere above; ONE
-# activity queue, on the hub: the limb holds no Kubernetes credential at all.
-# It reaches each KubeVirt cluster through that cluster's two agents
-# (kv-capacity, kv-vm-api), behind Routes, with one fleet bearer token each,
-# and reads the zone's cluster list from the day1 repo with the same token
-# segment-lifecycle pushes with. So there is nothing to run per MCE and
-# nothing to run per KubeVirt cluster — one deployment serves every zone.
+# TWO workflows, each on its own queue as everywhere above: create-vm, one run
+# per VM, and kv-zone-lock, ONE long-lived run per (site, zone) that hands the
+# zone to one create-vm run at a time (it has no route: a create-vm run starts
+# it, or signals the one already running).
+#
+# The ACTIVITY queue is per KV CLUSTER, exactly like server-lifecycle's per-MCE
+# queue above and for the same reason: a `vm-lifecycle-worker` runs INSIDE each
+# KubeVirt (KV) cluster, acts on its own API server as its own ServiceAccount,
+# and dials out to the hub's Temporal. The queue name IS the target: the name
+# is the KV cluster's day1 file stem, so the list a run reads from day1 is
+# also the list of queues it may send work to. Nothing on the hub holds a
+# credential for a KV cluster. The zone's cluster list is read by the
+# cluster-lifecycle limb (it holds the day1 token), on its own queue below.
 CREATE_VM_WORKFLOW_QUEUE = "create-vm-workflow"
+KV_ZONE_LOCK_WORKFLOW_QUEUE = "kv-zone-lock-workflow"
 VM_LIFECYCLE_ACTIVITY_QUEUE = "vm-lifecycle-activity"
+
+
+def vm_lifecycle_activity_queue(kv_cluster: str) -> str:
+    """The vm-lifecycle activity queue for ONE KV cluster (see server_lifecycle_activity_queue).
+
+    `kv_cluster` is the cluster's day1 file stem (`ocp4-prod-kv-five-a`), which
+    is also the `KV_CLUSTER` its worker is deployed with, NEVER canonicalised:
+    the two must be the same string or the worker polls a queue no run sends to.
+    """
+    return f"{VM_LIFECYCLE_ACTIVITY_QUEUE}-{kv_cluster}"
 
 # -- Cluster-lifecycle domain --
 # ONE workflow today, provision-cluster, on its own queue; ONE activity queue,

@@ -22,6 +22,7 @@ from shared.models.cluster_lifecycle import (
     MergeRequestRequest,
     MergeRequestState,
 )
+from shared.models.vm_lifecycle import KvClusterList, KvClusterListRequest
 
 
 @activity.defn
@@ -121,5 +122,35 @@ async def ensure_cluster_shortcut(request: ClusterShortcutRequest) -> ClusterSho
     nothing posted. Raises ShortcutTakenError (another owner holds the name —
     deterministic, non-retryable); EVERY other failure, refusals included, is the
     retryable ShortcutsApiError (the run is past its merge and cannot be re-run).
+    """
+    ...
+
+
+# --- shared with the vm-lifecycle domain ------------------------------------------------
+#
+# create-vm (workflow_domains/vm_lifecycle/create_vm.py) asks THIS limb which KV
+# clusters a zone has: the limb holds the day1 token, and the worker inside a
+# KV cluster holds none (the get_inventory_segment precedent — an activity lives
+# where its credential is, CLAUDE.md §2).
+
+
+@activity.defn
+async def list_kv_clusters(request: KvClusterListRequest) -> KvClusterList:
+    """The KV clusters of (site, zone) as day1 `main` lists them, OLDEST FIRST, with the
+    placement buffer every run of the zone must use.
+
+    The zone's clusters are the files of ONE folder, its seed's:
+    `sites/<site>/mces/ocp4-seed-<site>-<zone number>/hostedClusters/`
+    (`Day1.kv_clusters`, activities/day1_repo.py), read on the commit-keyed
+    snapshot of `main`: the remote is asked for its head every time, and a
+    clone happens only when the head moved. Each file is one entry, sorted by
+    the sequence letter its name ends with. An entry's `zone` is set only when
+    every one of its NodePools labels its nodes with the seed's zone, and its
+    `id` only when its name is `ocp4-<lifecycle>-kv-<site>-<id>`; otherwise
+    `problems` says why and the run never uses it. A missing folder is an
+    EMPTY list, never an error. `buffer_percent` is this worker's
+    HEADROOM_BUFFER_PERCENT. Observe-only. Raises the retryable
+    ValuesRepoGitError / ValuesBranchNotFoundError (unreachable, or no `main`:
+    waited out).
     """
     ...

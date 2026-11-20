@@ -27,6 +27,7 @@ from shared.consts import (
     ALLOCATE_SEGMENT_WORKFLOW_QUEUE,
     CREATE_VM_WORKFLOW_QUEUE,
     INITIALIZE_SEGMENT_WORKFLOW_QUEUE,
+    KV_ZONE_LOCK_WORKFLOW_QUEUE,
     LEGACY_INSTALL_SERVER_WORKFLOW_QUEUE,
     LEGACY_PUBLISH_INFRAENV_BOOT_WORKFLOW_QUEUE,
     LEGACY_REMOVE_SERVER_WORKFLOW_QUEUE,
@@ -86,6 +87,7 @@ from workflow_domains.server_provisioning.provision_dell_server import (
     ProvisionDellServerWorkflow,
 )
 from workflow_domains.vm_lifecycle.create_vm import CreateVmWorkflow
+from workflow_domains.vm_lifecycle.kv_zone_lock import KvZoneLockWorkflow
 
 _settings = TemporalSettings()
 
@@ -98,6 +100,7 @@ _WORKER_SPECS: list[tuple[str, list[type]]] = [
     (ALLOCATE_SEGMENT_WORKFLOW_QUEUE, [AllocateSegmentWorkflow]),
     (CREATE_VM_WORKFLOW_QUEUE, [CreateVmWorkflow]),
     (INITIALIZE_SEGMENT_WORKFLOW_QUEUE, [InitializeSegmentWorkflow]),
+    (KV_ZONE_LOCK_WORKFLOW_QUEUE, [KvZoneLockWorkflow]),
     (PROVISION_CLUSTER_WORKFLOW_QUEUE, [ProvisionClusterWorkflow]),
     (PROVISION_DELL_SERVER_WORKFLOW_QUEUE, [ProvisionDellServerWorkflow]),
     (PUBLISH_INFRAENV_TO_PXE_SERVER_WORKFLOW_QUEUE, [PublishInfraEnvToPxeServerWorkflow]),

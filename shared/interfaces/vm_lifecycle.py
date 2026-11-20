@@ -1,12 +1,14 @@
-"""VM-lifecycle activity signatures — the domain's ONE hub limb, `vm-lifecycle-worker`.
+"""VM-lifecycle activity signatures — the worker that runs INSIDE each KV cluster, `vm-lifecycle-worker`.
 
-Everything here runs on one hub deployment polling VM_LIFECYCLE_ACTIVITY_QUEUE.
-It holds no Kubernetes credential: each KubeVirt cluster is reached through
-its two agents behind Routes (kv-capacity, read-only facts; kv-vm-api, the
-idempotent VM create/read/delete), one fleet bearer token each, and the
-zone's cluster list comes from the day1 repo with the day1 git token
-(activities/vm_lifecycle/day1_repo.py on activities/day1_repo.py, the monorepo's
-shared day1 reader).
+One deployment per KubeVirt (KV) cluster, polling
+`vm_lifecycle_activity_queue(<its cluster>)` (shared/consts.py) and acting on
+its own API server as its own ServiceAccount; it dials out to the hub's
+Temporal and exposes nothing. So the queue a call is sent on IS the cluster
+it acts on, and every request also names that cluster so a worker deployed
+under the wrong name refuses instead of acting.
+
+The zone's cluster list is NOT here: it is day1's, read by the
+cluster-lifecycle limb (shared/interfaces/cluster_lifecycle.py, list_kv_clusters).
 """
 
 from __future__ import annotations
@@ -14,10 +16,8 @@ from __future__ import annotations
 from temporalio import activity
 
 from shared.models.vm_lifecycle import (
-    KvClusterList,
-    KvClusterListRequest,
-    KvPlacement,
-    KvPlacementRequest,
+    KvClusterFigures,
+    KvFiguresRequest,
     VmCreated,
     VmCreateRequest,
     VmDeleted,
@@ -28,70 +28,63 @@ from shared.models.vm_lifecycle import (
 
 
 @activity.defn
-async def list_kv_clusters(request: KvClusterListRequest) -> KvClusterList:
-    """The KubeVirt clusters of (site, zone), as day1 `main` lists them.
+async def read_kv_cluster_figures(request: KvFiguresRequest) -> KvClusterFigures:
+    """This KV cluster's capacity figures, measured now: allocatable over the usable nodes,
+    what pods request, what the stopped `redfish-enabled` VMs will request, each usable
+    node's headroom as a CPU and memory pair.
 
-    One fresh clone per attempt; the seed folder
-    `sites/<site>/mces/ocp4-seed-<site>-<zone>/hostedClusters/` is built from
-    the validated tokens, and each file there is one entry with the chart's
-    `clusterName` (its own key, else the file name minus the prefix). A
-    missing folder is an EMPTY list, never an error. Observe-only. Raises the
-    retryable ValuesRepoGitError / ValuesBranchNotFoundError (unreachable or
-    no `main`: waited out, as cluster-upgrade does).
-    """
-    ...
-
-
-@activity.defn
-async def rank_kv_clusters(request: KvPlacementRequest) -> KvPlacement:
-    """Every candidate's kv-capacity report, ranked for a VM of (cpu, memory_gib).
-
-    Fans out to every candidate's agent at once; a cluster that cannot be
-    read is a row with its skip reason (unreachable, no-agent, refused-token,
-    malformed), never an exception, and `known_macs` unions every MAC the
-    reachable reports list. Observe-only. Raises KvCapacityUnavailableError
-    (retried) when NO cluster could be read, KvAgentAuthError (permanent)
-    when every reachable one refused the token.
+    Observe-only: four list calls at once (nodes, unfinished pods, labelled
+    VirtualMachines, VirtualMachineInstances), each bounded at 20 s. NEVER
+    raises for the cluster's sake: an API it could not read, or a request
+    naming another cluster than the worker's own, is answered `readable:
+    false` with a bounded `detail` — the caller holds the zone's lock and must
+    neither retry nor wait.
     """
     ...
 
 
 @activity.defn
 async def create_vm_on_cluster(request: VmCreateRequest) -> VmCreated:
-    """PUT the VM on the chosen cluster's kv-vm-api: Halted, labelled for kubevirt-redfish.
+    """ONE Halted VirtualMachine for the request, its MAC drawn and its name derived HERE.
 
-    Idempotent by NAME and identity: the agent answers 201 on create and 200
-    when a VM of this name with the same namespace, MAC, size and labels
-    already exists (`created` False — a retry finding its own earlier PUT).
-    The MAC is `VM_MAC_PREFIX:<suffix_hex as xx:xx:xx>`. Raises, permanent:
-    VmIdentityConflictError (409, a different VM under the name),
-    VmNamespaceNotFoundError (404), VmRequestRejectedError (422),
-    KvAgentAuthError (401/403); transient: KvVmApiUnavailableError.
+    Idempotent by the request id: a VM already labelled with it (an earlier
+    attempt whose answer was lost) is returned, `created` False, whatever the
+    time. Otherwise nothing is created after `create_before`
+    (VmLeaseExpiredError). Then up to three draws: three random bytes behind
+    the cluster's `VM_MAC_PREFIX`, the name
+    `ocp-<flavor>-kv<cpu>-<site>-<MAC>`; a MAC any VM of the cluster already
+    has (any namespace), an AlreadyExists, or KubeMacPool refusing the MAC,
+    draws again. Raises VmMacExhaustedError (three draws taken),
+    VmLeaseExpiredError, VmNamespaceNotFoundError, VmRequestRejectedError
+    (400/422), KvClusterMismatchError (another cluster's or site's request),
+    KvClusterAccessError (403) — all permanent — and the retryable
+    KvClusterApiError (5xx, 401, a timeout).
     """
     ...
 
 
 @activity.defn
 async def await_vm_ready(request: VmReadyRequest) -> VmReadyOutcome:
-    """ONE heartbeating wait until the VM's root disk is bound and the VM admitted, or the deadline.
+    """Until the VM's root disk is bound and the VM admitted, or the deadline on its OWN clock.
 
-    Polls kv-vm-api every few seconds, heartbeats each poll with its start
-    time so a retry on another worker keeps the clock, and returns `done` or
-    `deadline` with the last root-disk phase — never raises for "not yet".
-    Raises VmDisappearedError (404, permanent) and KvVmApiUnavailableError
-    (transient; the retry resumes the clock).
+    ONE heartbeating activity (CLAUDE.md §5): a poll every 8 s, a heartbeat
+    per poll, the clock kept in the heartbeat details so a retry on a
+    restarted worker resumes it. Returns `done` or `deadline` (with the last
+    state seen) — the deadline is a result, never an exception. Raises
+    VmDisappearedError (permanent) when the VM is gone, KvClusterMismatchError
+    and KvClusterAccessError (permanent), the retryable KvClusterApiError.
     """
     ...
 
 
 @activity.defn
 async def delete_vm_on_cluster(request: VmDeleteRequest) -> VmDeleted:
-    """DELETE the run's own VM (and its DataVolume) by name AND MAC on the chosen cluster.
+    """Delete the run's own VM and its root DataVolume: the VM labelled with the request id.
 
-    Idempotent: 204 is `deleted` True, 404 (already gone) `deleted` False —
-    both success. The MAC guards it: the agent deletes only a VM carrying the
-    caller's MAC, and answers 409 for any other, raised as
-    VmIdentityConflictError (permanent — someone replaced the VM, leave it).
-    KvAgentAuthError (401/403) permanent; KvVmApiUnavailableError transient.
+    Idempotent: nothing there is `deleted` False, success. With `name` and
+    `mac`, a VM of that name carrying another MAC or another request id is
+    someone else's and is left alone (VmIdentityConflictError, permanent).
+    Raises KvClusterMismatchError and KvClusterAccessError (permanent), the
+    retryable KvClusterApiError.
     """
     ...

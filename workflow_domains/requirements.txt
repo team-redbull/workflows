@@ -1,4 +1,6 @@
-temporalio>=1.28,<2
+# 1.32: workflow.cancellation_reason(), which create-vm's cancel rollback tells a real
+# cancel from a cache eviction by (workflow_domains/vm_lifecycle/create_vm.py).
+temporalio>=1.32,<2
 pydantic>=2,<3
 pydantic-settings>=2,<3
 # The trigger front-door (workflows/api.py) runs from this same image via a

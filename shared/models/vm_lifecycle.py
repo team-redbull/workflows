@@ -1,18 +1,23 @@
 """Typed state for the vm-lifecycle domain: create-vm's input, progress and result, the
-activity requests and answers of its one hub limb, and the KubeVirt agents' wire contract.
+zone lock's state and signals, and the activity requests and answers of the worker that
+runs inside each KV cluster (plus the zone's cluster list, read by the cluster-lifecycle limb).
 
 No `extra="forbid"` on any model here: these cross the workflow/activity
 boundary and are decoded from history (CLAUDE.md §5). The API edge's
 `CreateVmRequest` (workflow_domains/vm_lifecycle/router.py) is the strict one.
+
+Every capacity number is an INTEGER, in millicores and bytes: nothing on the
+hub parses a Kubernetes quantity string (docs/design/create-vm-placement.md §6.3.1).
 """
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
-from shared.cluster_names import name_token
+from shared.cluster_names import name_token, zone_number
 
 # --- the run ----------------------------------------------------------------------------
 
@@ -20,17 +25,17 @@ from shared.cluster_names import name_token
 class CreateVmInput(BaseModel):
     """Input to CreateVmWorkflow: which InfraEnv needs a VM, and everything derived from it.
 
-    `site`, `zone`, `cpu` and `memory_gib` are derived ONCE at the API edge
-    (from the MCE's and the InfraEnv's names, shared/cluster_names.py and
-    shared/infraenv_names.py) and carried, never re-derived on replay — the
-    provision-dell-server region precedent. `namespace` is the VM's namespace
-    on the chosen KubeVirt cluster, verbatim: a kubevirt-redfish chassis
-    namespace the platform created, never this run.
+    `flavor`, `site`, `zone`, `cpu` and `memory_gib` are derived ONCE at the
+    API edge from the InfraEnv's name (shared/infraenv_names.py) and carried,
+    never re-derived on replay — the provision-dell-server region precedent.
+    `namespace` is the VM's namespace on the chosen KV cluster, verbatim: a
+    kubevirt-redfish chassis namespace the platform created, never this run.
     """
 
     mce_cluster: str = Field(min_length=1)
     infra_env: str = Field(min_length=1)
     namespace: str = Field(min_length=1)
+    flavor: str = Field(min_length=1)
     site: str = Field(min_length=1)
     zone: str = Field(min_length=1)
     cpu: int = Field(ge=1)
@@ -43,108 +48,11 @@ class CreateVmRunArgs(BaseModel):
     input: CreateVmInput
 
 
-class KvClusterRef(BaseModel):
-    """One KubeVirt cluster of the zone, as the workflow and the limb name it.
-
-    `name` is the day1 file's stem (`ocp4-kubevirt-bat-yam-a1`), `cluster_name`
-    the chart's clusterName (the file's own, else the name minus the prefix),
-    `hosted_cluster` the HostedCluster the chart renders (`openshift-<clusterName>`).
-    The limb renders the agents' URLs from these and the site/zone
-    (`KV_*_URL_TEMPLATE`); `agent_host` is what it rendered, for the table.
-    """
-
-    name: str = Field(min_length=1)
-    cluster_name: str = Field(min_length=1)
-    hosted_cluster: str = Field(min_length=1)
-    site: str = Field(min_length=1)
-    zone: str = Field(min_length=1)
-    agent_host: str | None = None
-
-
-class KvClusterRank(BaseModel):
-    """One row of the ranking table: what the cluster's agent reported and what was decided.
-
-    Fills are ratios of the cluster's schedulable allocatable (0..1, over 1 when
-    overcommitted); `*_after` includes this VM. `halted_reservations` is how
-    many Halted, launcher-less VMs of ours the fill counts. `skip_reason` is a
-    key of placement.SKIP_REASONS (mirrored by the workflow's `_SKIP_SUMMARY`).
-    """
-
-    name: str
-    cluster_name: str
-    reachable: bool
-    fits: bool
-    skip_reason: str | None = None
-    skip_detail: str | None = None
-    cpu_fill_before: float | None = None
-    cpu_fill_after: float | None = None
-    memory_fill_before: float | None = None
-    memory_fill_after: float | None = None
-    max_node_cpu_headroom_millicores: int | None = None
-    max_node_memory_headroom_bytes: int | None = None
-    halted_reservations: int = 0
-    agent_host: str | None = None
-
-
-class KvPlacement(BaseModel):
-    """The ranked table, chosen first, then the fitting, then the skipped.
-
-    `chosen` is the chosen cluster's `name`, None when nothing fits.
-    `known_macs` is every VM MAC the reachable clusters reported, lowercased,
-    so the workflow draws a suffix not in use anywhere in the zone (the bridge
-    network spans every KV cluster of it).
-    """
-
-    ranked: list[KvClusterRank]
-    chosen: str | None = None
-    buffer_percent: int
-    pod_cpu_millicores: int
-    pod_memory_bytes: int
-    known_macs: list[str] = Field(default_factory=list)
-
-
-class CreateVmProgress(BaseModel):
-    """Returned by the `progress` query."""
-
-    phase: str
-    kv_candidates: list[str] = Field(default_factory=list)
-    placement: KvPlacement | None = None
-    kv_cluster: str | None = None
-    vm_name: str | None = None
-    mac: str | None = None
-    redraws: int = 0
-
-
-class CreateVmResult(BaseModel):
-    """The VM this run created, Halted, on the cluster it chose.
-
-    `created` False means ONLY that an activity retry inside this run found its
-    own earlier PUT had landed (kv-vm-api answered 200 for the same identity);
-    a re-run of the slot is a new VM with a new suffix. `redraws` counts the
-    suffixes given up: drawn MACs already in the zone, and 409s from the agent.
-    """
-
-    vm_name: str
-    mac: str
-    namespace: str
-    cpu: int
-    memory_gib: int
-    kv_cluster: KvClusterRef
-    placement: KvPlacement
-    redraws: int = 0
-    root_disk_phase: str | None = None
-    created: bool = True
-    infra_env: str
-    mce_cluster: str
-    site: str
-    zone: str
-
-
-# --- the day1 list ----------------------------------------------------------------------
+# --- the zone's KV clusters, from day1 (cluster-lifecycle limb) ---------------------------
 
 
 class KvClusterListRequest(BaseModel):
-    """Which zone's seed folder to list; the tokens are validated so the path they
+    """Which zone's KV clusters to list; the tokens are validated so the day1 path they
     build holds no `/`, `..` or glob character."""
 
     site: str
@@ -158,52 +66,140 @@ class KvClusterListRequest(BaseModel):
     @field_validator("zone")
     @classmethod
     def _zone(cls, value: str) -> str:
-        return name_token(value, "zone")
+        zone_number(value)
+        return value
 
 
 class KvClusterEntry(BaseModel):
-    """One file of the seed folder. `problems` is what the layer reader could not use
-    (a key written twice, a layer that is not a mapping) — reported, never fatal."""
+    """One file of the zone's seed folder.
+
+    `name` is the day1 file's stem, and so the cluster's name everywhere: the
+    queue its worker polls and the `KV_CLUSTER` that worker is deployed with.
+    `id` is the sequence letter its name ends with (creation order), None when
+    the name is not `ocp4-<lifecycle>-kv-<site>-<id>`. `problems` is why the
+    file cannot be used as it is (its NodePools name another zone, or none; a
+    name outside the convention; a key written twice): an entry with any is
+    listed and NEVER chosen.
+    """
 
     name: str
     cluster_name: str
     hosted_cluster: str
     path: str
+    zone: str | None = None
+    id: str | None = None
     problems: list[str] = Field(default_factory=list)
 
 
 class KvClusterList(BaseModel):
+    """The zone's clusters, OLDEST FIRST (by `id`), the commit they were read at, and the
+    placement buffer the run must use: ONE value for every KV cluster, the
+    cluster-lifecycle worker's `HEADROOM_BUFFER_PERCENT`, handed over here so each run
+    records the buffer it decided with."""
+
     clusters: list[KvClusterEntry] = Field(default_factory=list)
+    buffer_percent: int = Field(ge=0, le=90)
     revision: str
+    folder: str | None = None
 
 
-# --- placement ---------------------------------------------------------------------------
+# --- one cluster's figures (the worker inside it) -----------------------------------------
 
 
-class KvPlacementRequest(BaseModel):
-    candidates: list[KvClusterRef]
-    cpu: int = Field(ge=1)
-    memory_gib: int = Field(ge=1)
+class KvFiguresRequest(BaseModel):
+    """The queue already picks the cluster; the name is there so a worker on the wrong
+    queue says so instead of reporting another cluster's numbers."""
+
+    kv_cluster: str = Field(min_length=1)
 
 
-# --- the VM --------------------------------------------------------------------------------
+class KvNodeHeadroom(BaseModel):
+    """One usable node: its allocatable minus the requests of the pods on it, CPU and memory
+    as a PAIR — the largest free CPU and the largest free memory can be on two different
+    nodes, and then neither holds the VM. Negative when a node is overcommitted."""
+
+    name: str
+    cpu_millicores: int
+    memory_bytes: int
+
+
+class KvClusterFigures(BaseModel):
+    """What a KV cluster's worker measured on its own cluster, at the moment it was asked.
+
+    `readable` False: the worker answered but could not read its cluster's API
+    in time, or was asked for another cluster than its own (`detail` says
+    which, bounded). It is a VALUE, never an exception, so the run neither
+    retries it nor holds the zone lock while it does. "Requested" is pods plus
+    stopped VMs, added by whoever reads this.
+    """
+
+    kv_cluster: str
+    readable: bool
+    detail: str | None = None
+    nodes: int = 0
+    usable_nodes: int = 0
+    allocatable_cpu_millicores: int = 0
+    allocatable_memory_bytes: int = 0
+    pods_cpu_millicores: int = 0
+    pods_memory_bytes: int = 0
+    stopped_vms: int = 0
+    stopped_vms_cpu_millicores: int = 0
+    stopped_vms_memory_bytes: int = 0
+    node_headroom: list[KvNodeHeadroom] = Field(default_factory=list)
+
+
+class KvClusterRow(BaseModel):
+    """One row of the run's per-cluster table: a cluster the run judged, and what it decided.
+
+    `skip_reason` is a key of placement.SKIP_REASONS, None for the cluster
+    that fits. `figures` is what its worker reported (None for a cluster that
+    was never read: no worker, or a day1 problem). The clusters AFTER the
+    chosen one are not read and have no row (`not_read` on the progress and
+    the result names them).
+    """
+
+    name: str
+    fits: bool = False
+    skip_reason: str | None = None
+    skip_detail: str | None = None
+    figures: KvClusterFigures | None = None
+    cpu_fill_after: float | None = None
+    memory_fill_after: float | None = None
+
+
+# --- the VM (the worker inside the chosen cluster) ----------------------------------------
 
 
 class VmCreateRequest(BaseModel):
-    """One PUT of the VM `name` on `kv_cluster`. The limb composes the MAC from
-    `suffix_hex` (`VM_MAC_PREFIX:xx:xx:xx`); `labels` are extra VM labels (none today)."""
+    """What the VM IS; the chosen cluster's worker draws the MAC, derives the name, builds
+    the VirtualMachine and creates it Halted.
 
-    kv_cluster: KvClusterRef
+    `request_id` is the RUN's id (a slot's workflow id is reused by later
+    runs): the worker labels the VM with it, so a retried attempt whose answer
+    was lost finds its own VM instead of drawing a second one. `workflow_id`
+    goes on the VM as an annotation, for a person. `create_before` is the end
+    of the zone lease the create is sent under: the worker creates nothing
+    after it (VmLeaseExpiredError), though a retry still returns the VM it
+    already created.
+    """
+
+    kv_cluster: str = Field(min_length=1)
     namespace: str = Field(min_length=1)
-    name: str = Field(min_length=1)
+    flavor: str = Field(min_length=1)
     cpu: int = Field(ge=1)
     memory_gib: int = Field(ge=1)
-    suffix_hex: str = Field(pattern=r"^[0-9a-f]{6}$")
-    labels: dict[str, str] = Field(default_factory=dict)
+    site: str = Field(min_length=1)
+    zone: str = Field(min_length=1)
+    mce: str = Field(min_length=1)
+    request_id: str = Field(min_length=1)
+    workflow_id: str | None = None
+    create_before: datetime
 
 
 class VmCreated(BaseModel):
-    """What kv-vm-api holds after the PUT. `created` False: it already held this identity."""
+    """The VM the worker holds for this request. `created` False: an earlier attempt of
+    the same activity had already created it (found by its request-id label). `draws` is
+    how many MACs this attempt drew (0 when it found its own VM)."""
 
     name: str
     namespace: str
@@ -212,10 +208,11 @@ class VmCreated(BaseModel):
     memory_gib: int
     created: bool
     kv_cluster: str
+    draws: int = 0
 
 
 class VmReadyRequest(BaseModel):
-    kv_cluster: KvClusterRef
+    kv_cluster: str = Field(min_length=1)
     namespace: str = Field(min_length=1)
     name: str = Field(min_length=1)
     deadline_minutes: int = Field(default=10, ge=1)
@@ -235,124 +232,145 @@ class VmReadyOutcome(BaseModel):
 
 
 class VmDeleteRequest(BaseModel):
-    """DELETE the run's own VM: by name AND by the MAC the run gave it."""
+    """Delete the RUN's own VM: the one labelled with `request_id`.
 
-    kv_cluster: KvClusterRef
+    With `name` and `mac` (the run knows them once the create answered), the
+    VM of that name must carry that MAC and that label, or it is someone
+    else's and is left alone (VmIdentityConflictError). Without them (a cancel
+    that cut the create's answer off), every VM in the namespace labelled with
+    the request id goes — at most one.
+    """
+
+    kv_cluster: str = Field(min_length=1)
     namespace: str = Field(min_length=1)
-    name: str = Field(min_length=1)
-    mac: str = Field(min_length=1)
+    request_id: str = Field(min_length=1)
+    name: str | None = None
+    mac: str | None = None
 
 
 class VmDeleted(BaseModel):
-    """`deleted` False: the VM was already gone (404) — success all the same."""
+    """`deleted` False: nothing of this run was there (already gone, or never created) —
+    success all the same. `names` is what was deleted."""
 
     deleted: bool
+    names: list[str] = Field(default_factory=list)
 
 
-# --- the agents' wire contract (vendored; tests/test_kv_agents_contract.py keeps the
-# --- agents' copy equal) --------------------------------------------------------------
+# --- progress and result ------------------------------------------------------------------
+
+
+class CreateVmProgress(BaseModel):
+    """Returned by the `progress` query."""
+
+    phase: str
+    kv_candidates: list[str] = Field(default_factory=list)
+    buffer_percent: int | None = None
+    day1_revision: str | None = None
+    table: list[KvClusterRow] = Field(default_factory=list)
+    not_read: list[str] = Field(default_factory=list)
+    zone_lock: str | None = None
+    lease_ends_at: datetime | None = None
+    leases: int = 0
+    kv_cluster: str | None = None
+    vm_name: str | None = None
+    mac: str | None = None
+    cancel_rollback: str | None = None
+
+
+class CreateVmResult(BaseModel):
+    """The VM this run created, Halted, on the cluster it chose.
+
+    `table` is every cluster the run judged, oldest first, the chosen one
+    last; `not_read` the clusters after it, never asked. `created` False means
+    ONLY that an activity retry inside this run found its own earlier create
+    had landed. `draws` counts the MACs the worker drew for it, `leases` the
+    zone leases the run needed (1 unless clusters without a worker outlasted one).
+    """
+
+    vm_name: str
+    mac: str
+    namespace: str
+    flavor: str
+    cpu: int
+    memory_gib: int
+    kv_cluster: str
+    table: list[KvClusterRow] = Field(default_factory=list)
+    not_read: list[str] = Field(default_factory=list)
+    buffer_percent: int
+    day1_revision: str
+    root_disk_phase: str | None = None
+    created: bool = True
+    draws: int = 0
+    leases: int = 1
+    infra_env: str
+    mce_cluster: str
+    site: str
+    zone: str
+
+
+# --- the zone lock -------------------------------------------------------------------------
 #
-# Per KubeVirt cluster, two services behind Routes (their own repo, kv-agents):
-#   kv-capacity  GET  /v1/capacity                      -> KvCapacityReport
-#   kv-vm-api    PUT  /v1/vms/{name}   KvVmCreateRequest -> 201/200 KvVmCreateResponse,
-#                                                          409 KvVmConflict, 404/422/401 KvApiError
-#                GET  /v1/vms/{name}?namespace=         -> KvVmState | 404
-#                DELETE /v1/vms/{name}?namespace=&mac=  -> 204 | 404 | 409 KvVmConflict
-# Integers only on the wire: millicores and bytes, never Kubernetes quantities.
+# One KvZoneLockWorkflow per (site, zone) hands the zone to one create-vm run at a
+# time. A run is known by its workflow id AND its run id: slot ids are reused, so a
+# grant is signalled to exactly the run that asked, and a later run on the same id
+# never receives a grant it did not ask for.
 
 
-class KvNodeCapacity(BaseModel):
-    """One node: allocatable, and the requests of its Pending|Running pods (the
-    kube-scheduler's own view). `schedulable` = not cordoned AND Ready."""
+class KvZoneLockRequest(BaseModel):
+    """A run asking for the zone's lock (signal `request_lock`), or taking itself out of
+    the line (signal `withdraw`)."""
 
-    name: str
-    schedulable: bool
-    allocatable_cpu_millicores: int
-    allocatable_memory_bytes: int
-    requested_cpu_millicores: int
-    requested_memory_bytes: int
+    workflow_id: str = Field(min_length=1)
+    run_id: str = Field(min_length=1)
 
 
-class KvHaltedReservation(BaseModel):
-    """A Halted VM of ours (labelled for kubevirt-redfish) with NO launcher pod: it
-    consumes nothing on the scheduler yet, so the agent reports what its
-    launcher WILL request and placement counts it toward the cluster's fill."""
+class KvZoneLockGrant(BaseModel):
+    """Signal `lock_granted`, lock -> run: the zone is yours until `lease_ends_at`."""
 
-    namespace: str
-    name: str
-    cpu_millicores: int
-    memory_bytes: int
+    lease_id: str
+    lease_ends_at: datetime
 
 
-class KvVmIdentity(BaseModel):
-    """Every VM the agent sees, running or not, by its MAC — the zone-wide set a
-    new suffix must stay out of. `mac` is None for a VM with no fixed MAC."""
+class KvZoneLockRelease(BaseModel):
+    """Signal `release`, run -> lock. A release carrying another lease's id (an expired
+    one) is ignored."""
 
-    namespace: str
-    name: str
-    mac: str | None = None
+    lease_id: str
 
 
-class KvCapacityReport(BaseModel):
-    cluster: str
-    observed_at: str
-    nodes: list[KvNodeCapacity] = Field(default_factory=list)
-    halted_reservations: list[KvHaltedReservation] = Field(default_factory=list)
-    vms: list[KvVmIdentity] = Field(default_factory=list)
+class KvZoneLease(BaseModel):
+    """The lease in force: who holds the zone and until when."""
+
+    lease_id: str
+    holder: KvZoneLockRequest
+    ends_at: datetime
 
 
-class KvVmCreateRequest(BaseModel):
-    """The body of PUT /v1/vms/{name}: the agent renders the platform's vm.yaml
-    template with these and its per-cluster values (storage class, network,
-    node selector); the VM is created Halted and labelled `redfish-enabled=true`."""
+class KvZoneLockRunArgs(BaseModel):
+    """The lock workflow's single argument: its zone, and the state a continued run carries
+    on from (the line, the lease in force, how many grants it has made in all)."""
 
-    namespace: str
-    cpu: int
-    memory_gib: int
-    mac: str
-    labels: dict[str, str] = Field(default_factory=dict)
-
-
-class KvVmCreateResponse(BaseModel):
-    name: str
-    namespace: str
-    mac: str
-    cpu: int
-    memory_gib: int
-    created: bool
+    site: str = Field(min_length=1)
+    zone: str = Field(min_length=1)
+    line: list[KvZoneLockRequest] = Field(default_factory=list)
+    lease: KvZoneLease | None = None
+    grants: int = 0
+    skipped: int = 0
+    expired: int = 0
 
 
-class KvVmConflict(BaseModel):
-    """409: a VM of this name exists with ANOTHER identity (namespace, MAC, size or
-    our labels differ; runStrategy is never compared). `existing` describes it."""
+class KvZoneLockProgress(BaseModel):
+    """Returned by the lock's `progress` query: the line, the holder and its lease's end.
+    `skipped` counts waiters found gone when their turn came, `expired` leases that ran out."""
 
-    reason: str
-    existing: KvVmState | None = None
-
-
-class KvRootDisk(BaseModel):
-    name: str
-    phase: str | None = None
-    bound: bool = False
-
-
-class KvVmState(BaseModel):
-    """GET /v1/vms/{name}: the VM as the agent reads it. `admitted`: KubeVirt accepted
-    the spec (no `FailedCreate`-style condition); `root_disk` is its DataVolume's
-    phase and whether its PVC is Bound."""
-
-    name: str
-    namespace: str
-    mac: str | None = None
-    cpu: int
-    memory_gib: int
-    run_strategy: str | None = None
-    admitted: bool = False
-    root_disk: KvRootDisk | None = None
-
-
-class KvApiError(BaseModel):
-    """Every non-2xx body: a short machine-readable `error` and a sentence for a person."""
-
-    error: str
-    detail: str = ""
+    phase: str
+    site: str
+    zone: str
+    waiting: int = 0
+    line: list[KvZoneLockRequest] = Field(default_factory=list)
+    holder: KvZoneLockRequest | None = None
+    lease_id: str | None = None
+    lease_ends_at: datetime | None = None
+    grants: int = 0
+    skipped: int = 0
+    expired: int = 0

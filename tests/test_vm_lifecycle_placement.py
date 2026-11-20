@@ -1,275 +1,208 @@
-"""Where a VM goes (activities/vm_lifecycle/placement.py): the pod-request formulas, fit per
-node, buffer per cluster, Halted reservations, best-fit on the dominant resource."""
+"""The fit rule create-vm decides with (workflow_domains/vm_lifecycle/placement.py): pure, on
+figures a KV cluster's worker would report. docs/design/create-vm-placement.md §6.4."""
 
 from __future__ import annotations
 
-from activities.vm_lifecycle import placement
-from activities.vm_lifecycle.kv_capacity_api import KvProbeFailure
-from activities.vm_lifecycle.placement import GIB, pod_cpu_millicores, pod_memory_bytes, rank
-from shared.models.vm_lifecycle import (
-    KvCapacityReport,
-    KvClusterRef,
-    KvHaltedReservation,
-    KvNodeCapacity,
-    KvVmIdentity,
-)
-from workflow_domains.vm_lifecycle.create_vm import _SKIP_SUMMARY
+import ast
+import pathlib
+
+import pytest
+
+from shared.models.vm_lifecycle import KvClusterFigures, KvClusterRow, KvNodeHeadroom
+from shared.vm_requests import GIB, pod_cpu_millicores, pod_memory_bytes, request_cores
+from workflow_domains.vm_lifecycle import placement
+from workflow_domains.vm_lifecycle.placement import SKIP_REASONS, judge, skip_reason, summarise_skips
 
 
-def _ref(n: int) -> KvClusterRef:
-    return KvClusterRef(
-        name=f"ocp4-kubevirt-s-a{n}", cluster_name=f"kubevirt-s-a{n}", hosted_cluster=f"openshift-kubevirt-s-a{n}",
-        site="s", zone="a",
+def figures(
+    nodes: list[tuple[int, int]],
+    *,
+    pods: tuple[int, int] = (0, 0),
+    stopped: tuple[int, int, int] = (0, 0, 0),
+    allocatable: tuple[int, int] | None = None,
+    readable: bool = True,
+    name: str = "ocp4-prod-kv-five-a",
+) -> KvClusterFigures:
+    """Figures from node HEADROOM pairs (cores, GiB). `allocatable` defaults to headroom + pods."""
+    headroom = [KvNodeHeadroom(name=f"n{i}", cpu_millicores=c * 1000, memory_bytes=m * GIB) for i, (c, m) in enumerate(nodes)]
+    alloc_cpu = sum(c for c, _ in nodes) * 1000 + pods[0] * 1000 if allocatable is None else allocatable[0] * 1000
+    alloc_mem = sum(m for _, m in nodes) * GIB + pods[1] * GIB if allocatable is None else allocatable[1] * GIB
+    return KvClusterFigures(
+        kv_cluster=name, readable=readable, nodes=len(nodes), usable_nodes=len(nodes),
+        allocatable_cpu_millicores=alloc_cpu, allocatable_memory_bytes=alloc_mem,
+        pods_cpu_millicores=pods[0] * 1000, pods_memory_bytes=pods[1] * GIB,
+        stopped_vms=stopped[0], stopped_vms_cpu_millicores=stopped[1] * 1000, stopped_vms_memory_bytes=stopped[2] * GIB,
+        node_headroom=headroom,
     )
 
 
-def _node(name: str, *, cores: int, gib: int, used_cores: float = 0, used_gib: int = 0, schedulable: bool = True) -> KvNodeCapacity:
-    return KvNodeCapacity(
-        name=name, schedulable=schedulable, allocatable_cpu_millicores=cores * 1000, allocatable_memory_bytes=gib * GIB,
-        requested_cpu_millicores=int(used_cores * 1000), requested_memory_bytes=used_gib * GIB,
+KV32 = (pod_cpu_millicores(32), pod_memory_bytes(256))   # 30 cores, 257 GiB
+KV8 = (pod_cpu_millicores(8), pod_memory_bytes(64))      # 7 cores, 65 GiB
+
+
+class TestTheVmInRequestTerms:
+    @pytest.mark.parametrize(
+        ("cpu", "memory_gib", "cores", "request_gib"),
+        [(8, 64, 7, 65), (16, 128, 15, 129), (32, 256, 30, 257), (64, 512, 60, 513)],
     )
+    def test_the_designs_table(self, cpu, memory_gib, cores, request_gib):
+        assert pod_cpu_millicores(cpu) == cores * 1000
+        assert pod_memory_bytes(memory_gib) == request_gib * GIB
+
+    @pytest.mark.parametrize(("cpu", "cores"), [(1, 1), (2, 1), (3, 2), (4, 3), (15, 14), (16, 15), (17, 15), (256, 240)])
+    def test_the_cpu_request_is_fifteen_sixteenths_rounded_down_and_never_zero(self, cpu, cores):
+        assert request_cores(cpu) == cores
 
 
-def _report(n: int, nodes: list[KvNodeCapacity], *, halted=(), vms=()) -> KvCapacityReport:
-    return KvCapacityReport(
-        cluster=f"kubevirt-s-a{n}", observed_at="2026-11-05T10:00:00Z", nodes=nodes,
-        halted_reservations=list(halted), vms=list(vms),
+class TestTheFitRule:
+    def test_an_empty_cluster_takes_the_vm(self):
+        verdict = judge(figures([(100, 1000)]), *KV32, 15)
+        assert verdict.fits and verdict.reason is None
+        assert verdict.cpu_fill_after == pytest.approx(0.30)
+
+    def test_an_unreadable_cluster_is_unreachable_whatever_its_numbers(self):
+        answer = figures([(100, 1000)], readable=False).model_copy(update={"detail": "its API timed out"})
+        verdict = judge(answer, *KV32, 15)
+        assert (verdict.reason, verdict.detail) == ("unreachable", "its API timed out")
+
+    def test_no_usable_node_is_no_nodes(self):
+        empty = KvClusterFigures(kv_cluster="x", readable=True, nodes=3, usable_nodes=0)
+        assert skip_reason(empty, *KV32, 15) == "no-nodes"
+        assert "3 nodes" in judge(empty, *KV32, 15).detail
+
+    def test_the_order_of_the_checks_is_the_designs(self):
+        # Unreadable beats everything; no node beats the fit; the node beats the buffer.
+        unreadable_and_empty = KvClusterFigures(kv_cluster="x", readable=False, nodes=0, usable_nodes=0)
+        assert skip_reason(unreadable_and_empty, *KV32, 15) == "unreachable"
+        # One 20-core node, half full: no node holds 30 cores AND the buffer is passed.
+        assert skip_reason(figures([(10, 500)], pods=(10, 0)), *KV32, 15) == "fit-node"
+
+
+class TestOneNodeMustHoldIt:
+    def test_room_spread_over_nodes_is_not_room(self):
+        # 200 free cores over ten nodes of 20: no 30-core pod fits anywhere.
+        assert skip_reason(figures([(20, 1000)] * 10), *KV32, 0) == "fit-node"
+
+    def test_cpu_and_memory_must_be_on_the_same_node(self):
+        # The largest free CPU and the largest free memory are on two different nodes.
+        answer = figures([(64, 100), (10, 600)])
+        assert skip_reason(answer, *KV32, 0) == "fit-node"
+        detail = judge(answer, *KV32, 0).detail
+        assert "30000 m" in detail and "257 GiB" in detail
+
+    def test_one_node_with_both_is_enough(self):
+        assert skip_reason(figures([(64, 100), (10, 600), (30, 257)]), *KV32, 0) is None
+
+    def test_an_exact_fit_fits(self):
+        assert skip_reason(figures([(30, 257)]), *KV32, 0) is None
+        assert skip_reason(figures([(30, 256)]), *KV32, 0) == "fit-node"
+
+    def test_memory_runs_out_before_cpu_on_an_eight_gib_per_core_node(self):
+        # The design's example: a 64-core / 512 GiB node holds one 32-vCPU VM on memory, two on CPU.
+        one_running = figures([(64 - 30, 512 - 257)], pods=(30, 257))
+        assert skip_reason(one_running, *KV32, 0) == "fit-node"
+        assert "GiB free" in judge(one_running, *KV32, 0).detail
+
+    def test_an_overcommitted_node_has_negative_room_and_is_no_room(self):
+        assert skip_reason(figures([(-5, -10)], allocatable=(100, 1000)), *KV8, 0) == "fit-node"
+
+    def test_stopped_vms_are_on_no_node_so_the_node_check_does_not_see_them(self):
+        # The design's known limit (§11.6): the node check passes, only the buffer counts them.
+        assert skip_reason(figures([(64, 600)], stopped=(1, 30, 257)), *KV32, 0) is None
+
+
+class TestTheBuffer:
+    @pytest.mark.parametrize(
+        ("already", "fits"),
+        [(0, True), (30, True), (55, True), (56, False), (60, False), (85, False)],
     )
+    def test_cpu_stays_at_or_under_one_minus_the_buffer(self, already, fits):
+        # 100 cores, 15% buffer: 85 cores of requests at most. 55 + 30 = 85 fits, 56 + 30 does not.
+        answer = figures([(100 - already, 10_000)], pods=(already, 0))
+        assert (skip_reason(answer, *KV32, 15) is None) is fits
+
+    def test_stopped_vms_count_toward_the_buffer(self):
+        # Two VMs created a moment ago, not started: 60 cores taken, the third would be 90 > 85.
+        answer = figures([(100, 10_000)], stopped=(2, 60, 514))
+        verdict = judge(answer, *KV32, 15)
+        assert verdict.reason == "fit-buffer"
+        assert "90000 m of 100000 m" in verdict.detail and "15% buffer allows 85%" in verdict.detail
+
+    def test_memory_is_checked_as_well_as_cpu(self):
+        # Plenty of CPU; 1000 GiB, 600 requested, + 257 = 857 > 850.
+        answer = figures([(1000, 400)], pods=(0, 600))
+        verdict = judge(answer, *KV32, 15)
+        assert verdict.reason == "fit-buffer" and "memory after placing: 857 GiB of 1000 GiB" in verdict.detail
+        assert skip_reason(figures([(1000, 407)], pods=(0, 593)), *KV32, 15) is None  # 593 + 257 = 850 of 1000
+
+    def test_the_boundary_is_exact_in_integers(self):
+        # 3 millicores allocatable short of the boundary must not fit; floats would round this.
+        base = figures([(100, 10_000)])
+        at = base.model_copy(update={"allocatable_cpu_millicores": 100_000, "pods_cpu_millicores": 55_000})
+        over = base.model_copy(update={"allocatable_cpu_millicores": 99_997, "pods_cpu_millicores": 55_000})
+        assert skip_reason(at, *KV32, 15) is None
+        assert skip_reason(over, *KV32, 15) == "fit-buffer"
+
+    @pytest.mark.parametrize("buffer", [0, 15, 30, 50, 90])
+    def test_the_buffer_is_a_share_of_the_whole_cluster(self, buffer):
+        # 1000 cores over ten nodes; the VM takes 30: it fits while requested + 30 <= (100 - buffer)% of 1000.
+        limit = (100 - buffer) * 10 - 30
+        assert skip_reason(figures([(100, 10_000)] * 10, pods=(limit, 0), allocatable=(1000, 100_000)), *KV32, buffer) is None
+        assert skip_reason(figures([(100, 10_000)] * 10, pods=(limit + 1, 0), allocatable=(1000, 100_000)), *KV32, buffer) == "fit-buffer"
+
+    def test_a_node_may_fill_completely_the_buffer_is_never_per_node(self):
+        # One node takes the VM to 100% of itself; the cluster as a whole stays under the buffer.
+        assert skip_reason(figures([(30, 257), (100, 1000), (100, 1000)]), *KV32, 15) is None
 
 
-class TestTheFormulas:
-    def test_the_cpu_request_is_vm_yamls_fifteen_sixteenths(self):
-        # vm.yaml: `div (mul cpu 15) 16`, integer division.
-        assert pod_cpu_millicores(32) == 30_000
-        assert pod_cpu_millicores(64) == 60_000
-        assert pod_cpu_millicores(8) == 7_000
-        assert pod_cpu_millicores(1) == 1_000  # floored: 15/16 of one core would be zero
+class TestTheDesignsExample:
+    """§6.5: ten 32-vCPU VMs over two 100-core clusters with the 15% buffer."""
 
-    def test_the_memory_request_is_the_guest_plus_the_launcher_pad(self):
-        assert pod_memory_bytes(256) == 257 * GIB
-        assert pod_memory_bytes(64) == 65 * GIB
-
-
-class TestFitPerNodeBufferPerCluster:
-    def test_free_cores_spread_over_nodes_do_not_hold_a_big_vm(self):
-        # 10 nodes × 20 free cores = 200 free, and no node has 60.
-        nodes = [_node(f"n{i}", cores=64, gib=512, used_cores=44, used_gib=100) for i in range(10)]
-        table = rank([_ref(1)], [_report(1, nodes)], cpu=64, memory_gib=256, buffer_percent=0)
-        row = table.ranked[0]
-        assert table.chosen is None
-        assert (row.fits, row.skip_reason) == (False, "fit-node")
-        assert row.max_node_cpu_headroom_millicores == 20_000
-
-    def test_the_buffer_is_checked_on_the_cluster_after_placing(self):
-        # One empty 64-core / 512 GiB node: the pod (60 cores) fits the node,
-        # but 60/64 = 94% is past a 30% buffer.
-        table = rank([_ref(1)], [_report(1, [_node("n1", cores=64, gib=512)])], cpu=64, memory_gib=256, buffer_percent=30)
-        row = table.ranked[0]
-        assert (row.fits, row.skip_reason) == (False, "fit-buffer")
-        assert row.cpu_fill_after == 60_000 / 64_000
-        table = rank([_ref(1)], [_report(1, [_node("n1", cores=64, gib=512)])], cpu=64, memory_gib=256, buffer_percent=0)
-        assert table.chosen == "ocp4-kubevirt-s-a1"
-
-    def test_the_buffer_binds_on_memory_as_well(self):
-        # Plenty of CPU, memory at the wall: 257 of 300 GiB after.
-        table = rank([_ref(1)], [_report(1, [_node("n1", cores=256, gib=300)])], cpu=64, memory_gib=256, buffer_percent=30)
-        row = table.ranked[0]
-        assert (row.fits, row.skip_reason) == (False, "fit-buffer")
-        assert "memory" in row.skip_detail
-
-    def test_halted_reservations_count_toward_the_fill_but_not_the_node_headroom(self):
-        nodes = [_node("n1", cores=64, gib=512)]
-        halted = [KvHaltedReservation(namespace="inventory", name="ocp-x-1", cpu_millicores=30_000, memory_bytes=129 * GIB)]
-        table = rank([_ref(1)], [_report(1, nodes, halted=halted)], cpu=32, memory_gib=128, buffer_percent=0)
-        row = table.ranked[0]
-        assert row.halted_reservations == 1
-        assert row.cpu_fill_before == 30_000 / 64_000
-        assert row.cpu_fill_after == 60_000 / 64_000
-        assert row.max_node_cpu_headroom_millicores == 64_000  # the Halted VM sits on no node
-        assert row.fits
-        # A second reservation of the same size takes the cluster past 100%: no fit.
-        table = rank([_ref(1)], [_report(1, nodes, halted=halted * 2)], cpu=32, memory_gib=128, buffer_percent=0)
-        assert table.ranked[0].skip_reason == "fit-buffer"
-
-    def test_unschedulable_nodes_are_neither_capacity_nor_headroom(self):
-        nodes = [_node("n1", cores=64, gib=512, schedulable=False), _node("n2", cores=8, gib=64)]
-        table = rank([_ref(1)], [_report(1, nodes)], cpu=32, memory_gib=128, buffer_percent=0)
-        assert table.ranked[0].skip_reason == "fit-node"
-        table = rank([_ref(1)], [_report(1, [_node("n1", cores=64, gib=512, schedulable=False)])], cpu=2, memory_gib=16, buffer_percent=0)
-        assert table.ranked[0].skip_reason == "no-nodes"
+    def test_two_two_then_no_capacity(self):
+        taken = {"a": 0, "b": 0}
+        placed: list[str | None] = []
+        for _ in range(10):
+            chosen = None
+            for name in ("a", "b"):  # oldest first, first fit
+                answer = figures([(100, 100_000)], stopped=(taken[name] // 30, taken[name], 0))
+                if skip_reason(answer, *KV32, 15) is None:
+                    chosen = name
+                    break
+            if chosen:
+                taken[chosen] += 30
+            placed.append(chosen)
+        assert placed == ["a", "a", "b", "b"] + [None] * 6
+        assert taken == {"a": 60, "b": 60}
 
 
-class TestBestFit:
-    def test_the_fullest_after_placement_wins_on_the_dominant_resource(self):
-        # a1: 64 cores, 20 used → 50/64 = 78% after (cpu dominant)
-        # a2: 64 cores, 5 used → 35/64 = 55% after
-        # a3: 64 cores, 10 used, memory 160 of 300 GiB used → memory 289/300 = 96% after
-        reports = [
-            _report(1, [_node("n", cores=64, gib=512, used_cores=20)]),
-            _report(2, [_node("n", cores=64, gib=512, used_cores=5)]),
-            _report(3, [_node("n", cores=64, gib=300, used_cores=10, used_gib=160)]),
+class TestTheTable:
+    def test_a_row_carries_the_figures_and_the_verdict(self):
+        answer = figures([(100, 1000)])
+        row = placement.row("ocp4-prod-kv-five-a", answer, judge(answer, *KV32, 15))
+        assert row.fits and row.skip_reason is None and row.figures == answer and row.cpu_fill_after == pytest.approx(0.3)
+
+    def test_the_summary_names_the_clusters_per_reason_in_the_tables_order(self):
+        table = [
+            KvClusterRow(name="-a", skip_reason="fit-buffer"),
+            KvClusterRow(name="-b", skip_reason="no-worker"),
+            KvClusterRow(name="-c", skip_reason="fit-buffer"),
+            KvClusterRow(name="-d", fits=True),
         ]
-        table = rank([_ref(1), _ref(2), _ref(3)], reports, cpu=32, memory_gib=128, buffer_percent=0)
-        assert [row.name for row in table.ranked] == ["ocp4-kubevirt-s-a3", "ocp4-kubevirt-s-a1", "ocp4-kubevirt-s-a2"]
-        assert table.chosen == "ocp4-kubevirt-s-a3"
-        assert all(row.fits for row in table.ranked)
+        said = summarise_skips(table)
+        assert said == f"-a, -c {SKIP_REASONS['fit-buffer']}; -b {SKIP_REASONS['no-worker']}"
 
-    def test_a_tie_goes_by_name(self):
-        reports = [_report(2, [_node("n", cores=64, gib=512)]), _report(1, [_node("n", cores=64, gib=512)])]
-        table = rank([_ref(2), _ref(1)], reports, cpu=32, memory_gib=128, buffer_percent=0)
-        assert table.chosen == "ocp4-kubevirt-s-a1"
-
-    def test_first_fit_is_not_the_rule(self):
-        # The first candidate fits; a later, fuller one is still chosen.
-        reports = [_report(1, [_node("n", cores=64, gib=512)]), _report(2, [_node("n", cores=64, gib=512, used_cores=20)])]
-        table = rank([_ref(1), _ref(2)], reports, cpu=32, memory_gib=128, buffer_percent=0)
-        assert table.chosen == "ocp4-kubevirt-s-a2"
-
-    def test_skipped_clusters_follow_the_fitting_ones_in_name_order(self):
-        reports = [
-            KvProbeFailure("no-agent", "no route"),
-            _report(2, [_node("n", cores=64, gib=512)]),
-            KvProbeFailure("unreachable", "timeout"),
-        ]
-        table = rank([_ref(3), _ref(2), _ref(1)], reports, cpu=32, memory_gib=128, buffer_percent=0)
-        assert [(row.name, row.fits, row.skip_reason) for row in table.ranked] == [
-            ("ocp4-kubevirt-s-a2", True, None),
-            ("ocp4-kubevirt-s-a1", False, "unreachable"),
-            ("ocp4-kubevirt-s-a3", False, "no-agent"),
-        ]
-        assert table.ranked[1].reachable is False
-        assert table.ranked[1].skip_detail == "timeout"
-
-
-class TestKnownMacs:
-    def test_every_reachable_reports_macs_lowercased_once(self):
-        reports = [
-            _report(1, [_node("n", cores=64, gib=512)], vms=[
-                KvVmIdentity(namespace="inventory", name="a", mac="02:A1:B2:00:00:01"),
-                KvVmIdentity(namespace="inventory", name="b", mac=None),
-            ]),
-            KvProbeFailure("unreachable", "x"),
-            _report(3, [_node("n", cores=64, gib=512)], vms=[
-                KvVmIdentity(namespace="other", name="c", mac="02:a1:b2:00:00:01"),
-                KvVmIdentity(namespace="other", name="d", mac="02:a1:b2:00:00:02"),
-            ]),
-        ]
-        table = rank([_ref(1), _ref(2), _ref(3)], reports, cpu=2, memory_gib=16, buffer_percent=0)
-        assert table.known_macs == ["02:a1:b2:00:00:01", "02:a1:b2:00:00:02"]
-
-
-def test_the_workflows_skip_summary_mirrors_the_placement_reasons():
-    # The workflow cannot import the limb, so it keeps a copy of the wording;
-    # this is what keeps the two from drifting (the _REJECTION_SUMMARY precedent).
-    assert _SKIP_SUMMARY == placement.SKIP_REASONS
-    reasons_the_module_records = {"unreachable", "no-agent", "refused-token", "malformed", "no-nodes", "fit-node", "fit-buffer"}
-    assert set(placement.SKIP_REASONS) == reasons_the_module_records
-
-
-class TestEdges:
-    """The boundaries of the fit test, the buffer and the ranking."""
-
-    def test_a_fill_exactly_at_the_ceiling_fits(self):
-        # 64 cores, 51.2 used after a 7-core pod → 80.0% exactly; buffer 20 allows 80%.
-        node = KvNodeCapacity(name="n", schedulable=True, allocatable_cpu_millicores=64_000,
-                              allocatable_memory_bytes=512 * GIB, requested_cpu_millicores=44_200, requested_memory_bytes=0)
-        table = rank([_ref(1)], [_report(1, [node])], cpu=8, memory_gib=64, buffer_percent=20)
-        assert table.ranked[0].cpu_fill_after == 0.8
-        assert table.chosen == "ocp4-kubevirt-s-a1"
-        # One millicore more is past it.
-        node = node.model_copy(update={"requested_cpu_millicores": 44_201})
-        table = rank([_ref(1)], [_report(1, [node])], cpu=8, memory_gib=64, buffer_percent=20)
-        assert table.ranked[0].skip_reason == "fit-buffer"
-
-    def test_buffer_zero_allows_a_full_cluster_and_buffer_ninety_almost_nothing(self):
-        node = _node("n", cores=7, gib=65)  # exactly the pod of an 8-vCPU VM
-        assert rank([_ref(1)], [_report(1, [node])], cpu=8, memory_gib=64, buffer_percent=0).chosen is not None
-        big = _node("n", cores=640, gib=6500)
-        assert rank([_ref(1)], [_report(1, [big])], cpu=8, memory_gib=64, buffer_percent=90).chosen is not None
-        assert rank([_ref(1)], [_report(1, [_node("n", cores=64, gib=512)])], cpu=8, memory_gib=64, buffer_percent=90).ranked[0].skip_reason == "fit-buffer"
-
-    def test_an_overcommitted_node_has_negative_headroom_and_never_fits(self):
-        node = _node("n", cores=64, gib=512, used_cores=70, used_gib=600)
-        row = rank([_ref(1)], [_report(1, [node])], cpu=1, memory_gib=8, buffer_percent=0).ranked[0]
-        assert (row.skip_reason, row.max_node_cpu_headroom_millicores) == ("fit-node", -6_000)
-        assert row.cpu_fill_before is not None and row.cpu_fill_before > 1
-
-    def test_a_cluster_with_zero_allocatable_is_no_nodes_or_fit_node_never_a_division_error(self):
-        empty = KvNodeCapacity(name="n", schedulable=True, allocatable_cpu_millicores=0, allocatable_memory_bytes=0,
-                               requested_cpu_millicores=0, requested_memory_bytes=0)
-        row = rank([_ref(1)], [_report(1, [empty])], cpu=1, memory_gib=8, buffer_percent=0).ranked[0]
-        assert row.skip_reason == "fit-node"
-        assert row.cpu_fill_before is None and row.memory_fill_after is None
-        row = rank([_ref(1)], [_report(1, [])], cpu=1, memory_gib=8, buffer_percent=0).ranked[0]
-        assert (row.skip_reason, row.reachable) == ("no-nodes", True)
-
-    def test_cpu_one_is_a_whole_core_and_the_sixteenth_is_rounded_away(self):
-        assert pod_cpu_millicores(1) == pod_cpu_millicores(2) == 1_000  # 15/16 of two is 1.875 → 1
-        assert pod_cpu_millicores(16) == 15_000 and pod_cpu_millicores(17) == 15_000
-        assert pod_cpu_millicores(256) == 240_000
-
-    def test_the_dominant_resource_is_per_cluster(self):
-        # a1 is CPU-bound (80% after), a2 memory-bound (90% after): a2 wins on its own dominant resource.
-        reports = [
-            _report(1, [_node("n", cores=64, gib=1024, used_cores=44)]),       # cpu 51/64 = 80%, mem 65/1024
-            _report(2, [_node("n", cores=640, gib=200, used_cores=10, used_gib=115)]),  # mem 180/200 = 90%
-        ]
-        table = rank([_ref(1), _ref(2)], reports, cpu=8, memory_gib=64, buffer_percent=0)
-        assert table.chosen == "ocp4-kubevirt-s-a2"
-        assert [round(placement._score(row), 2) for row in table.ranked] == [0.9, 0.8]
-
-    def test_the_choice_does_not_depend_on_the_candidates_order(self):
-        reports = {
-            1: _report(1, [_node("n", cores=64, gib=512, used_cores=20)]),
-            2: _report(2, [_node("n", cores=64, gib=512, used_cores=40)]),
-            3: _report(3, [_node("n", cores=64, gib=512, used_cores=30)]),
+    def test_every_reason_the_rule_or_the_run_records_has_its_words(self):
+        """A reason without words would reach the operator as a bare key."""
+        recorded = {placement.DAY1_PROBLEM, placement.NO_WORKER, placement.UNREACHABLE, placement.NO_NODES,
+                    placement.FIT_NODE, placement.FIT_BUFFER}
+        assert recorded == set(SKIP_REASONS)
+        # …and the workflow records no reason by a literal of its own.
+        source = pathlib.Path(__file__).resolve().parent.parent / "workflow_domains/vm_lifecycle/create_vm.py"
+        literals = {
+            keyword.value.value
+            for node in ast.walk(ast.parse(source.read_text()))
+            if isinstance(node, ast.Call)
+            for keyword in node.keywords
+            if keyword.arg == "skip_reason" and isinstance(keyword.value, ast.Constant)
         }
-        for order in ([1, 2, 3], [3, 2, 1], [2, 1, 3]):
-            table = rank([_ref(n) for n in order], [reports[n] for n in order], cpu=8, memory_gib=64, buffer_percent=0)
-            assert table.chosen == "ocp4-kubevirt-s-a2"
-            assert [row.name for row in table.ranked] == ["ocp4-kubevirt-s-a2", "ocp4-kubevirt-s-a3", "ocp4-kubevirt-s-a1"]
-
-    def test_every_candidate_is_exactly_one_row(self):
-        candidates = [_ref(n) for n in range(1, 41)]
-        outcomes = [
-            KvProbeFailure("unreachable", "x") if n % 5 == 0 else _report(n, [_node("n", cores=64, gib=512, used_cores=n)])
-            for n in range(1, 41)
-        ]
-        table = rank(candidates, outcomes, cpu=8, memory_gib=64, buffer_percent=0)
-        assert sorted(row.name for row in table.ranked) == sorted(ref.name for ref in candidates)
-        assert len({row.name for row in table.ranked}) == 40
-        assert table.chosen == "ocp4-kubevirt-s-a39"  # the fullest reachable one (40 is unreachable)
-
-    def test_candidates_and_outcomes_must_pair_up(self):
-        import pytest
-
-        with pytest.raises(ValueError):
-            rank([_ref(1), _ref(2)], [_report(1, [_node("n", cores=64, gib=512)])], cpu=8, memory_gib=64, buffer_percent=0)
-
-    def test_a_halted_reservation_alone_can_push_a_cluster_past_the_buffer_before_any_node_is_full(self):
-        # The node has room (100 of 512 GiB used), but five Halted 65 GiB VMs are waiting to start.
-        halted = [KvHaltedReservation(namespace="inventory", name=f"ocp-x-{i}", cpu_millicores=7_000, memory_bytes=65 * GIB) for i in range(5)]
-        table = rank([_ref(1)], [_report(1, [_node("n", cores=64, gib=512, used_gib=100)], halted=halted)], cpu=8, memory_gib=64, buffer_percent=20)
-        row = table.ranked[0]
-        assert row.max_node_memory_headroom_bytes == 412 * GIB  # the node itself is far from full
-        assert (row.skip_reason, row.halted_reservations) == ("fit-buffer", 5)
-        assert row.memory_fill_after == (100 + 325 + 65) / 512
-
-    def test_unreachable_rows_carry_no_fills_and_reachable_ones_always_do(self):
-        table = rank([_ref(1), _ref(2)], [KvProbeFailure("refused-token", "401"), _report(2, [_node("n", cores=64, gib=512)])], cpu=8, memory_gib=64, buffer_percent=0)
-        failed, ok = (row for row in table.ranked if row.name == "ocp4-kubevirt-s-a1"), (row for row in table.ranked if row.name == "ocp4-kubevirt-s-a2")
-        failed, ok = next(failed), next(ok)
-        assert (failed.reachable, failed.cpu_fill_before, failed.max_node_cpu_headroom_millicores) == (False, None, None)
-        assert ok.reachable and ok.cpu_fill_before == 0.0 and ok.cpu_fill_after == 7 / 64
-
-    def test_known_macs_ignore_empty_and_dedupe_across_case_and_clusters(self):
-        reports = [
-            _report(1, [_node("n", cores=64, gib=512)], vms=[
-                KvVmIdentity(namespace="a", name="x", mac="02:A1:B2:00:00:0A"),
-                KvVmIdentity(namespace="a", name="y", mac=""),
-                KvVmIdentity(namespace="a", name="z", mac=None),
-            ]),
-            _report(2, [_node("n", cores=64, gib=512)], vms=[KvVmIdentity(namespace="b", name="x", mac="02:a1:b2:00:00:0a")]),
-        ]
-        assert placement.known_macs(reports) == ["02:a1:b2:00:00:0a"]
-        assert placement.known_macs([KvProbeFailure("unreachable", "x")]) == []
+        assert literals == set()

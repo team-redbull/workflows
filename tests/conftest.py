@@ -85,11 +85,9 @@ os.environ.update(
         "UPGRADE_AGENT_TOKEN": "test-agent-token",
         # --- create-vm: the KubeVirt clusters' agents and the placement policy ---
         # DAY1_REPO_URL / DAY1_GIT_TOKEN above serve the vm-lifecycle limb too.
-        "KV_CAPACITY_URL_TEMPLATE": "https://kv-capacity.apps.{cluster}.test",
-        "KV_VM_API_URL_TEMPLATE": "https://kv-vm-api.apps.{cluster}.test",
-        "KV_CAPACITY_TOKEN": "test-kv-capacity-token",
-        "KV_VM_API_TOKEN": "test-kv-vm-api-token",
-        "HEADROOM_BUFFER_PERCENT": "30",
-        "VM_MAC_PREFIX": "02:a1:b2",
+        "HEADROOM_BUFFER_PERCENT": "15",
+        "KV_CLUSTER": "ocp4-prod-kv-five-a",
+        "VM_MAC_PREFIX": "0e:03:f2",
+        "VM_STORAGE_CLASS_NAME": "test-cephfs",
     }
 )

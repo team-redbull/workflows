@@ -937,7 +937,8 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
     `<cpu>` vCPUs, `<cpu> × 8` GiB — `MEMORY_GIB_PER_CPU`, the ONE place the ratio lives), the
     zone `az<N>`, the flavor carrying its optional variant letter. A VM is
     `ocp-<flavor>-kv<cpu>-<site>-<its MAC, 12 hex>` (`ocp-c200-kv32-five-0e03f2a1b2c3`): the zone
-    is a label, never in the name. **A seed is `ocp4-seed-<site>-<zone number>`** for zone
+    is a label, never in the name. Its size LABEL is `redbull.io/size: <cpu>c` (`32c`), not the
+    name's `kv<cpu>` (the operator, 2026-11-21). **A seed is `ocp4-seed-<site>-<zone number>`** for zone
     `az<N>` (the operator, 2026-11-20, AGAINST the draft's `ocp4-<lifecycle>-seed-<site>-<id>`,
     which is to be updated): one seed per zone and immutable, so its name can carry the zone,
     where a KV cluster's does not. The route refuses an MCE whose site is not the InfraEnv's (a VM

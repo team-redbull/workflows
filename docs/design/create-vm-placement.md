@@ -470,7 +470,7 @@ ocp-c200-kv32-five-0e03f2a1b2c3
 | label | value |
 | --- | --- |
 | `redbull.io/flavor` | `c200` |
-| `redbull.io/size` | `kv32` |
+| `redbull.io/size` | `32c` |
 | `redbull.io/site` | `five` |
 | `topology.kubernetes.io/zone` | `az1` |
 | `redbull.io/role` | `worker` (a tenant warm-pool VM) |

@@ -42,11 +42,16 @@ class TestTheVirtualMachine:
         assert vm["spec"]["dataVolumeTemplates"][0]["metadata"]["name"] == "ocp-c200-kv32-five-0e03f2a1b2c3-root"
         assert vm["spec"]["template"]["metadata"]["labels"] == {"kubevirt.io/vm": "ocp-c200-kv32-five-0e03f2a1b2c3"}
 
+    @pytest.mark.parametrize(("cpu", "label"), [(1, "1c"), (32, "32c"), (256, "256c")])
+    def test_the_size_label_is_the_vcpus_and_a_c(self, cpu, label):
+        """The label says the size alone; `kv<cpu>` is the NAME's field, not the label's."""
+        assert vm_spec.size_label(cpu) == label
+
     def test_its_labels_are_the_conventions(self):
         assert _build()["metadata"]["labels"] == {
             "redfish-enabled": "true",
             "redbull.io/flavor": "c200",
-            "redbull.io/size": "kv32",
+            "redbull.io/size": "32c",
             "redbull.io/site": "five",
             "topology.kubernetes.io/zone": "az1",
             "redbull.io/role": "worker",

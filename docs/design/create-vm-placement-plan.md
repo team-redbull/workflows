@@ -216,7 +216,7 @@ completed             name, MAC, namespace, size, cluster, the per-cluster table
     memory pairs; quantities parsed with `kubernetes.utils.parse_quantity` into integers.
   - `vm_spec.py` (pure): `draw_mac(prefix, random_bytes)`, `vm_name(flavor, cpu, site, mac)` =
     `ocp-<flavor>-kv<cpu>-<site>-<mac, 12 hex>`, the labels (`redbull.io/flavor`,
-    `redbull.io/size` = `kv<cpu>`, `redbull.io/site`, `topology.kubernetes.io/zone`,
+    `redbull.io/size` = `<cpu>c`, `redbull.io/site`, `topology.kubernetes.io/zone`,
     `redbull.io/role: worker`, `redbull.io/mce`, `redfish-enabled: "true"`,
     `redbull.io/created-by` = the request id), and the VirtualMachine
     `kv-agents/templates/vm.yaml.j2` renders; root-disk facts.

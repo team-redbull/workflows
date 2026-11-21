@@ -263,7 +263,7 @@ class TestOneVm:
         namespace, body = seen[0]
         assert namespace == "inventory"
         assert body["metadata"]["labels"] | {"redbull.io/created-by": "x"} == {
-            "redfish-enabled": "true", "redbull.io/flavor": "c200n", "redbull.io/size": "kv8", "redbull.io/site": "five",
+            "redfish-enabled": "true", "redbull.io/flavor": "c200n", "redbull.io/size": "8c", "redbull.io/site": "five",
             "topology.kubernetes.io/zone": "az1", "redbull.io/role": "worker", "redbull.io/mce": MCE,
             "redbull.io/created-by": "x",
         }

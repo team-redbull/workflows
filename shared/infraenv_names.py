@@ -111,7 +111,7 @@ def is_kubevirt(name: str) -> bool:
 
 
 def vm_size(cpu: int) -> str:
-    """`kv<cpu>`: the size field of an InfraEnv's and a VM's name, and the VM's `redbull.io/size` label."""
+    """`kv<cpu>`: the size field of an InfraEnv's and a VM's name. (The VM's `redbull.io/size` label is `<cpu>c`, the worker's.)"""
     return f"{KUBEVIRT_SIZE_PREFIX}{cpu}"
 
 

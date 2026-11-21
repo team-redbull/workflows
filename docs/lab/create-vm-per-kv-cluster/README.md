@@ -225,6 +225,12 @@ and from the cluster.
   `redbull.io/created-by=<run id>`, annotation `redbull.io/workflow-id`, its DataVolume
   `Succeeded` and PVC `Bound` 27 s after the create. The FIRST attempt of this run failed, and
   that was a real finding: see "What the lab changed" below.
+- **The VM is vm.yaml's** (2026-11-21, after the network change): `ocp-c200-kv2-five-0e0063d9fd32`,
+  compared field by field with the platform's `vm.yaml` rendered for it, differs only by its
+  fixed `macAddress` (ours, on purpose) and what KubeVirt adds to every VM (`architecture`,
+  `machine.type`, `firmware.serial`/`uuid`, the `pci-topology-version` annotation); its network
+  is `multus: {networkName: openshift-cnv/vm-external-network}`, its size label `2c`, its disk
+  `Succeeded`, 18 s for the whole run.
 - **The worker's figures are the cluster's own.** Its allocatable and requested totals equal
   what the three nodes report (`oc describe node`, allocated resources) to the millicore and
   the byte: 18 840 m and 58 533 609 472 bytes requested at the time of the read.

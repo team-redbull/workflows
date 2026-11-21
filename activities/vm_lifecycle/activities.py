@@ -54,7 +54,7 @@ _cluster = ClusterValues(
     mac_prefix=_settings.vm_mac_prefix,
     storage_class_name=_settings.vm_storage_class_name,
     redfish_label=_settings.redfish_label,
-    network=_settings.vm_network,
+    network_name=_settings.vm_network_name,
     node_selector=_settings.vm_node_selector,
     root_disk_size=_settings.vm_root_disk_size,
 )

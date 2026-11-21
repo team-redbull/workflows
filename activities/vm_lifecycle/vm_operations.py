@@ -72,7 +72,7 @@ class ClusterValues:
     mac_prefix: str
     storage_class_name: str
     redfish_label: tuple[str, str] = ("redfish-enabled", "true")
-    network: dict[str, Any] = field(default_factory=dict)
+    network_name: str = "openshift-cnv/vm-external-network"
     node_selector: dict[str, str] = field(default_factory=dict)
     root_disk_size: str = "120Gi"
 
@@ -248,7 +248,7 @@ async def create_vm(
             namespace=request.namespace, flavor=request.flavor, cpu=request.cpu, memory_gib=request.memory_gib,
             site=request.site, zone=request.zone, mce=request.mce, mac=mac, request_id=request.request_id,
             workflow_id=request.workflow_id, redfish_label=cluster.redfish_label,
-            storage_class_name=cluster.storage_class_name, network=cluster.network,
+            storage_class_name=cluster.storage_class_name, network_name=cluster.network_name,
             node_selector=cluster.node_selector, root_disk_size=cluster.root_disk_size,
         )
         spend("creating the VM")

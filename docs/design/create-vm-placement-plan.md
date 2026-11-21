@@ -184,7 +184,7 @@ completed             name, MAC, namespace, size, cluster, the per-cluster table
   the day1 file stem — and parsed at startup as `ocp4-<lifecycle>-kv-<site>-<id>`: the site comes
   from it, so there is no separate `SITE`), `VM_MAC_PREFIX` (REQUIRED, exactly 3 octets, the first
   `0e`; no default, so a cluster without it does not start; the ONE place the prefix is set, so
-  there is no `VLAN_ID` to keep in step with it), `VM_STORAGE_CLASS_NAME`, `VM_NETWORK` (JSON),
+  there is no `VLAN_ID` to keep in step with it), `VM_STORAGE_CLASS_NAME`, `VM_NETWORK_NAME` (as implemented: the NAD's name only, the network always multus),
   `VM_NODE_SELECTOR` (JSON), `VM_REDFISH_LABEL`. − day1, `KV_*` URL templates, tokens, CA,
   `HEADROOM_BUFFER_PERCENT`.
 - `shared/cluster_names.py`: `seed_cluster(site, zone)` stays, now `ocp4-seed-<site>-<N>` for zone

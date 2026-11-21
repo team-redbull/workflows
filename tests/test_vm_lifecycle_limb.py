@@ -429,7 +429,7 @@ class TestCreateVm:
                 earlier = vm_spec.build(
                     namespace="inventory", flavor="c200", cpu=32, memory_gib=256, site="five", zone="az1",
                     mce="ocp4-prod-mce-five-a", mac="0e:03:f2:00:00:01", request_id=RUN, workflow_id=None,
-                    redfish_label=kv.values.redfish_label, storage_class_name="cephfs", network=kv.values.network,
+                    redfish_label=kv.values.redfish_label, storage_class_name="cephfs", network_name=kv.values.network_name,
                     node_selector={}, root_disk_size="120Gi",
                 )
                 late["name"] = (await original(namespace, earlier))["metadata"]["name"]
@@ -979,16 +979,10 @@ class TestTheActivities:
 
 
 def settings(**overrides) -> VmLifecycleActivitySettings:
-    values = dict(
-        kv_cluster="ocp4-prod-kv-five-a", vm_mac_prefix="0e:03:f2", vm_storage_class_name="cephfs",
-        vm_network={"multus": {"networkName": "inventory/vlan1010"}},
-    )
+    values = dict(kv_cluster="ocp4-prod-kv-five-a", vm_mac_prefix="0e:03:f2", vm_storage_class_name="cephfs")
     values.update(overrides)
-    # pydantic-settings MERGES a dict given here with the same key's dict from the environment
-    # (tests/conftest.py sets VM_NETWORK), which would turn `{"pod": {}}` into a network of two
-    # types. A worker only ever has the environment, so the test takes it away.
     with mock.patch.dict(os.environ):
-        os.environ.pop("VM_NETWORK", None)
+        os.environ.pop("VM_NETWORK_NAME", None)
         return VmLifecycleActivitySettings(**values)
 
 
@@ -1007,13 +1001,13 @@ class TestSettings:
         with pytest.raises(ValidationError):
             settings(kv_cluster=name)
 
-    def test_the_four_required_keys_have_no_default(self, monkeypatch):
-        for key in ("KV_CLUSTER", "VM_MAC_PREFIX", "VM_STORAGE_CLASS_NAME", "VM_NETWORK"):
+    def test_the_three_required_keys_have_no_default(self, monkeypatch):
+        for key in ("KV_CLUSTER", "VM_MAC_PREFIX", "VM_STORAGE_CLASS_NAME"):
             monkeypatch.delenv(key)
         with pytest.raises(ValidationError) as raised:
             VmLifecycleActivitySettings()
         assert {error["loc"][0] for error in raised.value.errors()} == {
-            "kv_cluster", "vm_mac_prefix", "vm_storage_class_name", "vm_network",
+            "kv_cluster", "vm_mac_prefix", "vm_storage_class_name",
         }
 
     @pytest.mark.parametrize(("prefix", "stored"), [("0e:03:f2", "0e:03:f2"), ("0E:00:02", "0e:00:02"), (" 0e:0f:ff ", "0e:0f:ff")])
@@ -1028,55 +1022,49 @@ class TestSettings:
             settings(vm_mac_prefix=prefix)
 
     def test_the_vm_values_are_parsed_from_the_environment(self, monkeypatch):
-        monkeypatch.setenv("VM_NETWORK", '{"multus": {"networkName": "inventory/vlan1010"}}')
+        monkeypatch.setenv("VM_NETWORK_NAME", "inventory/vlan1010")
         monkeypatch.setenv("VM_NODE_SELECTOR", '{"node-role.kubernetes.io/worker": ""}')
         monkeypatch.setenv("VM_REDFISH_LABEL", "redfish-enabled=true")
         monkeypatch.setenv("VM_ROOT_DISK_SIZE", "2Gi")
         parsed = VmLifecycleActivitySettings()
-        assert parsed.vm_network == {"multus": {"networkName": "inventory/vlan1010"}}
+        assert parsed.vm_network_name == "inventory/vlan1010"
         assert parsed.vm_node_selector == {"node-role.kubernetes.io/worker": ""}
         assert parsed.redfish_label == ("redfish-enabled", "true") and parsed.vm_root_disk_size == "2Gi"
 
     def test_the_defaults_are_the_platforms_vm(self):
         parsed = settings()
+        assert parsed.vm_network_name == "openshift-cnv/vm-external-network"  # the platform's vm.yaml
         assert parsed.vm_node_selector == {} and parsed.vm_root_disk_size == "120Gi"
         assert parsed.redfish_label == ("redfish-enabled", "true")
 
     @pytest.mark.parametrize(
         ("key", "value"),
-        [("vm_network", {}), ("vm_network", {"multus": {"networkName": "a/b"}, "pod": {}}), ("vm_network", {"sriov": {}}),
-         ("vm_network", {"multus": {}}), ("vm_redfish_label", "redfish-enabled"), ("vm_redfish_label", "a=b,c=d"),
+        [("vm_network_name", ""), ("vm_network_name", "vm-external-network"), ("vm_network_name", "a/b/c"),
+         ("vm_network_name", "Openshift-CNV/net"), ("vm_redfish_label", "redfish-enabled"), ("vm_redfish_label", "a=b,c=d"),
          ("vm_root_disk_size", "120"), ("vm_root_disk_size", "0Gi"), ("vm_root_disk_size", "big"), ("vm_storage_class_name", "  ")],
     )
     def test_a_value_that_could_not_build_a_vm_stops_the_worker(self, key, value):
         with pytest.raises(ValidationError):
             settings(**{key: value})
 
-    def test_a_pod_network_is_one_type_too(self):
-        assert settings(vm_network={"pod": {}}).vm_network == {"pod": {}}
-
-    def test_the_chart_gives_the_network_no_default_to_merge_with(self):
-        """Helm merges maps: a default `multus` beside an override's `pod` is a VM KubeVirt refuses
-        (the lab, 2026-11-20). The chart must leave the network empty and fail the render without one."""
+    def test_the_chart_renders_vm_yamls_network_by_default(self):
+        """vm.yaml is the target: with no value the chart renders its network, and a cluster
+        only ever names ANOTHER NetworkAttachmentDefinition — never another network type."""
         import pathlib
         import shutil
         import subprocess
 
-        chart = pathlib.Path(__file__).resolve().parent.parent / "deploy" / "charts" / "vm-lifecycle-worker"
-        values = (chart / "values.yaml").read_text()
-        assert "\n  network: {}\n" in values
         if shutil.which("helm") is None:
             pytest.skip("needs helm")
+        chart = pathlib.Path(__file__).resolve().parent.parent / "deploy" / "charts" / "vm-lifecycle-worker"
         base = ["helm", "template", "x", str(chart), "--set", "kvCluster=ocp4-prod-kv-five-a", "--set",
-                "config.vmMacPrefix=0e:03:f2", "--set", "vm.storageClassName=cephfs", "--set", "temporal.host=t:7233"]
-        none = subprocess.run(base, capture_output=True, text=True)
-        assert none.returncode != 0 and "vm.network is required" in none.stderr
-        two = subprocess.run([*base, "--set-json", 'vm.network={"multus":{"networkName":"a/b"},"pod":{}}'], capture_output=True, text=True)
-        assert two.returncode != 0 and "exactly ONE network type" in two.stderr
-        pod = subprocess.run([*base, "--set-json", 'vm.network={"pod":{}}'], capture_output=True, text=True)
-        assert pod.returncode == 0 and 'VM_NETWORK: "{\\"pod\\":{}}"' in pod.stdout
-        multus = subprocess.run([*base, "--set", "vm.network.multus.networkName=openshift-cnv/vm-external-network"], capture_output=True, text=True)
-        assert multus.returncode == 0 and "vm-external-network" in multus.stdout
+                "config.vmMacPrefix=0e:03:f2", "--set", "vm.storageClassName=basic", "--set", "temporal.host=t:7233"]
+        default = subprocess.run(base, capture_output=True, text=True)
+        assert default.returncode == 0 and 'VM_NETWORK_NAME: "openshift-cnv/vm-external-network"' in default.stdout
+        other = subprocess.run([*base, "--set", "vm.networkName=inventory/vlan1010"], capture_output=True, text=True)
+        assert other.returncode == 0 and 'VM_NETWORK_NAME: "inventory/vlan1010"' in other.stdout
+        bare = subprocess.run([*base, "--set", "vm.networkName=vm-external-network"], capture_output=True, text=True)
+        assert bare.returncode != 0 and "<namespace>/<name>" in bare.stderr
 
     def test_the_buffer_is_not_this_workers(self):
         assert "headroom_buffer_percent" not in VmLifecycleActivitySettings.model_fields

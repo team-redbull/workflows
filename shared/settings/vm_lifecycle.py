@@ -19,7 +19,11 @@ _LABEL = re.compile(r"^(?P<key>[A-Za-z0-9]([-A-Za-z0-9_./]*[A-Za-z0-9])?)=(?P<va
 # The first octet every VM MAC of ours starts with: locally administered and
 # unicast, and deliberately not `02` (KubeMacPool's range) nor `0a` (OVN-Kubernetes').
 MAC_FIRST_OCTET = "0e"
-_NETWORK_TYPES = frozenset({"multus", "pod"})
+# `<namespace>/<name>` of a NetworkAttachmentDefinition: what Multus resolves and what
+# OVN-Kubernetes requires a NAD to name itself as.
+_NETWORK_NAME = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?/[a-z0-9]([-a-z0-9.]*[a-z0-9])?$")
+# The platform's vm.yaml (redbull-platform): every VM boots on this network.
+DEFAULT_VM_NETWORK_NAME = "openshift-cnv/vm-external-network"
 
 
 class VmLifecycleActivitySettings(BaseSettings):
@@ -54,12 +58,12 @@ class VmLifecycleActivitySettings(BaseSettings):
     # ReadWriteMany + Filesystem volume: a WaitForFirstConsumer class never
     # binds a Halted VM's disk, and every run would end in the rollback.
     vm_storage_class_name: str
-    # The VM's `networks[0]` body, JSON, exactly ONE network type (`multus` or
-    # `pod`): the network every VM of the cluster boots on (the site's
-    # inventory network). REQUIRED, no default: KubeVirt admits a Halted VM on
-    # a network that does not exist, so a default naming another platform's
-    # network would make VMs that never boot, with nothing saying why.
-    vm_network: dict
+    # The Multus network every VM of the cluster boots on, `<namespace>/<name>` of
+    # its NetworkAttachmentDefinition: the VM's `networks[0]` is ALWAYS
+    # `{multus: {networkName: <this>}}`, as in the platform's vm.yaml, whose
+    # network is the default. Only the name is a value — never the network's
+    # type: a pod-network VM is not one the platform runs.
+    vm_network_name: str = DEFAULT_VM_NETWORK_NAME
     # The VM template's nodeSelector, JSON; `{}` for none.
     vm_node_selector: dict[str, str] = {}
     # `key=value`: the label kubevirt-redfish exposes a VM by, and the one the
@@ -94,22 +98,14 @@ class VmLifecycleActivitySettings(BaseSettings):
             raise ValueError("vm_storage_class_name must name the root disk's storage class")
         return value.strip()
 
-    @field_validator("vm_network")
+    @field_validator("vm_network_name")
     @classmethod
-    def _network(cls, value: dict) -> dict:
-        if not value:
-            raise ValueError('vm_network must be the VM\'s `networks[0]` body, e.g. {"multus": {"networkName": "ns/name"}}')
-        # KubeVirt's admission refuses a network of two types ("should have only one network
-        # type") — which is what a chart default merged with an override produces. Refused
-        # here, at worker start, not on the first run of a zone.
-        if len(value) != 1 or not set(value) <= _NETWORK_TYPES:
+    def _network_name(cls, value: str) -> str:
+        if not _NETWORK_NAME.fullmatch(value.strip()):
             raise ValueError(
-                f"vm_network must name exactly ONE network type of {sorted(_NETWORK_TYPES)} (got {sorted(value)}): "
-                "KubeVirt refuses a network of two"
+                f"vm_network_name must be `<namespace>/<name>` of the VMs' NetworkAttachmentDefinition (got {value!r})"
             )
-        if "multus" in value and not (isinstance(value["multus"], dict) and value["multus"].get("networkName")):
-            raise ValueError("vm_network.multus must name its NetworkAttachmentDefinition: {\"multus\": {\"networkName\": \"ns/name\"}}")
-        return value
+        return value.strip()
 
     @field_validator("vm_redfish_label")
     @classmethod

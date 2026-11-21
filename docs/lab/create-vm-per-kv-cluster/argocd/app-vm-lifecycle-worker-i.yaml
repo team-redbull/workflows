@@ -22,9 +22,8 @@ spec:
           vmMacPrefix: "0e:00:64"
         vm:
           storageClassName: ocs-external-storagecluster-ceph-rbd
-          # The pod network: this cluster has no VM bridge network. Bridge binding on it is admitted.
-          network:
-            pod: {}
+          # No network value: the chart's default is vm.yaml's, openshift-cnv/vm-external-network
+          # (a layer2 overlay of that name here, lab/extras/vm-external-network.yaml).
           rootDiskSize: 2Gi
         replicaCount: 1
         image:

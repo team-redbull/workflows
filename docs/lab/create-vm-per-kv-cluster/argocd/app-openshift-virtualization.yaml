@@ -15,7 +15,8 @@
 #       only name HCO accepts).
 #   vmBridge.enabled=false
 #       the NNCP enslaves `bond0` on every worker and needs kubernetes-nmstate; this
-#       cluster has neither, and create-vm's Halted VMs attach to the pod network.
+#       cluster has neither. create-vm's VMs name `openshift-cnv/vm-external-network`, which
+#       the lab makes an OVN layer2 overlay instead (lab/extras/vm-external-network.yaml).
 #
 # Plus one `ignoreDifferences`: the chart's HyperConverged sets
 # `featureGates.disableMdevConfiguration: false`, a gate HCO 4.22.16 no longer has. The

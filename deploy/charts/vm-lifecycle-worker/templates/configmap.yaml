@@ -17,7 +17,7 @@ data:
   KV_CLUSTER: {{ .Values.kvCluster | quote }}
   VM_MAC_PREFIX: {{ .Values.config.vmMacPrefix | lower | quote }}
   VM_STORAGE_CLASS_NAME: {{ .Values.vm.storageClassName | quote }}
-  VM_NETWORK: {{ .Values.vm.network | toJson | quote }}
+  VM_NETWORK_NAME: {{ .Values.vm.networkName | quote }}
   VM_NODE_SELECTOR: {{ .Values.vm.nodeSelector | default dict | toJson | quote }}
   VM_REDFISH_LABEL: {{ .Values.vm.redfishLabel | quote }}
   VM_ROOT_DISK_SIZE: {{ .Values.vm.rootDiskSize | quote }}

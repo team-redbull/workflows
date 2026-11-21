@@ -15,7 +15,8 @@ no I/O: vm_operations.py hands this the request and the cluster's own values.
     2026-11-20 by the kv-vm-api agent from `kv-agents/templates/vm.yaml.j2`),
     built here as a plain object: Halted, a blank root disk on a DataVolume
     template (ReadWriteMany + Filesystem), one bridged interface with the
-    fixed MAC on the cluster's network, the CPU request `vCPUs × 15/16`
+    fixed MAC on the cluster's Multus network (vm.yaml's `openshift-cnv/vm-external-network`
+    unless the cluster names another), the CPU request `vCPUs × 15/16`
     floored at one core. KubeVirt re-randomises an unset MAC on every start
     and the BareMetalHost needs a fixed boot MAC, hence `macAddress`.
 """
@@ -96,7 +97,7 @@ def build(
     workflow_id: str | None,
     redfish_label: tuple[str, str],
     storage_class_name: str,
-    network: dict[str, Any],
+    network_name: str,
     node_selector: dict[str, str],
     root_disk_size: str,
 ) -> dict[str, Any]:
@@ -122,7 +123,7 @@ def build(
                 "rng": {},
             },
         },
-        "networks": [{"name": "default", **network}],
+        "networks": [{"name": "default", "multus": {"networkName": network_name}}],
         "volumes": [{"name": ROOT_DISK_VOLUME, "dataVolume": {"name": root}}],
     }
     if node_selector:

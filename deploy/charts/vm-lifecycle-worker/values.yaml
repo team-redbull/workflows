@@ -32,15 +32,11 @@ vm:
   # Halted VM's disk never binds and every create-vm run ends in its rollback
   # (ceph-rbd refuses RWX + Filesystem too; cephfs does not).
   storageClassName: ""
-  # REQUIRED. The VM's `networks[0]` body, exactly ONE network type: the network every
-  # VM of the cluster boots on (the site's inventory network). In production:
-  #   network:
-  #     multus:
-  #       networkName: <namespace>/<NetworkAttachmentDefinition>
-  # NO default here on purpose: Helm MERGES maps, so a default `multus` would stay
-  # beside an override's `pod` and KubeVirt refuses a network of two types (found in
-  # the lab, 2026-11-20). The render fails unless exactly one type is given.
-  network: {}
+  # The Multus network every VM boots on, `<namespace>/<name>` of its
+  # NetworkAttachmentDefinition: the VM's `networks[0]` is always
+  # `{multus: {networkName: <this>}}`, as in the platform's vm.yaml, whose network
+  # is the default. A cluster names another only when its NAD has another name.
+  networkName: openshift-cnv/vm-external-network
   # The VM template's nodeSelector; {} for none. The worker also measures
   # capacity on the nodes matching it only: a node a VM cannot go to is not room.
   nodeSelector: {}

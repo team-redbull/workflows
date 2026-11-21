@@ -197,7 +197,7 @@ class FakeKvCluster:
         self.name = name
         self.values = ClusterValues(
             kv_cluster=name, site=parse_kv_cluster(name).site, mac_prefix=mac_prefix, storage_class_name="cephfs",
-            redfish_label=REDFISH_LABEL, network={"multus": {"networkName": "inventory/vm-network"}},
+            redfish_label=REDFISH_LABEL, network_name="openshift-cnv/vm-external-network",
             node_selector=dict(node_selector or {}), root_disk_size="120Gi",
         )
         self.nodes: list[dict] = list(nodes)

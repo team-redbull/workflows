@@ -193,7 +193,7 @@ more Applications in `openshift-gitops`; the workloads run in `redbull-workflows
 | --- | --- |
 | `lab-create-vm-workflows-orchestrator` | the brain and the trigger API, redbull-platform's chart (the worktree of its `feat/vm-lifecycle-per-kv-cluster` branch) |
 | `lab-create-vm-cluster-lifecycle-worker` | the day1 reader (`list_kv_clusters`), reading the lab's day1 repo with the read-only token |
-| `lab-create-vm-vm-lifecycle-worker-a` | THE REAL KV CLUSTER'S WORKER: this cluster as `ocp4-lab-kv-five-a`, zone az1, MAC prefix `0e:00:63`, cephfs, the pod network, 2Gi root disks |
+| `lab-create-vm-vm-lifecycle-worker-a` | THE REAL KV CLUSTER'S WORKER: this cluster as `ocp4-lab-kv-five-a`, zone az1, MAC prefix `0e:00:63`, cephfs, vm.yaml's network (`openshift-cnv/vm-external-network`, here an OVN layer2 overlay), 2Gi root disks |
 | `lab-create-vm-vm-lifecycle-worker-i` | the same cluster under a second name, `ocp4-lab-kv-five-i`, zone az3, on `ceph-rbd` (WaitForFirstConsumer): the rollback scenario |
 | `lab-create-vm-kv-fleet` | `tests/kv_fleet.py` as one pod: seven fake KV clusters, each with its own worker on its own queue, running the real worker code over an in-memory cluster |
 
@@ -266,11 +266,15 @@ and from the cluster.
 
 ### What the lab changed
 
-- **`vm.network` has no chart default any more.** The chart's default was
-  `{multus: {networkName: …}}`; the lab's value `{pod: {}}` was MERGED with it by Helm into a
-  network of two types, and KubeVirt refused every create (422, "should have only one
-  network type"). The chart now requires the value and refuses anything but one of `multus`
-  or `pod`, and the worker checks the same at start.
+- **The VM's network is vm.yaml's, always multus.** The chart first took the whole
+  `networks[0]` body as a map with a multus default; the lab's `{pod: {}}` was MERGED with it
+  by Helm into a network of two types, and KubeVirt refused every create (422, "should have
+  only one network type"). On 2026-11-21 the operator set the platform's `vm.yaml` as the
+  target, which never uses the pod network: the worker now always builds
+  `{multus: {networkName: …}}`, and only the name is a value (`vm.networkName`, default
+  `openshift-cnv/vm-external-network`). The lab got a NetworkAttachmentDefinition of that
+  name (an OVN layer2 overlay, `lab/extras/vm-external-network.yaml`), and the VMs created
+  before that day are on the pod network.
 - **The simulator runs in the cluster, not on the laptop**: through `oc port-forward` its
   workers' long polls never got a task, so its clusters showed as `no-worker`.
 - `temporal workflow cancel` through the relay failed (RST_STREAM); it works from inside the
@@ -401,7 +405,7 @@ argocd/app-git.yaml                       Gitea (its chart values inline)
 argocd/app-temporal.yaml                  Temporal (overrides inline)
 argocd/app-openshift-virtualization.yaml  CNV (overrides inline)
 argocd/app-extras.yaml                    inventory namespace + Temporal relay
-platform-extra/lab/extras/                what the lab adds to the lab repo
+platform-extra/lab/extras/                what the lab adds to the lab repo (inventory, the VM network, the relay)
 test/vm-halted.yaml                       the verification VM
 workers.sh                                up / images / charts / day1 / status / api / fleet / down
 argocd/app-workflows-orchestrator.yaml    the brain and the API

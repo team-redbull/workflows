@@ -1069,17 +1069,24 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
     ends as an `unreachable` row instead of holding the zone). NONE on the create, the wait or the
     delete: after the create a worker pod away for five minutes must not fail the run, or its
     rollback, and orphan the VM (§5).
+  - **THE VM IS THE PLATFORM'S `vm.yaml`** (redbull-platform, the operator 2026-11-21: "vm.yaml
+    is the target"): the same body, network included (multus `openshift-cnv/vm-external-network`
+    unless the cluster's NAD has another name). What the worker adds on purpose, and only this:
+    the namespace, the labels beside `redfish-enabled` and the workflow-id annotation, the FIXED
+    `macAddress` (the name and the BareMetalHost's boot MAC), and a CPU request floored at one
+    core where vm.yaml's integer `cpu × 15 / 16` gives 0 for one vCPU.
+    `tests/test_vm_spec.py::test_the_body_is_the_platforms_vm_yaml` pins it field by field.
   - **End state Halted** (`runStrategy: Halted`, the redfish label): kubevirt-redfish owns the power
     state and Ironic starts it; the worker's RBAC has no verb that starts, stops or patches a VM.
     **The VM namespace is add-server-to-mce's `namespace`, verbatim** (default `inventory` on the
     edge only), a kubevirt-redfish chassis namespace the platform created — never created here;
     missing is `VmNamespaceNotFoundError`. The cluster's VM values are the worker's own:
     `VM_STORAGE_CLASS_NAME` (REQUIRED: it must bind Immediately and allow ReadWriteMany +
-    Filesystem — ceph-rbd refuses that pair, found in the 2026-11-05 lab), `VM_NETWORK`
-    (REQUIRED, exactly ONE network type, `multus` or `pod`, checked at worker start; neither the
-    settings nor the CHART has a default, and the chart does not render without `vm.network` — a chart default is MERGED by Helm
-    with a cluster's own value into a network of two types, which KubeVirt refuses on every
-    create: the first run of the 2026-11-20 lab),
+    Filesystem — ceph-rbd refuses that pair, found in the 2026-11-05 lab), `VM_NETWORK_NAME`
+    (the NAD's `<namespace>/<name>`, default `openshift-cnv/vm-external-network`: the VM's network
+    is ALWAYS multus and only its name is a value — never the network's type. A map value with a
+    chart default was MERGED by Helm with the lab's `pod` into a network of two types, which
+    KubeVirt refused on every create, 2026-11-20; a scalar cannot merge),
     `VM_NODE_SELECTOR`, `VM_REDFISH_LABEL`, and `VM_ROOT_DISK_SIZE` (the lead's, default `120Gi`).
   - **kubevirt-redfish runs `systemIdConvention: legacy`** (the operator, 2026-11-05): the Redfish
     system id IS the VM name, so the id, the VM and the server name server-scan lists are one
@@ -1767,7 +1774,7 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   worker only; this one is the worker INSIDE a KV cluster and holds only that cluster's own values:
   `KV_CLUSTER`, REQUIRED and NEVER canonicalised — it must equal the day1 file name — parsed at start
   as `ocp4-<lifecycle>-kv-<site>-<id>`, the site read from it; `VM_MAC_PREFIX`, REQUIRED, three
-  octets, the first `0e`, no default; `VM_STORAGE_CLASS_NAME`, REQUIRED; `VM_NETWORK`, REQUIRED, exactly one network type, and
+  octets, the first `0e`, no default; `VM_STORAGE_CLASS_NAME`, REQUIRED; `VM_NETWORK_NAME`, the NAD, default vm.yaml's, and
   `VM_NODE_SELECTOR`, JSON; `VM_REDFISH_LABEL`; `VM_ROOT_DISK_SIZE`. No day1 key, no token, no
   buffer since 2026-11-20) and
   `ClusterLifecycleActivitySettings` (`HEADROOM_BUFFER_PERCENT`, create-vm's placement buffer, ONE
@@ -1850,7 +1857,7 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   one release INSIDE each KV cluster, its ConfigMap that cluster's own values, a ClusterRole of
   exactly the verbs `activities/vm_lifecycle/kubevirt_api.py` uses — list nodes and pods, get
   namespaces and PVCs, get/list/create/delete VirtualMachines, list VMIs, get/delete DataVolumes
-  — and NO Secret; the render fails without `kvCluster`, the MAC prefix, the storage class or the ONE network type;
+  — and NO Secret; the render fails without `kvCluster`, the MAC prefix or the storage class;
   until then `gitops/charts/vm-lifecycle-worker/` was a hub chart with two agent-token Secrets)
   — the last three copied into redbull-platform's
   `gitops/charts/<same name>/` BY CI (`sync-upgrade-charts`, `scripts/sync_platform_charts.sh`,

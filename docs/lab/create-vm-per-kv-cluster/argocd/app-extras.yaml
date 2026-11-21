@@ -1,6 +1,7 @@
 # What the lab adds that no platform chart owns — plain manifests, lab/extras/ in the lab
 # repo (platform-extra/lab/extras/ in this folder):
 #   - Namespace `inventory`, where create-vm puts its VMs
+#   - NetworkAttachmentDefinition openshift-cnv/vm-external-network, the VMs' network (vm.yaml's)
 #   - Deployment temporal/temporal-grpc-relay, the laptop's way to the Temporal frontend
 # No prune and no finalizer on purpose: `inventory` is kept across test runs, and removing
 # this Application must not take the namespace (and every VM in it) with it.

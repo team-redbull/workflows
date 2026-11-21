@@ -14,7 +14,7 @@ def _build(**overrides):
         namespace="inventory", flavor="c200", cpu=32, memory_gib=256, site="five", zone="az1",
         mce="ocp4-prod-mce-five-a", mac="0e:03:f2:a1:b2:c3", request_id="0196f6a2-1111-7222-8333-444455556666",
         workflow_id="create-vm-ocp4-prod-mce-five-a_c200-kv32-five-az1_1", redfish_label=REDFISH_LABEL,
-        storage_class_name="cephfs", network={"multus": {"networkName": "openshift-cnv/vm-external-network"}},
+        storage_class_name="cephfs", network_name="openshift-cnv/vm-external-network",
         node_selector={}, root_disk_size="120Gi",
     )
     values.update(overrides)
@@ -104,8 +104,71 @@ class TestTheVirtualMachine:
         assert "nodeSelector" not in _build()["spec"]["template"]["spec"]
         assert _build(node_selector={"role": "vm"})["spec"]["template"]["spec"]["nodeSelector"] == {"role": "vm"}
 
-    def test_a_pod_network_is_the_clusters_choice_too(self):
-        assert _build(network={"pod": {}})["spec"]["template"]["spec"]["networks"] == [{"name": "default", "pod": {}}]
+    def test_the_network_is_always_multus_and_only_its_name_is_the_clusters(self):
+        assert _build(network_name="inventory/vlan1010")["spec"]["template"]["spec"]["networks"] == [
+            {"name": "default", "multus": {"networkName": "inventory/vlan1010"}}
+        ]
+
+    def test_the_body_is_the_platforms_vm_yaml(self):
+        """redbull-platform's vm.yaml is the TARGET (the operator, 2026-11-21). Here it is,
+        rendered for a 32-vCPU, 256 GiB VM on `basic`; the built VM must be exactly it plus
+        what the workflow adds on purpose, each named below — nothing else may differ."""
+        name = "ocp-c200-kv32-five-0e03f2a1b2c3"
+        vm_yaml = {
+            "apiVersion": "kubevirt.io/v1",
+            "kind": "VirtualMachine",
+            "metadata": {"name": name, "labels": {"redfish-enabled": "true"}},
+            "spec": {
+                "runStrategy": "Halted",
+                "dataVolumeTemplates": [{
+                    "metadata": {"name": f"{name}-root"},
+                    "spec": {"source": {"blank": {}}, "storage": {
+                        "storageClassName": "basic", "accessModes": ["ReadWriteMany"], "volumeMode": "Filesystem",
+                        "resources": {"requests": {"storage": "120Gi"}}}},
+                }],
+                "template": {
+                    "metadata": {"labels": {"kubevirt.io/vm": name}},
+                    "spec": {
+                        "evictionStrategy": "LiveMigrate",
+                        "domain": {
+                            "cpu": {"cores": 32},
+                            "memory": {"guest": "256Gi"},
+                            "resources": {"requests": {"cpu": "30", "memory": "256Gi"},
+                                          "limits": {"cpu": "32", "memory": "256Gi"}},
+                            "firmware": {"bootloader": {"efi": {"secureBoot": False}}},
+                            "devices": {
+                                "blockMultiQueue": True,
+                                "networkInterfaceMultiqueue": True,
+                                "disks": [{"name": "rootdisk", "dedicatedIOThread": True, "disk": {"bus": "virtio"}}],
+                                "interfaces": [{"name": "default", "bridge": {}}],
+                                "rng": {},
+                            },
+                        },
+                        "networks": [{"name": "default", "multus": {"networkName": "openshift-cnv/vm-external-network"}}],
+                        "volumes": [{"name": "rootdisk", "dataVolume": {"name": f"{name}-root"}}],
+                    },
+                },
+            },
+        }
+        built = _build(storage_class_name="basic")
+        # What the workflow adds on purpose: the namespace it creates in; its labels beside
+        # the redfish one and the workflow id annotation (how a run finds its VM, how the
+        # placement counts it); and the FIXED MAC (KubeVirt re-randomises an unset one on every
+        # start, the BareMetalHost needs a fixed boot MAC, and the name is that MAC).
+        assert built["metadata"].pop("namespace") == "inventory"
+        assert built["metadata"].pop("annotations") == {"redbull.io/workflow-id": "create-vm-ocp4-prod-mce-five-a_c200-kv32-five-az1_1"}
+        assert built["metadata"]["labels"].pop("redbull.io/created-by")
+        for key in ("redbull.io/flavor", "redbull.io/size", "redbull.io/site", "topology.kubernetes.io/zone", "redbull.io/role", "redbull.io/mce"):
+            built["metadata"]["labels"].pop(key)
+        interface = built["spec"]["template"]["spec"]["domain"]["devices"]["interfaces"][0]
+        assert interface.pop("macAddress") == "0e:03:f2:a1:b2:c3"
+        assert built == vm_yaml
+
+    def test_one_vcpu_requests_one_core_where_vm_yaml_would_request_none(self):
+        """The one place the body departs from vm.yaml's arithmetic: `cpu * 15 / 16` in
+        integers is 0 for one vCPU, a VM the scheduler counts as free. The reviewed plan
+        floors it at one core (shared/vm_requests.py), and the placement counts the same."""
+        assert _build(cpu=1, memory_gib=8)["spec"]["template"]["spec"]["domain"]["resources"]["requests"]["cpu"] == "1"
 
     def test_what_the_figures_count_for_it_is_what_it_requests(self):
         # The worker that built it and the worker that counts it stopped agree by construction.

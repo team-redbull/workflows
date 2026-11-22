@@ -42,12 +42,14 @@ from typing import Any
 
 from temporalio import activity
 from temporalio.client import Client
+from temporalio.exceptions import ApplicationError
 from temporalio.worker import Worker
 
 from activities.vm_lifecycle import cluster_figures, vm_operations, vm_spec
 from activities.vm_lifecycle.kubevirt_api import MacRefused, NameTaken, NotFound
 from activities.vm_lifecycle.vm_operations import ClusterValues
 from shared.cluster_names import parse_kv_cluster, seed_folder_pattern
+from shared.exceptions import Day1QueryInvalidError
 from shared.consts import (
     CLUSTER_LIFECYCLE_ACTIVITY_QUEUE,
     CREATE_VM_WORKFLOW_QUEUE,
@@ -463,7 +465,11 @@ class KvFleet:
             fleet.listed.append(request)
             if fleet.list_failures:
                 raise fleet.list_failures.pop(0)
-            lifecycle = request.lifecycle or "prod"
+            if request.lifecycle is None:  # as the real limb: refused, never guessed
+                raise ApplicationError(
+                    "KV clusters asked for without a lifecycle", type=Day1QueryInvalidError.__name__, non_retryable=True
+                )
+            lifecycle = request.lifecycle
             folder = f"sites/{request.site}/mces/{seed_folder_pattern(lifecycle, request.site, request.zone)}/hostedClusters/"
             return KvClusterList(
                 clusters=fleet.entries(request.site, request.zone, lifecycle), buffer_percent=fleet.buffer_percent,

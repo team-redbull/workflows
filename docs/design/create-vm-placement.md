@@ -1,5 +1,14 @@
 # How create-vm places a VM: one zone at a time, a worker in every KubeVirt cluster
 
+> **Names, 2026-11-22.** This document uses the names of its time: seed `ocp4-seed-<site>-<N>`,
+> KV cluster `ocp4-<lifecycle>-kv-<site>-<id>`, InfraEnv `<flavor>-kv<cpu>-<site>-<zone>`, size
+> label `<cpu>c`. When the platform convention left draft
+> (`Idan-Maimon/kubevirt-workflows` `docs/naming-convention.md`, the source of truth, fetched by
+> the `naming-convention` skill) create-vm moved to `ocp4-<lifecycle>-seed-<site>-<zone>-<id>`,
+> `ocp4-<lifecycle>-kv-<site>-<zone>-<id>`, `<flavor>-kv<cpu>-<zone>` (the site is the MCE's) and
+> `kv<cpu>`, and reads only the seeds of the MCE's lifecycle (a zone may have several). The
+> placement design is unchanged. CLAUDE.md §4 has the current names.
+
 This page explains, end to end, how a create-vm run decides which KubeVirt cluster (KV cluster)
 a new VM goes on, how the VM gets its MAC address and its name, and who talks to what. It replaces
 `kubevirt-vm-placement.md` (every run ranks the clusters on its own) and `kv-agents-api.md` (two

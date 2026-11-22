@@ -26,6 +26,7 @@ from activities.vm_lifecycle import vm_operations, vm_spec
 from activities.vm_lifecycle.kubevirt_api import MacRefused, NameTaken
 from shared.consts import CREATE_VM_WORKFLOW_QUEUE, vm_lifecycle_activity_queue
 from shared.exceptions import (
+    Day1QueryInvalidError,
     KvClusterAccessError,
     KvClusterApiError,
     KvZoneLeaseExpiredError,
@@ -482,6 +483,22 @@ class TestClustersThatCannotAnswer:
 
 
 class TestTheListFromDay1:
+    async def test_a_run_without_a_lifecycle_fails_and_creates_nothing(self):
+        """A run recorded before the lifecycle filter: the list is refused, never guessed."""
+        fleet = fleet_of(A)
+        async with Harness(fleet) as h:
+            failed = await h.failure(await h.start(vm_input().model_copy(update={"lifecycle": None})))
+            assert cause(failed).type == Day1QueryInvalidError.__name__
+            assert fleet.clusters[A].calls == []
+
+    async def test_a_prep_mce_never_sees_the_prod_seeds_clusters(self):
+        fleet = fleet_of(A)
+        async with Harness(fleet) as h:
+            failed = await h.failure(await h.start(vm_input(mce="ocp4-prep-mce-five-a")))
+            assert cause(failed).type == NoKvClusterError.__name__
+            assert "ocp4-prep-seed-five-az1-*" in cause(failed).message
+            assert fleet.clusters[A].calls == []
+
     async def test_a_zone_with_no_cluster_fails_at_once_naming_the_folder(self):
         fleet = fleet_of(A)
         async with Harness(fleet) as h:

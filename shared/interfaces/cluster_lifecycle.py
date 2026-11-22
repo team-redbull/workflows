@@ -148,7 +148,8 @@ async def list_day1_clusters(query: Day1ClusterQuery) -> Day1ClusterList:
     `kind` `kv` is a cluster under a SEED folder (`ocp4-<lifecycle>-seed-<site>-<zone>-<id>`, zone
     `az<N>`), never one named kubevirt; `hc` is one under any other folder. A
     kv entry whose NodePools do not all label their nodes with the seed's zone,
-    or whose name is off the convention, is listed WITH its `problems`.
+    or whose name is off the convention or disagrees with its seed's site, zone
+    or lifecycle, is listed WITH its `problems`.
 
     Observe-only, so trivially idempotent. The remote is asked for `main`'s
     head on every call and cloned only when it moved (git_repo.snapshot), so
@@ -171,21 +172,26 @@ async def list_day1_clusters(query: Day1ClusterQuery) -> Day1ClusterList:
 
 @activity.defn
 async def list_kv_clusters(request: KvClusterListRequest) -> KvClusterList:
-    """The KV clusters of (site, zone) as day1 `main` lists them, OLDEST FIRST, with the
-    placement buffer every run of the zone must use.
+    """The KV clusters of (lifecycle, site, zone) as day1 `main` lists them, OLDEST FIRST, with
+    the placement buffer every run of the zone must use.
 
-    The zone's clusters are the files of ONE folder, its seed's:
+    The zone's clusters are the files of its seeds' folders of that lifecycle (the
+    MCE's — a prod MCE's VMs go on prod KV clusters only; a zone may have several
+    seeds, `-a`, `-b`, whose clusters are ordered together):
     `sites/<site>/mces/ocp4-<lifecycle>-seed-<site>-<zone>-<id>/hostedClusters/`
     (`Day1.kv_clusters`, activities/day1_repo.py), read on the commit-keyed
     snapshot of `main`: the remote is asked for its head every time, and a
     clone happens only when the head moved. Each file is one entry, sorted by
     the sequence letter its name ends with. An entry's `zone` is set only when
-    every one of its NodePools labels its nodes with the seed's zone, and its
-    `id` only when its name is `ocp4-<lifecycle>-kv-<site>-<zone>-<id>`; otherwise
-    `problems` says why and the run never uses it. A missing folder is an
-    EMPTY list, never an error. `buffer_percent` is this worker's
-    HEADROOM_BUFFER_PERCENT. Observe-only. Raises the retryable
-    ValuesRepoGitError / ValuesBranchNotFoundError (unreachable, or no `main`:
-    waited out).
+    every one of its NodePools labels its nodes with the seed's zone and its name
+    — `ocp4-<lifecycle>-kv-<site>-<zone>-<id>`, which also gives its `id` — has
+    the seed's site, zone and lifecycle; otherwise `problems` says why and the run
+    never uses it. A zone with no such seed is an EMPTY list, never an error.
+    `folder` names the seed folders as a pattern. `buffer_percent` is this
+    worker's HEADROOM_BUFFER_PERCENT. Observe-only. Raises a NON-RETRYABLE
+    ApplicationError of type Day1QueryInvalidError for a request without a
+    lifecycle (a run recorded before the field: refused, never guessed), before
+    any git call; the retryable ValuesRepoGitError / ValuesBranchNotFoundError
+    (unreachable, or no `main`: waited out).
     """
     ...

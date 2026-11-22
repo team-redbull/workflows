@@ -20,6 +20,7 @@ from shared.settings.cluster_lifecycle import ClusterLifecycleActivitySettings
 from shared.settings.cluster_upgrade import ClusterUpgradeActivitySettings
 from shared.settings.segment_lifecycle import SegmentLifecycleActivitySettings
 from shared.settings.server_lifecycle import ServerLifecycleActivitySettings
+from shared.settings.server_provisioning import ServerProvisioningActivitySettings
 from shared.settings.temporal import TemporalSettings
 from shared.settings.upgrade_agent import UpgradeAgentActivitySettings
 from shared.settings.upgrade_gitops import UpgradeGitopsActivitySettings
@@ -30,6 +31,7 @@ for _settings_class in (
     ClusterUpgradeActivitySettings,
     SegmentLifecycleActivitySettings,
     ServerLifecycleActivitySettings,
+    ServerProvisioningActivitySettings,
     TemporalSettings,
     UpgradeAgentActivitySettings,
     UpgradeGitopsActivitySettings,
@@ -67,6 +69,14 @@ os.environ.update(
         # --- add-server-to-mce: the site PXE map, for IPMI servers ---
         "PXE_MAP_URLS": '{"bat-yam": "http://pxe.bat-yam.test:8080"}',
         "PXE_MAP_TOKEN": "test-pxe-token",
+        # --- provision-dell-server: OME, iDRAC root, templates, naming service ---
+        "OME_URL": "https://ome.test",
+        "OME_USERNAME": "test-ome-user",
+        "OME_PASSWORD": "test-ome-pass",
+        "IDRAC_ROOT_PASSWORD": "target-pass",
+        "IDRAC_FACTORY_PASSWORDS": '["factory-a", "factory-b"]',
+        "DELL_TEMPLATES": '{"PowerEdge R660": {"7.10.70.00": "ocp-r660-7.10.70.00"}}',
+        "SERVER_NAMER_URL": "https://namer.test/rename",
         # --- release-segment: the DHCP scope API ---
         "DHCP_API_URL": "http://dhcp.test",
         "DHCP_API_TOKEN": "test-dhcp-token",

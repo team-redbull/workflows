@@ -87,6 +87,20 @@
       ]
     },
     {
+      domain: "server-provisioning",
+      // Not per MCE: this limb writes to no cluster at all, only outward to the
+      // iDRACs, OME, the naming service and server-scan. One deployment serves
+      // the whole estate.
+      queue: "server-provisioning-activity",
+      workflows: [
+        {
+          name: "provision-dell-server",
+          href: "/server-provisioning/provision-dell-server.html",
+          blurb: "rack-ready Dell → listed in server-scan"
+        }
+      ]
+    },
+    {
       domain: "cluster-upgrade",
       // Three limbs: the per-MCE cluster limb shown here (reads, Argo CD syncs,
       // watches), plus upgrade-gitops-activity on the hub (day1 git, the mirror)

@@ -11,9 +11,13 @@ An OpenShift cluster lifecycle orchestrator built on Temporal. Four domains toda
   inventory platform and creates the `BareMetalHost` + BMC `Secret` +
   `NMStateConfig` an InfraEnv needs. It replaces `bmh-generator-operator`, a
   Kopf operator that queried four vendor managers itself.
-- **server-provisioning** (getting a racked Dell INTO that inventory,
-  **provision-dell-server**) is NOT on `main`: it is not in production, and lives
-  on the `feat/provision-dell-server` branch until it is merged.
+- **server-provisioning** owns getting a racked server INTO that inventory:
+  **provision-dell-server** takes a Dell whose iDRAC has an IP and nothing else,
+  and discovers it in OpenManage Enterprise, deploys its template (which sets
+  root's password), builds the RAID 1 on the BOSS, sets the PERC drives
+  Non-RAID, has the naming service rename it, and completes when server-scan
+  lists it — ready for add-server-to-mce. It replaces the DC team's manual OME and
+  BIOS work; Cisco, HPE and Intersight get their own workflows later.
 - **cluster-upgrade** (in progress) upgrades a HyperShift HostedCluster through
   day1 git and Argo CD, never by patching it: the control plane one minor at a
   time along a verified ladder, then the NodePools one at a time, at a person's
@@ -63,6 +67,9 @@ workflow_domains/                 The brain — one folder per domain, plus main
   server_lifecycle/               add_server_to_mce.py (the SHAPE of the run),
                                     bond_selection.py (the pure rule it applies),
                                     router.py
+  server_provisioning/            provision_dell_server.py, storage_plan.py and
+                                    server_name.py (its pure rules), regions.py
+                                    (iDRAC prefix -> region), router.py
   cluster_upgrade/                upgrade_cluster.py, upgrade_control_plane.py (the
                                     per-MCE slot child), upgrade_path.py and gates.py
                                     (its pure rules), dispatch.py, router.py (not
@@ -104,7 +111,7 @@ The prod charts are vendored into the Argo CD repo, not this one:
 | `redbull-platform/gitops/charts/workflows-orchestrator/` | the brain — ONE release, shared by every domain |
 | `redbull-platform/gitops/charts/segment-lifecycle-worker/` | the `segment-lifecycle-worker` limb |
 | `redbull-platform/gitops/charts/server-lifecycle-worker/` | the `server-lifecycle-worker` limb |
-| `redbull-platform/gitops/charts/server-provisioning-worker/` | the `server-provisioning-worker` limb — its code is on the `feat/provision-dell-server` branch, not `main`; no `gitops/services/` entry, so nothing deploys it |
+| `redbull-platform/gitops/charts/server-provisioning-worker/` | the `server-provisioning-worker` limb — no `gitops/services/` entry yet, so nothing deploys it |
 | `redbull-platform/gitops/charts/vm-lifecycle-worker/` | the `vm-lifecycle-worker` limb (create-vm) — ONE release on the hub for every zone; needs the `kv-capacity-token` and `kv-vm-api-token` Secrets and reads the shared `redbull-git-token` |
 | `redbull-platform/gitops/charts/cluster-lifecycle-worker/` | the `cluster-lifecycle-worker` limb (provision-cluster) — ONE release on the hub; reads the shared `redbull-git-token` (day1 push + its provider's merge-request API, the day2 sig repos) and names the `shortcuts-api-token` Secret |
 | `redbull-platform/gitops/charts/cluster-upgrade-worker/`, `.../upgrade-agent-worker/` | cluster-upgrade's per-MCE limbs, copied from `deploy/charts/` here by CI (`sync-upgrade-charts`) on every `main` push that changes them — no `gitops/services/` entry yet |
@@ -729,6 +736,61 @@ URL (it carries an `api_key`) never enters workflow history. Id:
 `publish-infraenv-to-pxe-server-<mce>-<infra_env>`, so a second trigger for the same
 entry while one runs is a 409.
 
+### `provision-dell-server` — from an iDRAC IP to a server add-server-to-mce can use
+
+`POST /workflows/server-provisioning/provision-dell-server` with `{"idrac_ip": "134.1.2.1"}`
+(or `/bulk` with `{"servers": [{"idrac_ip": ...}, ...]}` — one run per machine).
+The **region** is resolved from the IP's prefix (`workflow_domains/server_provisioning/regions.py`)
+before the run starts; an address under no prefix is a 422 (a `rejected` item in
+bulk). An explicit `region` wins. The only manual step left is the iDRAC IP.
+
+1. **probing-idrac** — which root password does the iDRAC accept: the target
+   (`IDRAC_ROOT_PASSWORD`) first, then each of `IDRAC_FACTORY_PASSWORDS`. One
+   request each, so a round can trip iDRAC9's 3-failure IP block only when every
+   candidate is wrong — and the next round then waits 11 min for the block to
+   lift. Three rounds, then `IdracCredentialsRejectedError`. An iDRAC that
+   answers nothing gets 30 min (`IdracUnreachableError`).
+2. **reading-identity**, **checking-server-scan** — service tag, model, iDRAC
+   firmware; must be a Dell PowerEdge; and server-scan must not list that service
+   tag as claimed by a cluster (`ServerAlreadyInstalledError`) — everything after
+   this reboots the machine, and a mistyped IP must not take a node down.
+3. **discovering-in-ome** — skipped when OME already has the service tag.
+4. **deploying-template** — `DELL_TEMPLATES[model][iDRAC firmware]`. The template
+   creates the profile and **enforces root's password**; it must touch root
+   (user 2) only, never the OME account on the iDRAC. A device already carrying a
+   profile from another template is `ProfileConflictError`, never overwritten.
+5. **verifying-root-password** — root must accept the target password now; if the
+   machine came in on a factory one, OME is re-discovered with the new one.
+6. **configuring-storage / applying-storage / verifying-storage** — RAID 1 over
+   the BOSS's two drives, every PERC drive Non-RAID, staged together and applied
+   by ONE reboot, then read back. It **never deletes**: an existing volume or a
+   drive in use is `StorageLayoutUnsupportedError`.
+7. **naming-server / verifying-name** — the naming service renames the OME
+   profile; the name is read back and must be
+   `ocp-dell-<model>-<region>-<N>c-<N>gb-<N>tb-<service tag>` with THIS region
+   and service tag. `server_namer.py` is where the service's real request
+   contract goes — today it POSTs the request model to `SERVER_NAMER_URL`.
+
+The run ends there: the machine is configured. It does **not** wait for
+server-scan to list it — server-scan's own Dell collector (every 6 h) picks the
+server up afterwards, and waiting would add hours to every run to watch
+something the run cannot influence.
+
+Workflow id `provision-dell-server-<idrac ip>`. Every wait is the workflow's, on
+durable timers with a deadline; no password is ever in Temporal history (a run
+names a credential by its position in the limb's list).
+
+Every OME and iDRAC request was checked against Dell's own client code (the
+`dellemc.openmanage` collection); the facts, their sources and what is still
+unverified on real hardware are in `docs/design/dell-ome-idrac-api.md`.
+`tests/test_provision_dell_server_e2e.py` runs the real workflow and activities
+against a Dell simulator built from them (`tests/dell_simulator.py`).
+
+> **The templates in `DELL_TEMPLATES` must not carry storage components.** A
+> template captured from a reference server can include `RAIDresetConfig=True`
+> (Dell's own sample does), which wipes the controller when it is deployed —
+> and the storage layout is this workflow's job, done after the template.
+
 ### `create-vm` — one VirtualMachine for a KubeVirt InfraEnv
 
 Under the naming convention an InfraEnv `<conf>[-<letter>]-zone-<zone>-<cpu>`
@@ -894,6 +956,8 @@ result.
 | `POST /workflows/server-lifecycle/uninstall-server-from-hc` | one workflow PER server in `server_names`: out of its hosted cluster (if a node), ending once its Agent is free — it stays in the MCE (remove-server-from-mce takes it out) |
 | `POST /workflows/server-lifecycle/publish-infraenv-to-pxe-server` | an InfraEnv's current iPXE script onto its site's PXE VM |
 | `POST /workflows/server-lifecycle/update-nodepool` | one NodePool's replicas, by name (a scale-up or scale-down child); a scale-down may name its `server_names` or a `scale_down_policy` (OpenShift 4.19 and later only) |
+| `POST /workflows/server-provisioning/provision-dell-server` | one Dell server, by iDRAC IP |
+| `POST /workflows/server-provisioning/provision-dell-server/bulk` | one workflow PER iDRAC IP |
 | `POST /workflows/vm-lifecycle/create-vm` | one workflow PER VM for a KubeVirt InfraEnv: one in the first free slot, or `count` in parallel |
 | `POST /workflows/cluster-lifecycle/provision-cluster?cluster=&mce=` | one hosted cluster from the YAML in the body (`application/yaml`): segment, day1 branch, merge request, the wait for the merge, day2, the console shortcut |
 | `GET  /workflows/runs/{workflow_id}` | (status, every domain) |
@@ -981,6 +1045,15 @@ would hide which segments actually got a workflow.
 | `DAY1_REPO_URL`, `DAY1_VALIDATE_COMMAND` | `server-lifecycle-config` | update-nodepool's day1 read and replicas commit, `https://`; OPTIONAL — unset, only update-nodepool is refused on that MCE |
 | `DAY1_GIT_TOKEN` | Secret (credentials, or `day1.tokenSecret`) | its push token; optional with the URL |
 | `ARGO_NAMESPACE`, `ARGO_VALUES_REF` | `server-lifecycle-config` | update-nodepool's Argo CD sync: the Applications' namespace (`openshift-gitops`) and the day1 source's `ref` (`values`) |
+| `OME_URL` | `server-provisioning-config` | the OpenManage Enterprise appliance, `https://` |
+| `OME_USERNAME`/`OME_PASSWORD` | Secret | discovers devices and deploys templates |
+| `IDRAC_USERNAME` | `server-provisioning-config` | default `root` — the only iDRAC account touched |
+| `IDRAC_ROOT_PASSWORD` | Secret | the password the template enforces; tried first |
+| `IDRAC_FACTORY_PASSWORDS` | Secret | JSON list, at most 2 — what servers may arrive with |
+| `DELL_TEMPLATES` | `server-provisioning-config` | `{"<Redfish model>": {"<iDRAC firmware>": "<OME template>"}}` |
+| `SERVER_NAMER_URL` | `server-provisioning-config` | the naming service |
+| `SERVER_NAMER_API_TOKEN` | Secret | optional bearer token |
+| `SERVER_SCAN_URL`/`_API_TOKEN` | as above | the provisioning worker reads it too (a viewer token) |
 | `DAY1_REPO_URL` | `vm-lifecycle-config` | create-vm lists a zone's KubeVirt clusters from it (read only); the shared `redbull-git-token` is mapped onto `DAY1_GIT_TOKEN` here too |
 | `KV_CAPACITY_URL_TEMPLATE`, `KV_VM_API_URL_TEMPLATE` | `vm-lifecycle-config` | the agents' Routes per KubeVirt cluster: `{cluster}`, `{name}`, `{hosted_cluster}`, `{site}`, `{zone}` |
 | `KV_CAPACITY_TOKEN`, `KV_VM_API_TOKEN` | Secrets `kv-capacity-token`, `kv-vm-api-token` | the agents' fleet tokens; rotate each with its agents |

@@ -9,6 +9,7 @@ One module per deployment boundary, each holding one settings class:
                           Client (every worker and api.py)
   segment_lifecycle.py    SegmentLifecycleActivitySettings
   server_lifecycle.py     ServerLifecycleActivitySettings
+  server_provisioning.py  ServerProvisioningActivitySettings
   upgrade_gitops.py       UpgradeGitopsActivitySettings    } cluster-upgrade's three
   cluster_upgrade.py      ClusterUpgradeActivitySettings   } limbs, one class per
   upgrade_agent.py        UpgradeAgentActivitySettings     } credential set (§2)

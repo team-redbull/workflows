@@ -802,27 +802,28 @@ against a Dell simulator built from them (`tests/dell_simulator.py`).
 
 ### `create-vm` — one VirtualMachine for a KubeVirt InfraEnv
 
-Under the platform naming convention an InfraEnv `<flavor>-kv<cpu>-<site>-<zone>`
-(`c200-kv32-five-az1`) holds VMs of `<cpu>` vCPUs and `<cpu> × 8` GiB on one of the
+Under the platform naming convention an InfraEnv `<flavor>-kv<cpu>-<zone>`
+(`c200-kv32-az1`) holds VMs of `<cpu>` vCPUs and `<cpu> × 8` GiB on one of the
 zone's KV clusters (the hosted clusters whose nodes run the warm-pool VMs); a
-`<flavor>-mtl-<site>-<zone>` InfraEnv holds physical servers. A KubeVirt InfraEnv has
+`<flavor>-mtl-<zone>` InfraEnv holds physical servers. A KubeVirt InfraEnv has
 nothing to install until a VM exists, and `create-vm` is that step. Full page:
 `docs/site/vm-lifecycle/create-vm.html`; the design: `docs/design/create-vm-placement.md`.
 
 **The zone's clusters come from day1, their numbers from the clusters themselves, only
 one run at a time chooses in a zone, and the chosen cluster builds the VM.**
 
-Input: `mce_cluster` (named `ocp4-<lifecycle>-mce-<site>-<id>`, at the InfraEnv's site),
-`infra_env` (the **flavor**, the **size**, the **site** and the **zone** come from it),
+Input: `mce_cluster` (named `ocp4-<lifecycle>-mce-<site>-<id>`: the **site** and the
+**lifecycle** come from it), `infra_env` (the **flavor**, the **size** and the **zone** come from it),
 `namespace` (default `inventory` — the VM's namespace on the KV cluster, verbatim, a
 kubevirt-redfish chassis namespace the platform created) and an optional `count`. The
-API derives flavor, site, zone, cpu and memory once; the run carries them.
+API derives flavor, site, lifecycle, zone, cpu and memory once; the run carries them.
 
-1. **listing-kv-clusters** — the zone's KV clusters, oldest first, from the day1 folder
-   of the zone's ONE seed, `sites/<site>/mces/ocp4-seed-<site>-<zone number>/hostedClusters/`,
+1. **listing-kv-clusters** — the zone's KV clusters, oldest first, from the day1 folders
+   of the zone's seeds OF THE MCE's LIFECYCLE, `sites/<site>/mces/ocp4-<lifecycle>-seed-<site>-<zone>-<id>/hostedClusters/`,
    with the placement buffer — read at `main` by the **cluster-lifecycle worker** (it
    holds the day1 token) on the snapshot cached by commit. A file whose NodePools do not
-   all label the zone, or whose name is off the convention, is listed and never used.
+   all label the zone, whose name is off the convention or names another zone or lifecycle
+   than its seed's, is listed and never used.
    None usable: `NoKvClusterError`.
 2. **awaiting-zone-lock** — the run asks the zone's lock (`kv-zone-lock`, one long-lived
    workflow per (site, zone), no route) and waits for its grant, at most 30 min
@@ -991,7 +992,7 @@ result.
 | `POST /workflows/server-lifecycle/update-nodepool` | one NodePool's replicas, by name (a scale-up or scale-down child); a scale-down may name its `server_names` or a `scale_down_policy` (OpenShift 4.19 and later only) |
 | `POST /workflows/server-provisioning/provision-dell-server` | one Dell server, by iDRAC IP |
 | `POST /workflows/server-provisioning/provision-dell-server/bulk` | one workflow PER iDRAC IP |
-| `POST /workflows/vm-lifecycle/create-vm` | one workflow PER VM for a KubeVirt InfraEnv (`<flavor>-kv<cpu>-<site>-<zone>`, at the MCE's site): one in the first free slot, or `count` of them; runs of one zone choose and create one after another |
+| `POST /workflows/vm-lifecycle/create-vm` | one workflow PER VM for a KubeVirt InfraEnv (`<flavor>-kv<cpu>-<zone>`; the site is the MCE's): one in the first free slot, or `count` of them; runs of one zone choose and create one after another |
 | `POST /workflows/cluster-lifecycle/provision-cluster?cluster=&mce=` | one hosted cluster from the YAML in the body (`application/yaml`): segment, day1 branch, merge request, the wait for the merge, day2, the console shortcut |
 | `GET  /workflows/runs/{workflow_id}` | (status, every domain) |
 
@@ -1088,7 +1089,7 @@ would hide which segments actually got a workflow.
 | `SERVER_NAMER_URL` | `server-provisioning-config` | the naming service |
 | `SERVER_NAMER_API_TOKEN` | Secret | optional bearer token |
 | `SERVER_SCAN_URL`/`_API_TOKEN` | as above | the provisioning worker reads it too (a viewer token) |
-| `KV_CLUSTER` | `vm-lifecycle-config` (in each KV cluster) | the KV cluster this worker runs in: EXACTLY its day1 file name (`ocp4-<lifecycle>-kv-<site>-<id>`), never abbreviated — it names the queue; the site is read from it |
+| `KV_CLUSTER` | `vm-lifecycle-config` (in each KV cluster) | the KV cluster this worker runs in: EXACTLY its day1 file name (`ocp4-<lifecycle>-kv-<site>-<zone>-<id>`), never abbreviated — it names the queue; the site and the zone are read from it |
 | `VM_MAC_PREFIX` | `vm-lifecycle-config` | the first three octets of every MAC this cluster's VMs get: `0e` + the cluster's VLAN ID; required, no default; the worker draws the last three |
 | `VM_STORAGE_CLASS_NAME` | `vm-lifecycle-config` | the root disk's storage class; must bind Immediately and allow RWX + Filesystem |
 | `VM_NETWORK_NAME` | `vm-lifecycle-config` | `<namespace>/<name>` of the NetworkAttachmentDefinition every VM boots on (default `openshift-cnv/vm-external-network`, the platform's vm.yaml); the network is always multus |
@@ -1118,7 +1119,7 @@ PYTHONPATH=. python -m activities.cluster_lifecycle.worker_init &     # provisio
 # for a developer). To see a zone of many without the clusters, attach fake ones to the same
 # Temporal — the fleet the tests use, real limb code over an in-memory cluster API:
 #   PYTHONPATH=. python -m tests.kv_fleet --temporal localhost:7233 \
-#     --cluster ocp4-prod-kv-five-a:100:1024 --cluster ocp4-prod-kv-five-b:100:1024
+#     --cluster ocp4-prod-kv-five-az1-a:100:1024 --cluster ocp4-prod-kv-five-az1-b:100:1024
 
 # Unified API
 pip install -r requirements.txt

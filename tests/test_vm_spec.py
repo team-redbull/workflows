@@ -13,7 +13,7 @@ def _build(**overrides):
     values = dict(
         namespace="inventory", flavor="c200", cpu=32, memory_gib=256, site="five", zone="az1",
         mce="ocp4-prod-mce-five-a", mac="0e:03:f2:a1:b2:c3", request_id="0196f6a2-1111-7222-8333-444455556666",
-        workflow_id="create-vm-ocp4-prod-mce-five-a_c200-kv32-five-az1_1", redfish_label=REDFISH_LABEL,
+        workflow_id="create-vm-ocp4-prod-mce-five-a_c200-kv32-az1_1", redfish_label=REDFISH_LABEL,
         storage_class_name="cephfs", network_name="openshift-cnv/vm-external-network",
         node_selector={}, root_disk_size="120Gi",
     )
@@ -42,16 +42,16 @@ class TestTheVirtualMachine:
         assert vm["spec"]["dataVolumeTemplates"][0]["metadata"]["name"] == "ocp-c200-kv32-five-0e03f2a1b2c3-root"
         assert vm["spec"]["template"]["metadata"]["labels"] == {"kubevirt.io/vm": "ocp-c200-kv32-five-0e03f2a1b2c3"}
 
-    @pytest.mark.parametrize(("cpu", "label"), [(1, "1c"), (32, "32c"), (256, "256c")])
-    def test_the_size_label_is_the_vcpus_and_a_c(self, cpu, label):
-        """The label says the size alone; `kv<cpu>` is the NAME's field, not the label's."""
+    @pytest.mark.parametrize(("cpu", "label"), [(1, "kv1"), (32, "kv32"), (256, "kv256")])
+    def test_the_size_label_is_the_names_size_field(self, cpu, label):
+        """The convention's §4 value, the one its InfraEnv's Agents carry: `kv<cpu>`."""
         assert vm_spec.size_label(cpu) == label
 
     def test_its_labels_are_the_conventions(self):
         assert _build()["metadata"]["labels"] == {
             "redfish-enabled": "true",
             "redbull.io/flavor": "c200",
-            "redbull.io/size": "32c",
+            "redbull.io/size": "kv32",
             "redbull.io/site": "five",
             "topology.kubernetes.io/zone": "az1",
             "redbull.io/role": "worker",
@@ -61,7 +61,7 @@ class TestTheVirtualMachine:
 
     def test_the_slots_workflow_id_is_an_annotation_never_a_label(self):
         # It holds `_` runs and can pass 63 characters: not a label value.
-        vm = _build(workflow_id="create-vm-ocp4-prod-mce-bat-yam-a_c200n-kv32-bat-yam-az1_100" + "x" * 30)
+        vm = _build(workflow_id="create-vm-ocp4-prod-mce-bat-yam-a_c200n-kv32-az1_100" + "x" * 30)
         assert vm["metadata"]["annotations"]["redbull.io/workflow-id"].startswith("create-vm-ocp4-prod-mce-bat-yam-a_")
         assert "annotations" not in _build(workflow_id=None)["metadata"]
 
@@ -156,7 +156,7 @@ class TestTheVirtualMachine:
         # placement counts it); and the FIXED MAC (KubeVirt re-randomises an unset one on every
         # start, the BareMetalHost needs a fixed boot MAC, and the name is that MAC).
         assert built["metadata"].pop("namespace") == "inventory"
-        assert built["metadata"].pop("annotations") == {"redbull.io/workflow-id": "create-vm-ocp4-prod-mce-five-a_c200-kv32-five-az1_1"}
+        assert built["metadata"].pop("annotations") == {"redbull.io/workflow-id": "create-vm-ocp4-prod-mce-five-a_c200-kv32-az1_1"}
         assert built["metadata"]["labels"].pop("redbull.io/created-by")
         for key in ("redbull.io/flavor", "redbull.io/size", "redbull.io/site", "topology.kubernetes.io/zone", "redbull.io/role", "redbull.io/mce"):
             built["metadata"]["labels"].pop(key)

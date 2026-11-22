@@ -71,6 +71,9 @@ class ClusterValues:
     site: str
     mac_prefix: str
     storage_class_name: str
+    # The zone the cluster's name carries (`ocp4-prod-kv-five-az1-a`); None only where a
+    # caller builds values without one, and then no request's zone is checked against it.
+    zone: str | None = None
     redfish_label: tuple[str, str] = ("redfish-enabled", "true")
     network_name: str = "openshift-cnv/vm-external-network"
     node_selector: dict[str, str] = field(default_factory=dict)
@@ -186,6 +189,11 @@ async def create_vm(
         raise KvClusterMismatchError(
             f"KV cluster {cluster.kv_cluster} is at site {cluster.site} and was asked for a VM of site "
             f"{request.site}: a VM boots on its own site's inventory network"
+        )
+    if cluster.zone is not None and request.zone != cluster.zone:
+        raise KvClusterMismatchError(
+            f"KV cluster {cluster.kv_cluster} is in zone {cluster.zone} and was asked for a VM of zone "
+            f"{request.zone}: a VM goes into its InfraEnv's zone"
         )
     try:  # every field the name is built from, before anything is asked of the cluster
         vm_name(request.flavor, request.cpu, request.site, vm_spec.draw_mac(cluster.mac_prefix, bytes(vm_spec.RANDOM_OCTETS)))

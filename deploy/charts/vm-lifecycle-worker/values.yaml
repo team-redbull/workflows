@@ -7,11 +7,11 @@
 # worker's ServiceAccount is its whole identity (rbac.yaml).
 
 # REQUIRED. The KV cluster this worker runs in: EXACTLY the name of its day1
-# file, `sites/<site>/mces/ocp4-seed-<site>-<zone number>/hostedClusters/<kvCluster>.yaml`,
-# e.g. ocp4-prod-kv-five-a. It names the queue the worker polls
+# file, `sites/<site>/mces/ocp4-<lifecycle>-seed-<site>-<zone>-<id>/hostedClusters/<kvCluster>.yaml`,
+# e.g. ocp4-prod-kv-five-az1-a. It names the queue the worker polls
 # (vm-lifecycle-activity-<kvCluster>), and a create-vm run builds the same queue
 # name from the list it reads in day1 — so it is NEVER canonicalised or
-# abbreviated. The worker reads its SITE from it (`ocp4-<lifecycle>-kv-<site>-<id>`)
+# abbreviated. The worker reads its SITE and ZONE from it (`ocp4-<lifecycle>-kv-<site>-<zone>-<id>`)
 # and refuses to start on any other shape. A wrong value is not silent: the
 # cluster shows as `no-worker` in every run of its zone.
 kvCluster: ""

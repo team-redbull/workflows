@@ -34,7 +34,7 @@ from shared.models.vm_lifecycle import KvFiguresRequest, VmCreateRequest, VmDele
 from shared.settings.vm_lifecycle import VmLifecycleActivitySettings
 from tests.kv_fleet import GIB, FakeKvCluster, node, stopped_vm
 
-KV = "ocp4-prod-kv-five-a"
+KV = "ocp4-prod-kv-five-az1-a"
 RUN = "0196f6a2-1111-7222-8333-444455556666"
 NOW = datetime(2026, 11, 20, 12, 0, tzinfo=UTC)
 
@@ -48,7 +48,7 @@ def cluster(**kwargs) -> FakeKvCluster:
 def create_request(**overrides) -> VmCreateRequest:
     values = dict(
         kv_cluster=KV, namespace="inventory", flavor="c200", cpu=32, memory_gib=256, site="five", zone="az1",
-        mce="ocp4-prod-mce-five-a", request_id=RUN, workflow_id="create-vm-ocp4-prod-mce-five-a_c200-kv32-five-az1_1",
+        mce="ocp4-prod-mce-five-a", request_id=RUN, workflow_id="create-vm-ocp4-prod-mce-five-a_c200-kv32-az1_1",
         create_before=NOW + timedelta(minutes=4),
     )
     values.update(overrides)
@@ -89,8 +89,8 @@ class TestReadFigures:
 
     async def test_a_request_for_another_cluster_is_not_answered_with_this_ones_numbers(self):
         kv = cluster()
-        figures = await vm_operations.read_figures(kv, kv.values, KvFiguresRequest(kv_cluster="ocp4-prod-kv-five-b"))
-        assert figures.readable is False and figures.kv_cluster == "ocp4-prod-kv-five-b"
+        figures = await vm_operations.read_figures(kv, kv.values, KvFiguresRequest(kv_cluster="ocp4-prod-kv-five-az1-b"))
+        assert figures.readable is False and figures.kv_cluster == "ocp4-prod-kv-five-az1-b"
         assert KV in figures.detail and "kvCluster" in figures.detail
         assert kv.calls == []  # its own cluster was not even read
 
@@ -329,13 +329,20 @@ class TestCreateVm:
     async def test_a_request_for_another_cluster_is_refused(self):
         kv = cluster()
         with pytest.raises(KvClusterMismatchError, match="kvCluster"):
-            await create(kv, create_request(kv_cluster="ocp4-prod-kv-five-b"))
+            await create(kv, create_request(kv_cluster="ocp4-prod-kv-five-az1-b"))
         assert kv.calls == []
 
     async def test_a_vm_of_another_site_is_refused(self):
         kv = cluster()
         with pytest.raises(KvClusterMismatchError, match="site five .* site six"):
             await create(kv, create_request(site="six"))
+        assert kv.calls == []
+
+    async def test_a_vm_of_another_zone_is_refused(self):
+        """The cluster's name carries its zone; a request for another zone's VM is not its own."""
+        kv = cluster()
+        with pytest.raises(KvClusterMismatchError, match="zone az1 .* zone az2"):
+            await create(kv, create_request(zone="az2"))
         assert kv.calls == []
 
     async def test_a_request_that_cannot_name_a_vm_is_rejected_before_the_cluster_is_asked(self):
@@ -539,7 +546,7 @@ class TestWaitReady:
         kv = cluster()
         with pytest.raises(KvClusterMismatchError):
             await vm_operations.wait_ready(
-                kv, kv.values, VmReadyRequest(kv_cluster="ocp4-prod-kv-five-b", namespace="inventory", name="x"),
+                kv, kv.values, VmReadyRequest(kv_cluster="ocp4-prod-kv-five-az1-b", namespace="inventory", name="x"),
                 started_at=NOW, polls=0, now=lambda: NOW, heartbeat=lambda *_: None,
             )
 
@@ -621,7 +628,7 @@ class TestDeleteVm:
     async def test_a_delete_for_another_cluster_is_refused(self):
         kv = cluster()
         with pytest.raises(KvClusterMismatchError):
-            await vm_operations.delete_vm(kv, kv.values, delete_request(kv_cluster="ocp4-prod-kv-five-b"))
+            await vm_operations.delete_vm(kv, kv.values, delete_request(kv_cluster="ocp4-prod-kv-five-az1-b"))
 
     async def test_an_api_failure_is_raised_for_temporal_to_retry(self):
         kv = cluster()
@@ -904,7 +911,7 @@ def bound(monkeypatch):
 
 class TestTheActivities:
     def test_the_worker_is_bound_to_its_own_cluster_from_its_settings(self):
-        assert limb._cluster.kv_cluster == "ocp4-prod-kv-five-a" and limb._cluster.site == "five"
+        assert limb._cluster.kv_cluster == "ocp4-prod-kv-five-az1-a" and limb._cluster.site == "five"
         assert limb._cluster.mac_prefix == "0e:03:f2" and limb._cluster.storage_class_name == "test-cephfs"
         assert limb._cluster.redfish_label == ("redfish-enabled", "true")
         assert isinstance(limb._api, KubevirtApi)
@@ -979,7 +986,7 @@ class TestTheActivities:
 
 
 def settings(**overrides) -> VmLifecycleActivitySettings:
-    values = dict(kv_cluster="ocp4-prod-kv-five-a", vm_mac_prefix="0e:03:f2", vm_storage_class_name="cephfs")
+    values = dict(kv_cluster="ocp4-prod-kv-five-az1-a", vm_mac_prefix="0e:03:f2", vm_storage_class_name="cephfs")
     values.update(overrides)
     with mock.patch.dict(os.environ):
         os.environ.pop("VM_NETWORK_NAME", None)
@@ -987,16 +994,20 @@ def settings(**overrides) -> VmLifecycleActivitySettings:
 
 
 class TestSettings:
-    def test_the_site_is_read_from_the_clusters_name(self):
-        assert settings().site == "five"
-        assert settings(kv_cluster="ocp4-prep-kv-bat-yam-c").site == "bat-yam"
+    def test_the_site_and_the_zone_are_read_from_the_clusters_name(self):
+        assert (settings().site, settings().zone) == ("five", "az1")
+        assert (settings(kv_cluster="ocp4-prep-kv-bat-yam-az12-c").site, settings(kv_cluster="ocp4-prep-kv-bat-yam-az12-c").zone) == ("bat-yam", "az12")
 
     def test_the_name_is_never_canonicalised(self):
         with pytest.raises(ValidationError):
             settings(kv_cluster="prod-kv-five-a")  # no `ocp4-`: it must equal the day1 file name as it is
-        assert settings(kv_cluster="ocp4-prod-kv-five-a").kv_cluster == "ocp4-prod-kv-five-a"
+        assert settings(kv_cluster="ocp4-prod-kv-five-az1-a").kv_cluster == "ocp4-prod-kv-five-az1-a"
 
-    @pytest.mark.parametrize("name", ["ocp4-prod-mce-five-a", "ocp4-seed-five-1", "ocp4-prod-kv-five", "", "ocp4-prod-kv-five-A"])
+    @pytest.mark.parametrize("name", [
+        "ocp4-prod-mce-five-a", "ocp4-prod-seed-five-az1-a", "ocp4-seed-five-1", "ocp4-prod-kv-five", "",
+        "ocp4-prod-kv-five-az1-A",
+        "ocp4-prod-kv-five-a",  # no zone: the shape before 2026-11-22
+    ])
     def test_only_a_kv_clusters_name_starts_the_worker(self, name):
         with pytest.raises(ValidationError):
             settings(kv_cluster=name)
@@ -1057,7 +1068,7 @@ class TestSettings:
         if shutil.which("helm") is None:
             pytest.skip("needs helm")
         chart = pathlib.Path(__file__).resolve().parent.parent / "deploy" / "charts" / "vm-lifecycle-worker"
-        base = ["helm", "template", "x", str(chart), "--set", "kvCluster=ocp4-prod-kv-five-a", "--set",
+        base = ["helm", "template", "x", str(chart), "--set", "kvCluster=ocp4-prod-kv-five-az1-a", "--set",
                 "config.vmMacPrefix=0e:03:f2", "--set", "vm.storageClassName=basic", "--set", "temporal.host=t:7233"]
         default = subprocess.run(base, capture_output=True, text=True)
         assert default.returncode == 0 and 'VM_NETWORK_NAME: "openshift-cnv/vm-external-network"' in default.stdout

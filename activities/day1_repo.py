@@ -21,23 +21,29 @@ is activities/git_repo.py. `main` only: Argo CD renders main and nothing else.
 THE REPO (inspected 2026-11-20, gitops-day1/platform-config): every cluster
 file is `sites/<site>/mces/<folder>/hostedClusters/<cluster>.yaml`. A
 `<folder>` is an MCE (`ocp4-<env>-mce-<site>-<letter>`, or a legacy name such
-as `ocp4-mce-site2`) or a SEED (`ocp4-seed-<site>-<zone number>`, the one
-cluster hosting a zone's KV clusters). There is no env folder. This module is
+as `ocp4-mce-site2`) or a SEED (`ocp4-<lifecycle>-seed-<site>-<zone>-<id>`, a
+cluster hosting a zone's KV clusters; the seeds sit beside the MCEs, and a zone
+may have several). There is no env folder. Names are the platform convention's
+(the `naming-convention` skill), parsed by shared/cluster_names.py. This module is
 the ONE place that layout is written down (checker AC009): a domain module
 asks `Day1`, or builds the path it writes with `mce_dir` / `cluster_file_path`.
 
 `Day1` — the definitions, each in one place:
-  * kind `kv`: a hosted cluster under a SEED folder. Never by name: day1 has
+  * kind `kv`: a hosted cluster under a SEED folder (a folder whose name parses
+    as a seed's, `seed_of`). Never by the file's name: day1 has
     `ocp4-test-kubevirt-site4` under an MCE, and it is an `hc`.
   * kind `hc`: a hosted cluster under any other folder. KV clusters are hosted
     clusters too, so `hc` means "not under a seed", not "not KubeVirt".
-  * zone (kv only): the seed folder's (`seed_zone`), cross-checked against
-    EVERY NodePool's `nodeLabels["topology.kubernetes.io/zone"]` in the merged
-    values; a NodePool naming another zone or none, or no NodePool at all, is
-    a `problems` line — the record is still returned, with it.
+  * zone (kv only): the seed folder's (`seed_zone`), cross-checked against the
+    zone in the cluster's own name and EVERY NodePool's
+    `nodeLabels["topology.kubernetes.io/zone"]` in the merged values (the
+    convention's §4.b: all three must agree); any disagreement, or no NodePool
+    at all, is a `problems` line — the record is still returned, with it.
   * id (kv only): the sequence letter the convention ends the name with
-    (`ocp4-<lifecycle>-kv-<site>-<id>`), given in creation order; a name off
-    the convention has none, and a `problems` line.
+    (`ocp4-<lifecycle>-kv-<site>-<zone>-<id>`), given in creation order; a name
+    off the convention has none, and a `problems` line.
+  * lifecycle (kv only): the seed folder's; a KV cluster whose name says another
+    is a `problems` line. `kv_clusters(lifecycle=…)` keeps one lifecycle's seeds.
   * env: `day2.env` from the merged values, else the cluster name's first
     field after `ocp4-` (`cluster_env`, provision-cluster's rule, moved here).
     Never the folder's name: legacy folders carry none.
@@ -83,7 +89,8 @@ from shared.cluster_names import (
     env_of_hosted_cluster,
     name_token,
     parse_kv_cluster,
-    seed_site,
+    seed_lifecycle,
+    seed_of,
     seed_zone,
     zone_number,
 )
@@ -449,12 +456,20 @@ class Day1:
                     records.append(record)
         return sorted(records, key=_order)
 
-    def kv_clusters(self, site: str | None = None, zone: str | None = None) -> list[ClusterRecord]:
-        """The KV clusters (hosted clusters under a seed folder) of a site and zone, oldest first.
+    def kv_clusters(
+        self, site: str | None = None, zone: str | None = None, lifecycle: str | None = None
+    ) -> list[ClusterRecord]:
+        """The KV clusters (hosted clusters under a seed folder) of a site and zone, oldest first;
+        with `lifecycle`, only those under that lifecycle's seeds (a prod MCE's VMs go on prod
+        KV clusters only — the operator, 2026-11-22). Every seed of the zone counts: a zone
+        may have several (`-a`, `-b`), and their clusters are ordered together by id.
 
         A record with `problems` is listed, not hidden: whether it may be
         chosen is the caller's rule."""
-        return self.clusters(site=site, kind=KIND_KV, zone=zone)
+        if lifecycle is not None:
+            name_token(lifecycle, "lifecycle")
+        records = self.clusters(site=site, kind=KIND_KV, zone=zone)
+        return [record for record in records if lifecycle is None or seed_lifecycle(record.folder) == lifecycle]
 
     def hosted_clusters(
         self, site: str | None = None, env: str | None = None, include_kv: bool = False
@@ -504,24 +519,34 @@ class Day1:
         name = Path(path).stem
         problems = list(values.problems)
         blocking: list[str] = []
-        zone = seed_zone(folder)
+        seed = seed_of(folder)
+        zone = seed.zone if seed else None
         identifier: str | None = None
-        if zone is not None:
-            if seed_site(folder) != site:
+        if seed is not None and zone is not None:
+            if seed.site != site:
                 blocking.append(
-                    f"{path}: seed folder {folder} is named for site {seed_site(folder)!r}, but is under {SITES}/{site}"
+                    f"{path}: seed folder {folder} is named for site {seed.site!r}, but is under {SITES}/{site}"
                 )
             try:
                 parsed = parse_kv_cluster(name)
             except ClusterNameError:
                 blocking.append(
-                    f"{path}: a KV cluster is named `ocp4-<lifecycle>-kv-<site>-<id>`; {name!r} is not, "
-                    "so its place in the zone's order is unknown"
+                    f"{path}: a KV cluster is named `ocp4-<lifecycle>-kv-<site>-<zone>-<id>`; {name!r} is not, "
+                    "so its zone and its place in the zone's order are unknown"
                 )
             else:
                 identifier = parsed.id
                 if parsed.site != site:
                     blocking.append(f"{path}: the name says site {parsed.site!r}, but the file is under {SITES}/{site}")
+                if parsed.zone != zone:
+                    blocking.append(
+                        f"{path}: the name says zone {parsed.zone}, but the file is under seed {folder} of zone {zone}"
+                    )
+                if parsed.lifecycle != seed.lifecycle:
+                    blocking.append(
+                        f"{path}: the name says lifecycle {parsed.lifecycle!r}, but the file is under seed {folder}, "
+                        f"a {seed.lifecycle!r} one"
+                    )
             blocking += _zone_problems(values.merged, zone, path)
             problems += blocking
         if not values.cluster_name:

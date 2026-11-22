@@ -14,7 +14,7 @@ MIB = 1024**2
 
 def _figures(nodes, pods=(), vms=(), vmis=(), **kwargs):
     usages = [usage for usage in (pod_usage(p) for p in pods) if usage is not None]
-    return compute(kv_cluster="ocp4-prod-kv-five-a", nodes=list(nodes), pods=usages, vms=list(vms), vmis=list(vmis),
+    return compute(kv_cluster="ocp4-prod-kv-five-az1-a", nodes=list(nodes), pods=usages, vms=list(vms), vmis=list(vmis),
                    redfish_label=REDFISH_LABEL, **kwargs)
 
 
@@ -211,7 +211,7 @@ class TestTheWholePicture:
         vms = [stopped_vm("run", 32, 256), stopped_vm("halted-1", 32, 256), stopped_vm("halted-2", 8, 64)]
         figures = _figures(nodes, pods, vms, [_vmi("run", "Running")])
         assert figures.model_dump(exclude={"node_headroom"}) == {
-            "kv_cluster": "ocp4-prod-kv-five-a", "readable": True, "detail": None, "nodes": 3, "usable_nodes": 2,
+            "kv_cluster": "ocp4-prod-kv-five-az1-a", "readable": True, "detail": None, "nodes": 3, "usable_nodes": 2,
             "allocatable_cpu_millicores": 128_000, "allocatable_memory_bytes": 1024 * GIB,
             "pods_cpu_millicores": 30_100, "pods_memory_bytes": 257 * GIB + 70 * MIB,
             "stopped_vms": 2, "stopped_vms_cpu_millicores": 37_000, "stopped_vms_memory_bytes": (257 + 65) * GIB,

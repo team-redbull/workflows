@@ -47,7 +47,7 @@ from temporalio.worker import Worker
 from activities.vm_lifecycle import cluster_figures, vm_operations, vm_spec
 from activities.vm_lifecycle.kubevirt_api import MacRefused, NameTaken, NotFound
 from activities.vm_lifecycle.vm_operations import ClusterValues
-from shared.cluster_names import parse_kv_cluster, seed_cluster
+from shared.cluster_names import parse_kv_cluster, seed_folder_pattern
 from shared.consts import (
     CLUSTER_LIFECYCLE_ACTIVITY_QUEUE,
     CREATE_VM_WORKFLOW_QUEUE,
@@ -196,7 +196,8 @@ class FakeKvCluster:
     ) -> None:
         self.name = name
         self.values = ClusterValues(
-            kv_cluster=name, site=parse_kv_cluster(name).site, mac_prefix=mac_prefix, storage_class_name="cephfs",
+            kv_cluster=name, site=parse_kv_cluster(name).site, zone=parse_kv_cluster(name).zone,
+            mac_prefix=mac_prefix, storage_class_name="cephfs",
             redfish_label=REDFISH_LABEL, network_name="openshift-cnv/vm-external-network",
             node_selector=dict(node_selector or {}), root_disk_size="120Gi",
         )
@@ -385,7 +386,7 @@ class KvFleet:
         self.revision = revision
         self.clusters: dict[str, FakeKvCluster] = {}
         # What day1 lists per (site, zone), in the order added; sorted by id when answered.
-        self.day1: dict[tuple[str, str], list[KvClusterEntry]] = {}
+        self.day1: dict[tuple[str, str, str], list[KvClusterEntry]] = {}
         self.listed: list[KvClusterListRequest] = []
         self.list_failures: list[BaseException] = []
         # Seconds the fleet's clusters' clocks run ahead of this process's (a lease-expiry knob).
@@ -427,24 +428,29 @@ class KvFleet:
         return cluster
 
     def list_in_day1(self, name: str, site: str, zone: str, *, problems: list[str] | None = None,
-                     confirmed_zone: str | None = "same", identifier: str | None = "from-name") -> KvClusterEntry:
-        """A day1 entry in the seed folder of (site, zone), with or without a cluster behind it."""
-        folder = f"sites/{site}/mces/{seed_cluster(site, zone)}/hostedClusters"
+                     confirmed_zone: str | None = "same", identifier: str | None = "from-name",
+                     lifecycle: str | None = None) -> KvClusterEntry:
+        """A day1 entry in a seed folder of (lifecycle, site, zone), with or without a cluster behind
+        it. The seed's lifecycle is the name's, else `lifecycle`, else prod."""
         try:
-            parsed_id: str | None = parse_kv_cluster(name).id
+            parsed = parse_kv_cluster(name)
+            parsed_id: str | None = parsed.id
+            lifecycle = lifecycle or parsed.lifecycle
         except ValueError:
             parsed_id = None
+        lifecycle = lifecycle or "prod"
+        folder = f"sites/{site}/mces/ocp4-{lifecycle}-seed-{site}-{zone}-a/hostedClusters"
         entry = KvClusterEntry(
             name=name, cluster_name=name.removeprefix("ocp4-"), hosted_cluster=f"openshift-{name.removeprefix('ocp4-')}",
             path=f"{folder}/{name}.yaml", zone=zone if confirmed_zone == "same" else confirmed_zone,
             id=parsed_id if identifier == "from-name" else identifier, problems=list(problems or []),
         )
-        self.day1.setdefault((site, zone), []).append(entry)
+        self.day1.setdefault((lifecycle, site, zone), []).append(entry)
         return entry
 
-    def entries(self, site: str, zone: str) -> list[KvClusterEntry]:
-        """What day1 answers for the zone: oldest first (by id), entries without an id last."""
-        listed = self.day1.get((site, zone), [])
+    def entries(self, site: str, zone: str, lifecycle: str = "prod") -> list[KvClusterEntry]:
+        """What day1 answers for the zone's seeds of one lifecycle: oldest first (by id), entries without an id last."""
+        listed = self.day1.get((lifecycle, site, zone), [])
         return sorted(listed, key=lambda entry: (entry.id is None, entry.id or "", entry.name))
 
     # --- the activities ----------------------------------------------------------------------
@@ -457,9 +463,10 @@ class KvFleet:
             fleet.listed.append(request)
             if fleet.list_failures:
                 raise fleet.list_failures.pop(0)
-            folder = f"sites/{request.site}/mces/{seed_cluster(request.site, request.zone)}/hostedClusters/"
+            lifecycle = request.lifecycle or "prod"
+            folder = f"sites/{request.site}/mces/{seed_folder_pattern(lifecycle, request.site, request.zone)}/hostedClusters/"
             return KvClusterList(
-                clusters=fleet.entries(request.site, request.zone), buffer_percent=fleet.buffer_percent,
+                clusters=fleet.entries(request.site, request.zone, lifecycle), buffer_percent=fleet.buffer_percent,
                 revision=fleet.revision, folder=folder,
             )
 
@@ -606,7 +613,7 @@ async def _main() -> None:  # pragma: no cover — a lab tool
         name, cores, memory, *rest = spec.split(":")
         count = int(rest[0]) if rest else 1
         fleet.add(
-            name, "az1", in_day1=False, nodes=[node(f"{name}-n{i}", int(cores), int(memory)) for i in range(count)],
+            name, parse_kv_cluster(name).zone or "az1", in_day1=False, nodes=[node(f"{name}-n{i}", int(cores), int(memory)) for i in range(count)],
             storage="wffc" if name in args.wffc else "immediate",
             namespaces=() if name in args.no_namespace else ("inventory",),
         )

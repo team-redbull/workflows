@@ -11,7 +11,7 @@ attaches the commit they were read at.
 from __future__ import annotations
 
 from activities.day1_repo import ClusterRecord, hosted_clusters_dir, main_snapshot
-from shared.cluster_names import seed_cluster
+from shared.cluster_names import seed_folder_pattern
 from shared.models.cluster_lifecycle import Day1ClusterEntry, Day1ClusterList, Day1ClusterQuery
 from shared.models.vm_lifecycle import KvClusterEntry, KvClusterList
 
@@ -58,17 +58,21 @@ def kv_entry(record: ClusterRecord) -> KvClusterEntry:
     )
 
 
-async def list_kv_clusters(*, repo_url: str, token: str, site: str, zone: str, buffer_percent: int) -> KvClusterList:
-    """The KV clusters of (site, zone) at day1 `main`, oldest first, with the placement buffer.
+async def list_kv_clusters(
+    *, repo_url: str, token: str, site: str, zone: str, lifecycle: str, buffer_percent: int
+) -> KvClusterList:
+    """The KV clusters of (lifecycle, site, zone) at day1 `main`, oldest first, with the placement buffer.
 
     Observe-only, on the snapshot of `main`. The order, the zone check and the
-    kinds are `Day1.kv_clusters`'s; a zone whose seed folder does not exist is
-    an empty list. `site` and `zone` are validated tokens (the request model's).
+    kinds are `Day1.kv_clusters`'s; every seed folder of the zone and lifecycle
+    counts, and a zone with none is an empty list. `site`, `zone` and
+    `lifecycle` are validated tokens (the request model's). `folder` names the
+    seed folders as a pattern, for messages.
     """
     async with main_snapshot(repo_url=repo_url, token=token) as day1:
         return KvClusterList(
-            clusters=[kv_entry(record) for record in day1.kv_clusters(site=site, zone=zone)],
+            clusters=[kv_entry(record) for record in day1.kv_clusters(site=site, zone=zone, lifecycle=lifecycle)],
             buffer_percent=buffer_percent,
             revision=day1.revision,
-            folder=hosted_clusters_dir(site, seed_cluster(site, zone)),
+            folder=hosted_clusters_dir(site, seed_folder_pattern(lifecycle, site, zone)),
         )

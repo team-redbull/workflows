@@ -235,12 +235,13 @@ _ZONED = 'nodepool:\n  - name: workers\n    nodeLabels:\n      topology.kubernet
 
 async def test_list_day1_clusters_answers_from_day1_main_with_the_commit_it_read(env, monkeypatch, tmp_path):
     """The real activity over the real reader, against a local bare day1."""
-    seed, mce = "sites/five/mces/ocp4-seed-five-1/hostedClusters", "sites/five/mces/ocp4-prod-mce-five-a/hostedClusters"
+    seed = "sites/five/mces/ocp4-prod-seed-five-az1-a/hostedClusters"
+    mce = "sites/five/mces/ocp4-prod-mce-five-a/hostedClusters"
     origin, head = _day1_origin(tmp_path, {
-        f"{seed}/ocp4-prod-kv-five-b.yaml": _ZONED.format(zone="az1"),
-        f"{seed}/ocp4-prod-kv-five-a.yaml": _ZONED.format(zone="az2"),
+        f"{seed}/ocp4-prod-kv-five-az1-b.yaml": _ZONED.format(zone="az1"),
+        f"{seed}/ocp4-prod-kv-five-az1-a.yaml": _ZONED.format(zone="az2"),
         f"{mce}/ocp4-prod-iac-five-a.yaml": "mastertag: 4.19.1\n",
-        "sites/six/mces/ocp4-seed-six-1/hostedClusters/ocp4-prod-kv-six-a.yaml": _ZONED.format(zone="az1"),
+        "sites/six/mces/ocp4-prod-seed-six-az1-a/hostedClusters/ocp4-prod-kv-six-az1-a.yaml": _ZONED.format(zone="az1"),
     })
     # The settings accept only an https URL; the activity reads these two keys.
     monkeypatch.setattr(limb, "_settings", SimpleNamespace(day1_repo_url=str(origin), redbull_git_token=""))
@@ -248,17 +249,18 @@ async def test_list_day1_clusters_answers_from_day1_main_with_the_commit_it_read
     listed = await env.run(limb.list_day1_clusters, Day1ClusterQuery(site="five", kind="kv", zone="az1"))
     assert listed.revision == head
     assert [(c.name, c.id, c.zone, c.kind, c.site, c.folder) for c in listed.clusters] == [
-        ("ocp4-prod-kv-five-a", "a", "az1", "kv", "five", "ocp4-seed-five-1"),
-        ("ocp4-prod-kv-five-b", "b", "az1", "kv", "five", "ocp4-seed-five-1"),
+        ("ocp4-prod-kv-five-az1-a", "a", "az1", "kv", "five", "ocp4-prod-seed-five-az1-a"),
+        ("ocp4-prod-kv-five-az1-b", "b", "az1", "kv", "five", "ocp4-prod-seed-five-az1-a"),
     ]
     first, second = listed.clusters
     assert second.problems == [] and len(first.problems) == 1 and "zone 'az2'" in first.problems[0]  # listed, with its problem
     assert (first.cluster_name, first.hosted_cluster, first.hosted_cluster_namespace, first.path) == (
-        "prod-kv-five-a", "openshift-prod-kv-five-a", "hcp-prod-kv-five-a", f"{seed}/ocp4-prod-kv-five-a.yaml")
+        "prod-kv-five-az1-a", "openshift-prod-kv-five-az1-a", "hcp-prod-kv-five-az1-a",
+        f"{seed}/ocp4-prod-kv-five-az1-a.yaml")
 
     everything = await env.run(limb.list_day1_clusters, Day1ClusterQuery())
     assert [c.name for c in everything.clusters] == [
-        "ocp4-prod-iac-five-a", "ocp4-prod-kv-five-a", "ocp4-prod-kv-five-b", "ocp4-prod-kv-six-a",
+        "ocp4-prod-iac-five-a", "ocp4-prod-kv-five-az1-a", "ocp4-prod-kv-five-az1-b", "ocp4-prod-kv-six-az1-a",
     ]
     by_env = await env.run(limb.list_day1_clusters, Day1ClusterQuery(kind="hc", env="prod"))
     assert [c.name for c in by_env.clusters] == ["ocp4-prod-iac-five-a"]
@@ -275,96 +277,129 @@ def _kv_settings(origin: Path, buffer: int = 15) -> SimpleNamespace:
 
 
 async def test_list_kv_clusters_answers_a_zones_clusters_oldest_first_with_the_buffer(env, monkeypatch, tmp_path):
-    """The real activity over the real reader, against a local bare day1."""
-    seed, other = "sites/five/mces/ocp4-seed-five-1/hostedClusters", "sites/five/mces/ocp4-seed-five-2/hostedClusters"
+    """The real activity over the real reader, against a local bare day1: every seed of the
+    zone of the asked lifecycle, their clusters pooled and ordered by id."""
+    seed = "sites/five/mces/ocp4-prod-seed-five-az1-a/hostedClusters"
+    second = "sites/five/mces/ocp4-prod-seed-five-az1-b/hostedClusters"
+    other = "sites/five/mces/ocp4-prod-seed-five-az2-a/hostedClusters"
     origin, head = _day1_origin(tmp_path, {
-        f"{seed}/ocp4-prod-kv-five-c.yaml": _ZONED.format(zone="az1"),
-        f"{seed}/ocp4-prod-kv-five-a.yaml": _ZONED.format(zone="az1"),
-        f"{seed}/ocp4-prep-kv-five-b.yaml": _ZONED.format(zone="az1"),     # the id orders, not the lifecycle
-        f"{seed}/ocp4-prod-kv-five-d.yaml": _ZONED.format(zone="az2"),     # its NodePools name another zone
-        f"{seed}/ocp4-prod-kv-five-e.yaml": "mastertag: 4.19.1\n",         # no NodePool, so no zone at all
-        f"{seed}/ocp4-test-kubevirt-five.yaml": _ZONED.format(zone="az1"),  # a name off the convention
-        f"{other}/ocp4-prod-kv-five-f.yaml": _ZONED.format(zone="az2"),    # another zone's seed
+        f"{seed}/ocp4-prod-kv-five-az1-c.yaml": _ZONED.format(zone="az1"),
+        f"{seed}/ocp4-prod-kv-five-az1-a.yaml": _ZONED.format(zone="az1"),
+        f"{second}/ocp4-prod-kv-five-az1-b.yaml": _ZONED.format(zone="az1"),  # the zone's second seed: one order
+        f"{seed}/ocp4-prod-kv-five-az1-d.yaml": _ZONED.format(zone="az2"),     # its NodePools name another zone
+        f"{seed}/ocp4-prod-kv-five-az1-e.yaml": "mastertag: 4.19.1\n",        # no NodePool, so no zone at all
+        f"{seed}/ocp4-test-kubevirt-five.yaml": _ZONED.format(zone="az1"),     # a name off the convention
+        f"{other}/ocp4-prod-kv-five-az2-f.yaml": _ZONED.format(zone="az2"),    # another zone's seed
+        "sites/five/mces/ocp4-prep-seed-five-az1-a/hostedClusters/ocp4-prep-kv-five-az1-a.yaml":
+            _ZONED.format(zone="az1"),                                          # another lifecycle's seed
         "sites/five/mces/ocp4-prod-mce-five-a/hostedClusters/ocp4-test-kubevirt-site4.yaml": _ZONED.format(zone="az1"),
-        "sites/six/mces/ocp4-seed-six-1/hostedClusters/ocp4-prod-kv-six-a.yaml": _ZONED.format(zone="az1"),
+        "sites/six/mces/ocp4-prod-seed-six-az1-a/hostedClusters/ocp4-prod-kv-six-az1-a.yaml": _ZONED.format(zone="az1"),
     })
     monkeypatch.setattr(limb, "_settings", _kv_settings(origin, buffer=22))
 
-    listed = await env.run(limb.list_kv_clusters, KvClusterListRequest(site="five", zone="az1"))
-    assert (listed.revision, listed.buffer_percent, listed.folder) == (head, 22, f"{seed}/")
+    listed = await env.run(limb.list_kv_clusters, KvClusterListRequest(site="five", zone="az1", lifecycle="prod"))
+    assert (listed.revision, listed.buffer_percent, listed.folder) == (
+        head, 22, "sites/five/mces/ocp4-prod-seed-five-az1-*/hostedClusters/")
     assert [(c.name, c.id, c.zone) for c in listed.clusters] == [
-        ("ocp4-prod-kv-five-a", "a", "az1"),
-        ("ocp4-prep-kv-five-b", "b", "az1"),
-        ("ocp4-prod-kv-five-c", "c", "az1"),
-        ("ocp4-prod-kv-five-d", "d", None),          # listed, never confirmed for this zone
-        ("ocp4-prod-kv-five-e", "e", None),
-        ("ocp4-test-kubevirt-five", None, None),     # no place in the order, last
+        ("ocp4-prod-kv-five-az1-a", "a", "az1"),
+        ("ocp4-prod-kv-five-az1-b", "b", "az1"),
+        ("ocp4-prod-kv-five-az1-c", "c", "az1"),
+        ("ocp4-prod-kv-five-az1-d", "d", None),          # listed, never confirmed for this zone
+        ("ocp4-prod-kv-five-az1-e", "e", None),
+        ("ocp4-test-kubevirt-five", None, None),         # no place in the order, last
     ]
     by_name = {c.name: c for c in listed.clusters}
-    assert by_name["ocp4-prod-kv-five-a"].problems == []
-    assert "zone 'az2'" in by_name["ocp4-prod-kv-five-d"].problems[0]
-    assert "no NodePool" in by_name["ocp4-prod-kv-five-e"].problems[0]
-    assert "ocp4-<lifecycle>-kv-<site>-<id>" in by_name["ocp4-test-kubevirt-five"].problems[0]
-    first = by_name["ocp4-prod-kv-five-a"]
+    assert by_name["ocp4-prod-kv-five-az1-a"].problems == []
+    assert by_name["ocp4-prod-kv-five-az1-b"].problems == []
+    assert "zone 'az2'" in by_name["ocp4-prod-kv-five-az1-d"].problems[0]
+    assert "no NodePool" in by_name["ocp4-prod-kv-five-az1-e"].problems[0]
+    assert "ocp4-<lifecycle>-kv-<site>-<zone>-<id>" in by_name["ocp4-test-kubevirt-five"].problems[0]
+    first = by_name["ocp4-prod-kv-five-az1-a"]
     assert (first.cluster_name, first.hosted_cluster, first.path) == (
-        "prod-kv-five-a", "openshift-prod-kv-five-a", f"{seed}/ocp4-prod-kv-five-a.yaml")
+        "prod-kv-five-az1-a", "openshift-prod-kv-five-az1-a", f"{seed}/ocp4-prod-kv-five-az1-a.yaml")
     # What create-vm will use of it: exactly the three confirmed for the zone, oldest first.
     from workflow_domains.vm_lifecycle.create_vm import usable
 
     assert [c.name for c in listed.clusters if usable(c, "az1")] == [
-        "ocp4-prod-kv-five-a", "ocp4-prep-kv-five-b", "ocp4-prod-kv-five-c"]
+        "ocp4-prod-kv-five-az1-a", "ocp4-prod-kv-five-az1-b", "ocp4-prod-kv-five-az1-c"]
 
-    az2 = await env.run(limb.list_kv_clusters, KvClusterListRequest(site="five", zone="az2"))
-    assert [(c.name, c.zone) for c in az2.clusters] == [("ocp4-prod-kv-five-f", "az2")] and az2.folder == f"{other}/"
-    six = await env.run(limb.list_kv_clusters, KvClusterListRequest(site="six", zone="az1"))
-    assert [c.name for c in six.clusters] == ["ocp4-prod-kv-six-a"]
+    prep = await env.run(limb.list_kv_clusters, KvClusterListRequest(site="five", zone="az1", lifecycle="prep"))
+    assert [(c.name, c.zone) for c in prep.clusters] == [("ocp4-prep-kv-five-az1-a", "az1")]
+    assert prep.folder == "sites/five/mces/ocp4-prep-seed-five-az1-*/hostedClusters/"
+    az2 = await env.run(limb.list_kv_clusters, KvClusterListRequest(site="five", zone="az2", lifecycle="prod"))
+    assert [(c.name, c.zone) for c in az2.clusters] == [("ocp4-prod-kv-five-az2-f", "az2")]
+    assert az2.folder == "sites/five/mces/ocp4-prod-seed-five-az2-*/hostedClusters/"
+    six = await env.run(limb.list_kv_clusters, KvClusterListRequest(site="six", zone="az1", lifecycle="prod"))
+    assert [c.name for c in six.clusters] == ["ocp4-prod-kv-six-az1-a"]
 
 
 async def test_a_zone_without_a_seed_folder_is_an_empty_list_that_still_names_the_folder(env, monkeypatch, tmp_path):
     origin, head = _day1_origin(tmp_path, {"sites/five/values.yaml": "x: 1\n"})
     monkeypatch.setattr(limb, "_settings", _kv_settings(origin))
-    listed = await env.run(limb.list_kv_clusters, KvClusterListRequest(site="five", zone="az3"))
+    listed = await env.run(limb.list_kv_clusters, KvClusterListRequest(site="five", zone="az3", lifecycle="prod"))
     assert listed == KvClusterList(
-        clusters=[], buffer_percent=15, revision=head, folder="sites/five/mces/ocp4-seed-five-3/hostedClusters/")
-    nowhere = await env.run(limb.list_kv_clusters, KvClusterListRequest(site="nowhere", zone="az1"))
+        clusters=[], buffer_percent=15, revision=head,
+        folder="sites/five/mces/ocp4-prod-seed-five-az3-*/hostedClusters/")
+    nowhere = await env.run(limb.list_kv_clusters, KvClusterListRequest(site="nowhere", zone="az1", lifecycle="prod"))
     assert nowhere.clusters == []
 
 
+async def test_a_request_without_a_lifecycle_is_refused_for_good_before_any_git(env, monkeypatch):
+    """Only a run recorded before the lifecycle filter asks without one: refused, never guessed."""
+    from temporalio.exceptions import ApplicationError
+
+    async def forbidden(**_kwargs):
+        raise AssertionError("day1 was read for a request without a lifecycle")
+
+    monkeypatch.setattr(day1_clusters, "list_kv_clusters", forbidden)
+    with pytest.raises(ApplicationError) as caught:
+        await env.run(limb.list_kv_clusters, KvClusterListRequest(site="five", zone="az1"))
+    assert caught.value.type == Day1QueryInvalidError.__name__ and caught.value.non_retryable
+    assert "without a lifecycle" in caught.value.message
+
+
 async def test_a_duplicate_key_in_a_shared_layer_is_reported_and_blocks_no_cluster(env, monkeypatch, tmp_path):
-    seed = "sites/five/mces/ocp4-seed-five-1/hostedClusters"
+    seed = "sites/five/mces/ocp4-prod-seed-five-az1-a/hostedClusters"
     origin, _ = _day1_origin(tmp_path, {
         "sites/configValues.yaml": "mastertag: 4.18.1\nmastertag: 4.18.2\n",
-        f"{seed}/ocp4-prod-kv-five-a.yaml": _ZONED.format(zone="az1"),
+        f"{seed}/ocp4-prod-kv-five-az1-a.yaml": _ZONED.format(zone="az1"),
     })
     monkeypatch.setattr(limb, "_settings", _kv_settings(origin))
-    listed = await env.run(limb.list_kv_clusters, KvClusterListRequest(site="five", zone="az1"))
+    listed = await env.run(limb.list_kv_clusters, KvClusterListRequest(site="five", zone="az1", lifecycle="prod"))
     only = listed.clusters[0]
     assert only.zone == "az1" and only.id == "a" and "written twice" in only.problems[0]
 
 
 async def test_a_new_cluster_file_is_seen_by_the_first_listing_after_its_commit(env, monkeypatch, tmp_path):
     """Git stays the only source of truth: the snapshot is asked for main's head every time."""
-    seed = "sites/five/mces/ocp4-seed-five-1/hostedClusters"
-    origin, first_head = _day1_origin(tmp_path, {f"{seed}/ocp4-prod-kv-five-a.yaml": _ZONED.format(zone="az1")})
+    seed = "sites/five/mces/ocp4-prod-seed-five-az1-a/hostedClusters"
+    origin, first_head = _day1_origin(tmp_path, {f"{seed}/ocp4-prod-kv-five-az1-a.yaml": _ZONED.format(zone="az1")})
     monkeypatch.setattr(limb, "_settings", _kv_settings(origin))
-    request = KvClusterListRequest(site="five", zone="az1")
-    assert [c.name for c in (await env.run(limb.list_kv_clusters, request)).clusters] == ["ocp4-prod-kv-five-a"]
+    request = KvClusterListRequest(site="five", zone="az1", lifecycle="prod")
+    assert [c.name for c in (await env.run(limb.list_kv_clusters, request)).clusters] == ["ocp4-prod-kv-five-az1-a"]
     again = await env.run(limb.list_kv_clusters, request)
     assert again.revision == first_head
     work = tmp_path / "work"
     _run_git("clone", "-q", str(origin), str(work), cwd=tmp_path)
-    (work / seed / "ocp4-prod-kv-five-b.yaml").write_text(_ZONED.format(zone="az1"))
+    (work / seed / "ocp4-prod-kv-five-az1-b.yaml").write_text(_ZONED.format(zone="az1"))
     _run_git("add", "-A", cwd=work)
     _run_git("-c", "user.name=seed", "-c", "user.email=seed@test", "commit", "-q", "-m", "a standby cluster", cwd=work)
     _run_git("push", "-q", "origin", "HEAD:main", cwd=work)
     after = await env.run(limb.list_kv_clusters, request)
-    assert [c.name for c in after.clusters] == ["ocp4-prod-kv-five-a", "ocp4-prod-kv-five-b"] and after.revision != first_head
+    assert [c.name for c in after.clusters] == ["ocp4-prod-kv-five-az1-a", "ocp4-prod-kv-five-az1-b"]
+    assert after.revision != first_head
 
 
 @pytest.mark.parametrize(("site", "zone"), [("../five", "az1"), ("five", "a"), ("five", "az1/.."), ("fi*e", "az1"), ("five", "az0")])
 def test_a_request_that_could_shape_a_path_never_reaches_the_reader(site, zone):
     with pytest.raises(ValueError):
-        KvClusterListRequest(site=site, zone=zone)
+        KvClusterListRequest(site=site, zone=zone, lifecycle="prod")
+
+
+@pytest.mark.parametrize("lifecycle", ["../prod", "Prod", "pr*d", ""])
+def test_a_lifecycle_that_could_shape_a_path_never_reaches_the_reader(lifecycle):
+    with pytest.raises(ValueError):
+        KvClusterListRequest(site="five", zone="az1", lifecycle=lifecycle)
 
 
 def test_the_boundary_models_take_what_an_older_or_newer_side_sends():

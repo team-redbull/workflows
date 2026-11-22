@@ -52,6 +52,7 @@ from shared.models.vm_lifecycle import (
     VmCreated,
     VmCreateRequest,
 )
+from shared.cluster_names import parse_mce_cluster
 from shared.workflow_ids import create_vm_slot_workflow_id, kv_zone_lock_workflow_id
 from tests.kv_fleet import GIB, FakeKvCluster, KvFleet, node, stopped_vm
 from tests.manual_time import ManualTime
@@ -61,14 +62,16 @@ from workflow_domains.vm_lifecycle.kv_zone_lock import KvZoneLockWorkflow
 
 SITE = "five"
 MCE = "ocp4-prod-mce-five-a"
-A, B, C = "ocp4-prod-kv-five-a", "ocp4-prod-kv-five-b", "ocp4-prod-kv-five-c"
+A, B, C = "ocp4-prod-kv-five-az1-a", "ocp4-prod-kv-five-az1-b", "ocp4-prod-kv-five-az1-c"
 
 
-def vm_input(infra_env: str = "c200-kv32-five-az1", *, mce: str = MCE, namespace: str = "inventory") -> CreateVmInput:
-    flavor, size, *site, zone = infra_env.split("-")
+def vm_input(infra_env: str = "c200-kv32-az1", *, mce: str = MCE, namespace: str = "inventory") -> CreateVmInput:
+    """What the edge builds: the flavor, size and zone from the InfraEnv, the site and lifecycle from the MCE."""
+    flavor, size, zone = infra_env.split("-")
     cpu = int(size.removeprefix("kv"))
-    return CreateVmInput(mce_cluster=mce, infra_env=infra_env, namespace=namespace, flavor=flavor, site="-".join(site),
-                         zone=zone, cpu=cpu, memory_gib=cpu * 8)
+    parsed_mce = parse_mce_cluster(mce)
+    return CreateVmInput(mce_cluster=mce, infra_env=infra_env, namespace=namespace, flavor=flavor, site=parsed_mce.site,
+                         zone=zone, cpu=cpu, memory_gib=cpu * 8, lifecycle=parsed_mce.lifecycle)
 
 
 def big(name: str) -> list[dict]:
@@ -227,7 +230,7 @@ class TestOneVm:
             assert result.vm_name == "ocp-c200-kv32-five-" + result.mac.replace(":", "")
             assert result.mac.startswith(cluster.values.mac_prefix + ":")
             assert (result.flavor, result.cpu, result.memory_gib, result.namespace) == ("c200", 32, 256, "inventory")
-            assert (result.site, result.zone, result.mce_cluster, result.infra_env) == (SITE, "az1", MCE, "c200-kv32-five-az1")
+            assert (result.site, result.zone, result.mce_cluster, result.infra_env) == (SITE, "az1", MCE, "c200-kv32-az1")
             assert (result.buffer_percent, result.day1_revision, result.leases, result.draws, result.created) == (15, "0123abc", 1, 1, True)
             assert result.root_disk_phase == "Succeeded" and result.not_read == []
             assert [(row.name, row.fits, row.skip_reason) for row in result.table] == [(A, True, None)]
@@ -259,11 +262,11 @@ class TestOneVm:
 
         cluster.create_vm = spy
         async with Harness(fleet) as h:
-            result = await h.create(vm_input("c200n-kv8-five-az1"))
+            result = await h.create(vm_input("c200n-kv8-az1"))
         namespace, body = seen[0]
         assert namespace == "inventory"
         assert body["metadata"]["labels"] | {"redbull.io/created-by": "x"} == {
-            "redfish-enabled": "true", "redbull.io/flavor": "c200n", "redbull.io/size": "8c", "redbull.io/site": "five",
+            "redfish-enabled": "true", "redbull.io/flavor": "c200n", "redbull.io/size": "kv8", "redbull.io/site": "five",
             "topology.kubernetes.io/zone": "az1", "redbull.io/role": "worker", "redbull.io/mce": MCE,
             "redbull.io/created-by": "x",
         }
@@ -300,9 +303,9 @@ class TestOneVm:
     async def test_vms_of_two_sizes_share_the_zone_and_its_room(self):
         fleet = fleet_of(A)
         async with Harness(fleet) as h:
-            big_vm = await h.create(vm_input("c200-kv64-five-az1"))   # 60 cores
-            small = await h.create(vm_input("c200-kv16-five-az1"))    # + 15 = 75 <= 85
-            failed = await h.failure(await h.start(vm_input("c200-kv16-five-az1")))  # + 15 = 90 > 85
+            big_vm = await h.create(vm_input("c200-kv64-az1"))   # 60 cores
+            small = await h.create(vm_input("c200-kv16-az1"))    # + 15 = 75 <= 85
+            failed = await h.failure(await h.start(vm_input("c200-kv16-az1")))  # + 15 = 90 > 85
         assert big_vm.kv_cluster == small.kv_cluster == A
         assert cause(failed).type == NoKvClusterFitsError.__name__
         assert len(fleet.clusters[A].vms) == 2 and (await fleet.clusters[A].requested_cpu_millicores()) == 75_000
@@ -418,12 +421,12 @@ class TestClustersThatCannotAnswer:
         fleet = fleet_of(B)
         # day1 also lists A, and the worker polling A's queue is really B's twin, misnamed.
         fleet.list_in_day1(A, SITE, "az1")
-        imposter = FakeKvCluster("ocp4-prod-kv-five-z", nodes=big("z"), mac_prefix="0e:0f:01")
+        imposter = FakeKvCluster("ocp4-prod-kv-five-az1-z", nodes=big("z"), mac_prefix="0e:0f:01")
         async with Harness(fleet) as h:
             async with Worker(h.client, task_queue=vm_lifecycle_activity_queue(A), activities=fleet.cluster_activities(imposter)):
                 result = await h.create()
         assert result.kv_cluster == B and imposter.vms == {}
-        assert result.table[0].skip_reason == "unreachable" and "ocp4-prod-kv-five-z" in result.table[0].skip_detail
+        assert result.table[0].skip_reason == "unreachable" and "ocp4-prod-kv-five-az1-z" in result.table[0].skip_detail
 
     async def test_a_worker_that_only_ever_fails_is_given_up_on_not_waited_for(self):
         """Whatever keeps a figures read from answering, the cluster ends as a row."""
@@ -459,14 +462,14 @@ class TestClustersThatCannotAnswer:
         fleet.add(A, "az1", nodes=big(A)).add_pod(f"{A}-n1", 60_000, 0)
         fleet.add(B, "az1", nodes=[node("b1", 16, 128)])
         fleet.add(C, "az1", nodes=big(C))
-        fleet.add("ocp4-prod-kv-five-d", "az1", nodes=[node("d1", 64, 512, cordoned=True)])
+        fleet.add("ocp4-prod-kv-five-az1-d", "az1", nodes=[node("d1", 64, 512, cordoned=True)])
         async with Harness(fleet, down={C}) as h:
             handle = await h.start()
             failed = await h.failure(handle, step=timedelta(seconds=10))
             error = cause(failed)
             assert error.type == NoKvClusterFitsError.__name__
             for words in (f"{A} would go past the placement buffer", f"{B} have no single node with the room",
-                          f"{C} have no vm-lifecycle worker answering", "ocp4-prod-kv-five-d have no usable node",
+                          f"{C} have no vm-lifecycle worker answering", "ocp4-prod-kv-five-az1-d have no usable node",
                           "32 vCPU / 256 GiB", "pod request 30000 m / 257 GiB", "15% buffer", "Nothing was created"):
                 assert words in error.message, words
             assert all(cluster.vms == {} for cluster in fleet.clusters.values())
@@ -482,10 +485,10 @@ class TestTheListFromDay1:
     async def test_a_zone_with_no_cluster_fails_at_once_naming_the_folder(self):
         fleet = fleet_of(A)
         async with Harness(fleet) as h:
-            failed = await h.failure(await h.start(vm_input("c200-kv32-five-az2")))
+            failed = await h.failure(await h.start(vm_input("c200-kv32-az2")))
             error = cause(failed)
             assert error.type == NoKvClusterError.__name__
-            assert "sites/five/mces/ocp4-seed-five-2/hostedClusters/" in error.message and "0123abc" in error.message
+            assert "sites/five/mces/ocp4-prod-seed-five-az2-*/hostedClusters/" in error.message and "0123abc" in error.message
             assert fleet.clusters[A].calls == []
             # The lock was never asked for: nothing of the zone exists.
             with pytest.raises(Exception):  # noqa: B017, PT011
@@ -496,7 +499,7 @@ class TestTheListFromDay1:
         wrong_zone = fleet.add(A, "az1", nodes=big(A), in_day1=False)
         fleet.list_in_day1(A, SITE, "az1", confirmed_zone=None,
                            problems=["nodepool workers labels its nodes topology.kubernetes.io/zone=az2, not this seed's az1"])
-        fleet.list_in_day1("ocp4-test-kubevirt-five", SITE, "az1", problems=["its name is not ocp4-<lifecycle>-kv-<site>-<id>"])
+        fleet.list_in_day1("ocp4-test-kubevirt-five", SITE, "az1", problems=["its name is not ocp4-<lifecycle>-kv-<site>-<zone>-<id>"])
         async with Harness(fleet) as h:
             result = await h.create()
         assert result.kv_cluster == B and wrong_zone.calls == []
@@ -671,11 +674,14 @@ def dead_and_alive(dead: int, alive: int = 1) -> tuple[KvFleet, list[str], list[
     """A zone whose first `dead` clusters (the oldest) have no worker, and then `alive` that do."""
     letters = "abcdefghijklmnopqrstuvwxyz"
     fleet = KvFleet()
-    names = [f"ocp4-prod-kv-five-{letter}" for letter in letters[: dead + alive]]
-    # More than 26 clusters in one zone: a second lifecycle keeps the names within the convention.
-    names += [f"ocp4-prep-kv-five-{letter}" for letter in letters[: max(0, dead + alive - 26)]]
+    names = [f"ocp4-prod-kv-five-az1-{letter}" for letter in letters[: dead + alive]]
+    # More than 26 clusters in one zone cannot be named in one lifecycle; the test is about
+    # the leases only, so the fake lists the rest, named `prep`, among the prod seeds' (day1
+    # itself would list them with a lifecycle problem).
+    names += [f"ocp4-prep-kv-five-az1-{letter}" for letter in letters[: max(0, dead + alive - 26)]]
     for name in names:
-        fleet.add(name, "az1", nodes=big(name))
+        fleet.add(name, "az1", nodes=big(name), in_day1=False)
+        fleet.list_in_day1(name, SITE, "az1", lifecycle="prod")
     ordered = [entry.name for entry in fleet.entries(SITE, "az1")]
     return fleet, ordered[:dead], ordered[dead:]
 
@@ -1125,7 +1131,7 @@ class TestTheBrainFalling:
         hands them to the new worker once the old one's sticky queue goes unanswered."""
         fleet = fleet_of(A)
         fleet.clusters[A].delays["create_vm"] = 1.5
-        small = vm_input("c200-kv8-five-az1")
+        small = vm_input("c200-kv8-az1")
         async with Harness(fleet, quick=True, real_time=True) as h:
             holder = await h.start(small)
             await h.until_phase(holder, "creating-vm")
@@ -1145,7 +1151,7 @@ class TestTheLockFalling:
         fleet = fleet_of(A, replaying=True)
         fleet.clusters[A].delays["create_vm"] = 1.5
         async with Harness(fleet) as h:
-            small = vm_input("c200-kv8-five-az1")  # four of them fit on the one cluster
+            small = vm_input("c200-kv8-az1")  # four of them fit on the one cluster
             holder = await h.start(small)
             await h.until_phase(holder, "creating-vm")
             waiters = [await h.start(small) for _ in range(3)]
@@ -1397,7 +1403,7 @@ class TestAClustersApiFalling:
 class TestSlotReuse:
     async def test_a_second_run_on_the_same_workflow_id_makes_a_second_vm_never_the_first_again(self):
         fleet = fleet_of(A)
-        slot = create_vm_slot_workflow_id(MCE, "c200-kv32-five-az1", 1)
+        slot = create_vm_slot_workflow_id(MCE, "c200-kv32-az1", 1)
         async with Harness(fleet) as h:
             first_handle = await h.start(workflow_id=slot)
             first = await h.result(first_handle)
@@ -1413,7 +1419,7 @@ class TestSlotReuse:
     async def test_a_slot_reused_after_its_run_was_terminated_in_the_line_is_served_once(self):
         fleet = fleet_of(A)
         fleet.clusters[A].delays["create_vm"] = 2.0
-        slot = create_vm_slot_workflow_id(MCE, "c200-kv32-five-az1", 7)
+        slot = create_vm_slot_workflow_id(MCE, "c200-kv32-az1", 7)
         async with Harness(fleet) as h:
             holder = await h.start()
             await h.until_phase(holder, "creating-vm")
@@ -1437,15 +1443,16 @@ def a_fleet(sites: tuple[str, ...], zones: tuple[str, ...], per_zone: int, *, co
     for site in sites:
         for zone_index, zone in enumerate(zones):
             for index in range(per_zone):
-                # Ids run on through the site's zones: a cluster's name carries no zone.
+                # Ids run on through the site's zones (each zone could start again at `a`,
+                # since the name carries the zone; running on keeps every name distinct at a glance).
                 letter = "abcdefghijklmnopqrstuvwxyz"[zone_index * per_zone + index]
-                name = f"ocp4-prod-kv-{site}-{letter}"
+                name = f"ocp4-prod-kv-{site}-{zone}-{letter}"
                 fleet.add(name, zone, nodes=[node(f"{name}-n1", cores, 10_000)])
     return fleet
 
 
 def infra_env(site: str, zone: str, cpu: int = 32) -> CreateVmInput:
-    return vm_input(f"c200-kv{cpu}-{site}-{zone}", mce=f"ocp4-prod-mce-{site}-a")
+    return vm_input(f"c200-kv{cpu}-{zone}", mce=f"ocp4-prod-mce-{site}-a")
 
 
 class TestZonesAndSites:
@@ -1533,7 +1540,7 @@ class TestZonesAndSites:
                 down.add(own[0])
                 unreadable = fleet.clusters[own[1]]
                 unreadable.fail("list_nodes", *[KvClusterApiError("503: etcd leader changed")] * 50)
-                fleet.list_in_day1(f"ocp4-test-kubevirt-{site}", site, zone, problems=["its name is not ocp4-<lifecycle>-kv-<site>-<id>"])
+                fleet.list_in_day1(f"ocp4-test-kubevirt-{site}", site, zone, problems=["its name is not ocp4-<lifecycle>-kv-<site>-<zone>-<id>"])
                 healthy[(site, zone)] = own[2:]
         async with Harness(fleet, down=down, quick=True) as h:
             handles = {key: [await h.start(infra_env(*key)) for _ in range(4)] for key in healthy}

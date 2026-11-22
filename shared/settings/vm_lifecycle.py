@@ -39,10 +39,10 @@ class VmLifecycleActivitySettings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     # The KV cluster this worker runs in: EXACTLY the day1 file's name
-    # (`ocp4-prod-kv-five-a`), because it builds the queue the worker polls and
+    # (`ocp4-prod-kv-five-az1-a`), because it builds the queue the worker polls and
     # the hub builds the same queue from the day1 list. NEVER canonicalised.
-    # Parsed at startup as `ocp4-<lifecycle>-kv-<site>-<id>`: the site is read
-    # from it, so there is no separate SITE to keep in step.
+    # Parsed at startup as `ocp4-<lifecycle>-kv-<site>-<zone>-<id>`: the site and
+    # the zone are read from it, so there is no separate SITE or ZONE to keep in step.
     kv_cluster: str
 
     # The first three octets of every MAC this cluster's VMs get: `0e` + the
@@ -125,6 +125,13 @@ class VmLifecycleActivitySettings(BaseSettings):
     def site(self) -> str:
         """The site this cluster is at, read from its name."""
         return parse_kv_cluster(self.kv_cluster).site
+
+    @property
+    def zone(self) -> str:
+        """The zone this cluster is in, read from its name."""
+        zone = parse_kv_cluster(self.kv_cluster).zone
+        assert zone is not None  # a KV cluster's name always carries its zone
+        return zone
 
     @property
     def redfish_label(self) -> tuple[str, str]:

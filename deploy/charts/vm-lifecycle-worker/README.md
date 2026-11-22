@@ -32,12 +32,12 @@ The zone's list of KV clusters is not this worker's: it is day1's, read on the h
 ## `kvCluster` is the day1 file name
 
 A create-vm run reads its zone's KV clusters from day1,
-`sites/<site>/mces/ocp4-seed-<site>-<zone number>/hostedClusters/<kv cluster>.yaml`, and sends
+`sites/<site>/mces/ocp4-<lifecycle>-seed-<site>-<zone>-<id>/hostedClusters/<kv cluster>.yaml`, and sends
 each cluster's work to `vm-lifecycle-activity-<that file's name>`. This worker polls
 `vm-lifecycle-activity-<kvCluster>`. **The two must be the same string**, so `kvCluster` is
-exactly the day1 file's name without `.yaml` (`ocp4-prod-kv-five-a`), never abbreviated and
-never canonicalised. It must be `ocp4-<lifecycle>-kv-<site>-<id>`: the worker reads its site
-from it and refuses a VM of another site.
+exactly the day1 file's name without `.yaml` (`ocp4-prod-kv-five-az1-a`), never abbreviated and
+never canonicalised. It must be `ocp4-<lifecycle>-kv-<site>-<zone>-<id>` (the platform naming
+convention): the worker reads its site and zone from it and refuses a VM of another site or zone.
 
 A wrong value is not silent. The render fails on a name of another shape; a name of the right
 shape that is not the day1 file's leaves the cluster a `no-worker` row in every run of its
@@ -53,7 +53,7 @@ when the KV cluster is created, through day2, never typed in by hand:
 ```bash
 helm upgrade --install vm-lifecycle-worker <chart dir> \
   -n redbull-workflows \
-  --set kvCluster=ocp4-prod-kv-five-a \
+  --set kvCluster=ocp4-prod-kv-five-az1-a \
   --set config.vmMacPrefix=0e:03:f2 \
   --set vm.storageClassName=<an Immediate, RWX-Filesystem class> \
   --set temporal.host=<the hub's Temporal Route>:443 \
@@ -124,7 +124,7 @@ minutes later, by deleting its VM again (`VmRootDiskNotBoundError`). ceph-rbd re
 The render fails (and so does the worker's start, on the same rules) without `kvCluster`,
 `config.vmMacPrefix`, `vm.storageClassName` or `temporal.host`; on a `vm.networkName` that is not
 `<namespace>/<name>`; on a `kvCluster`
-that is not `ocp4-<lifecycle>-kv-<site>-<id>`; and on a prefix that is not three hex octets
+that is not `ocp4-<lifecycle>-kv-<site>-<zone>-<id>`; and on a prefix that is not three hex octets
 starting with `0e`. A KV cluster whose worker does not start is skipped as `no-worker` by
 every run of its zone, 30 seconds each.
 

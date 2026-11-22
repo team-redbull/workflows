@@ -25,9 +25,12 @@ from shared.cluster_names import name_token, zone_number
 class CreateVmInput(BaseModel):
     """Input to CreateVmWorkflow: which InfraEnv needs a VM, and everything derived from it.
 
-    `flavor`, `site`, `zone`, `cpu` and `memory_gib` are derived ONCE at the
-    API edge from the InfraEnv's name (shared/infraenv_names.py) and carried,
-    never re-derived on replay — the provision-dell-server region precedent.
+    `flavor`, `zone`, `cpu` and `memory_gib` are derived ONCE at the API edge
+    from the InfraEnv's name (shared/infraenv_names.py), `site` and `lifecycle`
+    from the MCE's (the InfraEnv's name carries no site), and carried, never
+    re-derived on replay — the provision-dell-server region precedent.
+    `lifecycle` (2026-11-22) picks the seeds whose KV clusters may hold the VM;
+    None only in a run recorded before it, which the day1 list then refuses.
     `namespace` is the VM's namespace on the chosen KV cluster, verbatim: a
     kubevirt-redfish chassis namespace the platform created, never this run.
     """
@@ -40,6 +43,7 @@ class CreateVmInput(BaseModel):
     zone: str = Field(min_length=1)
     cpu: int = Field(ge=1)
     memory_gib: int = Field(ge=1)
+    lifecycle: str | None = None
 
 
 class CreateVmRunArgs(BaseModel):
@@ -52,11 +56,13 @@ class CreateVmRunArgs(BaseModel):
 
 
 class KvClusterListRequest(BaseModel):
-    """Which zone's KV clusters to list; the tokens are validated so the day1 path they
-    build holds no `/`, `..` or glob character."""
+    """Which zone's KV clusters to list, and of which lifecycle's seeds (the MCE's); the
+    tokens are validated so the day1 path they build holds no `/`, `..` or glob character.
+    `lifecycle` is None only from a run recorded before it, and the limb refuses that."""
 
     site: str
     zone: str
+    lifecycle: str | None = None
 
     @field_validator("site")
     @classmethod
@@ -69,14 +75,19 @@ class KvClusterListRequest(BaseModel):
         zone_number(value)
         return value
 
+    @field_validator("lifecycle")
+    @classmethod
+    def _lifecycle(cls, value: str | None) -> str | None:
+        return None if value is None else name_token(value, "lifecycle")
+
 
 class KvClusterEntry(BaseModel):
-    """One file of the zone's seed folder.
+    """One file of a seed folder of the zone.
 
     `name` is the day1 file's stem, and so the cluster's name everywhere: the
     queue its worker polls and the `KV_CLUSTER` that worker is deployed with.
     `id` is the sequence letter its name ends with (creation order), None when
-    the name is not `ocp4-<lifecycle>-kv-<site>-<id>`. `problems` is why the
+    the name is not `ocp4-<lifecycle>-kv-<site>-<zone>-<id>`. `problems` is why the
     file cannot be used as it is (its NodePools name another zone, or none; a
     name outside the convention; a key written twice): an entry with any is
     listed and NEVER chosen.

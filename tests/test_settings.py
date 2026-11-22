@@ -181,7 +181,7 @@ class TestVmLifecycleSettings:
                            "HEADROOM_BUFFER_PERCENT": "999", "DAY1_REPO_URL": "git@x:y.git"}.items():
             monkeypatch.setenv(key, value)
         parsed = VmLifecycleActivitySettings()
-        assert parsed.kv_cluster == "ocp4-prod-kv-five-a"
+        assert parsed.kv_cluster == "ocp4-prod-kv-five-az1-a"
         for gone in ("kv_capacity_url_template", "kv_vm_api_token", "kv_agent_ca", "headroom_buffer_percent", "day1_repo_url"):
             assert not hasattr(parsed, gone)
 
@@ -189,7 +189,7 @@ class TestVmLifecycleSettings:
         from shared.consts import vm_lifecycle_activity_queue
         from shared.settings.vm_lifecycle import VmLifecycleActivitySettings
 
-        assert vm_lifecycle_activity_queue(VmLifecycleActivitySettings().kv_cluster) == "vm-lifecycle-activity-ocp4-prod-kv-five-a"
+        assert vm_lifecycle_activity_queue(VmLifecycleActivitySettings().kv_cluster) == "vm-lifecycle-activity-ocp4-prod-kv-five-az1-a"
 
 
 class TestClusterLifecycleSettings:

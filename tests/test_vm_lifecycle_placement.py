@@ -21,7 +21,7 @@ def figures(
     stopped: tuple[int, int, int] = (0, 0, 0),
     allocatable: tuple[int, int] | None = None,
     readable: bool = True,
-    name: str = "ocp4-prod-kv-five-a",
+    name: str = "ocp4-prod-kv-five-az1-a",
 ) -> KvClusterFigures:
     """Figures from node HEADROOM pairs (cores, GiB). `allocatable` defaults to headroom + pods."""
     headroom = [KvNodeHeadroom(name=f"n{i}", cpu_millicores=c * 1000, memory_bytes=m * GIB) for i, (c, m) in enumerate(nodes)]
@@ -178,7 +178,7 @@ class TestTheDesignsExample:
 class TestTheTable:
     def test_a_row_carries_the_figures_and_the_verdict(self):
         answer = figures([(100, 1000)])
-        row = placement.row("ocp4-prod-kv-five-a", answer, judge(answer, *KV32, 15))
+        row = placement.row("ocp4-prod-kv-five-az1-a", answer, judge(answer, *KV32, 15))
         assert row.fits and row.skip_reason is None and row.figures == answer and row.cpu_fill_after == pytest.approx(0.3)
 
     def test_the_summary_names_the_clusters_per_reason_in_the_tables_order(self):

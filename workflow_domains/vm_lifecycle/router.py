@@ -6,10 +6,12 @@ progress and the result. PATHS ARE `/workflows/<domain>/<workflow>`: the
 domain prefix lives here, and every workflow of the domain adds its own path.
 
 The request is the smallest thing that names the work — the MCE and the
-InfraEnv — and the edge derives what the run carries from the InfraEnv's name,
-`<flavor>-kv<cpu>-<site>-<zone>`: the flavor, the VM's size, the site and the
-zone (CLAUDE.md §4: derived ONCE here, never on replay). The MCE's own site
-must be the InfraEnv's. A VM's name is drawn inside the run (by the worker in
+InfraEnv — and the edge derives what the run carries from their names (the
+platform naming convention): from the InfraEnv's, `<flavor>-kv<cpu>-<zone>`, the
+flavor, the VM's size and the zone; from the MCE's,
+`ocp4-<lifecycle>-mce-<site>-<id>`, the site and the lifecycle — an InfraEnv
+belongs to one MCE and carries no site of its own (CLAUDE.md §4: derived ONCE
+here, never on replay). A VM's name is drawn inside the run (by the worker in
 the chosen KV cluster), so a run is a SLOT of its InfraEnv on its MCE
 (shared/workflow_ids.py), filled by workflow_domains/routers/slots.py exactly
 as add-server-to-mce's pool draws.
@@ -21,7 +23,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from temporalio.client import Client
 
-from shared.cluster_names import canonical_mce_cluster, site_of_mce_cluster
+from shared.cluster_names import canonical_mce_cluster, parse_mce_cluster
 from shared.consts import CREATE_VM_WORKFLOW_QUEUE
 from shared.infraenv_names import InfraEnvKind, parse_infraenv, vm_name
 from shared.models.vm_lifecycle import CreateVmInput, CreateVmRunArgs
@@ -58,15 +60,16 @@ class CreateVmRequest(BaseModel):
         description=(
             "The MCE whose InfraEnv the VM is for, with or without its `ocp4-` prefix — "
             "`prod-mce-five-a` and `ocp4-prod-mce-five-a` name the same cluster. Must be "
-            "named `ocp4-<lifecycle>-mce-<site>-<id>`, and its site must be the InfraEnv's."
+            "named `ocp4-<lifecycle>-mce-<site>-<id>`: its site is the VM's, and its lifecycle picks "
+            "the seeds whose KV clusters may hold it."
         ),
     )
     infra_env: str = Field(
         min_length=1,
         description=(
-            "A KubeVirt InfraEnv, `<flavor>-kv<cpu>-<site>-<zone>` (`c200-kv32-five-az1`): the site "
-            "and zone pick the KV clusters, `kv<cpu>` the VM's vCPUs (memory is cpu × 8 GiB). A "
-            "`-mtl-` InfraEnv has servers, not VMs, and is refused."
+            "A KubeVirt InfraEnv, `<flavor>-kv<cpu>-<zone>` (`c200-kv32-az1`): the zone picks the "
+            "KV clusters, `kv<cpu>` the VM's vCPUs (memory is cpu × 8 GiB). A `-mtl-` InfraEnv has "
+            "servers, not VMs, and is refused."
         ),
     )
     namespace: str = Field(
@@ -91,7 +94,7 @@ class CreateVmRequest(BaseModel):
     @classmethod
     def _canonical_named_mce(cls, value: str) -> str:
         name = canonical_mce_cluster(value)
-        site_of_mce_cluster(name)  # MceNameError is a ValueError: a 422 naming the shape
+        parse_mce_cluster(name)  # MceNameError is a ValueError: a 422 naming the shape
         return name
 
     @field_validator("infra_env")
@@ -103,30 +106,27 @@ class CreateVmRequest(BaseModel):
                 f"InfraEnv {value!r} is bare metal (`-mtl-`): it takes servers from server-scan "
                 "through add-server-to-mce, not VMs"
             )
-        assert parsed.cpu is not None  # a KubeVirt InfraEnv always has its vCPUs
-        # The VM name the cluster's worker will build must be a Kubernetes name:
-        # refused HERE, where it is a 422, not there, where it fails the run.
-        vm_name(parsed.flavor, parsed.cpu, parsed.site, "00:00:00:00:00:00")
         return value
 
     @model_validator(mode="after")
-    def _the_mce_is_at_the_infraenvs_site(self) -> CreateVmRequest:
-        mce_site, infraenv_site = site_of_mce_cluster(self.mce_cluster), parse_infraenv(self.infra_env).site
-        if mce_site != infraenv_site:
-            raise ValueError(
-                f"MCE {self.mce_cluster} is at site {mce_site!r} and InfraEnv {self.infra_env} at "
-                f"{infraenv_site!r}: a VM boots on its own site's inventory network"
-            )
+    def _the_vm_name_fits(self) -> CreateVmRequest:
+        """The VM name the cluster's worker will build — the InfraEnv's flavor and size, the
+        MCE's site — must be a Kubernetes name: refused HERE, where it is a 422, not there,
+        where it fails the run."""
+        parsed = parse_infraenv(self.infra_env)
+        assert parsed.cpu is not None  # a KubeVirt InfraEnv always has its vCPUs
+        vm_name(parsed.flavor, parsed.cpu, parse_mce_cluster(self.mce_cluster).site, "00:00:00:00:00:00")
         return self
 
     def run_input(self) -> CreateVmInput:
-        """What ONE run carries: the request plus the flavor, site, zone and size derived here."""
-        parsed = parse_infraenv(self.infra_env)
+        """What ONE run carries: the request plus what the two names say — the flavor, zone and
+        size (the InfraEnv's), the site and lifecycle (the MCE's)."""
+        parsed, mce = parse_infraenv(self.infra_env), parse_mce_cluster(self.mce_cluster)
         assert parsed.cpu is not None and parsed.memory_gib is not None  # validated above
         return CreateVmInput(
             mce_cluster=self.mce_cluster, infra_env=self.infra_env, namespace=self.namespace,
-            flavor=parsed.flavor, site=parsed.site, zone=parsed.zone,
-            cpu=parsed.cpu, memory_gib=parsed.memory_gib,
+            flavor=parsed.flavor, site=mce.site, zone=parsed.zone,
+            cpu=parsed.cpu, memory_gib=parsed.memory_gib, lifecycle=mce.lifecycle,
         )
 
 

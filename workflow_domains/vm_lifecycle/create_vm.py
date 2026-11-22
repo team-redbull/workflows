@@ -1,7 +1,7 @@
 """create-vm — ONE Halted VirtualMachine for a KubeVirt InfraEnv, on the OLDEST KV cluster of
 its zone that has room, with a fixed MAC, ready for add-server-to-mce.
 
-An InfraEnv `<flavor>-kv<cpu>-<site>-<zone>` holds VMs of `<cpu>` vCPUs and
+An InfraEnv `<flavor>-kv<cpu>-<zone>` (its site is its MCE's) holds VMs of `<cpu>` vCPUs and
 `<cpu> × 8` GiB. A bare-metal InfraEnv has servers to draw; a KubeVirt one
 has nothing until a VM exists. This run creates it: once it is Halted and
 labelled `redfish-enabled: "true"`, kubevirt-redfish exposes it as a Redfish
@@ -94,7 +94,6 @@ from temporalio.exceptions import (
 )
 
 with workflow.unsafe.imports_passed_through():
-    from shared.cluster_names import seed_cluster
     from shared.consts import (
         CLUSTER_LIFECYCLE_ACTIVITY_QUEUE,
         KV_ZONE_LOCK_WORKFLOW_QUEUE,
@@ -307,7 +306,7 @@ class CreateVmWorkflow:
         # Step 1 — the zone's KV clusters and the buffer, from day1.
         self._phase = "listing-kv-clusters"
         try:
-            zone_request = KvClusterListRequest(site=request.site, zone=request.zone)
+            zone_request = KvClusterListRequest(site=request.site, zone=request.zone, lifecycle=request.lifecycle)
         except ValueError as err:
             # Only a run started around the API can carry these: the edge parses both from
             # the InfraEnv's name. Failed, not hung (a plain error here fails the TASK for ever, §5).
@@ -334,7 +333,7 @@ class CreateVmWorkflow:
                 workflow.logger.warning("day1 %s: %s is not usable for zone %s: %s", listed.revision, entry.path,
                                         request.zone, why)
         if not clusters:
-            folder = listed.folder or f"the day1 folder of seed {seed_cluster(request.site, request.zone)}"  # both validated above
+            folder = listed.folder or f"the day1 seed folders of site {request.site} zone {request.zone}"
             listed_with_problems = (
                 f"; listed with a problem and never used: {placement.summarise_skips(self._table)}" if self._table else ""
             )

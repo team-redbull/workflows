@@ -1,18 +1,22 @@
 """InfraEnv and VM names under the platform naming convention — pure, stdlib only, read on both sides.
 
-An InfraEnv's name states what the hosts in it are, where, and how big:
+The convention is kubevirt-workflows' docs/naming-convention.md (the
+`naming-convention` skill fetches it). An InfraEnv's name states what the hosts
+in it are, how big, and in which zone:
 
-    c200-kv32-five-az1
-     │    │    │    └─ zone, `az<N>`
-     │    │    └────── site (one field or several: `five`, `bat-yam`)
-     │    └─────────── `kv<cpu>`: VirtualMachines of <cpu> vCPUs; `mtl`: bare metal
-     └──────────────── flavor, with its optional variant letter (c200, c200n, c200d…)
+    c200-kv32-az1
+     │    │    └─ zone, `az<N>`
+     │    └────── `kv<cpu>`: VirtualMachines of <cpu> vCPUs; `mtl`: bare metal
+     └─────────── flavor, with its optional variant letter (c200, c200n, c200d…)
 
-  * `<flavor>-mtl-<site>-<zone>`       — bare metal: add-server-to-mce draws
+  * `<flavor>-mtl-<zone>`       — bare metal: add-server-to-mce draws
     physical servers for it;
-  * `<flavor>-kv<cpu>-<site>-<zone>`   — KubeVirt: its hosts are VirtualMachines
+  * `<flavor>-kv<cpu>-<zone>`   — KubeVirt: its hosts are VirtualMachines
     of `<cpu>` vCPUs and `<cpu> × MEMORY_GIB_PER_CPU` GiB, created by create-vm
     on one of the zone's KV clusters.
+
+The SITE is not in the name: an InfraEnv belongs to one MCE, and so to that
+MCE's site (`shared/cluster_names.site_of_mce_cluster`).
 
 A VM of a KubeVirt InfraEnv is `ocp-<flavor>-kv<cpu>-<site>-<its MAC, 12 hex>`
 (`ocp-c200-kv32-five-0e03f2a1b2c3`): the full MAC makes the name unique
@@ -20,10 +24,12 @@ wherever the MAC is, and the zone is NOT in it (a label carries it).
 
 This replaced `<conf>[-<opt>]-zone-<zone>-<cpu>` / `…-metal` and the
 `ocp-<infraenv>-<6 hex>` VM name on 2026-11-20 (no VM of that shape was ever
-created in production: the agents it needed were never deployed).
+created in production: the agents it needed were never deployed), and the
+InfraEnv lost its site (`c200-kv32-five-az1`) on 2026-11-22, when the
+convention left draft.
 
 Lives in `shared/` because both sides apply the rule: the API edge derives
-the flavor, site, zone and VM size from the name (the run carries them, never
+the flavor, zone and VM size from the name (and the site from the MCE's) (the run carries them, never
 re-deriving on replay — the provision-dell-server region precedent), and the
 worker inside the KV cluster names the VM. No I/O, no third-party import.
 """
@@ -43,9 +49,7 @@ MIN_CPU = 1
 MAX_CPU = 256
 
 _SITE = r"[a-z0-9]+(?:-[a-z0-9]+)*"
-_INFRAENV = re.compile(
-    rf"^(?P<flavor>[a-z][0-9a-z]*)-(?P<size>mtl|kv[1-9][0-9]*)-(?P<site>{_SITE})-(?P<zone>az[1-9][0-9]*)$"
-)
+_INFRAENV = re.compile(r"^(?P<flavor>[a-z][0-9a-z]*)-(?P<size>mtl|kv[1-9][0-9]*)-(?P<zone>az[1-9][0-9]*)$")
 _FLAVOR = re.compile(r"^[a-z][0-9a-z]*$")
 _SITE_TOKEN = re.compile(rf"^{_SITE}$")
 # A VirtualMachine's name is a DNS-1123 label: the VM, its DataVolume
@@ -72,35 +76,33 @@ class InfraEnvKind(str, Enum):
 
 @dataclass(frozen=True)
 class ParsedInfraEnv:
-    """What an InfraEnv name says. `cpu`/`memory_gib` are None for bare metal."""
+    """What an InfraEnv name says — never the site, which is its MCE's. `cpu`/`memory_gib`
+    are None for bare metal."""
 
     name: str
     kind: InfraEnvKind
     flavor: str
-    site: str
     zone: str
     cpu: int | None
     memory_gib: int | None
 
 
 def parse_infraenv(name: str) -> ParsedInfraEnv:
-    """`c200n-kv32-bat-yam-az2` -> flavor c200n, 32 vCPUs / 256 GiB, site bat-yam, zone az2."""
+    """`c200n-kv32-az2` -> flavor c200n, 32 vCPUs / 256 GiB, zone az2."""
     match = _INFRAENV.fullmatch(name)
     if match is None:
         raise InfraEnvNameError(
-            f"InfraEnv {name!r} is not named by the convention `<flavor>-kv<cpu>-<site>-<zone>` "
-            "(`c200-kv32-five-az1`) or `<flavor>-mtl-<site>-<zone>`, the zone being `az<N>`"
+            f"InfraEnv {name!r} is not named by the convention `<flavor>-kv<cpu>-<zone>` "
+            "(`c200-kv32-az1`) or `<flavor>-mtl-<zone>`, the zone being `az<N>` (no site: it is the MCE's)"
         )
-    flavor, size, site, zone = match.group("flavor"), match.group("size"), match.group("site"), match.group("zone")
+    flavor, size, zone = match.group("flavor"), match.group("size"), match.group("zone")
     if size == BARE_METAL_SIZE:
-        return ParsedInfraEnv(
-            name=name, kind=InfraEnvKind.METAL, flavor=flavor, site=site, zone=zone, cpu=None, memory_gib=None
-        )
+        return ParsedInfraEnv(name=name, kind=InfraEnvKind.METAL, flavor=flavor, zone=zone, cpu=None, memory_gib=None)
     cpu = int(size.removeprefix(KUBEVIRT_SIZE_PREFIX))
     if not MIN_CPU <= cpu <= MAX_CPU:
         raise InfraEnvNameError(f"InfraEnv {name!r} asks for {cpu} vCPUs; the convention allows {MIN_CPU}..{MAX_CPU}")
     return ParsedInfraEnv(
-        name=name, kind=InfraEnvKind.KUBEVIRT, flavor=flavor, site=site, zone=zone,
+        name=name, kind=InfraEnvKind.KUBEVIRT, flavor=flavor, zone=zone,
         cpu=cpu, memory_gib=cpu * MEMORY_GIB_PER_CPU,
     )
 
@@ -111,7 +113,7 @@ def is_kubevirt(name: str) -> bool:
 
 
 def vm_size(cpu: int) -> str:
-    """`kv<cpu>`: the size field of an InfraEnv's and a VM's name. (The VM's `redbull.io/size` label is `<cpu>c`, the worker's.)"""
+    """`kv<cpu>`: the size field of an InfraEnv's and a VM's name, and the `redbull.io/size` label's value."""
     return f"{KUBEVIRT_SIZE_PREFIX}{cpu}"
 
 

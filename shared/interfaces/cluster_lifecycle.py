@@ -145,7 +145,7 @@ async def list_day1_clusters(query: Day1ClusterQuery) -> Day1ClusterList:
     it and it writes nothing; it answers typed facts about one commit, and the
     answer carries that commit (`revision`).
 
-    `kind` `kv` is a cluster under a SEED folder (`ocp4-seed-<site>-<N>`, zone
+    `kind` `kv` is a cluster under a SEED folder (`ocp4-<lifecycle>-seed-<site>-<zone>-<id>`, zone
     `az<N>`), never one named kubevirt; `hc` is one under any other folder. A
     kv entry whose NodePools do not all label their nodes with the seed's zone,
     or whose name is off the convention, is listed WITH its `problems`.
@@ -175,13 +175,13 @@ async def list_kv_clusters(request: KvClusterListRequest) -> KvClusterList:
     placement buffer every run of the zone must use.
 
     The zone's clusters are the files of ONE folder, its seed's:
-    `sites/<site>/mces/ocp4-seed-<site>-<zone number>/hostedClusters/`
+    `sites/<site>/mces/ocp4-<lifecycle>-seed-<site>-<zone>-<id>/hostedClusters/`
     (`Day1.kv_clusters`, activities/day1_repo.py), read on the commit-keyed
     snapshot of `main`: the remote is asked for its head every time, and a
     clone happens only when the head moved. Each file is one entry, sorted by
     the sequence letter its name ends with. An entry's `zone` is set only when
     every one of its NodePools labels its nodes with the seed's zone, and its
-    `id` only when its name is `ocp4-<lifecycle>-kv-<site>-<id>`; otherwise
+    `id` only when its name is `ocp4-<lifecycle>-kv-<site>-<zone>-<id>`; otherwise
     `problems` says why and the run never uses it. A missing folder is an
     EMPTY list, never an error. `buffer_percent` is this worker's
     HEADROOM_BUFFER_PERCENT. Observe-only. Raises the retryable

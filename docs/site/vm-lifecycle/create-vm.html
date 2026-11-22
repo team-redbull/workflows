@@ -51,7 +51,7 @@
       like any physical machine.
     </p>
     <p class="lede">A bare-metal InfraEnv has servers to draw. A KubeVirt one &mdash; named
-    <code>&lt;flavor&gt;-kv&lt;cpu&gt;-&lt;site&gt;-&lt;zone&gt;</code>, say <code>c200-kv32-five-az1</code>
+    <code>&lt;flavor&gt;-kv&lt;cpu&gt;-&lt;zone&gt;</code>, say <code>c200-kv32-az1</code>
     &mdash; has nothing until a VM of <code>&lt;cpu&gt;</code> vCPUs and <code>&lt;cpu&gt; &times; 8</code> GiB
     exists. This run is that step. <b>The zone&rsquo;s clusters come from day1, their numbers from the
     clusters themselves, only one run at a time chooses in a zone, and the chosen cluster builds the
@@ -77,29 +77,32 @@
   <section id="walkthrough">
     <div class="sec-head">
       <div class="eyebrow">Read this first</div>
-      <h2>Names carry everything: flavor, size, site, zone</h2>
-      <p class="lede">Nothing is looked up to decide <em>what</em> to create; the InfraEnv&rsquo;s name says
-      it, and the API derives it once (the run carries the derived values and never re-derives them).
-      Every name follows the platform naming convention.</p>
+      <h2>Names carry everything: flavor, size, zone, site, lifecycle</h2>
+      <p class="lede">Nothing is looked up to decide <em>what</em> to create; the InfraEnv&rsquo;s and the
+      MCE&rsquo;s names say it, and the API derives it once (the run carries the derived values and never
+      re-derives them). Every name follows the platform naming convention
+      (<code>Idan-Maimon/kubevirt-workflows</code>, <code>docs/naming-convention.md</code>).</p>
     </div>
 
     <div class="grid-2">
       <div class="panel">
         <h3>What the names say</h3>
         <ul>
-          <li><b>InfraEnv</b> <code>&lt;flavor&gt;-kv&lt;cpu&gt;-&lt;site&gt;-&lt;zone&gt;</code> &rarr; the
+          <li><b>InfraEnv</b> <code>&lt;flavor&gt;-kv&lt;cpu&gt;-&lt;zone&gt;</code> &rarr; the
             <b>flavor</b> (with its optional variant letter: <code>c200</code>, <code>c200n</code>), the
-            <b>vCPUs</b>, the <b>site</b> and the <b>zone</b>, which is <code>az&lt;N&gt;</code>
-            (<code>c200-kv32-five-az1</code> &rarr; c200, 32 vCPU, 256 GiB, site <code>five</code>, zone
-            <code>az1</code>). Memory is <code>vCPUs &times; 8</code> GiB. A <code>-mtl-</code> InfraEnv is
-            bare metal and is refused: it takes servers, not VMs.</li>
-          <li><b>MCE</b> <code>ocp4-&lt;lifecycle&gt;-mce-&lt;site&gt;-&lt;id&gt;</code>: its site must be the
-            InfraEnv&rsquo;s, or the request is a 422 &mdash; a VM boots on its own site&rsquo;s inventory
-            network.</li>
-          <li><b>(site, zone)</b> &rarr; the zone&rsquo;s ONE <b>seed</b>, <code>ocp4-seed-&lt;site&gt;-&lt;N&gt;</code>
-            for zone <code>az&lt;N&gt;</code>, whose day1 folder lists the zone&rsquo;s KV clusters,
-            <code>ocp4-&lt;lifecycle&gt;-kv-&lt;site&gt;-&lt;id&gt;</code>. The <code>id</code> letter is given in
-            creation order, so sorting by it is <b>oldest first</b>.</li>
+            <b>vCPUs</b> and the <b>zone</b>, which is <code>az&lt;N&gt;</code>
+            (<code>c200-kv32-az1</code> &rarr; c200, 32 vCPU, 256 GiB, zone <code>az1</code>). Memory is
+            <code>vCPUs &times; 8</code> GiB. No site: an InfraEnv belongs to one MCE, and so to its site.
+            A <code>-mtl-</code> InfraEnv is bare metal and is refused: it takes servers, not VMs.</li>
+          <li><b>MCE</b> <code>ocp4-&lt;lifecycle&gt;-mce-&lt;site&gt;-&lt;id&gt;</code> &rarr; the <b>site</b>
+            (a VM boots on its own site&rsquo;s inventory network) and the <b>lifecycle</b>
+            (<code>ocp4-prod-mce-five-a</code> &rarr; site <code>five</code>, lifecycle <code>prod</code>).</li>
+          <li><b>(lifecycle, site, zone)</b> &rarr; the zone&rsquo;s <b>seeds</b> of that lifecycle,
+            <code>ocp4-&lt;lifecycle&gt;-seed-&lt;site&gt;-&lt;zone&gt;-&lt;id&gt;</code> (a zone may have
+            several), whose day1 folders list the zone&rsquo;s KV clusters,
+            <code>ocp4-&lt;lifecycle&gt;-kv-&lt;site&gt;-&lt;zone&gt;-&lt;id&gt;</code>. A prod MCE&rsquo;s VMs go
+            on prod KV clusters only. The <code>id</code> letter is given in creation order, so sorting by
+            it is <b>oldest first</b>.</li>
           <li><b>VM</b> <code>ocp-&lt;flavor&gt;-kv&lt;cpu&gt;-&lt;site&gt;-&lt;its MAC, 12 hex&gt;</code>
             (<code>ocp-c200-kv32-five-0e03f2a1b2c3</code>): the name is the MAC in full, so name and MAC
             agree by construction. The zone is a label, never in the name.</li>
@@ -147,8 +150,9 @@
             <h3>list_kv_clusters</h3>
             <span class="phase">phase <b>listing-kv-clusters</b></span>
           </div>
-          <p>The zone&rsquo;s KV clusters are the files of ONE day1 folder at <code>main</code>, its seed&rsquo;s:
-          <code>sites/&lt;site&gt;/mces/ocp4-seed-&lt;site&gt;-&lt;zone number&gt;/hostedClusters/</code>. The
+          <p>The zone&rsquo;s KV clusters are the files of its seeds&rsquo; day1 folders at <code>main</code>,
+          the seeds of the MCE&rsquo;s lifecycle:
+          <code>sites/&lt;site&gt;/mces/ocp4-&lt;lifecycle&gt;-seed-&lt;site&gt;-&lt;zone&gt;-&lt;id&gt;/hostedClusters/</code>. The
           <b>cluster-lifecycle worker</b> on the hub reads it (it holds the day1 token; the worker inside a
           KV cluster holds none) and answers the clusters <b>oldest first</b>, the commit they were read at,
           and the <b>placement buffer</b> the run must use. It happens <em>before</em> the lock, so the
@@ -158,9 +162,10 @@
           </div>
           <p class="note">A file is <b>usable</b> only when day1 confirms it for this zone: every one of its
           NodePools labels its nodes <code>topology.kubernetes.io/zone</code> with the seed&rsquo;s zone, and
-          its name is <code>ocp4-&lt;lifecycle&gt;-kv-&lt;site&gt;-&lt;id&gt;</code> at this site. Any other file
+          its name is <code>ocp4-&lt;lifecycle&gt;-kv-&lt;site&gt;-&lt;zone&gt;-&lt;id&gt;</code> with the
+          seed&rsquo;s site, zone and lifecycle. Any other file
           is a <code>day1-problem</code> row in the table and is <b>never read</b>. Only the files under
-          the seed folder are KV clusters: the seed sits beside the MCEs in <code>mces/</code>, and a file
+          the seed folders are KV clusters: the seeds sit beside the MCEs in <code>mces/</code>, and a file
           under any other folder there (an MCE&rsquo;s) is not one, even one whose name mentions kubevirt.
           No usable cluster fails the run with <code>NoKvClusterError</code>, naming the folder, the commit
           and the files that had a problem. A new cluster file is seen by the first run after its commit lands.</p>
@@ -524,7 +529,7 @@
         <tbody>
           <tr><td class="k">redfish-enabled</td><td class="muted"><code>"true"</code> (the worker&rsquo;s <code>VM_REDFISH_LABEL</code>): kubevirt-redfish exposes the VM by it, and the capacity figures count a stopped VM by it.</td></tr>
           <tr><td class="k">redbull.io/flavor</td><td class="muted"><code>c200</code></td></tr>
-          <tr><td class="k">redbull.io/size</td><td class="muted"><code>32c</code> (the vCPUs; the name keeps <code>kv32</code>)</td></tr>
+          <tr><td class="k">redbull.io/size</td><td class="muted"><code>kv32</code> (the name&rsquo;s size field, the value the InfraEnv&rsquo;s Agents carry)</td></tr>
           <tr><td class="k">redbull.io/site</td><td class="muted"><code>five</code></td></tr>
           <tr><td class="k">topology.kubernetes.io/zone</td><td class="muted"><code>az1</code></td></tr>
           <tr><td class="k">redbull.io/role</td><td class="muted"><code>worker</code> (a tenant warm-pool VM)</td></tr>
@@ -555,7 +560,8 @@
       <table>
         <thead><tr><th>error</th><th>when</th></tr></thead>
         <tbody>
-          <tr><td class="k">NoKvClusterError</td><td class="muted"><b>listing-kv-clusters</b>: the zone&rsquo;s seed folder lists no usable KV cluster. The message names the folder, the day1 commit and every file listed with a problem. Also a site or zone the convention does not know, for a run started around the API. Nothing was read from or written to any cluster.</td></tr>
+          <tr><td class="k">NoKvClusterError</td><td class="muted"><b>listing-kv-clusters</b>: the zone&rsquo;s seed folders of the MCE&rsquo;s lifecycle list no usable KV cluster. The message names the folder, the day1 commit and every file listed with a problem. Also a site or zone the convention does not know, for a run started around the API. Nothing was read from or written to any cluster.</td></tr>
+          <tr><td class="k">Day1QueryInvalidError</td><td class="muted"><b>listing-kv-clusters</b>: a run that carries no lifecycle &mdash; one started before the lifecycle filter (2026-11-22). Refused rather than guessed: a prod MCE&rsquo;s VM must not land on a test KV cluster. Start it again. Nothing was created.</td></tr>
           <tr><td class="k">KvZoneLockTimeoutError</td><td class="muted"><b>awaiting-zone-lock</b>: the lock was not granted within 30 minutes. The run left the line first. Nothing was created.</td></tr>
           <tr><td class="k">NoKvClusterFitsError</td><td class="muted"><b>choosing-kv-cluster</b>: no cluster takes the VM under the buffer. The message names the VM&rsquo;s size in request terms, the buffer, and the clusters grouped by reason. Nothing was created.</td></tr>
           <tr><td class="k">KvZoneLeaseExpiredError</td><td class="muted"><b>choosing-kv-cluster</b>: 3 leases ran out while the run was still reading clusters &mdash; a zone with many clusters without a worker. The message names them. Nothing was created; bring those workers back, then ask again.</td></tr>
@@ -574,7 +580,7 @@
           <tr><td class="k">VmNamespaceNotFoundError</td><td class="muted">The VM&rsquo;s <code>namespace</code> does not exist on the chosen cluster. The platform creates chassis namespaces; this run never does.</td></tr>
           <tr><td class="k">VmRequestRejectedError</td><td class="muted">The cluster&rsquo;s API server or an admission webhook refused the VirtualMachine (400/422), or the request cannot name a VM. The API&rsquo;s own sentence is carried, bounded.</td></tr>
           <tr><td class="k">KvClusterAccessError</td><td class="muted">The cluster&rsquo;s API refused the worker&rsquo;s ServiceAccount (403): the chart&rsquo;s ClusterRole is missing a verb. On the figures read this is an <code>unreachable</code> row instead.</td></tr>
-          <tr><td class="k">KvClusterMismatchError</td><td class="muted">The worker was asked to act for another KV cluster, or another site, than its own: its <code>kvCluster</code> value is not the day1 file name its queue was built from.</td></tr>
+          <tr><td class="k">KvClusterMismatchError</td><td class="muted">The worker was asked to act for another KV cluster, or another site or zone, than its own: its <code>kvCluster</code> value is not the day1 file name its queue was built from.</td></tr>
           <tr><td class="k">VmDisappearedError</td><td class="muted"><b>awaiting-root-disk</b>: the VM is gone before its disk bound. Something else deleted it.</td></tr>
           <tr><td class="k">VmIdentityConflictError</td><td class="muted">On the <b>delete</b> only: the VM under that name carries another run&rsquo;s id or another MAC, so the run leaves it.</td></tr>
         </tbody>
@@ -678,21 +684,22 @@
           <p>Two fields are required: the MCE and the InfraEnv. <code>namespace</code> defaults to
           <code>inventory</code>; <code>count</code> asks for several VMs. <code>mce_cluster</code> is
           accepted with or without its <code>ocp4-</code> prefix and must be named
-          <code>ocp4-&lt;lifecycle&gt;-mce-&lt;site&gt;-&lt;id&gt;</code>; <code>infra_env</code> must be a
-          KubeVirt InfraEnv of the convention, at the MCE&rsquo;s site.</p>
+          <code>ocp4-&lt;lifecycle&gt;-mce-&lt;site&gt;-&lt;id&gt;</code> (its site and lifecycle are the
+          VM&rsquo;s); <code>infra_env</code> must be a KubeVirt InfraEnv of the convention,
+          <code>&lt;flavor&gt;-kv&lt;cpu&gt;-&lt;zone&gt;</code>.</p>
           <pre><span class="c">// request — one VM</span>
 {
   "mce_cluster": "prod-mce-five-a",
-  "infra_env":   "c200-kv32-five-az1"
+  "infra_env":   "c200-kv32-az1"
 }
 
 <span class="c">// 202 response — the first free slot</span>
-{ "workflow_id": "create-vm-ocp4-prod-mce-five-a_c200-kv32-five-az1_1", "run_id": "…" }
+{ "workflow_id": "create-vm-ocp4-prod-mce-five-a_c200-kv32-az1_1", "run_id": "…" }
 
 <span class="c">// request — three VMs, in another chassis namespace</span>
 {
   "mce_cluster": "ocp4-prod-mce-five-a",
-  "infra_env":   "c200-kv32-five-az1",
+  "infra_env":   "c200-kv32-az1",
   "namespace":   "redfish-vms",
   "count":       3
 }
@@ -701,9 +708,9 @@
 {
   "started": 2, "already_running": 1, "failed": 0,
   "results": [
-    { "slot": 1, "workflow_id": "create-vm-ocp4-prod-mce-five-a_c200-kv32-five-az1_1", "status": "already_running" },
-    { "slot": 2, "workflow_id": "create-vm-ocp4-prod-mce-five-a_c200-kv32-five-az1_2", "status": "started", "run_id": "…" },
-    { "slot": 3, "workflow_id": "create-vm-ocp4-prod-mce-five-a_c200-kv32-five-az1_3", "status": "started", "run_id": "…" }
+    { "slot": 1, "workflow_id": "create-vm-ocp4-prod-mce-five-a_c200-kv32-az1_1", "status": "already_running" },
+    { "slot": 2, "workflow_id": "create-vm-ocp4-prod-mce-five-a_c200-kv32-az1_2", "status": "started", "run_id": "…" },
+    { "slot": 3, "workflow_id": "create-vm-ocp4-prod-mce-five-a_c200-kv32-az1_3", "status": "started", "run_id": "…" }
   ]
 }</pre>
           <p class="note">The body <b>forbids unknown fields</b>: anything besides <code>mce_cluster</code>,
@@ -731,24 +738,24 @@
           <code>/workflows/runs/kv-zone-lock-&lt;site&gt;-&lt;zone&gt;</code>.</p>
           <pre><span class="c">// 200 while running</span>
 {
-  "workflow_id":   "create-vm-ocp4-prod-mce-five-a_c200-kv32-five-az1_1",
+  "workflow_id":   "create-vm-ocp4-prod-mce-five-a_c200-kv32-az1_1",
   "workflow_type": "CreateVmWorkflow",
   "status":        "RUNNING",
   "progress": {
     "phase":          "awaiting-root-disk",
-    "kv_candidates":  ["ocp4-prod-kv-five-a", "ocp4-prod-kv-five-b"],
+    "kv_candidates":  ["ocp4-prod-kv-five-az1-a", "ocp4-prod-kv-five-az1-b"],
     "buffer_percent": 15,
     "day1_revision":  "9f2c…",
     "table": [
-      { "name": "ocp4-prod-kv-five-a", "fits": false, "skip_reason": "fit-buffer",
+      { "name": "ocp4-prod-kv-five-az1-a", "fits": false, "skip_reason": "fit-buffer",
         "skip_detail": "CPU after placing: 90000 m of 100000 m allocatable; the 15% buffer allows 85%", "figures": { … } },
-      { "name": "ocp4-prod-kv-five-b", "fits": true, "skip_reason": null, "figures": { … }, "cpu_fill_after": 0.3 }
+      { "name": "ocp4-prod-kv-five-az1-b", "fits": true, "skip_reason": null, "figures": { … }, "cpu_fill_after": 0.3 }
     ],
     "not_read":       [],
     "zone_lock":      "kv-zone-lock-five-az1",
     "lease_ends_at":  null,
     "leases":         1,
-    "kv_cluster":     "ocp4-prod-kv-five-b",
+    "kv_cluster":     "ocp4-prod-kv-five-az1-b",
     "vm_name":        "ocp-c200-kv32-five-0e03f2a1b2c3",
     "mac":            "0e:03:f2:a1:b2:c3",
     "cancel_rollback": null
@@ -763,11 +770,11 @@
     "mac":        "0e:03:f2:a1:b2:c3",
     "namespace":  "inventory",
     "flavor": "c200", "cpu": 32, "memory_gib": 256,
-    "kv_cluster": "ocp4-prod-kv-five-b",
+    "kv_cluster": "ocp4-prod-kv-five-az1-b",
     "table": [ … ], "not_read": [],
     "buffer_percent": 15, "day1_revision": "9f2c…",
     "root_disk_phase": "Succeeded", "created": true, "draws": 1, "leases": 1,
-    "infra_env": "c200-kv32-five-az1", "mce_cluster": "ocp4-prod-mce-five-a", "site": "five", "zone": "az1"
+    "infra_env": "c200-kv32-az1", "mce_cluster": "ocp4-prod-mce-five-a", "site": "five", "zone": "az1"
   }, …
 }</pre>
           <p class="note">A phase that does not advance past <b>listing-kv-clusters</b> means nothing is
@@ -793,8 +800,8 @@
       <table>
         <thead><tr><th>Field</th><th>Type</th><th>Rules</th><th>What it&rsquo;s for</th></tr></thead>
         <tbody>
-          <tr><td class="k">mce_cluster</td><td class="k">str</td><td class="muted">required; <code>ocp4-</code> added if missing; must be <code>ocp4-&lt;lifecycle&gt;-mce-&lt;site&gt;-&lt;id&gt;</code>, at the InfraEnv&rsquo;s site</td><td class="muted">Which MCE the InfraEnv belongs to. It goes on the VM as <code>redbull.io/mce</code> and in the workflow id.</td></tr>
-          <tr><td class="k">infra_env</td><td class="k">str</td><td class="muted">required; <code>&lt;flavor&gt;-kv&lt;cpu&gt;-&lt;site&gt;-&lt;zone&gt;</code>, 1&ndash;256 vCPU, zone <code>az&lt;N&gt;</code>; <code>-mtl-</code> refused</td><td class="muted">Gives the <b>flavor</b>, the VM&rsquo;s size (memory = cpu &times; 8 GiB), the <b>site</b> and the <b>zone</b>.</td></tr>
+          <tr><td class="k">mce_cluster</td><td class="k">str</td><td class="muted">required; <code>ocp4-</code> added if missing; must be <code>ocp4-&lt;lifecycle&gt;-mce-&lt;site&gt;-&lt;id&gt;</code></td><td class="muted">Which MCE the InfraEnv belongs to; its site is the VM&rsquo;s and its lifecycle picks the seeds. It goes on the VM as <code>redbull.io/mce</code> and in the workflow id.</td></tr>
+          <tr><td class="k">infra_env</td><td class="k">str</td><td class="muted">required; <code>&lt;flavor&gt;-kv&lt;cpu&gt;-&lt;zone&gt;</code>, 1&ndash;256 vCPU, zone <code>az&lt;N&gt;</code>; <code>-mtl-</code> refused</td><td class="muted">Gives the <b>flavor</b>, the VM&rsquo;s size (memory = cpu &times; 8 GiB) and the <b>zone</b>; never the site (the MCE&rsquo;s).</td></tr>
           <tr><td class="k">namespace</td><td class="k">str</td><td class="muted">non-empty, default <code>inventory</code></td><td class="muted">The VM&rsquo;s namespace on the KV cluster &mdash; the InfraEnv&rsquo;s namespace on the MCE, verbatim. Must exist there as a kubevirt-redfish chassis namespace.</td></tr>
           <tr><td class="k">count</td><td class="k">int | null</td><td class="muted">1&ndash;20</td><td class="muted">That many runs, one per free slot, with a per-run report. Without it one run and <code>{workflow_id, run_id}</code>.</td></tr>
         </tbody>
@@ -885,7 +892,7 @@
       <table>
         <thead><tr><th>key</th><th>chart value</th><th>notes</th></tr></thead>
         <tbody>
-          <tr><td class="k">KV_CLUSTER</td><td class="muted"><code>kvCluster</code>, required</td><td class="muted"><b>Exactly the cluster&rsquo;s day1 file name</b> (<code>ocp4-prod-kv-five-a</code>), never abbreviated: it names the queue, and the hub builds the same name from day1. The worker reads its site from it and refuses to start on any other shape.</td></tr>
+          <tr><td class="k">KV_CLUSTER</td><td class="muted"><code>kvCluster</code>, required</td><td class="muted"><b>Exactly the cluster&rsquo;s day1 file name</b> (<code>ocp4-prod-kv-five-az1-a</code>), never abbreviated: it names the queue, and the hub builds the same name from day1. The worker reads its site from it and refuses to start on any other shape.</td></tr>
           <tr><td class="k">VM_MAC_PREFIX</td><td class="muted"><code>config.vmMacPrefix</code>, required</td><td class="muted"><code>0e</code> + the cluster&rsquo;s VLAN ID, three octets. No default: a worker without it does not start. The one place the prefix is set.</td></tr>
           <tr><td class="k">VM_STORAGE_CLASS_NAME</td><td class="muted"><code>vm.storageClassName</code>, required</td><td class="muted">The root disk&rsquo;s storage class. It must bind <b>Immediately</b> and allow <code>ReadWriteMany</code> + <code>Filesystem</code> (ceph-rbd refuses that pair; cephfs does not).</td></tr>
           <tr><td class="k">VM_NETWORK_NAME</td><td class="muted"><code>vm.networkName</code></td><td class="muted"><code>&lt;namespace&gt;/&lt;name&gt;</code> of the NetworkAttachmentDefinition every VM boots on. Default <code>openshift-cnv/vm-external-network</code>, the platform&rsquo;s <code>vm.yaml</code>. The VM&rsquo;s network is always multus; only the name is a value.</td></tr>
@@ -907,8 +914,8 @@
     the hub per cluster.</p>
     <ol>
       <li><b>Its day1 file</b>, in its zone&rsquo;s seed folder
-        (<code>sites/&lt;site&gt;/mces/ocp4-seed-&lt;site&gt;-&lt;zone number&gt;/hostedClusters/</code>), named
-        <code>ocp4-&lt;lifecycle&gt;-kv-&lt;site&gt;-&lt;id&gt;</code>, every NodePool labelling its nodes
+        (<code>sites/&lt;site&gt;/mces/ocp4-&lt;lifecycle&gt;-seed-&lt;site&gt;-&lt;zone&gt;-&lt;id&gt;/hostedClusters/</code>), named
+        <code>ocp4-&lt;lifecycle&gt;-kv-&lt;site&gt;-&lt;zone&gt;-&lt;id&gt;</code>, every NodePool labelling its nodes
         <code>topology.kubernetes.io/zone</code> with that zone.</li>
       <li><b>The <code>vm-lifecycle-worker</code> chart</b> on the cluster, through day2: <code>kvCluster</code>
         = the day1 file name, <code>config.vmMacPrefix</code> = <code>0e</code> + its VLAN ID, the Temporal

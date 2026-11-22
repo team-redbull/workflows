@@ -30,17 +30,20 @@ def canonical_mce_cluster(name: str) -> str:
 
 # --- the platform naming convention: clusters, seeds, zones ------------------------------
 #
-# Every cluster is `ocp4-<lifecycle>-<flavor>-<site>-<id>` (`ocp4-prod-mce-five-a`,
-# `ocp4-prod-kv-five-a`): `<id>` is a sequence letter given in creation order, so
-# sorting a flavor's clusters by it is oldest first. Two flavors are reserved:
-# `mce` (an MCE) and `kv` (a KubeVirt cluster, a "KV cluster": the hosted
-# cluster whose nodes run the warm-pool VMs).
+# The convention is kubevirt-workflows' docs/naming-convention.md (the
+# `naming-convention` skill fetches it). A tenant cluster or an MCE is
+# `ocp4-<lifecycle>-<flavor>-<site>-<id>` (`ocp4-prod-mce-five-a`); a SEED or a
+# KV cluster also carries its zone, `ocp4-<lifecycle>-<seed|kv>-<site>-<zone>-<id>`
+# (`ocp4-prod-seed-five-az1-a`, `ocp4-prod-kv-five-az1-a`). `<id>` is a sequence
+# letter given in creation order, so sorting by it is oldest first; a zone is
+# `az<N>`. Three flavors are reserved: `mce`, `seed` and `kv`.
 #
-# A zone is `az<N>`. Per zone of a site ONE seed cluster, `ocp4-seed-<site>-<N>`,
-# hosts that zone's KV clusters (decided 2026-11-20: the seed is one per zone
-# and immutable, so its name carries the zone, where a KV cluster's does not).
-# A seed is a "seed", never an "mce": it hosts the platform's own KV clusters,
-# not clients' clusters.
+# A seed hosts its zone's KV clusters (the hosted clusters whose nodes run the
+# warm-pool VMs); its day1 folder sits beside the MCEs' in `sites/<site>/mces/`.
+# A seed is a "seed", never an "mce". Until 2026-11-22 a seed was
+# `ocp4-seed-<site>-<zone number>` and a KV cluster carried no zone (the
+# operator's 2026-11-20 decision against the convention's draft, reversed when
+# the convention left draft).
 #
 # Pure, so workflow code may import these too; the tokens are validated so a
 # day1 path built from them can hold no `/`, `..` or glob character.
@@ -48,73 +51,105 @@ def canonical_mce_cluster(name: str) -> str:
 _SITE = r"[a-z0-9]+(?:-[a-z0-9]+)*"
 _MCE = re.compile(rf"^ocp4-(?P<env>[a-z0-9]+)-mce-(?P<site>{_SITE})-(?P<letter>[a-z])$")
 _CLUSTER = re.compile(rf"^ocp4-(?P<lifecycle>[a-z0-9]+)-(?P<flavor>[a-z0-9]+)-(?P<site>{_SITE})-(?P<id>[a-z])$")
-_SEED = re.compile(rf"^ocp4-seed-(?P<site>{_SITE})-(?P<number>[1-9][0-9]*)$")
+# A seed or a KV cluster: the zone, `az<N>`, sits between the site and the id, so a
+# site of several fields (`bat-yam`) is everything between the flavor and the zone.
+_ZONED = re.compile(
+    rf"^ocp4-(?P<lifecycle>[a-z0-9]+)-(?P<flavor>seed|kv)-(?P<site>{_SITE})-(?P<zone>az[1-9][0-9]*)-(?P<id>[a-z])$"
+)
 _ZONE = re.compile(r"^az(?P<number>[1-9][0-9]*)$")
 _TOKEN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
-SEED_CLUSTER_PREFIX = "ocp4-seed-"
 MCE_FLAVOR = "mce"
+SEED_FLAVOR = "seed"
 KV_FLAVOR = "kv"
 
 
 class MceNameError(ValueError):
-    """The MCE name is not `ocp4-<env>-mce-<site>-<letter>`. A ValueError too, so a
+    """The MCE name is not `ocp4-<lifecycle>-mce-<site>-<id>`. A ValueError too, so a
     Pydantic validator turns it into a 422 at the API edge."""
 
 
 class ClusterNameError(ValueError):
-    """The name is not `ocp4-<lifecycle>-<flavor>-<site>-<id>` (or not of the flavor
-    asked for). A ValueError too, so a Pydantic validator turns it into a 422."""
+    """The name is not the convention's (or not of the flavor asked for). A
+    ValueError too, so a Pydantic validator turns it into a 422."""
 
 
 @dataclass(frozen=True)
 class ParsedClusterName:
-    """What a cluster name says under the convention."""
+    """What a cluster name says under the convention. `zone` only for a seed or a KV cluster."""
 
     name: str
     lifecycle: str
     flavor: str
     site: str
     id: str
+    zone: str | None = None
 
 
 def site_of_mce_cluster(name: str) -> str:
     """`ocp4-prod-mce-bat-yam-a` -> `bat-yam`. Takes the CANONICAL name (canonical_mce_cluster first)."""
+    return parse_mce_cluster(name).site
+
+
+def parse_mce_cluster(name: str) -> ParsedClusterName:
+    """`ocp4-prod-mce-bat-yam-a` -> lifecycle prod, site bat-yam, id a; MceNameError otherwise."""
     match = _MCE.fullmatch(name)
     if match is None:
-        raise MceNameError(f"MCE {name!r} is not named `ocp4-<env>-mce-<site>-<letter>`, so its site is unknown")
-    return match.group("site")
+        raise MceNameError(f"MCE {name!r} is not named `ocp4-<lifecycle>-mce-<site>-<id>`, so its site is unknown")
+    return ParsedClusterName(
+        name=name, lifecycle=match.group("env"), flavor=MCE_FLAVOR, site=match.group("site"), id=match.group("letter")
+    )
 
 
 def name_token(value: str, what: str) -> str:
-    """A site token as the convention spells it; refused otherwise (MceNameError)."""
+    """A site (or lifecycle) token as the convention spells it; refused otherwise (MceNameError)."""
     if not _TOKEN.fullmatch(value):
         raise MceNameError(f"{what} {value!r} must be lowercase letters, digits and single dashes")
     return value
 
 
 def parse_cluster_name(name: str) -> ParsedClusterName:
-    """`ocp4-prod-kv-five-a` -> lifecycle prod, flavor kv, site five, id a.
+    """`ocp4-prod-eck-five-a` -> lifecycle prod, flavor eck, site five, id a; a seed or a
+    KV cluster (`ocp4-prod-kv-five-az1-a`) with its zone too.
 
-    The lifecycle and the flavor are one field each and the id one letter, so
-    a site of several fields (`bat-yam`) is everything between them.
+    The lifecycle and the flavor are one field each, the zone `az<N>` and the id
+    one letter, so a site of several fields (`bat-yam`) is everything between them.
     """
+    zoned = _ZONED.fullmatch(name)
+    if zoned is not None:
+        return ParsedClusterName(
+            name=name, lifecycle=zoned.group("lifecycle"), flavor=zoned.group("flavor"),
+            site=zoned.group("site"), id=zoned.group("id"), zone=zoned.group("zone"),
+        )
     match = _CLUSTER.fullmatch(name)
-    if match is None:
-        raise ClusterNameError(f"cluster {name!r} is not named `ocp4-<lifecycle>-<flavor>-<site>-<id>`")
+    if match is None or match.group("flavor") in (SEED_FLAVOR, KV_FLAVOR):
+        raise ClusterNameError(
+            f"cluster {name!r} is not named `ocp4-<lifecycle>-<flavor>-<site>-<id>`, nor, for a seed or a KV "
+            "cluster, `ocp4-<lifecycle>-<seed|kv>-<site>-<zone>-<id>`"
+        )
     return ParsedClusterName(
         name=name, lifecycle=match.group("lifecycle"), flavor=match.group("flavor"),
         site=match.group("site"), id=match.group("id"),
     )
 
 
-def parse_kv_cluster(name: str) -> ParsedClusterName:
-    """A KV cluster's name, `ocp4-<lifecycle>-kv-<site>-<id>`; ClusterNameError for anything else."""
-    parsed = parse_cluster_name(name)
-    if parsed.flavor != KV_FLAVOR:
+def _parse_zoned(name: str, flavor: str) -> ParsedClusterName:
+    match = _ZONED.fullmatch(name)
+    if match is None or match.group("flavor") != flavor:
         raise ClusterNameError(
-            f"cluster {name!r} is of flavor {parsed.flavor!r}: a KV cluster is `ocp4-<lifecycle>-{KV_FLAVOR}-<site>-<id>`"
+            f"{name!r} is not a {flavor} cluster's name, `ocp4-<lifecycle>-{flavor}-<site>-<zone>-<id>` "
+            f"(`ocp4-prod-{flavor}-five-az1-a`)"
         )
-    return parsed
+    return parse_cluster_name(name)
+
+
+def parse_kv_cluster(name: str) -> ParsedClusterName:
+    """A KV cluster's name, `ocp4-<lifecycle>-kv-<site>-<zone>-<id>`; ClusterNameError for anything else."""
+    return _parse_zoned(name, KV_FLAVOR)
+
+
+def parse_seed(name: str) -> ParsedClusterName:
+    """A seed's name (and its day1 folder's), `ocp4-<lifecycle>-seed-<site>-<zone>-<id>`; ClusterNameError otherwise."""
+    return _parse_zoned(name, SEED_FLAVOR)
 
 
 def zone_number(zone: str) -> int:
@@ -125,21 +160,37 @@ def zone_number(zone: str) -> int:
     return int(match.group("number"))
 
 
-def seed_cluster(site: str, zone: str) -> str:
-    """`ocp4-seed-<site>-<N>` for zone `az<N>`: the zone's seed, whose day1 folder lists its KV clusters."""
-    return f"{SEED_CLUSTER_PREFIX}{name_token(site, 'site')}-{zone_number(zone)}"
+def seed_of(folder: str) -> ParsedClusterName | None:
+    """What a day1 folder under `mces/` says when it is a SEED's (`ocp4-prod-seed-five-az1-a`): its
+    lifecycle, site, zone and id. None for any other folder — an MCE's — whatever else it is called."""
+    try:
+        return parse_seed(folder)
+    except ClusterNameError:
+        return None
 
 
 def seed_zone(folder: str) -> str | None:
-    """`ocp4-seed-five-1` -> `az1`: the zone of a seed's day1 folder; None for any other folder."""
-    match = _SEED.fullmatch(folder)
-    return f"az{match.group('number')}" if match else None
+    """`ocp4-prod-seed-five-az1-a` -> `az1`: the zone of a seed's day1 folder; None for any other folder."""
+    seed = seed_of(folder)
+    return seed.zone if seed else None
 
 
 def seed_site(folder: str) -> str | None:
-    """`ocp4-seed-bat-yam-2` -> `bat-yam`: the site a seed's name carries; None for any other folder."""
-    match = _SEED.fullmatch(folder)
-    return match.group("site") if match else None
+    """`ocp4-prod-seed-bat-yam-az2-a` -> `bat-yam`: the site a seed's name carries; None for any other folder."""
+    seed = seed_of(folder)
+    return seed.site if seed else None
+
+
+def seed_lifecycle(folder: str) -> str | None:
+    """`ocp4-prep-seed-five-az1-a` -> `prep`: the lifecycle a seed's name carries; None for any other folder."""
+    seed = seed_of(folder)
+    return seed.lifecycle if seed else None
+
+
+def seed_folder_pattern(lifecycle: str, site: str, zone: str) -> str:
+    """`ocp4-prod-seed-five-az1-*`: how a message names the seed folders of one (lifecycle, site,
+    zone) — a zone may have several seeds (`-a`, `-b`), so no one folder is derived."""
+    return f"ocp4-{name_token(lifecycle, 'lifecycle')}-{SEED_FLAVOR}-{name_token(site, 'site')}-{zone}-*"
 
 
 # --- hosted clusters: the day1 file stem and its parts ---------------------------------

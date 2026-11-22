@@ -158,14 +158,23 @@ async def list_day1_clusters(query: Day1ClusterQuery) -> Day1ClusterList:
 
 @activity.defn
 async def list_kv_clusters(request: KvClusterListRequest) -> KvClusterList:
+    if request.lifecycle is None:
+        # Only a run started before the lifecycle filter (2026-11-22) asks without one:
+        # refused, never guessed — a prod MCE's VM must not land on a test KV cluster.
+        raise ApplicationError(
+            f"KV clusters of site {request.site} zone {request.zone} asked for without a lifecycle: the run "
+            "predates the lifecycle filter (its MCE's lifecycle picks the seeds). Start it again.",
+            type=Day1QueryInvalidError.__name__, non_retryable=True,
+        )
     listed = await day1_clusters.list_kv_clusters(
         repo_url=_settings.day1_repo_url, token=_settings.redbull_git_token, site=request.site, zone=request.zone,
-        buffer_percent=_settings.headroom_buffer_percent,
+        lifecycle=request.lifecycle, buffer_percent=_settings.headroom_buffer_percent,
     )
     usable = [entry.name for entry in listed.clusters if entry.zone == request.zone and entry.id]
     activity.logger.info(
-        "day1 %s lists %d KV clusters for site %s zone %s in %s (buffer %d%%): %s; %d not usable",
-        listed.revision, len(listed.clusters), request.site, request.zone, listed.folder, listed.buffer_percent,
+        "day1 %s lists %d %s KV clusters for site %s zone %s in %s (buffer %d%%): %s; %d not usable",
+        listed.revision, len(listed.clusters), request.lifecycle, request.site, request.zone, listed.folder,
+        listed.buffer_percent,
         ", ".join(usable) or "none usable", len(listed.clusters) - len(usable),
     )
     return listed

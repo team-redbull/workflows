@@ -1,5 +1,14 @@
 # create-vm lab on `cluster-qcl8n`: the base services, then the workers
 
+> **Names changed on 2026-11-22.** This lab ran, and its day1 mock and `workers.sh` still use,
+> the names of before: seed `ocp4-seed-<site>-<N>`, KV cluster `ocp4-<lifecycle>-kv-<site>-<id>`,
+> InfraEnv `<flavor>-kv<cpu>-<site>-<zone>`, size label `<cpu>c`. The platform convention
+> (`Idan-Maimon/kubevirt-workflows` `docs/naming-convention.md`) now spells them
+> `ocp4-<lifecycle>-seed-<site>-<zone>-<id>`, `ocp4-<lifecycle>-kv-<site>-<zone>-<id>`,
+> `<flavor>-kv<cpu>-<zone>` (the site is the MCE's) and `kv<cpu>`, and create-vm reads only the
+> seeds of the MCE's lifecycle. Re-running the lab needs its day1 tree and cluster names renamed
+> first; the numbers below are what ran, and its goldens still replay.
+
 The services a create-vm end-to-end test needs before any workflow worker is deployed, on
 a disposable Red Hat workshop cluster (`https://api.cluster-qcl8n.dyn.redhatworkshops.io:6443`,
 OpenShift 4.22, three nodes, ODF external ceph, OpenShift GitOps 1.18). Everything is an

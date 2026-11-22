@@ -11,7 +11,11 @@ from shared.cluster_names import (
     name_token,
     parse_cluster_name,
     parse_kv_cluster,
-    seed_cluster,
+    parse_mce_cluster,
+    parse_seed,
+    seed_folder_pattern,
+    seed_lifecycle,
+    seed_of,
     seed_site,
     seed_zone,
     site_of_mce_cluster,
@@ -30,25 +34,24 @@ from shared.infraenv_names import (
 
 class TestParseInfraEnv:
     @pytest.mark.parametrize(
-        ("name", "flavor", "site", "zone", "cpu"),
+        ("name", "flavor", "zone", "cpu"),
         [
-            ("c200-kv32-five-az1", "c200", "five", "az1", 32),
-            ("c200n-kv8-five-az2", "c200n", "five", "az2", 8),          # a variant letter is part of the flavor
-            ("c200-kv64-bat-yam-az1", "c200", "bat-yam", "az1", 64),    # a site of several fields
-            ("x201-kv1-site2-az12", "x201", "site2", "az12", 1),
-            ("c200-kv256-five-az1", "c200", "five", "az1", 256),
-            ("c200-kv32-kv8-az1", "c200", "kv8", "az1", 32),            # a site that looks like a size is still the site
+            ("c200-kv32-az1", "c200", "az1", 32),
+            ("c200n-kv8-az2", "c200n", "az2", 8),          # a variant letter is part of the flavor
+            ("x201-kv1-az12", "x201", "az12", 1),
+            ("c200-kv256-az1", "c200", "az1", 256),
         ],
     )
-    def test_a_kubevirt_infraenv_names_its_flavor_site_zone_and_size(self, name, flavor, site, zone, cpu):
+    def test_a_kubevirt_infraenv_names_its_flavor_zone_and_size(self, name, flavor, zone, cpu):
         parsed = parse_infraenv(name)
-        assert (parsed.kind, parsed.flavor, parsed.site, parsed.zone, parsed.cpu) == (
-            InfraEnvKind.KUBEVIRT, flavor, site, zone, cpu,
-        )
+        assert (parsed.kind, parsed.flavor, parsed.zone, parsed.cpu) == (InfraEnvKind.KUBEVIRT, flavor, zone, cpu)
         assert parsed.memory_gib == cpu * MEMORY_GIB_PER_CPU
         assert is_kubevirt(name)
 
-    @pytest.mark.parametrize("name", ["c200-mtl-five-az1", "c200n-mtl-bat-yam-az3"])
+    def test_the_site_is_not_the_infraenvs_but_its_mces(self):
+        assert not hasattr(parse_infraenv("c200-kv32-az1"), "site")
+
+    @pytest.mark.parametrize("name", ["c200-mtl-az1", "c200n-mtl-az3"])
     def test_a_bare_metal_infraenv_has_no_size(self, name):
         parsed = parse_infraenv(name)
         assert parsed.kind is InfraEnvKind.METAL
@@ -58,25 +61,25 @@ class TestParseInfraEnv:
     @pytest.mark.parametrize(
         "name",
         [
-            "c200-kv32-five",             # no zone
-            "c200-kv32-five-a",           # the zone is `az<N>`
-            "c200-kv32-five-az0",         # zones count from 1
-            "c200-kv32-five-az01",        # leading zero
-            "c200-kv0-five-az1",          # zero vCPUs
-            "c200-kv08-five-az1",         # leading zero
-            "c200-kv257-five-az1",        # over the bound
-            "c200-kv-five-az1",           # no vCPUs
-            "c200-kvm8-five-az1",         # not a number
-            "c200-32-five-az1",           # the size is `kv<cpu>` or `mtl`
-            "c200-kv32--az1",             # empty site
-            "200c-kv32-five-az1",         # a flavor starts with a letter
-            "C200-kv32-five-az1",         # uppercase
-            "c200-kv32-Five-az1",
+            "c200-kv32",                  # no zone
+            "c200-kv32-a",                # the zone is `az<N>`
+            "c200-kv32-az0",              # zones count from 1
+            "c200-kv32-az01",             # leading zero
+            "c200-kv0-az1",               # zero vCPUs
+            "c200-kv08-az1",              # leading zero
+            "c200-kv257-az1",             # over the bound
+            "c200-kv-az1",                # no vCPUs
+            "c200-kvm8-az1",              # not a number
+            "c200-32-az1",                # the size is `kv<cpu>` or `mtl`
+            "200c-kv32-az1",              # a flavor starts with a letter
+            "C200-kv32-az1",              # uppercase
+            "c200-kv32-five-az1",         # the convention's draft, with the site (before 2026-11-22)
+            "c200-mtl-bat-yam-az1",
             "x201-zone-a-8",              # the convention before 2026-11-20
             "x201-zone-a-metal",
             "cisco-m6-bat-yam-64c-512gb",  # the one before that
-            "c200-kv32-five-az1/../x",    # path characters
-            "c200-kv32-fi*e-az1",
+            "c200-kv32-az1/../x",         # path characters
+            "c200-kv32-a*1",
             "",
         ],
     )
@@ -129,26 +132,40 @@ class TestMceNames:
         assert isinstance(raised.value, ValueError)
 
 
-class TestClusterNames:
-    def test_a_cluster_name_says_its_lifecycle_flavor_site_and_id(self):
-        parsed = parse_cluster_name("ocp4-prod-kv-five-a")
-        assert (parsed.lifecycle, parsed.flavor, parsed.site, parsed.id) == ("prod", "kv", "five", "a")
+class TestMceLifecycle:
+    def test_the_lifecycle_is_read_from_the_mce_name(self):
+        parsed = parse_mce_cluster("ocp4-prep-mce-bat-yam-b")
+        assert (parsed.lifecycle, parsed.site, parsed.id) == ("prep", "bat-yam", "b")
 
-    def test_a_site_of_several_fields_is_everything_between_the_flavor_and_the_id(self):
-        parsed = parse_kv_cluster("ocp4-prep-kv-bat-yam-c")
-        assert (parsed.site, parsed.id) == ("bat-yam", "c")
+
+class TestClusterNames:
+    def test_a_tenant_cluster_name_says_its_lifecycle_flavor_site_and_id(self):
+        parsed = parse_cluster_name("ocp4-prod-eck-five-a")
+        assert (parsed.lifecycle, parsed.flavor, parsed.site, parsed.id, parsed.zone) == ("prod", "eck", "five", "a", None)
+
+    def test_a_kv_cluster_name_also_says_its_zone(self):
+        parsed = parse_kv_cluster("ocp4-prod-kv-five-az1-a")
+        assert (parsed.lifecycle, parsed.flavor, parsed.site, parsed.zone, parsed.id) == ("prod", "kv", "five", "az1", "a")
+        assert parse_cluster_name("ocp4-prod-kv-five-az1-a") == parsed
+
+    def test_a_site_of_several_fields_is_everything_between_the_flavor_and_the_zone(self):
+        parsed = parse_kv_cluster("ocp4-prep-kv-bat-yam-az12-c")
+        assert (parsed.site, parsed.zone, parsed.id) == ("bat-yam", "az12", "c")
 
     @pytest.mark.parametrize(
         "name",
         [
             "ocp4-prod-mce-five-a",        # an MCE is not a KV cluster
+            "ocp4-prod-seed-five-az1-a",   # nor is a seed
             "ocp4-test-kubevirt-site4",    # day1's ordinary hosted cluster that only says kubevirt
-            "ocp4-prod-kv-five",           # no id
-            "ocp4-prod-kv-five-ab",        # the id is one letter
-            "ocp4-prod-kv-five-1",
-            "prod-kv-five-a",              # no ocp4-
-            "ocp4-kv-five-a",              # no lifecycle: `kv` would be the lifecycle and `five` the flavor
-            "ocp4-prod-kv-five-a/../x",
+            "ocp4-prod-kv-five-a",         # no zone: the shape before 2026-11-22
+            "ocp4-prod-kv-five-az1",       # no id
+            "ocp4-prod-kv-five-az1-ab",    # the id is one letter
+            "ocp4-prod-kv-five-az0-a",     # zones count from 1
+            "ocp4-prod-kv-five-az1-1",
+            "prod-kv-five-az1-a",          # no ocp4-
+            "ocp4-kv-five-az1-a",          # no lifecycle
+            "ocp4-prod-kv-five-az1-a/../x",
         ],
     )
     def test_anything_else_is_not_a_kv_cluster(self, name):
@@ -156,46 +173,59 @@ class TestClusterNames:
             parse_kv_cluster(name)
         assert isinstance(raised.value, ValueError)
 
+    @pytest.mark.parametrize("name", ["ocp4-prod-kv-five-a", "ocp4-prod-seed-five-a"])
+    def test_a_seed_or_kv_cluster_without_its_zone_is_no_cluster_name(self, name):
+        with pytest.raises(ClusterNameError):
+            parse_cluster_name(name)
+
     def test_the_id_letters_sort_oldest_first(self):
-        names = ["ocp4-prod-kv-five-c", "ocp4-prod-kv-five-a", "ocp4-prod-kv-five-b"]
+        names = ["ocp4-prod-kv-five-az1-c", "ocp4-prod-kv-five-az1-a", "ocp4-prod-kv-five-az1-b"]
         assert sorted(names, key=lambda name: parse_kv_cluster(name).id) == [
-            "ocp4-prod-kv-five-a", "ocp4-prod-kv-five-b", "ocp4-prod-kv-five-c",
+            "ocp4-prod-kv-five-az1-a", "ocp4-prod-kv-five-az1-b", "ocp4-prod-kv-five-az1-c",
         ]
 
 
 class TestSeedAndZone:
-    def test_the_seed_carries_the_zone_number(self):
-        assert seed_cluster("five", "az1") == "ocp4-seed-five-1"
-        assert seed_cluster("bat-yam", "az12") == "ocp4-seed-bat-yam-12"
-
-    def test_the_seed_folder_gives_the_zone_and_the_site_back(self):
-        assert seed_zone("ocp4-seed-five-1") == "az1"
-        assert seed_site("ocp4-seed-five-1") == "five"
-        assert seed_zone("ocp4-seed-bat-yam-12") == "az12"
-        assert seed_site("ocp4-seed-bat-yam-12") == "bat-yam"
-
-    @pytest.mark.parametrize("site,zone", [("five", "az1"), ("bat-yam", "az3"), ("site2", "az10")])
-    def test_the_two_are_inverse(self, site, zone):
-        assert seed_zone(seed_cluster(site, zone)) == zone
-        assert seed_site(seed_cluster(site, zone)) == site
+    @pytest.mark.parametrize(
+        ("folder", "lifecycle", "site", "zone", "id"),
+        [
+            ("ocp4-prod-seed-five-az1-a", "prod", "five", "az1", "a"),
+            ("ocp4-prep-seed-bat-yam-az12-b", "prep", "bat-yam", "az12", "b"),
+        ],
+    )
+    def test_a_seed_folder_says_its_lifecycle_site_zone_and_id(self, folder, lifecycle, site, zone, id):
+        seed = seed_of(folder)
+        assert seed is not None and (seed.lifecycle, seed.site, seed.zone, seed.id) == (lifecycle, site, zone, id)
+        assert (seed_zone(folder), seed_site(folder), seed_lifecycle(folder)) == (zone, site, lifecycle)
+        assert parse_seed(folder) == seed
 
     @pytest.mark.parametrize(
-        "folder", ["ocp4-prod-mce-five-a", "ocp4-mce-site2", "ocp4-seed-five", "ocp4-seed-five-0", "ocp4-seed-five-a", "ocp4-seed-five-01", ""]
+        "folder",
+        [
+            "ocp4-prod-mce-five-a", "ocp4-mce-site2", "ocp4-prod-kv-five-az1-a",
+            "ocp4-seed-five-1",            # the shape before 2026-11-22
+            "ocp4-prod-seed-five-a",       # no zone
+            "ocp4-prod-seed-five-az1",     # no id
+            "ocp4-prod-seed-five-az0-a", "",
+        ],
     )
     def test_any_other_folder_is_no_seed(self, folder):
-        assert seed_zone(folder) is None
-        assert seed_site(folder) is None
+        assert seed_of(folder) is None
+        assert (seed_zone(folder), seed_site(folder), seed_lifecycle(folder)) == (None, None, None)
+
+    def test_the_seed_folders_of_a_zone_are_named_by_a_pattern(self):
+        assert seed_folder_pattern("prod", "five", "az1") == "ocp4-prod-seed-five-az1-*"
 
     @pytest.mark.parametrize("zone", ["a", "az", "az0", "az01", "AZ1", "zone1", "az1/..", ""])
     def test_a_zone_is_az_and_a_number(self, zone):
         with pytest.raises(MceNameError):
             zone_number(zone)
-        with pytest.raises(MceNameError):
-            seed_cluster("five", zone)
 
     @pytest.mark.parametrize("token", ["../x", "a/b", "a*", "A", "", "-a", "a--b"])
     def test_a_token_that_could_shape_a_path_is_refused(self, token):
         with pytest.raises(MceNameError):
             name_token(token, "site")
         with pytest.raises(MceNameError):
-            seed_cluster(token, "az1")
+            seed_folder_pattern("prod", token, "az1")
+        with pytest.raises(MceNameError):
+            seed_folder_pattern(token, "five", "az1")

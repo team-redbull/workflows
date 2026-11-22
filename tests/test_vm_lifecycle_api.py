@@ -13,8 +13,8 @@ from workflow_domains.routers.deps import get_temporal_client
 from workflow_domains.vm_lifecycle import router as router_module
 
 PATH = "/workflows/vm-lifecycle/create-vm"
-BODY = {"mce_cluster": "ocp4-prod-mce-bat-yam-a", "infra_env": "c200-kv8-bat-yam-az1"}
-SLOT = "create-vm-ocp4-prod-mce-bat-yam-a_c200-kv8-bat-yam-az1_{}"
+BODY = {"mce_cluster": "ocp4-prod-mce-bat-yam-a", "infra_env": "c200-kv8-az1"}
+SLOT = "create-vm-ocp4-prod-mce-bat-yam-a_c200-kv8-az1_{}"
 
 
 class _FakeHandle:
@@ -64,23 +64,24 @@ def test_one_request_is_one_run_in_the_first_free_slot(client, fake):
 def test_the_run_carries_what_the_edge_derived(client, fake):
     client.post(PATH, json=BODY)
     assert fake.args[0].input == CreateVmInput(
-        mce_cluster="ocp4-prod-mce-bat-yam-a", infra_env="c200-kv8-bat-yam-az1", namespace="inventory",
-        flavor="c200", site="bat-yam", zone="az1", cpu=8, memory_gib=64,
+        mce_cluster="ocp4-prod-mce-bat-yam-a", infra_env="c200-kv8-az1", namespace="inventory",
+        flavor="c200", site="bat-yam", zone="az1", cpu=8, memory_gib=64, lifecycle="prod",
     )
 
 
 @pytest.mark.parametrize(
     ("mce", "infra_env", "derived"),
     [
-        ("ocp4-prod-mce-five-a", "c200-kv32-five-az1", ("c200", "five", "az1", 32, 256)),
-        ("ocp4-prep-mce-five-c", "c200n-kv64-five-az12", ("c200n", "five", "az12", 64, 512)),
-        ("prod-mce-bat-yam-b", "x201-kv1-bat-yam-az2", ("x201", "bat-yam", "az2", 1, 8)),
+        ("ocp4-prod-mce-five-a", "c200-kv32-az1", ("c200", "five", "prod", "az1", 32, 256)),
+        ("ocp4-prep-mce-five-c", "c200n-kv64-az12", ("c200n", "five", "prep", "az12", 64, 512)),
+        ("prod-mce-bat-yam-b", "x201-kv1-az2", ("x201", "bat-yam", "prod", "az2", 1, 8)),
     ],
 )
-def test_the_infraenvs_name_says_everything_about_the_vm(client, fake, mce, infra_env, derived):
+def test_the_two_names_say_everything_about_the_vm(client, fake, mce, infra_env, derived):
+    """The flavor, zone and size are the InfraEnv's; the site and the lifecycle the MCE's."""
     assert client.post(PATH, json={"mce_cluster": mce, "infra_env": infra_env}).status_code == 202
     run = fake.args[0].input
-    assert (run.flavor, run.site, run.zone, run.cpu, run.memory_gib) == derived
+    assert (run.flavor, run.site, run.lifecycle, run.zone, run.cpu, run.memory_gib) == derived
 
 
 def test_an_explicit_namespace_is_kept(client, fake):
@@ -97,16 +98,14 @@ def test_the_mce_is_canonical(client, fake, typed):
 @pytest.mark.parametrize(
     ("body", "words"),
     [
-        ({**BODY, "infra_env": "c200-mtl-bat-yam-az1"}, "bare metal"),
+        ({**BODY, "infra_env": "c200-mtl-az1"}, "bare metal"),
+        ({**BODY, "infra_env": "c200-kv8-bat-yam-az1"}, "no site"),           # the draft's, with the site (before 2026-11-22)
         ({**BODY, "infra_env": "x201-zone-a-8"}, "convention"),               # the convention before 2026-11-20
         ({**BODY, "infra_env": "cisco-m6-bat-yam-64c-512gb"}, "convention"),  # and the one before that
         ({**BODY, "infra_env": "c200-kv8-bat-yam-a"}, "convention"),          # a zone is az<N>
-        ({**BODY, "infra_env": "c200-kv0-bat-yam-az1"}, "convention"),
-        ({**BODY, "infra_env": "c200-kv512-bat-yam-az1"}, "1..256"),
-        ({**BODY, "mce_cluster": "ocp4-mce-bat-yam-01"}, "ocp4-<env>-mce-<site>-<letter>"),
-        # The MCE and the InfraEnv must be at the same site: a VM boots on its own site's network.
-        ({**BODY, "mce_cluster": "ocp4-prod-mce-five-a"}, "site"),
-        ({**BODY, "infra_env": "c200-kv8-five-az1"}, "a VM boots on its own site"),
+        ({**BODY, "infra_env": "c200-kv0-az1"}, "convention"),
+        ({**BODY, "infra_env": "c200-kv512-az1"}, "1..256"),
+        ({**BODY, "mce_cluster": "ocp4-mce-bat-yam-01"}, "ocp4-<lifecycle>-mce-<site>-<id>"),
         ({**BODY, "namespace": ""}, "namespace"),
         ({**BODY, "count": 0}, "count"),
         ({**BODY, "count": 21}, "count"),
@@ -115,7 +114,9 @@ def test_the_mce_is_canonical(client, fake, typed):
         ({"infra_env": "x201-zone-a-8"}, "mce_cluster"),
         # The VM name `ocp-<flavor>-kv<cpu>-<site>-<MAC>` must fit a Kubernetes name; refused at
         # the edge, where it is a 422, not in the cluster's worker, where it fails a run.
-        ({**BODY, "infra_env": "c" * 40 + "-kv8-bat-yam-az1"}, "DNS-1123"),
+        ({**BODY, "infra_env": "c" * 40 + "-kv8-az1"}, "DNS-1123"),
+        # …with the MCE's site in it: a long site can push it over too.
+        ({**BODY, "mce_cluster": f"ocp4-prod-mce-{'s' * 30}-a", "infra_env": "c" * 15 + "-kv8-az1"}, "DNS-1123"),
     ],
 )
 def test_anything_else_is_422_and_starts_nothing(client, fake, body, words):
@@ -183,7 +184,7 @@ def test_every_run_field_is_sent_or_derived():
     and the ones the edge derives. A field added to the input and forgotten here would reach
     the run as its default — or never validate."""
     request_fields = set(router_module.CreateVmRequest.model_fields) - {"count"}
-    derived = {"flavor", "site", "zone", "cpu", "memory_gib"}
+    derived = {"flavor", "site", "zone", "cpu", "memory_gib", "lifecycle"}
     assert request_fields | derived == set(CreateVmInput.model_fields)
     produced = router_module.CreateVmRequest(**BODY).run_input()
     assert set(produced.model_fields_set) == set(CreateVmInput.model_fields)

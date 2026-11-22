@@ -147,6 +147,9 @@ def _hc(site: str, folder: str, name: str) -> str:
     return f"sites/{site}/mces/{folder}/hostedClusters/{name}.yaml"
 
 
+SEED_FIVE_1 = "ocp4-prod-seed-five-az1-a"
+SEED_FIVE_2 = "ocp4-prod-seed-five-az2-a"
+
 # Two sites (one with a dash), MCE folders of both conventions, seeds for two zones
 # and two sites, and every way a file under a seed can disagree with it.
 TREE = {
@@ -160,23 +163,25 @@ TREE = {
     _hc("five", "ocp4-mce-site2", "ocp4-legacy"): "clusterName: legacy-named\n",
     "sites/five/mces/ocp4-mce-site2/hostedClusters/notes.txt": "not a cluster file\n",
     "sites/five/mces/ocp4-mce-site2/hostedClusters/ocp4-old.yml": "x: 1\n",
-    _hc("five", "ocp4-seed-five-1", "ocp4-prod-kv-five-c"): _nodepools("az1"),
-    _hc("five", "ocp4-seed-five-1", "ocp4-prod-kv-five-a"): _nodepools("az1", "az1"),
-    _hc("five", "ocp4-seed-five-1", "ocp4-prod-kv-five-b"): _nodepools("az1"),
-    _hc("five", "ocp4-seed-five-2", "ocp4-prod-kv-five-d"): _nodepools("az2"),
-    _hc("five", "ocp4-seed-five-2", "ocp4-prod-kv-five-e"): _nodepools("az1"),  # another zone
-    _hc("five", "ocp4-seed-five-2", "ocp4-prod-kv-five-f"): _nodepools(None),  # no zone
-    _hc("five", "ocp4-seed-five-2", "ocp4-prod-kv-five-g"): _nodepools("az2", "az3", None),  # mixed
-    _hc("five", "ocp4-seed-five-2", "ocp4-prod-kv-five-h"): "mastertag: 4.19.1\n",  # no NodePool at all
-    _hc("five", "ocp4-seed-five-2", "ocp4-kubevirt-five-az2-1"): _nodepools("az2"),  # a name off the convention
-    _hc("five", "ocp4-seed-five-2", "ocp4-prod-kv-six-a"): _nodepools("az2"),  # the name says another site
+    _hc("five", SEED_FIVE_1, "ocp4-prod-kv-five-az1-c"): _nodepools("az1"),
+    _hc("five", SEED_FIVE_1, "ocp4-prod-kv-five-az1-a"): _nodepools("az1", "az1"),
+    _hc("five", SEED_FIVE_1, "ocp4-prod-kv-five-az1-b"): _nodepools("az1"),
+    _hc("five", SEED_FIVE_2, "ocp4-prod-kv-five-az2-d"): _nodepools("az2"),
+    _hc("five", SEED_FIVE_2, "ocp4-prod-kv-five-az2-e"): _nodepools("az1"),  # another zone
+    _hc("five", SEED_FIVE_2, "ocp4-prod-kv-five-az2-f"): _nodepools(None),  # no zone
+    _hc("five", SEED_FIVE_2, "ocp4-prod-kv-five-az2-g"): _nodepools("az2", "az3", None),  # mixed
+    _hc("five", SEED_FIVE_2, "ocp4-prod-kv-five-az2-h"): "mastertag: 4.19.1\n",  # no NodePool at all
+    _hc("five", SEED_FIVE_2, "ocp4-kubevirt-five-az2-1"): _nodepools("az2"),  # a name off the convention
+    _hc("five", SEED_FIVE_2, "ocp4-prod-kv-six-az2-a"): _nodepools("az2"),  # the name says another site
+    _hc("five", SEED_FIVE_2, "ocp4-prod-kv-five-az3-i"): _nodepools("az2"),  # the name says another zone
+    _hc("five", SEED_FIVE_2, "ocp4-test-kv-five-az2-j"): _nodepools("az2"),  # the name says another lifecycle
     # --- site bat-yam: a site with a dash, one MCE, one seed, and a seed named for another site
     _hc("bat-yam", "ocp4-prep-mce-bat-yam-a", "ocp4-prep-iac-bat-yam-a"): "mastertag: 4.19.1\n",
-    _hc("bat-yam", "ocp4-seed-bat-yam-1", "ocp4-prep-kv-bat-yam-a"): _nodepools("az1"),
-    _hc("bat-yam", "ocp4-seed-five-3", "ocp4-prep-kv-bat-yam-b"): _nodepools("az3"),  # the seed's own site differs
+    _hc("bat-yam", "ocp4-prep-seed-bat-yam-az1-a", "ocp4-prep-kv-bat-yam-az1-a"): _nodepools("az1"),
+    _hc("bat-yam", "ocp4-prep-seed-five-az3-a", "ocp4-prep-kv-bat-yam-az3-b"): _nodepools("az3"),  # the seed's own site differs
     # --- an empty MCE folder, and things that are not folders of clusters
     "sites/bat-yam/mces/ocp4-prep-mce-bat-yam-b/values.yaml": "x: 1\n",
-    "sites/bat-yam/not-mces/ocp4-seed-bat-yam-1/hostedClusters/ocp4-prod-kv-bat-yam-z.yaml": "x: 1\n",
+    "sites/bat-yam/not-mces/ocp4-prep-seed-bat-yam-az1-a/hostedClusters/ocp4-prep-kv-bat-yam-az1-z.yaml": "x: 1\n",
     "upgrade/mces/ocp4-prod-mce-five-a.yaml": "mce:\n  version: 2.17.3\n",
 }
 
@@ -202,7 +207,7 @@ class TestKinds:
     def test_every_kind_filter(self, day1):
         everything = day1.clusters()
         hc, kv = day1.clusters(kind="hc"), day1.clusters(kind="kv")
-        assert len(everything) == 17 and len(hc) == 5 and len(kv) == 12
+        assert len(everything) == 19 and len(hc) == 5 and len(kv) == 14
         assert sorted(_names(everything)) == sorted(_names(hc) + _names(kv))
         assert {record.kind for record in hc} == {"hc"} and {record.kind for record in kv} == {"kv"}
         assert day1.clusters(kind="all") == everything
@@ -215,7 +220,7 @@ class TestKinds:
 
     def test_only_yaml_files_of_a_hosted_clusters_folder_are_clusters(self, day1):
         names = _names(day1.clusters())
-        assert "notes" not in names and "ocp4-old" not in names and "ocp4-prod-kv-bat-yam-z" not in names
+        assert "notes" not in names and "ocp4-old" not in names and "ocp4-prep-kv-bat-yam-az1-z" not in names
         assert "ocp4-prod-mce-five-a" not in names  # upgrade/mces/ is not the cluster tree
 
 
@@ -223,38 +228,40 @@ class TestTheZoneOfAKvCluster:
     def test_it_is_the_seed_folders_and_agreeing_nodepools_leave_no_problem(self, day1):
         records = day1.kv_clusters(site="five", zone="az1")
         assert [(r.name, r.zone, r.id, r.folder, r.problems) for r in records] == [
-            ("ocp4-prod-kv-five-a", "az1", "a", "ocp4-seed-five-1", []),
-            ("ocp4-prod-kv-five-b", "az1", "b", "ocp4-seed-five-1", []),
-            ("ocp4-prod-kv-five-c", "az1", "c", "ocp4-seed-five-1", []),
+            ("ocp4-prod-kv-five-az1-a", "az1", "a", SEED_FIVE_1, []),
+            ("ocp4-prod-kv-five-az1-b", "az1", "b", SEED_FIVE_1, []),
+            ("ocp4-prod-kv-five-az1-c", "az1", "c", SEED_FIVE_1, []),
         ]
 
     def test_oldest_first_by_the_id_letter_names_without_one_last(self, day1):
         ordered = day1.kv_clusters(site="five", zone="az2")
         assert [(record.id, record.name) for record in ordered] == [
-            ("a", "ocp4-prod-kv-six-a"),
-            ("d", "ocp4-prod-kv-five-d"),
-            ("e", "ocp4-prod-kv-five-e"),
-            ("f", "ocp4-prod-kv-five-f"),
-            ("g", "ocp4-prod-kv-five-g"),
-            ("h", "ocp4-prod-kv-five-h"),
+            ("a", "ocp4-prod-kv-six-az2-a"),
+            ("d", "ocp4-prod-kv-five-az2-d"),
+            ("e", "ocp4-prod-kv-five-az2-e"),
+            ("f", "ocp4-prod-kv-five-az2-f"),
+            ("g", "ocp4-prod-kv-five-az2-g"),
+            ("h", "ocp4-prod-kv-five-az2-h"),
+            ("i", "ocp4-prod-kv-five-az3-i"),
+            ("j", "ocp4-test-kv-five-az2-j"),
             (None, "ocp4-kubevirt-five-az2-1"),  # alphabetically first, listed last
         ]
 
     def test_two_clusters_with_one_letter_are_ordered_by_name(self, tmp_path):
         _write(tmp_path, {
-            _hc("five", "ocp4-seed-five-1", "ocp4-prod-kv-five-b"): _nodepools("az1"),
-            _hc("five", "ocp4-seed-five-1", "ocp4-test-kv-five-a"): _nodepools("az1"),
-            _hc("five", "ocp4-seed-five-1", "ocp4-prep-kv-five-a"): _nodepools("az1"),
+            _hc("five", SEED_FIVE_1, "ocp4-prod-kv-five-az1-b"): _nodepools("az1"),
+            _hc("five", "ocp4-test-seed-five-az1-a", "ocp4-test-kv-five-az1-a"): _nodepools("az1"),
+            _hc("five", "ocp4-prep-seed-five-az1-a", "ocp4-prep-kv-five-az1-a"): _nodepools("az1"),
         })
         assert _names(Day1(tmp_path, revision=REVISION).kv_clusters("five", "az1")) == [
-            "ocp4-prep-kv-five-a", "ocp4-test-kv-five-a", "ocp4-prod-kv-five-b",
+            "ocp4-prep-kv-five-az1-a", "ocp4-test-kv-five-az1-a", "ocp4-prod-kv-five-az1-b",
         ]
 
     @pytest.mark.parametrize(("name", "said"), [
-        ("ocp4-prod-kv-five-e", ["nodepool[0] labels its nodes zone 'az1', but the file is under the seed of zone az2"]),
-        ("ocp4-prod-kv-five-f", ["nodepool[0] has no `topology.kubernetes.io/zone` nodeLabel"]),
-        ("ocp4-prod-kv-five-g", ["nodepool[1] labels its nodes zone 'az3'", "nodepool[2] has no `topology.kubernetes.io/zone`"]),
-        ("ocp4-prod-kv-five-h", ["no NodePool, so no `topology.kubernetes.io/zone` nodeLabel says its nodes are in zone az2"]),
+        ("ocp4-prod-kv-five-az2-e", ["nodepool[0] labels its nodes zone 'az1', but the file is under the seed of zone az2"]),
+        ("ocp4-prod-kv-five-az2-f", ["nodepool[0] has no `topology.kubernetes.io/zone` nodeLabel"]),
+        ("ocp4-prod-kv-five-az2-g", ["nodepool[1] labels its nodes zone 'az3'", "nodepool[2] has no `topology.kubernetes.io/zone`"]),
+        ("ocp4-prod-kv-five-az2-h", ["no NodePool, so no `topology.kubernetes.io/zone` nodeLabel says its nodes are in zone az2"]),
     ])
     def test_nodepools_that_do_not_all_name_the_zone_are_problems_and_the_record_is_still_listed(self, day1, name, said):
         record = next(r for r in day1.kv_clusters(site="five", zone="az2") if r.name == name)
@@ -266,36 +273,57 @@ class TestTheZoneOfAKvCluster:
     def test_a_name_off_the_convention_has_no_id_and_a_problem(self, day1):
         record = day1.cluster("ocp4-kubevirt-five-az2-1")
         assert (record.kind, record.zone, record.id) == ("kv", "az2", None)
-        assert len(record.problems) == 1 and "ocp4-<lifecycle>-kv-<site>-<id>" in record.problems[0]
-        assert "its place in the zone's order is unknown" in record.problems[0]
+        assert len(record.problems) == 1 and "ocp4-<lifecycle>-kv-<site>-<zone>-<id>" in record.problems[0]
+        assert "its zone and its place in the zone's order are unknown" in record.problems[0]
+
+    @pytest.mark.parametrize("name", ["ocp4-prod-kv-five-a", "ocp4-prod-kv-five-az2"])
+    def test_a_kv_name_without_its_zone_or_its_id_is_off_the_convention(self, tmp_path, name):
+        _write(tmp_path, {_hc("five", SEED_FIVE_2, name): _nodepools("az2")})
+        (record,) = Day1(tmp_path, revision=REVISION).kv_clusters("five", "az2")
+        assert (record.kind, record.zone, record.id, record.confirmed_zone) == ("kv", "az2", None, None)
+        assert "ocp4-<lifecycle>-kv-<site>-<zone>-<id>" in record.blocking[0]
 
     def test_a_name_of_another_flavor_under_a_seed_is_still_a_kv_cluster_without_an_id(self, tmp_path):
-        _write(tmp_path, {_hc("five", "ocp4-seed-five-1", "ocp4-prod-iac-five-a"): _nodepools("az1")})
+        _write(tmp_path, {_hc("five", SEED_FIVE_1, "ocp4-prod-iac-five-a"): _nodepools("az1")})
         (record,) = Day1(tmp_path, revision=REVISION).kv_clusters("five", "az1")
         assert (record.kind, record.id) == ("kv", None) and "'ocp4-prod-iac-five-a' is not" in record.problems[0]
 
     def test_a_name_or_a_seed_folder_of_another_site_is_a_problem(self, day1):
-        by_name = day1.cluster("ocp4-prod-kv-six-a")
+        by_name = day1.cluster("ocp4-prod-kv-six-az2-a")
         assert (by_name.site, by_name.id) == ("five", "a")
         assert by_name.problems == [f"{by_name.path}: the name says site 'six', but the file is under sites/five"]
-        by_folder = day1.cluster("ocp4-prep-kv-bat-yam-b")
-        assert (by_folder.site, by_folder.folder, by_folder.zone) == ("bat-yam", "ocp4-seed-five-3", "az3")
+        by_folder = day1.cluster("ocp4-prep-kv-bat-yam-az3-b")
+        assert (by_folder.site, by_folder.folder, by_folder.zone) == ("bat-yam", "ocp4-prep-seed-five-az3-a", "az3")
         assert by_folder.problems == [
-            f"{by_folder.path}: seed folder ocp4-seed-five-3 is named for site 'five', but is under sites/bat-yam"
+            f"{by_folder.path}: seed folder ocp4-prep-seed-five-az3-a is named for site 'five', but is under sites/bat-yam"
+        ]
+
+    def test_a_name_whose_zone_is_not_its_seeds_is_a_problem(self, day1):
+        record = day1.cluster("ocp4-prod-kv-five-az3-i")
+        assert (record.zone, record.id, record.confirmed_zone) == ("az2", "i", None)
+        assert record.problems == [
+            f"{record.path}: the name says zone az3, but the file is under seed {SEED_FIVE_2} of zone az2"
+        ]
+
+    def test_a_name_whose_lifecycle_is_not_its_seeds_is_a_problem(self, day1):
+        record = day1.cluster("ocp4-test-kv-five-az2-j")
+        assert (record.zone, record.id, record.confirmed_zone) == ("az2", "j", None)
+        assert record.problems == [
+            f"{record.path}: the name says lifecycle 'test', but the file is under seed {SEED_FIVE_2}, a 'prod' one"
         ]
 
     def test_a_zones_order_does_not_depend_on_which_seed_folder_a_file_is_in(self, tmp_path):
         """Two seed folders of one zone under a site (one named for another site): still oldest first."""
         _write(tmp_path, {
-            _hc("five", "ocp4-seed-five-1", "ocp4-prod-kv-five-b"): _nodepools("az1"),
-            _hc("five", "ocp4-seed-bat-yam-1", "ocp4-prod-kv-five-a"): _nodepools("az1"),
-            _hc("five", "ocp4-seed-five-1", "ocp4-prod-kv-five-c"): _nodepools("az1"),
-            _hc("five", "ocp4-seed-five-2", "ocp4-prod-kv-five-a"): _nodepools("az2"),
+            _hc("five", SEED_FIVE_1, "ocp4-prod-kv-five-az1-b"): _nodepools("az1"),
+            _hc("five", "ocp4-prod-seed-bat-yam-az1-a", "ocp4-prod-kv-five-az1-a"): _nodepools("az1"),
+            _hc("five", SEED_FIVE_1, "ocp4-prod-kv-five-az1-c"): _nodepools("az1"),
+            _hc("five", SEED_FIVE_2, "ocp4-prod-kv-five-az2-a"): _nodepools("az2"),
             _hc("five", "ocp4-zzz-mce-five-a", "ocp4-prod-iac-five-a"): "mastertag: 4.19.1\n",
         })
         day1 = Day1(tmp_path, revision=REVISION)
         assert [(r.id, r.folder) for r in day1.kv_clusters("five", "az1")] == [
-            ("a", "ocp4-seed-bat-yam-1"), ("b", "ocp4-seed-five-1"), ("c", "ocp4-seed-five-1"),
+            ("a", "ocp4-prod-seed-bat-yam-az1-a"), ("b", SEED_FIVE_1), ("c", SEED_FIVE_1),
         ]
         # A site's hosted clusters first, then its KV clusters zone by zone.
         assert [(r.kind, r.zone, r.id) for r in day1.clusters(site="five")] == [
@@ -305,10 +333,10 @@ class TestTheZoneOfAKvCluster:
     def test_a_site_with_dashes(self, day1):
         records = day1.kv_clusters(site="bat-yam", zone="az1")
         assert [(r.name, r.site, r.zone, r.id, r.problems) for r in records] == [
-            ("ocp4-prep-kv-bat-yam-a", "bat-yam", "az1", "a", [])
+            ("ocp4-prep-kv-bat-yam-az1-a", "bat-yam", "az1", "a", [])
         ]
         assert _names(day1.clusters(site="bat-yam")) == [
-            "ocp4-prep-iac-bat-yam-a", "ocp4-prep-kv-bat-yam-a", "ocp4-prep-kv-bat-yam-b",
+            "ocp4-prep-iac-bat-yam-a", "ocp4-prep-kv-bat-yam-az1-a", "ocp4-prep-kv-bat-yam-az3-b",
         ]
 
     def test_a_zone_or_a_site_with_no_seed_folder_is_an_empty_list(self, day1, tmp_path):
@@ -319,9 +347,52 @@ class TestTheZoneOfAKvCluster:
 
     def test_a_zone_filter_keeps_only_what_is_under_that_zones_seed(self, day1):
         assert _names(day1.clusters(zone="az1")) == [
-            "ocp4-prep-kv-bat-yam-a", "ocp4-prod-kv-five-a", "ocp4-prod-kv-five-b", "ocp4-prod-kv-five-c",
+            "ocp4-prep-kv-bat-yam-az1-a", "ocp4-prod-kv-five-az1-a", "ocp4-prod-kv-five-az1-b", "ocp4-prod-kv-five-az1-c",
         ]
         assert day1.clusters(kind="hc", zone="az1") == []
+
+    def test_the_old_seed_shape_is_no_seed_and_its_files_are_hosted_clusters(self, tmp_path):
+        _write(tmp_path, {_hc("five", "ocp4-seed-five-1", "ocp4-prod-kv-five-az1-a"): _nodepools("az1")})
+        day1 = Day1(tmp_path, revision=REVISION)
+        assert day1.kv_clusters("five", "az1") == []
+        assert [(r.kind, r.zone) for r in day1.hosted_clusters("five")] == [("hc", None)]
+
+
+class TestTheLifecycleOfAZonesSeeds:
+    """create-vm places a VM only on KV clusters under seeds of its MCE's lifecycle (the
+    operator, 2026-11-22); a zone may have several seeds, whose clusters are one ordered list."""
+
+    @pytest.fixture
+    def zone(self, tmp_path: Path) -> Day1:
+        _write(tmp_path, {
+            _hc("five", "ocp4-prod-seed-five-az1-a", "ocp4-prod-kv-five-az1-c"): _nodepools("az1"),
+            _hc("five", "ocp4-prod-seed-five-az1-a", "ocp4-prod-kv-five-az1-a"): _nodepools("az1"),
+            _hc("five", "ocp4-prod-seed-five-az1-b", "ocp4-prod-kv-five-az1-b"): _nodepools("az1"),
+            _hc("five", "ocp4-prep-seed-five-az1-a", "ocp4-prep-kv-five-az1-a"): _nodepools("az1"),
+            _hc("five", "ocp4-prod-seed-five-az2-a", "ocp4-prod-kv-five-az2-a"): _nodepools("az2"),
+        })
+        return Day1(tmp_path, revision=REVISION)
+
+    def test_only_that_lifecycles_seeds_and_every_seed_of_the_zone_ordered_together(self, zone):
+        prod = zone.kv_clusters("five", "az1", lifecycle="prod")
+        assert [(r.name, r.folder) for r in prod] == [
+            ("ocp4-prod-kv-five-az1-a", "ocp4-prod-seed-five-az1-a"),
+            ("ocp4-prod-kv-five-az1-b", "ocp4-prod-seed-five-az1-b"),
+            ("ocp4-prod-kv-five-az1-c", "ocp4-prod-seed-five-az1-a"),
+        ]
+        assert all(r.problems == [] and r.confirmed_zone == "az1" for r in prod)
+        assert _names(zone.kv_clusters("five", "az1", lifecycle="prep")) == ["ocp4-prep-kv-five-az1-a"]
+        assert zone.kv_clusters("five", "az1", lifecycle="test") == []
+
+    def test_without_a_lifecycle_every_seed_of_the_zone(self, zone):
+        assert _names(zone.kv_clusters("five", "az1")) == [
+            "ocp4-prep-kv-five-az1-a", "ocp4-prod-kv-five-az1-a", "ocp4-prod-kv-five-az1-b", "ocp4-prod-kv-five-az1-c",
+        ]
+
+    @pytest.mark.parametrize("lifecycle", ["Prod", "../prod", "*", "", "pr od"])
+    def test_a_lifecycle_that_could_shape_a_path_is_refused(self, zone, lifecycle):
+        with pytest.raises(MceNameError, match="lifecycle"):
+            zone.kv_clusters("five", "az1", lifecycle=lifecycle)
 
 
 class TestWhatMakesAKvClusterUnusable:
@@ -329,13 +400,14 @@ class TestWhatMakesAKvClusterUnusable:
     and a YAML warning that is every cluster's alike must not take the whole fleet out."""
 
     def test_a_clean_file_is_confirmed_for_its_seeds_zone(self, day1):
-        record = day1.cluster("ocp4-prod-kv-five-a")
+        record = day1.cluster("ocp4-prod-kv-five-az1-a")
         assert (record.zone, record.confirmed_zone, record.blocking, record.problems) == ("az1", "az1", [], [])
 
     @pytest.mark.parametrize(
         "name",
-        ["ocp4-prod-kv-five-e", "ocp4-prod-kv-five-f", "ocp4-prod-kv-five-g", "ocp4-prod-kv-five-h",
-         "ocp4-kubevirt-five-az2-1", "ocp4-prod-kv-six-a", "ocp4-prep-kv-bat-yam-b"],
+        ["ocp4-prod-kv-five-az2-e", "ocp4-prod-kv-five-az2-f", "ocp4-prod-kv-five-az2-g", "ocp4-prod-kv-five-az2-h",
+         "ocp4-kubevirt-five-az2-1", "ocp4-prod-kv-six-az2-a", "ocp4-prep-kv-bat-yam-az3-b",
+         "ocp4-prod-kv-five-az3-i", "ocp4-test-kv-five-az2-j"],
     )
     def test_a_zone_a_name_or_a_site_that_disagrees_blocks_it(self, day1, name):
         record = day1.cluster(name)
@@ -346,7 +418,7 @@ class TestWhatMakesAKvClusterUnusable:
     def test_a_key_written_twice_in_a_layer_every_cluster_shares_blocks_none_of_them(self, tmp_path):
         _write(tmp_path, {**TREE, "sites/configValues.yaml": "mastertag: 4.18.56\nmastertag: 4.18.57\n"})
         records = Day1(tmp_path, revision=REVISION).kv_clusters(site="five", zone="az1")
-        assert _names(records) == ["ocp4-prod-kv-five-a", "ocp4-prod-kv-five-b", "ocp4-prod-kv-five-c"]
+        assert _names(records) == ["ocp4-prod-kv-five-az1-a", "ocp4-prod-kv-five-az1-b", "ocp4-prod-kv-five-az1-c"]
         for record in records:
             assert record.problems and "written twice" in record.problems[0]  # reported…
             assert record.blocking == [] and record.confirmed_zone == "az1"   # …and still usable
@@ -358,17 +430,17 @@ class TestWhatMakesAKvClusterUnusable:
     def test_the_folder_of_a_zones_clusters_is_spelled_in_one_place(self):
         from activities.day1_repo import hosted_clusters_dir
 
-        assert hosted_clusters_dir("five", "ocp4-seed-five-1") == "sites/five/mces/ocp4-seed-five-1/hostedClusters/"
+        assert hosted_clusters_dir("five", SEED_FIVE_1) == f"sites/five/mces/{SEED_FIVE_1}/hostedClusters/"
 
 
 class TestTheRecord:
     def test_what_one_record_says(self, day1):
-        record = day1.cluster("ocp4-prod-kv-five-a")
+        record = day1.cluster("ocp4-prod-kv-five-az1-a")
         assert record == day1_repo.ClusterRecord(
-            name="ocp4-prod-kv-five-a", site="five", folder="ocp4-seed-five-1", kind="kv", env="prod",
-            zone="az1", id="a", cluster_name="prod-kv-five-a", hosted_cluster="openshift-prod-kv-five-a",
-            hosted_cluster_namespace="hcp-prod-kv-five-a",
-            path="sites/five/mces/ocp4-seed-five-1/hostedClusters/ocp4-prod-kv-five-a.yaml",
+            name="ocp4-prod-kv-five-az1-a", site="five", folder=SEED_FIVE_1, kind="kv", env="prod",
+            zone="az1", id="a", cluster_name="prod-kv-five-az1-a", hosted_cluster="openshift-prod-kv-five-az1-a",
+            hosted_cluster_namespace="hcp-prod-kv-five-az1-a",
+            path=f"sites/five/mces/{SEED_FIVE_1}/hostedClusters/ocp4-prod-kv-five-az1-a.yaml",
             problems=[], revision=REVISION,
         )
 
@@ -384,7 +456,7 @@ class TestTheRecord:
         assert _names(day1.clusters(env="prod", kind="hc")) == ["ocp4-prep-web-five-b", "ocp4-prod-iac-five-a"]
         assert _names(day1.hosted_clusters(site="five", env="test")) == ["ocp4-test-kubevirt-site4"]
         assert _names(day1.hosted_clusters(env="prep", include_kv=True)) == [
-            "ocp4-prep-iac-bat-yam-a", "ocp4-prep-kv-bat-yam-a", "ocp4-prep-kv-bat-yam-b",
+            "ocp4-prep-iac-bat-yam-a", "ocp4-prep-kv-bat-yam-az1-a", "ocp4-prep-kv-bat-yam-az3-b",
         ]
 
     def test_the_files_own_cluster_name_and_its_yaml_problems_are_carried(self, day1, tmp_path):
@@ -434,7 +506,7 @@ class TestFindingByName:
         for not_a_site in ("../five", "five/mces/ocp4-mce-site2", "five/..", "nowhere", "*", ""):
             assert day1.folders(not_a_site) == []
         assert day1.folders("bat-yam") == [
-            "ocp4-prep-mce-bat-yam-a", "ocp4-prep-mce-bat-yam-b", "ocp4-seed-bat-yam-1", "ocp4-seed-five-3",
+            "ocp4-prep-mce-bat-yam-a", "ocp4-prep-mce-bat-yam-b", "ocp4-prep-seed-bat-yam-az1-a", "ocp4-prep-seed-five-az3-a",
         ]
         assert day1.mce_folders("ocp4-mce-site2") == [("five", "sites/five/mces/ocp4-mce-site2")]
         assert day1.mce_folders("ocp4-prep-mce-bat-yam-b") == [("bat-yam", "sites/bat-yam/mces/ocp4-prep-mce-bat-yam-b")]
@@ -495,7 +567,7 @@ class TestOnTheSnapshot:
             head = _git("rev-parse", "main", cwd=origin).strip()
             assert day1.revision == head
             records = day1.kv_clusters(site="five", zone="az1")
-            assert _names(records) == ["ocp4-prod-kv-five-a", "ocp4-prod-kv-five-b", "ocp4-prod-kv-five-c"]
+            assert _names(records) == ["ocp4-prod-kv-five-az1-a", "ocp4-prod-kv-five-az1-b", "ocp4-prod-kv-five-az1-c"]
             assert {record.revision for record in records} == {head}
             assert await day1.blob(records[0].path) == _git("rev-parse", f"main:{records[0].path}", cwd=origin).strip()
 

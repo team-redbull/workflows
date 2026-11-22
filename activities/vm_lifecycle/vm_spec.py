@@ -26,7 +26,7 @@ from __future__ import annotations
 from typing import Any
 
 from activities.vm_lifecycle.cluster_figures import get, guest_memory_bytes, vcpus
-from shared.infraenv_names import ROOT_DISK_SUFFIX, vm_name
+from shared.infraenv_names import ROOT_DISK_SUFFIX, vm_name, vm_size
 from shared.upgrade_layout import ZONE_LABEL
 from shared.vm_requests import GIB, request_cores
 
@@ -59,11 +59,10 @@ def draw_mac(prefix: str, random_bytes: bytes) -> str:
 
 
 def size_label(cpu: int) -> str:
-    """The `redbull.io/size` label's value: the VM's vCPUs, `<cpu>c` (`32c`).
-
-    Not the name's `kv<cpu>` field (the operator, 2026-11-21): the label says a size,
-    and the platform is already said by the VM being a VirtualMachine."""
-    return f"{cpu}c"
+    """The `redbull.io/size` label's value: `kv<cpu>` (`kv32`), the name's size field —
+    the naming convention's §4 value, the same as its InfraEnv's Agents carry (the
+    operator, 2026-11-22; from 2026-11-21 it was `<cpu>c`)."""
+    return vm_size(cpu)
 
 
 def labels(

@@ -251,7 +251,7 @@ class Day1ClusterQuery(BaseModel):
 
     Every filter is optional and they combine: `site` (a `sites/<site>` folder),
     `env` (`day2.env` else the cluster name's first field), `kind` (`all`,
-    `kv` — under a seed folder `ocp4-seed-<site>-<N>`, never by name — or `hc` —
+    `kv` — under a seed folder `ocp4-<lifecycle>-seed-<site>-<zone>-<id>`, never by name — or `hc` —
     under any other folder of `sites/<site>/mces/`, an MCE's; the seeds sit beside them),
     `zone` (`az<N>`: the clusters under that zone's seed, so only `kv` ones).
     `kind` is a plain string here on purpose: this model is decoded from

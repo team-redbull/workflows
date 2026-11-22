@@ -934,41 +934,53 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   The decisions now, with the operator unless marked otherwise:
   - **THE NAMING CONVENTION says everything, parsed ONCE at the API edge** (`shared/infraenv_names.py`,
     `shared/cluster_names.py`) and carried in the input, never re-derived on replay (the
-    provision-dell-server region precedent). It is the platform convention
-    (`kubevirt-workflows/docs/review/naming-convention-draft.md`, a draft). A cluster is
-    `ocp4-<lifecycle>-<flavor>-<site>-<id>`, `<id>` a letter given in creation order, flavors `mce`
-    and `kv` reserved (a KV cluster: `ocp4-prod-kv-five-a`). An InfraEnv is
-    `<flavor>-mtl-<site>-<zone>` (bare metal) or `<flavor>-kv<cpu>-<site>-<zone>` (KubeVirt:
-    `<cpu>` vCPUs, `<cpu> × 8` GiB — `MEMORY_GIB_PER_CPU`, the ONE place the ratio lives), the
-    zone `az<N>`, the flavor carrying its optional variant letter. A VM is
+    provision-dell-server region precedent). It is the platform convention,
+    `Idan-Maimon/kubevirt-workflows` `docs/naming-convention.md` — out of draft 2026-11-22 and THE
+    source of truth: the `naming-convention` skill fetches it before anything is named, and where
+    this file disagrees, the convention wins. A tenant cluster or an MCE is
+    `ocp4-<lifecycle>-<flavor>-<site>-<id>`; a SEED or a KV cluster also carries its zone,
+    `ocp4-<lifecycle>-<seed|kv>-<site>-<zone>-<id>` (`ocp4-prod-seed-five-az1-a`,
+    `ocp4-prod-kv-five-az1-a`); `<id>` a letter given in creation order, flavors `mce`, `seed` and
+    `kv` reserved. An InfraEnv is `<flavor>-mtl-<zone>` (bare metal) or `<flavor>-kv<cpu>-<zone>`
+    (KubeVirt: `<cpu>` vCPUs, `<cpu> × 8` GiB — `MEMORY_GIB_PER_CPU`, the ONE place the ratio
+    lives), the zone `az<N>`, the flavor carrying its optional variant letter, and NO SITE: an
+    InfraEnv belongs to one MCE, so the run's SITE and LIFECYCLE come from the MCE's name. A VM is
     `ocp-<flavor>-kv<cpu>-<site>-<its MAC, 12 hex>` (`ocp-c200-kv32-five-0e03f2a1b2c3`): the zone
-    is a label, never in the name. Its size LABEL is `redbull.io/size: <cpu>c` (`32c`), not the
-    name's `kv<cpu>` (the operator, 2026-11-21). **A seed is `ocp4-seed-<site>-<zone number>`** for zone
-    `az<N>` (the operator, 2026-11-20, AGAINST the draft's `ocp4-<lifecycle>-seed-<site>-<id>`,
-    which is to be updated): one seed per zone and immutable, so its name can carry the zone,
-    where a KV cluster's does not. The route refuses an MCE whose site is not the InfraEnv's (a VM
-    boots on its own site's inventory network). VOCABULARY the operator insists on: "day1" names
-    only the REPO; a seed cluster is a "seed", never an "mce"; a KubeVirt cluster is a "KV
-    cluster"; in day1 the two kinds are `hc` and `kv`.
-  - **The zone's clusters are the FILES of its ONE seed folder**,
-    `sites/<site>/mces/ocp4-seed-<site>-<zone number>/hostedClusters/` at day1 `main`, read by the
+    is a label, never in the name. Its size LABEL is `redbull.io/size: kv<cpu>` (`kv32`), the
+    value the InfraEnv's Agents carry (the operator, 2026-11-22). REVERSED on 2026-11-22, when the
+    convention left draft — do not restore: the seed `ocp4-seed-<site>-<zone number>` (the
+    operator's 2026-11-20 choice against the draft), the KV cluster without its zone
+    (`ocp4-prod-kv-five-a`), the InfraEnv with its site (`c200-kv32-five-az1`) and the route's
+    "MCE at the InfraEnv's site" 422 that came with it, and the size label `<cpu>c` (2026-11-21).
+    Nothing of those shapes ran in production; the lab goldens replay unchanged (the workflow
+    never parses a name). VOCABULARY the operator insists on: "day1" names only the REPO; a seed
+    cluster is a "seed", never an "mce"; a KubeVirt cluster is a "KV cluster"; in day1 the two
+    kinds are `hc` and `kv`.
+  - **The zone's clusters are the FILES of its seeds' folders, of the MCE's LIFECYCLE**,
+    `sites/<site>/mces/ocp4-<lifecycle>-seed-<site>-<zone>-<id>/hostedClusters/` at day1 `main`
+    (a zone may have several seeds, `-a`, `-b`: their clusters are ordered together; a prod MCE's
+    VMs go on prod KV clusters only — the operator, 2026-11-22), read by the
     **cluster-lifecycle limb** (`list_kv_clusters`, §2: it holds the day1 token) through the `Day1`
-    query library (`activities/day1_repo.py`: `Day1.kv_clusters(site, zone)`) on the snapshot of
-    `main` cached by commit (§5), sorted by the name's `id` letter: OLDEST FIRST. `kv` is decided by
+    query library (`activities/day1_repo.py`: `Day1.kv_clusters(site, zone, lifecycle)`) on the
+    snapshot of `main` cached by commit (§5), sorted by the name's `id` letter: OLDEST FIRST. The
+    run carries `lifecycle` (`CreateVmInput`, None only in a run recorded before it, which the limb
+    refuses with `Day1QueryInvalidError` rather than guess). `kv` is decided by
     FOLDER: the seed folders sit beside the MCE folders in `sites/<site>/mces/`, and only a file
-    under a folder named `ocp4-seed-<site>-<N>` is `kv` (`seed_zone`); a file under any other folder
+    under a folder whose name parses as a seed's (`seed_of`) is `kv`; a file under any other folder
     there, an MCE's, is `hc` — never by name (day1 has `ocp4-test-kubevirt-site4` under an MCE, an
     ordinary `hc`) and never by `platform: kubevirt`. A file is USABLE only when day1 CONFIRMS it
     for the zone: every NodePool labels its nodes `topology.kubernetes.io/zone` with the seed's zone,
-    the seed folder and the cluster's name are of this site, and the name is
-    `ocp4-<lifecycle>-kv-<site>-<id>` (`ClusterRecord.blocking` / `confirmed_zone`;
+    the name is `ocp4-<lifecycle>-kv-<site>-<zone>-<id>` and its site, zone and lifecycle are the
+    seed folder's, and the seed is of this site (the convention's §4.b: the zone in the name, the
+    seed's and the NodePools' must agree) (`ClusterRecord.blocking` / `confirmed_zone`;
     `KvClusterEntry.zone` and `.id`; `create_vm.usable`). Any other file is a `day1-problem` row and
     NEVER read. **Judging day1's values is not create-vm's job**: a YAML
     warning (a key written twice in any value layer — `sites/configValues.yaml` puts it in every
     record) is in `problems` and blocks NOTHING; only `blocking` (the zone label, the name, the
     site) takes a file out, because placement depends on those. The
     list is read BEFORE the lock, so the locked part stays short, and carries the commit
-    (`day1_revision` in the result).
+    (`day1_revision` in the result). The zone lock stays per (site, zone), whatever the lifecycle:
+    runs of two lifecycles choose among disjoint clusters, and only wait for each other.
   - **ONE RUN AT A TIME CHOOSES AND CREATES IN A ZONE: the zone lock**
     (`workflow_domains/vm_lifecycle/kv_zone_lock.py`, `KvZoneLockWorkflow`, §5). The run takes its
     zone's lock, reads figures, chooses, has the VM created, and **releases as soon as the VM OBJECT
@@ -1099,8 +1111,10 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   - **kubevirt-redfish runs `systemIdConvention: legacy`** (the operator, 2026-11-05): the Redfish
     system id IS the VM name, so the id, the VM and the server name server-scan lists are one
     string, now `ocp-<flavor>-kv<cpu>-<site>-<MAC>`. add-server-to-mce's pool match (the
-    InfraEnv's first three words, 2026-11-19) is then `^ocp-<flavor>-kv<cpu>-<site>-`: the VMs of
-    that flavor and size at that site, of every zone — to settle before the KubeVirt branch is built.
+    InfraEnv's first three words, 2026-11-19) assumed an InfraEnv WITH its site; under the
+    convention's `<flavor>-<size>-<zone>` it is the whole name (`^ocp-c200-kv32-az1-`) and matches
+    no server — the convention's §3 draws `^ocp-<flavor>-<size>-<MCE's site>-` AND server-scan's zone.
+    Reported to the operator 2026-11-22, not yet changed (add-server-to-mce is not create-vm's).
   - **Deploy order**: terminate any old-shape run → redbull-platform's cleanup (the hub limb's
     `gitops/services/` entry, the two agent charts) → the brain → the cluster-lifecycle limb (the
     listing; `HEADROOM_BUFFER_PERCENT` has a default, so the chart need not ship first) → the
@@ -1781,7 +1795,8 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   `ServerProvisioningActivitySettings`, `VmLifecycleActivitySettings` (each that domain's activity
   worker only; this one is the worker INSIDE a KV cluster and holds only that cluster's own values:
   `KV_CLUSTER`, REQUIRED and NEVER canonicalised — it must equal the day1 file name — parsed at start
-  as `ocp4-<lifecycle>-kv-<site>-<id>`, the site read from it; `VM_MAC_PREFIX`, REQUIRED, three
+  as `ocp4-<lifecycle>-kv-<site>-<zone>-<id>`, the site and the zone read from it (a request for
+  another site or zone is `KvClusterMismatchError`); `VM_MAC_PREFIX`, REQUIRED, three
   octets, the first `0e`, no default; `VM_STORAGE_CLASS_NAME`, REQUIRED; `VM_NETWORK_NAME`, the NAD, default vm.yaml's, and
   `VM_NODE_SELECTOR`, JSON; `VM_REDFISH_LABEL`; `VM_ROOT_DISK_SIZE`. No day1 key, no token, no
   buffer since 2026-11-20) and
@@ -2060,12 +2075,13 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   one run in the first free slot (`create-vm-<mce>_<infraEnv>_<slot>`, never a 409 unless all 100
   slots run), with `count` (1-20) one run per free slot and a per-run report — the VM's name is drawn
   inside the run, so nothing at the edge can key it (§4). `infra_env` must parse as a KubeVirt
-  InfraEnv of the convention, `<flavor>-kv<cpu>-<site>-<zone>` (zone `az<N>`, 1..256 vCPUs; a
-  `-mtl-` InfraEnv and the 2026-11-04 `…-zone-<zone>-<cpu>` form are refused), `mce_cluster` as
-  `ocp4-<lifecycle>-mce-<site>-<id>` AT THE INFRAENV'S SITE (a VM boots on its own site's inventory
-  network), and the VM name the cluster's worker will build must fit a Kubernetes name with its
-  `-root` DataVolume — each a 422 otherwise. The flavor, site, zone, cpu and memory are derived
-  here once and carried. `count` runs are ordinary parallel runs: each takes its zone's lock in
+  InfraEnv of the convention, `<flavor>-kv<cpu>-<zone>` (zone `az<N>`, 1..256 vCPUs; a
+  `-mtl-` InfraEnv, the draft's `<flavor>-kv<cpu>-<site>-<zone>` and the 2026-11-04
+  `…-zone-<zone>-<cpu>` form are refused), `mce_cluster` as `ocp4-<lifecycle>-mce-<site>-<id>` (its
+  site is the VM's, its lifecycle picks the seeds), and the VM name the cluster's worker will build —
+  the InfraEnv's flavor and size, the MCE's site — must fit a Kubernetes name with its `-root`
+  DataVolume — each a 422 otherwise. The flavor, zone, cpu and memory (the InfraEnv's) and the site
+  and lifecycle (the MCE's) are derived here once and carried. `count` runs are ordinary parallel runs: each takes its zone's lock in
   turn, so they no longer all land on one cluster.
   `POST /workflows/segment-lifecycle/initialize-segment` is ASYNC (202 + workflow id) and takes
   the full segment definition; poll `GET /workflows/runs/{workflow_id}` for progress/result. The

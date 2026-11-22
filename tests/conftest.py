@@ -86,7 +86,7 @@ os.environ.update(
         # --- create-vm: the KubeVirt clusters' agents and the placement policy ---
         # DAY1_REPO_URL / DAY1_GIT_TOKEN above serve the vm-lifecycle limb too.
         "HEADROOM_BUFFER_PERCENT": "15",
-        "KV_CLUSTER": "ocp4-prod-kv-five-a",
+        "KV_CLUSTER": "ocp4-prod-kv-five-az1-a",
         "VM_MAC_PREFIX": "0e:03:f2",
         "VM_STORAGE_CLASS_NAME": "test-cephfs",
     }

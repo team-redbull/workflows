@@ -312,7 +312,7 @@ for all.
   | | rule |
   | --- | --- |
   | `kv` | a hosted cluster under a SEED folder. Never by name: day1 has `ocp4-test-kubevirt-site4` under an MCE, and it is an `hc` |
-  | `hc` | a hosted cluster under an MCE folder (KV clusters are hosted clusters too, so `hc` means "not under a seed", stated in the docstring) |
+  | `hc` | a hosted cluster under any other folder of `sites/<site>/mces/`, an MCE's — the seed folders sit beside them there (KV clusters are hosted clusters too, so `hc` means "not under a seed", stated in the docstring) |
   | `zone` | the seed folder's zone (`seed_zone`, 1.3), checked against the NodePools' `nodeLabels`; a mismatch is a `problems` line |
   | `env` | provision-cluster's existing rule, moved here so it has one home: `day2.env` from the merged values, else the cluster name's first field after `ocp4-`. Never the MCE folder's name: legacy folders carry none |
   | `site` | the `sites/<site>` folder |

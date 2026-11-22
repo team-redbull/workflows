@@ -950,15 +950,18 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
     **cluster-lifecycle limb** (`list_kv_clusters`, §2: it holds the day1 token) through the `Day1`
     query library (`activities/day1_repo.py`: `Day1.kv_clusters(site, zone)`) on the snapshot of
     `main` cached by commit (§5), sorted by the name's `id` letter: OLDEST FIRST. `kv` is decided by
-    FOLDER (under a seed), never by name — day1 has `ocp4-test-kubevirt-site4` under an MCE, an
-    ordinary `hc` — and never by `platform: kubevirt`. A file is USABLE only when day1 CONFIRMS it
+    FOLDER: the seed folders sit beside the MCE folders in `sites/<site>/mces/`, and only a file
+    under a folder named `ocp4-seed-<site>-<N>` is `kv` (`seed_zone`); a file under any other folder
+    there, an MCE's, is `hc` — never by name (day1 has `ocp4-test-kubevirt-site4` under an MCE, an
+    ordinary `hc`) and never by `platform: kubevirt`. A file is USABLE only when day1 CONFIRMS it
     for the zone: every NodePool labels its nodes `topology.kubernetes.io/zone` with the seed's zone,
     the seed folder and the cluster's name are of this site, and the name is
     `ocp4-<lifecycle>-kv-<site>-<id>` (`ClusterRecord.blocking` / `confirmed_zone`;
     `KvClusterEntry.zone` and `.id`; `create_vm.usable`). Any other file is a `day1-problem` row and
-    NEVER read. **A YAML warning every cluster shares blocks none of them**: a key written twice in
-    `sites/configValues.yaml` is in every record's `problems`, and treating `problems` as
-    disqualifying would take the whole fleet out for one typo — hence `blocking`, a subset. The
+    NEVER read. **Judging day1's values is not create-vm's job**: a YAML
+    warning (a key written twice in any value layer — `sites/configValues.yaml` puts it in every
+    record) is in `problems` and blocks NOTHING; only `blocking` (the zone label, the name, the
+    site) takes a file out, because placement depends on those. The
     list is read BEFORE the lock, so the locked part stays short, and carries the commit
     (`day1_revision` in the result).
   - **ONE RUN AT A TIME CHOOSES AND CREATES IN A ZONE: the zone lock**

@@ -336,7 +336,8 @@ class ClusterRecord:
     # kv only: the lines of `problems` that make the file UNUSABLE as a KV cluster of its
     # seed's zone — a seed folder under another site, a name off the convention or of
     # another site, NodePools that do not all label the zone. A key written twice in a
-    # value layer is a problem too, but not one of these: it is every cluster's alike.
+    # value layer is a problem too, but never one of these: judging day1's values is not
+    # create-vm's job, only what its placement depends on is.
     blocking: list[str] = field(default_factory=list)
 
     @property

@@ -251,7 +251,8 @@ class Day1ClusterQuery(BaseModel):
 
     Every filter is optional and they combine: `site` (a `sites/<site>` folder),
     `env` (`day2.env` else the cluster name's first field), `kind` (`all`,
-    `hc` — under an MCE folder — or `kv` — under a seed folder, never by name),
+    `kv` — under a seed folder `ocp4-seed-<site>-<N>`, never by name — or `hc` —
+    under any other folder of `sites/<site>/mces/`, an MCE's; the seeds sit beside them),
     `zone` (`az<N>`: the clusters under that zone's seed, so only `kv` ones).
     `kind` is a plain string here on purpose: this model is decoded from
     history, and the limb refuses an unknown one with Day1QueryInvalidError

@@ -159,11 +159,11 @@
           <p class="note">A file is <b>usable</b> only when day1 confirms it for this zone: every one of its
           NodePools labels its nodes <code>topology.kubernetes.io/zone</code> with the seed&rsquo;s zone, and
           its name is <code>ocp4-&lt;lifecycle&gt;-kv-&lt;site&gt;-&lt;id&gt;</code> at this site. Any other file
-          is a <code>day1-problem</code> row in the table and is <b>never read</b>. A YAML warning every
-          cluster shares (a key written twice in a value layer) is reported and blocks none of them. A
-          hosted cluster under an MCE folder is never a KV cluster, whatever its name says. No usable
-          cluster fails the run with <code>NoKvClusterError</code> naming the folder, the commit and the
-          files listed with a problem. A new cluster file is seen by the first run after its commit lands.</p>
+          is a <code>day1-problem</code> row in the table and is <b>never read</b>. Only the files under
+          the seed folder are KV clusters: the seed sits beside the MCEs in <code>mces/</code>, and a file
+          under any other folder there (an MCE&rsquo;s) is not one, even one whose name mentions kubevirt.
+          No usable cluster fails the run with <code>NoKvClusterError</code>, naming the folder, the commit
+          and the files that had a problem. A new cluster file is seen by the first run after its commit lands.</p>
         </div>
       </div>
 

@@ -335,7 +335,7 @@ def test_every_settings_class_of_the_repo_is_found(checker):
     """DL004/DL005 read shared/settings/*.py: one class per module, none missed."""
     found = sorted(node.name for node in checker._settings_classes())
     modules = sorted(p.stem for p in (REPO_ROOT / "shared" / "settings").glob("*.py") if p.stem != "__init__")
-    assert len(found) == len(modules) == 9, (found, modules)
+    assert len(found) == len(modules) == 8, (found, modules)
     assert "TemporalSettings" in found and "ClusterLifecycleActivitySettings" in found
 
 

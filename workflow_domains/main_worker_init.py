@@ -32,7 +32,6 @@ from shared.consts import (
     LEGACY_REMOVE_SERVER_WORKFLOW_QUEUE,
     LEGACY_UNINSTALL_SERVER_WORKFLOW_QUEUE,
     PROVISION_CLUSTER_WORKFLOW_QUEUE,
-    PROVISION_DELL_SERVER_WORKFLOW_QUEUE,
     PUBLISH_INFRAENV_TO_PXE_SERVER_WORKFLOW_QUEUE,
     RELEASE_SEGMENT_WORKFLOW_QUEUE,
     REMOVE_SERVER_FROM_MCE_WORKFLOW_QUEUE,
@@ -82,9 +81,6 @@ from workflow_domains.server_lifecycle.uninstall_server_from_hc import (
     UninstallServerWorkflow,
 )
 from workflow_domains.server_lifecycle.update_nodepool import UpdateNodePoolWorkflow
-from workflow_domains.server_provisioning.provision_dell_server import (
-    ProvisionDellServerWorkflow,
-)
 from workflow_domains.vm_lifecycle.create_vm import CreateVmWorkflow
 
 _settings = TemporalSettings()
@@ -99,7 +95,6 @@ _WORKER_SPECS: list[tuple[str, list[type]]] = [
     (CREATE_VM_WORKFLOW_QUEUE, [CreateVmWorkflow]),
     (INITIALIZE_SEGMENT_WORKFLOW_QUEUE, [InitializeSegmentWorkflow]),
     (PROVISION_CLUSTER_WORKFLOW_QUEUE, [ProvisionClusterWorkflow]),
-    (PROVISION_DELL_SERVER_WORKFLOW_QUEUE, [ProvisionDellServerWorkflow]),
     (PUBLISH_INFRAENV_TO_PXE_SERVER_WORKFLOW_QUEUE, [PublishInfraEnvToPxeServerWorkflow]),
     (RELEASE_SEGMENT_WORKFLOW_QUEUE, [ReleaseSegmentWorkflow]),
     (REMOVE_SERVER_FROM_MCE_WORKFLOW_QUEUE, [RemoveServerFromMceWorkflow]),

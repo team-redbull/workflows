@@ -218,16 +218,6 @@ def scale_down_nodepool_workflow_id(cluster: str) -> str:
     return f"scale-down-nodepool-{cluster}"
 
 
-def provision_dell_server_workflow_id(idrac_ip: str) -> str:
-    """`provision-dell-server-<idrac ip>`: natural dedup per machine at the rack.
-
-    The iDRAC address is the only identity the run has when it starts — the
-    service tag is read FROM that iDRAC — and a technician double-submitting a
-    row of a bulk list must land on the running run, not start a second one
-    that races it through the same reboots.
-    """
-    return f"provision-dell-server-{idrac_ip}"
-
 def release_segment_workflow_id(segment_type: SegmentType, cluster: str) -> str:
     """`release-segment-<TYPE>-<cluster>`: natural dedup per (type, cluster).
 

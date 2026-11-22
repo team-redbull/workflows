@@ -91,8 +91,9 @@ Prod charts are VENDORED into the Argo CD repo, at
 `redbull-platform/gitops/charts/<service>/`: `workflows-orchestrator` (brain: ONE release for
 all domains), `segment-lifecycle-worker`, `server-lifecycle-worker` and `server-provisioning-worker`
 (limbs: one per domain), cluster-upgrade's `cluster-upgrade-worker`, `upgrade-agent-worker`
-and `upgrade-gitops-worker` (since 2026-11-02; with `server-provisioning-worker`, these have no
-`gitops/services/` entry yet, so CI bumps their tags and Argo CD deploys nothing), and
+and `upgrade-gitops-worker` (since 2026-11-02; these have no `gitops/services/` entry yet, so CI
+bumps their tags and Argo CD deploys nothing; `server-provisioning-worker` has none either, and
+its code is on the `feat/provision-dell-server` branch, so `main` builds no image for it), and
 `vm-lifecycle-worker` (written 2026-11-05) and `cluster-lifecycle-worker` (written 2026-11-11), both
 on redbull-platform's `main` since (CI's bump of each failed until then; a failing bump now stops
 no other image, §9). One generic ApplicationSet
@@ -239,48 +240,14 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
 
 ## 4. External dependencies are black boxes
 
-- **provision-dell-server (domain `server-provisioning`) takes a Dell from "iDRAC has an IP" to
-  "this machine is configured"**, after which add-server-to-mce can draw it. Designed with the
-  operator 2026-09-30.
-  The pieces that are decisions, not incidental:
-  - **Credentials by POSITION, never by value in history.** Root only (iDRAC user 2); the OME
-    account on the iDRAC is NEVER touched (OME would lose the machine). Candidates are
-    `IDRAC_ROOT_PASSWORD` (the one the template enforces) then `IDRAC_FACTORY_PASSWORDS` (≤2), one
-    request each — iDRAC9 blocks an address after 3 failures, so only an all-wrong round trips it,
-    and the next round waits `_LOCKOUT_WAIT` out. A machine that came in on a factory password is
-    re-discovered in OME with the target one after the template, or OME loses it.
-  - **The TEMPLATE is per (Redfish model, iDRAC firmware)** — `DELL_TEMPLATES`, no fallback.
-    It sets root's password; the run verifies that by logging in.
-  - **Storage: RAID 1 on the BOSS pair, every PERC drive Non-RAID, NEVER a delete.** Policy in
-    `storage_plan.py`; staged `OnReset` so ONE reboot applies all; after the template, so the
-    layout checked is final. An existing volume or in-use drive fails the run.
-  - **The naming service is the author of the name** (it reads OME and rounds its own way);
-    `server_namer.py` is the opening for its real contract. The run checks the name read back
-    from the OME PROFILE (what server-scan reads) against the convention, the run's region and
-    the iDRAC's service tag — never re-deriving cores/memory/disk.
-  - **Region comes from the iDRAC prefix at the API EDGE** (`regions.py`, a const), carried as
-    input — never looked up on replay.
-  - **A server server-scan lists as claimed by a cluster is refused** before anything reboots it.
-  - **Dell's own client code is the reference for every OME/iDRAC shape** — the
-    `dellemc.openmanage` collection (`docs/design/dell-ome-idrac-api.md` lists each
-    fact with its source file). Change a request only against that code, and keep
-    `tests/dell_simulator.py` in step: the e2e test runs the real limb against it.
-    Traps it found: NVMe RaidStatus lives under `DellPCIeSSD`; a PERC runs Non-RAID
-    at once (RealTimeNoRebootConfiguration) so NO reset while a job runs; a
-    templated device is `ProfileState > 0` + same `TemplateId`, and its
-    `DeploymentTaskId` is the job to wait on.
-  - **DONE = CONFIGURED, NOT INVENTORIED. Do not re-add the server-scan wait.** The run ends
-    once root is on the enforced password, the template is applied, the storage layout verifies
-    and the OME profile carries the right name. It used to end instead at "server-scan lists it",
-    polling a Mongo-backed read every 10 min for up to 8 h (`awaiting-server-scan`,
-    `_SERVER_SCAN_DEADLINE`, `ServerScanNeverSawServerError`). Reversed by the operator on
-    2026-09-30: server-scan discovers by itself on a 6-hourly collection, so the wait added hours
-    to every run to observe something the run cannot influence, and made a slow or paused
-    collector fail a fleet of correctly provisioned machines. The EARLY server-scan read stays —
-    that one refuses a machine a cluster is using, which is a safety check, not a completion one.
-    Either way, never ask server-scan to refresh and never call `/servers/available` (live vendor
-    recheck).
-
+- **provision-dell-server (domain `server-provisioning`) is NOT ON `main`** (the operator,
+  2026-11-22: it is not in production). Its code, tests, docs page, limb image row and its design
+  bullet here live on the `feat/provision-dell-server` branch — open a PR from it when the
+  workflow is to be used; nothing on `main` depends on it (verified when it moved: no other
+  workflow imports or starts it, no sibling repo calls its route, its limb was never deployed).
+  The redbull-platform chart `gitops/charts/server-provisioning-worker/` stays vendored and
+  undeployed. "The provision-dell-server region precedent" cited below means: a fact parsed
+  ONCE at the API edge and carried in the run's input, never looked up on replay.
 - **server-scan is the inventory source of record for add-server-to-mce**
   (`SERVER_SCAN_URL`), and it ALLOCATES each run ONE server (server-scan's
   ADR-0063, 2026-11-16; adopted here 2026-11-17, the operator: "every workflow
@@ -1541,7 +1508,7 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   fail at startup (§5) — so a new exception still rebuilds every image, and that is accepted.
   The classes: `TemporalSettings` (workers + api.py),
   `SegmentLifecycleActivitySettings`, `ServerLifecycleActivitySettings`,
-  `ServerProvisioningActivitySettings`, `VmLifecycleActivitySettings` (each that domain's activity
+  `VmLifecycleActivitySettings` (each that domain's activity
   worker only; this one: `DAY1_REPO_URL`/`DAY1_GIT_TOKEN` again, `KV_CAPACITY_URL_TEMPLATE` /
   `KV_VM_API_URL_TEMPLATE` with their placeholders checked at startup, the two tokens, `KV_AGENT_CA`,
   `HEADROOM_BUFFER_PERCENT` 0..90 and `VM_MAC_PREFIX` — locally administered unicast, checked) and
@@ -1609,7 +1576,7 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   `gitops/charts/segment-lifecycle-worker/`, `gitops/charts/server-lifecycle-worker/`,
   `gitops/charts/server-provisioning-worker/` (each: ConfigMap + Secrets + limb +
   SA; the provisioning one needs no RBAC, only egress to the iDRACs, OME, the naming service and
-  server-scan), `gitops/charts/upgrade-gitops-worker/` (the cluster-upgrade hub limb; its only
+  server-scan — its limb's code is on `feat/provision-dell-server`, not `main`), `gitops/charts/upgrade-gitops-worker/` (the cluster-upgrade hub limb; its only
   copy, moved from `deploy/charts/` on 2026-11-02) and `gitops/charts/vm-lifecycle-worker/`
   (create-vm's hub limb: ConfigMap + the two agent-token Secrets behind `existing*` hooks + limb +
   SA, `automountServiceAccountToken: false`, an optional CA ConfigMap; it NAMES the

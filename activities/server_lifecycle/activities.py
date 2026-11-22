@@ -542,14 +542,25 @@ async def check_infra_env(ref: InfraEnvRef) -> InfraEnvState:
             f"MCE {_settings.mce_cluster}: create it, or fix infra_env / namespace "
             "in the request"
         )
-    cluster_ref = ((infra_env.get("spec") or {}).get("clusterRef") or {}).get("name")
+    spec = infra_env.get("spec") or {}
+    cluster_ref = (spec.get("clusterRef") or {}).get("name")
+    labels = spec.get("agentLabels")
+    agent_labels = (
+        {str(key): str(value) for key, value in labels.items()} if isinstance(labels, dict) else {}
+    )
     activity.logger.info(
-        "InfraEnv %s/%s exists%s",
+        "InfraEnv %s/%s exists%s, agentLabels %s",
         ref.namespace,
         ref.name,
         f" (early-bound to cluster {cluster_ref})" if cluster_ref else "",
+        agent_labels or "none",
     )
-    return InfraEnvState(name=ref.name, namespace=ref.namespace, cluster_ref=cluster_ref)
+    return InfraEnvState(
+        name=ref.name,
+        namespace=ref.namespace,
+        cluster_ref=cluster_ref,
+        agent_labels=agent_labels,
+    )
 
 
 @activity.defn

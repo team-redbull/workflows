@@ -74,7 +74,7 @@
       <div class="eyebrow">The first thing to know</div>
       <h2>Two ways to trigger it: name a server, or don&rsquo;t</h2>
       <p class="lede"><code>server_names</code> is optional, and <b>leaving it out is the normal mode</b>.
-      The InfraEnv&rsquo;s own name is then the hardware query, so you ask for &ldquo;a server for this
+      The InfraEnv&rsquo;s agent labels are then the hardware query, so you ask for &ldquo;a server for this
       InfraEnv&rdquo; and the workflow decides which one. Either way one run installs <b>one</b>
       server; several servers are several runs (<a href="#api">below</a>).</p>
     </div>
@@ -84,7 +84,7 @@
         <thead><tr><th></th><th><code>server_names</code> omitted</th><th><code>server_names</code> given</th></tr></thead>
         <tbody>
           <tr><td class="k">reads as</td><td class="muted"><em>&ldquo;fill this InfraEnv&rdquo;</em></td><td class="muted"><em>&ldquo;install this machine&rdquo;</em></td></tr>
-          <tr><td class="k">server-scan allocation</td><td class="muted"><code>POST /servers/available {"pattern": "^ocp-&lt;first 3 words of infraEnv&gt;-", …}</code></td><td class="muted"><code>POST /servers/available {"name": "&lt;server&gt;", …}</code></td></tr>
+          <tr><td class="k">server-scan allocation</td><td class="muted"><code>POST /servers/available {"pattern": "^ocp-&lt;flavor&gt;-&lt;size&gt;-&lt;site&gt;-", …}</code>, from the InfraEnv&rsquo;s <code>agentLabels</code></td><td class="muted"><code>POST /servers/available {"name": "&lt;server&gt;", …}</code></td></tr>
           <tr><td class="k">servers per run</td><td class="muted">one &mdash; server-scan picks it, locks it for the run and live-checks it</td><td class="muted">one &mdash; that one</td></tr>
           <tr><td class="k">already has a BareMetalHost</td><td class="muted">its lock <b>given back</b>, the run fails</td><td class="muted"><b>converged</b> &mdash; that is the point</td></tr>
           <tr><td class="k">workflow id</td><td class="muted"><code>add-server-to-mce-&lt;mce&gt;_&lt;infraEnv&gt;_&lt;slot&gt;</code>, the first free slot</td><td class="muted"><code>add-server-to-mce-&lt;mce&gt;_&lt;server&gt;</code></td></tr>
@@ -106,19 +106,30 @@
         expected state rather than a reason to give the server back.</p>
       </div>
       <div class="panel">
-        <h3>The pool: the InfraEnv&rsquo;s first three words</h3>
-        <p>server-scan names carry the InfraEnv&rsquo;s leading words behind an <code>ocp-</code> prefix,
-        so the query is the InfraEnv name&rsquo;s <b>first three <code>-</code>-separated words</b>
-        (the operator, 2026-11-19): <code>c200-mtl-haifa-az1</code> draws from
-        <code>^ocp-c200-mtl-haifa-</code>. Always three, whatever the name &mdash; a longer name such as
-        <code>cisco-m6-bat-yam-64c-512gb</code> draws from <code>^ocp-cisco-m6-bat-</code>, any size; a
-        name of fewer words is used whole. There is no mapping table to keep in step. The trailing
-        <code>-</code> is load-bearing (the operator, 2026-11-17): the third word must end where the
-        server&rsquo;s next word begins, so <code>c200-mtl-haifa</code> never draws a server of
-        <code>c200-mtl-haifa2</code> or <code>c200-mtl-haifax</code>.</p>
-        <p class="note">The InfraEnv name is caller data going into a regex, so it is escaped. Today&rsquo;s
-        names are <code>[a-z0-9-]</code> and it changes nothing &mdash; a <code>.</code> would silently
-        widen the pool without it.</p>
+        <h3>The pool: the InfraEnv&rsquo;s flavor, size and site labels</h3>
+        <p>Under the naming convention (since 2026-11-22) a server is named
+        <code>ocp-&lt;flavor&gt;-&lt;size&gt;-&lt;site&gt;-&lt;serial&gt;</code> and an InfraEnv
+        <code>&lt;flavor&gt;-&lt;size&gt;-&lt;zone&gt;</code>, so the InfraEnv&rsquo;s name no longer says
+        which servers are its: the zone is in no server&rsquo;s name, and the site is in no
+        InfraEnv&rsquo;s. Each InfraEnv carries every part as an agent label, so the query is built from
+        three of its <code>spec.agentLabels</code>:</p>
+<pre><code># InfraEnv c200-mtl-az1
+spec:
+  agentLabels:
+    redbull.io/flavor: c200
+    redbull.io/size: mtl
+    redbull.io/site: five
+    topology.kubernetes.io/zone: az1   # not part of the query</code></pre>
+        <p>draws from <code>^ocp-c200-mtl-five-</code>. The trailing <code>-</code> is load-bearing
+        (the operator, 2026-11-17): the site must end where the server&rsquo;s next word begins, so
+        <code>five</code> never draws a server of <code>five2</code>. Each of the three must be present and
+        one lowercase word of letters and digits, or the run fails before anything is allocated
+        (<code>InfraEnvAgentLabelsError</code>, naming each label). A named install needs none of them.</p>
+        <p class="note">A <code>server-lifecycle-worker</code> older than this rule reports no labels; a
+        run against it, and every run started before it, still draws from the InfraEnv name&rsquo;s
+        first three words (<code>c200-mtl-haifa-az1</code> &rarr; <code>^ocp-c200-mtl-haifa-</code>).
+        The zone is not filtered on yet: drawing only servers whose zone in server-scan matches the
+        InfraEnv&rsquo;s waits on server-scan&rsquo;s allocation taking a zone.</p>
       </div>
     </div>
   </section>
@@ -216,6 +227,7 @@
       <table>
         <thead><tr><th>Situation</th><th>What the run does</th><th>Where the lock ends up</th></tr></thead>
         <tbody>
+          <tr><td>The InfraEnv is not on the MCE, or (a pool draw) its <code>agentLabels</code> lack a flavor, size or site that can name a server</td><td class="muted">Fails at once, before the draw: <code>InfraEnvNotFoundError</code> / <code>InfraEnvAgentLabelsError</code> naming each label</td><td class="muted">never taken</td></tr>
           <tr><td>server-scan has nothing to allocate &mdash; nothing healthy, all claimed or locked, every candidate failing its live check</td><td class="muted">Fails at once, <code>ServerNotAvailableError</code> with server-scan&rsquo;s reasons</td><td class="muted">never taken</td></tr>
           <tr><td>The allocated server fails a check</td><td class="muted">Gives it back and fails, saying which check</td><td class="muted">released at once</td></tr>
           <tr><td>The Agent appears</td><td class="muted">Installed; then waits (up to 24 h, server-scan read every 5 min) for server-scan to show it <code>INSTALLED_TO_INVENTORY</code> / <code>INSTALLED</code>, and completes</td><td class="muted">held 24 h, then <b>released</b> as soon as server-scan shows it installed (<code>lock_released: true</code>)</td></tr>
@@ -892,7 +904,7 @@
       <table>
         <thead><tr><th>Field</th><th>Type</th><th>Rules</th><th>What it&rsquo;s for</th></tr></thead>
         <tbody>
-          <tr><td class="k">infra_env</td><td class="k">str</td><td class="muted">required, non-empty</td><td class="muted">The InfraEnv to fill. Labels both resources, <b>and</b> its first three words are the server query (<code>c200-mtl-haifa-az1</code> &rarr; <code>^ocp-c200-mtl-haifa-</code>). Must already exist, in <code>namespace</code>.</td></tr>
+          <tr><td class="k">infra_env</td><td class="k">str</td><td class="muted">required, non-empty</td><td class="muted">The InfraEnv to fill. Labels both resources, <b>and</b> its flavor, size and site <code>agentLabels</code> are a pool draw&rsquo;s server query (<code>c200</code>, <code>mtl</code>, <code>five</code> &rarr; <code>^ocp-c200-mtl-five-</code>). Must already exist, in <code>namespace</code>.</td></tr>
           <tr><td class="k">mce_cluster</td><td class="k">str</td><td class="muted">required, non-empty</td><td class="muted">Which MCE. Selects the <code>INVENTORY</code> segment the VLAN comes from <b>and</b> the activity queue the cluster writes go to.</td></tr>
           <tr><td class="k">namespace</td><td class="k">str</td><td class="muted">non-empty, default <code>inventory</code></td><td class="muted">Where the three resources go. Must be the InfraEnv&rsquo;s own namespace.</td></tr>
           <tr><td class="k">server_names</td><td class="k">str | list | null</td><td class="muted">default <code>null</code>; a list is 1&ndash;20 names, each once</td><td class="muted">Install these machines instead of letting the pool pick: one name, or a list &mdash; one run per name. Turns the already-installed refusal off; changes the workflow id.</td></tr>
@@ -918,7 +930,7 @@
         <tbody>
           <tr><td class="k">pending</td><td class="muted">Run accepted, nothing read yet</td><td class="muted">instant</td></tr>
           <tr><td class="k">resolving-vlan</td><td class="muted">Reading the MCE&rsquo;s <code>INVENTORY</code> segment from the Segments Manager</td><td class="muted">instant</td></tr>
-
+          <tr><td class="k">validating-infraenv</td><td class="muted">Reading the InfraEnv on the MCE: it must exist and, for a pool draw, its <code>agentLabels</code> name the servers to ask for</td><td class="muted">instant</td></tr>
           <tr><td class="k">acquiring-server</td><td class="muted">server-scan allocating ONE server: locked for this run, live-checked while locked</td><td class="muted">seconds to ~1 min (it reaches a vendor manager); ~22 min at its worst</td></tr>
           <tr><td class="k">selecting-server</td><td class="muted">Name, BMC, the two bond members picked, one BareMetalHost read; refused, the lock goes back and the run fails</td><td class="muted">seconds</td></tr>
           <tr><td class="k">reserving-server</td><td class="muted">Only a named server the allocation refused that the run takes anyway (its own leftover lock, <code>allow_unhealthy</code>): taking server-scan&rsquo;s install lock</td><td class="muted">instant</td></tr>

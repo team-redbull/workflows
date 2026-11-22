@@ -284,16 +284,23 @@ maintenance, its health — fails saying which.
    Manager by **cluster name**. Before the allocation, because no server could
    make a missing allocation usable (and one allocated first would sit locked).
    Runs on the *segment-lifecycle* queue, where that credential already lives.
+   **validating-infraenv** — the InfraEnv must exist on the MCE
+   (`InfraEnvNotFoundError`), and for a pool draw its `spec.agentLabels` must
+   name its servers (below; `InfraEnvAgentLabelsError` naming each label
+   missing or not one lowercase word). Nothing is allocated before it.
 2. **acquiring-server** — `POST /servers/available`: server-scan **allocates**
    ONE server, locked for this run (holder `add-server-to-mce`, the run's
    workflow id, 2 h) and live-checked while locked (its ADR-0063). The
-   pool is the InfraEnv name's **first three `-`-separated words** behind an
-   `ocp-` prefix (since 2026-11-19): InfraEnv `c200-mtl-haifa-az1` draws from
-   `^ocp-c200-mtl-haifa-`. Always three, whatever the name — a longer name like
-   `cisco-m6-bat-yam-64c-512gb` draws from `^ocp-cisco-m6-bat-`, any size; a name
-   of fewer words is used whole. The trailing `-` ends the third word, so
-   `c200-mtl-haifa` never draws `c200-mtl-haifa2-…`; `max_health: HEALTHY`,
-   `min_nic_macs: 2`. Nothing reservable is server-scan's 503
+   pool is `^ocp-<flavor>-<size>-<site>-`, from the InfraEnv's
+   `redbull.io/flavor`, `redbull.io/size` and `redbull.io/site` agentLabels
+   (the naming convention, since 2026-11-22): InfraEnv `c200-mtl-az1` labelled
+   `c200` / `mtl` / `five` draws from `^ocp-c200-mtl-five-`. Its name cannot
+   say it: the zone in it is in no server's name, and the site is in no
+   InfraEnv's. The zone label is not filtered on yet. The trailing `-` ends the
+   site, so `five` never draws `five2-…`; `max_health: HEALTHY`,
+   `min_nic_macs: 2`. A limb older than the labels, and a run started before
+   them, draw from the InfraEnv name's first three words instead
+   (`c200-mtl-haifa-az1` → `^ocp-c200-mtl-haifa-`). Nothing reservable is server-scan's 503
    `NO_AVAILABLE_SERVER` with its reasons → `ServerNotAvailableError`, the run
    fails. Seconds as a rule, ~22 min at server-scan's worst (five live checks):
    the activity heartbeats and allows 30. **Not idempotent**: a retry after a
@@ -367,8 +374,8 @@ maintenance, its health — fails saying which.
 
 Its id is `add-server-to-mce-<mce>_<infraEnv>_<slot>` — the hub, the
 **pool** and a slot. The MCE is in the id so each hub finds only its own
-runs; the pool itself (`^ocp-<first 3 words of the infraEnv>-`) has no MCE in it, so
-two hubs filling InfraEnvs that start with the same three words draw from the same machines, and the install
+runs; the pool itself (`^ocp-<flavor>-<size>-<site>-`, from the InfraEnv's agentLabels) has no MCE in it, so
+two hubs filling InfraEnvs with the same three labels draw from the same machines, and the install
 lock is what keeps them apart. Installs drawing from one pool run in parallel,
 one per slot (see
 [Several servers at once](#several-servers-at-once--count-or-a-list-of-server_names));
@@ -458,7 +465,7 @@ error type of that one reason.
 
 | field | type | rules | what it is for |
 | --- | --- | --- | --- |
-| `infra_env` | str | non-empty | The InfraEnv to fill. Labels both resources, **and** its first three `-`-separated words are the server query (`c200-mtl-haifa-az1` → `^ocp-c200-mtl-haifa-`). Must already exist, in `namespace`. |
+| `infra_env` | str | non-empty | The InfraEnv to fill. Labels both resources, **and** its flavor, size and site `agentLabels` are a pool draw's server query (`c200`, `mtl`, `five` → `^ocp-c200-mtl-five-`). Must already exist, in `namespace`. |
 | `mce_cluster` | str | non-empty | Which MCE. Names the `INVENTORY` segment the VLAN comes from **and** the activity queue the cluster writes go to. |
 | `namespace` | str | non-empty | Where the three resources go. **Must be the InfraEnv's own namespace** — BMAC looks for the InfraEnv beside the BareMetalHost. |
 | `server_names` | str \| list \| null | default `null`; a list is 1–20 names, each once | Install these machines instead of letting the pool pick (see above): one name, or a list — one run per name. |

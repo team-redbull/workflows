@@ -61,6 +61,7 @@ from shared.consts import ADD_SERVER_TO_MCE_WORKFLOW_QUEUE
 from shared.exceptions import (
     AgentNeverAppearedError,
     BmhConflictError,
+    InfraEnvAgentLabelsError,
     ServerLooksInstalledError,
     ServerNotAvailableError,
     ServerScanAuthError,
@@ -233,6 +234,15 @@ SCENARIOS: dict[str, Callable[[], Scenario]] = {
     # ... or, server-scan unreadable, the lock kept and the run completed.
     "server-scan-unreadable-after-install": lambda: Scenario(
         mocks={"scan_error": ServerScanAuthError("server-scan rejected our credentials (401)")},
+    ),
+    # Since 2026-11-22 the pool is `ocp-<flavor>-<size>-<site>-`, from the
+    # InfraEnv's agentLabels (every allocated-* golden above predates the key
+    # and draws by the name's first three words, as an older limb's run does).
+    "labelled-pool-install": lambda: Scenario(),
+    # ... and an InfraEnv whose labels cannot name a server fails before the draw.
+    "infraenv-without-agent-labels": lambda: Scenario(
+        mocks={"agent_labels": {"topology.kubernetes.io/zone": "az1"}},
+        fails_with=InfraEnvAgentLabelsError.__name__,
     ),
 }
 

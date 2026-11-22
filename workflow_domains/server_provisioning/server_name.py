@@ -11,9 +11,12 @@ another machine.
 
     ocp-dell-r660-<region>-128c-1024gb-10tb-<service tag>
 
-Its leading words are also what add-server-to-mce matches an InfraEnv against
-(`^ocp-<the InfraEnv's first three words>-`, i.e. `ocp-dell-<model>-<region>-`),
-so this shape is load-bearing.
+Its leading words are also what add-server-to-mce draws an InfraEnv's servers
+by, so this shape is load-bearing: since 2026-11-22 `^ocp-<flavor>-<size>-<site>-`
+from the InfraEnv's agentLabels, so an InfraEnv drawing these machines labels
+flavor `dell`, size `<model>`, site `<region>` (before, the InfraEnv name's
+first three words, `ocp-dell-<model>-<region>-`). The naming convention names a
+bare-metal server `ocp-<flavor>-mtl-<site>-<serial>`, which this shape is not.
 """
 
 from __future__ import annotations

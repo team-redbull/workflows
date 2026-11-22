@@ -285,12 +285,26 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   (`SERVER_SCAN_URL`), and it ALLOCATES each run ONE server (server-scan's
   ADR-0063, 2026-11-16; adopted here 2026-11-17, the operator: "every workflow
   will ask for one server, no need for candidate"). `allocate_server` =
-  `POST /servers/available` {pattern `^ocp-<the InfraEnv's FIRST THREE words>-`
-  (the operator, 2026-11-19: `c200-mtl-haifa-az1` → `^ocp-c200-mtl-haifa-`; ALWAYS
-  three, so a longer-style name like `cisco-m6-bat-yam-64c-512gb` draws
-  `^ocp-cisco-m6-bat-`, size and the rest of the site dropped — accepted; fewer
-  words = the whole name; `server_pool_prefix`, `_POOL_WORDS`. The trailing `-`
-  is load-bearing, the operator 2026-11-17: `…-haifa` must not draw `…-haifa2-…`) | name, `max_health:
+  `POST /servers/available` {pattern `^ocp-<flavor>-<size>-<site>-` FROM THE
+  INFRAENV'S `spec.agentLabels` (`redbull.io/flavor`, `redbull.io/size`,
+  `redbull.io/site`; the operator, 2026-11-22, on the naming convention in
+  `Idan-Maimon/kubevirt-workflows` `docs/naming-convention.md`: InfraEnv
+  `<flavor>-<mtl|kv<cpu>>-<zone>` = `c200-mtl-az1`, servers
+  `ocp-<flavor>-<mtl|kv<cpu>>-<site>-<serial|mac>` — the zone is in no server's
+  name, the site in no InfraEnv's, so the NAME cannot be the query any more; do
+  not go back to parsing it). `check_infra_env` reports the labels
+  (`InfraEnvState.agent_labels`, always emitted, `{}` for none — the limb never
+  judges them, publish-infraenv-to-pxe-server needs none); a POOL draw judges them
+  in `validating-infraenv` (`agent_label_problems`: each present and ONE lowercase
+  `[a-z0-9]+` word) and fails `InfraEnvAgentLabelsError`, every label named,
+  before anything is allocated; a named install needs none. The zone label is NOT
+  filtered on: server-scan's allocation takes no zone yet (the convention's open
+  item 2). Gated on the KEY's presence, not a patch (§5(a)): a limb predating it,
+  and every run recorded before, keep the InfraEnv name's FIRST THREE words
+  (the operator, 2026-11-19: `c200-mtl-haifa-az1` → `^ocp-c200-mtl-haifa-`,
+  `pool_prefix_from_name`, `_POOL_WORDS`) — the allocation's input is not
+  compared on replay. The trailing `-` is load-bearing, the operator 2026-11-17:
+  `…-five` must not draw `…-five2-…`) | name, `max_health:
   HEALTHY`, `min_nic_macs: 2`, holder, workflow id, mce_cluster, infra_env,
   namespace, `ttl_seconds` = the install TTL}: server-scan draws a candidate,
   LOCKS it for the run, live-rechecks it against its vendor manager WHILE locked
@@ -477,7 +491,9 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
 - **add-server-to-mce checks the InfraEnv exists on the MCE before drawing**
   (`check_infra_env`, phase `validating-infraenv`, gated by
   `infraenv-precheck`): a missing one fails the run with `InfraEnvNotFoundError`
-  instead of locking, booting and waiting an hour on every candidate. An
+  instead of locking, booting and waiting an hour on every candidate, and a pool
+  draw's InfraEnv whose agentLabels cannot name its servers fails
+  `InfraEnvAgentLabelsError` (the server-scan bullet above). An
   early-bound InfraEnv (`spec.clusterRef`) is logged, not refused. The API
   defaults `namespace` to `inventory` — on the edge model only, so a recorded
   run's input never changes on replay.
@@ -961,11 +977,12 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
     available); NO extra VM labels for now (`labels` is in the contract, sent empty).
     **kubevirt-redfish runs `systemIdConvention: legacy`** (the operator, 2026-11-05, before any
     production VM exists): the Redfish system id IS the VM name, so the id, the VM and the server
-    name server-scan lists are one string, `ocp-<infraenv>-<suffix>`, and add-server-to-mce's
-    match holds (since 2026-11-19 on the InfraEnv's first three words only — which for a
-    KubeVirt InfraEnv `<conf>[-<letter>]-zone-<zone>-<cpu>` stops before the zone and size:
-    the pool then spans the conf's VMs of every zone and size, to settle before the KubeVirt
-    branch is built). `enhanced` (`<ns>.<vm>`) was the chart's setting until then;
+    name server-scan lists are one string, `ocp-<infraenv>-<suffix>`. add-server-to-mce's pool
+    match no longer holds for those names: since 2026-11-22 it draws
+    `^ocp-<flavor>-<size>-<site>-` from the InfraEnv's agentLabels (the server-scan bullet), and
+    the naming convention renames a VM `ocp-<flavor>-kv<cpu>-<site>-<full MAC>` (its open item 9,
+    create-vm's change) — to settle before the KubeVirt branch is built, which draws no pool
+    anyway (the install puts exactly that VM in). `enhanced` (`<ns>.<vm>`) was the chart's setting until then;
     its one advantage, duplicate names across chassis namespaces, cannot arise for create-vm's
     VMs (the suffix is the MAC's, unique zone-wide). Changed in redbull-platform's chart values
     and lab manifests; each cluster's out-of-band config Secret is re-rendered by the operator.
@@ -1729,11 +1746,11 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   localhost — no port assumptions in code).
 - Trigger via the unified API: `uvicorn workflow_domains.api:app --port 8080`, Swagger at `/docs`.
   `POST /workflows/server-lifecycle/add-server-to-mce` is ASYNC (202 + workflow id) and takes the
-  InfraEnv to fill plus its MCE cluster; the InfraEnv's name states which hardware it is for
-  (`cisco-m6-bat-yam-64c-512gb`) and server names carry the same tokens behind an `ocp-` prefix,
-  so the InfraEnv IS the server query. EVERY POOL RUN IS ON A SLOT of its HUB's CANDIDATE POOL — the
+  InfraEnv to fill plus its MCE cluster; the InfraEnv's agentLabels state which hardware it is
+  for (flavor `c200`, size `mtl`, site `five`) and server names carry the same words behind an
+  `ocp-` prefix, so the labels ARE the server query (§4). EVERY POOL RUN IS ON A SLOT of its HUB's CANDIDATE POOL — the
   MCE and the InfraEnv. The MCE is in the id (since 2026-10-25) so a hub finds only its own runs;
-  the machines the pool draws from (`^ocp-<the InfraEnv's first three words>-`) are still shared by every hub, so a run
+  the machines the pool draws from (`^ocp-<flavor>-<size>-<site>-`) are still shared by every hub, so a run
   sizing its spares no longer counts another hub's runs, and the install lock keeps two hubs off
   one machine. The install lock (§4) guards the machine itself, so draws are PARALLEL: a request
   without `count` starts ONE new run and `count` (1-20, on the request ONLY — never in a run's

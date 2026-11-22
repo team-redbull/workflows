@@ -23,13 +23,14 @@ Shape of the run:
                            where that credential already lives.
      validating-infraenv — the InfraEnv must exist on the MCE, in the run's
                            namespace, before any server is drawn; missing
-                           fails the run (no candidate could fix it).
+                           fails the run (no candidate could fix it). For a
+                           pool draw, its agentLabels must name its servers.
   2. acquiring-server    — POST /servers/available: server-scan ALLOCATES one
-                           server (its ADR-0063). The InfraEnv name states
-                           which hardware it is for
-                           (cisco-m6-bat-yam-64c-512gb), and server names carry
-                           the same tokens behind an `ocp-` prefix, so the
-                           InfraEnv IS the query. server-scan locks a
+                           server (its ADR-0063). The InfraEnv's agentLabels
+                           state which hardware it is for (flavor c200, size
+                           mtl, site five), and server names carry the same
+                           words behind an `ocp-` prefix (ocp-c200-mtl-five-…),
+                           so the labels ARE the query. server-scan locks a
                            candidate for this run, live-checks it WHILE locked
                            and returns it, or releases it and tries its next —
                            so the server comes back already this run's, and no
@@ -198,7 +199,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import timedelta
 from typing import cast
 
@@ -237,6 +238,7 @@ with workflow.unsafe.imports_passed_through():
         AgentNeverAppearedError,
         BmhPrerequisiteMissingError,
         BmhRequestInvalidError,
+        InfraEnvAgentLabelsError,
         InfraEnvImageNotUpdatedError,
         InfraEnvNotFoundError,
         InvalidMacError,
@@ -544,21 +546,51 @@ def _acquire_request(
     )
 
 
-# How many of the InfraEnv name's `-`-separated words its servers' names carry
-# after `ocp-` (the operator, 2026-11-19): `c200-mtl-haifa-az1` draws from
-# `ocp-c200-mtl-haifa-…`. ALWAYS the first three, whatever the name's style —
-# a longer name (`cisco-m6-bat-yam-64c-512gb`) draws from its first three words
-# too, size and the rest of the site dropped; the operator accepted that. A
+# The InfraEnv's agentLabels whose values its servers' names carry after
+# `ocp-`, in this order (the naming convention, adopted 2026-11-22): InfraEnv
+# `c200-mtl-az1`, labelled flavor c200, size mtl, site five, draws from
+# `ocp-c200-mtl-five-…`. The name alone can no longer say it: the zone in it is
+# in no server's name (a server's zone is where it is cabled, server-scan's to
+# know), and the site is in no InfraEnv's name (it is its MCE's).
+_POOL_LABELS = ("redbull.io/flavor", "redbull.io/size", "redbull.io/site")
+# One `-`-separated word of a server name, as the convention writes them.
+_POOL_WORD = re.compile(r"[a-z0-9]+")
+# For a limb predating the labels, and runs recorded before: how many of the
+# InfraEnv name's `-`-separated words its servers' names carry after `ocp-`
+# (the operator, 2026-11-19): `c200-mtl-haifa-az1` draws from
+# `ocp-c200-mtl-haifa-…`. ALWAYS the first three, whatever the name's style; a
 # name of fewer words is used whole.
 _POOL_WORDS = 3
 
 
-def server_pool_prefix(infra_env: str) -> str:
-    """What the names of an InfraEnv's servers start with after `ocp-`: its first three words."""
+def agent_label_problems(agent_labels: Mapping[str, str]) -> list[str]:
+    """Why an InfraEnv's agentLabels cannot name its servers: one line per label, empty when they can."""
+    problems = []
+    for key in _POOL_LABELS:
+        value = agent_labels.get(key)
+        if not value:
+            problems.append(f"{key} is missing")
+        elif not _POOL_WORD.fullmatch(value):
+            problems.append(f"{key}={value!r} is not one lowercase word of letters and digits")
+    return problems
+
+
+def pool_prefix_from_labels(agent_labels: Mapping[str, str]) -> str:
+    """What the names of an InfraEnv's servers start with after `ocp-`: `<flavor>-<size>-<site>`.
+
+    Only for labels agent_label_problems passed.
+    """
+    return "-".join(agent_labels[key] for key in _POOL_LABELS)
+
+
+def pool_prefix_from_name(infra_env: str) -> str:
+    """The same, for a limb predating the labels: the InfraEnv name's first three words."""
     return "-".join(infra_env.split("-")[:_POOL_WORDS])
 
 
-def _allocation_request(install_input: AddServerToMceInput) -> AllocateServerRequest:
+def _allocation_request(
+    install_input: AddServerToMceInput, pool_prefix: str
+) -> AllocateServerRequest:
     """What to ask server-scan to allocate: the named machine, or one from the InfraEnv's pool.
 
     Locked for this run's holder and workflow id for the install's TTL, which
@@ -567,17 +599,13 @@ def _allocation_request(install_input: AddServerToMceInput) -> AllocateServerReq
     server_name = install_input.server_name
     return AllocateServerRequest(
         name=server_name or None,
-        # The InfraEnv's first three words (server_pool_prefix). Escaped: the
-        # InfraEnv name is caller data going into a regex (see
-        # _acquire_request). The trailing `-` is load-bearing (the operator,
-        # 2026-11-17, kept 2026-11-19): the prefix must END where the server
-        # name's next word begins, or `c200-mtl-haifa` would also draw servers
-        # of `c200-mtl-haifa2` / `c200-mtl-haifax`.
-        pattern=(
-            None
-            if server_name
-            else f"^ocp-{re.escape(server_pool_prefix(install_input.infra_env))}-"
-        ),
+        # `<flavor>-<size>-<site>` from the InfraEnv's agentLabels (or its
+        # name's first three words, from a limb predating them). Escaped: it
+        # is caller data going into a regex (see _acquire_request). The
+        # trailing `-` is load-bearing (the operator, 2026-11-17, kept
+        # 2026-11-19): the prefix must END where the server name's next word
+        # begins, or site `five` would also draw servers of `five2` / `fivex`.
+        pattern=None if server_name else f"^ocp-{re.escape(pool_prefix)}-",
         max_health=_REQUIRED_HEALTH,
         min_nic_macs=_BOND_NIC_MACS,
         holder=_reservation_holder(),
@@ -814,6 +842,10 @@ class AddServerToMceWorkflow:
         self._release_once_installed = False
         self._rollback_on_cancel = False
         self._allocating = False
+        # A pool draw's server names after `ocp-`, from the InfraEnv's
+        # agentLabels; None = from its name (a limb predating the labels, a
+        # run recorded before) or a named install.
+        self._pool_prefix: str | None = None
         # What a cancel would have to undo, set BEFORE each call that may lock,
         # write or map (a call a cancel cuts off may still land): the candidate
         # being installed, whether anything may be on the MCE for it, and its PXE
@@ -929,12 +961,30 @@ class AddServerToMceWorkflow:
                     infra_env,
                     state.cluster_ref,
                 )
+            # A pool draw's servers are named by the InfraEnv's flavor, size
+            # and site agentLabels, judged here, before anything is allocated:
+            # a label missing would draw from no pool, or the wrong one. Gated
+            # on the key's PRESENCE (CLAUDE.md §5): a limb predating it, and
+            # every run recorded before, draw by the name's first three words.
+            if not install_input.server_name and "agent_labels" in state.model_fields_set:
+                problems = agent_label_problems(state.agent_labels)
+                if problems:
+                    raise ApplicationError(
+                        f"InfraEnv {namespace}/{infra_env} on MCE {install_input.mce_cluster} "
+                        "cannot name the servers of a pool draw "
+                        f"(ocp-<{'>-<'.join(_POOL_LABELS)}>-…): "
+                        + "; ".join(problems)
+                        + ". Set them in its spec.agentLabels, or name the server "
+                        "(server_names). Nothing was allocated",
+                        type=InfraEnvAgentLabelsError.__name__,
+                    )
+                self._pool_prefix = pool_prefix_from_labels(state.agent_labels)
 
-        # Step 2 — the InfraEnv name IS the hardware query. It encodes vendor,
-        # model, site and spec, and server names carry the same tokens behind
-        # an `ocp-` prefix, so no part of either is parsed apart. Since the
-        # allocation, ONE server, already locked for this run by server-scan
-        # (`allocated`); a run recorded before draws a list of candidates.
+        # Step 2 — the hardware query. A named machine is asked for by name; a
+        # pool draw by `ocp-<flavor>-<size>-<site>-`, from the InfraEnv's
+        # agentLabels (above). Since the allocation, ONE server, already
+        # locked for this run by server-scan (`allocated`); a run recorded
+        # before draws a list of candidates by the whole InfraEnv name.
         self._phase = "acquiring-server"
         candidates, record_waivers, allocated = await self._acquire(
             install_input, activity_queue
@@ -1389,7 +1439,10 @@ class AddServerToMceWorkflow:
             if self._allocating:
                 server = await workflow.execute_activity(
                     allocate_server,
-                    _allocation_request(install_input),
+                    _allocation_request(
+                        install_input,
+                        self._pool_prefix or pool_prefix_from_name(install_input.infra_env),
+                    ),
                     task_queue=task_queue,
                     start_to_close_timeout=_ALLOCATE_TIMEOUT,
                     heartbeat_timeout=_ALLOCATE_HEARTBEAT_TIMEOUT,

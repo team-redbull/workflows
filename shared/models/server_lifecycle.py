@@ -170,7 +170,8 @@ class AcquireServerRequest(BaseModel):
     Exactly one of `pattern`/`name`, mirroring the endpoint's own contract.
     `pattern` is how an InfraEnv resolved to hardware for these runs: the whole
     InfraEnv name after an `ocp-` prefix. (A run since the allocation sends
-    AllocateServerRequest, built from the InfraEnv's first three words.)
+    AllocateServerRequest, built from the InfraEnv's flavor, size and site
+    agentLabels — from its name's first three words for a limb predating them.)
 
     `health` is sent as `max_health` since server-scan's ADR-0063 (2026-11-16):
     `health` is a 400 there now, and HEALTHY means the same in both — that
@@ -504,6 +505,11 @@ class InfraEnvState(BaseModel):
     # to this cluster at once, so a host added to it can be installed rather
     # than wait in the inventory. Reported, not refused.
     cluster_ref: str | None = None
+    # `spec.agentLabels`, as found (`{}` when it has none): every Agent that
+    # registers from it carries them. add-server-to-mce builds its pool draw
+    # from three of them. Always emitted, so a workflow can tell this limb from
+    # one predating the field (`"agent_labels" in model_fields_set`).
+    agent_labels: dict[str, str] = Field(default_factory=dict)
 
 
 class CreatedResource(BaseModel):

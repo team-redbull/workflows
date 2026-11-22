@@ -290,6 +290,10 @@ async def check_infra_env(ref: InfraEnvRef) -> InfraEnvState:
     hour only to fail — the BareMetalHost and NMStateConfig carry its label,
     and nothing registers into an InfraEnv that is not there.
 
+    Reports its `spec.agentLabels` (`{}` when it has none), which name the
+    servers of a pool draw; judging them is the workflow's, so a caller that
+    needs none of them (publish-infraenv-to-pxe-server) is not refused.
+
     Raises InfraEnvNotFoundError (non-retryable) when it is absent, and the
     cluster read's BmhPrerequisiteMissingError (403: no `get` on infraenvs;
     404 of the type: the Assisted Installer is not installed on this MCE).

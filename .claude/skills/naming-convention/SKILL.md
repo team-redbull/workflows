@@ -80,9 +80,10 @@ which say what is not settled yet.
   | --- | --- |
   | MCE name, its site | `shared/cluster_names.py` (`canonical_mce_cluster`, `site_of_mce_cluster`), every server-lifecycle and vm-lifecycle route |
   | seed / KV cluster, zone | `shared/cluster_names.py`, `activities/day1_repo.py` (which day1 folder is a seed, which file a KV cluster, the zone check), `activities/cluster_lifecycle/` (`list_kv_clusters`, `list_day1_clusters`), the vm-lifecycle worker's `KV_CLUSTER` setting |
-  | InfraEnv | `shared/infraenv_names.py`, `workflow_domains/vm_lifecycle/router.py`, add-server-to-mce's pool draw (`server_pool_prefix`) |
+  | InfraEnv | `shared/infraenv_names.py`, `workflow_domains/vm_lifecycle/router.py`, add-server-to-mce's pool draw (`pool_prefix_from_name`, only for a limb predating the InfraEnv's agentLabels and runs recorded before) |
   | VM name and labels | `shared/infraenv_names.py` (`vm_name`), `activities/vm_lifecycle/vm_spec.py` |
-  | bare-metal server name | `workflow_domains/server_provisioning/server_name.py` (provision-dell-server's check of the name OME carries), `activities/server_provisioning/server_namer.py` (the naming service that writes it), add-server-to-mce's pool draw (`server_pool_prefix`) and name checks |
+  | bare-metal server name | `workflow_domains/server_provisioning/server_name.py` (provision-dell-server's check of the name OME carries), `activities/server_provisioning/server_namer.py` (the naming service that writes it), add-server-to-mce's pool draw (`pool_prefix_from_labels`: `^ocp-<flavor>-<size>-<site>-`) and name checks |
+  | InfraEnv `agentLabels` (`redbull.io/flavor`, `redbull.io/size`, `redbull.io/site`) | `activities/server_lifecycle/activities.py` (`check_infra_env` reports them), add-server-to-mce (`_POOL_LABELS`, `agent_label_problems`, `pool_prefix_from_labels`) |
   | hosted cluster / day1 file stem | `shared/cluster_names.py` (`hosted_cluster_stem`), provision-cluster |
   | NodePool name, selector, nodeLabels | `activities/day1_repo.py` and the upgrade-gitops day1 modules (rendered as the hostedclusters-setup chart does), update-nodepool |
   | Agent labels (`redbull.io/claimed`…) | uninstall-server-from-hc, update-nodepool's scale-down |

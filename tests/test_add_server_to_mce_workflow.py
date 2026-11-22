@@ -99,6 +99,14 @@ SERVER_NAME = "ocp-dell-r650-tlv-64c-1024gb-DEL0000485"
 INPUT = AddServerToMceInput(
     infra_env=INFRA_ENV, mce_cluster=MCE_CLUSTER, namespace=NAMESPACE
 )
+# The InfraEnv's spec.agentLabels, as the naming convention writes them: a pool
+# draw asks server-scan for `^ocp-c200-mtl-five-`.
+AGENT_LABELS = {
+    "redbull.io/flavor": "c200",
+    "redbull.io/size": "mtl",
+    "redbull.io/site": "five",
+    "topology.kubernetes.io/zone": "az1",
+}
 
 # One inventory segment per MCE, found by cluster name — no BMC-protocol class.
 INVENTORY_SEGMENT = SegmentEntry(
@@ -221,6 +229,8 @@ def make_mock_activities(
     pxe_sites: set[str] | None = None,
     pxe_error: Exception | None = None,
     infra_env_missing: bool = False,
+    agent_labels: dict[str, str] | None = None,
+    infra_env_predates_labels: bool = False,
     image_after_polls: int = 0,
     image_never_updates: bool = False,
     boot_superseded: bool = False,
@@ -266,6 +276,10 @@ def make_mock_activities(
     `nmstate_error` is raised by `create_nmstate_config` — the incident in which
     the NMStateConfig already existed with other content (BmhConflictError) —
     every time, or only the first time with `nmstate_error_once`.
+
+    `check_infra_env` reports `agent_labels` (default AGENT_LABELS) as the
+    InfraEnv's spec.agentLabels; `infra_env_predates_labels` answers as a limb
+    from before the field, whose payload has no `agent_labels` key at all.
 
     `scan_hides_locked` makes `acquire_servers` answer as server-scan's does
     for a NAMED machine under a live install lock: 404, whoever holds the lock
@@ -442,7 +456,14 @@ def make_mock_activities(
             raise InfraEnvNotFoundError(
                 f"InfraEnv {ref.name} does not exist in namespace {ref.namespace}"
             )
-        return InfraEnvState(name=ref.name, namespace=ref.namespace)
+        if infra_env_predates_labels:
+            # An older limb's payload: the model it sent had no such field.
+            return {"name": ref.name, "namespace": ref.namespace, "cluster_ref": None}  # type: ignore[return-value]
+        return InfraEnvState(
+            name=ref.name,
+            namespace=ref.namespace,
+            agent_labels=AGENT_LABELS if agent_labels is None else agent_labels,
+        )
 
     @activity.defn
     async def unregister_pxe_boot(ref: PxeMapRef) -> PxeUnregistration:
@@ -806,6 +827,47 @@ async def test_happy_path_resolves_vlan_acquires_creates_and_awaits_the_agent():
 
 
 @pytest.mark.parametrize(
+    ("labels", "prefix"),
+    [
+        (AGENT_LABELS, "c200-mtl-five"),
+        ({**AGENT_LABELS, "redbull.io/flavor": "c200n"}, "c200n-mtl-five"),  # a variant
+        ({**AGENT_LABELS, "redbull.io/size": "kv32"}, "c200-kv32-five"),  # a VM pool
+    ],
+)
+def test_the_pool_is_the_infraenvs_flavor_size_and_site_labels(labels, prefix):
+    assert add_server_to_mce.agent_label_problems(labels) == []
+    assert add_server_to_mce.pool_prefix_from_labels(labels) == prefix
+    pool = re.compile(f"^ocp-{re.escape(prefix)}-")
+    assert pool.match(f"ocp-{prefix}-fch2145v1ab")
+    assert not pool.match(f"ocp-{prefix}2-fch2145v1ab")
+
+
+@pytest.mark.parametrize(
+    ("labels", "problem"),
+    [
+        ({}, "redbull.io/flavor is missing"),
+        ({k: v for k, v in AGENT_LABELS.items() if k != "redbull.io/site"}, "redbull.io/site is missing"),
+        ({**AGENT_LABELS, "redbull.io/size": ""}, "redbull.io/size is missing"),
+        # Each is ONE word of the server name: a `-` would span two, a `.`
+        # is no name word at all, and server names are lowercase.
+        ({**AGENT_LABELS, "redbull.io/site": "bat-yam"}, "redbull.io/site='bat-yam' is not one"),
+        ({**AGENT_LABELS, "redbull.io/flavor": "c200.x"}, "redbull.io/flavor='c200.x' is not one"),
+        ({**AGENT_LABELS, "redbull.io/flavor": "C200"}, "redbull.io/flavor='C200' is not one"),
+    ],
+)
+def test_labels_that_cannot_name_a_server_are_each_named(labels, problem):
+    problems = add_server_to_mce.agent_label_problems(labels)
+    assert any(line.startswith(problem) for line in problems), problems
+
+
+def test_the_zone_label_is_not_part_of_the_pool():
+    # A server's zone is where it is cabled (server-scan's), never in its name.
+    labels = {k: v for k, v in AGENT_LABELS.items() if k != "topology.kubernetes.io/zone"}
+    assert add_server_to_mce.agent_label_problems(labels) == []
+    assert add_server_to_mce.pool_prefix_from_labels(labels) == "c200-mtl-five"
+
+
+@pytest.mark.parametrize(
     ("infra_env", "prefix"),
     [
         ("c200-mtl-haifa-az1", "c200-mtl-haifa"),
@@ -814,14 +876,12 @@ async def test_happy_path_resolves_vlan_acquires_creates_and_awaits_the_agent():
         ("dell-r660", "dell-r660"),  # fewer than three words: the whole name
     ],
 )
-def test_the_pool_is_the_infraenvs_first_three_words(infra_env, prefix):
-    assert add_server_to_mce.server_pool_prefix(infra_env) == prefix
-    pool = re.compile(f"^ocp-{re.escape(prefix)}-")
-    assert pool.match(f"ocp-{prefix}-anything-FCH0001")
-    assert not pool.match(f"ocp-{prefix}2-FCH0001")
+def test_without_labels_the_pool_is_the_infraenvs_first_three_words(infra_env, prefix):
+    # A limb predating agent_labels, and every run recorded before.
+    assert add_server_to_mce.pool_prefix_from_name(infra_env) == prefix
 
 
-async def test_the_infraenv_becomes_the_server_query():
+async def test_the_infraenv_labels_become_the_server_query():
     calls, segment_acts, server_acts = make_mock_activities()
     async with _Harness(segment_acts, server_acts) as client:
         await _execute_as(client, AddServerToMceRunArgs(input=INPUT), "add-server-to-mce-the-query")
@@ -830,18 +890,18 @@ async def test_the_infraenv_becomes_the_server_query():
     # only for runs recorded before the allocation.
     [request] = calls["allocate_server"]
     assert calls["acquire_servers"] == []
-    # The InfraEnv's FIRST THREE words (the operator, 2026-11-19), escaped,
-    # because the InfraEnv name is caller data going into a regex that
-    # server-scan hands to Mongo. `\-` is a literal `-`, so the pool is the
-    # same; an unescaped `.` or `+` in a future name would not be.
-    # The `-` after the third word is load-bearing (the operator, 2026-11-17).
-    assert request.pattern == f"^ocp-{re.escape('cisco-m6-bat')}-"
+    # `ocp-<flavor>-<size>-<site>-` from the InfraEnv's agentLabels (the naming
+    # convention, 2026-11-22), escaped: label values are caller data going
+    # into a regex server-scan hands to Mongo. The `-` after the site is
+    # load-bearing (the operator, 2026-11-17).
+    assert request.pattern == f"^ocp-{re.escape('c200-mtl-five')}-"
     pool = re.compile(request.pattern)
-    assert pool.match(f"ocp-{INFRA_ENV}-FCH0001")
-    assert pool.match("ocp-cisco-m6-bat-yam-64c-256gb-FCH0002")  # size is no longer part of it
-    assert not pool.match("ocp-cisco-m6-batx-FCH0001")
-    assert not pool.match("ocp-cisco-m6-bat2-FCH0001")
-    assert not pool.match("ocp-cisco-m6-bat")
+    assert pool.match("ocp-c200-mtl-five-fch2145v1ab")
+    assert pool.match("ocp-c200-mtl-five-7xk2m33")
+    assert not pool.match("ocp-c200-mtl-five2-fch2145v1ab")  # another site
+    assert not pool.match("ocp-c200n-mtl-five-fch2145v1ab")  # another variant
+    assert not pool.match("ocp-c200-kv32-five-02a1b2c3d4e5")  # another size
+    assert not pool.match(f"ocp-{INFRA_ENV}-FCH0001")  # the InfraEnv's name is not it
     assert request.name is None
     assert (request.max_health, request.min_nic_macs) == ("HEALTHY", 2)
     # The lock server-scan takes as it allocates IS this run's: its holder and
@@ -860,6 +920,52 @@ async def test_an_explicit_server_name_bypasses_the_pattern():
     [request] = calls["allocate_server"]
     assert request.name == SERVER_NAME
     assert request.pattern is None
+
+
+class TestThePoolComesFromTheInfraEnvsAgentLabels:
+    async def test_an_infraenv_without_them_fails_the_draw_before_anything_is_allocated(
+        self,
+    ) -> None:
+        calls, segment_acts, server_acts = make_mock_activities(
+            agent_labels={"topology.kubernetes.io/zone": "az1", "redbull.io/site": "Five"}
+        )
+        async with _Harness(segment_acts, server_acts) as client:
+            with pytest.raises(WorkflowFailureError) as excinfo:
+                await _execute(client, AddServerToMceRunArgs(input=INPUT))
+
+        error = _application_error(excinfo.value)
+        assert error.type == "InfraEnvAgentLabelsError"
+        # Every reason at once, so one fix of the InfraEnv is enough.
+        for part in (
+            f"InfraEnv {NAMESPACE}/{INFRA_ENV}",
+            "redbull.io/flavor is missing",
+            "redbull.io/size is missing",
+            "redbull.io/site='Five' is not one",
+        ):
+            assert part in error.message
+        assert calls["allocate_server"] == [] and calls["acquire_servers"] == []
+
+    async def test_a_named_install_needs_none_of_them(self) -> None:
+        calls, segment_acts, server_acts = make_mock_activities(agent_labels={})
+        named = INPUT.model_copy(update={"server_name": SERVER_NAME})
+        async with _Harness(segment_acts, server_acts) as client:
+            result = await _execute(client, AddServerToMceRunArgs(input=named))
+
+        assert result.server_name == SERVER_NAME
+        [request] = calls["allocate_server"]
+        assert (request.name, request.pattern) == (SERVER_NAME, None)
+
+    async def test_a_limb_predating_them_draws_by_the_infraenvs_first_three_words(
+        self,
+    ) -> None:
+        # The brain ships before the limb (CLAUDE.md §5): an older limb's answer
+        # has no `agent_labels` key, so the run draws as it did before.
+        calls, segment_acts, server_acts = make_mock_activities(infra_env_predates_labels=True)
+        async with _Harness(segment_acts, server_acts) as client:
+            await _execute(client, AddServerToMceRunArgs(input=INPUT))
+
+        [request] = calls["allocate_server"]
+        assert request.pattern == f"^ocp-{re.escape('cisco-m6-bat')}-"
 
 
 async def test_the_vlan_comes_from_the_mce_segment_not_the_caller():

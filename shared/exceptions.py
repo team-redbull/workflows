@@ -536,6 +536,18 @@ class InfraEnvNotFoundError(OrchestratorError):
     """
 
 
+class InfraEnvAgentLabelsError(OrchestratorError):
+    """WORKFLOW-RAISED. The InfraEnv a pool draw fills cannot name its servers.
+
+    Its servers are `ocp-<flavor>-<size>-<site>-…`, the three words taken from
+    its `spec.agentLabels` (`redbull.io/flavor`, `redbull.io/size`,
+    `redbull.io/site`) — the zone in its name is in no server's name, and the
+    site in its labels is in no InfraEnv's. A label missing, or not one
+    lowercase word of letters and digits, fails the run before anything is
+    allocated; the message names each. A named install needs none of them.
+    """
+
+
 class InfraEnvNotReadyError(OrchestratorError):
     """The InfraEnv exists but publishes no iPXE script URL yet.
 

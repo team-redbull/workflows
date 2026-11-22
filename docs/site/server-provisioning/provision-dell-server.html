@@ -553,7 +553,7 @@
         <thead><tr><th>Field</th><th>Type</th><th>Rules</th><th>What it's for</th></tr></thead>
         <tbody>
           <tr><td class="k">idrac_ip</td><td class="k">str</td><td class="muted">a real IP address</td><td class="muted">The machine. Normalised before it becomes the workflow id, so the dedup key does not depend on how it was typed.</td></tr>
-          <tr><td class="k">site</td><td class="k">str</td><td class="muted">optional</td><td class="muted">Overrides the prefix lookup. Must be a site code server-scan knows, because it becomes a token of the server's name.</td></tr>
+          <tr><td class="k">site</td><td class="k">str</td><td class="muted">optional; lowercase letters, digits and single dashes, else 422</td><td class="muted">Overrides the prefix lookup. Must be a site code server-scan knows, because it becomes a token of the server's name.</td></tr>
         </tbody>
       </table>
     </div>

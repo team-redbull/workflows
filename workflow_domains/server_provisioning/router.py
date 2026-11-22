@@ -26,6 +26,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from temporalio.client import Client
 from temporalio.exceptions import WorkflowAlreadyStartedError
 
+from shared.cluster_names import name_token
 from shared.consts import PROVISION_DELL_SERVER_WORKFLOW_QUEUE
 from shared.models.server_provisioning import (
     ProvisionDellServerInput,
@@ -57,6 +58,13 @@ class ProvisionDellServerRequest(ProvisionDellServerInput):
     @classmethod
     def _idrac_ip_is_an_address(cls, value: str) -> str:
         return str(ipaddress.ip_address(value.strip()))
+
+    @field_validator("site")
+    @classmethod
+    def _site_is_a_convention_token(cls, value: str | None) -> str | None:
+        """An explicit site becomes the `<site>` of a lowercase name: refused HERE (422) when
+        it is not a convention token, not at verifying-name, after the template and the reboot."""
+        return None if value is None else name_token(value, "site")
 
 
 class BulkProvisionDellServerRequest(BaseModel):

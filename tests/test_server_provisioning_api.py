@@ -69,6 +69,14 @@ def test_an_explicit_site_wins(make_client):
     assert fake.args[0].input.site == "tlv"
 
 
+@pytest.mark.parametrize("site", ["TLV", "tlv_1", "tlv/..", "", "-tlv"])
+def test_an_explicit_site_that_could_not_be_in_a_name_is_422(make_client, site):
+    fake = _FakeClient()
+    resp = make_client(fake).post(PATH, json={"idrac_ip": "192.0.2.10", "site": site})
+    assert resp.status_code == 422
+    assert fake.started == []
+
+
 def test_an_unknown_prefix_is_422_and_starts_nothing(make_client):
     fake = _FakeClient()
     resp = make_client(fake).post(PATH, json={"idrac_ip": "192.0.2.10"})

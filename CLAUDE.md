@@ -20,6 +20,11 @@ every teammate; use them in this order and keep them in step:
   `shared/`, `deploy/`, `docs/`. It composes with **`temporal-developer`** (vendored in
   `.agents/skills/`, symlinked into `.claude/skills/`): that skill owns SDK mechanics,
   THIS repo's rules win where the two differ (the skill lists the divergences).
+- **`.claude/skills/naming-convention/`** — HOW TO NAME a cluster (tenant, MCE, seed, KV),
+  an InfraEnv, a NodePool, a server or VM, a zone or a label: it fetches the platform's
+  convention, `Idan-Maimon/kubevirt-workflows` `docs/naming-convention.md`, the single source
+  of truth, before anything is named. Where this file or the code spells a name differently,
+  the convention wins and the mismatch is reported. Invoke `/naming-convention`.
 - **`scripts/check_conventions.py`** — the ENFORCEMENT: AST checks of every rule that
   can be checked from source (sandbox imports, activity-call options, unbounded retries
   named through exception classes, no whole response body in an activity error,

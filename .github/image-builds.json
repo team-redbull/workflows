@@ -35,13 +35,6 @@
     "helm-image-path": "activityWorker.image"
   },
   {
-    "image-name": "server-provisioning-worker",
-    "dockerfile": "activities/server_provisioning/Dockerfile",
-    "chart-repo": "team-redbull/redbull-platform",
-    "helm-values-path": "gitops/charts/server-provisioning-worker/values.yaml",
-    "helm-image-path": "activityWorker.image"
-  },
-  {
     "image-name": "upgrade-agent-worker",
     "dockerfile": "activities/upgrade_agent/Dockerfile",
     "chart-repo": "team-redbull/redbull-platform",

@@ -82,7 +82,7 @@ which say what is not settled yet.
   | seed / KV cluster, zone | `shared/cluster_names.py`, `activities/day1_repo.py` (which day1 folder is a seed, which file a KV cluster, the zone check), `activities/cluster_lifecycle/` (`list_kv_clusters`, `list_day1_clusters`), the vm-lifecycle worker's `KV_CLUSTER` setting |
   | InfraEnv | `shared/infraenv_names.py`, `workflow_domains/vm_lifecycle/router.py`, add-server-to-mce's pool draw (`server_pool_prefix`) |
   | VM name and labels | `shared/infraenv_names.py` (`vm_name`), `activities/vm_lifecycle/vm_spec.py` |
-  | bare-metal server name | `workflow_domains/server_provisioning/server_name.py` (provision-dell-server's check of the name OME carries), `activities/server_provisioning/server_namer.py` (the naming service that writes it), add-server-to-mce's pool draw (`server_pool_prefix`) and name checks |
+  | bare-metal server name | add-server-to-mce's pool draw (`server_pool_prefix`) and name checks; provision-dell-server's check of the name OME carries (`workflow_domains/server_provisioning/server_name.py`, on the `feat/provision-dell-server` branch, not `main`) |
   | hosted cluster / day1 file stem | `shared/cluster_names.py` (`hosted_cluster_stem`), provision-cluster |
   | NodePool name, selector, nodeLabels | `activities/day1_repo.py` and the upgrade-gitops day1 modules (rendered as the hostedclusters-setup chart does), update-nodepool |
   | Agent labels (`redbull.io/claimed`…) | uninstall-server-from-hc, update-nodepool's scale-down |

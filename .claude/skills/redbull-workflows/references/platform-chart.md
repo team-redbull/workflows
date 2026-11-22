@@ -8,7 +8,7 @@ Two homes for charts, decided by where the limb runs:
 | PER-MCE limbs (`server-lifecycle-worker`, `cluster-upgrade-worker`, `upgrade-agent-worker`) | this repo, `deploy/charts/<limb>-worker/` | copied into redbull-platform as `gitops/charts/<limb>-worker/` (where CI bumps the tag) by CI's `sync-upgrade-charts` on each `main` push that changes them — a new per-MCE limb joins `scripts/sync_platform_charts.sh`, the job's render step and the `charts` filter; `server-lifecycle-worker`'s redbull-platform chart is its own, not synced and deployed per MCE from there (example ApplicationSet in `deploy/argocd/`); `deploy/` triggers no image build |
 
 A chart in redbull-platform with no `gitops/services/` entry deploys nothing; CI still bumps
-its tag. `server-provisioning-worker` and cluster-upgrade's three are like that today.
+its tag. Cluster-upgrade's three are like that today (and `server-provisioning-worker`, whose code is on the `feat/provision-dell-server` branch, not `main`, so `main` builds no image for it).
 
 redbull-platform is assumed checked out at `../redbull-platform`; verify the path before
 editing, and if it is absent hand the chart change over as a diff in the reply. Its

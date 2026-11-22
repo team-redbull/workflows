@@ -32,9 +32,6 @@ from workflow_domains.server_lifecycle.router import (
     router as server_lifecycle_router,
 )
 from workflow_domains.server_lifecycle.ui import router as server_lifecycle_ui_router
-from workflow_domains.server_provisioning.router import (
-    router as server_provisioning_router,
-)
 from workflow_domains.vm_lifecycle.router import router as vm_lifecycle_router
 
 _settings = TemporalSettings()
@@ -49,7 +46,6 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Cluster Orchestrator API", lifespan=lifespan)
 app.include_router(segment_lifecycle_router)
 app.include_router(server_lifecycle_router)
-app.include_router(server_provisioning_router)
 # upgrade-cluster and upgrade-targets: a started run's activities wait,
 # visible as pending, on any limb not deployed yet (DESIGN O18).
 app.include_router(cluster_upgrade_router)

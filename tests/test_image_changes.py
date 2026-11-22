@@ -48,7 +48,7 @@ def _affected(*paths: str) -> list[str]:
 
 def test_every_image_of_the_repo_is_found():
     assert sorted(BY_NAME) == sorted([BRAIN, DOCS, *LIMBS])
-    assert len(LIMBS) == len(list((REPO_ROOT / "activities").glob("*/Dockerfile"))) == 8
+    assert len(LIMBS) == len(list((REPO_ROOT / "activities").glob("*/Dockerfile"))) == 7
     assert BY_NAME[BRAIN].entrypoints == ("workflow_domains.main_worker_init", "workflow_domains.api")
     for limb in LIMBS:
         folder = limb.removesuffix("-worker").replace("-", "_")
@@ -283,7 +283,7 @@ def test_a_job_whose_inputs_are_expressions_is_no_old_row():
 def test_a_data_file_in_a_copied_folder_is_built_wide():
     # The temporary UI pages are read from disk at run time: no import names them.
     assert _affected("workflow_domains/cluster_upgrade/ui/index.html") == [BRAIN]
-    assert _affected("activities/server_provisioning/some-template.j2") == LIMBS
+    assert _affected("activities/segment_lifecycle/some-template.j2") == LIMBS
     assert _affected("shared/some-data.json") == sorted([BRAIN, *LIMBS])
 
 

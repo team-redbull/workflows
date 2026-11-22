@@ -60,6 +60,10 @@ LIMB_ACTIVITIES = [
     limb.probe_idrac_credentials,
     limb.check_idrac_login,
     limb.read_idrac_identity,
+    limb.clear_idrac_os_hostname,
+    limb.set_idrac_root_password,
+    limb.verify_bios_configuration,
+    limb.stage_bios_attributes,
     limb.read_storage_layout,
     limb.stage_storage_config,
     limb.apply_staged_idrac_jobs,
@@ -68,6 +72,7 @@ LIMB_ACTIVITIES = [
     limb.start_ome_discovery,
     limb.get_ome_job,
     limb.deploy_ome_template,
+    limb.read_ome_template,
     limb.get_ome_profile,
     limb.request_server_name,
     limb.find_in_server_scan,
@@ -140,8 +145,9 @@ class World:
 
 
 @pytest.fixture
-def world(certificate, monkeypatch) -> Iterator[World]:
-    idrac = sim.IdracSim(root_password="calvin")
+def world(request, certificate, monkeypatch) -> Iterator[World]:
+    generation = getattr(request, "param", 9)
+    idrac = sim.IdracSim.for_generation(generation, root_password="calvin")
     ome = sim.OmeSim(idrac=idrac, idrac_ip=IDRAC_IP, template_root_password=TARGET)
     scan = sim.ScanSim(ome=ome)
     port = _free_port()
@@ -218,16 +224,23 @@ async def test_a_factory_fresh_server_is_provisioned_end_to_end(world: World):
 
     assert result.service_tag == world.idrac.service_tag
     assert result.initial_credential == "factory-1"  # arrived on calvin
-    assert result.profile_name == f"ocp-dell-r660-{REGION}-128c-1024gb-10tb-{world.idrac.service_tag}"
+    # The factory OS hostname is gone, so OME shows the machine's address next
+    # to its profile. Cleared before OME ever discovered it.
+    assert world.idrac.os_hostname == "" and result.os_hostname_cleared
+    token = world.idrac.model.split()[-1].lower()
+    assert result.profile_name == f"ocp-dell-{token}-{REGION}-128c-1024gb-10tb-{world.idrac.service_tag}"
     # The run finished on its own configuration work. server-scan has not
     # collected the machine yet (its simulator needs 3 reads), and that is
     # deliberately not something the run waits for.
     assert world.scan.current() is None
 
-    # The template enforced the target password, and OME was re-pointed at it.
+    # Root was moved onto the target password over Redfish, BEFORE OME saw the
+    # machine — so OME was discovered ONCE, with the password root keeps, and
+    # its credential can never go stale. This is what replaced the rediscovery.
     assert world.idrac.root_password == TARGET
+    assert world.idrac.password_writes == [TARGET]
     assert world.ome.device_credential == TARGET
-    assert len(world.ome.discovery_posts) == 2
+    assert len(world.ome.discovery_posts) == 1
     assert world.ome.deploy_calls == 1
 
     # Storage: one reboot; RAID 1 over the BOSS pair; every PERC drive Non-RAID,
@@ -238,6 +251,15 @@ async def test_a_factory_fresh_server_is_provisioned_end_to_end(world: World):
     perc = [d for d in world.idrac.drives if d.controller == sim.PERC]
     assert [d.status for d in perc] == ["NonRAID"] * 4
     assert result.boss_raid1_created and result.non_raid_drives_converted == 4
+
+    # The template deployment really did apply its BIOS attributes, so the
+    # verification finds nothing to fix and nothing is staged over Redfish.
+    assert world.idrac.bios["SysProfile"] == "PerfOptimized"
+    assert "System Profile" in world.ome.template_applied
+    assert result.bios_attributes_checked == 2
+    assert result.bios_attributes_remediated == 0
+    assert result.bios_attributes_unverified == 0
+    assert world.ome.deploy_calls == 1
 
     # No OME session left open behind the run.
     assert world.ome.open_sessions == set()
@@ -281,3 +303,190 @@ async def test_a_boss_without_raid1_fails_before_anything_is_staged(world: World
     error = await _failure()
     assert error.type == "IdracRequestRejectedError"
     assert world.idrac.jobs == {} and world.idrac.resets == []
+
+
+async def test_a_template_carrying_the_idracs_own_address_is_refused(world: World):
+    """The audit against a real OME AttributeDetails payload.
+
+    A template captured from a reference server carries THAT server's iDRAC
+    address. Deploying it would move this machine's address or reset it to
+    DHCP, and no remote call could bring it back — so the run refuses before it
+    writes anything at all.
+    """
+    world.ome.template_attribute_groups.append(
+        {
+            "DisplayName": "iDRAC",
+            "SubAttributeGroups": [
+                {
+                    "DisplayName": "IPv4 Information",
+                    "SubAttributeGroups": [],
+                    "Attributes": [
+                        {"AttributeId": 70, "DisplayName": "Address",
+                         "Value": "10.9.9.9", "IsIgnored": False},
+                    ],
+                }
+            ],
+        }
+    )
+    error = await _failure()
+    assert error.type == "TemplateUnsafeError"
+    # Nothing was written: the machine is still on its factory password, still
+    # carries its factory hostname, and OME never saw it.
+    assert world.idrac.root_password == "calvin"
+    assert world.idrac.password_writes == []
+    assert world.idrac.os_hostname == "Miniwinpc"
+    assert world.ome.discovery_posts == [] and world.ome.deploy_calls == 0
+
+
+@pytest.mark.parametrize("world", [9, 10], indirect=True)
+async def test_both_supported_idrac_generations_are_provisioned(world: World):
+    """iDRAC9 and iDRAC10 put the root account in different places — 9 under the
+    Manager, 10 under AccountService — and the limb has to find it without being
+    told which machine it is talking to."""
+    result = await _run()
+
+    assert result.model == world.idrac.model
+    assert world.idrac.root_password == TARGET
+    assert world.idrac.password_writes == [TARGET]
+    # Whichever collection this generation serves, exactly one was written.
+    assert len(world.ome.discovery_posts) == 1
+    token = world.idrac.model.split()[-1].lower()
+    assert result.profile_name.startswith(f"ocp-dell-{token}-")
+
+
+async def test_a_setting_the_deployment_silently_skipped_is_fixed(world: World):
+    """The case the whole verification exists for.
+
+    SCP import is a "continue on error" operation: the job reports Completed
+    while one attribute never applied. Nothing in OME says so — only reading the
+    value back does.
+    """
+    world.ome.template_apply_failures = {"System Profile"}
+    result = await _run()
+
+    # The deployment claimed success and did apply the rest.
+    assert world.ome.deploy_calls == 1
+    assert world.ome.template_applied == ["Boot Mode"]
+    # The run caught it, staged it over Redfish, and the storage reboot applied it.
+    assert result.bios_attributes_remediated == 1
+    assert world.idrac.bios["SysProfile"] == "PerfOptimized"
+    assert world.idrac.bios_pending == {}
+    # Fixed by modifying the setting, NOT by redeploying the profile.
+    assert world.ome.deploy_calls == 1
+
+
+async def test_an_attribute_this_firmware_lacks_is_reported_not_failed(world: World):
+    """A template built for another firmware level names attributes the target
+    does not have. Dell's documented consequence, and a coverage gap to report
+    rather than a machine to fail."""
+    world.ome.template_attribute_groups.append(
+        {
+            "DisplayName": "BIOS",
+            "SubAttributeGroups": [
+                {
+                    "DisplayName": "Newer Firmware Only",
+                    "SubAttributeGroups": [],
+                    "Attributes": [
+                        {"AttributeId": 99, "DisplayName": "Some New Knob",
+                         "Value": "Enabled", "IsIgnored": False},
+                    ],
+                }
+            ],
+        }
+    )
+    result = await _run()
+
+    assert result.bios_attributes_unverified == 1
+    assert result.bios_attributes_remediated == 0
+    assert "Some New Knob" not in world.ome.template_applied
+
+
+@pytest.mark.parametrize("world", [8], indirect=True)
+async def test_an_idrac8_machine_fails_loudly_rather_than_misconfiguring(world: World):
+    """The honest boundary of this workflow.
+
+    iDRAC8 takes `VolumeType: Mirrored` where iDRAC9 takes `RAIDType: RAID1`
+    (Dell's redfish_storage_volume switches on firmware > 3.0), and the limb only
+    speaks the modern form. That is fine — the fleet is R660s — but it has to
+    fail by NAME rather than leave a half-configured machine, and it must fail
+    before the reboot rather than after it.
+
+    Everything up to storage works on an iDRAC8, which is what makes this worth
+    pinning: the root account, the hostname and the template all behave.
+    """
+    error = await _failure()
+
+    assert error.type == "IdracRequestRejectedError"
+    assert "RAIDType" in error.message
+    # It got far enough to prove the rest of the generation handling works...
+    assert world.idrac.password_writes == [TARGET]
+    assert world.idrac.os_hostname == ""
+    assert world.ome.deploy_calls == 1
+    # ...and stopped before touching the machine's storage or rebooting it.
+    assert world.idrac.volumes[sim.BOSS] == [] and world.idrac.resets == []
+
+
+async def test_a_server_ordered_with_force_change_of_password_stops_at_the_probe(world: World):
+    """The refusal that looks exactly like a wrong password, and is not.
+
+    Force Change of Password is a factory order option: the right password
+    authenticates, and then the iDRAC refuses every interface but IPMI until it
+    is changed. Its 401 is distinguishable from a wrong password ONLY by the
+    Redfish MessageId.
+
+    Read as a rejection it costs more than a failed run. The probe would spend
+    the remaining candidates on a machine that is already answering, trip the
+    iDRAC's own three-strike block with the last of them, and then report that
+    no configured password worked — about the one that did. So the test pins
+    the credential arithmetic, not just the error: ONE login attempt, and no
+    block.
+    """
+    world.idrac.force_password_change = True
+
+    error = await _failure()
+
+    assert error.type == "IdracForcePasswordChangeError"
+    assert "Force Change of Password" in error.message
+    # Candidates are the enforced password first, then the factory ones. The
+    # probe stops at the one the machine answers to: the third is never tried,
+    # which is the whole point — three wrong logins is what trips the block.
+    assert world.idrac.login_attempts == [TARGET, "calvin"]
+    assert "Factory-Pw2" not in world.idrac.login_attempts
+    assert world.idrac.blocked_for == 0
+    # Nothing was written, anywhere: this fails before the first mutation.
+    assert world.idrac.password_writes == []
+    assert world.idrac.os_hostname == "Miniwinpc"
+    assert world.ome.discovery_posts == []
+
+
+async def test_an_idrac_that_restarts_after_the_template_is_waited_out(world: World):
+    """Applying a template rewrites the iDRAC's own settings, and it restarts.
+    Every call in that window fails; the run has to wait rather than give up,
+    which is what verifying-root-password's 20-minute poll is for."""
+    world.idrac.restart_after_template = 4
+    result = await _run()
+
+    assert result.service_tag == world.idrac.service_tag
+    assert world.idrac.unavailable_for == 0
+    assert world.ome.deploy_calls == 1
+
+
+async def test_a_drive_with_a_foreign_config_is_never_wiped(world: World):
+    """The domain's hardest rule: the run never destroys data.
+
+    A drive carrying a foreign RAID configuration is a machine that was in use
+    somewhere else. Clearing it is a person's decision, so the run stops before
+    staging anything and says what it found.
+    """
+    perc = next(d for d in world.idrac.drives if d.controller == sim.PERC)
+    perc.status = "Foreign"
+
+    error = await _failure()
+
+    assert error.type == "StorageLayoutUnsupportedError"
+    assert "Foreign" in error.message
+    # Nothing staged, nothing rebooted, no volume created.
+    assert world.idrac.jobs == {} and world.idrac.resets == []
+    assert world.idrac.volumes[sim.BOSS] == []
+    # The drive is exactly as it was found.
+    assert perc.status == "Foreign"

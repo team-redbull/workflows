@@ -53,7 +53,12 @@ from shared.exceptions import (
     ProfileConflictError,
     TemplateNotFoundError,
 )
-from shared.models.server_provisioning import OmeDevice, OmeJobState, OmeProfile
+from shared.models.server_provisioning import (
+    OmeDevice,
+    OmeJobState,
+    OmeProfile,
+    TemplateAttribute,
+)
 
 # OME job LastRunStatus ids (RestOME.get_job_info's job_status_map).
 _JOB_COMPLETED = 2060
@@ -249,6 +254,52 @@ async def find_template_id(client: httpx.AsyncClient, template_name: str) -> int
             "name exactly one"
         )
     return int(matches[0]["Id"])
+
+
+def _walk_attribute_groups(
+    groups: Any, prefix: str, found: list[TemplateAttribute]
+) -> None:
+    """Flatten OME's nested AttributeGroups, exactly as Dell's client walks them.
+
+    `ome_template.py::recurse_subattr_list`: a group either has
+    `SubAttributeGroups` to descend into or `Attributes` to collect, and the
+    display path is the group DisplayNames joined with a comma.
+    """
+    if not isinstance(groups, list):
+        return
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        path = f"{prefix},{group.get('DisplayName')}" if prefix else str(group.get("DisplayName") or "")
+        if group.get("SubAttributeGroups"):
+            _walk_attribute_groups(group.get("SubAttributeGroups"), path, found)
+            continue
+        for attribute in group.get("Attributes") or []:
+            if not isinstance(attribute, dict):
+                continue
+            found.append(
+                TemplateAttribute(
+                    attribute_id=attribute.get("AttributeId"),
+                    name=str(attribute.get("DisplayName") or ""),
+                    group=path,
+                    value=None if attribute.get("Value") is None else str(attribute.get("Value")),
+                    is_ignored=bool(attribute.get("IsIgnored")),
+                )
+            )
+
+
+async def template_attributes(client: httpx.AsyncClient, template_id: int) -> list[TemplateAttribute]:
+    """Every attribute this template would deploy, flattened.
+
+    `TemplateService/Templates({id})/AttributeDetails` — the path Dell's own
+    `ome_template.py` uses (its `TEMPLATE_ATTRIBUTES`), not the
+    `Views({id})/AttributeViewDetails` its comments mention for looking up a
+    single attribute id.
+    """
+    body = (await _request(client, "GET", f"/TemplateService/Templates({template_id})/AttributeDetails")).json()
+    found: list[TemplateAttribute] = []
+    _walk_attribute_groups((body or {}).get("AttributeGroups"), "", found)
+    return found
 
 
 def _profile(raw: dict[str, Any]) -> OmeProfile:

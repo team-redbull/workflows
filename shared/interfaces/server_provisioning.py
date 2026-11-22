@@ -16,6 +16,9 @@ from __future__ import annotations
 from temporalio import activity
 
 from shared.models.server_provisioning import (
+    BiosStageRequest,
+    BiosVerification,
+    BiosVerifyRequest,
     IdracIdentity,
     IdracJobsRef,
     IdracJobsState,
@@ -28,12 +31,14 @@ from shared.models.server_provisioning import (
     OmeJobState,
     OmeProfile,
     OmeProfileRef,
+    OmeTemplateRef,
     RebootResult,
     ServerNameRequest,
     ServerScanLookup,
     ServerScanState,
     StorageConfigRequest,
     StorageLayout,
+    TemplateContents,
     TemplateDeployRequest,
     TemplateDeployResult,
 )
@@ -67,6 +72,56 @@ async def check_idrac_login(ref: IdracRef) -> bool:
 @activity.defn
 async def read_idrac_identity(ref: IdracRef) -> IdracIdentity:
     """Service tag (`SKU`), model, manufacturer, BIOS and iDRAC firmware versions."""
+    ...
+
+
+@activity.defn
+async def set_idrac_root_password(ref: IdracRef) -> bool:
+    """Set root's password to the TARGET one, using the credential `ref` names.
+
+    True when this call changed it, False when root already had it. Both
+    passwords are resolved on the limb — neither crosses this boundary.
+
+    Runs BEFORE OME discovers the machine, so OME is only ever handed the
+    password root keeps. Touches iDRAC user 2 and refuses if slot 2 turns out
+    not to be root.
+    """
+    ...
+
+
+@activity.defn
+async def clear_idrac_os_hostname(ref: IdracRef) -> bool:
+    """Blank the machine's OS hostname; True when it had one. Idempotent.
+
+    Servers arrive carrying a factory OS hostname (`Miniwinpc`), and while one
+    is set OME displays it instead of the machine's address next to the
+    profile. Cleared unconditionally — a machine being provisioned has no OS,
+    so whatever is there is stale.
+    """
+    ...
+
+
+@activity.defn
+async def verify_bios_configuration(request: BiosVerifyRequest) -> BiosVerification:
+    """What the template meant each BIOS attribute to be, against what it is.
+
+    Keyed by OME's DISPLAY name, which is all OME reports about a template. The
+    limb resolves those through the machine's BIOS attribute registry — the only
+    bridge to the names Redfish accepts — and reports an attribute the registry
+    does not know rather than dropping it, because a silent drop reads as
+    "verified" when it means "not checked".
+    """
+    ...
+
+
+@activity.defn
+async def stage_bios_attributes(request: BiosStageRequest) -> str:
+    """Stage BIOS values and queue the job that applies them on the next reset.
+
+    Returns the job id, which joins the storage job ids so ONE reboot applies
+    configuration drift and RAID together. Idempotent: an existing pending
+    `Configure: BIOS.Setup.1-1` job is returned rather than a second queued.
+    """
     ...
 
 
@@ -141,6 +196,17 @@ async def deploy_ome_template(request: TemplateDeployRequest) -> TemplateDeployR
     that template gets no second deployment — the profile's own
     DeploymentTaskId is returned to wait on. Raises TemplateNotConfiguredError,
     TemplateNotFoundError or ProfileConflictError — all deterministic.
+    """
+    ...
+
+
+@activity.defn
+async def read_ome_template(ref: OmeTemplateRef) -> TemplateContents:
+    """Every attribute the configured template would deploy, flattened.
+
+    Read BEFORE anything touches the machine, so a template carrying iDRAC
+    network settings, storage or user accounts stops the run without a single
+    write. `template_policy.py` decides what is unsafe; this only reports.
     """
     ...
 

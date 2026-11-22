@@ -52,7 +52,7 @@ from workflow_domains.server_provisioning.provision_dell_server import (
 )
 
 IDRAC_IP = "127.0.0.2"
-REGION = "israel"
+SITE = "israel"
 TARGET = "Target-Pw1"
 FACTORY = ["calvin", "Factory-Pw2"]
 
@@ -191,7 +191,7 @@ async def _temporal_run() -> ProvisionDellServerResult:
             return await asyncio.wait_for(
                 client.execute_workflow(
                     ProvisionDellServerWorkflow.run,
-                    ProvisionDellServerRunArgs(input=ProvisionDellServerInput(idrac_ip=IDRAC_IP, region=REGION)),
+                    ProvisionDellServerRunArgs(input=ProvisionDellServerInput(idrac_ip=IDRAC_IP, site=SITE)),
                     id=f"e2e-{uuid.uuid4()}",
                     task_queue=PROVISION_DELL_SERVER_WORKFLOW_QUEUE,
                 ),
@@ -228,7 +228,7 @@ async def test_a_factory_fresh_server_is_provisioned_end_to_end(world: World):
     # to its profile. Cleared before OME ever discovered it.
     assert world.idrac.os_hostname == "" and result.os_hostname_cleared
     token = world.idrac.model.split()[-1].lower()
-    assert result.profile_name == f"ocp-dell-{token}-{REGION}-128c-1024gb-10tb-{world.idrac.service_tag}"
+    assert result.profile_name == f"ocp-{token}-mtl-{SITE}-{world.idrac.service_tag.lower()}"
     # The run finished on its own configuration work. server-scan has not
     # collected the machine yet (its simulator needs 3 reads), and that is
     # deliberately not something the run waits for.
@@ -351,7 +351,7 @@ async def test_both_supported_idrac_generations_are_provisioned(world: World):
     # Whichever collection this generation serves, exactly one was written.
     assert len(world.ome.discovery_posts) == 1
     token = world.idrac.model.split()[-1].lower()
-    assert result.profile_name.startswith(f"ocp-dell-{token}-")
+    assert result.profile_name.startswith(f"ocp-{token}-mtl-")
 
 
 async def test_a_setting_the_deployment_silently_skipped_is_fixed(world: World):

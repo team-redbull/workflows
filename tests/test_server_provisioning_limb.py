@@ -736,7 +736,7 @@ class TestTemplateAttributes:
 
 
 class TestServerScan:
-    NAME = "ocp-dell-r660-israel-128c-1024gb-10tb-ABC1234"
+    NAME = "ocp-c200-mtl-israel-abc1234"
 
     def _mock(self, *servers: dict) -> None:
         respx.get(f"{SS}/servers").mock(
@@ -777,7 +777,7 @@ class TestServerScan:
 
 
 NAMER = "https://namer.test/rename"
-NAME_REQUEST = ServerNameRequest(service_tag="ABC1234", ome_device_id=2, region="israel", idrac_ip=IP)
+NAME_REQUEST = ServerNameRequest(service_tag="ABC1234", ome_device_id=2, site="israel", idrac_ip=IP)
 
 
 class TestNamer:

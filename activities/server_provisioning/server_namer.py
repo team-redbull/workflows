@@ -1,17 +1,21 @@
 """The naming service — the ONE place its request is built. Fill this in.
 
-The service already exists inside the disconnected environment: it reads the
-device's cores, memory and disks from OME, rounds them its own way and renames
-the OME server profile to
+The service already exists inside the disconnected environment: it chooses the
+server's flavor and renames the OME server profile, under the platform naming
+convention (Idan-Maimon/kubevirt-workflows, docs/naming-convention.md), to
 
-    ocp-dell-<model>-<region>-<cores>c-<mem>gb-<disk>tb-<service tag>
+    ocp-<flavor>-mtl-<site>-<service tag>      lowercase, at most 32 characters
+
+(until 2026-11-22: `ocp-dell-<model>-<region>-<cores>c-<mem>gb-<disk>tb-<tag>`;
+the service itself must follow — a run whose name it still writes the old way
+fails at verifying-name with ServerNameNotAppliedError).
 
 Its exact request contract is not known to this repo yet, so `request_name` is
 the opening for it: it sends everything the workflow knows (ServerNameRequest)
 as JSON to SERVER_NAMER_URL and treats any 2xx as "accepted". Adapt the method,
 path and body below to the real API — nothing else in the workflow depends on
 them. The workflow does NOT trust the answer: it reads the profile name back
-from OME and checks it against the convention, the region and the service tag.
+from OME and checks it against the convention, the site and the service tag.
 
 Error classification follows the other limbs: 4xx is the service refusing
 this request (deterministic, ServerNamerRejectedError), anything else —

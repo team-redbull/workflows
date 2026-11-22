@@ -9,10 +9,10 @@ Technicians rack servers in batches, so the `/bulk` variant takes a list of
 iDRAC IPs and starts ONE WORKFLOW PER MACHINE — each with its own dedup id, its
 own status and its own failure — answering 202 with a per-item report.
 
-The region is resolved HERE, from the iDRAC's address prefix (regions.py), and
+The site is resolved HERE, from the iDRAC's address prefix (sites.py), and
 travels into the run as input. An address no prefix matches is refused now —
 a 422 on the single route, a `rejected` item in bulk — rather than failing the
-run later. An explicit `region` overrides the lookup.
+run later. An explicit `site` overrides the lookup.
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ from workflow_domains.routers.models import StartWorkflowResponse
 from workflow_domains.server_provisioning.provision_dell_server import (
     ProvisionDellServerWorkflow,
 )
-from workflow_domains.server_provisioning.regions import resolve_region
+from workflow_domains.server_provisioning.sites import resolve_site
 
 router = APIRouter(prefix="/workflows/server-provisioning", tags=["server-provisioning"])
 
@@ -69,7 +69,7 @@ class BulkProvisionDellServerItem(BaseModel):
     idrac_ip: str
     workflow_id: str
     status: Literal["started", "already_running", "rejected", "failed"]
-    region: str | None = None
+    site: str | None = None
     run_id: str | None = None
     error: str | None = None
 
@@ -82,15 +82,15 @@ class BulkStartProvisionDellServerResponse(BaseModel):
     results: list[BulkProvisionDellServerItem]
 
 
-def _with_region(request: ProvisionDellServerRequest) -> ProvisionDellServerInput:
-    """The run's input, region resolved; ValueError when no prefix matches."""
-    region = request.region or resolve_region(request.idrac_ip)
-    if not region:
+def _with_site(request: ProvisionDellServerRequest) -> ProvisionDellServerInput:
+    """The run's input, site resolved; ValueError when no prefix matches."""
+    site = request.site or resolve_site(request.idrac_ip)
+    if not site:
         raise ValueError(
-            f"No region for iDRAC {request.idrac_ip}: its address matches no prefix in "
-            "workflow_domains/server_provisioning/regions.py — add the prefix, or pass `region`"
+            f"No site for iDRAC {request.idrac_ip}: its address matches no prefix in "
+            "workflow_domains/server_provisioning/sites.py — add the prefix, or pass `site`"
         )
-    return ProvisionDellServerInput(idrac_ip=request.idrac_ip, region=region)
+    return ProvisionDellServerInput(idrac_ip=request.idrac_ip, site=site)
 
 
 async def _start(client: Client, run_input: ProvisionDellServerInput):
@@ -123,7 +123,7 @@ async def start_provision_dell_server(
     while a run is going gets a 409.
     """
     try:
-        run_input = _with_region(request)
+        run_input = _with_site(request)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
     try:
@@ -148,14 +148,14 @@ async def start_provision_dell_server_bulk(
     """Provision many Dell servers — one workflow per iDRAC IP (202).
 
     Always 202 with a per-item report: some start, some are already running,
-    some are rejected (no region for their prefix) — one bad row never holds
+    some are rejected (no site for their prefix) — one bad row never holds
     the others back. A repeated IP in one request reports `already_running`.
     """
 
     async def _start_one(request: ProvisionDellServerRequest) -> BulkProvisionDellServerItem:
         workflow_id = provision_dell_server_workflow_id(request.idrac_ip)
         try:
-            run_input = _with_region(request)
+            run_input = _with_site(request)
         except ValueError as exc:
             return BulkProvisionDellServerItem(
                 idrac_ip=request.idrac_ip, workflow_id=workflow_id, status="rejected", error=str(exc)
@@ -167,21 +167,21 @@ async def start_provision_dell_server_bulk(
                 idrac_ip=request.idrac_ip,
                 workflow_id=workflow_id,
                 status="already_running",
-                region=run_input.region,
+                site=run_input.site,
             )
         except Exception as exc:  # noqa: BLE001 — one bad row must not sink the batch
             return BulkProvisionDellServerItem(
                 idrac_ip=request.idrac_ip,
                 workflow_id=workflow_id,
                 status="failed",
-                region=run_input.region,
+                site=run_input.site,
                 error=str(exc),
             )
         return BulkProvisionDellServerItem(
             idrac_ip=request.idrac_ip,
             workflow_id=handle.id,
             status="started",
-            region=run_input.region,
+            site=run_input.site,
             run_id=handle.result_run_id or "",
         )
 

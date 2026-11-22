@@ -1,5 +1,11 @@
 # provision-dell-server — handoff prompt for the next Claude Code session
 
+> **Names, 2026-11-22.** Written with the names of its time. Since the platform naming
+> convention left draft (`Idan-Maimon/kubevirt-workflows` `docs/naming-convention.md`) the server
+> is `ocp-<flavor>-mtl-<site>-<service tag>` (lowercase, at most 32 characters; the flavor checked
+> by shape only), and "region" is "site" (`sites.py`, `ServerSiteMissingError`). CLAUDE.md §4 has
+> the current rules.
+
 Paste everything under "Prompt" into a new Claude Code session opened on the
 `team-redbull/workflows` repo, branch `claude/ome-api-verification`.
 

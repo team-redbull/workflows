@@ -40,13 +40,13 @@ IDRAC_AWAITING_RESET_STATE = "Scheduled"
 class ProvisionDellServerInput(BaseModel):
     """One machine to provision, as the technician names it: its iDRAC address.
 
-    `region` is resolved from the iDRAC's address prefix at the API edge, so a
+    `site` is resolved from the iDRAC's address prefix at the API edge, so a
     run started through the router always carries one; the workflow refuses a
     run without it rather than guessing.
     """
 
     idrac_ip: str
-    region: str | None = None
+    site: str | None = None
 
 
 class ProvisionDellServerRunArgs(BaseModel):
@@ -352,12 +352,12 @@ class ServerNameRequest(BaseModel):
 
     The service computes the name itself from what it reads in OME (cores,
     memory and disks, rounded its own way), so nothing here is a name — only
-    which device, and the region the convention needs.
+    which device, and the site the convention needs.
     """
 
     service_tag: str
     ome_device_id: int
-    region: str
+    site: str
     idrac_ip: str
 
 
@@ -401,7 +401,7 @@ class ProvisionDellServerProgress(BaseModel):
 
 class ProvisionDellServerResult(BaseModel):
     idrac_ip: str
-    region: str
+    site: str
     service_tag: str
     model: str
     idrac_firmware: str

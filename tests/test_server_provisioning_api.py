@@ -1,6 +1,6 @@
 """provision-dell-server trigger routes: real router, a stand-in Temporal client.
 
-What matters is the edge contract: the region is resolved from the iDRAC prefix
+What matters is the edge contract: the site is resolved from the iDRAC prefix
 before a run exists, the dedup id is the normalized IP, and a bulk request
 reports every machine on its own.
 """
@@ -55,18 +55,18 @@ def make_client():
     return _make
 
 
-def test_single_resolves_the_region_from_the_prefix(make_client):
+def test_single_resolves_the_site_from_the_prefix(make_client):
     fake = _FakeClient()
     resp = make_client(fake).post(PATH, json={"idrac_ip": "134.1.2.1"})
     assert resp.status_code == 202
     assert resp.json()["workflow_id"] == "provision-dell-server-134.1.2.1"
-    assert fake.args[0].input.region == "israel"
+    assert fake.args[0].input.site == "israel"
 
 
-def test_an_explicit_region_wins(make_client):
+def test_an_explicit_site_wins(make_client):
     fake = _FakeClient()
-    make_client(fake).post(PATH, json={"idrac_ip": "192.0.2.10", "region": "tlv"})
-    assert fake.args[0].input.region == "tlv"
+    make_client(fake).post(PATH, json={"idrac_ip": "192.0.2.10", "site": "tlv"})
+    assert fake.args[0].input.site == "tlv"
 
 
 def test_an_unknown_prefix_is_422_and_starts_nothing(make_client):
@@ -108,7 +108,7 @@ def test_bulk_reports_every_machine_on_its_own(make_client):
         "already_running",
     ]
     assert (body["started"], body["already_running"], body["rejected"], body["failed"]) == (1, 2, 1, 0)
-    assert body["results"][0]["region"] == "region1"
+    assert body["results"][0]["site"] == "site1"
 
 
 def test_bulk_survives_temporal_failing(make_client):

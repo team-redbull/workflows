@@ -633,7 +633,7 @@ def idrac_app(sim: IdracSim) -> FastAPI:
     return app
 
 
-def services_app(ome: OmeSim, scan: ScanSim, region_names: dict[str, str] | None = None) -> FastAPI:
+def services_app(ome: OmeSim, scan: ScanSim, site_names: dict[str, str] | None = None) -> FastAPI:
     """OME under /api, the naming service under /namer, server-scan under /scan/api/v1."""
     app = FastAPI()
     idrac = ome.idrac
@@ -783,13 +783,11 @@ def services_app(ome: OmeSim, scan: ScanSim, region_names: dict[str, str] | None
     async def rename(request: Request):
         body = await request.json()
         profile = next(p for p in ome.profiles if p["TargetId"] == body["ome_device_id"] and p["ProfileState"] > 0)
-        # The service reads cores/memory/disks from OME and rounds them itself.
-        # The model token comes from the machine, so this follows whichever
-        # generation the test asked for.
-        token = idrac.model.split()[-1].lower()
-        profile["ProfileName"] = (
-            f"ocp-dell-{token}-{body['region']}-128c-1024gb-10tb-{idrac.service_tag}"
-        )
+        # The service chooses the flavor itself (the convention's §1 shape:
+        # ocp-<flavor>-mtl-<site>-<service tag>, lowercase); here it is the
+        # model's last word, so it follows whichever generation the test asked for.
+        flavor = idrac.model.split()[-1].lower()
+        profile["ProfileName"] = f"ocp-{flavor}-mtl-{body['site']}-{idrac.service_tag.lower()}"
         return {"renamed": profile["ProfileName"]}
 
     @app.get("/scan/api/v1/servers")

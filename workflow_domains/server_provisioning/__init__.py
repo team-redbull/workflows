@@ -10,6 +10,6 @@ their own later.
 
 Beside the workflow sit the pure rules it applies — storage_plan.py (which
 controller gets the RAID 1, which drives go Non-RAID) and server_name.py (what
-a correctly named server looks like) — and regions.py, the router's mapping
-from an iDRAC address to its region. None of them does I/O.
+a correctly named server looks like) — and sites.py, the router's mapping
+from an iDRAC address to its site. None of them does I/O.
 """

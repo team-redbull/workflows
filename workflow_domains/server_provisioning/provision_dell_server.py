@@ -40,7 +40,7 @@ Shape of the run:
                             back. Nothing is ever deleted (storage_plan.py).
   8. naming-server        — the naming service renames the OME profile, and
      verifying-name         the name is read back from OME and checked against
-                            the convention, region and service tag included.
+                            the convention, site and service tag included.
 
 DONE MEANS CONFIGURED, NOT YET INVENTORIED. The run ends when the machine is
 right: root on the enforced password, the template applied, the storage layout
@@ -110,7 +110,7 @@ with workflow.unsafe.imports_passed_through():
         OmeRequestRejectedError,
         ConfigurationDriftError,
         ProfileConflictError,
-        RegionMissingError,
+        ServerSiteMissingError,
         RootPasswordNotSetError,
         ServerNameNotAppliedError,
         ServerNamerRejectedError,
@@ -183,8 +183,9 @@ with workflow.unsafe.imports_passed_through():
         unverifiable,
     )
     from workflow_domains.server_provisioning.server_name import (
-        model_token,
+        expected_shape,
         name_matches_convention,
+        name_problem,
     )
     from workflow_domains.server_provisioning.storage_plan import StoragePlan, plan_storage
 
@@ -287,13 +288,13 @@ class ProvisionDellServerWorkflow:
         run_input = run_args.input
         idrac_ip = run_input.idrac_ip
         self._progress.idrac_ip = idrac_ip
-        if not run_input.region:
+        if not run_input.site:
             raise _fail(
-                f"No region for iDRAC {idrac_ip}: start the run through the API, which "
+                f"No site for iDRAC {idrac_ip}: start the run through the API, which "
                 "resolves it from the address prefix, or pass one explicitly",
-                RegionMissingError,
+                ServerSiteMissingError,
             )
-        region = run_input.region
+        site = run_input.site
 
         # Step 1 — which root password opens this iDRAC.
         initial_credential = await self._probe(idrac_ip)
@@ -463,7 +464,7 @@ class ProvisionDellServerWorkflow:
             ServerNameRequest(
                 service_tag=identity.service_tag,
                 ome_device_id=device_id,
-                region=region,
+                site=site,
                 idrac_ip=idrac_ip,
             ),
         )
@@ -473,17 +474,20 @@ class ProvisionDellServerWorkflow:
             lambda p: bool(
                 p.found
                 and p.profile_name
-                and name_matches_convention(p.profile_name, identity.model, region, identity.service_tag)
+                and name_matches_convention(p.profile_name, site, identity.service_tag)
             ),
             _NAME_DEADLINE,
             _NAME_POLL,
         )
         if not named:
-            observed = repr(profile.profile_name) if profile.found else "missing"
+            if profile.found and profile.profile_name:
+                why = name_problem(str(profile.profile_name), site, identity.service_tag)
+            else:
+                why = "the profile is missing" if not profile.found else "the profile has no name"
             raise _fail(
-                f"The OME profile of {identity.service_tag} is {observed}, not "
-                f"ocp-dell-{model_token(identity.model)}-{region}-<cores>c-<mem>gb-<disk>tb-"
-                f"{identity.service_tag}, {_NAME_DEADLINE} after asking the naming service",
+                f"The OME profile of {identity.service_tag} is not named "
+                f"{expected_shape(site, identity.service_tag)} (lowercase, at most 32 characters, the "
+                f"platform naming convention) {_NAME_DEADLINE} after asking the naming service: {why}",
                 ServerNameNotAppliedError,
             )
         profile_name = str(profile.profile_name)
@@ -496,7 +500,7 @@ class ProvisionDellServerWorkflow:
         self._phase("completed")
         return ProvisionDellServerResult(
             idrac_ip=idrac_ip,
-            region=region,
+            site=site,
             service_tag=identity.service_tag,
             model=identity.model,
             idrac_firmware=identity.idrac_firmware,

@@ -314,7 +314,7 @@ async def request_server_name(request: ServerNameRequest) -> None:
     await server_namer.request_name(
         _settings.server_namer_url, _settings.server_namer_api_token, request
     )
-    activity.logger.info("Naming service accepted %s (region %s)", request.service_tag, request.region)
+    activity.logger.info("Naming service accepted %s (site %s)", request.service_tag, request.site)
 
 
 # --- server-scan -------------------------------------------------------------

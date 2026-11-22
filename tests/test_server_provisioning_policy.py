@@ -1,6 +1,6 @@
 """provision-dell-server's pure rules, with no Temporal and no I/O.
 
-Three of them: the region an iDRAC's address belongs to (resolved at the API
+Three of them: the site an iDRAC's address belongs to (resolved at the API
 edge), the shape a correctly named server has (checked after the naming service
 ran), and the storage plan — the one that must NEVER propose destroying data.
 """
@@ -17,7 +17,7 @@ from shared.models.server_provisioning import (
     StorageLayout,
     TemplateAttribute,
 )
-from workflow_domains.server_provisioning.regions import resolve_region
+from workflow_domains.server_provisioning.sites import resolve_site
 from workflow_domains.server_provisioning.template_policy import (
     NETWORK,
     STORAGE,
@@ -27,61 +27,79 @@ from workflow_domains.server_provisioning.template_policy import (
     describe_hazards,
 )
 from workflow_domains.server_provisioning.server_name import (
-    model_token,
+    MAX_NAME_LENGTH,
+    expected_shape,
     name_matches_convention,
+    name_problem,
 )
 from workflow_domains.server_provisioning.storage_plan import plan_storage
 
 
-class TestRegion:
+class TestSite:
     @pytest.mark.parametrize(
-        ("ip", "region"),
-        [("1.1.1.1", "region1"), ("2.2.2.2", "region2"), ("134.1.2.1", "israel")],
+        ("ip", "site"),
+        [("1.1.1.1", "site1"), ("2.2.2.2", "site2"), ("134.1.2.1", "israel")],
     )
-    def test_the_prefix_names_the_region(self, ip, region):
-        assert resolve_region(ip) == region
+    def test_the_prefix_names_the_site(self, ip, site):
+        assert resolve_site(ip) == site
 
-    def test_an_address_under_no_prefix_has_no_region(self):
-        assert resolve_region("192.0.2.10") is None
+    def test_an_address_under_no_prefix_has_no_site(self):
+        assert resolve_site("192.0.2.10") is None
 
     def test_a_non_address_is_refused(self):
         with pytest.raises(ValueError):
-            resolve_region("not-an-ip")
+            resolve_site("not-an-ip")
 
 
 class TestServerName:
-    NAME = "ocp-dell-r660-israel-128c-1024gb-10tb-ABC1234"
+    """The platform naming convention's bare-metal node: ocp-<flavor>-mtl-<site>-<serial>,
+    lowercase, at most 32 characters; for a Dell the serial is its service tag."""
 
-    def test_model_token_is_the_lowercased_model_number(self):
-        assert model_token("PowerEdge R660") == "r660"
+    NAME = "ocp-c200-mtl-israel-abc1234"
 
     def test_the_convention_matches(self):
-        assert name_matches_convention(self.NAME, "PowerEdge R660", "israel", "ABC1234")
+        assert name_matches_convention(self.NAME, "israel", "ABC1234")
+        assert name_problem(self.NAME, "israel", "ABC1234") is None
 
-    def test_service_tag_case_does_not_matter(self):
-        assert name_matches_convention(self.NAME.lower(), "PowerEdge R660", "israel", "ABC1234")
+    @pytest.mark.parametrize("flavor", ["c200", "c200n", "c200d", "c200x", "r660", "d7"])
+    def test_any_flavor_of_the_conventions_shape_matches(self, flavor):
+        """The naming service chooses the flavor; only its shape is checked (the operator, 2026-11-22)."""
+        assert name_matches_convention(f"ocp-{flavor}-mtl-israel-abc1234", "israel", "ABC1234")
+
+    def test_the_service_tag_is_compared_lowercased(self):
+        """The iDRAC reports the tag in upper case; the name carries it lowercased."""
+        assert name_matches_convention(self.NAME, "israel", "abc1234")
+        assert expected_shape("israel", "ABC1234") == "ocp-<flavor>-mtl-israel-abc1234"
 
     @pytest.mark.parametrize(
-        ("model", "region", "tag"),
-        [
-            ("PowerEdge R650", "israel", "ABC1234"),  # another model
-            ("PowerEdge R660", "region1", "ABC1234"),  # another region
-            ("PowerEdge R660", "israel", "ABC1235"),  # another machine
-        ],
+        ("site", "tag"),
+        [("site1", "ABC1234"), ("israel", "ABC1235")],  # another site; another machine
     )
-    def test_a_wrong_token_does_not_match(self, model, region, tag):
-        assert not name_matches_convention(self.NAME, model, region, tag)
+    def test_a_wrong_token_does_not_match(self, site, tag):
+        assert not name_matches_convention(self.NAME, site, tag)
+
+    def test_a_name_with_upper_case_is_refused_saying_so(self):
+        assert "lowercase" in name_problem("ocp-c200-mtl-israel-ABC1234", "israel", "ABC1234")
+
+    def test_a_name_over_32_characters_is_refused_saying_so(self):
+        name = "ocp-c200n-mtl-longsitename-abc1234"
+        assert len(name) > MAX_NAME_LENGTH == 32
+        assert "32" in name_problem(name, "longsitename", "ABC1234")
+        assert name_matches_convention("ocp-c200n-mtl-site-name-abc1234", "site-name", "ABC1234")  # 31
 
     @pytest.mark.parametrize(
         "name",
         [
-            "ocp-dell-r660-israel-128c-1024gb-ABC1234",  # no disk token
+            "ocp-dell-r660-israel-128c-1024gb-10tb-abc1234",  # the shape before 2026-11-22
+            "ocp-c200-kv32-israel-abc1234",  # a VM's size, not bare metal
+            "ocp-c200-israel-abc1234",  # no size
+            "ocp-200c-mtl-israel-abc1234",  # a flavor starts with a letter
+            "ocp-c200-mtl-israel-abc1234-x",
             "Profile from template 00001",  # OME's default, never renamed
-            "ocp-dell-r660-israel-128c-1024gb-10tb-ABC1234-x",
         ],
     )
     def test_a_malformed_name_does_not_match(self, name):
-        assert not name_matches_convention(name, "PowerEdge R660", "israel", "ABC1234")
+        assert not name_matches_convention(name, "israel", "ABC1234")
 
 
 def _drive(controller: str, n: int, status: str | None) -> IdracDrive:

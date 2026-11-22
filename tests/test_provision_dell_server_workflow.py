@@ -34,7 +34,7 @@ from shared.exceptions import (
     NotADellServerError,
     ProfileConflictError,
     RootPasswordNotSetError,
-    RegionMissingError,
+    ServerSiteMissingError,
     ServerAlreadyInstalledError,
     ServerNameNotAppliedError,
     StorageJobFailedError,
@@ -83,9 +83,9 @@ from workflow_domains.server_provisioning.provision_dell_server import (
 )
 
 IP = "134.1.2.1"
-REGION = "israel"
+SITE = "israel"
 TAG = "ABC1234"
-NAME = f"ocp-dell-r660-{REGION}-128c-1024gb-10tb-{TAG}"
+NAME = f"ocp-c200-mtl-{SITE}-{TAG.lower()}"
 DEVICE_ID = 42
 BOSS = "AHCI.SL.6-1"
 PERC = "RAID.SL.3-1"
@@ -271,7 +271,7 @@ class Fake:
 
         @activity.defn(name="request_server_name")
         async def rename(request: ServerNameRequest) -> None:
-            fake.calls.append(f"rename:{request.region}")
+            fake.calls.append(f"rename:{request.site}")
 
         @activity.defn(name="find_in_server_scan")
         async def scan(lookup: ServerScanLookup) -> ServerScanState:
@@ -306,12 +306,12 @@ class _Harness:
         await self._env.__aexit__(*exc_info)
 
 
-async def _run(fake: Fake, region: str | None = REGION):
+async def _run(fake: Fake, site: str | None = SITE):
     async with _Harness(fake) as client:
         return await asyncio.wait_for(
             client.execute_workflow(
                 ProvisionDellServerWorkflow.run,
-                ProvisionDellServerRunArgs(input=ProvisionDellServerInput(idrac_ip=IP, region=region)),
+                ProvisionDellServerRunArgs(input=ProvisionDellServerInput(idrac_ip=IP, site=site)),
                 id=f"test-{uuid.uuid4()}",
                 task_queue=PROVISION_DELL_SERVER_WORKFLOW_QUEUE,
             ),
@@ -319,9 +319,9 @@ async def _run(fake: Fake, region: str | None = REGION):
         )
 
 
-async def _failure(fake: Fake, region: str | None = REGION) -> ApplicationError:
+async def _failure(fake: Fake, site: str | None = SITE) -> ApplicationError:
     with pytest.raises(WorkflowFailureError) as info:
-        await _run(fake, region)
+        await _run(fake, site)
     cause = info.value.cause
     if isinstance(cause, ActivityError):
         cause = cause.cause
@@ -376,10 +376,10 @@ async def test_converged_storage_is_left_alone():
     assert "stage" not in fake.calls and "reboot" not in fake.calls
 
 
-async def test_no_region_fails_before_touching_anything():
+async def test_no_site_fails_before_touching_anything():
     fake = Fake()
-    error = await _failure(fake, region=None)
-    assert error.type == RegionMissingError.__name__
+    error = await _failure(fake, site=None)
+    assert error.type == ServerSiteMissingError.__name__
     assert fake.calls == []
 
 
@@ -486,9 +486,18 @@ async def test_a_staged_job_the_reset_can_never_reach_fails_at_the_first_deadlin
 
 
 async def test_a_name_that_never_matches_fails_the_run():
-    fake = Fake(profile_names=["ocp-dell-r660-region1-128c-1024gb-10tb-ABC1234"])  # wrong region
+    fake = Fake(profile_names=["ocp-c200-mtl-site1-abc1234"])  # wrong site
     error = await _failure(fake)
     assert error.type == ServerNameNotAppliedError.__name__
+    assert "ocp-<flavor>-mtl-israel-abc1234" in error.message and "is not" in error.message
+
+
+async def test_a_name_in_the_old_shape_fails_the_run_naming_the_new_one():
+    """The naming service must follow the convention: its pre-2026-11-22 name is refused."""
+    fake = Fake(profile_names=["ocp-dell-r660-israel-128c-1024gb-10tb-ABC1234"])
+    error = await _failure(fake)
+    assert error.type == ServerNameNotAppliedError.__name__
+    assert "lowercase" in error.message  # the old name carried the tag upper case
 
 
 

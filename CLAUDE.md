@@ -311,12 +311,19 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   - **Storage: RAID 1 on the BOSS pair, every PERC drive Non-RAID, NEVER a delete.** Policy in
     `storage_plan.py`; staged `OnReset` so ONE reboot applies all; after the template, so the
     layout checked is final. An existing volume or in-use drive fails the run.
-  - **The naming service is the author of the name** (it reads OME and rounds its own way);
-    `server_namer.py` is the opening for its real contract. The run checks the name read back
-    from the OME PROFILE (what server-scan reads) against the convention, the run's region and
-    the iDRAC's service tag — never re-deriving cores/memory/disk.
-  - **Region comes from the iDRAC prefix at the API EDGE** (`regions.py`, a const), carried as
-    input — never looked up on replay.
+  - **The naming service is the author of the name**; `server_namer.py` is the opening for its
+    real contract. The run checks the name read back from the OME PROFILE (what server-scan
+    reads) against the platform naming convention (the `naming-convention` skill fetches it):
+    `ocp-<flavor>-mtl-<site>-<service tag>`, lowercase, at most 32 characters, THIS run's site
+    and THIS iDRAC's service tag; the flavor by its SHAPE only — the convention defines no Dell
+    flavor and the service chooses it (the operator, 2026-11-22). The length cannot be checked
+    before the name is written (the service writes it), so it is checked at the read-back, and
+    `ServerNameNotAppliedError` says which rule failed. Until 2026-11-22 the name was
+    `ocp-dell-<model>-<region>-<cores>c-<mem>gb-<disk>tb-<tag>` and the model was checked; the
+    naming service must move to the new shape before a real run can pass `verifying-name`.
+  - **Site comes from the iDRAC prefix at the API EDGE** (`sites.py`, a const), carried as
+    input — never looked up on replay (a "region" until 2026-11-22: `region` → `site` on the
+    request, the input and the result, `RegionMissingError` → `ServerSiteMissingError`).
   - **A server server-scan lists as claimed by a cluster is refused** before anything reboots it.
   - **Dell's own client code is the reference for every OME/iDRAC shape** — the
     `dellemc.openmanage` collection (`docs/design/dell-ome-idrac-api.md` lists each

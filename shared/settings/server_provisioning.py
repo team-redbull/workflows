@@ -54,8 +54,8 @@ class ServerProvisioningActivitySettings(BaseSettings):
     dell_templates: dict[str, dict[str, str]]
 
     # --- the naming service -------------------------------------------------
-    # Renames the OME server profile to ocp-dell-<model>-<region>-<cores>c-
-    # <mem>gb-<disk>tb-<service tag>. See
+    # Renames the OME server profile to ocp-<flavor>-mtl-<site>-<service tag>,
+    # lowercase, at most 32 characters (the platform naming convention). See
     # activities/server_provisioning/server_namer.py for the request it gets.
     server_namer_url: str
     server_namer_api_token: str = ""

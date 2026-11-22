@@ -68,8 +68,8 @@ workflow_domains/                 The brain — one folder per domain, plus main
                                     bond_selection.py (the pure rule it applies),
                                     router.py
   server_provisioning/            provision_dell_server.py, storage_plan.py and
-                                    server_name.py (its pure rules), regions.py
-                                    (iDRAC prefix -> region), router.py
+                                    server_name.py (its pure rules), sites.py
+                                    (iDRAC prefix -> site), router.py
   cluster_upgrade/                upgrade_cluster.py, upgrade_control_plane.py (the
                                     per-MCE slot child), upgrade_path.py and gates.py
                                     (its pure rules), dispatch.py, router.py (not
@@ -740,9 +740,9 @@ entry while one runs is a 409.
 
 `POST /workflows/server-provisioning/provision-dell-server` with `{"idrac_ip": "134.1.2.1"}`
 (or `/bulk` with `{"servers": [{"idrac_ip": ...}, ...]}` — one run per machine).
-The **region** is resolved from the IP's prefix (`workflow_domains/server_provisioning/regions.py`)
+The **site** is resolved from the IP's prefix (`workflow_domains/server_provisioning/sites.py`)
 before the run starts; an address under no prefix is a 422 (a `rejected` item in
-bulk). An explicit `region` wins. The only manual step left is the iDRAC IP.
+bulk). An explicit `site` wins. The only manual step left is the iDRAC IP.
 
 1. **probing-idrac** — which root password does the iDRAC accept: the target
    (`IDRAC_ROOT_PASSWORD`) first, then each of `IDRAC_FACTORY_PASSWORDS`. One
@@ -766,9 +766,10 @@ bulk). An explicit `region` wins. The only manual step left is the iDRAC IP.
    by ONE reboot, then read back. It **never deletes**: an existing volume or a
    drive in use is `StorageLayoutUnsupportedError`.
 7. **naming-server / verifying-name** — the naming service renames the OME
-   profile; the name is read back and must be
-   `ocp-dell-<model>-<region>-<N>c-<N>gb-<N>tb-<service tag>` with THIS region
-   and service tag. `server_namer.py` is where the service's real request
+   profile; the name is read back and must be the platform naming convention's
+   `ocp-<flavor>-mtl-<site>-<service tag>` — lowercase, at most 32 characters,
+   THIS site and service tag, any flavor of the convention's shape (the service
+   chooses it). `server_namer.py` is where the service's real request
    contract goes — today it POSTs the request model to `SERVER_NAMER_URL`.
 
 The run ends there: the machine is configured. It does **not** wait for

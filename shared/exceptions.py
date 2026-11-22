@@ -1096,12 +1096,14 @@ class ServerNamerRejectedError(OrchestratorError):
     """The naming service refused the request (4xx). Deterministic."""
 
 
-class RegionMissingError(OrchestratorError):
-    """WORKFLOW-RAISED. A run carries no region.
+class ServerSiteMissingError(OrchestratorError):
+    """WORKFLOW-RAISED. A provision-dell-server run carries no site.
 
     The router resolves one from the iDRAC prefix on every run it starts, so
-    only a run started around it gets here. The region is part of the name
-    server-scan reads the site from, so it is never guessed.
+    only a run started around it gets here. The site is part of the server's
+    name (`ocp-<flavor>-mtl-<site>-<service tag>`), which server-scan reads the
+    site from, so it is never guessed. (`RegionMissingError` until 2026-11-22,
+    when the naming convention's word replaced "region".)
     """
 
 
@@ -1226,7 +1228,7 @@ class StorageNotConvergedError(OrchestratorError):
 
 class ServerNameNotAppliedError(OrchestratorError):
     """WORKFLOW-RAISED. The OME profile never carried a name matching the
-    convention for this machine (region and service tag included) in time."""
+    convention for this machine (site and service tag included) in time."""
 
 
 # --- cluster-upgrade --------------------------------------------------------

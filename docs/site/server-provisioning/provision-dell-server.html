@@ -259,13 +259,15 @@
             <h3>request_server_name &middot; get_ome_profile</h3>
             <span class="phase">phase <b>naming-server</b> &rarr; <b>verifying-name</b></span>
           </div>
-          <p>The naming service is the <b>author</b> of the name: it reads the device&rsquo;s cores, memory
-          and disks from OME, rounds them its own way and renames the server profile. This workflow asks,
-          then verifies &mdash; it never re-derives the numbers, because two roundings eventually
-          disagree.</p>
-          <pre>ocp-dell-r660-&lt;region&gt;-128c-1024gb-10tb-&lt;service tag&gt;</pre>
-          <p class="note">Checked against the convention, the run&rsquo;s <b>region</b> and the iDRAC&rsquo;s
-          own <b>service tag</b> &mdash; getting either wrong would file the machine under the wrong
+          <p>The naming service is the <b>author</b> of the name: it chooses the server&rsquo;s flavor and
+          renames the server profile under the platform naming convention
+          (<code>Idan-Maimon/kubevirt-workflows</code>, <code>docs/naming-convention.md</code>). This
+          workflow asks, then verifies.</p>
+          <pre>ocp-&lt;flavor&gt;-mtl-&lt;site&gt;-&lt;service tag&gt;     ocp-c200-mtl-israel-7xk2qf3</pre>
+          <p class="note">All lowercase, at most <b>32 characters</b>. Checked exactly: <code>mtl</code>, the
+          run&rsquo;s <b>site</b> and the iDRAC&rsquo;s own <b>service tag</b>; the flavor only for its shape
+          (a letter, then letters and digits, its variant letter included) &mdash; the convention defines
+          no Dell flavor, and the service chooses it. Getting the site or the tag wrong would file the machine under the wrong
           server-scan site, or name it after a different server. Read back from the <b>OME profile</b>,
           because that is the name server-scan reads. Polled every 30 s for 30 min, then
           <code>ServerNameNotAppliedError</code>.</p>
@@ -360,18 +362,18 @@
     </div>
   </section>
 
-  <!-- ======================= REGION ======================= -->
-  <section id="region">
+  <!-- ======================= SITE ======================= -->
+  <section id="site">
     <div class="sec-head">
       <div class="eyebrow">Where the machine is</div>
-      <h2>Region is resolved at the edge, once</h2>
+      <h2>Site is resolved at the edge, once</h2>
     </div>
 
     <div class="grid-2">
       <div class="panel">
         <h3>From the iDRAC&rsquo;s address prefix</h3>
-        <p>Technicians submit IPs, not regions, and the address plan already says where a machine is: each
-        region&rsquo;s iDRACs live under their own prefix. The <em>router</em> resolves it and the run
+        <p>Technicians submit IPs, not sites, and the address plan already says where a machine is: each
+        site&rsquo;s iDRACs live under their own prefix. The <em>router</em> resolves it and the run
         carries it as input.</p>
         <p>So editing the prefix table never changes what an in-flight run does &mdash; a lookup inside the
         workflow would be a non-deterministic change on replay &mdash; and an address matching no prefix is
@@ -379,11 +381,12 @@
       </div>
       <div class="panel">
         <h3>It has to be a server-scan site code</h3>
-        <p>The region is the <code>&lt;region&gt;</code> token of the server name, and server-scan parses a
-        server&rsquo;s <b>site</b> out of that name. A region that is not a site code server-scan knows
+        <p>The site is the <code>&lt;site&gt;</code> token of the server name, and server-scan parses a
+        server&rsquo;s <b>site</b> out of that name. A site that is not a code server-scan knows
         produces a machine filed in the wrong place &mdash; which is why the name is verified against the
-        run&rsquo;s region at step 7.</p>
-        <p class="note">An explicit <code>region</code> in the request body overrides the lookup, for a
+        run&rsquo;s site at step 7. (A &ldquo;site&rdquo; until 2026-11-22, when the naming
+        convention&rsquo;s word replaced it.)</p>
+        <p class="note">An explicit <code>site</code> in the request body overrides the lookup, for a
         machine on a network the table does not cover yet.</p>
       </div>
     </div>
@@ -404,14 +407,14 @@
         <div class="endpoint-head">
           <span class="method">POST</span>
           <span class="path">/workflows/server-provisioning/provision-dell-server</span>
-          <span class="ret">202 &middot; 409 if already running &middot; 422 if no region</span>
+          <span class="ret">202 &middot; 409 if already running &middot; 422 if no site</span>
         </div>
         <div class="endpoint-body">
           <p>One machine, identified only by its iDRAC address.</p>
           <pre><span class="c">// request</span>
 {
   "idrac_ip": "134.1.20.31",
-  "region":   "israel"          <span class="c">// optional — resolved from the prefix when omitted</span>
+  "site":   "israel"          <span class="c">// optional — resolved from the prefix when omitted</span>
 }
 
 <span class="c">// 202 response</span>
@@ -436,13 +439,13 @@
           <pre><span class="c">// 202 response</span>
 { "started": 2, "already_running": 1, "rejected": 1, "failed": 0,
   "results": [
-    { "idrac_ip": "134.1.20.31", "workflow_id": "provision-dell-server-134.1.20.31", "status": "started",         "region": "israel", "run_id": "…" },
-    { "idrac_ip": "134.1.20.32", "workflow_id": "provision-dell-server-134.1.20.32", "status": "already_running", "region": "israel" },
+    { "idrac_ip": "134.1.20.31", "workflow_id": "provision-dell-server-134.1.20.31", "status": "started",         "site": "israel", "run_id": "…" },
+    { "idrac_ip": "134.1.20.32", "workflow_id": "provision-dell-server-134.1.20.32", "status": "already_running", "site": "israel" },
     { "idrac_ip": "9.9.9.9",     "workflow_id": "provision-dell-server-9.9.9.9",     "status": "rejected",
-      "error": "No region for iDRAC 9.9.9.9: its address matches no prefix …" }
+      "error": "No site for iDRAC 9.9.9.9: its address matches no prefix …" }
   ] }</pre>
           <p class="note"><code>rejected</code> is this route&rsquo;s own status, and it is the common one:
-          a machine on a network nobody has added to the region table yet. It is refused before a workflow
+          a machine on a network nobody has added to the site table yet. It is refused before a workflow
           is started at all.</p>
         </div>
       </div>
@@ -467,7 +470,7 @@
 <span class="c">// COMPLETED</span>
 { …, "status": "COMPLETED",
   "result": { "service_tag": "7XK2QF3", "initial_credential": "factory-1",
-              "profile_name": "ocp-dell-r660-israel-128c-1024gb-10tb-7XK2QF3",
+              "profile_name": "ocp-c200-mtl-israel-7xk2qf3",
               "boss_raid1_created": true, "non_raid_drives_converted": 4,
               "os_hostname_cleared": true, "bios_attributes_checked": 37,
               "bios_attributes_remediated": 1, "bios_attributes_unverified": 0 } }</pre>
@@ -516,7 +519,7 @@
       <div class="panel">
         <h3>Failures the workflow itself raises</h3>
         <p style="font-size:var(--fs-14);color:var(--ink-2)">Decisions, not call failures &mdash; each one
-        stops the run immediately: <code>RegionMissingError</code>, <code>NotADellServerError</code>,
+        stops the run immediately: <code>ServerSiteMissingError</code>, <code>NotADellServerError</code>,
         <code>ServerAlreadyInstalledError</code>, <code>IdracUnreachableError</code>,
         <code>IdracCredentialsRejectedError</code>, <code>OmeDiscoveryFailedError</code>,
         <code>TemplateUnsafeError</code>, <code>RootPasswordNotSetError</code>,
@@ -550,7 +553,7 @@
         <thead><tr><th>Field</th><th>Type</th><th>Rules</th><th>What it's for</th></tr></thead>
         <tbody>
           <tr><td class="k">idrac_ip</td><td class="k">str</td><td class="muted">a real IP address</td><td class="muted">The machine. Normalised before it becomes the workflow id, so the dedup key does not depend on how it was typed.</td></tr>
-          <tr><td class="k">region</td><td class="k">str</td><td class="muted">optional</td><td class="muted">Overrides the prefix lookup. Must be a site code server-scan knows, because it becomes a token of the server's name.</td></tr>
+          <tr><td class="k">site</td><td class="k">str</td><td class="muted">optional</td><td class="muted">Overrides the prefix lookup. Must be a site code server-scan knows, because it becomes a token of the server's name.</td></tr>
         </tbody>
       </table>
     </div>

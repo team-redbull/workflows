@@ -17,15 +17,19 @@ Shape of the run:
   2. (refuse)         — an Agent bound to a cluster (`spec.clusterDeploymentName`)
                         fails the run with AgentBoundToClusterError. Nothing has
                         been touched yet.
-  3. powering-off     — `spec.online: false` on the BMH, then wait for metal3 to
-                        report `status.poweredOn: false`. Bounded: a BMC that
-                        never answers fails the run with HostPowerOffTimeoutError
-                        and nothing is deleted. The activity re-checks the Agents
-                        are still unbound right before it acts.
-  4. removing-host    — the NMStateConfig and the BMH (and its BMC Secret), by
-                        the same teardown add-server-to-mce's rollback uses: detach
-                        first, so metal3 does not try to deprovision through the
-                        BMC, then delete, then drop the finalizer if it sticks.
+  3. removing-host    — the NMStateConfig and the BMH deleted, the activity
+                        re-checking right before that no Agent is bound. NO
+                        power-off step, NO `detached` annotation, NO finalizer
+                        touched: metal3 deprovisions a deleted host — powers it
+                        off through its BMC, deletes its ironic node — and only
+                        then releases its `baremetalhost.metal3.io` finalizer.
+  4. awaiting-bmh-deletion — the BMH read every 15 s until metal3 has let it
+                        go, then its BMC Secret deleted if it outlived the host
+                        (metal3 needed it for the power-off). Bounded: still
+                        there after 15 min fails the run with
+                        BmhDeletionTimeoutError, the Agent untouched — usually a
+                        BMC that does not answer. metal3 finishes once it does,
+                        and a re-run waits for the same delete.
   5. removing-agent   — the Agent(s), each re-checked as unbound right before
                         its delete.
      removing-pxe-boot — every MAC the host is known by is cleared from the
@@ -45,6 +49,13 @@ Shape of the run:
                         ServerStillPresentError naming it — typically an Agent
                         re-registered by a host that had no BMH to power it
                         off through.
+
+Runs recorded before `remove-server-delete-without-power-off` (2026-11-24)
+replay their own steps 3-4 instead: `powering-off` — `spec.online: false`,
+then `status.poweredOn` read every 15 s for up to 10 min, else
+HostPowerOffTimeoutError with nothing deleted — and `removing-host` through
+add-server-to-mce's rollback teardown (detach, delete, the finalizer dropped
+after 30 s).
 
 NO LOCK IS RELEASED HERE (the operator, 2026-11-17). The run ends at the
 check: server-scan's install lock is its holder's to give back. Each caller
@@ -66,12 +77,24 @@ still end with step 7:
                         the removal is done; `lock_released` / `lock_detail`
                         say what was found.
 
-WHY POWER OFF FIRST, AND DELETE THE AGENT LAST. The host is still running the
-discovery image, and its agent re-registers with assisted-service when its
-Agent disappears — a fresh Agent would be back within a minute. Powering it off
-through its BMH stops that, and deleting the Agent only once the host is off
-means nothing is left to bring it back. (The detach in step 4 is then safe: the
-host is already off, so there is nothing for a deprovision to do.)
+WHY THE AGENT GOES LAST, AND WHY METAL3 POWERS THE HOST OFF. The host is still
+running the discovery image, and its agent re-registers with assisted-service
+when its Agent disappears — a fresh Agent would be back within a minute. So the
+host must be off before the Agent is deleted. metal3's own delete does that:
+it deprovisions the host on its way out (`deprovisioning`, `powering off
+before delete`, `deleting`) and releases its finalizer only then, so a BMH
+really gone means a host powered off and an ironic node deleted.
+
+WHY NOT POWER IT OFF FIRST, AND NEVER DROP THE FINALIZER (the operator,
+2026-11-24, after 2026-11-23). The power-off step could never pass for a host
+mid-deploy (`provisioning` / `wait call-back`): metal3 ignores `spec.online`
+until a deploy ends, so such a host failed HostPowerOffTimeoutError every time
+with nothing deleted. And the shared teardown dropped the finalizer after a
+fixed 30 s, while a deprovision through a BMC that answers takes 30-45 s: it
+cut metal3 off mid-way and orphaned the ironic node, whose power sync then
+forced the machine to a stale power state every minute — twelve servers no one
+could power on. A BMH that stays deleting is visible and finishes on its own;
+an orphaned ironic node is neither.
 
 WHY STEP 7 EXISTED (the operator's decision, 2026-10-31, reversed 2026-11-17).
 add-server-to-mce then held its lock a full day after a success, so a machine
@@ -111,6 +134,7 @@ with workflow.unsafe.imports_passed_through():
         AgentBoundToClusterError,
         AmbiguousInventorySegmentError,
         AmbiguousServerNameError,
+        BmhDeletionTimeoutError,
         BmhPrerequisiteMissingError,
         BmhRequestInvalidError,
         HostPowerOffTimeoutError,
@@ -126,6 +150,8 @@ with workflow.unsafe.imports_passed_through():
     from shared.interfaces.segment_lifecycle import get_inventory_segment
     from shared.interfaces.server_lifecycle import (
         delete_agents,
+        delete_bmc_secret,
+        delete_host_resources,
         get_baremetal_host,
         inspect_inventory_host,
         lookup_server_membership,
@@ -136,7 +162,11 @@ with workflow.unsafe.imports_passed_through():
     )
     from shared.models.server_lifecycle import (
         AgentDeleteRequest,
+        BmcSecretRef,
         BmhRef,
+        BmhState,
+        HostDeleteRequest,
+        HostDeletion,
         HostPowerRequest,
         InventoryHostState,
         PxeHostEntriesRef,
@@ -148,6 +178,11 @@ with workflow.unsafe.imports_passed_through():
         ServerMembership,
         ServerMembershipRequest,
         ServerReservation,
+    )
+    from workflow_domains.server_lifecycle.bmh_deletion import (
+        BMH_DELETION_DEADLINE,
+        BMH_DELETION_POLL_INTERVAL,
+        describe_metal3,
     )
 
 _ACTIVITY_TIMEOUT = timedelta(seconds=90)
@@ -182,9 +217,12 @@ _RETRY_POLICY = RetryPolicy(
 # Machine convergence, so a real deadline (CLAUDE.md §5). A BMC normally
 # answers a power-off in seconds; ten minutes covers a slow one without
 # leaving a run waiting on a BMC that is gone. Changing either constant is a
-# non-deterministic change for in-flight runs.
+# non-deterministic change for in-flight runs. (Runs recorded before
+# `remove-server-delete-without-power-off` only.)
 _POWER_OFF_DEADLINE = timedelta(minutes=10)
 _POWER_POLL_INTERVAL = timedelta(seconds=15)
+# The wait for metal3 to let a deleted BMH go — 15 s polls, 15 min — is
+# bmh_deletion.py's, shared with add-server-to-mce's rollbacks.
 # The final check: an Agent's finalizer holds it for seconds after the delete.
 # Five minutes, polled every 10s, is ample for that and short enough that a
 # host re-registering its Agent fails the run rather than hiding.
@@ -205,6 +243,12 @@ _PXE_OWN_SITE_PATCH = "remove-server-pxe-own-site"
 # to its final check. (CLAUDE.md §5's unbounded retries out-wait outages the
 # RUN depends on; nothing about this removal depends on the PXE VM.)
 _PXE_CLEANUP_DEADLINE = timedelta(minutes=10)
+
+# Retires the power-off step and add-server-to-mce's rollback teardown here (the
+# operator, 2026-11-24): the NMStateConfig and the BMH are deleted with no
+# `spec.online`, no detach and no finalizer touched, and the run waits for
+# metal3 to let the BMH go. Runs recorded before it power off, then tear down.
+_DELETE_WITHOUT_POWER_OFF_PATCH = "remove-server-delete-without-power-off"
 
 # Gates releasing add-server-to-mce's lock for this MCE once the host is gone.
 # Runs recorded before it end at the final check and leave the lock to its TTL.
@@ -249,6 +293,7 @@ class RemoveServerFromMceWorkflow:
         self._activity_queue: str | None = None
         self._pxe_cleanup = False
         self._pxe_own_site = False
+        self._delete_without_power_off = False
 
     @workflow.query
     def progress(self) -> RemoveServerFromMceProgress:
@@ -261,6 +306,7 @@ class RemoveServerFromMceWorkflow:
         self._activity_queue = activity_queue
         self._pxe_cleanup = workflow.patched(_PXE_CLEANUP_PATCH)
         self._pxe_own_site = workflow.patched(_PXE_OWN_SITE_PATCH)
+        self._delete_without_power_off = workflow.patched(_DELETE_WITHOUT_POWER_OFF_PATCH)
         ref = BmhRef(server_name=request.server_name, namespace=request.namespace)
 
         def result(**fields) -> RemoveServerFromMceResult:
@@ -298,36 +344,43 @@ class RemoveServerFromMceWorkflow:
             )
         agent_names = [agent.name for agent in state.agents]
 
-        # Step 3 — power off, so the host cannot re-register its Agent.
         powered_off = False
-        if state.bmh_found:
-            self._phase = "powering-off"
-            await self._call(
-                set_host_online,
-                HostPowerRequest(
-                    server_name=request.server_name,
-                    namespace=request.namespace,
-                    online=False,
-                    agents_must_be_unbound=agent_names,
-                ),
-                activity_queue,
-            )
-            if not await self._await_power_off(ref, activity_queue):
-                raise ApplicationError(
-                    f"BareMetalHost {request.server_name} in {request.namespace} on "
-                    f"MCE {request.mce_cluster} did not report powered off within "
-                    f"{_POWER_OFF_DEADLINE}. It is left with online: false and "
-                    "NOTHING was deleted — check its BMC, then re-run",
-                    type=HostPowerOffTimeoutError.__name__,
-                )
-            powered_off = True
-
-        # Step 4 — the BMH (+ its Secret) and the NMStateConfig.
         resources_removed: list[str] = []
-        if state.bmh_found or state.nmstate_found:
-            self._phase = "removing-host"
-            teardown = await self._call(teardown_bmh_resources, ref, activity_queue)
-            resources_removed = list(teardown.removed)
+        if self._delete_without_power_off:
+            # Steps 3-4 — the NMStateConfig and the BMH deleted, and metal3 left
+            # to deprovision the host: its delete powers the host off.
+            if state.bmh_found or state.nmstate_found:
+                resources_removed = await self._delete_host(request, ref, agent_names, activity_queue)
+        else:
+            # A run recorded before `remove-server-delete-without-power-off`:
+            # step 3, power off, so the host cannot re-register its Agent ...
+            if state.bmh_found:
+                self._phase = "powering-off"
+                await self._call(
+                    set_host_online,
+                    HostPowerRequest(
+                        server_name=request.server_name,
+                        namespace=request.namespace,
+                        online=False,
+                        agents_must_be_unbound=agent_names,
+                    ),
+                    activity_queue,
+                )
+                if not await self._await_power_off(ref, activity_queue):
+                    raise ApplicationError(
+                        f"BareMetalHost {request.server_name} in {request.namespace} on "
+                        f"MCE {request.mce_cluster} did not report powered off within "
+                        f"{_POWER_OFF_DEADLINE}. It is left with online: false and "
+                        "NOTHING was deleted — check its BMC, then re-run",
+                        type=HostPowerOffTimeoutError.__name__,
+                    )
+                powered_off = True
+
+            # ... and step 4, the BMH (+ its Secret) and the NMStateConfig.
+            if state.bmh_found or state.nmstate_found:
+                self._phase = "removing-host"
+                teardown = await self._call(teardown_bmh_resources, ref, activity_queue)
+                resources_removed = list(teardown.removed)
 
         # Step 5 — the Agent, last, once nothing can bring it back.
         agents_removed: list[str] = []
@@ -384,14 +437,20 @@ class RemoveServerFromMceWorkflow:
         leftover = await self._await_gone(ref, activity_queue)
         if leftover is not None:
             remaining = _describe_leftover(leftover)
-            hint = (
-                " The host could not be powered off (there was no BareMetalHost "
-                "to do it through) and is likely still running the discovery "
-                "image, re-registering its Agent: power it off through its BMC, "
-                "then re-run."
-                if leftover.agents and not powered_off
-                else ""
-            )
+            hint = ""
+            if leftover.agents and self._delete_without_power_off and state.bmh_found:
+                hint = (
+                    " metal3 let the BareMetalHost go without the host powering off, "
+                    "and it is likely still running the discovery image, re-registering "
+                    "its Agent: power it off through its BMC, then re-run."
+                )
+            elif leftover.agents and not powered_off:
+                hint = (
+                    " The host could not be powered off (there was no BareMetalHost "
+                    "to do it through) and is likely still running the discovery "
+                    "image, re-registering its Agent: power it off through its BMC, "
+                    "then re-run."
+                )
             raise ApplicationError(
                 f"{request.server_name} is still on MCE {request.mce_cluster} in "
                 f"{request.namespace} {_GONE_DEADLINE} after the deletes: {remaining}.{hint}",
@@ -598,6 +657,65 @@ class RemoveServerFromMceWorkflow:
             if workflow.now() - started_at >= _POWER_OFF_DEADLINE:
                 return False
             await workflow.sleep(_POWER_POLL_INTERVAL)  # durable, replay-safe
+
+    async def _delete_host(
+        self,
+        request: RemoveServerFromMceInput,
+        ref: BmhRef,
+        agent_names: list[str],
+        task_queue: str,
+    ) -> list[str]:
+        """Steps 3-4: delete the NMStateConfig and the BMH, wait for metal3, then the Secret.
+
+        What was deleted, as `Kind/name`. metal3's finalizer is never touched:
+        a BMH still there at the deadline fails the run, the Agent untouched.
+        """
+        self._phase = "removing-host"
+        deletion: HostDeletion = await self._call(
+            delete_host_resources,
+            HostDeleteRequest(
+                server_name=request.server_name,
+                namespace=request.namespace,
+                agents_must_be_unbound=agent_names,
+            ),
+            task_queue,
+        )
+        removed = list(deletion.removed)
+
+        self._phase = "awaiting-bmh-deletion"
+        stuck = await self._await_bmh_deleted(ref, task_queue)
+        if stuck is not None:
+            raise ApplicationError(
+                f"BareMetalHost {request.server_name} in {request.namespace} on MCE "
+                f"{request.mce_cluster} is still deleting {BMH_DELETION_DEADLINE} after "
+                f"the delete (metal3: {describe_metal3(stuck)}). Its finalizer is "
+                "left to metal3, which lets the host go only once it has powered it off "
+                "and deleted its ironic node — usually it cannot reach the BMC. The "
+                "NMStateConfig is deleted; the Agent was NOT. Fix the BMC, then re-run: "
+                "the run waits for the same delete",
+                type=BmhDeletionTimeoutError.__name__,
+            )
+
+        # metal3 needed the Secret for the power-off; it normally goes with the
+        # host, and is deleted here only when it outlived it.
+        if deletion.bmc_secret and await self._call(
+            delete_bmc_secret,
+            BmcSecretRef(namespace=request.namespace, name=deletion.bmc_secret),
+            task_queue,
+        ):
+            removed.append(f"Secret/{deletion.bmc_secret}")
+        return removed
+
+    async def _await_bmh_deleted(self, ref: BmhRef, task_queue: str) -> BmhState | None:
+        """Poll the BMH until metal3 has let it go: None, or its last read at the deadline."""
+        started_at = workflow.now()
+        while True:
+            bmh: BmhState = await self._call(get_baremetal_host, ref, task_queue)
+            if not bmh.found:
+                return None
+            if workflow.now() - started_at >= BMH_DELETION_DEADLINE:
+                return bmh
+            await workflow.sleep(BMH_DELETION_POLL_INTERVAL)  # durable, replay-safe
 
 
 @workflow.defn(name=_LEGACY_WORKFLOW_TYPE)

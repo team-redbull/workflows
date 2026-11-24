@@ -274,7 +274,7 @@
         <thead><tr><th>what was left</th><th>why nothing finishes it</th><th>what the run does</th></tr></thead>
         <tbody>
           <tr><td class="k">AgentMachine + Machine, no Node</td><td class="muted">Nothing is broken: CAPI skips the drain of a Machine with no Node.</td><td class="muted">The normal path &mdash; but the Node is still <b>looked for</b> by providerID and hostname, never assumed absent because the Machine has no nodeRef.</td></tr>
-          <tr><td class="k">AgentMachine, no Machine</td><td class="muted">The provider unbinds <b>only from a Machine&rsquo;s pre-terminate hook</b>. With no Machine it never unbinds, and its finalizer is dropped without the unbind &mdash; or, with no owner reference at all, stays for ever.</td><td class="muted">Releases the Agent with <b>the provider&rsquo;s exact write</b>, deletes the AgentMachine, and drops the provider&rsquo;s finalizer if it is still stuck a minute later.</td></tr>
+          <tr><td class="k">AgentMachine, no Machine</td><td class="muted">The provider unbinds <b>only from a Machine&rsquo;s pre-terminate hook</b>. With no Machine it never unbinds, and its finalizer is dropped without the unbind &mdash; or, with no owner reference at all, stays for ever.</td><td class="muted">Releases the Agent with <b>the provider&rsquo;s exact write</b> and deletes the AgentMachine. With no owner reference at all, drops the provider&rsquo;s finalizer if it is still stuck a minute later; with an owner that is merely gone, leaves the finalizer to the provider, which drops it itself.</td></tr>
           <tr><td class="k">Machine, no AgentMachine</td><td class="muted">Found by its providerID <code>agent://&lt;agent&gt;</code>. The provider&rsquo;s hook stays on it for ever &mdash; there is no AgentMachine to reconcile &mdash; so the Machine never finishes deleting.</td><td class="muted">Deletes the Machine; at its pre-terminate hook releases the Agent, waits for a state the provider itself releases in, then <b>removes the provider&rsquo;s hook</b>. CAPI does the rest.</td></tr>
           <tr><td class="k">Agent still bound, both gone</td><td class="muted">Nothing on the CAPI side references the Agent any more.</td><td class="muted">Releases it &mdash; recognised by its binding into the HostedCluster&rsquo;s control-plane namespace.</td></tr>
           <tr><td class="k">Node, no Machine or AgentMachine</td><td class="muted">CAPI drains and deletes a Node <b>only through its Machine</b>.</td><td class="muted">Ready: <b>cordon and evict</b> (CAPI&rsquo;s drain rules, PodDisruptionBudgets respected, 20 min) <em>before</em> the release that reboots the host; once the host is back in discovery and the Node NotReady, <b>delete it</b>. NotReady from the start: no drain. Ready with nothing on the MCE to release the host through: <b>refused before any write</b>.</td></tr>
@@ -299,8 +299,10 @@
         <p>The result&rsquo;s <code>leftovers_at_start</code> lists what HyperShift had left, in words, and
         <code>cleaned_up</code> every write the run made on a controller&rsquo;s behalf &mdash; each with why
         that controller could not.</p>
-        <p class="note">Only the Agent provider&rsquo;s own hook and finalizer are ever removed, and only once
-        their one job &mdash; the unbind &mdash; is done. Two Machines, two Nodes, or links into two control
+        <p class="note">Only the Agent provider&rsquo;s own hook and finalizer are ever removed, only once
+        their one job &mdash; the unbind &mdash; is done, and only where no controller ever will (the
+        operator, 2026-11-24). That rests on the provider&rsquo;s code as read: on every provider upgrade,
+        re-check that its hook and finalizer still guard nothing but the unbind. Two Machines, two Nodes, or links into two control
         planes are refused (<code>ConflictingHostedObjectsError</code>): the run cannot tell which is real.</p>
       </div>
     </div>
@@ -473,8 +475,10 @@
           more. The release itself refuses an Agent a live Machine holds, too
           (<code>AgentBindingChangedError</code>).</p>
           <p><b>verifying-agentmachine</b> &mdash; re-derived fresh: no AgentMachine names the Agent. One with
-          no Machine is deleted; one stuck deleting on the provider&rsquo;s finalizer (it drops it only through
-          a Machine) has that finalizer dropped after a minute; a Machine still linked fails the run (5 min,
+          no Machine is deleted; one stuck deleting on the provider&rsquo;s finalizer with <b>no owner at
+          all</b> (the provider keeps it for ever) has that finalizer dropped after a minute, while one whose
+          owner Machine is merely gone is left to the provider, which drops it itself; anything still there, or
+          a Machine still linked, fails the run (5 min,
           polled every 10 s). <b>verifying-node</b> &mdash; no Node of the hosted cluster is the server: a stale
           one, NotReady with no Machine left to delete it, is deleted; one still Ready fails the run (5 min).
           <b>verifying-agent</b> &mdash; unbound, no <code>agentMachineRef</code> label,
@@ -531,12 +535,14 @@
           This is where the server leaves the MCE, for a hosted node and an inventory host alike &mdash;
           remove-server-from-mce&rsquo;s own rules, unchanged:</p>
           <ol>
-            <li><b>powering-off</b> &mdash; <code>spec.online: false</code>, then <code>status.poweredOn</code>
-              read until false (10 min, else <code>HostPowerOffTimeoutError</code> with nothing deleted). It
-              re-checks right before that no Agent of the host is bound.</li>
-            <li><b>removing-host</b> &mdash; the BareMetalHost annotated <code>detached</code>, the
-              NMStateConfig deleted, the BareMetalHost deleted and waited on (a stuck metal3 finalizer is
-              dropped), and its BMC Secret deleted if it outlives the host.</li>
+            <li><b>removing-host</b> &mdash; the NMStateConfig and the BareMetalHost deleted, nothing else:
+              no power-off of its own, no <code>detached</code> annotation, no finalizer touched. It re-checks
+              right before that no Agent of the host is bound.</li>
+            <li><b>awaiting-bmh-deletion</b> &mdash; the BareMetalHost read every 15 s until metal3 has
+              powered the host off and let it go (15 min, else <code>BmhDeletionTimeoutError</code>, the Agent
+              untouched), then its BMC Secret deleted if it outlives the host. A child started before
+              2026-11-24 powered the host off itself (<code>powering-off</code>) and dropped a stuck metal3
+              finalizer instead.</li>
             <li><b>removing-agent</b> &mdash; the Agent deleted last: nothing can boot the host into
               discovery to re-register it any more.</li>
             <li><b>removing-pxe-boot</b> &mdash; every MAC the host is known by, cleared from its own
@@ -547,9 +553,8 @@
           <p class="note">remove-server-from-mce reads and releases <b>no lock</b> (since 2026-11-17): this
           run&rsquo;s own lock is this run&rsquo;s to release, in step 8.</p>
           <div class="calls">
-            <div class="call sm"><span class="verb">PATCH</span><span class="path">baremetalhosts/&lt;server&gt; <em>&middot; spec.online: false, then annotation detached</em></span></div>
             <div class="call sm"><span class="verb">DELETE</span><span class="path">nmstateconfigs/nmstate-config-&lt;server&gt;</span></div>
-            <div class="call sm"><span class="verb">DELETE</span><span class="path">baremetalhosts/&lt;server&gt;</span></div>
+            <div class="call sm"><span class="verb">DELETE</span><span class="path">baremetalhosts/&lt;server&gt; <em>&middot; then read every 15 s until metal3 lets it go</em></span></div>
             <div class="call sm"><span class="verb">DELETE</span><span class="path">secrets/&lt;bmc secret&gt; <em>&middot; only if it outlives the host</em></span></div>
             <div class="call sm"><span class="verb">DELETE</span><span class="path">agents/&lt;agent&gt;</span></div>
             <div class="call sm"><span class="verb">DELETE</span><span class="path">/pxe-map/&lt;mac&gt;?mce_cluster=&lt;mce&gt; <em>&middot; on the site&rsquo;s PXE VM</em></span></div>
@@ -901,7 +906,7 @@
           <tr><td class="k">draining-node</td><td class="muted">A Node no Machine stands behind: cordon + evictions, every 30 s</td><td class="muted">&le; 20 min</td></tr>
           <tr><td class="k">deleting-machine</td><td class="muted">Hosted nodes: the Machine delete, or a recorded no-op</td><td class="muted">instant</td></tr>
           <tr><td class="k">awaiting-machine-deletion</td><td class="muted">Hosted nodes: <code>sub_phase</code> <b>draining</b> (Agent still bound), <b>releasing</b> (the run makes the provider&rsquo;s writes) and <b>unbinding</b> (released, rebooting), polled every 30 s; stops if another AgentMachine takes the Agent</td><td class="muted"><b>&le; 20 min</b> draining, <b>&le; 1 h</b> unbinding</td></tr>
-          <tr><td class="k">verifying-agentmachine</td><td class="muted">No AgentMachine names the Agent, and no Machine is linked to it; a Machine-less one deleted, a stuck provider finalizer dropped. An inventory host: inspected again, fresh &mdash; anything linked stops the run</td><td class="muted">&le; 5 min</td></tr>
+          <tr><td class="k">verifying-agentmachine</td><td class="muted">No AgentMachine names the Agent, and no Machine is linked to it; a Machine-less one deleted, a stuck provider finalizer dropped only with no owner at all. An inventory host: inspected again, fresh &mdash; anything linked stops the run</td><td class="muted">&le; 5 min</td></tr>
           <tr><td class="k">verifying-node</td><td class="muted">No Node of the hosted cluster is the server; a stale (NotReady) one deleted</td><td class="muted">&le; 5 min</td></tr>
           <tr><td class="k">verifying-agent</td><td class="muted">Hosted nodes: the Agent is a clean free Agent &mdash; where a new run ends</td><td class="muted">&le; 5 min</td></tr>
           <tr><td class="k">holding-server</td><td class="muted">Recorded runs only: the lock extended to 24 h</td><td class="muted">instant</td></tr>
@@ -918,7 +923,7 @@
         <thead><tr><th>group / resource</th><th>verbs</th><th>why</th></tr></thead>
         <tbody>
           <tr><td class="k">cluster.x-k8s.io machines</td><td class="muted">get, list, delete, patch</td><td class="muted">the Machine behind a hosted node&rsquo;s Agent, found by any link; patch removes the provider&rsquo;s hook from one whose AgentMachine is gone</td></tr>
-          <tr><td class="k">capi-provider.agent-install.openshift.io agentmachines</td><td class="muted">get, list, delete, patch</td><td class="muted">found by <code>status.agentRef</code>, the only link once the provider starts unbinding; delete one with no Machine, patch to drop the provider&rsquo;s stuck finalizer</td></tr>
+          <tr><td class="k">capi-provider.agent-install.openshift.io agentmachines</td><td class="muted">get, list, delete, patch</td><td class="muted">found by <code>status.agentRef</code>, the only link once the provider starts unbinding; delete one with no Machine, patch to drop the provider&rsquo;s stuck finalizer from one with no owner at all</td></tr>
           <tr><td class="k">agent-install.openshift.io agents <em>(InfraEnv Role)</em></td><td class="muted">patch</td><td class="muted">the provider&rsquo;s unbind, for an Agent the provider can no longer release (and the <code>redbull.io/uninstalling</code> label of a run started before 2026-11-17)</td></tr>
           <tr><td class="k">hypershift.openshift.io hostedclusters</td><td class="muted">get, list</td><td class="muted">found by its control-plane namespace; its <code>status.kubeconfig</code></td></tr>
           <tr><td class="k">"" secrets</td><td class="muted">get</td><td class="muted">the HostedCluster&rsquo;s admin kubeconfig &mdash; <b>every Secret on the MCE, the widest grant in the chart</b></td></tr>

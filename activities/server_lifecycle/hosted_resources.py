@@ -23,7 +23,13 @@ documented as an API:
     provider's hook for ever. These are the leftovers a broken HyperShift
     deletion leaves, and why uninstall-server-from-hc does the provider's writes
     itself when the provider cannot (`agent_release_patch`, the hook, the
-    finalizer).
+    finalizer) — and ONLY then: the finalizer of an AgentMachine whose owner is
+    merely gone is the provider's to drop (2026-11-24).
+    RE-CHECK ON EVERY PROVIDER UPGRADE: removing PROVIDER_MACHINE_HOOK and
+    AGENT_MACHINE_FINALIZER is safe only while the provider's hook and
+    finalizer guard nothing but the Agent unbind, which `agent_release_patch`
+    reproduces. A provider that does more there (a Secret, a deregistration)
+    would have that work skipped silently.
   * It sets the AgentMachine's — and so the Machine's — `spec.providerID` to
     `agent://<agent name>`, and CAPI links a Machine to the Node whose
     `spec.providerID` matches. The Node's name is the Agent's hostname

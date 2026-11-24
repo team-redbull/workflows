@@ -35,6 +35,10 @@ their first shape can exist): `allocated-server-refused` once an allocated
 server's NICs and MACs were no longer judged by the run, and
 `allocated-no-agent` once such a server went into maintenance.
 
+Every golden before `rollback-waits-for-metal3` and `rollback-bmh-still-deleting`
+that rolls a host back does it through teardown_bmh_resources, which is what
+proves `add-server-rollback-keeps-finalizer` (2026-11-24) replays them unchanged.
+
 The workflow was install-server until 2026-11-01. Those goldens stay where they
 were recorded, in tests/histories/install_server/ (LEGACY_GOLDEN), as runs of
 type `InstallServerWorkflow`: replayed by the legacy subclass, they prove a run
@@ -61,6 +65,7 @@ from shared.consts import ADD_SERVER_TO_MCE_WORKFLOW_QUEUE
 from shared.exceptions import (
     AgentNeverAppearedError,
     BmhConflictError,
+    BmhDeletionTimeoutError,
     InfraEnvAgentLabelsError,
     ServerLooksInstalledError,
     ServerNotAvailableError,
@@ -243,6 +248,18 @@ SCENARIOS: dict[str, Callable[[], Scenario]] = {
     "infraenv-without-agent-labels": lambda: Scenario(
         mocks={"agent_labels": {"topology.kubernetes.io/zone": "az1"}},
         fails_with=InfraEnvAgentLabelsError.__name__,
+    ),
+    # Since 2026-11-24 (`add-server-rollback-keeps-finalizer`) a rollback deletes
+    # with no detach and waits for metal3 to let the host go (every golden above
+    # tears down through teardown_bmh_resources) ...
+    "rollback-waits-for-metal3": lambda: Scenario(
+        mocks={"agent_never_for": {SERVER_NAME}},
+        fails_with=AgentNeverAppearedError.__name__,
+    ),
+    # ... or fails at 15 min, metal3's finalizer left in place, nothing after it.
+    "rollback-bmh-still-deleting": lambda: Scenario(
+        mocks={"agent_never_for": {SERVER_NAME}, "bmh_stays_deleting": {SERVER_NAME}},
+        fails_with=BmhDeletionTimeoutError.__name__,
     ),
 }
 

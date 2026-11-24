@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>remove-server-from-mce — Redbull Workflows</title>
-<meta name="description" content="The remove-server-from-mce workflow: take one server out of an MCE's inventory — power it off, then delete its NMStateConfig, BareMetalHost and Agent and clear its MACs from its site's PXE VM. Never a server whose Agent is bound to a cluster.">
+<meta name="description" content="The remove-server-from-mce workflow: take one server out of an MCE's inventory — delete its NMStateConfig and BareMetalHost and wait for metal3 to power it off and let it go, then delete its Agent and clear its MACs from its site's PXE VM. Never a server whose Agent is bound to a cluster.">
 <link rel="icon" href="/assets/favicon.svg?v=__DOC_VERSION__" type="image/svg+xml">
 <link rel="stylesheet" href="/assets/site.css?v=__DOC_VERSION__">
 </head>
@@ -42,9 +42,10 @@
     <div class="eyebrow">Temporal workflow &middot; domain: server-lifecycle</div>
     <h1>remove-server-from-mce<span class="dim"> &mdash; what actually happens</span></h1>
     <p class="lede">
-      One request takes <b>one named server out of an MCE&rsquo;s inventory</b>. The run powers the host
-      off, then deletes its NMStateConfig, its BareMetalHost (with its BMC Secret) and its Agent, and clears
-      its MACs from its site&rsquo;s PXE VM. Afterwards the machine is no longer in that MCE&rsquo;s InfraEnv.
+      One request takes <b>one named server out of an MCE&rsquo;s inventory</b>. The run deletes its
+      NMStateConfig and its BareMetalHost and waits until metal3 has powered the host off and let the
+      BareMetalHost go (its BMC Secret with it), then deletes its Agent and clears its MACs from its
+      site&rsquo;s PXE VM. Afterwards the machine is no longer in that MCE&rsquo;s InfraEnv.
     </p>
     <p class="lede"><b>Only inventory.</b> If any Agent of the host is bound to a cluster
     (<code>spec.clusterDeploymentName</code> set), the run fails with <code>AgentBoundToClusterError</code>
@@ -133,22 +134,33 @@
         <div class="marker">3</div>
         <div class="card">
           <div class="card-title">
-            <h3>set_host_online &middot; get_baremetal_host</h3>
-            <span class="phase">phase <b>powering-off</b></span>
+            <h3>delete_host_resources</h3>
+            <span class="phase">phase <b>removing-host</b></span>
           </div>
-          <p>Only when a BareMetalHost was found. Sets <code>spec.online: false</code>, then reads the BMH every
-          <b>15 s</b> until metal3 reports <code>status.poweredOn: false</code> (or the BMH is gone), for up to
-          <b>10 minutes</b>. Right before it writes, the activity re-reads every Agent found in step 1 and
-          refuses with <code>AgentBoundToClusterError</code> if one has been bound since.</p>
+          <p>Only when a BMH or an NMStateConfig was found. Right before it deletes anything, the activity
+          re-reads every Agent found in step 1 and refuses with <code>AgentBoundToClusterError</code> if one has
+          been bound since. Then it deletes the NMStateConfig and the BareMetalHost &mdash; and does
+          <b>nothing else</b>: no power-off of its own, no <code>detached</code> annotation, no finalizer
+          touched.</p>
           <div class="calls">
-            <div class="call sm"><span class="verb">PATCH</span><span class="path">baremetalhosts/&lt;server&gt; <em>&middot; spec.online: false</em></span></div>
-            <div class="call sm"><span class="verb">GET</span><span class="path">baremetalhosts/&lt;server&gt; <em>&middot; status.poweredOn, every 15 s</em></span></div>
+            <div class="call sm"><span class="verb">DELETE</span><span class="path">nmstateconfigs/nmstate-config-&lt;server&gt;</span></div>
+            <div class="call sm"><span class="verb">DELETE</span><span class="path">baremetalhosts/&lt;server&gt;</span></div>
           </div>
-          <p class="note"><b>Why first.</b> The host is still running the discovery image. Its agent
-          re-registers with assisted-service when its Agent disappears &mdash; a fresh Agent would be back
-          within a minute. Powered off, nothing can bring it back. Not off within 10 minutes:
-          <code>HostPowerOffTimeoutError</code>. The BMH is left with <code>online: false</code> and
-          <b>nothing is deleted</b> &mdash; check its BMC, then re-run.</p>
+          <p class="note"><b>metal3 powers the host off.</b> On the delete, metal3 deprovisions the host
+          (<code>deprovisioning</code> &rarr; <code>powering off before delete</code> &rarr;
+          <code>deleting</code>): it powers it off through its BMC, deletes its ironic node, and only then
+          releases its <code>baremetalhost.metal3.io</code> finalizer. The host must be off before its Agent is
+          deleted &mdash; still running the discovery image, it would re-register a fresh Agent within a
+          minute &mdash; and a BMH really gone means it is.</p>
+          <p class="note"><b>The BMC Secret is kept for now</b>: metal3 needs it for that power-off. Its name is
+          read off the BMH before the delete, for step 4.</p>
+          <p class="note"><b>A run started before 2026-11-24</b> replays its own steps here instead:
+          <code>powering-off</code> (<code>spec.online: false</code>, then <code>status.poweredOn</code> every
+          15 s for up to 10 min, else <code>HostPowerOffTimeoutError</code> with nothing deleted) and
+          <code>removing-host</code> through add-server-to-mce&rsquo;s rollback teardown (detach, delete, the
+          finalizer dropped after 30 s). Both were retired: metal3 ignores <code>spec.online</code> while a deploy
+          is in flight, so a host stuck in <code>provisioning</code> never powered off; and the 30 s cut a
+          healthy deprovision off half-way, orphaning its ironic node.</p>
         </div>
       </div>
 
@@ -157,27 +169,22 @@
         <div class="marker">4</div>
         <div class="card">
           <div class="card-title">
-            <h3>teardown_bmh_resources</h3>
-            <span class="phase">phase <b>removing-host</b></span>
+            <h3>get_baremetal_host &middot; delete_bmc_secret</h3>
+            <span class="phase">phase <b>awaiting-bmh-deletion</b></span>
           </div>
-          <p>Only when a BMH or an NMStateConfig was found. The same teardown add-server-to-mce uses to roll a
-          candidate back, in this order:</p>
-          <ol>
-            <li>annotate the BareMetalHost <code>baremetalhost.metal3.io/detached</code>, so metal3 does not
-              try to deprovision it through the BMC (the host is already off, so there is nothing for a
-              deprovision to do);</li>
-            <li>delete the NMStateConfig;</li>
-            <li>delete the BareMetalHost and wait for it to go; if metal3&rsquo;s finalizer still holds it,
-              drop that finalizer;</li>
-            <li>delete the <b>BMC Secret</b> if it outlives the host (normally it goes with the BMH through its
-              ownerReference).</li>
-          </ol>
+          <p>Reads the BareMetalHost every <b>15 s</b> until metal3 has let it go, for up to
+          <b>15 minutes</b>. With a BMC that answers this takes 30&ndash;45 s. Then the BMC Secret is deleted
+          if it outlived the host (normally metal3 hands it to the garbage collector with the host).</p>
           <div class="calls">
-            <div class="call sm"><span class="verb">PATCH</span><span class="path">baremetalhosts/&lt;server&gt; <em>&middot; annotation detached</em></span></div>
-            <div class="call sm"><span class="verb">DELETE</span><span class="path">nmstateconfigs/nmstate-config-&lt;server&gt;</span></div>
-            <div class="call sm"><span class="verb">DELETE</span><span class="path">baremetalhosts/&lt;server&gt;</span></div>
+            <div class="call sm"><span class="verb">GET</span><span class="path">baremetalhosts/&lt;server&gt; <em>&middot; every 15 s, until absent</em></span></div>
             <div class="call sm"><span class="verb">DELETE</span><span class="path">secrets/&lt;bmc secret&gt; <em>&middot; only if it outlives the host</em></span></div>
           </div>
+          <p class="note"><b>Still there after 15 minutes:</b> <code>BmhDeletionTimeoutError</code>, naming
+          metal3&rsquo;s state and error. The NMStateConfig is deleted; the Agent and the PXE map are not
+          touched. The finalizer is <b>never dropped</b> (the operator, 2026-11-24): dropping it orphans the
+          ironic node, whose power sync then forces the machine to a stale power state every minute &mdash;
+          servers no one could power on (2026-11-23). Usually the BMC does not answer: fix it, metal3 finishes
+          on its own, and a re-run waits for the same delete.</p>
           <p class="note">What was actually deleted is reported in <code>resources_removed</code>, as
           <code>Kind/name</code>. A resource already gone is success.</p>
         </div>
@@ -251,8 +258,9 @@
           passes on the first or second look.</p>
           <p class="note">Anything still there after <b>5 minutes</b> fails the run with
           <code>ServerStillPresentError</code>, naming what is left. It is never reported as removed. The
-          usual cause is an <b>Agent that re-registered</b> because the host had no BMH to power it off
-          through; the message then says to power it off through its BMC and re-run.</p>
+          usual cause is an <b>Agent that re-registered</b> because the host is still on: it had no BMH to power
+          it off through, or metal3 let its BMH go without powering it off. The message then says to power it
+          off through its BMC and re-run.</p>
         </div>
       </div>
 
@@ -264,7 +272,8 @@
             <h3>Result</h3>
             <span class="phase">phase <b>completed</b></span>
           </div>
-          <p><code>found</code>, <code>powered_off</code> (false when there was no BMH to power off through),
+          <p><code>found</code>, <code>powered_off</code> (false since 2026-11-24: metal3&rsquo;s delete powers the
+          host off, not the run),
           <code>agents_removed</code>, <code>resources_removed</code>, <code>pxe_cleared</code>,
           <code>pxe_kept</code> and <code>pxe_failed</code> &mdash; <a href="#api">example below</a>.
           <code>lock_released</code> / <code>lock_detail</code> stay <code>false</code> / <code>null</code>:
@@ -286,7 +295,8 @@
       <div class="panel">
         <h3>Removed</h3>
         <ul>
-          <li>the BareMetalHost <code>&lt;server&gt;</code>, after it is powered off;</li>
+          <li>the BareMetalHost <code>&lt;server&gt;</code> &mdash; metal3 powers the host off and deletes its
+            ironic node before it lets it go;</li>
           <li>its BMC <b>Secret</b> &mdash; with the BMH, or explicitly if it outlives it;</li>
           <li>the NMStateConfig <code>nmstate-config-&lt;server&gt;</code>;</li>
           <li>every <b>unbound</b> Agent of the host;</li>
@@ -365,11 +375,11 @@
       <table>
         <thead><tr><th>error</th><th>when</th></tr></thead>
         <tbody>
-          <tr><td class="k">AgentBoundToClusterError</td><td class="muted">An Agent of the host is bound to a cluster &mdash; found at <code>inspecting</code>, or bound since and caught by the re-check right before the power-off. Nothing was changed. Remove the server from that cluster first (uninstall-server-from-hc does both).</td></tr>
-          <tr><td class="k">HostPowerOffTimeoutError</td><td class="muted">The BMH did not report <code>poweredOn: false</code> within 10 min. It is left with <code>online: false</code>; nothing was deleted. Usually an unreachable BMC: check it, then re-run.</td></tr>
+          <tr><td class="k">AgentBoundToClusterError</td><td class="muted">An Agent of the host is bound to a cluster &mdash; found at <code>inspecting</code>, or bound since and caught by the re-check right before the delete. Nothing was changed. Remove the server from that cluster first (uninstall-server-from-hc does both).</td></tr>
+          <tr><td class="k">HostPowerOffTimeoutError</td><td class="muted">Only a run started before 2026-11-24: the BMH did not report <code>poweredOn: false</code> within 10 min. It is left with <code>online: false</code>; nothing was deleted. A re-run deletes the BMH and waits for metal3 instead.</td></tr>
           <tr><td class="k">ServerScanAuthError</td><td class="muted">server-scan rejected the worker&rsquo;s token during the inspection, which reads server-scan&rsquo;s MACs.</td></tr>
           <tr><td class="k">InvalidServerNameError</td><td class="muted">The server name cannot be a Kubernetes resource name, even lowercased.</td></tr>
-          <tr><td class="k">BmhPrerequisiteMissingError</td><td class="muted">The MCE refused a read or the power-off with 403 (the worker&rsquo;s ServiceAccount lacks the verb) or a 404 meaning the resource type is not installed. Fix the worker&rsquo;s RBAC or the MCE, then re-run.</td></tr>
+          <tr><td class="k">BmhPrerequisiteMissingError</td><td class="muted">The MCE refused a read or the delete with 403 (the worker&rsquo;s ServiceAccount lacks the verb) or a 404 meaning the resource type is not installed. Fix the worker&rsquo;s RBAC or the MCE, then re-run.</td></tr>
         </tbody>
       </table>
     </div>
@@ -379,9 +389,10 @@
       <table>
         <thead><tr><th>error</th><th>when</th></tr></thead>
         <tbody>
-          <tr><td class="k">AgentBoundToClusterError</td><td class="muted">An Agent was bound between the power-off and its delete. The BMH and NMStateConfig are gone; the bound Agent is left alone.</td></tr>
+          <tr><td class="k">BmhDeletionTimeoutError</td><td class="muted">metal3 had not let the deleted BMH go 15 min on &mdash; the message names its state and error, usually a BMC it cannot reach. The NMStateConfig is gone; the BMH stays <b>deleting</b>, its finalizer left to metal3; the Agent and the PXE map are untouched. Fix the BMC: metal3 finishes on its own, then re-run.</td></tr>
+          <tr><td class="k">AgentBoundToClusterError</td><td class="muted">An Agent was bound between the BMH delete and its own delete. The BMH and NMStateConfig are gone; the bound Agent is left alone.</td></tr>
           <tr><td class="k">BmhPrerequisiteMissingError</td><td class="muted">A delete refused with 403 &mdash; typically the Agent delete, when the worker has no <code>delete</code> on agents. The BMH and NMStateConfig are already gone; grant the verb, then re-run.</td></tr>
-          <tr><td class="k">ServerStillPresentError</td><td class="muted">After the deletes, a BMH, NMStateConfig or Agent of the server was still there 5 min on; the message names it. An Agent that came back on a host with no BMH: power the host off through its BMC, then re-run.</td></tr>
+          <tr><td class="k">ServerStillPresentError</td><td class="muted">After the deletes, a BMH, NMStateConfig or Agent of the server was still there 5 min on; the message names it. An Agent that came back on a host still on (no BMH, or one metal3 let go without powering it off): power the host off through its BMC, then re-run.</td></tr>
         </tbody>
       </table>
     </div>
@@ -390,9 +401,9 @@
       <div class="panel">
         <h3>Out-waited, never failed</h3>
         <p>Every call to the MCE and to server-scan retries <b>without limit</b>, backing off to once a
-        minute: an MCE API server or server-scan that is down, or a BMH still deleting
-        (<code>BmhTeardownError</code>). The run sits RUNNING on that phase, with the failure visible on the
-        activity in the Temporal UI.</p>
+        minute: an MCE API server or server-scan that is down. The run sits RUNNING on that phase, with the
+        failure visible on the activity in the Temporal UI. (A BMH still deleting is a wait with a deadline,
+        15 min, not an outage; a run started before 2026-11-24 out-waits it as <code>BmhTeardownError</code>.)</p>
         <p class="note">No worker polling the MCE&rsquo;s queue shows the same way: the call times out after
         5 minutes waiting to be picked up and is tried again. The <code>progress</code> query names the queue
         it is waiting on (<code>activity_queue</code>).</p>
@@ -422,7 +433,8 @@
         <tbody>
           <tr><td class="k">a removal of that server is still running</td><td class="muted">refused with <b>409</b> &mdash; the id is one per server</td></tr>
           <tr><td class="k">the last run completed</td><td class="muted">finds nothing and completes with <code>found: false</code></td></tr>
-          <tr><td class="k">after <code>HostPowerOffTimeoutError</code></td><td class="muted">sets <code>online: false</code> again and waits again; once the BMC answers, removes the host</td></tr>
+          <tr><td class="k">after <code>BmhDeletionTimeoutError</code></td><td class="muted">finds the BMH still deleting, sends the delete again (it changes nothing) and waits another 15 min; once metal3 can reach the BMC it lets the host go and the run carries on</td></tr>
+          <tr><td class="k">after <code>HostPowerOffTimeoutError</code> (a run started before 2026-11-24)</td><td class="muted">deletes the BMH and waits for metal3, like any new run</td></tr>
           <tr><td class="k">after <code>ServerStillPresentError</code></td><td class="muted">removes what it finds now &mdash; power a re-registering host off through its BMC first, or the Agent comes back again</td></tr>
           <tr><td class="k">after <code>AgentBoundToClusterError</code></td><td class="muted">refused again while the Agent is bound</td></tr>
           <tr><td class="k">after a PXE cleanup failure</td><td class="muted">the host is gone from the MCE, so it is <code>found: false</code> and the PXE map is <b>not</b> retried &mdash; clear the entries on the PXE VM by hand if needed</td></tr>
@@ -490,7 +502,7 @@
 {
   "status":   "RUNNING",
   "progress": {
-    "phase":          "powering-off",
+    "phase":          "awaiting-bmh-deletion",
     "activity_queue": "server-lifecycle-activity-ocp4-mce-bat-yam-01"
   }
 }
@@ -502,7 +514,7 @@
     "server_name": "ocp-cisco-m6-bat-yam-64c-512gb-WZP12345",
     "namespace": "inventory", "mce_cluster": "ocp4-mce-bat-yam-01",
     "found": true,                                <span class="c">// false: nothing of it was on the MCE</span>
-    "powered_off": true,
+    "powered_off": false,                         <span class="c">// metal3's delete powered it off</span>
     "agents_removed": [ "…" ],
     "resources_removed": [ "NMStateConfig/nmstate-config-ocp-cisco-m6-bat-yam-64c-512gb-wzp12345",
                            "BareMetalHost/ocp-cisco-m6-bat-yam-64c-512gb-wzp12345" ],
@@ -547,8 +559,9 @@
         <tbody>
           <tr><td class="k">pending</td><td class="muted">Run accepted, nothing read yet</td><td class="muted">&mdash;</td></tr>
           <tr><td class="k">inspecting</td><td class="muted">BMH, NMStateConfig and Agents &mdash; reads only; a bound Agent stops the run here</td><td class="muted">seconds</td></tr>
-          <tr><td class="k">powering-off</td><td class="muted"><code>spec.online: false</code>, then <code>status.poweredOn</code> every 15 s &mdash; only with a BMH</td><td class="muted">&le; 10 min</td></tr>
-          <tr><td class="k">removing-host</td><td class="muted">Detach, NMStateConfig, BMH, BMC Secret &mdash; only with a BMH or NMStateConfig</td><td class="muted">minutes</td></tr>
+          <tr><td class="k">removing-host</td><td class="muted">The NMStateConfig and the BMH deleted, no finalizer touched &mdash; only with a BMH or NMStateConfig</td><td class="muted">seconds</td></tr>
+          <tr><td class="k">awaiting-bmh-deletion</td><td class="muted">The BMH every 15 s until metal3 lets it go (it powers the host off first), then the BMC Secret if it outlived it</td><td class="muted">&le; 15 min</td></tr>
+          <tr><td class="k">powering-off</td><td class="muted">Only on a run started before 2026-11-24: <code>spec.online: false</code>, then <code>status.poweredOn</code> every 15 s &mdash; only with a BMH</td><td class="muted">&le; 10 min</td></tr>
           <tr><td class="k">removing-agent</td><td class="muted">The Agents, each re-checked unbound &mdash; only with Agents</td><td class="muted">seconds</td></tr>
           <tr><td class="k">removing-pxe-boot</td><td class="muted">The host&rsquo;s MACs off its own site&rsquo;s PXE VM &mdash; only with known MACs; best effort</td><td class="muted">&le; 10 min per call</td></tr>
           <tr><td class="k">verifying</td><td class="muted">Re-inspect every 10 s until nothing is left</td><td class="muted">&le; 5 min</td></tr>
@@ -581,16 +594,21 @@
     </div>
 
     <h3 style="margin:28px 0 10px">Runs recorded before a change</h3>
-    <p class="note">Four changes are gated so runs already in flight replay unchanged:
+    <p class="note">Five changes are gated so runs already in flight replay unchanged:
     <code>remove-server-pxe-cleanup</code> (before it, no PXE cleanup),
     <code>remove-server-pxe-own-site</code> (before it, every PXE VM the worker knows was swept, and the first
     refusal failed the run), <code>remove-server-release-own-mce-lock</code> (from it, the run released
-    add-server-to-mce&rsquo;s lock for this MCE after <code>verifying</code>) and
-    <code>remove-server-no-lock-release</code> (from it, it no longer does).</p>
+    add-server-to-mce&rsquo;s lock for this MCE after <code>verifying</code>),
+    <code>remove-server-no-lock-release</code> (from it, it no longer does) and
+    <code>remove-server-delete-without-power-off</code> (before it, the run powered the host off itself and
+    removed the BMH through add-server-to-mce&rsquo;s rollback teardown, dropping metal3&rsquo;s finalizer
+    after 30 s).</p>
 
     <h3 style="margin:28px 0 10px">What it never does</h3>
     <ul>
-      <li>No removal of a bound Agent, and no power-off under a cluster &mdash; refused, nothing changed.</li>
+      <li>No removal of a bound Agent, and no delete under a cluster &mdash; refused, nothing changed.</li>
+      <li>No forced delete: metal3&rsquo;s <code>baremetalhost.metal3.io</code> finalizer is never dropped,
+        and no <code>detached</code> annotation is set.</li>
       <li>No hosted-cluster work &mdash; that is <a href="/server-lifecycle/uninstall-server-from-hc.html">uninstall-server-from-hc</a>&rsquo;s.</li>
       <li>No removal of the InfraEnv&rsquo;s shared boot entry, or of another MCE&rsquo;s PXE entry.</li>
       <li>No read or release of server-scan&rsquo;s install lock &mdash; it is its holder&rsquo;s.</li>

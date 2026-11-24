@@ -56,6 +56,8 @@ from activities.server_lifecycle.activities import (
     create_bmc_secret,
     create_nmstate_config,
     delete_agents,
+    delete_bmc_secret,
+    delete_host_resources,
     delete_hosted_node,
     drain_hosted_node,
     ensure_machine_deleting,
@@ -126,8 +128,11 @@ async def main() -> None:
             release_server,
             put_server_in_maintenance,
             teardown_bmh_resources,
-            # remove-server-from-mce
+            # remove-server-from-mce (set_host_online and teardown_bmh_resources:
+            # runs recorded before remove-server-delete-without-power-off)
             inspect_inventory_host,
+            delete_host_resources,
+            delete_bmc_secret,
             set_host_online,
             delete_agents,
             remove_host_pxe_entries,

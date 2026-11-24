@@ -34,11 +34,14 @@ from shared.models.server_lifecycle import (
     AgentReleaseRequest,
     AgentState,
     AllocateServerRequest,
+    BmcSecretRef,
     BmhRef,
     BmhResourceRequest,
     BmhState,
     BoundHostState,
     CreatedResource,
+    HostDeleteRequest,
+    HostDeletion,
     HostedNodeAction,
     HostedNodeDeletion,
     HostedNodeDrain,
@@ -278,6 +281,41 @@ async def delete_agents(request: AgentDeleteRequest) -> AgentDeletion:
     An Agent already gone is `absent` (success). A bound one raises
     AgentBoundToClusterError (non-retryable) and is left alone. Needs the
     `delete` verb on agents.agent-install.openshift.io in this worker's RBAC.
+    """
+    ...
+
+
+@activity.defn
+async def delete_host_resources(request: HostDeleteRequest) -> HostDeletion:
+    """remove-server-from-mce: delete the NMStateConfig and the BareMetalHost, and stop there.
+
+    First re-reads every Agent in `agents_must_be_unbound` and raises
+    AgentBoundToClusterError (non-retryable) if any is now bound, before
+    anything is deleted. Then deletes the NMStateConfig (no finalizer: it goes
+    at once) and the BareMetalHost — with NO `detached` annotation and NO
+    finalizer touched. metal3 deprovisions a deleted host, powering it off
+    through its BMC and deleting its ironic node, and only then releases
+    `baremetalhost.metal3.io`. Dropping that finalizer early orphans the ironic
+    node, whose power sync then forces the machine to a stale power state every
+    minute (2026-11-23). Does not wait: the workflow polls `get_baremetal_host`
+    on a durable timer until the host is gone.
+
+    Leaves the BMC Secret, which metal3 needs for that power-off, and returns
+    its name for `delete_bmc_secret` once the host is gone. Idempotent: a
+    resource already absent is success, and deleting a host that is already
+    being deleted changes nothing.
+    """
+    ...
+
+
+@activity.defn
+async def delete_bmc_secret(ref: BmcSecretRef) -> bool:
+    """Delete one BMC credentials Secret; False when it was already gone.
+
+    Called only once the BareMetalHost that used it is gone. Usually already
+    gone itself: metal3 hands it to the garbage collector with the host. It is
+    deleted explicitly when it outlives the host, so no BMC credential is left
+    behind.
     """
     ...
 
@@ -540,6 +578,12 @@ async def find_agent_for_host(ref: AgentRef) -> AgentState:
 @activity.defn
 async def teardown_bmh_resources(ref: BmhRef) -> TeardownResult:
     """Remove one candidate's resources so the machine returns to the inventory.
+
+    ONLY for runs recorded before `add-server-rollback-keeps-finalizer` /
+    `remove-server-delete-without-power-off` (2026-11-24). Every run since
+    deletes through `delete_host_resources` and waits for metal3 instead: step 4
+    below cut healthy deprovisions off at 30 s and orphaned their ironic nodes
+    (2026-11-23). Kept registered until no such run can replay.
 
     Called when a host never produced an Agent, to roll that candidate back
     before the next one is tried. Ordering is NOT arbitrary and was established
@@ -804,8 +848,10 @@ async def clean_up_agent_machines(request: AgentMachineCleanupRequest) -> AgentM
     `request.known`. One that a Machine still owns or names is never touched
     (`held_by_machine` — that is CAPI's deletion). Any other is deleted; one
     already deleting has the provider's own finalizer dropped when
-    `clear_finalizers` is set and the Agent is released — the provider removes
-    it only through a Machine, so without one it would hold for ever. Also
+    `clear_finalizers` is set, the Agent is released, and it has NO owner
+    Machine at all — the one case the provider keeps it for ever. One whose
+    owner Machine is merely gone is left to the provider, which drops it itself
+    (the operator, 2026-11-24); `remaining` says so. Also
     reports every Machine still linked to the Agent (`machines`). Needs list,
     delete and patch on agentmachines, list on machines.
     """

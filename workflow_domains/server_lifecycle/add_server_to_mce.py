@@ -189,10 +189,15 @@ server's own health is waived and recorded (`allowed_unhealthy` on the progress,
 the result and every create), a safety reason fails the run as before. The bond
 then accepts a member whose link is not UP — never one port alone.
 
-The teardown order is load-bearing and was established against a live cluster:
-metal3 must be told to detach the host BEFORE the delete, or its
-`baremetalhost.metal3.io` finalizer blocks forever trying to deprovision
-through the BMC that just failed to answer. See teardown_bmh_resources.
+A ROLLBACK NEVER FORCES metal3 (the operator, 2026-11-24, after 2026-11-23): the
+NMStateConfig and the BareMetalHost are deleted with no `detached` annotation
+and metal3's `baremetalhost.metal3.io` finalizer untouched, and the run waits —
+every 15 s, up to 15 min (bmh_deletion.py) — for metal3 to deprovision the host
+(power it off, delete its ironic node) and let it go. Dropping that finalizer
+after a fixed 30 s, as runs recorded before `add-server-rollback-keeps-finalizer`
+still do (teardown_bmh_resources), cut healthy deprovisions off half-way and
+orphaned their ironic nodes, whose power sync then forced the machines' power
+every minute. Still there at the deadline fails the run (_teardown).
 """
 
 from __future__ import annotations
@@ -235,6 +240,7 @@ with workflow.unsafe.imports_passed_through():
         BmcCredentialsMissingError,
         BmcEndpointMissingError,
         BmhConflictError,
+        BmhDeletionTimeoutError,
         AgentNeverAppearedError,
         BmhPrerequisiteMissingError,
         BmhRequestInvalidError,
@@ -266,6 +272,8 @@ with workflow.unsafe.imports_passed_through():
         create_baremetal_host,
         create_bmc_secret,
         create_nmstate_config,
+        delete_bmc_secret,
+        delete_host_resources,
         find_agent_for_host,
         get_baremetal_host,
         lookup_install_candidate,
@@ -289,11 +297,14 @@ with workflow.unsafe.imports_passed_through():
         AgentRef,
         AgentState,
         AllocateServerRequest,
+        BmcSecretRef,
         BmhRef,
         BmhResourceRequest,
         BmhState,
         BondMember,
         CreatedResource,
+        HostDeleteRequest,
+        HostDeletion,
         InfraEnvBootRequest,
         InfraEnvBootState,
         InfraEnvRef,
@@ -312,6 +323,11 @@ with workflow.unsafe.imports_passed_through():
         TeardownResult,
         WaivedHealthCheck,
         mac_is_valid,
+    )
+    from workflow_domains.server_lifecycle.bmh_deletion import (
+        BMH_DELETION_DEADLINE,
+        BMH_DELETION_POLL_INTERVAL,
+        describe_metal3,
     )
     from workflow_domains.server_lifecycle.bond_selection import (
         describe_candidate,
@@ -488,6 +504,13 @@ _CANCEL_RELEASES_AFTER_REMOVAL_PATCH = "add-server-cancel-releases-after-removal
 # for them, _evaluate_candidate), and a server with no Agent in the hour is put
 # in maintenance in server-scan before its lock goes back (_put_in_maintenance).
 _ALLOCATE_PATCH = "add-server-allocates-one-server"
+# Gates the rollback's delete (the operator, 2026-11-24, after 2026-11-23's
+# orphaned ironic nodes): the NMStateConfig and the BareMetalHost deleted with
+# no `detached` annotation and metal3's finalizer never touched, then the
+# BareMetalHost read every 15 s until metal3 lets it go (bmh_deletion.py). A
+# run recorded before it tears down through teardown_bmh_resources, which
+# detaches and drops the finalizer after 30 s.
+_ROLLBACK_KEEPS_FINALIZER_PATCH = "add-server-rollback-keeps-finalizer"
 # The allocation live-checks each candidate it locks, one at a time, against
 # its vendor manager — seconds as a rule, ~22 minutes at server-scan's worst
 # (five candidates, UCS Central's probe deadline each). Its HTTP client gives up
@@ -1149,7 +1172,10 @@ class AddServerToMceWorkflow:
                     # Not this machine's fault, so not a skip — but undo the
                     # candidate (NMStateConfig, MAC entries, lock) before failing.
                     self._phase = "rolling-back"
-                    await self._teardown(bmh_ref, activity_queue)
+                    await self._teardown(
+                        bmh_ref, activity_queue,
+                        why="the InfraEnv published no discovery image after its NMStateConfig",
+                    )
                     if self._pxe_cleanup:
                         self._phase = "unregistering-pxe-boot"
                         await self._unregister_pxe_boot(
@@ -1210,7 +1236,7 @@ class AddServerToMceWorkflow:
                 is None
             ):
                 self._phase = "rolling-back"
-                await self._teardown(bmh_ref, activity_queue)
+                await self._teardown(bmh_ref, activity_queue, why="its install lock lapsed")
                 continue
             agent, last_state = await self._await_agent(
                 bmh_ref, [member.mac for member in bond_members], activity_queue
@@ -1286,7 +1312,9 @@ class AddServerToMceWorkflow:
             # another — a BareMetalHost left pointing at it would make the same
             # server undrawable, and on another MCE, invisible.
             self._phase = "rolling-back"
-            teardown = await self._teardown(bmh_ref, activity_queue)
+            teardown = await self._teardown(
+                bmh_ref, activity_queue, why=f"no Agent within {_AGENT_DEADLINE}"
+            )
             workflow.logger.warning(
                 "Rolled back %s after no Agent in %s: removed %s",
                 candidate.name,
@@ -2216,24 +2244,74 @@ class AddServerToMceWorkflow:
                 return agent, await self._read_bmh(ref, task_queue)
             await workflow.sleep(_AGENT_POLL_INTERVAL)  # durable, replay-safe
 
-    async def _teardown(self, ref: BmhRef, task_queue: str) -> TeardownResult:
-        """Roll one candidate back so its machine returns to the inventory.
+    async def _teardown(self, ref: BmhRef, task_queue: str, why: str) -> TeardownResult:
+        """Roll one candidate back so its machine returns to the inventory; `why` it is rolled back.
 
-        Retried like any other activity, and that matters more here than
-        elsewhere: the usual reason teardown does not finish is metal3 holding
-        its finalizer while it tries to deprovision through the BMC that just
-        failed to answer, which is a state the activity is built to break out of
-        but should still be allowed to retry into.
+        Since `add-server-rollback-keeps-finalizer` (the operator, 2026-11-24):
+        the NMStateConfig and the BareMetalHost are deleted — no `detached`
+        annotation, metal3's finalizer never touched — and the BareMetalHost is
+        read every 15 s until metal3 has deprovisioned the host (powered it
+        off, deleted its ironic node) and let it go; then its BMC Secret, if it
+        outlived the host (metal3 needed it for the power-off). Still there at
+        the deadline fails the run with BmhDeletionTimeoutError and nothing
+        after it — no PXE unmap, no maintenance, no release: a BareMetalHost
+        still points at the machine, so its lock runs to its expiry.
+
+        A run recorded before tears down through teardown_bmh_resources, which
+        detaches, drops the finalizer after 30 s, and is retried until the host
+        is gone.
         """
-        return await workflow.execute_activity(
-            teardown_bmh_resources,
-            ref,
+        if not workflow.patched(_ROLLBACK_KEEPS_FINALIZER_PATCH):
+            return await workflow.execute_activity(
+                teardown_bmh_resources,
+                ref,
+                task_queue=task_queue,
+                start_to_close_timeout=_ACTIVITY_TIMEOUT,
+                schedule_to_start_timeout=_SCHEDULE_TO_START_TIMEOUT,
+                retry_policy=_RETRY_POLICY,
+                cancellation_type=_ON_CANCEL,
+            )
+
+        deletion: HostDeletion = await workflow.execute_activity(
+            delete_host_resources,
+            HostDeleteRequest(server_name=ref.server_name, namespace=ref.namespace),
             task_queue=task_queue,
             start_to_close_timeout=_ACTIVITY_TIMEOUT,
             schedule_to_start_timeout=_SCHEDULE_TO_START_TIMEOUT,
             retry_policy=_RETRY_POLICY,
             cancellation_type=_ON_CANCEL,
         )
+        started_at = workflow.now()
+        while True:
+            bmh = await self._read_bmh(ref, task_queue)
+            if not bmh.found:
+                break
+            if workflow.now() - started_at >= BMH_DELETION_DEADLINE:
+                raise ApplicationError(
+                    f"Rolling {ref.server_name} back ({why}): its BareMetalHost in {ref.namespace} "
+                    f"is still deleting {BMH_DELETION_DEADLINE} after the delete (metal3: "
+                    f"{describe_metal3(bmh)}). Its finalizer is left to metal3, which lets "
+                    "the host go only once it has powered it off and deleted its ironic "
+                    "node — usually it cannot reach the BMC. The NMStateConfig is deleted; "
+                    "nothing after the delete was done — no PXE unmap, no maintenance, no "
+                    "release — since a BareMetalHost still points at the machine, so its "
+                    "install lock runs to its expiry. Fix the BMC: metal3 finishes on its own",
+                    type=BmhDeletionTimeoutError.__name__,
+                )
+            await workflow.sleep(BMH_DELETION_POLL_INTERVAL)  # durable, replay-safe
+
+        removed = list(deletion.removed)
+        if deletion.bmc_secret and await workflow.execute_activity(
+            delete_bmc_secret,
+            BmcSecretRef(namespace=ref.namespace, name=deletion.bmc_secret),
+            task_queue=task_queue,
+            start_to_close_timeout=_ACTIVITY_TIMEOUT,
+            schedule_to_start_timeout=_SCHEDULE_TO_START_TIMEOUT,
+            retry_policy=_RETRY_POLICY,
+            cancellation_type=_ON_CANCEL,
+        ):
+            removed.append(f"Secret/{deletion.bmc_secret}")
+        return TeardownResult(removed=removed)
 
 
 @workflow.defn(name=_LEGACY_WORKFLOW_TYPE)

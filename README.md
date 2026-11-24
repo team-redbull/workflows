@@ -256,7 +256,7 @@ before the BareMetalHost or the NMStateConfig is written.
 | cancelled while server-scan is still allocating | ends CANCELED, never learning which server server-scan may still lock for it | that one expires (2 h) |
 | the allocation's answer is lost and it is retried | the retry is allocated *another* server — server-scan ties a lock to the request that took it | the first expires (2 h) |
 | crash/failure while creating resources | stops, resources **left** on the MCE | expires after 2 h; a re-run of the same named install extends it |
-| operator **cancels** before the Agent | **rolls back** (since 2026-11-09): after 2 min for calls in flight, **remove-server-from-mce** takes the server out of the MCE (power off, delete, PXE, verify) — or, nothing written, its PXE mapping is removed here; ends CANCELED, `progress.cancel_rollback` says what was done | released here, after the child (which releases no lock since 2026-11-17); kept to expire if its PXE cleanup failed |
+| operator **cancels** before the Agent | **rolls back** (since 2026-11-09): after 2 min for calls in flight, **remove-server-from-mce** takes the server out of the MCE (delete, wait for metal3 to power it off, Agent, PXE, verify) — or, nothing written, its PXE mapping is removed here; ends CANCELED, `progress.cancel_rollback` says what was done | released here, after the child (which releases no lock since 2026-11-17); kept to expire if its PXE cleanup failed |
 | operator cancels after the Agent | stops the wait for server-scan, ends CANCELED; the server **stays installed** | expires |
 | operator **terminates** | stops at once — no rollback, resources left (use Cancel to roll back) | expires |
 | no worker in that MCE | waits; `progress` names the queue | — |
@@ -361,9 +361,13 @@ maintenance, its health — fails saying which.
    instead. A run started before 2026-11-17 releases with no maintenance and
    tries its next candidate from step 3.
 
-   Teardown order is load-bearing — metal3 must be told to detach the host
-   *before* the delete, or its finalizer blocks forever trying to deprovision
-   through the BMC that just failed to answer.
+   The rollback never forces metal3 (since 2026-11-24): the NMStateConfig and
+   BareMetalHost are deleted with no detach and metal3's finalizer untouched,
+   and the run waits — every 15 s, up to 15 min — for metal3 to power the host
+   off and let the BareMetalHost go. Still there at 15 min, the run fails
+   `BmhDeletionTimeoutError` with nothing after it (no maintenance, no release:
+   the lock runs out). Dropping the finalizer, as runs started before still do,
+   orphaned ironic nodes that then forced the machines' power every minute.
 
    This replaced a 10-minute Ironic-registration deadline, which was the wrong
    signal both ways: it passed hosts whose bond or VLAN was wrong (they register

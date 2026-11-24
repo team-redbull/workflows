@@ -1820,8 +1820,10 @@ class UninstallServerFromHcWorkflow:
         """Until no AgentMachine names the Agent, re-derived fresh each pass (bounded 5 min).
 
         One left with no Machine is deleted; one stuck deleting on the
-        provider's finalizer — which it removes only through a Machine — has
-        that finalizer dropped after _FINALIZER_GRACE. A Machine still linked
+        provider's finalizer with NO owner Machine at all — which the provider
+        keeps for ever — has that finalizer dropped after _FINALIZER_GRACE (one
+        whose owner Machine is merely gone the provider drops itself, and the
+        limb leaves it to it). A Machine still linked
         to the Agent fails the run: the Machine's deletion is CAPI's, and one
         appearing now is a NodePool's replacement taking this host again.
         """

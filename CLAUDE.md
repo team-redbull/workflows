@@ -513,13 +513,30 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   `/servers/{id}`, never `/servers/available`), which is what finds an Agent
   whose BMH is already gone. Any of the three may be missing. It refuses with
   `AgentBoundToClusterError` — changing nothing — if any is bound
-  (`spec.clusterDeploymentName`). Order is load-bearing: POWER OFF first
-  (`spec.online: false`, bounded wait on `status.poweredOn`, else
-  `HostPowerOffTimeoutError` with nothing deleted), then the BMH + NMStateConfig
-  via the same `teardown_bmh_resources` as add-server-to-mce's rollback, and the
-  Agent LAST — a host still running discovery re-registers a deleted Agent
-  within a minute. The power-off and the Agent delete each re-check the binding
-  right before acting. It ENDS by re-inspecting until none of the three is left
+  (`spec.clusterDeploymentName`). Order is load-bearing: the NMStateConfig + BMH
+  deleted FIRST (`delete_host_resources`) — NO power-off of its own, NO
+  `detached` annotation, metal3's `baremetalhost.metal3.io` finalizer NEVER
+  touched — then the BMH read every 15 s until metal3 lets it go (15 min, else
+  `BmhDeletionTimeoutError`, the Agent untouched), its BMC Secret deleted only
+  then (metal3 needs it), and the Agent LAST — a host still running discovery
+  re-registers a deleted Agent within a minute, and metal3 deprovisions a deleted
+  host (powers it off, deletes its ironic node) before releasing its finalizer.
+  Decided with the operator 2026-11-24, after 2026-11-23: the old power-off
+  (`spec.online: false`, `HostPowerOffTimeoutError`) could never pass for a host
+  mid-deploy — metal3 ignores `spec.online` while `provisioning` — and the shared
+  `teardown_bmh_resources` dropped the finalizer after a fixed 30 s, mid-way
+  through a deprovision that takes 30-45 s with a BMC that answers, orphaning
+  ironic nodes whose power sync then forced twelve servers' power every minute.
+  Do not re-add the power-off, the detach or a finalizer drop here. Gated
+  `remove-server-delete-without-power-off`: a run recorded before still powers
+  off and tears down. add-server-to-mce's rollbacks (no Agent, a lapsed lock, an
+  unpublished IPMI boot entry) do the same since then — delete, wait 15 s /
+  15 min, Secret after, never the finalizer, `BmhDeletionTimeoutError` with
+  nothing after it (no PXE unmap, no maintenance, no release; the lock runs out)
+  — gated `add-server-rollback-keeps-finalizer`; the wait is ONE policy for both,
+  `workflow_domains/server_lifecycle/bmh_deletion.py`. `teardown_bmh_resources`
+  (detach, 30 s, finalizer dropped) is left only for runs recorded before.
+  The delete and the Agent delete each re-check the binding right before acting. It ENDS by re-inspecting until none of the three is left
   (bounded, 5 min): anything still there — typically an Agent re-registered by
   a host with no BMH to power it off through — fails with
   `ServerStillPresentError` naming it, never a success. After the Agent delete
@@ -734,8 +751,12 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   provider release state, `release_machine_hook` drops the provider's hook;
   `verifying-agentmachine` (`clean_up_agent_machines`, re-derived FRESH: any
   AgentMachine naming the Agent by agentRef or label, a Machine-less one deleted,
-  one stuck deleting has ONLY the provider's finalizer dropped after 1 min and
-  only once the Agent is released; any Machine still linked =
+  one stuck deleting has ONLY the provider's finalizer dropped after 1 min, only
+  once the Agent is released, and only with NO owner Machine at all — one whose
+  owner is merely gone the provider drops itself and is left to it (the
+  operator, 2026-11-24: a hold is removed only where no controller ever will;
+  RE-CHECK the hook and finalizer against cluster-api-provider-agent on every
+  provider upgrade, `hosted_resources.py`); any Machine still linked =
   `ServerStillPresentError`, a NodePool replacement taking it again);
   `verifying-node` deletes a Node still there once NotReady (the host is back in
   discovery) and fails on one still Ready. Writes go in `result.cleaned_up`, each

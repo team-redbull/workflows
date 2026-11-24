@@ -55,6 +55,7 @@ from shared.models.server_lifecycle import (
     AgentNameRef,
     AgentRelease,
     AgentReleaseRequest,
+    BmcSecretRef,
     BmhRef,
     BmhState,
     BoundHostState,
@@ -68,7 +69,8 @@ from shared.models.server_lifecycle import (
     HostedNodeRef,
     HostedNodes,
     HostedNodeState,
-    HostPowerRequest,
+    HostDeleteRequest,
+    HostDeletion,
     InventoryHostState,
     MachineDeletion,
     MachineHookRelease,
@@ -82,7 +84,6 @@ from shared.models.server_lifecycle import (
     ServerMembership,
     ServerMembershipRequest,
     ServerReservation,
-    TeardownResult,
     UninstallServerFromHcInput,
     UninstallServerFromHcRunArgs,
 )
@@ -237,7 +238,7 @@ def make_mocks(
             "lookup_server_membership", "inspect_bound_host", "reserve_server",
             "ensure_machine_deleting", "get_machine_state", "get_agent_binding",
             "get_agent_machine_state", "check_hosted_node", "get_baremetal_host",
-            "inspect_inventory_host", "set_host_online", "teardown_bmh_resources",
+            "inspect_inventory_host", "delete_host_resources", "delete_bmc_secret",
             "delete_agents", "remove_host_pxe_entries", "find_hosted_nodes",
             "drain_hosted_node", "delete_hosted_node", "release_agent",
             "release_machine_hook", "clean_up_agent_machines", "release_server",
@@ -392,8 +393,11 @@ def make_mocks(
 
     @activity.defn
     async def get_baremetal_host(ref: BmhRef) -> BmhState:
-        # Shared by verifying-agent and the child's power-off poll.
+        # Shared by verifying-agent and the child's wait for metal3 to let the
+        # BMH go — gone once the child deleted it.
         calls["get_baremetal_host"].append(ref)
+        if calls["delete_host_resources"]:
+            return BmhState(found=False)
         return BmhState(found=True, provisioning_state="externally provisioned",
                         operational_status="OK", powered_on=False)
 
@@ -406,16 +410,17 @@ def make_mocks(
         return inventory if first else InventoryHostState()
 
     @activity.defn
-    async def set_host_online(request: HostPowerRequest) -> bool:
-        calls["set_host_online"].append(request)
-        _mark("child-power-off")
-        return True
+    async def delete_host_resources(request: HostDeleteRequest) -> HostDeletion:
+        calls["delete_host_resources"].append(request)
+        _mark("child-delete-host")
+        return HostDeletion(removed=[f"BareMetalHost/{request.server_name.lower()}"],
+                            bmc_secret=f"cisco-ucs-{request.server_name.lower()}")
 
     @activity.defn
-    async def teardown_bmh_resources(ref: BmhRef) -> TeardownResult:
-        calls["teardown_bmh_resources"].append(ref)
-        _mark("child-teardown")
-        return TeardownResult(removed=[f"BareMetalHost/{ref.server_name.lower()}"])
+    async def delete_bmc_secret(ref: BmcSecretRef) -> bool:
+        calls["delete_bmc_secret"].append(ref)
+        _mark("child-secret")
+        return False
 
     @activity.defn
     async def delete_agents(request: AgentDeleteRequest) -> AgentDeletion:
@@ -440,7 +445,7 @@ def make_mocks(
             lookup_server_membership, inspect_bound_host, reserve_server,
             ensure_machine_deleting, get_machine_state, get_agent_binding,
             get_agent_machine_state, check_hosted_node, get_baremetal_host,
-            inspect_inventory_host, set_host_online, teardown_bmh_resources,
+            inspect_inventory_host, delete_host_resources, delete_bmc_secret,
             delete_agents, remove_host_pxe_entries, find_hosted_nodes,
             drain_hosted_node, delete_hosted_node, release_agent,
             release_machine_hook, clean_up_agent_machines, release_server,
@@ -530,7 +535,7 @@ def _recorded_before_the_free_agent_end(monkeypatch):
 
 # remove-server-from-mce's steps (it reads no lock since 2026-11-17), then the
 # parent's release of its own lock.
-CHILD = ["child-inspect", "child-power-off", "child-teardown", "child-delete-agents",
+CHILD = ["child-inspect", "child-delete-host", "child-secret", "child-delete-agents",
          "child-pxe", "child-verify", "release"]
 HOSTED_HALF = ["delete-machine", "await-machine", "verify-agentmachine", "verify-node"]
 
@@ -543,7 +548,7 @@ _NOT_THIS_WORKFLOWS = (
 # Everything a run writes or locks besides the hosted-cluster half: none of it is a new run's.
 _NEVER_TOUCHED = (
     "reserve_server", "release_server", "mark_agents_uninstalling", "inspect_inventory_host",
-    "set_host_online", "teardown_bmh_resources", "delete_agents", "remove_host_pxe_entries",
+    "delete_host_resources", "delete_bmc_secret", "delete_agents", "remove_host_pxe_entries",
 )
 
 
@@ -1255,7 +1260,10 @@ class TestAnInventoryHost:
             "checking-hosted-node", "hosted-cluster half",
         ]
         assert calls["ensure_machine_deleting"] == []
-        assert result.remove_server.found and result.remove_server.powered_off
+        # Removed by the child — its BMH deleted and waited on, metal3 powering
+        # the host off (since 2026-11-24 the child powers off nothing itself).
+        assert result.remove_server.found and not result.remove_server.powered_off
+        assert result.remove_server.resources_removed == [f"BareMetalHost/{SERVER.lower()}"]
 
     async def test_an_available_server_is_accepted(self):
         available = INSTALLED.model_copy(update={
@@ -1390,7 +1398,7 @@ class TestARunRecordedWithKeepInventory:
         assert calls["order"] == ["lookup", "inspect", "find-nodes", "reserve", *HOSTED_HALF, "hold"]
         assert result.kept_in_inventory and result.hosted and result.machine_deleted_by_run
         assert result.remove_server is None and result.remove_server_workflow_id is None
-        for untouched in ("inspect_inventory_host", "set_host_online", "teardown_bmh_resources",
+        for untouched in ("inspect_inventory_host", "delete_host_resources", "delete_bmc_secret",
                           "delete_agents", "remove_host_pxe_entries"):
             assert calls[untouched] == [], untouched
         assert result.reservation_expires_at == "2026-10-25T09:00:00Z"

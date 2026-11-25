@@ -392,7 +392,8 @@ class TestCreateVmClassification:
         assert raised <= permanent | self.RETRIED, sorted(raised - permanent - self.RETRIED)
         assert not self.RETRIED & permanent
         assert {"KvClusterAccessError", "KvClusterMismatchError", "VmIdentityConflictError", "VmNamespaceNotFoundError",
-                "VmRequestRejectedError", "VmDisappearedError", "VmMacExhaustedError", "VmLeaseExpiredError"} == permanent
+                "VmRequestRejectedError", "VmDisappearedError", "VmSerialExhaustedError", "VmLeaseExpiredError",
+                "VmMacNotAssignedError"} == permanent
         # Every one of them is really raised by the limb: an entry nothing raises reads as a protection.
         assert permanent <= raised, sorted(permanent - raised)
 

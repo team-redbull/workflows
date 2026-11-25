@@ -6,3 +6,9 @@ __pycache__/
 # Personal Claude Code settings only — .claude/settings.json, rules, skills and
 # hooks are shared with the team and committed.
 .claude/settings.local.json
+# Lab notes, manifests and day1 mocks: kept locally, not on the remote (2026-11-25).
+# Their findings are in CLAUDE.md and docs/design/; their histories are goldens in tests/histories/.
+docs/lab/
+# Agent worktrees, and a local draft of the rejected server-scan placement proposal.
+.claude/worktrees/
+/vm-placement.md

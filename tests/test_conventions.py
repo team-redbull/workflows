@@ -74,6 +74,51 @@ class ProbeWorkflow:
     assert {"WF001", "WF003", "WF004", "WF005", "WF007", "WF008", "WF009", "WF010"} <= rules
 
 
+def test_an_exit_path_of_a_workflow_never_awaits_in_a_finally_nor_trusts_in_workflow_alone(checker):
+    """WF017. A `finally` also runs when a run's coroutine is thrown away inside ANOTHER run's
+    task, and `workflow.in_workflow()` is true there: what the path sends is recorded in the
+    other run's history (create-vm, 2026-11-24)."""
+    head = "from temporalio import workflow\n\n\n@workflow.defn\nclass ProbeWorkflow:\n"
+    in_finally = head + (
+        "    @workflow.run\n"
+        "    async def run(self, args):\n"
+        "        try:\n"
+        "            await workflow.sleep(1)\n"
+        "        finally:\n"
+        "            await self._give_back()\n"
+    )
+    assert "WF017" in _rules(checker.run_source("workflow_domains/probe/probe.py", in_finally))
+    trusting = head + (
+        "    @workflow.run\n"
+        "    async def run(self, args):\n"
+        "        try:\n"
+        "            await workflow.sleep(1)\n"
+        "        except BaseException:\n"
+        "            if workflow.in_workflow() and workflow.cancellation_reason() is not None:\n"
+        "                await self._give_back()\n"
+        "            raise\n"
+    )
+    assert "WF017" in _rules(checker.run_source("workflow_domains/probe/probe.py", trusting))
+    by_its_own_run = head + (
+        "    def _own_task(self):\n"
+        "        return workflow.in_workflow() and workflow.info().run_id == self._run_id\n\n"
+        "    @workflow.run\n"
+        "    async def run(self, args):\n"
+        "        try:\n"
+        "            await workflow.sleep(1)\n"
+        "        except BaseException as err:\n"
+        "            if isinstance(err, Exception) or (self._own_task() and workflow.cancellation_reason() is not None):\n"
+        "                await self._give_back()\n"
+        "            raise\n"
+        "        finally:\n"
+        "            self._phase = \"done\"\n"
+    )
+    assert "WF017" not in _rules(checker.run_source("workflow_domains/probe/probe.py", by_its_own_run))
+    # …and the workflow the rule comes from keeps it.
+    source = (REPO_ROOT / "workflow_domains/vm_lifecycle/create_vm.py").read_text()
+    assert "WF017" not in _rules(checker.run_source("workflow_domains/vm_lifecycle/create_vm.py", source))
+
+
 def test_checker_accepts_the_canonical_workflow_shape(checker):
     source = (REPO_ROOT / "workflow_domains/segment_lifecycle/allocate_segment.py").read_text()
     violations = checker.run_source("workflow_domains/segment_lifecycle/allocate_segment.py", source)

@@ -6,7 +6,7 @@ the brain on the hub picks the target cluster purely by which queue it
 dispatches to — the per-MCE `server-lifecycle-worker` pattern. This worker
 talks to its OWN API server as its own ServiceAccount and reaches Temporal by
 dialling OUT (gRPC, TLS through the hub's Route): the KV cluster exposes
-nothing, and nothing on the hub holds a credential for it or its MAC prefix.
+nothing, and nothing on the hub holds a credential for it.
 
 Its own deployment because of where it runs and what it may do (CLAUDE.md §2):
 read nodes, pods, namespaces, VirtualMachineInstances and PersistentVolumeClaims,
@@ -63,9 +63,8 @@ async def main() -> None:
     )
     stop = install_shutdown_handler()
     logger.info(
-        "Activity worker polling queue=%s on %s (KV cluster %s, site %s, MAC prefix %s)",
+        "Activity worker polling queue=%s on %s (KV cluster %s, site %s)",
         _TASK_QUEUE, _settings.temporal_host, _activity_settings.kv_cluster, _activity_settings.site,
-        _activity_settings.vm_mac_prefix,
     )
     async with worker:
         await stop.wait()

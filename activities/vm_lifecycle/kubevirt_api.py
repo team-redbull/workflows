@@ -16,10 +16,9 @@ pod list is paged and each page reduced as it arrives.
 CLASSIFICATION — everything a retry cannot fix is named, the rest is transient:
   * KubeMacPool's "failed to allocate requested mac address" -> MacRefused, at
     ANY status and matched FIRST (it arrives as an admission denial that would
-    otherwise read as an invalid request): the caller draws another MAC. Only
-    a courtesy to a cluster that happens to run one: NOTHING HERE RELIES ON
-    KUBEMACPOOL (plain KubeVirt has none) — a MAC is kept unique by the
-    worker's own check against every VM of the cluster (vm_operations.create_vm).
+    otherwise read as an invalid request). The worker requests no MAC since
+    2026-11-25 — KubeMacPool assigns one — so this is KubeMacPool unable to
+    give a VM one, which the caller reports as VmMacNotAssignedError.
   * 409 AlreadyExists on a create -> NameTaken: the caller draws another MAC.
   * 404 -> None / False / NotFound: each caller knows what an absent object means.
   * 403 -> KvClusterAccessError (permanent): the chart's ClusterRole lacks a verb.

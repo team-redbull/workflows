@@ -803,7 +803,7 @@ against a Dell simulator built from them (`tests/dell_simulator.py`).
 ### `create-vm` — one VirtualMachine for a KubeVirt InfraEnv
 
 Under the platform naming convention an InfraEnv `<flavor>-kv<cpu>-<zone>`
-(`c200-kv32-az1`) holds VMs of `<cpu>` vCPUs and `<cpu> × 8` GiB on one of the
+(`c200-kv32-az1`) holds VMs of `<cpu>` vCPUs (an even number) and `<cpu> × 7.5` GiB on one of the
 zone's KV clusters (the hosted clusters whose nodes run the warm-pool VMs); a
 `<flavor>-mtl-<zone>` InfraEnv holds physical servers. A KubeVirt InfraEnv has
 nothing to install until a VM exists, and `create-vm` is that step. Full page:
@@ -836,12 +836,18 @@ API derives flavor, site, lifecycle, zone, cpu and memory once; the run carries 
    read.** No worker on a queue within 30 s is a `no-worker` row, never a failure.
    Nothing fits: `NoKvClusterFitsError` with the table summarised per reason.
 4. **creating-vm** — what the VM is (flavor, vCPUs, memory, site, zone, MCE, namespace,
-   the run's id, the lease's end) goes to the chosen cluster's worker, which draws the MAC
-   behind its cluster's prefix (`0e` + the cluster's VLAN ID + 3 random bytes), names the
-   VM `ocp-<flavor>-kv<cpu>-<site>-<MAC>`, builds the VirtualMachine and creates it
-   Halted, labelled `redfish-enabled: "true"`. A taken MAC or name is drawn again by the
-   worker (3 draws, then `VmMacExhaustedError`); nothing is created after the lease
-   (`VmLeaseExpiredError`). Out-waited on the chosen cluster, never moved.
+   the run's id, the create's deadline: 90 s, or the lease's end if sooner) goes to the
+   chosen cluster's worker, which draws an 8-character serial, names the VM
+   `ocp-<flavor>-kv<cpu>-<site>-<serial>` (the serial also its SMBIOS serial), builds the
+   VirtualMachine with NO MAC and creates it Halted, labelled `redfish-enabled: "true"`;
+   KubeMacPool assigns the MAC, read back for the BareMetalHost. A taken name is drawn again
+   by the worker (3 draws); nothing is created after the
+   deadline. **A cluster that fails the create is left, not the run** (`checking-kv-cluster`):
+   the run waits 45 s, asks the cluster for its VM by the run-id label (it keeps one it
+   finds — the create had landed), and otherwise moves on to the next cluster; a cluster
+   that cannot even be asked gets a `delete-stray-vm` child, which removes any VM of the run
+   there once the cluster answers. Only when every cluster fails or does not fit does the
+   run fail (`NoKvClusterFitsError`).
 5. **releasing-zone-lock** — as soon as the VM object exists, and on every other path.
    The next run's figures already count the VM, as a stopped VM: nothing is remembered
    between runs.
@@ -849,8 +855,8 @@ API derives flavor, site, lifecycle, zone, cpu and memory once; the run carries 
    bound and the VM admitted; bounded, 10 min; after the lock, in parallel with other runs.
 7. **removing-vm** — only when the run will not complete: that deadline
    (`VmRootDiskNotBoundError`), a wait that fails for good, or a cancel. The run deletes
-   ITS OWN VM, found by the run-id label it was created with. A re-run draws a new MAC,
-   so an orphan would only multiply.
+   ITS OWN VM, found by the run-id label it was created with. A re-run draws a new serial
+   and gets a new MAC, so an orphan would only multiply.
 
 The result carries the VM's name and MAC, the chosen cluster and the per-cluster table.
 Every run is a **slot** of its InfraEnv on its MCE (`create-vm-<mce>_<infraEnv>_<slot>`):
@@ -862,8 +868,9 @@ A `vm-lifecycle-worker` runs **inside each KV cluster** (chart
 `deploy/charts/vm-lifecycle-worker/`), polls `vm-lifecycle-activity-<its day1 file name>`,
 acts as its own ServiceAccount and dials out to the hub's Temporal: the KV cluster
 exposes nothing, the chart holds no Secret, and nothing on the hub holds a credential for
-it. A MAC is kept unique by the worker's own check against every VM of its cluster; it
-does not rely on KubeMacPool. A cluster in day1 without a running worker is skipped.
+it. A VM's MAC is assigned by KubeMacPool, unique on its cluster (the operator, 2026-11-25);
+the HyperConverged object will give each cluster its own range so that clusters do not
+overlap. A cluster in day1 without a running worker is skipped.
 This design replaced the hub limb and its two HTTP agents (`kv-capacity`, `kv-vm-api`)
 on 2026-11-20; `docs/design/kubevirt-vm-placement.md` and `kv-agents-api.md` are superseded.
 
@@ -1090,7 +1097,6 @@ would hide which segments actually got a workflow.
 | `SERVER_NAMER_API_TOKEN` | Secret | optional bearer token |
 | `SERVER_SCAN_URL`/`_API_TOKEN` | as above | the provisioning worker reads it too (a viewer token) |
 | `KV_CLUSTER` | `vm-lifecycle-config` (in each KV cluster) | the KV cluster this worker runs in: EXACTLY its day1 file name (`ocp4-<lifecycle>-kv-<site>-<zone>-<id>`), never abbreviated — it names the queue; the site and the zone are read from it |
-| `VM_MAC_PREFIX` | `vm-lifecycle-config` | the first three octets of every MAC this cluster's VMs get: `0e` + the cluster's VLAN ID; required, no default; the worker draws the last three |
 | `VM_STORAGE_CLASS_NAME` | `vm-lifecycle-config` | the root disk's storage class; must bind Immediately and allow RWX + Filesystem |
 | `VM_NETWORK_NAME` | `vm-lifecycle-config` | `<namespace>/<name>` of the NetworkAttachmentDefinition every VM boots on (default `openshift-cnv/vm-external-network`, the platform's vm.yaml); the network is always multus |
 | `VM_NODE_SELECTOR` | `vm-lifecycle-config` | JSON: the VM template's nodeSelector (`{}` for none) |

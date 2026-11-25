@@ -450,6 +450,39 @@ def check_workflow_side_module(path: Path, tree: ast.Module, report: _Report) ->
         elif _is_workflow_class(node):
             _check_workflow_class(path, node, imported, report)
 
+        elif isinstance(node, ast.Try):
+            # WF017 — a `finally` runs on EVERY way out, the two included on which no workflow
+            # API may be called: a worker dropping the run from its cache, and Python throwing
+            # the coroutine of a run a stopped worker left behind away — inside ANOTHER run's task.
+            for stmt in node.finalbody:
+                for inner in ast.walk(stmt):
+                    if isinstance(inner, ast.Await):
+                        report.error(
+                            path, inner.lineno, "WF017",
+                            "`await` in a `finally` of workflow-side code — it also runs when the run is "
+                            "dropped from a cache or its coroutine thrown away inside another run's task, "
+                            "and what it sends is then recorded in THAT run's history. Act in `except`, "
+                            "on an ordinary Exception or a cancel asked of this run (§5)",
+                        )
+                        break
+
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            # WF017 — `workflow.in_workflow()` says SOME workflow's task is on the thread, not this
+            # run's: an exit path guarded by it alone acts inside another run. The function that
+            # asks must also compare the run it is in with its own (`workflow.info().run_id`).
+            asks = [
+                inner for inner in ast.walk(node)
+                if isinstance(inner, ast.Call) and _dotted(inner.func) == "workflow.in_workflow"
+            ]
+            compares = any(isinstance(inner, ast.Attribute) and inner.attr == "run_id" for inner in ast.walk(node))
+            if asks and not compares:
+                report.error(
+                    path, asks[0].lineno, "WF017",
+                    "`workflow.in_workflow()` alone is no guard on an exit path — it is true inside "
+                    "ANOTHER run's task too. Compare `workflow.info().run_id` with this run's own in "
+                    "the same function (create_vm.py `_own_task`, §5)",
+                )
+
 
 def _check_activity_call(path: Path, node: ast.Call, name: str, imported: dict[str, str],
                          parents: dict[int, ast.AST], report: _Report) -> None:

@@ -65,16 +65,16 @@ def test_the_run_carries_what_the_edge_derived(client, fake):
     client.post(PATH, json=BODY)
     assert fake.args[0].input == CreateVmInput(
         mce_cluster="ocp4-prod-mce-bat-yam-a", infra_env="c200-kv8-az1", namespace="inventory",
-        flavor="c200", site="bat-yam", zone="az1", cpu=8, memory_gib=64, lifecycle="prod",
+        flavor="c200", site="bat-yam", zone="az1", cpu=8, memory_gib=60, lifecycle="prod",
     )
 
 
 @pytest.mark.parametrize(
     ("mce", "infra_env", "derived"),
     [
-        ("ocp4-prod-mce-five-a", "c200-kv32-az1", ("c200", "five", "prod", "az1", 32, 256)),
-        ("ocp4-prep-mce-five-c", "c200n-kv64-az12", ("c200n", "five", "prep", "az12", 64, 512)),
-        ("prod-mce-bat-yam-b", "x201-kv1-az2", ("x201", "bat-yam", "prod", "az2", 1, 8)),
+        ("ocp4-prod-mce-five-a", "c200-kv32-az1", ("c200", "five", "prod", "az1", 32, 240)),
+        ("ocp4-prep-mce-five-c", "c200n-kv64-az12", ("c200n", "five", "prep", "az12", 64, 480)),
+        ("prod-mce-bat-yam-b", "x201-kv2-az2", ("x201", "bat-yam", "prod", "az2", 2, 15)),
     ],
 )
 def test_the_two_names_say_everything_about_the_vm(client, fake, mce, infra_env, derived):
@@ -104,7 +104,9 @@ def test_the_mce_is_canonical(client, fake, typed):
         ({**BODY, "infra_env": "cisco-m6-bat-yam-64c-512gb"}, "convention"),  # and the one before that
         ({**BODY, "infra_env": "c200-kv8-bat-yam-a"}, "convention"),          # a zone is az<N>
         ({**BODY, "infra_env": "c200-kv0-az1"}, "convention"),
-        ({**BODY, "infra_env": "c200-kv512-az1"}, "1..256"),
+        ({**BODY, "infra_env": "c200-kv512-az1"}, "2..256"),
+        ({**BODY, "infra_env": "c200-kv1-az1"}, "2..256"),
+        ({**BODY, "infra_env": "c200-kv7-az1"}, "odd number"),               # 7.5 GiB per vCPU: 52.5 GiB is no VM size
         ({**BODY, "mce_cluster": "ocp4-mce-bat-yam-01"}, "ocp4-<lifecycle>-mce-<site>-<id>"),
         ({**BODY, "namespace": ""}, "namespace"),
         ({**BODY, "count": 0}, "count"),

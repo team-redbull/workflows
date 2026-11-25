@@ -308,6 +308,17 @@ def create_vm_slot_workflow_id(mce_cluster: str, infra_env: str, slot: int) -> s
     return f"create-vm-{mce_cluster}_{infra_env}_{slot}"
 
 
+def delete_stray_vm_workflow_id(kv_cluster: str, run_id: str) -> str:
+    """`delete-stray-vm-<kv cluster>-<create-vm run id>`: the cleanup of ONE run on ONE cluster.
+
+    Started by a create-vm run that moved on from a KV cluster which failed its
+    create and could not then say whether the VM had landed there. Keyed on the
+    RUN id, like the VM's own label (a slot's workflow id is reused by later
+    runs), and on the cluster: a run moves on from each cluster at most once.
+    """
+    return f"delete-stray-vm-{kv_cluster}-{run_id}"
+
+
 def kv_zone_lock_workflow_id(site: str, zone: str) -> str:
     """`kv-zone-lock-<site>-<zone>`: THE lock of one zone of one site.
 

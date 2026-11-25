@@ -1,4 +1,4 @@
-"""VmLifecycleActivitySettings — the vm-lifecycle worker inside ONE KV cluster: which cluster it is, its MAC prefix, and the values of the VirtualMachine it builds.
+"""VmLifecycleActivitySettings — the vm-lifecycle worker inside ONE KV cluster: which cluster it is, and the values of the VirtualMachine it builds.
 
 One settings module per worker (shared/settings/__init__.py says why): this file
 is loaded by the images that read it and by no other.
@@ -13,12 +13,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from shared.cluster_names import parse_kv_cluster
 
-_MAC_PREFIX = re.compile(r"^[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}$")
 _QUANTITY = re.compile(r"^[1-9][0-9]*(Mi|Gi|Ti)$")
 _LABEL = re.compile(r"^(?P<key>[A-Za-z0-9]([-A-Za-z0-9_./]*[A-Za-z0-9])?)=(?P<value>[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?)$")
-# The first octet every VM MAC of ours starts with: locally administered and
-# unicast, and deliberately not `02` (KubeMacPool's range) nor `0a` (OVN-Kubernetes').
-MAC_FIRST_OCTET = "0e"
 # `<namespace>/<name>` of a NetworkAttachmentDefinition: what Multus resolves and what
 # OVN-Kubernetes requires a NAD to name itself as.
 _NETWORK_NAME = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?/[a-z0-9]([-a-z0-9.]*[a-z0-9])?$")
@@ -45,13 +41,8 @@ class VmLifecycleActivitySettings(BaseSettings):
     # the zone are read from it, so there is no separate SITE or ZONE to keep in step.
     kv_cluster: str
 
-    # The first three octets of every MAC this cluster's VMs get: `0e` + the
-    # cluster's VLAN ID (12 bits over the next two octets), computed when the
-    # cluster is created from the Segments Manager's allocation. REQUIRED, no
-    # default: the Segments Manager never gives one VLAN to two clusters of a
-    # site, so two clusters that share a network never share a prefix — and a
-    # worker without its prefix must not start. The ONE place it is set.
-    vm_mac_prefix: str
+    # No MAC value (2026-11-25, the operator): KubeMacPool on the cluster assigns every
+    # VM's MAC. A chart rendered before still sets VM_MAC_PREFIX; `extra="ignore"` drops it.
 
     # --- the VirtualMachine this cluster's worker builds ----------------------
     # The root disk's storage class. It must bind IMMEDIATELY and allow a
@@ -77,19 +68,6 @@ class VmLifecycleActivitySettings(BaseSettings):
     def _kv_cluster(cls, value: str) -> str:
         parse_kv_cluster(value)  # ClusterNameError is a ValueError: the worker does not start
         return value
-
-    @field_validator("vm_mac_prefix")
-    @classmethod
-    def _mac_prefix(cls, value: str) -> str:
-        prefix = value.strip().lower()
-        if not _MAC_PREFIX.fullmatch(prefix):
-            raise ValueError(f"vm_mac_prefix must be three hex octets `xx:xx:xx` (got {value!r})")
-        if not prefix.startswith(f"{MAC_FIRST_OCTET}:"):
-            raise ValueError(
-                f"vm_mac_prefix {prefix!r} must start with `{MAC_FIRST_OCTET}`: locally administered, unicast, "
-                "and neither KubeMacPool's `02` nor OVN-Kubernetes' `0a`; the other two octets are the cluster's VLAN ID"
-            )
-        return prefix
 
     @field_validator("vm_storage_class_name")
     @classmethod

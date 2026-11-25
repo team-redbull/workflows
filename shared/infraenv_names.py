@@ -12,8 +12,9 @@ in it are, how big, and in which zone:
   * `<flavor>-mtl-<zone>`       — bare metal: add-server-to-mce draws
     physical servers for it;
   * `<flavor>-kv<cpu>-<zone>`   — KubeVirt: its hosts are VirtualMachines
-    of `<cpu>` vCPUs and `<cpu> × MEMORY_GIB_PER_CPU` GiB, created by create-vm
-    on one of the zone's KV clusters.
+    of `<cpu>` vCPUs and `<cpu> × 7.5` GiB (`vm_memory_gib`), created by
+    create-vm on one of the zone's KV clusters. `<cpu>` is EVEN, so the memory
+    is a whole number of GiB.
 
 The SITE is not in the name: an InfraEnv belongs to one MCE, and so to that
 MCE's site (`shared/cluster_names.site_of_mce_cluster`).
@@ -40,13 +41,26 @@ import re
 from dataclasses import dataclass
 from enum import Enum
 
-# The ONE place the convention's memory ratio lives: a KubeVirt InfraEnv of
-# `<cpu>` vCPUs holds VMs of `<cpu> × 8` GiB. The name carries the vCPUs only.
-MEMORY_GIB_PER_CPU = 8
-# vCPUs an InfraEnv name may ask for. The upper bound keeps a typo from
-# sizing a VM no node could hold.
-MIN_CPU = 1
+# The ONE place the memory ratio lives: a KubeVirt InfraEnv of `<cpu>` vCPUs
+# holds VMs of `<cpu> × 7.5` GiB. The name carries the vCPUs only, and the
+# naming convention defines no memory: the ratio is this repo's. A FRACTION, so
+# the arithmetic stays in integers (`cpu × 15 // 2`).
+#
+# 7.5 and not 8 (the operator, 2026-11-24; docs/design/create-vm-placement.md
+# §6.1.1): every KV node has 8 GiB of RAM per core, and a node gives VMs less
+# than its RAM (the kernel's own share, the kubelet reserve, the node's pods,
+# each VM's overhead), so at 8 the last VM a node's CPUs allowed never fitted
+# on memory. Computed for the node types in use (128 and 192 CPUs); ANOTHER
+# node type needs that section's table recomputed before it joins — some sizes
+# stay one VM short at 7.5 (tests/test_vm_lifecycle_placement.py lists them).
+MEMORY_GIB_PER_CPU = (15, 2)
+# vCPUs an InfraEnv name may ask for: EVEN (7.5 GiB each is then a whole number
+# of GiB). The upper bound keeps a typo from sizing a VM no node could hold.
+MIN_CPU = 2
 MAX_CPU = 256
+# A VM's NAME carries any size from one vCPU up: names of VMs that already
+# exist are read, and the convention's `kv<cpu>` states no parity.
+_MIN_NAMED_CPU = 1
 
 _SITE = r"[a-z0-9]+(?:-[a-z0-9]+)*"
 _INFRAENV = re.compile(r"^(?P<flavor>[a-z][0-9a-z]*)-(?P<size>mtl|kv[1-9][0-9]*)-(?P<zone>az[1-9][0-9]*)$")
@@ -56,7 +70,11 @@ _SITE_TOKEN = re.compile(rf"^{_SITE}$")
 # (`<name>-root`) and its launcher pod's prefix all need one.
 _DNS_1123 = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
 _DNS_1123_MAX = 63
-_MAC = re.compile(r"^[0-9a-f]{2}(?::[0-9a-f]{2}){5}$")
+# A VM's serial: what tells two VMs of one flavor, size and site apart in their name, and
+# their SMBIOS serial number too (a bare-metal node's name carries its serial the same way).
+VM_SERIAL_LENGTH = 8
+VM_SERIAL_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789"
+_VM_SERIAL = re.compile(rf"^[a-z0-9]{{{VM_SERIAL_LENGTH}}}$")
 VM_NAME_PREFIX = "ocp-"
 BARE_METAL_SIZE = "mtl"
 KUBEVIRT_SIZE_PREFIX = "kv"
@@ -88,7 +106,7 @@ class ParsedInfraEnv:
 
 
 def parse_infraenv(name: str) -> ParsedInfraEnv:
-    """`c200n-kv32-az2` -> flavor c200n, 32 vCPUs / 256 GiB, zone az2."""
+    """`c200n-kv32-az2` -> flavor c200n, 32 vCPUs / 240 GiB, zone az2."""
     match = _INFRAENV.fullmatch(name)
     if match is None:
         raise InfraEnvNameError(
@@ -100,11 +118,23 @@ def parse_infraenv(name: str) -> ParsedInfraEnv:
         return ParsedInfraEnv(name=name, kind=InfraEnvKind.METAL, flavor=flavor, zone=zone, cpu=None, memory_gib=None)
     cpu = int(size.removeprefix(KUBEVIRT_SIZE_PREFIX))
     if not MIN_CPU <= cpu <= MAX_CPU:
-        raise InfraEnvNameError(f"InfraEnv {name!r} asks for {cpu} vCPUs; the convention allows {MIN_CPU}..{MAX_CPU}")
+        raise InfraEnvNameError(f"InfraEnv {name!r} asks for {cpu} vCPUs; a KubeVirt InfraEnv has {MIN_CPU}..{MAX_CPU}")
+    if cpu % MEMORY_GIB_PER_CPU[1]:
+        raise InfraEnvNameError(
+            f"InfraEnv {name!r} asks for {cpu} vCPUs, an odd number: a VM's memory is 7.5 GiB per vCPU, which "
+            f"would not be a whole number of GiB. Use an even size (`kv{cpu + 1}`)"
+        )
     return ParsedInfraEnv(
-        name=name, kind=InfraEnvKind.KUBEVIRT, flavor=flavor, zone=zone,
-        cpu=cpu, memory_gib=cpu * MEMORY_GIB_PER_CPU,
+        name=name, kind=InfraEnvKind.KUBEVIRT, flavor=flavor, zone=zone, cpu=cpu, memory_gib=vm_memory_gib(cpu),
     )
+
+
+def vm_memory_gib(cpu: int) -> int:
+    """The guest memory of a `cpu`-vCPU VM, in GiB: `cpu × 7.5`, for an even `cpu` (8 -> 60, 32 -> 240)."""
+    numerator, denominator = MEMORY_GIB_PER_CPU
+    if cpu % denominator:
+        raise InfraEnvNameError(f"{cpu} vCPUs × 7.5 GiB is not a whole number of GiB: the vCPU count must be even")
+    return cpu * numerator // denominator
 
 
 def is_kubevirt(name: str) -> bool:
@@ -117,23 +147,25 @@ def vm_size(cpu: int) -> str:
     return f"{KUBEVIRT_SIZE_PREFIX}{cpu}"
 
 
-def vm_name(flavor: str, cpu: int, site: str, mac: str) -> str:
-    """`ocp-<flavor>-kv<cpu>-<site>-<MAC, 12 lowercase hex>`: the VM, and the server name server-scan lists.
+def vm_name(flavor: str, cpu: int, site: str, serial: str) -> str:
+    """`ocp-<flavor>-kv<cpu>-<site>-<serial, 8 lowercase letters and digits>`: the VM, and the
+    server name server-scan lists.
 
-    Built by the worker inside the KV cluster from the MAC it drew, so name
-    and MAC agree by construction. Checked as a DNS-1123 label short enough
-    for the root DataVolume's `<name>-root` too.
+    The serial is drawn by the worker inside the KV cluster and is also the VM's SMBIOS serial
+    (the operator, 2026-11-25: KubeMacPool picks the MAC, so the name no longer carries it).
+    Checked as a DNS-1123 label short enough for the root DataVolume's `<name>-root` too.
     """
-    mac = mac.lower()
-    if not _MAC.fullmatch(mac):
-        raise InfraEnvNameError(f"MAC {mac!r} is not six lowercase hex octets joined by colons")
+    if not _VM_SERIAL.fullmatch(serial):
+        raise InfraEnvNameError(
+            f"serial {serial!r} is not {VM_SERIAL_LENGTH} lowercase letters and digits"
+        )
     if not _FLAVOR.fullmatch(flavor):
         raise InfraEnvNameError(f"flavor {flavor!r} is not a letter followed by letters and digits")
     if not _SITE_TOKEN.fullmatch(site):
         raise InfraEnvNameError(f"site {site!r} must be lowercase letters, digits and single dashes")
-    if not MIN_CPU <= cpu <= MAX_CPU:
-        raise InfraEnvNameError(f"a VM of {cpu} vCPUs is outside the convention's {MIN_CPU}..{MAX_CPU}")
-    name = f"{VM_NAME_PREFIX}{flavor}-{vm_size(cpu)}-{site}-{mac.replace(':', '')}"
+    if not _MIN_NAMED_CPU <= cpu <= MAX_CPU:
+        raise InfraEnvNameError(f"a VM of {cpu} vCPUs is outside the convention's {_MIN_NAMED_CPU}..{MAX_CPU}")
+    name = f"{VM_NAME_PREFIX}{flavor}-{vm_size(cpu)}-{site}-{serial}"
     if len(name) + len(ROOT_DISK_SUFFIX) > _DNS_1123_MAX or not _DNS_1123.fullmatch(name):
         raise InfraEnvNameError(
             f"VM name {name!r} is not a DNS-1123 label of at most {_DNS_1123_MAX - len(ROOT_DISK_SUFFIX)} "

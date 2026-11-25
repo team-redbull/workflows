@@ -9,7 +9,18 @@ import pathlib
 import pytest
 
 from shared.models.vm_lifecycle import KvClusterFigures, KvClusterRow, KvNodeHeadroom
-from shared.vm_requests import GIB, pod_cpu_millicores, pod_memory_bytes, request_cores
+from shared.infraenv_names import vm_memory_gib
+from shared.vm_requests import (
+    GIB,
+    MIB,
+    gib_free,
+    gib_needed,
+    launcher_overhead_bytes,
+    pod_cpu_millicores,
+    pod_memory_bytes,
+    pod_memory_bytes_of_guest,
+    request_cores,
+)
 from workflow_domains.vm_lifecycle import placement
 from workflow_domains.vm_lifecycle.placement import SKIP_REASONS, judge, skip_reason, summarise_skips
 
@@ -36,18 +47,57 @@ def figures(
     )
 
 
-KV32 = (pod_cpu_millicores(32), pod_memory_bytes(256))   # 30 cores, 257 GiB
-KV8 = (pod_cpu_millicores(8), pod_memory_bytes(64))      # 7 cores, 65 GiB
+KV32 = (pod_cpu_millicores(32), pod_memory_bytes(32, 240))   # 30 cores, 240 GiB + 1,036 MiB
+KV8 = (pod_cpu_millicores(8), pod_memory_bytes(8, 60))       # 7 cores, 60 GiB + 484 MiB
+KV32_MEMORY = KV32[1]
+
+
+def exact(nodes: list[tuple[int, int]], **changes: int) -> KvClusterFigures:
+    """Figures from node headroom pairs in MILLICORES and BYTES, for a boundary at the byte."""
+    headroom = [KvNodeHeadroom(name=f"n{i}", cpu_millicores=c, memory_bytes=m) for i, (c, m) in enumerate(nodes)]
+    return KvClusterFigures(
+        kv_cluster="ocp4-prod-kv-five-az1-a", readable=True, nodes=len(nodes), usable_nodes=len(nodes),
+        allocatable_cpu_millicores=sum(c for c, _ in nodes), allocatable_memory_bytes=sum(m for _, m in nodes),
+        node_headroom=headroom,
+    ).model_copy(update=changes)
 
 
 class TestTheVmInRequestTerms:
     @pytest.mark.parametrize(
-        ("cpu", "memory_gib", "cores", "request_gib"),
-        [(8, 64, 7, 65), (16, 128, 15, 129), (32, 256, 30, 257), (64, 512, 60, 513)],
+        ("cpu", "memory_gib", "cores", "overhead_mib"),
+        [(8, 60, 7, 484), (16, 120, 15, 668), (32, 240, 30, 1036), (64, 480, 60, 1772)],
     )
-    def test_the_designs_table(self, cpu, memory_gib, cores, request_gib):
+    def test_the_designs_table(self, cpu, memory_gib, cores, overhead_mib):
+        assert vm_memory_gib(cpu) == memory_gib
         assert pod_cpu_millicores(cpu) == cores * 1000
-        assert pod_memory_bytes(memory_gib) == request_gib * GIB
+        assert pod_memory_bytes(cpu, memory_gib) == memory_gib * GIB + overhead_mib * MIB
+
+    @pytest.mark.parametrize(
+        ("cpu", "guest_gib", "measured_overhead_mib"),
+        [(8, 62, 481), (16, 124, 669), (32, 248, 1045), (64, 496, 1797)],
+    )
+    def test_the_overhead_is_never_under_what_a_launcher_pod_requested_and_at_most_10_mib_over(
+        self, cpu, guest_gib, measured_overhead_mib
+    ):
+        """The four pods measured on cluster-qcl8n (2026-11-22, VMs of 7.75 GiB per vCPU built by
+        vm_spec.py): what each launcher pod requested over its guest. Under it, placement would
+        approve a VM whose pod has no node; far over it, room is wasted."""
+        formula_mib = launcher_overhead_bytes(cpu, guest_gib * GIB) // MIB
+        assert measured_overhead_mib <= formula_mib <= measured_overhead_mib + 10
+
+    def test_the_flat_gib_it_replaced_was_too_little_from_32_vcpus_up(self):
+        assert launcher_overhead_bytes(16, 120 * GIB) < GIB < launcher_overhead_bytes(32, 240 * GIB)
+
+    def test_a_vm_read_from_a_cluster_is_sized_by_the_same_rule(self):
+        assert pod_memory_bytes_of_guest(32, 240 * GIB) == pod_memory_bytes(32, 240)
+        # A guest that is not a whole number of GiB (someone else's VM): the page tables' share is floored.
+        assert pod_memory_bytes_of_guest(2, 1000) == 1000 + 300 * MIB + 16 * MIB + 1
+
+    def test_a_need_never_reads_smaller_than_the_room_it_was_refused(self):
+        assert (gib_needed(KV32_MEMORY), gib_free(KV32_MEMORY - 1)) == ("241.02 GiB", "241.01 GiB")
+        assert (gib_needed(240 * GIB), gib_free(240 * GIB)) == ("240.00 GiB", "240.00 GiB")
+        assert (gib_needed(240 * GIB + 1), gib_free(240 * GIB - 1)) == ("240.01 GiB", "239.99 GiB")
+        assert gib_free(-10 * GIB - GIB // 2) == "-10.50 GiB"
 
     @pytest.mark.parametrize(("cpu", "cores"), [(1, 1), (2, 1), (3, 2), (4, 3), (15, 14), (16, 15), (17, 15), (256, 240)])
     def test_the_cpu_request_is_fifteen_sixteenths_rounded_down_and_never_zero(self, cpu, cores):
@@ -88,27 +138,42 @@ class TestOneNodeMustHoldIt:
         answer = figures([(64, 100), (10, 600)])
         assert skip_reason(answer, *KV32, 0) == "fit-node"
         detail = judge(answer, *KV32, 0).detail
-        assert "30000 m" in detail and "257 GiB" in detail
+        assert "30000 m" in detail and "241.02 GiB together" in detail
+        assert "n0, has 64000 m / 100.00 GiB free" in detail
 
     def test_one_node_with_both_is_enough(self):
-        assert skip_reason(figures([(64, 100), (10, 600), (30, 257)]), *KV32, 0) is None
+        assert skip_reason(figures([(64, 100), (10, 600), (30, 242)]), *KV32, 0) is None
 
-    def test_an_exact_fit_fits(self):
-        assert skip_reason(figures([(30, 257)]), *KV32, 0) is None
-        assert skip_reason(figures([(30, 256)]), *KV32, 0) == "fit-node"
+    def test_an_exact_fit_fits_and_one_byte_or_one_millicore_less_does_not(self):
+        assert skip_reason(exact([(30_000, KV32_MEMORY)]), *KV32, 0) is None
+        assert skip_reason(exact([(30_000, KV32_MEMORY - 1)]), *KV32, 0) == "fit-node"
+        assert skip_reason(exact([(29_999, KV32_MEMORY)]), *KV32, 0) == "fit-node"
+        # A whole GiB over the guest is no longer the VM's size: 241 GiB is 20 MiB short of it.
+        assert skip_reason(figures([(30, 241)]), *KV32, 0) == "fit-node"
 
-    def test_memory_runs_out_before_cpu_on_an_eight_gib_per_core_node(self):
-        # The design's example: a 64-core / 512 GiB node holds one 32-vCPU VM on memory, two on CPU.
-        one_running = figures([(64 - 30, 512 - 257)], pods=(30, 257))
-        assert skip_reason(one_running, *KV32, 0) == "fit-node"
-        assert "GiB free" in judge(one_running, *KV32, 0).detail
+    def test_two_vms_fill_the_cpus_of_an_eight_gib_per_core_node_at_seven_and_a_half_per_vcpu(self):
+        """Why the ratio is 7.5 (design §6.1.1): a 64-core / 512 GiB node holds two 32-vCPU VMs
+        on CPU, and now on memory too. At 8 GiB per vCPU the second never fitted on memory."""
+        one_running = exact([(64_000 - 30_000, 512 * GIB - KV32_MEMORY)])
+        assert skip_reason(one_running, *KV32, 0) is None
+        at_eight = pod_memory_bytes(32, 256)
+        assert skip_reason(exact([(64_000 - 30_000, 512 * GIB - at_eight)]), 30_000, at_eight, 0) == "fit-node"
+        # A third has no CPU left on the node: 4 cores free.
+        two_running = exact([(4_000, 512 * GIB - 2 * KV32_MEMORY)])
+        assert skip_reason(two_running, *KV32, 0) == "fit-node"
+
+    def test_memory_runs_out_first_on_a_node_with_less_memory_per_core(self):
+        # 64 cores / 384 GiB (6 per core): one VM running, CPU for a second, memory for none.
+        one_running = exact([(34_000, 384 * GIB - KV32_MEMORY)])
+        verdict = judge(one_running, *KV32, 0)
+        assert verdict.reason == "fit-node" and "142.98 GiB free" in verdict.detail
 
     def test_an_overcommitted_node_has_negative_room_and_is_no_room(self):
         assert skip_reason(figures([(-5, -10)], allocatable=(100, 1000)), *KV8, 0) == "fit-node"
 
     def test_stopped_vms_are_on_no_node_so_the_node_check_does_not_see_them(self):
         # The design's known limit (§11.6): the node check passes, only the buffer counts them.
-        assert skip_reason(figures([(64, 600)], stopped=(1, 30, 257)), *KV32, 0) is None
+        assert skip_reason(figures([(64, 600)], stopped=(1, 30, 242)), *KV32, 0) is None
 
 
 class TestTheBuffer:
@@ -123,17 +188,52 @@ class TestTheBuffer:
 
     def test_stopped_vms_count_toward_the_buffer(self):
         # Two VMs created a moment ago, not started: 60 cores taken, the third would be 90 > 85.
-        answer = figures([(100, 10_000)], stopped=(2, 60, 514))
+        answer = figures([(100, 10_000)], stopped=(2, 60, 484))
         verdict = judge(answer, *KV32, 15)
         assert verdict.reason == "fit-buffer"
         assert "90000 m of 100000 m" in verdict.detail and "15% buffer allows 85%" in verdict.detail
 
     def test_memory_is_checked_as_well_as_cpu(self):
-        # Plenty of CPU; 1000 GiB, 600 requested, + 257 = 857 > 850.
-        answer = figures([(1000, 400)], pods=(0, 600))
+        # Plenty of CPU; 1000 GiB, 609 requested, + 241.02 = 850.02 > 850.
+        answer = figures([(1000, 391)], pods=(0, 609))
         verdict = judge(answer, *KV32, 15)
-        assert verdict.reason == "fit-buffer" and "memory after placing: 857 GiB of 1000 GiB" in verdict.detail
-        assert skip_reason(figures([(1000, 407)], pods=(0, 593)), *KV32, 15) is None  # 593 + 257 = 850 of 1000
+        assert verdict.reason == "fit-buffer"
+        assert "memory after placing: 850.02 GiB of 1000.00 GiB allocatable" in verdict.detail
+        assert skip_reason(figures([(1000, 392)], pods=(0, 608)), *KV32, 15) is None  # 608 + 241.02 = 849.02
+
+    def test_the_memory_boundary_is_exact_to_the_byte(self):
+        # 1000 GiB allocatable, 15%: 850 GiB of requests at most, the VM's own included.
+        room = exact([(1_000_000, 1000 * GIB)])
+        at = room.model_copy(update={"pods_memory_bytes": 850 * GIB - KV32_MEMORY})
+        over = room.model_copy(update={"pods_memory_bytes": 850 * GIB - KV32_MEMORY + 1})
+        assert skip_reason(at, *KV32, 15) is None
+        assert skip_reason(over, *KV32, 15) == "fit-buffer"
+
+    def test_stopped_vms_and_pods_add_up_on_memory(self):
+        # Neither alone passes the buffer; together with the VM they do.
+        room = exact([(1_000_000, 1000 * GIB)])
+        half = (850 * GIB - KV32_MEMORY) // 2 + 1
+        assert skip_reason(room.model_copy(update={"pods_memory_bytes": half}), *KV32, 15) is None
+        assert skip_reason(room.model_copy(update={"stopped_vms_memory_bytes": half}), *KV32, 15) is None
+        both = room.model_copy(update={"pods_memory_bytes": half, "stopped_vms_memory_bytes": half})
+        assert skip_reason(both, *KV32, 15) == "fit-buffer"
+
+    def test_cpu_is_reported_before_memory_when_both_pass_the_buffer(self):
+        both = exact([(100_000, 1000 * GIB)], pods_cpu_millicores=60_000, pods_memory_bytes=700 * GIB)
+        both = both.model_copy(update={"node_headroom": [KvNodeHeadroom(name="n0", cpu_millicores=40_000, memory_bytes=300 * GIB)]})
+        assert judge(both, *KV32, 15).detail.startswith("CPU after placing")
+
+    def test_a_buffer_of_zero_lets_the_cluster_fill_and_ninety_leaves_a_tenth(self):
+        assert skip_reason(exact([(30_000, KV32_MEMORY)]), *KV32, 0) is None
+        assert skip_reason(exact([(300_000, 10 * KV32_MEMORY)]), *KV32, 90) is None
+        assert skip_reason(exact([(299_999, 10 * KV32_MEMORY)]), *KV32, 90) == "fit-buffer"
+        assert skip_reason(exact([(300_000, 10 * KV32_MEMORY - 1)]), *KV32, 90) == "fit-buffer"
+
+    def test_a_cluster_with_nothing_allocatable_takes_nothing(self):
+        # Usable nodes that report no allocatable (a broken kubelet): no division, no fit.
+        broken = exact([(0, 0)])
+        verdict = judge(broken, *KV8, 15)
+        assert verdict.reason == "fit-node" and verdict.cpu_fill_after is None and verdict.memory_fill_after is None
 
     def test_the_boundary_is_exact_in_integers(self):
         # 3 millicores allocatable short of the boundary must not fit; floats would round this.
@@ -152,7 +252,7 @@ class TestTheBuffer:
 
     def test_a_node_may_fill_completely_the_buffer_is_never_per_node(self):
         # One node takes the VM to 100% of itself; the cluster as a whole stays under the buffer.
-        assert skip_reason(figures([(30, 257), (100, 1000), (100, 1000)]), *KV32, 15) is None
+        assert skip_reason(exact([(30_000, KV32_MEMORY), (100_000, 1000 * GIB), (100_000, 1000 * GIB)]), *KV32, 15) is None
 
 
 class TestTheDesignsExample:
@@ -194,7 +294,7 @@ class TestTheTable:
     def test_every_reason_the_rule_or_the_run_records_has_its_words(self):
         """A reason without words would reach the operator as a bare key."""
         recorded = {placement.DAY1_PROBLEM, placement.NO_WORKER, placement.UNREACHABLE, placement.NO_NODES,
-                    placement.FIT_NODE, placement.FIT_BUFFER}
+                    placement.FIT_NODE, placement.FIT_BUFFER, placement.CREATE_FAILED}
         assert recorded == set(SKIP_REASONS)
         # …and the workflow records no reason by a literal of its own.
         source = pathlib.Path(__file__).resolve().parent.parent / "workflow_domains/vm_lifecycle/create_vm.py"
@@ -206,3 +306,62 @@ class TestTheTable:
             if keyword.arg == "skip_reason" and isinstance(keyword.value, ast.Constant)
         }
         assert literals == set()
+
+
+class TestTheDesignsNodeTable:
+    """docs/design/create-vm-placement.md §6.1.1: how many VMs of each size ONE KV node takes,
+    counted by the fit rule itself. Every KV node has 8 GiB of RAM per core; what a node gives
+    VMs is less — the kernel keeps 1.62% of the RAM, day1's kubelet reserve is 15,100 Mi, and
+    the node's own pods (OVN, virt-handler, CSI…) request 6,721 Mi (the operator's R660 nodes,
+    measured 2026-11-24). The CPU side: 4 cores reserved, a VM requesting 15/16 of its vCPUs."""
+
+    SIZES = (8, 16, 32, 64)
+
+    @staticmethod
+    def vms_one_node_takes(node_cpus: int, cpu: int, memory_gib: int) -> int:
+        allocatable_cpu = (node_cpus - 4) * 1000
+        allocatable_memory = node_cpus * 8 * GIB * 98_377 // 100_000 - 15_100 * MIB
+        own_pods_memory = 6_721 * MIB
+        vm = (pod_cpu_millicores(cpu), pod_memory_bytes(cpu, memory_gib))
+        placed = 0
+        while True:
+            used_cpu, used_memory = placed * vm[0], own_pods_memory + placed * vm[1]
+            node = exact([(allocatable_cpu - used_cpu, allocatable_memory - used_memory)]).model_copy(update={
+                "allocatable_cpu_millicores": allocatable_cpu, "allocatable_memory_bytes": allocatable_memory,
+                "pods_cpu_millicores": used_cpu, "pods_memory_bytes": used_memory,
+            })
+            if skip_reason(node, *vm, 0) is not None:
+                return placed
+            placed += 1
+
+    @pytest.mark.parametrize(
+        ("node_cpus", "per_size", "the_cpus_limit"),
+        [(128, [16, 8, 4, 2], [17, 8, 4, 2]), (192, [24, 12, 6, 3], [26, 12, 6, 3])],
+    )
+    def test_at_seven_and_a_half_gib_per_vcpu_a_node_takes_what_its_cpus_allow(self, node_cpus, per_size, the_cpus_limit):
+        assert [self.vms_one_node_takes(node_cpus, cpu, vm_memory_gib(cpu)) for cpu in self.SIZES] == per_size
+        assert [(node_cpus - 4) * 1000 // pod_cpu_millicores(cpu) for cpu in self.SIZES] == the_cpus_limit
+        # kv16, kv32 and kv64 reach the CPU's limit; kv8 stays under it at any ratio above about 7.1 (accepted).
+        assert per_size[1:] == the_cpus_limit[1:]
+
+    @pytest.mark.parametrize(("node_cpus", "per_size"), [(128, [15, 7, 3, 1]), (192, [23, 11, 5, 2])])
+    def test_at_eight_gib_per_vcpu_every_size_was_one_vm_short(self, node_cpus, per_size):
+        assert [self.vms_one_node_takes(node_cpus, cpu, cpu * 8) for cpu in self.SIZES] == per_size
+
+    # Node sizes, in steps of 8 CPUs up to 256, where the memory stops one VM short of what the
+    # CPUs allow at 7.5 GiB per vCPU — with this model's 4 reserved cores and fixed reserve. NOT
+    # the node types in use (128 and 192 CPUs, above). A node type of one of these sizes, or of
+    # any size never computed, needs the design's table recomputed BEFORE it joins a KV cluster.
+    SHORT = {64: [16], 184: [16, 32, 64], 200: [16], 216: [16, 32], 232: [16]}
+
+    @pytest.mark.parametrize("node_cpus", range(64, 257, 8))
+    def test_where_the_ratio_reaches_the_cpus_limit_and_where_it_does_not(self, node_cpus):
+        short = [
+            cpu for cpu in (16, 32, 64)
+            if self.vms_one_node_takes(node_cpus, cpu, vm_memory_gib(cpu)) < (node_cpus - 4) * 1000 // pod_cpu_millicores(cpu)
+        ]
+        assert short == self.SHORT.get(node_cpus, [])
+
+    def test_the_smallest_shortfall_is_a_fifth_of_a_gib(self):
+        # 64 CPUs / 512 GiB: four kv16 need 482.61 GiB and the node gives its VMs 482.38.
+        assert (60_000 // pod_cpu_millicores(16), self.vms_one_node_takes(64, 16, 120)) == (4, 3)

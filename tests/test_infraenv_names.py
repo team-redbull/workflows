@@ -23,6 +23,7 @@ from shared.cluster_names import (
 )
 from shared.infraenv_names import (
     MEMORY_GIB_PER_CPU,
+    vm_memory_gib,
     InfraEnvKind,
     InfraEnvNameError,
     is_kubevirt,
@@ -34,19 +35,43 @@ from shared.infraenv_names import (
 
 class TestParseInfraEnv:
     @pytest.mark.parametrize(
-        ("name", "flavor", "zone", "cpu"),
+        ("name", "flavor", "zone", "cpu", "memory_gib"),
         [
-            ("c200-kv32-az1", "c200", "az1", 32),
-            ("c200n-kv8-az2", "c200n", "az2", 8),          # a variant letter is part of the flavor
-            ("x201-kv1-az12", "x201", "az12", 1),
-            ("c200-kv256-az1", "c200", "az1", 256),
+            ("c200-kv32-az1", "c200", "az1", 32, 240),
+            ("c200n-kv8-az2", "c200n", "az2", 8, 60),      # a variant letter is part of the flavor
+            ("x201-kv2-az12", "x201", "az12", 2, 15),
+            ("c200-kv16-az1", "c200", "az1", 16, 120),
+            ("c200-kv64-az3", "c200", "az3", 64, 480),
+            ("c200-kv256-az1", "c200", "az1", 256, 1920),
         ],
     )
-    def test_a_kubevirt_infraenv_names_its_flavor_zone_and_size(self, name, flavor, zone, cpu):
+    def test_a_kubevirt_infraenv_names_its_flavor_zone_and_size(self, name, flavor, zone, cpu, memory_gib):
         parsed = parse_infraenv(name)
         assert (parsed.kind, parsed.flavor, parsed.zone, parsed.cpu) == (InfraEnvKind.KUBEVIRT, flavor, zone, cpu)
-        assert parsed.memory_gib == cpu * MEMORY_GIB_PER_CPU
+        assert parsed.memory_gib == memory_gib == vm_memory_gib(cpu)
         assert is_kubevirt(name)
+
+    def test_the_memory_is_seven_and_a_half_gib_per_vcpu_in_integers(self):
+        """The ratio is this repo's, not the naming convention's (it names a size by its vCPUs
+        only), and it is a fraction: no float decides a VM's size."""
+        assert MEMORY_GIB_PER_CPU == (15, 2)
+        assert all(isinstance(vm_memory_gib(cpu), int) and vm_memory_gib(cpu) * 2 == cpu * 15 for cpu in range(2, 257, 2))
+
+    @pytest.mark.parametrize("cpu", [1, 3, 7, 31, 33, 255])
+    def test_an_odd_number_of_vcpus_is_refused_because_its_memory_is_not_whole_gib(self, cpu):
+        with pytest.raises(InfraEnvNameError) as raised:
+            parse_infraenv(f"c200-kv{cpu}-az1")
+        assert "odd" in str(raised.value) or "2..256" in str(raised.value)
+        with pytest.raises(InfraEnvNameError):
+            vm_memory_gib(cpu)
+
+    def test_the_refusal_of_an_odd_size_names_the_next_even_one(self):
+        with pytest.raises(InfraEnvNameError, match=r"7\.5 GiB per vCPU.*`kv4`"):
+            parse_infraenv("c200-kv3-az1")
+
+    def test_a_vm_that_already_exists_keeps_its_name_whatever_its_size(self):
+        # Only the InfraEnv parser refuses odd sizes: a VM's name is read for VMs created before the rule.
+        assert vm_name("c200", 1, "five", "k7q2m9xd") == "ocp-c200-kv1-five-k7q2m9xd"
 
     def test_the_site_is_not_the_infraenvs_but_its_mces(self):
         assert not hasattr(parse_infraenv("c200-kv32-az1"), "site")
@@ -90,31 +115,33 @@ class TestParseInfraEnv:
 
 
 class TestVmName:
-    def test_the_vm_is_named_after_its_flavor_size_site_and_whole_mac(self):
-        assert vm_name("c200", 32, "five", "0e:03:f2:a1:b2:c3") == "ocp-c200-kv32-five-0e03f2a1b2c3"
-        assert vm_name("c200n", 8, "bat-yam", "0E:00:02:5D:0C:9E") == "ocp-c200n-kv8-bat-yam-0e00025d0c9e"
+    def test_the_vm_is_named_after_its_flavor_size_site_and_serial(self):
+        """The operator, 2026-11-25: KubeMacPool picks the MAC, so the name carries a serial."""
+        assert vm_name("c200", 32, "five", "k7q2m9xd") == "ocp-c200-kv32-five-k7q2m9xd"
+        assert vm_name("c200n", 8, "bat-yam", "00000000") == "ocp-c200n-kv8-bat-yam-00000000"
+        assert len(vm_name("c200", 32, "five", "k7q2m9xd")) == 27
 
     def test_the_zone_is_not_in_the_name(self):
-        assert "az" not in vm_name("c200", 32, "five", "0e:03:f2:a1:b2:c3")
+        assert "az" not in vm_name("c200", 32, "five", "k7q2m9xd")
 
     def test_the_size_field_is_kv_and_the_vcpus(self):
         assert vm_size(32) == "kv32"
 
-    @pytest.mark.parametrize("mac", ["0e03f2a1b2c3", "0e:03:f2:a1:b2", "0e:03:f2:a1:b2:c3:d4", "zz:03:f2:a1:b2:c3", ""])
-    def test_the_mac_is_six_octets_with_colons(self, mac):
+    @pytest.mark.parametrize("serial", ["k7q2m9x", "k7q2m9xdz", "K7Q2M9XD", "k7q2-9xd", "0e:03:f2:a1:b2:c3", ""])
+    def test_the_serial_is_eight_lowercase_letters_and_digits(self, serial):
         with pytest.raises(InfraEnvNameError):
-            vm_name("c200", 32, "five", mac)
+            vm_name("c200", 32, "five", serial)
 
     @pytest.mark.parametrize(("flavor", "cpu", "site"), [("C200", 32, "five"), ("c200", 0, "five"), ("c200", 32, "fi/ve"), ("c-200", 32, "five")])
     def test_a_field_outside_the_convention_is_refused(self, flavor, cpu, site):
         with pytest.raises(InfraEnvNameError):
-            vm_name(flavor, cpu, site, "0e:03:f2:a1:b2:c3")
+            vm_name(flavor, cpu, site, "k7q2m9xd")
 
     def test_a_name_too_long_for_kubernetes_is_refused(self):
         # 63 characters must also hold the root DataVolume's `<name>-root`.
         with pytest.raises(InfraEnvNameError, match="DNS-1123"):
-            vm_name("c" * 30, 32, "s" * 20, "0e:03:f2:a1:b2:c3")
-        assert len(vm_name("c" * 20, 32, "s" * 15, "0e:03:f2:a1:b2:c3")) <= 59
+            vm_name("c" * 30, 32, "s" * 20, "k7q2m9xd")
+        assert len(vm_name("c" * 20, 32, "s" * 15, "k7q2m9xd")) <= 59
 
 
 class TestMceNames:

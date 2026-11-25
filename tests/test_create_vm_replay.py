@@ -38,21 +38,25 @@ from temporalio.exceptions import CancelledError
 from temporalio.worker import Replayer
 
 from activities.vm_lifecycle.kubevirt_api import MacRefused, NameTaken
+from shared.consts import DELETE_STRAY_VM_WORKFLOW_QUEUE
 from shared.exceptions import (
+    KvClusterApiError,
     KvZoneLeaseExpiredError,
     KvZoneLockTimeoutError,
     NoKvClusterError,
     NoKvClusterFitsError,
-    VmLeaseExpiredError,
-    VmMacExhaustedError,
+    VmRequestRejectedError,
     VmRootDiskNotBoundError,
 )
-from tests.kv_fleet import KvFleet
+from shared.models.vm_lifecycle import DeleteStrayVmInput, DeleteStrayVmRunArgs
+from tests.kv_fleet import KvFleet, stopped_vm
 from tests.test_add_server_to_mce_replay import _scrubbed
 from tests.test_create_vm_workflow import A, B, Harness, cause, dead_and_alive, fleet_of
 from workflow_domains.vm_lifecycle.create_vm import CreateVmWorkflow
+from workflow_domains.vm_lifecycle.delete_stray_vm import DeleteStrayVmWorkflow
 
 GOLDEN = pathlib.Path(__file__).parent / "histories" / "create_vm"
+STRAY_GOLDEN = pathlib.Path(__file__).parent / "histories" / "delete_stray_vm"
 _RECORD = os.environ.get("UPDATE_REPLAY_HISTORIES") == "1"
 
 
@@ -98,6 +102,47 @@ def _redraw() -> KvFleet:
 def _exhausted() -> KvFleet:
     fleet = fleet_of(A)
     fleet.clusters[A].fail("create_vm", NameTaken("exists"), MacRefused("failed to allocate requested mac address"), NameTaken("exists"))
+    return fleet
+
+
+def _refused_then_next() -> KvFleet:
+    fleet = fleet_of(A, B)
+    fleet.clusters[A].fail("create_vm", VmRequestRejectedError("422: networks[0] is invalid"))
+    return fleet
+
+
+def _landed_then_unreachable_until_the_check() -> KvFleet:
+    """The create lands, its answer is lost, every retry fails to the deadline; the check finds it."""
+    fleet = fleet_of(A, B)
+    cluster = fleet.clusters[A]
+    create, list_vms, until = cluster.create_vm, cluster.list_vms, {}
+
+    async def created_then_lost(namespace, body):
+        await create(namespace, body)
+        until.setdefault("at", fleet.now() + timedelta(seconds=100))
+        raise KvClusterApiError("this cluster's API could not be reached while creating: read timed out")
+
+    async def listed(label_selector=None):
+        if label_selector is None and "at" in until and fleet.now() < until["at"]:
+            raise KvClusterApiError("this cluster's API could not be reached while listing virtualmachines")
+        return await list_vms(label_selector)
+
+    cluster.create_vm, cluster.list_vms = created_then_lost, listed
+    return fleet
+
+
+def _landed_then_dark() -> KvFleet:
+    """The create lands and the cluster goes dark: the run moves on and leaves a cleanup behind."""
+    fleet = fleet_of(A, B)
+    cluster = fleet.clusters[A]
+    create = cluster.create_vm
+
+    async def created_then_dark(namespace, body):
+        await create(namespace, body)
+        cluster.down = True
+        raise KvClusterApiError("this cluster's API could not be reached while creating: connection reset")
+
+    cluster.create_vm = created_then_dark
     return fleet
 
 
@@ -150,10 +195,18 @@ SCENARIOS: dict[str, Scenario] = {
     "no-kv-worker": Scenario(fleet=lambda: fleet_of(A, B), down=lambda fleet: {A}, step=timedelta(seconds=10)),
     # A name taken on the first draw: the WORKER draws again; the run sees one create.
     "mac-redraw": Scenario(fleet=_redraw),
-    # Three draws taken: the worker's permanent error, after the release.
-    "draws-exhausted": Scenario(fleet=_exhausted, ends=VmMacExhaustedError.__name__),
-    # The create reached the worker after its lease: nothing created.
-    "lease-expired-at-the-worker": Scenario(fleet=_late, ends=VmLeaseExpiredError.__name__),
+    # Three draws taken: the cluster refuses the create, is checked (nothing of the run there)
+    # and left; with no other cluster the run fails, nothing created. (Re-recorded 2026-11-24,
+    # when a failed create stopped failing the run: the branch had run nowhere but the lab.)
+    "draws-exhausted": Scenario(fleet=_exhausted, ends=NoKvClusterFitsError.__name__, step=timedelta(seconds=5)),
+    # The create reached the worker after its deadline: nothing created, checked, left.
+    "lease-expired-at-the-worker": Scenario(fleet=_late, ends=NoKvClusterFitsError.__name__, step=timedelta(seconds=5)),
+    # The cluster refuses the create for good: checked, left, and the next cluster gets the VM.
+    "moved-on-after-a-refused-create": Scenario(fleet=_refused_then_next, step=timedelta(seconds=5)),
+    # The create landed but every retry failed: the check finds the VM, the run keeps it.
+    "kept-the-vm-that-landed": Scenario(fleet=_landed_then_unreachable_until_the_check, step=timedelta(seconds=10)),
+    # The create landed and the cluster went dark: the run moves on and starts delete-stray-vm.
+    "moved-on-from-a-dark-cluster": Scenario(fleet=_landed_then_dark, step=timedelta(seconds=10)),
     # The disk never binds: the VM is deleted again, then the run fails.
     "rollback": Scenario(fleet=lambda: fleet_of(A, storage="wffc"), ends=VmRootDiskNotBoundError.__name__),
     # Another run holds the zone: wait for the grant, then the same path as `create`.
@@ -217,9 +270,55 @@ async def test_every_run_a_scenario_records_replays(scenario):
         )
 
 
+async def _record_stray(name: str) -> WorkflowHistory:
+    """delete-stray-vm on its own: a VM of one run is on A (`with-a-stray`) or nothing is
+    (`nothing-there`), and A's API is down for its first minutes, then answers."""
+    fleet = fleet_of(A)
+    cluster = fleet.clusters[A]
+    if name == "with-a-stray":
+        cluster.add_vm(stopped_vm("ocp-c200-kv32-five-0e0000000001", 32, 240, labels={
+            "redfish-enabled": "true", "redbull.io/created-by": "run-of-the-recording"}))
+    cluster.down = True
+    async with Harness(fleet) as h:
+        handle = await h.client.start_workflow(
+            DeleteStrayVmWorkflow.run,
+            DeleteStrayVmRunArgs(input=DeleteStrayVmInput(
+                kv_cluster=A, namespace="inventory", request_id="run-of-the-recording",
+                workflow_id="create-vm-recording", why="the cluster failed the create")),
+            id=f"delete-stray-vm-{A}-run-of-the-recording", task_queue=DELETE_STRAY_VM_WORKFLOW_QUEUE,
+        )
+        await h.advance(timedelta(minutes=10))
+        cluster.down = False
+        await h.result(handle, step=timedelta(seconds=30))
+        assert (cluster.vms == {})
+        return await handle.fetch_history()
+
+
+@pytest.mark.parametrize("scenario", ["with-a-stray", "nothing-there"])
+async def test_delete_stray_vm_records_replay(scenario):
+    history = await _record_stray(scenario)
+    replayer = Replayer(workflows=[DeleteStrayVmWorkflow], data_converter=pydantic_data_converter)
+    await replayer.replay_workflow(history)
+    golden = STRAY_GOLDEN / f"{scenario}.json"
+    if _RECORD and not golden.exists():
+        STRAY_GOLDEN.mkdir(parents=True, exist_ok=True)
+        golden.write_text(
+            json.dumps({"workflow_id": history.workflow_id, "history": _scrubbed(json.loads(history.to_json()))},
+                       separators=(",", ":"), sort_keys=True) + "\n"
+        )
+
+
+@pytest.mark.parametrize("path", sorted(STRAY_GOLDEN.glob("*.json")), ids=lambda p: p.stem)
+async def test_delete_stray_vm_goldens_replay_on_the_current_code(path):
+    recorded = json.loads(path.read_text())
+    history = WorkflowHistory.from_json(recorded["workflow_id"], recorded["history"])
+    await Replayer(workflows=[DeleteStrayVmWorkflow], data_converter=pydantic_data_converter).replay_workflow(history)
+
+
 def test_there_are_golden_histories():
     """No committed history protects nothing in flight; every scenario has its golden."""
     assert {path.stem for path in GOLDEN.glob("*.json")} >= set(SCENARIOS)
+    assert {path.stem for path in STRAY_GOLDEN.glob("*.json")} >= {"with-a-stray", "nothing-there"}
 
 
 @pytest.mark.parametrize("path", sorted(GOLDEN.glob("*.json")), ids=lambda p: p.stem)

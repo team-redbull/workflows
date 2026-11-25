@@ -25,7 +25,7 @@ depends on it:
     create-vm and for the zone locks, the day1 reader).
 
 The same fleet can be attached to a REAL Temporal server next to one real
-cluster's worker (`python -m tests.kv_fleet`, docs/lab/create-vm-per-kv-cluster/),
+cluster's worker (`python -m tests.kv_fleet`),
 which is how a lab with one KV cluster sees a zone of many.
 """
 
@@ -49,10 +49,11 @@ from activities.vm_lifecycle import cluster_figures, vm_operations, vm_spec
 from activities.vm_lifecycle.kubevirt_api import MacRefused, NameTaken, NotFound
 from activities.vm_lifecycle.vm_operations import ClusterValues
 from shared.cluster_names import parse_kv_cluster, seed_folder_pattern
-from shared.exceptions import Day1QueryInvalidError
+from shared.exceptions import Day1QueryInvalidError, KvClusterApiError
 from shared.consts import (
     CLUSTER_LIFECYCLE_ACTIVITY_QUEUE,
     CREATE_VM_WORKFLOW_QUEUE,
+    DELETE_STRAY_VM_WORKFLOW_QUEUE,
     KV_ZONE_LOCK_WORKFLOW_QUEUE,
     vm_lifecycle_activity_queue,
 )
@@ -70,6 +71,7 @@ from shared.models.vm_lifecycle import (
     VmReadyRequest,
 )
 from workflow_domains.vm_lifecycle.create_vm import CreateVmWorkflow
+from workflow_domains.vm_lifecycle.delete_stray_vm import DeleteStrayVmWorkflow
 from workflow_domains.vm_lifecycle.kv_zone_lock import KvZoneLockWorkflow
 
 GIB = 1024**3
@@ -175,6 +177,10 @@ def _matches(obj: dict, selector: str | None) -> bool:
 # --- one fake KV cluster -----------------------------------------------------------------------
 
 
+def _mac_int(mac: str) -> int:
+    return int(mac.replace(":", "").replace("-", ""), 16)
+
+
 class FakeKvCluster:
     """A KV cluster's API in memory: kubevirt_api.KubevirtApi's async surface, plus knobs.
 
@@ -188,7 +194,7 @@ class FakeKvCluster:
         name: str,
         *,
         nodes: list[dict],
-        mac_prefix: str = "0e:00:01",
+        mac_range: tuple[str, str] = ("02:00:01:00:00:00", "02:00:01:ff:ff:ff"),
         namespaces: tuple[str, ...] = ("inventory",),
         storage: str = "immediate",
         bind_after_polls: int = 1,
@@ -199,7 +205,7 @@ class FakeKvCluster:
         self.name = name
         self.values = ClusterValues(
             kv_cluster=name, site=parse_kv_cluster(name).site, zone=parse_kv_cluster(name).zone,
-            mac_prefix=mac_prefix, storage_class_name="cephfs",
+            storage_class_name="cephfs",
             redfish_label=REDFISH_LABEL, network_name="openshift-cnv/vm-external-network",
             node_selector=dict(node_selector or {}), root_disk_size="120Gi",
         )
@@ -211,14 +217,22 @@ class FakeKvCluster:
         self.namespaces: set[str] = set(namespaces)
         self.storage = storage
         self.bind_after_polls = bind_after_polls
+        # KubeMacPool on this cluster, as cluster-qcl8n's behaves (2026-11-25): an interface
+        # created with NO MAC is given the next free one of `mac_range` (free of every VM's,
+        # in every namespace), and a REQUESTED MAC is taken as it is, duplicate or not.
+        # False: no KubeMacPool — a VM keeps whatever it was created with, none included.
         self.kubemacpool = kubemacpool
+        self.mac_range = mac_range
+        self._next_mac = _mac_int(mac_range[0])
         # What each next call of a method raises (popped front first), and how long it takes.
         self.failures: dict[str, list[BaseException]] = {}
         self.delays: dict[str, float] = {}
+        # True: every call to this cluster's API fails as an unreachable one does (an outage).
+        self.down = False
         self.calls: list[str] = []
         self.created: list[str] = []  # VM names, in creation order
         self.deleted: list[str] = []
-        self.draws: list[bytes] = []  # MAC bytes the next draws return, before the random ones
+        self.draws: list[bytes] = []  # random bytes the next serial draws take (eight each), before the random ones
         self._random = random.Random(seed if seed is not None else hash(name) & 0xFFFF)
         self._dv_polls: dict[tuple[str, str], int] = {}
         self._dv_storage: dict[tuple[str, str], str] = {}  # how each disk's class behaved when it was made
@@ -247,12 +261,13 @@ class FakeKvCluster:
 
     def start(self, namespace: str, name: str, node_name: str, *, phase: str = "Running") -> None:
         """Start a VM as kubevirt-redfish would: a VMI, and its launcher pod on a node,
-        requesting what the VM's template asks plus KubeVirt's real overhead (well under 1 GiB)."""
+        requesting what the VM's template asks plus KubeVirt's real overhead — the few MiB under
+        what the figures count for it stopped (shared/vm_requests.py rounds the fixed part up)."""
         vm = self.vms[(namespace, name)]
         cpu, memory = cluster_figures.stopped_vm_request(vm)
         self.vmis[(namespace, name)] = {"metadata": {"name": name, "namespace": namespace}, "status": {"phase": phase}}
         if phase in {"Scheduled", "Running", "Unknown"}:
-            self.pods.append(pod(f"virt-launcher-{name}", node_name, f"{cpu}m", str(memory - GIB + 300 * 1024**2),
+            self.pods.append(pod(f"virt-launcher-{name}", node_name, f"{cpu}m", str(memory - 7 * 1024**2),
                                  namespace=namespace))
 
     @property
@@ -261,6 +276,21 @@ class FakeKvCluster:
 
     def macs(self) -> list[str]:
         return sorted(mac for vm in self.vms.values() for mac in vm_spec.macs(vm))
+
+    def in_range(self, mac: str) -> bool:
+        """Whether `mac` lies inside this cluster's KubeMacPool range."""
+        return _mac_int(self.mac_range[0]) <= _mac_int(mac) <= _mac_int(self.mac_range[1])
+
+    def _allocate_mac(self) -> str:
+        """KubeMacPool's allocation: the next MAC of its range no VM of the cluster holds."""
+        held = {_mac_int(mac) for vm in self.vms.values() for mac in vm_spec.macs(vm)}
+        first, last = _mac_int(self.mac_range[0]), _mac_int(self.mac_range[1])
+        for _ in range(last - first + 1):
+            candidate, self._next_mac = self._next_mac, self._next_mac + 1 if self._next_mac < last else first
+            if candidate not in held:
+                raw = f"{candidate:012x}"
+                return ":".join(raw[i : i + 2] for i in range(0, 12, 2))
+        raise MacRefused("admission webhook denied the request: failed to allocate mac: the range is full")
 
     # --- the API surface -------------------------------------------------------------------
 
@@ -272,6 +302,8 @@ class FakeKvCluster:
         queued = self.failures.get(method)
         if queued:
             raise queued.pop(0)
+        if self.down:
+            raise KvClusterApiError(f"this cluster's API could not be reached while {method}: connection refused (the fake's outage)")
 
     async def list_nodes(self) -> list[dict]:
         await self._enter("list_nodes")
@@ -306,12 +338,11 @@ class FakeKvCluster:
             raise NotFound(f'namespaces "{namespace}" not found')
         if (namespace, name) in self.vms:
             raise NameTaken(f'virtualmachines.kubevirt.io "{name}" already exists')
-        if self.kubemacpool:
-            held = {mac for vm in self.vms.values() for mac in vm_spec.macs(vm)}
-            clash = [mac for mac in vm_spec.macs(body) if mac in held]
-            if clash:
-                raise MacRefused(f"admission webhook denied the request: Failed to allocate mac to the vm object: failed to allocate requested mac address {clash[0]}")
         stored = copy.deepcopy(body)
+        if self.kubemacpool:
+            for interface in stored["spec"]["template"]["spec"]["domain"]["devices"].get("interfaces", []):
+                if not interface.get("macAddress"):
+                    interface["macAddress"] = self._allocate_mac()
         stored["metadata"]["uid"] = str(uuid.uuid4())
         stored["metadata"]["creationTimestamp"] = datetime.now(UTC).isoformat()
         stored["status"] = {"printableStatus": "Provisioning" if self.storage == "immediate" and self.bind_after_polls > 0 else "Stopped"}
@@ -419,10 +450,14 @@ class KvFleet:
     ) -> FakeKvCluster:
         """A KV cluster of `zone`: its fake API, and (unless `in_day1` is False) its day1 entry."""
         parsed = parse_kv_cluster(name)
-        prefix = cluster_kwargs.pop("mac_prefix", f"0e:{len(self.clusters) // 256:02x}:{len(self.clusters) % 256:02x}")
+        index = len(self.clusters)
+        # Each fake cluster its own KubeMacPool range, as the HyperConverged object will give them.
+        mac_range = cluster_kwargs.pop(
+            "mac_range", (f"02:{index // 256:02x}:{index % 256:02x}:00:00:00", f"02:{index // 256:02x}:{index % 256:02x}:ff:ff:ff")
+        )
         cluster = FakeKvCluster(
             name, nodes=nodes if nodes is not None else [node(f"{name}-n{i}", 100, 1024) for i in range(1)],
-            mac_prefix=prefix, **cluster_kwargs,
+            mac_range=mac_range, **cluster_kwargs,
         )
         self.clusters[name] = cluster
         if in_day1:
@@ -525,9 +560,10 @@ class KvFleet:
 
     # --- the workers ---------------------------------------------------------------------------
 
-    # The hub's three workers, by the name tests take them away under.
+    # The hub's workers, by the name tests take them away under.
     CREATE_VM = "create-vm"      # the brain's worker for the create-vm workflow
     ZONE_LOCK = "kv-zone-lock"   # the brain's worker for the zone locks
+    STRAY = "delete-stray-vm"    # the brain's worker for create-vm's cleanup child
     DAY1 = "day1"                # the cluster-lifecycle worker (list_kv_clusters)
 
     @asynccontextmanager
@@ -542,6 +578,7 @@ class KvFleet:
         try:
             if brain:
                 await self.start_worker(self.CREATE_VM)
+                await self.start_worker(self.STRAY)
                 if lock_worker:
                     await self.start_worker(self.ZONE_LOCK)
             if list_worker:
@@ -563,6 +600,8 @@ class KvFleet:
             return Worker(self._client, task_queue=CREATE_VM_WORKFLOW_QUEUE, workflows=[CreateVmWorkflow], **runner)
         if name == self.ZONE_LOCK:
             return Worker(self._client, task_queue=KV_ZONE_LOCK_WORKFLOW_QUEUE, workflows=[KvZoneLockWorkflow], **runner)
+        if name == self.STRAY:
+            return Worker(self._client, task_queue=DELETE_STRAY_VM_WORKFLOW_QUEUE, workflows=[DeleteStrayVmWorkflow], **runner)
         if name == self.DAY1:
             return Worker(self._client, task_queue=CLUSTER_LIFECYCLE_ACTIVITY_QUEUE, activities=[self.list_activity()])
         return Worker(
@@ -597,6 +636,22 @@ class KvFleet:
 # --- attach the fleet to a real Temporal server (the lab) ---------------------------------------
 
 
+def _go_dark_after_the_first_create(cluster: FakeKvCluster, seconds: float) -> None:  # pragma: no cover — a lab tool
+    create = cluster.create_vm
+    done = {}
+
+    async def created_then_dark(namespace: str, body: dict) -> dict:
+        created = await create(namespace, body)
+        if not done:
+            done["at"] = True
+            cluster.down = True
+            asyncio.get_running_loop().call_later(seconds, setattr, cluster, "down", False)
+            raise KvClusterApiError("this cluster's API could not be reached while creating: connection reset (the lab's --dark)")
+        return created
+
+    cluster.create_vm = created_then_dark
+
+
 async def _main() -> None:  # pragma: no cover — a lab tool
     import argparse
     import logging
@@ -612,6 +667,13 @@ async def _main() -> None:  # pragma: no cover — a lab tool
                         help="requests already on a cluster's first node")
     parser.add_argument("--wffc", action="append", default=[], metavar="NAME", help="a cluster whose root disks never bind")
     parser.add_argument("--no-namespace", action="append", default=[], metavar="NAME", help="a cluster without the VM namespace")
+    parser.add_argument("--fail", action="append", default=[], metavar="NAME:METHOD:TIMES",
+                        help="a cluster whose API answers 503 to its next TIMES calls of METHOD (create_vm, list_nodes…): an outage")
+    parser.add_argument("--delay", action="append", default=[], metavar="NAME:METHOD:SECONDS",
+                        help="a cluster whose API takes SECONDS to answer every call of METHOD")
+    parser.add_argument("--dark", action="append", default=[], metavar="NAME:SECONDS",
+                        help="a cluster whose first create LANDS and then whose whole API is down for SECONDS "
+                             "(the answer lost): the run must move on, and its stray be cleaned up")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     fleet = KvFleet()
@@ -626,6 +688,15 @@ async def _main() -> None:  # pragma: no cover — a lab tool
     for spec in args.load:
         name, cores, memory = spec.split(":")
         fleet.clusters[name].add_pod(fleet.clusters[name].nodes[0]["metadata"]["name"], int(cores) * 1000, int(memory) * GIB)
+    for spec in args.fail:
+        name, method, times = spec.split(":")
+        fleet.clusters[name].fail(method, *(KvClusterApiError(f"this cluster's API failed in {method} (503): the lab's outage") for _ in range(int(times))))
+    for spec in args.delay:
+        name, method, seconds = spec.split(":")
+        fleet.clusters[name].delays[method] = float(seconds)
+    for spec in args.dark:
+        name, seconds = spec.split(":")
+        _go_dark_after_the_first_create(fleet.clusters[name], float(seconds))
     client = await Client.connect(args.temporal, namespace=args.namespace, data_converter=pydantic_data_converter)
     async with fleet.running(client, brain=False, list_worker=False):
         logging.info("fake KV clusters polling: %s", ", ".join(vm_lifecycle_activity_queue(n) for n in fleet.clusters))

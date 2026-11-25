@@ -18,6 +18,7 @@ from pydantic import BaseModel
 from temporalio import workflow
 from temporalio.client import WorkflowExecutionStatus, WorkflowFailureError, WorkflowHandle
 from temporalio.exceptions import WorkflowAlreadyStartedError
+from temporalio.service import RPCError
 from temporalio.worker import UnsandboxedWorkflowRunner, Worker
 
 from shared.consts import KV_ZONE_LOCK_WORKFLOW_QUEUE
@@ -506,3 +507,187 @@ class TestContinueAsNew:
             progress = await h.until(lambda p: p.holder is None)
             assert progress.expired == 1
             assert (await h.result(await h.waiter(hold_seconds=1))).granted
+
+
+# --- signals nobody should have sent ---------------------------------------------------------------
+
+
+class TestStraySignals:
+    """What reaches the lock late, twice, or from a run it does not know must never move the zone
+    from the run that holds it: a release frees only ITS lease, a withdraw only ITS run."""
+
+    async def test_a_release_or_withdraw_from_a_stranger_frees_nothing(self):
+        async with Harness() as h:
+            holder = await h.waiter(hold_seconds=None)
+            held = await h.holding(holder)
+            lock = h.client.get_workflow_handle(h.lock_id)
+            stranger = KvZoneLockRequest(workflow_id=f"never-asked-{uuid.uuid4()}", run_id=str(uuid.uuid4()))
+            await lock.signal(KvZoneLockWorkflow.release, KvZoneLockRelease(lease_id=str(uuid.uuid4())))
+            await lock.signal(KvZoneLockWorkflow.withdraw, stranger)
+            # The holder's own workflow id under ANOTHER run id is a stranger too (a slot's earlier run).
+            await lock.signal(KvZoneLockWorkflow.withdraw, KvZoneLockRequest(workflow_id=holder.id, run_id=str(uuid.uuid4())))
+            await h.advance(timedelta(seconds=30))
+            still = await h.lock_progress()
+            assert still.holder == held.holder and still.lease_id == held.lease_id and still.waiting == 0
+            await holder.signal(Waiter.proceed)
+            assert (await h.result(holder)).granted
+            assert (await h.until(lambda p: p.holder is None)).expired == 0
+
+    async def test_a_release_sent_twice_never_frees_the_next_holders_lease(self):
+        async with Harness() as h:
+            first = await h.waiter(hold_seconds=None)
+            first_lease = (await h.holding(first)).lease_id
+            second = await h.waiter(hold_seconds=None)
+            await h.queued(1)
+            await first.signal(Waiter.proceed)
+            await h.result(first)
+            held = await h.holding(second)
+            assert held.lease_id != first_lease
+            lock = h.client.get_workflow_handle(h.lock_id)
+            # The first run's release again (a retried signal), and its withdraw, minutes later.
+            await lock.signal(KvZoneLockWorkflow.release, KvZoneLockRelease(lease_id=first_lease))
+            await h.advance(timedelta(minutes=2))
+            await lock.signal(KvZoneLockWorkflow.release, KvZoneLockRelease(lease_id=first_lease))
+            still = await h.lock_progress()
+            assert still.holder.workflow_id == second.id and still.lease_id == held.lease_id
+            await second.signal(Waiter.proceed)
+            assert (await h.result(second)).granted
+            assert (await h.until(lambda p: p.holder is None)).grants == 2
+
+    async def test_a_late_withdraw_from_the_run_before_does_not_free_the_run_that_holds_now(self):
+        async with Harness() as h:
+            first = await h.waiter(hold_seconds=None)
+            first_request = (await h.holding(first)).holder
+            second = await h.waiter(hold_seconds=None)
+            await h.queued(1)
+            await first.signal(Waiter.proceed)
+            await h.result(first)
+            held = await h.holding(second)
+            await h.client.get_workflow_handle(h.lock_id).signal(KvZoneLockWorkflow.withdraw, first_request)
+            await h.advance(timedelta(seconds=30))
+            still = await h.lock_progress()
+            assert still.holder.workflow_id == second.id and still.lease_id == held.lease_id
+            await second.terminate()
+
+    async def test_a_run_that_asks_again_after_its_release_goes_to_the_back_of_the_line(self):
+        """A create-vm run whose lease ran out mid-scan asks for a second one: it gets no place
+        ahead of the runs that were already waiting."""
+        async with Harness() as h:
+            first = await h.waiter(hold_seconds=None)
+            first_request = (await h.holding(first)).holder
+            second = await h.waiter(hold_seconds=None)
+            await h.queued(1)
+            third = await h.waiter(hold_seconds=None)
+            await h.queued(2)
+            lock = h.client.get_workflow_handle(h.lock_id)
+            # Released, then asked again — while it holds, the same ask is ignored.
+            await lock.signal(KvZoneLockWorkflow.request_lock, first_request)
+            assert (await h.lock_progress()).waiting == 2
+            await lock.signal(KvZoneLockWorkflow.release, KvZoneLockRelease(lease_id=(await h.lock_progress()).lease_id))
+            await lock.signal(KvZoneLockWorkflow.request_lock, first_request)
+            progress = await h.until(lambda p: p.holder is not None and p.holder.workflow_id == second.id and p.waiting == 2)
+            assert [waiting.workflow_id for waiting in progress.line] == [third.id, first.id]
+            for handle in (first, second, third):
+                await handle.terminate()
+
+    async def test_a_request_delivered_with_the_locks_first_task_is_not_lost(self):
+        """signal-with-start, as a client would do it: the signal is handled BEFORE run() starts,
+        and must find the line the lock was started with."""
+        async with Harness() as h:
+            starter = KvZoneLockRequest(workflow_id=f"gone-{uuid.uuid4()}", run_id=str(uuid.uuid4()))
+            waiter = await h.waiter(hold_seconds=None)  # starts the lock itself, or signals it
+            await h.holding(waiter)
+            await waiter.terminate()
+            await h.client.get_workflow_handle(h.lock_id).terminate()
+            other = await h.client.start_workflow(Waiter.run, WaiterArgs(site=f"{h.site}y", hold_seconds=None),
+                                                  id=f"waiter-{uuid.uuid4()}", task_queue=WAITER_QUEUE)
+            other_lock = kv_zone_lock_workflow_id(f"{h.site}y", "az1")
+            for _ in range(100):
+                try:
+                    held = await h.client.get_workflow_handle(other_lock).query(KvZoneLockWorkflow.progress)
+                    if held.holder is not None:
+                        break
+                except Exception:  # noqa: BLE001 — not started yet
+                    pass
+                await asyncio.sleep(0.05)
+            # A lock started WITH a line and signalled in the same breath: both requests are kept, in order.
+            await h.client.start_workflow(
+                KvZoneLockWorkflow.run, KvZoneLockRunArgs(site=h.site, zone="az1", line=[starter]), id=h.lock_id,
+                task_queue=KV_ZONE_LOCK_WORKFLOW_QUEUE, start_signal="request_lock",
+                start_signal_args=[KvZoneLockRequest(workflow_id=other.id, run_id=other.first_execution_run_id)],
+            )
+            # `starter` never existed: skipped. `other` exists and is granted — although it never asked this zone.
+            progress = await h.until(lambda p: p.skipped == 1 and p.grants == 1)
+            assert progress.holder.workflow_id == other.id
+            await other.terminate()
+
+
+# --- many runs, every way a run can behave ---------------------------------------------------------
+
+
+class TestAStormOfRuns:
+    async def test_forty_runs_asking_in_the_same_instant_are_each_served_once(self):
+        """Forty runs race to START the lock; one wins and thirty-nine signal it."""
+        async with Harness() as h:
+            handles = await asyncio.gather(*(h.waiter(hold_seconds=0) for _ in range(40)))
+            outcomes = await h.results(*handles, step=timedelta(seconds=2), limit=120)
+            assert all(o.granted and o.grants_received == 1 for o in outcomes)
+            assert len({o.lease_id for o in outcomes}) == 40
+            ordered = sorted(outcomes, key=lambda o: o.granted_at)
+            for earlier, later in zip(ordered, ordered[1:], strict=False):
+                assert later.granted_at >= earlier.released_at, "two runs held the zone at once"
+            final = await h.until(lambda p: p.holder is None and p.waiting == 0)
+            assert (final.grants, final.skipped, final.expired) == (40, 0, 0)
+
+    @pytest.mark.parametrize("seed", [1, 7, 20261124])
+    async def test_whatever_the_runs_do_only_one_holds_the_zone_at_a_time_and_every_patient_run_is_served(self, seed):
+        """Runs that release, runs that hold past their lease and never release, runs that give
+        up, runs terminated in the line or while holding, runs that ask twice — all at once.
+        Whatever the mix: no two leases overlap, nobody is granted twice, every run that waits
+        is served, and the lock ends idle with an empty line."""
+        import random
+
+        rng = random.Random(seed)
+        async with Harness() as h:
+            kinds: list[str] = []
+            handles: list[WorkflowHandle] = []
+            for _ in range(24):
+                kind = rng.choice(["release", "release", "release", "hog", "give-up", "terminated", "twice"])
+                kinds.append(kind)
+                if kind == "hog":
+                    args = {"hold_seconds": 400, "release": False}
+                elif kind == "give-up":
+                    args = {"hold_seconds": rng.randrange(0, 4), "give_up_after_seconds": rng.randrange(1, 240)}
+                elif kind == "twice":
+                    args = {"hold_seconds": rng.randrange(0, 4), "ask_twice": True}
+                else:
+                    args = {"hold_seconds": rng.randrange(0, 20)}
+                handles.append(await h.waiter(**args))
+                if rng.random() < 0.3:
+                    await h.advance(timedelta(seconds=rng.randrange(1, 30)))
+            for kind, handle in zip(kinds, handles, strict=True):
+                if kind == "terminated":
+                    try:
+                        await handle.terminate()
+                    except RPCError:
+                        pass  # it was served and done before anyone got to terminating it
+                    if rng.random() < 0.5:
+                        await h.advance(timedelta(seconds=rng.randrange(1, 90)))
+            alive = [(kind, handle) for kind, handle in zip(kinds, handles, strict=True) if kind != "terminated"]
+            outcomes = await h.results(*(handle for _, handle in alive), step=timedelta(seconds=20), limit=240)
+            held = []
+            for (kind, _), outcome in zip(alive, outcomes, strict=True):
+                if kind != "give-up":
+                    assert outcome.granted, f"a {kind} run was never served"
+                if outcome.granted:
+                    assert outcome.grants_received == 1
+                    # A run that did not release held the zone to its lease's end, and no longer.
+                    held.append((outcome.granted_at, outcome.released_at or outcome.lease_ends_at, kind))
+            held.sort()
+            for (_, until, kind), (granted_at, _, next_kind) in zip(held, held[1:], strict=False):
+                assert granted_at >= until, f"a {next_kind} run was granted the zone while a {kind} run still held it"
+            assert len({outcome.lease_id for outcome in outcomes if outcome.granted}) == len(held)
+            final = await h.until(lambda p: p.holder is None and p.waiting == 0)
+            hogs = sum(1 for kind, _ in alive if kind == "hog")
+            assert final.expired >= hogs  # each hog's lease ended on its own (a terminated holder's too)
+            assert final.grants >= len(held)

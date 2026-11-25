@@ -1,13 +1,19 @@
 # How create-vm places a VM: one zone at a time, a worker in every KubeVirt cluster
 
-> **Names, 2026-11-22.** This document uses the names of its time: seed `ocp4-seed-<site>-<N>`,
-> KV cluster `ocp4-<lifecycle>-kv-<site>-<id>`, InfraEnv `<flavor>-kv<cpu>-<site>-<zone>`, size
-> label `<cpu>c`. When the platform convention left draft
-> (`Idan-Maimon/kubevirt-workflows` `docs/naming-convention.md`, the source of truth, fetched by
-> the `naming-convention` skill) create-vm moved to `ocp4-<lifecycle>-seed-<site>-<zone>-<id>`,
-> `ocp4-<lifecycle>-kv-<site>-<zone>-<id>`, `<flavor>-kv<cpu>-<zone>` (the site is the MCE's) and
-> `kv<cpu>`, and reads only the seeds of the MCE's lifecycle (a zone may have several). The
-> placement design is unchanged. CLAUDE.md §4 has the current names.
+> **Names, 2026-11-24.** Every name on this page is the platform convention's
+> (`Idan-Maimon/kubevirt-workflows` `docs/naming-convention.md`, fetched by the `naming-convention`
+> skill): seed `ocp4-<lifecycle>-seed-<site>-<zone>-<id>`, KV cluster
+> `ocp4-<lifecycle>-kv-<site>-<zone>-<id>`, InfraEnv `<flavor>-kv<cpu>-<zone>` (no site: it is the
+> MCE's), size label `kv<cpu>`. Section 3 was rewritten for them on 2026-11-24. Until the
+> convention left draft (2026-11-22) this page used the seed `ocp4-seed-<site>-<N>`, the KV cluster
+> without its zone, the InfraEnv with its site and the size label `<cpu>c`; none of those shapes
+> ran in production.
+
+> **Memory, 2026-11-24.** A VM's memory is **vCPUs × 7.5 GiB**, no longer × 8, and placement
+> counts KubeVirt's real overhead per VM instead of a flat 1 GiB (section 6.1). Measured on the
+> operator's R660 KV nodes: at 8 GiB per vCPU every size was one VM short of what the CPU allows
+> per node. Memory overcommit was weighed and rejected (`kv-memory-overcommit.md`). In the code
+> since 2026-11-24 ("As implemented").
 
 This page explains, end to end, how a create-vm run decides which KubeVirt cluster (KV cluster)
 a new VM goes on, how the VM gets its MAC address and its name, and who talks to what. It replaces
@@ -15,10 +21,10 @@ a new VM goes on, how the VM gets its MAC address and its name, and who talks to
 HTTP agents on every KV cluster). It also replaces `kv-placement-server-scan.md`: **server-scan
 takes no part in placing or creating a VM.**
 
-Every name on this page follows the platform's naming convention
-(`kubevirt-workflows/docs/review/naming-convention-draft.md`): clusters
-`ocp4-<lifecycle>-<flavor>-<site>-<id>`, InfraEnvs `<flavor>-kv<cpu>-<site>-<zone>`, VMs
-`ocp-<flavor>-kv<cpu>-<site>-<full MAC>`.
+Names follow the platform's naming convention (`Idan-Maimon/kubevirt-workflows`
+`docs/naming-convention.md`): clusters `ocp4-<lifecycle>-<flavor>-<site>-<id>`, InfraEnvs
+`<flavor>-kv<cpu>-<zone>` (no site: it is the MCE's), VMs `ocp-<flavor>-kv<cpu>-<site>-<full MAC>`.
+The seed and KV cluster names are the older ones (the note at the top).
 
 ---
 
@@ -63,55 +69,78 @@ from day1 is also the list of queues to send work to.
 when the request arrives:
 
 ```
-c200-kv32-five-az1
- │    │    │    └─ zone
- │    │    └────── site
- │    └─────────── kv + vCPU count: 32 vCPUs
- └──────────────── flavor, with its optional variant letter (c200, c200n, c200d…)
+c200-kv32-az1
+ │    │    └─ zone, az<N>
+ │    └────── kv + vCPU count: 32 vCPUs
+ └─────────── flavor, with its optional variant letter (c200, c200n, c200d…)
 ```
 
-A `-mtl-` InfraEnv is bare metal, not a VM pool, and is refused. The MCE is a cluster name,
-`ocp4-<lifecycle>-<flavor>-<site>-<id>`; its site must be the InfraEnv's site, or the request is
-refused. Memory is not in the name: it is **vCPUs × 8 GiB** (section 6.1).
+A `-mtl-` InfraEnv is bare metal, not a VM pool, and is refused. The InfraEnv has no site: it
+belongs to one MCE, so the site comes from the MCE's name, `ocp4-<lifecycle>-mce-<site>-<id>`,
+whose lifecycle also picks the seeds (only KV clusters of the same lifecycle). Memory is not in
+the name: it is **vCPUs × 7.5 GiB** (section 6.1).
 
-**Where the clusters are.** A KV cluster is a hosted cluster whose control plane runs on its
-zone's **seed** cluster (one seed per zone, AD17). A seed is named after its site and zone,
-**`ocp4-seed-<site>-<zone number>`** (decided 2026-11-20), and a KV cluster
-`ocp4-<lifecycle>-kv-<site>-<id>`. So a zone's KV clusters are the files of ONE folder, its
-seed's, in the day1 repo's `main`, read by the `cluster-lifecycle-worker` on the hub:
+**Where the clusters are.** A KV cluster is a hosted cluster whose control plane runs on a
+**seed** cluster of its zone (AD17). The naming convention names both after their site and zone,
+and gives each an `id`, a letter in creation order:
+
+| | name | example |
+| --- | --- | --- |
+| seed | `ocp4-<lifecycle>-seed-<site>-<zone>-<id>` | `ocp4-prod-seed-five-az1-a` |
+| KV cluster | `ocp4-<lifecycle>-kv-<site>-<zone>-<id>` | `ocp4-prod-kv-five-az1-a` |
+
+A zone may have **several seeds** (`-a`, `-b`). In the day1 repo the seed folders sit beside the
+MCE folders, and a seed's KV clusters are the files of its folder. The `cluster-lifecycle-worker`
+on the hub reads them from day1's `main` (`list_kv_clusters`, through the `Day1` query library's
+`kv_clusters(site, zone, lifecycle)`):
 
 ```
-sites/<site>/mces/ocp4-seed-<site>-<zone number>/hostedClusters/<kv cluster>.yaml
-sites/five/mces/ocp4-seed-five-1/hostedClusters/ocp4-prod-kv-five-a.yaml      (zone az1)
+sites/<site>/mces/ocp4-<lifecycle>-seed-<site>-<zone>-<id>/hostedClusters/ocp4-<lifecycle>-kv-<site>-<zone>-<id>.yaml
+
+sites/five/mces/ocp4-prod-seed-five-az1-a/hostedClusters/ocp4-prod-kv-five-az1-a.yaml
+sites/five/mces/ocp4-prod-seed-five-az1-a/hostedClusters/ocp4-prod-kv-five-az1-b.yaml
+sites/five/mces/ocp4-prod-seed-five-az1-b/hostedClusters/ocp4-prod-kv-five-az1-c.yaml
+sites/five/mces/ocp4-test-seed-five-az1-a/hostedClusters/ocp4-test-kv-five-az1-a.yaml   (test: not for a prod MCE)
+sites/five/mces/ocp4-prod-mce-five-a/hostedClusters/…                                    (an MCE: never KV clusters)
 ```
 
-- **The zone comes from the seed folder's name.** InfraEnv zone `az<N>` is seed
-  `ocp4-seed-<site>-<N>`, so the run goes straight to that folder; no other folder is read. A seed
-  is immutable and one per zone, so its name can carry the zone, while KV cluster names do not.
-- **An MCE's folder never holds KV clusters**, even one whose name says `kubevirt` (day1 has
-  `ocp4-test-kubevirt-site4` under `ocp4-prep-mce-site4-a`, an ordinary hosted cluster).
-- **The NodePools must agree.** The convention requires every KV NodePool to label its nodes
-  `topology.kubernetes.io/zone` (`nodeLabels`). A file under the seed of `az1` whose NodePools name
-  another zone, or none, is listed with a problem and never chosen: its VMs would carry the wrong
-  zone.
+- **The zone's clusters are the files of every seed folder of that zone and the MCE's
+  lifecycle.** A folder is a seed when its name parses as one; its site, zone and lifecycle are
+  read from that name. A prod MCE's VMs go on prod KV clusters only (the operator, 2026-11-22),
+  so the run asks for its MCE's lifecycle and the other lifecycles' seeds are not listed. The
+  zone's lock is still one per (site, zone): runs of two lifecycles choose among different
+  clusters, and only wait for each other.
+- **What is `kv` is decided by FOLDER, never by name or platform.** Only a file under a seed
+  folder is a KV cluster. A file under any other folder, an MCE's, is an ordinary hosted
+  cluster, even one whose name says `kubevirt` (day1 has `ocp4-test-kubevirt-site4` under an
+  MCE) or whose platform is KubeVirt.
+- **A cluster is used only when day1 confirms it for the zone.** Three places must agree, as the
+  convention's §4.b requires: the KV cluster's NAME (`ocp4-<lifecycle>-kv-<site>-<zone>-<id>`,
+  with the seed folder's site, zone and lifecycle), the SEED folder (of this site), and EVERY
+  NodePool, which labels its nodes `topology.kubernetes.io/zone` with that zone
+  (`nodeLabels`). A file where any of them disagrees, or that has no NodePool, is a
+  `day1-problem` row of the run's table and is never read: its VMs would carry the wrong zone.
+  A plain YAML warning (a key written twice in a value layer) is reported with the file and
+  blocks nothing; judging day1's values is not create-vm's job.
 - **The file's name (without `.yaml`) is the cluster's name everywhere.** It is the queue name and
   the `kvCluster` value the worker is deployed with. Both must be the same string.
-- **Oldest first.** The clusters are sorted by their `id`, the sequence letter the convention ends
-  every cluster name with (`…-a`, `…-b`). Letters are given in creation order, so the oldest
+- **Oldest first, across every seed of the zone.** The clusters are sorted by their `id` letter,
+  whichever seed holds them, ties by name. Letters are given in creation order, so the oldest
   cluster is tried first, which is how AD28 fills the active cluster before the standby one.
-- No cluster in the zone: the run fails at once with "no KV cluster in this zone".
+- No usable cluster in the zone: the run fails at once (`NoKvClusterError`), naming the
+  folders it read and every file it listed with a problem.
 - Each run reads this list **before** taking the lock, so the locked section stays short.
-- **The same read is not repeated for nothing.** The worker remembers the list for one commit
-  only, the latest one it read. Each run first asks git which commit `main` is on, which is one
-  small call. If it is the remembered commit, the list is the same by definition and no clone is
+- **The same read is not repeated for nothing.** The worker remembers day1 for one commit only,
+  the latest one it read. Each run first asks git which commit `main` is on, which is one small
+  call. If it is the remembered commit, the list is the same by definition and no clone is
   needed. If `main` moved (for example, someone added a cluster file), the worker clones once and
   replaces what it remembered. This is the repo-wide git read cache (the plan's §1.4a), not
-  something of create-vm's own. Thirty runs at the same moment
-  cause one clone. Git stays the only source of truth: a new cluster is seen by the first run
-  after its commit lands.
+  something of create-vm's own. Thirty runs at the same moment cause one clone. Git stays the
+  only source of truth: a new cluster is seen by the first run after its commit lands. Every
+  list carries the commit it was read at (`day1_revision` in the result).
 
 Today there is one KV cluster per zone. Nothing depends on that: with several, `-a` is tried
-before `-b`.
+before `-b`, whichever seed each is under.
 
 ---
 
@@ -161,7 +190,7 @@ sequenceDiagram
     participant A as worker in kv cluster -a
     participant B as worker in kv cluster -b
 
-    U->>WF: POST /workflows/vm-lifecycle/create-vm (MCE, InfraEnv c200-kv32-five-az1)
+    U->>WF: POST /workflows/vm-lifecycle/create-vm (MCE ocp4-prod-mce-five-a, InfraEnv c200-kv32-az1)
     WF->>G: list the KV clusters of five / az1 (day1)
     G-->>WF: [-a, -b], buffer 15%
     WF->>L: I want the lock
@@ -172,7 +201,7 @@ sequenceDiagram
     WF->>B: your figures?
     B-->>WF: figures
     WF->>WF: -b fits
-    WF->>B: create a VM: c200, 32 vCPU, 256 GiB, five, az1, MCE
+    WF->>B: create a VM: c200, 32 vCPU, 240 GiB, five, az1, MCE
     B->>B: MAC = its prefix + 3 random bytes; name = ocp-c200-kv32-five-<MAC>
     B->>B: MAC taken? draw again (at most 3 draws)
     B-->>WF: created: name, MAC
@@ -212,22 +241,67 @@ cluster, so it is applied in one place, not in every worker.
 
 ### 6.1 How big a VM is, in the scheduler's terms
 
-The InfraEnv's name gives the vCPUs: `c200-kv32-five-az1` means 32 vCPUs. Memory is
-`vCPUs × 8` GiB, so 256 GiB. Capacity is measured by what the VM's pod **requests** from the
-Kubernetes scheduler:
+The InfraEnv's name gives the vCPUs: `c200-kv32-az1` means 32 vCPUs. Memory is
+`vCPUs × 7.5` GiB, so 240 GiB, computed in integers as `cpu × 15 // 2`. The vCPU count must
+therefore be **even**, so the memory is a whole number of GiB; every size in use (8 to 64) is.
+Capacity is measured by what the VM's pod **requests** from the Kubernetes scheduler:
 
 - **CPU request** = vCPU × 15 / 16, rounded down, at least 1 core
-- **memory request** = guest memory + 1 GiB, for KubeVirt's own overhead. The lab measured about
-  0.3 GiB, so 1 GiB errs on the safe side.
+- **memory request** = guest memory + KubeVirt's overhead, counted as
+  **300 MiB + 8 MiB × vCPUs + guest memory ÷ 512**. KubeVirt adds this overhead to the launcher
+  pod's request itself (page tables, its own processes, per-vCPU state), plus a 35 MB
+  console-log container the scheduler also counts. Measured on cluster-qcl8n (OpenShift
+  Virtualization 4.22) on four VMs built by `vm_spec.py`, as 260 MiB + 8 MiB × vCPUs +
+  guest ÷ 512, + 35 MB: every one matched to the MiB. 300 MiB rounds the fixed part up. The
+  earlier flat 1 GiB pad was too small from 32 vCPUs up (a 64-vCPU VM's overhead is about
+  1.8 GiB), so placement could approve a VM whose pod then had no node to run on.
 
 | VM (vCPU / memory) | InfraEnv size | CPU request | memory request |
 | --- | --- | --- | --- |
-| 8 / 64 GiB | `kv8` | 7 cores | 65 GiB |
-| 16 / 128 GiB | `kv16` | 15 cores | 129 GiB |
-| 32 / 256 GiB | `kv32` | 30 cores | 257 GiB |
-| 64 / 512 GiB | `kv64` | 60 cores | 513 GiB |
+| 8 / 60 GiB | `kv8` | 7 cores | 60 GiB + 484 MiB |
+| 16 / 120 GiB | `kv16` | 15 cores | 120 GiB + 668 MiB |
+| 32 / 240 GiB | `kv32` | 30 cores | 240 GiB + 1,036 MiB |
+| 64 / 480 GiB | `kv64` | 60 cores | 480 GiB + 1,772 MiB |
 
 Every number below is in these request terms, never in vCPUs.
+
+#### 6.1.1 Why 7.5 GiB per vCPU
+
+Every KV node has **8 GiB of RAM per core** (the operator, 2026-11-24). At 8 GiB per vCPU the VM
+had exactly the node's ratio, and a node gives VMs less than its RAM, so the last VM never fit.
+Measured on the operator's KV nodes (`dell-r660-…-128c-1024gb`, 2026-11-24):
+
+| | 128c-1024gb |
+| --- | --- |
+| RAM installed | 1,024 GiB |
+| what the kernel makes usable (`capacity.memory`): 1.62% goes to its own page tables and reserve | 1,007.4 GiB |
+| allocatable (day1's kubelet reserve, 15,100 Mi) | 992.6 GiB |
+| left for VMs after the node's own pods (OVN, virt-handler, CSI…, 6.6 GiB) | **986.1 GiB** |
+| CPUs, allocatable | 128, 124 |
+
+VMs per node, the CPU's limit after the slash:
+
+| GiB per vCPU | 128c-1024gb: kv8 / kv16 / kv32 / kv64 | 192c-1536gb (computed) |
+| --- | --- | --- |
+| 8 (before) | 15/17, 7/8, 3/4, 1/2 | 23/26, 11/12, 5/6, 2/3 |
+| 7.875 or 7.75 | 15/17, 7/8, 3/4, 1/2: no change | 23/26, 11/12, 5/6, 2/3: no change |
+| **7.5** | 16/17, **8/8, 4/4, 2/2**, ~18 GiB left | 24/26, **12/12, 6/6, 3/3**, ~38 GiB left |
+
+A ratio works on a node when the memory it leaves unclaimed covers 1.62% of the RAM + the
+kubelet reserve + the node's own pods + each VM's overhead: about 4.2% of the RAM on a 128-core
+node, 3.6% on a 192-core one. 7.5 leaves 6.25%. Modelled across every 8-GiB-per-core node size
+in steps of 8 CPUs (4 cores reserved, the same kubelet reserve and node pods), 7.5 packs as many
+kv16, kv32 and kv64 as the CPU allows on most sizes up to 208 CPUs, both node types in use
+included, but not on all: it stays one VM short at **64 CPUs** (kv16, by 0.2 GiB), **184** (all
+three sizes) and **200** (kv16), and above 208 at 216 and 232 and most sizes from 336 up — where
+the CPU's 15/16 discount lets more vCPUs onto a node than 7.5 GiB each can feed. (Corrected
+2026-11-24 when the code was written: this paragraph said "every node from 64 to 208";
+`tests/test_vm_lifecycle_placement.py::TestTheDesignsNodeTable` runs the fit rule over the sweep
+and pins the list.) **Any node type other than 128c-1024gb and 192c-1536gb needs this table
+recomputed before it joins**; 7.375 (`cpu × 59 // 8`, vCPUs a multiple of 8) fits every size
+from 64 to 512 CPUs. On a 128-core node kv8 stays one VM under the CPU's limit at
+any ratio above about 7.1, and is accepted so. Memory overcommit (a request below the guest, backed by node swap) was the other way
+to close the gap, and was rejected: `kv-memory-overcommit.md`.
 
 ### 6.2 What the worker reads on its cluster when asked
 
@@ -244,7 +318,7 @@ With its own read-only permissions, at the moment of the request:
 | --- | --- |
 | **allocatable** | the sum of `allocatable` CPU and memory over the usable nodes |
 | **requested by pods** | the sum of the requests of the pods on usable nodes |
-| **requested by stopped VMs** | for every VM labelled `redfish-enabled=true` with **no running instance**, in any namespace and with any run strategy: the request its pod will make when it starts (section 6.1, including the 1 GiB). These VMs have no pod yet, but kubevirt-redfish will start them, so their room is already taken. **This is how a VM created a moment ago is counted.** |
+| **requested by stopped VMs** | for every VM labelled `redfish-enabled=true` with **no running instance**, in any namespace and with any run strategy: the request its pod will make when it starts (section 6.1, including KubeVirt's overhead). These VMs have no pod yet, but kubevirt-redfish will start them, so their room is already taken. **This is how a VM created a moment ago is counted.** |
 | **requested** | requested by pods + requested by stopped VMs |
 | **node headroom** | for each usable node, its allocatable minus the requests of the pods on it, CPU and memory **as a pair**. Kept per node, because the largest free CPU and the largest free memory can be on two different nodes, and then neither node holds the VM. It is one pair of numbers per node, never a pod list. |
 
@@ -377,9 +451,11 @@ A VM fits on a cluster when ALL of these hold:
   started after it, never to a run already going. With 15%, a cluster of 100 cores takes at most
   85 cores of requests. The buffer applies to the **whole cluster**, never to one node. Nodes
   may fill completely; the free share is the room live migration needs when a node is drained.
-- **Memory is checked as well as CPU**, although it follows CPU. A VM asks for about 8.5 GiB per
-  requested core, so on a node with 8 GiB per core memory runs out first. On a 64-core, 512 GiB
-  node, a second 32-vCPU VM fits on CPU (60 of 64 cores) but not on memory (514 of 512 GiB).
+- **Memory is checked as well as CPU**, although it follows CPU. At 7.5 GiB per vCPU a VM asks
+  for about 8 GiB per requested core, close to what a node gives VMs per core, so either can run
+  out first. At the earlier 8 GiB per vCPU memory always did: on a 128-core, 1,024 GiB node
+  (986 GiB left for VMs), a second 64-vCPU VM fit on CPU (120 of 123 cores) but not on memory
+  (1,026 GiB); at 7.5 GiB the two need 963.5 GiB and fit (section 6.1.1).
 - The run **never chooses a node**. The VM is created Halted; when it is started, the Kubernetes
   scheduler chooses the node. Check 3 only makes sure such a node exists.
 - The **first** cluster, oldest first, that fits is chosen. The clusters after it are not even
@@ -426,60 +502,81 @@ already taken is therefore drawn again inside the cluster, without asking the hu
 | --- | --- | --- |
 | `flavor` | `c200` (variant included: `c200n`) | the InfraEnv's name |
 | `cpu` | `32` | the InfraEnv's `kv<cpu>` |
-| `memory_gib` | `256` | `cpu × 8` |
-| `site` | `five` | the InfraEnv's name |
+| `memory_gib` | `240` | `cpu × 15 // 2` (7.5 GiB per vCPU) |
+| `site` | `five` | the MCE's name (the InfraEnv has no site) |
 | `zone` | `az1` | the InfraEnv's name |
 | `mce` | `ocp4-prod-mce-five-a` | the request |
 | `namespace` | `inventory` | the request, defaulted at the API (section 11) |
 | `request_id` | the run's workflow id | the run |
 | `create_before` | the lease's end | the zone lock, when it granted the lock |
 
-Everything else is the cluster's: its MAC prefix, and the VM template's values (storage class,
-network, node selector), all in the worker's ConfigMap. The worker refuses a request whose site
-is not its own cluster's (read from its name, `ocp4-<lifecycle>-kv-<site>-<id>`).
+Everything else is the cluster's: KubeMacPool's range, read from the cluster (7.2), and the VM
+template's values (storage class, network, node selector), in the worker's ConfigMap. The worker refuses a request whose site
+or zone is not its own cluster's (both read from its name, `ocp4-<lifecycle>-kv-<site>-<zone>-<id>`).
 
-### 7.2 The MAC: half the cluster's, half random
+### 7.2 The MAC: KubeMacPool's, assigned
+
+**Changed 2026-11-25 (the operator):** the worker chart must carry no per-cluster value, so the
+per-cluster prefix below (`0e` + the cluster's VLAN ID) went, and with it the worker's own check
+of the MAC against every VM. Now:
+
+- **The VM is created with no MAC, and KubeMacPool assigns one** at admission, from its pool,
+  unique on the cluster and written into the VM's spec, so it stays the same across restarts.
+  The worker reads it back and returns it; the run needs it for the BareMetalHost.
+- **Never a requested MAC.** On cluster-qcl8n (2026-11-25) KubeMacPool admitted three Halted VMs
+  requesting the same MAC inside its own range, two in one namespace: it keeps unique only the
+  MACs it assigns. (A few hours that day the worker drew a MAC inside KubeMacPool's range and
+  requested it; that test removed it.)
+- **So every KV cluster must run KubeMacPool**, and the VM namespace must not be labelled
+  `mutatevirtualmachines.kubemacpool.io=ignore`. A VM that comes back without a MAC is deleted
+  and the create fails, `VmMacNotAssignedError`: a BareMetalHost needs a fixed boot MAC.
+- **Across clusters it is not solved yet, on purpose.** Each cluster keeps the random
+  `02:xx:xx` /24 KubeMacPool picked, and two clusters can share one. The range is to be set per
+  cluster in the HyperConverged object (`spec.networking.kubeMacPoolConfiguration`), later — for
+  instance from a hash of the cluster's name, with a check over every KV cluster name in git that
+  no two share a range.
+
+What it replaced (2026-11-20 to 2026-11-25):
 
 ```
 byte 0   bytes 1-2              bytes 3-5
 0e     : the cluster's VLAN ID : 3 random bytes
-        (12 bits)                drawn by the worker
 VLAN 1010 = 0x3F2  ->  0e:03:f2:a1:b2:c3
-VLAN 2    = 0x002  ->  0e:00:02:5d:0c:9e
 ```
 
-- **The first half is the KV cluster's own prefix**, `VM_MAC_PREFIX` in the worker's ConfigMap,
-  written **when the KV cluster is created** (section 9) and never on the hub. It is `0e`
-  followed by the VLAN ID the Segments Manager allocated to that cluster.
-- **Why it can never repeat across clusters:** the Segments Manager never gives one VLAN to two
-  clusters of a site, and every VM of an MCE boots on that site's inventory network. So two KV
-  clusters that could put VMs on the same network always have different prefixes, without either
-  one knowing the other.
-- **Why `0e`:** it marks the address as locally administered (never a real vendor's NIC, such as
-  a bare-metal server on the same network) and unicast. It is deliberately not `02`, the range
-  OpenShift Virtualization's KubeMacPool gives out, nor `0a`, which OVN-Kubernetes gives pods, so
-  no other software on the network draws from the same space.
-- **The second half is 3 random bytes**, drawn by the worker: 16.7 million MACs per cluster.
+A per-cluster `VM_MAC_PREFIX` in the worker's ConfigMap, unique within a site because the
+Segments Manager never gives one VLAN to two clusters of a site, with the worker's own check
+against every VM of its cluster as the guard, and KubeMacPool's refusal only one more draw.
 
-### 7.3 The name: the MAC in full
+### 7.3 The name: a serial
 
 ```
-ocp-<flavor>-kv<cpu>-<site>-<MAC, 12 hex digits without colons>
-ocp-c200-kv32-five-0e03f2a1b2c3
+ocp-<flavor>-kv<cpu>-<site>-<serial, 8 lowercase letters and digits>
+ocp-c200-kv32-five-k7q2m9xd
 ```
 
-- It follows the naming convention for a VM node. The full MAC makes the name unique wherever the
-  MAC is, so two VMs of the same flavor and size on two clusters of one site never share a name.
+- **The serial** is drawn by the worker, uniform over `a-z0-9`: 36^8 = 2.8 trillion values. It
+  is also the VM's SMBIOS serial (`firmware.serial`), as a bare-metal node's name carries its
+  serial (the convention's `<serial|mac>` field). The Agent's inventory reports it; kubevirt-redfish
+  reports no SerialNumber today, so server-scan still matches a VM's Agent by its hostname.
+- **Unique on its cluster by a check**: a name any VM of the cluster has, in any namespace, is
+  drawn again (Kubernetes refuses a duplicate only within one namespace). **Across a site's
+  clusters, by chance**: two of 10,000 VMs of one flavor and size at one site share a serial
+  about once in 55,000; such a clash fails add-server-to-mce on the existing BareMetalHost,
+  loudly, never silently.
+- Until 2026-11-25 the name carried the full MAC (`ocp-c200-kv32-five-0e03f2a1b2c3`), as the
+  convention says; with KubeMacPool assigning the MAC at creation, the name could no longer be
+  built from it. The convention still says the full MAC: a divergence to raise with its owner.
 - **The zone is not in the name** (convention §2): it is on the VM's label, and server-scan
   records it from the KV cluster.
-- The name is at most about 34 characters; Kubernetes allows 63.
+- The name is about 27 characters (`ocp-c200-kv32-five-k7q2m9xd`); Kubernetes allows 63.
 
 ### 7.4 The labels
 
 | label | value |
 | --- | --- |
 | `redbull.io/flavor` | `c200` |
-| `redbull.io/size` | `32c` |
+| `redbull.io/size` | `kv32` |
 | `redbull.io/site` | `five` |
 | `topology.kubernetes.io/zone` | `az1` |
 | `redbull.io/role` | `worker` (a tenant warm-pool VM) |
@@ -494,22 +591,21 @@ All inside one activity on the chosen cluster, while the run holds the zone's lo
 1. **Has this run already created its VM?** The worker looks for a VM labelled with the run's
    id. If one exists, an earlier attempt of the same activity created it and its answer was lost
    (a pod restart, a timed-out response); the worker returns that VM and draws nothing. Without
-   this step a retry would draw a new MAC, hence a new name, and create a second VM.
+   this step a retry would draw a new serial, hence a new name, and create a second VM.
 2. **Is the lease over?** If `create_before` has passed, the worker creates nothing and the
    activity fails ("the zone's lease ended before the create"). Step 1 comes first, so a retry
    still finds the VM it already created, whatever the time.
-3. **Draw** 3 random bytes, build the MAC and the name.
-4. **Is the MAC taken?** The worker checks it against every VM on its cluster, in every
-   namespace. The name alone is not enough: Kubernetes refuses a duplicate name only within one
-   namespace. A taken MAC is drawn again (back to 3).
-5. **Create** the VM Halted. If the API answers `AlreadyExists` (a VM of that name appeared),
-   draw again (back to 3).
-6. **At most 3 draws**, then the activity fails with "no free MAC after 3 draws", which fails the
-   run after the lock is released.
+3. **Draw** a serial, build the name. A name some VM of the cluster has, in any namespace, is
+   drawn again.
+4. **Create** the VM Halted, with no MAC. If the API answers `AlreadyExists` (a VM of that name
+   appeared), draw again (back to 3).
+5. **At most 3 draws**, then the activity fails with "no free VM name after 3 draws"
+   (`VmSerialExhaustedError`), and the run leaves the cluster.
+6. **Read back** the run's VMs: exactly one, carrying the MAC KubeMacPool gave it. Without a
+   MAC it is deleted and the activity fails (`VmMacNotAssignedError`).
 
-Because the zone's lock is held, no other run of ours creates a VM on that cluster at the same
-moment, so "check, then create" cannot race. The worker answers with the VM's name, MAC and
-namespace; the run needs the MAC for the BareMetalHost.
+The worker answers with the VM's name, MAC and namespace; the run needs the MAC for the
+BareMetalHost.
 
 ---
 
@@ -521,7 +617,8 @@ namespace; the run needs the MAC for the BareMetalHost.
 | A cluster's day1 file names no zone, or two | It is listed with that problem and never chosen. |
 | No cluster fits | The run releases the lock and fails, listing every cluster and its reason. Nothing was created. |
 | A cluster's worker is down | That cluster is skipped as `no-worker` after 30 seconds, and the next one is tried. Every run in the zone pays those 30 seconds until the worker is back. |
-| The MAC or name is already used | The worker draws again by itself, on the same cluster, at most 3 draws in total. The hub is not involved. |
+| The name is already used | The worker draws another serial by itself, on the same cluster, at most 3 draws in total. The hub is not involved. |
+| KubeMacPool gives the VM no MAC | The VM is deleted, `VmMacNotAssignedError`, and the run moves to the next cluster. |
 | The cluster refuses the VM for another reason (namespace missing, invalid request) | The run releases the lock and fails. |
 | The run dies while holding the lock | The lock passes to the next run after 5 minutes. |
 | The create is held up past the lease (the worker restarting) | The worker creates nothing after the lease's end, and the run fails with nothing created. The caller asks again. |
@@ -537,16 +634,16 @@ namespace; the run needs the MAC for the BareMetalHost.
 
 All of this happens **when the KV cluster is created**; nothing is set on the hub.
 
-1. **Its day1 file**, in its zone's seed folder (`ocp4-seed-<site>-<zone number>`), named
-   `ocp4-<lifecycle>-kv-<site>-<id>`. Its name is the cluster's name from then on. The seed folder
-   is how create-vm knows its zone (section 3); its NodePools set the same zone as
-   `topology.kubernetes.io/zone` in their `nodeLabels`. Its `vlanId` is the VLAN the Segments
+1. **Its day1 file**, in the folder of the seed that hosts it
+   (`ocp4-<lifecycle>-seed-<site>-<zone>-<id>`), named `ocp4-<lifecycle>-kv-<site>-<zone>-<id>`
+   with the seed's lifecycle, site and zone and the next free `id` letter of that zone. Its name
+   is the cluster's name from then on. Its NodePools set the same zone as
+   `topology.kubernetes.io/zone` in their `nodeLabels`; the name, the seed folder and the
+   NodePools must agree, or create-vm never uses it (section 3). Its `vlanId` is the VLAN the Segments
    Manager allocated to it.
 2. **The `vm-lifecycle-worker` chart** on the cluster, with its ConfigMap holding:
-   - `kvCluster`: exactly the day1 file's name. The worker reads its site from it.
-   - `VM_MAC_PREFIX`: `0e` + the cluster's VLAN ID (section 7.2), computed from the same
-     allocation, never typed in by hand. It is the only place the prefix is set; the VLAN ID
-     itself is not stored beside it.
+   - `kvCluster`: exactly the day1 file's name. The worker reads its site and zone from it.
+   - no MAC value (since 2026-11-25): KubeMacPool on the cluster assigns every VM's (7.2)
    - the VM template's values: storage class, network, node selector
    - and, beside it, the hub Temporal address and its CA
 3. **Its permissions**, all on its own cluster:
@@ -554,7 +651,7 @@ All of this happens **when the KV cluster is created**; nothing is set on the hu
    - get, list, create and delete VirtualMachines
    - get and delete DataVolumes
 
-The worker refuses to start without a valid `VM_MAC_PREFIX` (3 octets, `0e` first). A cluster
+A cluster
 that is in day1 but has no running worker is skipped as `no-worker` (section 6.4).
 
 The storage class must bind immediately and allow a `ReadWriteMany` + `Filesystem` volume. The
@@ -566,7 +663,7 @@ lab found that otherwise every root disk stays unbound and every run ends in the
 
 | | today | this design |
 | --- | --- | --- |
-| Which clusters exist | the day1 seed folder, read by the hub vm-lifecycle worker | the zone's seed folder in day1 (`ocp4-seed-<site>-<zone number>`), read by the `cluster-lifecycle-worker` with provision-cluster's token, through the shared day1 reader |
+| Which clusters exist | the day1 seed folder, read by the hub vm-lifecycle worker | the zone's seed folders in day1 (`ocp4-<lifecycle>-seed-<site>-<zone>-<id>`, the MCE's lifecycle), read by the `cluster-lifecycle-worker` with provision-cluster's token, through the shared day1 reader |
 | Where the figures come from | an HTTP agent (`kv-capacity`) on each cluster | the worker inside each cluster |
 | Order | best fit across all clusters | oldest first (the cluster's `id` letter), first that fits |
 | Two runs at once | can pick the same cluster and overbook it | cannot: one run per zone chooses and creates at a time |
@@ -582,12 +679,21 @@ lab found that otherwise every root disk stays unbound and every run ends in the
 
 ## 11. Known limits and open points
 
-1. **The naming convention is still a draft, and differs on the seed.** The listing (section 3)
-   relies on the seed being `ocp4-seed-<site>-<zone number>` (decided 2026-11-20), the zone
-   number matching the InfraEnv's `az<N>`, and the zone label on every KV NodePool. The draft
-   still names a seed `ocp4-<lifecycle>-seed-<site>-<id>` and must be updated to match.
-2. **Memory is `vCPUs × 8` GiB.** The InfraEnv name carries the vCPUs only. If a flavor ever has
-   another ratio, the ratio must come from the flavor, not from this rule.
+1. **The listing depends on the naming convention** (`Idan-Maimon/kubevirt-workflows`
+   `docs/naming-convention.md`, out of draft since 2026-11-22): seeds and KV clusters named
+   with their lifecycle, site and zone, and the zone label on every KV NodePool (section 3). A
+   seed or KV cluster named any other way is not listed, or is listed with a problem and never
+   used. The interim seed name `ocp4-seed-<site>-<zone number>` (2026-11-20 to 2026-11-22) is
+   gone and must not come back.
+2. **Memory is `vCPUs × 7.5` GiB, computed for the 128c-1024gb and 192c-1536gb node types**
+   (section 6.1.1). The InfraEnv name carries the vCPUs only. Any other node type, or another
+   RAM-per-core ratio, needs the table recomputed first: 64, 184 and 200 CPUs already leave a
+   size one VM short (7.375 fits every 8-GiB-per-core size). If a flavor ever has another ratio, the ratio must come from the flavor, not from this
+   rule. The platform naming convention (`kubevirt-workflows` `docs/naming-convention.md`)
+   names the size by vCPUs only (`kv<cpu>`) and defines no memory, so it needs no change; the
+   ratio is this repo's (`shared/infraenv_names.py`). The overhead formula was measured on OpenShift
+   Virtualization 4.22; upstream KubeVirt computes it the same way, but its constants are worth
+   one check (a running VM's launcher pod request) on the first upstream KV cluster.
 3. **A VLAN freed by a deleted KV cluster can be given to a new one**, which then gets the old
    prefix. That is safe only once the old cluster's VMs are gone, including their BareMetalHost
    and Agent records on the MCE.
@@ -620,7 +726,10 @@ design, ends `create-vm-placement-plan.md`; the current description is
 | Section | The design says | The code does |
 |---|---|---|
 | 7.1, 7.4, 7.5 | `request_id` is the run's workflow id; `redbull.io/created-by` carries it | Both carry the RUN id. A create-vm workflow id is a slot the next run reuses, so a VM keyed on it would be taken by the slot's next run as its own. The workflow id is the VM's annotation `redbull.io/workflow-id`. |
-| 7.2 | The `0e` prefix keeps clear of KubeMacPool's range | Unchanged, and uniqueness does NOT depend on KubeMacPool at all (the operator, 2026-11-20: the KV clusters will run upstream KubeVirt). The worker lists the cluster's VMs and compares MACs before every draw; a duplicate it is told of by the API afterwards only draws again. |
+| 7.2, 7.3 | The `0e` prefix keeps clear of KubeMacPool's range; the name is the MAC | Until 2026-11-25 as designed, with uniqueness the worker's own check, never KubeMacPool's. Since 2026-11-25 (the operator) as 7.2 and 7.3 now read: KubeMacPool assigns the MAC (it does not guard a requested one), the name carries an 8-character serial; `VM_MAC_PREFIX` and the worker's MAC check are gone; the range per cluster is the HyperConverged object's, later. |
 | 7.5 | A retried create finds its own VM | And a create that finds TWO VMs of its request keeps the oldest and deletes the other. An attempt ends inside its timeout, and one reaching the worker after `create_before` is refused. |
 | 8 | A failed run leaves no VM | A CANCELLED run leaves none either: it deletes the VM carrying its run id, then leaves the line or releases the lock. A terminated run runs no code and can leave one, found by its label. |
 | 4 | The lock's lease | A run takes at most three leases for one placement, then fails `KvZoneLeaseExpiredError`. |
+| 6.1 | 7.5 GiB per vCPU (even vCPUs), KubeVirt's overhead formula (2026-11-24) | As designed, since 2026-11-24: `MEMORY_GIB_PER_CPU = (15, 2)` and `vm_memory_gib` in `shared/infraenv_names.py`, `launcher_overhead_bytes` in `shared/vm_requests.py`. Only the InfraEnv parser at the API edge refuses an odd size; a VM's name and the figures read any size, so VMs created before the rule are still counted. No `workflow.patched()`: every golden replays unchanged. |
+| 4, 8 | A run releases the lock on every path, and a cancelled run rolls back | Only inside its OWN run's workflow task, on a failure or a cancel asked of that run — never in a `finally` (2026-11-24). A brain that shuts down drops the runs it had in memory, and Python throws their coroutines away inside another run's task: a release or a rollback sent from there was recorded in THAT run's history, which then never replayed. `create_vm.py` `_own_task` / `_cancel_requested`; CLAUDE.md §5; checker WF017. A dropped run does nothing on the way out and is replayed by the next brain. |
+| 5 | The create is out-waited on the chosen cluster and never moved | A cluster that fails the create (retried to its own 90-s deadline, or refused) is LEFT: fenced, checked for a VM of the run (kept if found), then the next cluster; one that cannot be checked gets a `delete-stray-vm` child (the operator, 2026-11-24). CLAUDE.md §4. |

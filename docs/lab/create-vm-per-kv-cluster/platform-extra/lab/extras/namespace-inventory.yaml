@@ -1,9 +1,0 @@
-# The namespace create-vm puts its VMs in (add-server-to-mce's `namespace`, default
-# `inventory`). On a real KubeVirt cluster the platform creates it as a kubevirt-redfish
-# chassis namespace; here it is a plain namespace, kept across test runs.
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: inventory
-  labels:
-    redbull.io/lab: create-vm

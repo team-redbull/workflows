@@ -1,4 +1,4 @@
-"""The VirtualMachine a KV cluster's worker builds, its MAC and its name
+"""The VirtualMachine a KV cluster's worker builds, its serial and its name
 (activities/vm_lifecycle/vm_spec.py). docs/design/create-vm-placement.md §7."""
 
 from __future__ import annotations
@@ -11,8 +11,8 @@ from tests.kv_fleet import REDFISH_LABEL, stopped_vm
 
 def _build(**overrides):
     values = dict(
-        namespace="inventory", flavor="c200", cpu=32, memory_gib=256, site="five", zone="az1",
-        mce="ocp4-prod-mce-five-a", mac="0e:03:f2:a1:b2:c3", request_id="0196f6a2-1111-7222-8333-444455556666",
+        namespace="inventory", flavor="c200", cpu=32, memory_gib=240, site="five", zone="az1",
+        mce="ocp4-prod-mce-five-a", serial="k7q2m9xd", request_id="0196f6a2-1111-7222-8333-444455556666",
         workflow_id="create-vm-ocp4-prod-mce-five-a_c200-kv32-az1_1", redfish_label=REDFISH_LABEL,
         storage_class_name="cephfs", network_name="openshift-cnv/vm-external-network",
         node_selector={}, root_disk_size="120Gi",
@@ -21,26 +21,36 @@ def _build(**overrides):
     return vm_spec.build(**values)
 
 
-class TestTheMac:
-    def test_it_is_the_clusters_prefix_and_three_drawn_bytes(self):
-        assert vm_spec.draw_mac("0e:03:f2", bytes([0xA1, 0xB2, 0xC3])) == "0e:03:f2:a1:b2:c3"
-        assert vm_spec.draw_mac("0E:00:02", bytes([0x5D, 0x0C, 0x9E])) == "0e:00:02:5d:0c:9e"
-        assert vm_spec.draw_mac("0e:00:02", bytes(3)) == "0e:00:02:00:00:00"
+class TestTheSerial:
+    """A VM's serial: 8 lowercase letters and digits, drawn by the worker, in its name and its SMBIOS serial."""
 
-    @pytest.mark.parametrize("drawn", [b"", b"\x01\x02", b"\x01\x02\x03\x04"])
-    def test_exactly_three_bytes_are_drawn(self, drawn):
-        with pytest.raises(ValueError):
-            vm_spec.draw_mac("0e:03:f2", drawn)
+    def test_eight_bytes_make_eight_characters(self):
+        assert vm_spec.draw_serial(lambda count: bytes([10, 6, 16, 28, 12, 35, 23, 3])) == "kgq2m9xd"
+        assert vm_spec.draw_serial(lambda count: bytes(count)) == "aaaaaaaa"
+
+    def test_a_byte_past_the_last_whole_alphabet_is_passed_over_so_every_character_is_as_likely(self):
+        """256 = 7 x 36 + 4: bytes 252..255 would make a..d likelier; they are skipped instead."""
+        drawn = iter([bytes([252, 253, 254, 255, 0, 1, 2, 3]), bytes([4, 5, 6, 7, 8, 9, 10, 11])])
+        assert vm_spec.draw_serial(lambda count: next(drawn)) == "abcdefgh"
+
+    def test_every_draw_is_a_serial_the_name_accepts(self):
+        import secrets
+
+        from shared.infraenv_names import vm_name
+
+        for _ in range(500):
+            serial = vm_spec.draw_serial(secrets.token_bytes)
+            assert len(serial) == 8 and vm_name("c200", 32, "five", serial).endswith(serial)
 
 
 class TestTheVirtualMachine:
-    def test_its_name_is_the_mac_in_full_and_its_root_disk_follows(self):
+    def test_its_name_carries_the_serial_and_its_root_disk_follows(self):
         vm = _build()
-        assert vm["metadata"]["name"] == "ocp-c200-kv32-five-0e03f2a1b2c3"
+        assert vm["metadata"]["name"] == "ocp-c200-kv32-five-k7q2m9xd"
         assert vm["metadata"]["namespace"] == "inventory"
-        assert vm_spec.root_disk_name(vm) == "ocp-c200-kv32-five-0e03f2a1b2c3-root"
-        assert vm["spec"]["dataVolumeTemplates"][0]["metadata"]["name"] == "ocp-c200-kv32-five-0e03f2a1b2c3-root"
-        assert vm["spec"]["template"]["metadata"]["labels"] == {"kubevirt.io/vm": "ocp-c200-kv32-five-0e03f2a1b2c3"}
+        assert vm_spec.root_disk_name(vm) == "ocp-c200-kv32-five-k7q2m9xd-root"
+        assert vm["spec"]["dataVolumeTemplates"][0]["metadata"]["name"] == "ocp-c200-kv32-five-k7q2m9xd-root"
+        assert vm["spec"]["template"]["metadata"]["labels"] == {"kubevirt.io/vm": "ocp-c200-kv32-five-k7q2m9xd"}
 
     @pytest.mark.parametrize(("cpu", "label"), [(1, "kv1"), (32, "kv32"), (256, "kv256")])
     def test_the_size_label_is_the_names_size_field(self, cpu, label):
@@ -72,15 +82,18 @@ class TestTheVirtualMachine:
         for value in _build(flavor="c200n", site="bat-yam", mce="ocp4-prod-mce-bat-yam-a")["metadata"]["labels"].values():
             assert len(value) <= 63 and label_value.fullmatch(value)
 
-    def test_it_is_halted_with_the_fixed_mac_on_the_clusters_network(self):
+    def test_it_is_halted_on_the_clusters_network_with_no_mac_and_its_serial(self):
+        """No MAC: KubeMacPool assigns one at admission (the operator, 2026-11-25). A MAC the
+        worker requested would not be guarded — KubeMacPool admits a duplicate requested one."""
         vm = _build()
         assert vm["apiVersion"] == "kubevirt.io/v1" and vm["kind"] == "VirtualMachine"
         assert vm["spec"]["runStrategy"] == "Halted"
         spec = vm["spec"]["template"]["spec"]
-        assert spec["domain"]["devices"]["interfaces"] == [{"name": "default", "macAddress": "0e:03:f2:a1:b2:c3", "bridge": {}}]
+        assert spec["domain"]["devices"]["interfaces"] == [{"name": "default", "bridge": {}}]
+        assert spec["domain"]["firmware"]["serial"] == "k7q2m9xd"
         assert spec["networks"] == [{"name": "default", "multus": {"networkName": "openshift-cnv/vm-external-network"}}]
         assert spec["evictionStrategy"] == "LiveMigrate"
-        assert vm_spec.mac_of(vm) == "0e:03:f2:a1:b2:c3"
+        assert vm_spec.mac_of(vm) is None
 
     @pytest.mark.parametrize(("cpu", "cores"), [(1, "1"), (8, "7"), (32, "30"), (64, "60")])
     def test_its_cpu_request_is_fifteen_sixteenths_floored_at_a_core(self, cpu, cores):
@@ -111,9 +124,9 @@ class TestTheVirtualMachine:
 
     def test_the_body_is_the_platforms_vm_yaml(self):
         """redbull-platform's vm.yaml is the TARGET (the operator, 2026-11-21). Here it is,
-        rendered for a 32-vCPU, 256 GiB VM on `basic`; the built VM must be exactly it plus
+        rendered for a 32-vCPU, 240 GiB VM on `basic`; the built VM must be exactly it plus
         what the workflow adds on purpose, each named below — nothing else may differ."""
-        name = "ocp-c200-kv32-five-0e03f2a1b2c3"
+        name = "ocp-c200-kv32-five-k7q2m9xd"
         vm_yaml = {
             "apiVersion": "kubevirt.io/v1",
             "kind": "VirtualMachine",
@@ -132,9 +145,9 @@ class TestTheVirtualMachine:
                         "evictionStrategy": "LiveMigrate",
                         "domain": {
                             "cpu": {"cores": 32},
-                            "memory": {"guest": "256Gi"},
-                            "resources": {"requests": {"cpu": "30", "memory": "256Gi"},
-                                          "limits": {"cpu": "32", "memory": "256Gi"}},
+                            "memory": {"guest": "240Gi"},
+                            "resources": {"requests": {"cpu": "30", "memory": "240Gi"},
+                                          "limits": {"cpu": "32", "memory": "240Gi"}},
                             "firmware": {"bootloader": {"efi": {"secureBoot": False}}},
                             "devices": {
                                 "blockMultiQueue": True,
@@ -153,15 +166,14 @@ class TestTheVirtualMachine:
         built = _build(storage_class_name="basic")
         # What the workflow adds on purpose: the namespace it creates in; its labels beside
         # the redfish one and the workflow id annotation (how a run finds its VM, how the
-        # placement counts it); and the FIXED MAC (KubeVirt re-randomises an unset one on every
-        # start, the BareMetalHost needs a fixed boot MAC, and the name is that MAC).
+        # placement counts it); and the SMBIOS serial (the name's serial, as a bare-metal
+        # node's name carries its serial). No MAC: KubeMacPool writes it in at admission.
         assert built["metadata"].pop("namespace") == "inventory"
         assert built["metadata"].pop("annotations") == {"redbull.io/workflow-id": "create-vm-ocp4-prod-mce-five-a_c200-kv32-az1_1"}
         assert built["metadata"]["labels"].pop("redbull.io/created-by")
         for key in ("redbull.io/flavor", "redbull.io/size", "redbull.io/site", "topology.kubernetes.io/zone", "redbull.io/role", "redbull.io/mce"):
             built["metadata"]["labels"].pop(key)
-        interface = built["spec"]["template"]["spec"]["domain"]["devices"]["interfaces"][0]
-        assert interface.pop("macAddress") == "0e:03:f2:a1:b2:c3"
+        assert built["spec"]["template"]["spec"]["domain"]["firmware"].pop("serial") == "k7q2m9xd"
         assert built == vm_yaml
 
     def test_one_vcpu_requests_one_core_where_vm_yaml_would_request_none(self):
@@ -175,16 +187,16 @@ class TestTheVirtualMachine:
         from activities.vm_lifecycle.cluster_figures import stopped_vm_request
         from shared.vm_requests import pod_cpu_millicores, pod_memory_bytes
 
-        assert stopped_vm_request(_build(cpu=32, memory_gib=256)) == (pod_cpu_millicores(32), pod_memory_bytes(256))
-        assert stopped_vm_request(_build(cpu=1, memory_gib=8)) == (pod_cpu_millicores(1), pod_memory_bytes(8))
+        assert stopped_vm_request(_build(cpu=32, memory_gib=240)) == (pod_cpu_millicores(32), pod_memory_bytes(32, 240))
+        assert stopped_vm_request(_build(cpu=2, memory_gib=15)) == (pod_cpu_millicores(2), pod_memory_bytes(2, 15))
 
 
 class TestWhatAVirtualMachineSays:
     def test_identity_and_size(self):
         vm = _build()
         assert vm_spec.created_by(vm) == "0196f6a2-1111-7222-8333-444455556666"
-        assert (vm_spec.cores(vm), vm_spec.memory_gib(vm)) == (32, 256)
-        assert vm_spec.macs(vm) == ["0e:03:f2:a1:b2:c3"]
+        assert (vm_spec.cores(vm), vm_spec.memory_gib(vm)) == (32, 240)
+        assert vm_spec.macs(vm) == []  # until KubeMacPool writes one in
 
     def test_a_vm_without_a_fixed_mac_or_a_label_says_none(self):
         other = stopped_vm("someone-elses", 8, 64, labels={})

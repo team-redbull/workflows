@@ -2,10 +2,11 @@
 its zone that has room, with a fixed MAC, ready for add-server-to-mce.
 
 An InfraEnv `<flavor>-kv<cpu>-<zone>` (its site is its MCE's) holds VMs of `<cpu>` vCPUs and
-`<cpu> × 8` GiB. A bare-metal InfraEnv has servers to draw; a KubeVirt one
+`<cpu> × 7.5` GiB. A bare-metal InfraEnv has servers to draw; a KubeVirt one
 has nothing until a VM exists. This run creates it: once it is Halted and
 labelled `redfish-enabled: "true"`, kubevirt-redfish exposes it as a Redfish
-system and server-scan lists it under its name, `ocp-<flavor>-kv<cpu>-<site>-<MAC>`.
+system and server-scan lists it under its name, `ocp-<flavor>-kv<cpu>-<site>-<serial>`
+(8 random letters and digits, also its SMBIOS serial; its MAC is KubeMacPool's).
 
 THE ZONE'S CLUSTERS COME FROM DAY1, THEIR NUMBERS FROM THE CLUSTERS THEMSELVES,
 ONLY ONE RUN AT A TIME CHOOSES IN A ZONE, AND THE CHOSEN CLUSTER BUILDS THE VM
@@ -30,12 +31,36 @@ ONLY ONE RUN AT A TIME CHOOSES IN A ZONE, AND THE CHOSEN CLUSTER BUILDS THE VM
                            failure. None fits: release, NoKvClusterFitsError
                            with the table summarised per reason.
   4. creating-vm           what the VM IS (flavor, vCPUs, memory, site, zone,
-                           MCE, namespace, this run's id, the lease's end) to
-                           the chosen cluster's worker, which draws the MAC,
-                           derives the name, builds the VirtualMachine and
-                           creates it Halted, drawing again by itself when a
-                           MAC is taken (3 draws). It creates nothing after
-                           the lease's end.
+                           MCE, namespace, this run's id, the create's
+                           deadline) to the chosen cluster's worker, which
+                           draws the serial, derives the name, builds the
+                           VirtualMachine and creates it Halted with no MAC —
+                           KubeMacPool assigns one — drawing again by itself
+                           when a name is taken (3 draws). It creates
+                           nothing after the deadline: _CREATE_ON_ONE_CLUSTER
+                           (90 s) from now, or the lease's end if sooner.
+     checking-kv-cluster   ONLY when that create FAILED — retried until its
+                           deadline (an outage, a worker gone), or refused for
+                           good (no namespace, a 403, no MAC from KubeMacPool…). The run
+                           does not fail: it MOVES ON to the next cluster (the
+                           operator, 2026-11-24), after making sure the cluster
+                           it leaves holds no VM of the run. It waits out the
+                           deadline plus _LEASE_GUARD — after that nothing of
+                           the run can still land there — then asks the cluster
+                           for its VM by the run-id label (the same create,
+                           whose deadline has now passed: it returns a VM the
+                           run already has there, and creates nothing):
+                             a VM is there   the create landed after all: the
+                                             run KEEPS it and goes on with it;
+                             none is there   the cluster is clean: a
+                                             `create-failed` row, next cluster;
+                             no answer       nobody can know. The run goes on
+                                             all the same and starts a
+                                             delete-stray-vm child, which
+                                             removes any VM of the run there
+                                             once the cluster answers
+                                             (`stray_cleanups`).
+                           Every cluster failing ends in NoKvClusterFitsError.
   5. releasing-zone-lock   as soon as the VM OBJECT exists — and on every
                            other path out of 3 and 4. The next run's figures
                            already count this VM, as a stopped VM: nothing is
@@ -73,6 +98,18 @@ create's answer was cut off, since that call may still land). Then the run
 ends CANCELED. TERMINATE runs no code: the lock passes on at the lease's end,
 and a VM it left is found by its `redbull.io/created-by` label.
 
+A RUN THAT IS DROPPED DOES NOTHING ON THE WAY OUT. A brain that shuts down drops
+the runs it had in memory without cancelling them; Python throws their
+coroutines away later, when it collects, INSIDE whatever workflow task is on
+the thread then — any workflow's, of any run. Code of this run that woke up
+there (a `finally`, an `except BaseException`) and gave the lease back, left
+the line or rolled back would write its signal or its activity into THAT
+run's history, which no replay of it ever produces again: the other run is
+stuck at its next replay. So every exit path acts only inside this run's own
+workflow task (`_own_task`), and never on anything but an ordinary failure or
+a cancel a person asked of THIS run (`_cancel_requested`). The run itself
+loses nothing: it is still open on the server, and the next brain replays it.
+
 The namespace is add-server-to-mce's `namespace`, verbatim: a kubevirt-redfish
 chassis namespace the platform created. Nothing is created on the MCE.
 """
@@ -96,6 +133,7 @@ from temporalio.exceptions import (
 with workflow.unsafe.imports_passed_through():
     from shared.consts import (
         CLUSTER_LIFECYCLE_ACTIVITY_QUEUE,
+        DELETE_STRAY_VM_WORKFLOW_QUEUE,
         KV_ZONE_LOCK_WORKFLOW_QUEUE,
         vm_lifecycle_activity_queue,
     )
@@ -109,10 +147,11 @@ with workflow.unsafe.imports_passed_through():
         VmDisappearedError,
         VmIdentityConflictError,
         VmLeaseExpiredError,
-        VmMacExhaustedError,
+        VmMacNotAssignedError,
         VmNamespaceNotFoundError,
         VmRequestRejectedError,
         VmRootDiskNotBoundError,
+        VmSerialExhaustedError,
     )
     from shared.interfaces.cluster_lifecycle import list_kv_clusters
     from shared.interfaces.vm_lifecycle import (
@@ -126,6 +165,8 @@ with workflow.unsafe.imports_passed_through():
         CreateVmProgress,
         CreateVmResult,
         CreateVmRunArgs,
+        DeleteStrayVmInput,
+        DeleteStrayVmRunArgs,
         KvClusterEntry,
         KvClusterFigures,
         KvClusterList,
@@ -143,10 +184,11 @@ with workflow.unsafe.imports_passed_through():
         VmReadyOutcome,
         VmReadyRequest,
     )
-    from shared.vm_requests import GIB, pod_cpu_millicores, pod_memory_bytes
-    from shared.workflow_ids import kv_zone_lock_workflow_id
+    from shared.vm_requests import gib_needed, pod_cpu_millicores, pod_memory_bytes
+    from shared.workflow_ids import delete_stray_vm_workflow_id, kv_zone_lock_workflow_id
 
 from workflow_domains.vm_lifecycle import placement
+from workflow_domains.vm_lifecycle.delete_stray_vm import DeleteStrayVmWorkflow
 from workflow_domains.vm_lifecycle.kv_zone_lock import LOCK_GRANTED_SIGNAL, KvZoneLockWorkflow
 
 # A git read on the cluster-lifecycle limb, as every git activity in the repo.
@@ -165,8 +207,18 @@ _FIGURES_SCHEDULE_TO_CLOSE_TIMEOUT = timedelta(seconds=120)
 # the cluster's API. The worker ends an attempt by itself well inside this
 # (vm_operations.CREATE_BUDGET_SECONDS + one call), so Temporal never starts a
 # second attempt beside a first. NO schedule_to_start: a worker that restarts
-# must not fail the run — the request's `create_before` bounds it instead.
+# is waited for — up to the create's own deadline below, which the worker
+# enforces (it creates nothing after it) and the hub bounds the call by.
 _CREATE_TIMEOUT = timedelta(seconds=90)
+# How long ONE cluster may keep failing the create (an outage, its worker gone)
+# before the run moves on to the next: the create's deadline is this from now,
+# or the lease's end less _LEASE_GUARD if that is sooner. Room for a worker pod
+# to be replaced; a cluster whose API is down costs a run this, the fence
+# (_LEASE_GUARD) and the check below: about 3¼ minutes.
+_CREATE_ON_ONE_CLUSTER = timedelta(seconds=90)
+# Asking a cluster that failed the create whether the VM landed there after all:
+# best effort, bounded. No answer and the run moves on with a delete-stray-vm child.
+_CHECK_DEADLINE = timedelta(minutes=1)
 _DELETE_TIMEOUT = timedelta(seconds=90)
 # The ready wait is ONE heartbeating activity on its own clock (CLAUDE.md §5):
 # `deadline` after this, with start_to_close only a margin past it.
@@ -193,6 +245,11 @@ _CANCEL_SETTLE = _CREATE_TIMEOUT + timedelta(seconds=30)
 _ROLLBACK_DELETE_DEADLINE = timedelta(minutes=10)
 
 # Activity-raised failures no retry can fix, as CLASSES (CLAUDE.md §5).
+# What the check of a cluster that failed the create may answer that PROVES the run has
+# no VM there: the deadline passed with no VM of the run found (VmLeaseExpiredError), or
+# the worker on the cluster's queue is another cluster's and refused it before anything.
+_CHECKED_CLEAN = (VmLeaseExpiredError.__name__, KvClusterMismatchError.__name__)
+
 _PERMANENT_ACTIVITY_ERRORS: tuple[type[Exception], ...] = (
     KvClusterAccessError,
     KvClusterMismatchError,
@@ -200,8 +257,9 @@ _PERMANENT_ACTIVITY_ERRORS: tuple[type[Exception], ...] = (
     VmNamespaceNotFoundError,
     VmRequestRejectedError,
     VmDisappearedError,
-    VmMacExhaustedError,
+    VmSerialExhaustedError,
     VmLeaseExpiredError,
+    VmMacNotAssignedError,
 )
 _RETRY_POLICY = RetryPolicy(
     initial_interval=timedelta(seconds=1),
@@ -231,6 +289,12 @@ def _activity_failure(err: ActivityError) -> str:
     return str(cause or err)[:300]
 
 
+def _end_read(lock: asyncio.Future) -> None:
+    """Read how a zone lock this run started ended, so that it is not left unread."""
+    if not lock.cancelled():
+        lock.exception()
+
+
 @workflow.defn
 class CreateVmWorkflow:
     @workflow.init
@@ -254,6 +318,26 @@ class CreateVmWorkflow:
         self._created: VmCreated | None = None
         self._removed = False
         self._cancel_rollback: str | None = None
+        # delete-stray-vm workflow ids, and the clusters they clean (see _after_a_failed_create).
+        self._stray_cleanups: list[str] = []
+        self._stray_clusters: list[str] = []
+        # This run, to tell its own workflow task from another run's (see _own_task).
+        self._run_id = workflow.info().run_id
+
+    def _own_task(self) -> bool:
+        """Whether this code is running inside THIS run's own workflow task.
+
+        `workflow.in_workflow()` alone only says that SOME workflow's task is on the thread:
+        true as well for a coroutine of a dropped run that Python is throwing away in the
+        middle of another run's task (the module docstring says how). Nothing on an exit
+        path may touch a workflow API without this.
+        """
+        return workflow.in_workflow() and workflow.info().run_id == self._run_id
+
+    def _cancel_requested(self) -> bool:
+        """A cancel a person asked of THIS run — never a worker dropping it from its cache
+        (that cancels its tasks too, with no reason set), never another run's cancel."""
+        return self._own_task() and workflow.cancellation_reason() is not None
 
     @workflow.query
     def progress(self) -> CreateVmProgress:
@@ -263,7 +347,7 @@ class CreateVmWorkflow:
             zone_lock=self._lock_id, lease_ends_at=self._lease.lease_ends_at if self._lease else None,
             leases=self._leases, kv_cluster=self._kv_cluster,
             vm_name=self._created.name if self._created else None, mac=self._created.mac if self._created else None,
-            cancel_rollback=self._cancel_rollback,
+            cancel_rollback=self._cancel_rollback, stray_cleanups=list(self._stray_cleanups),
         )
 
     @workflow.signal(name=LOCK_GRANTED_SIGNAL)
@@ -283,12 +367,13 @@ class CreateVmWorkflow:
         try:
             result = await self._run(run_args.input)
         except BaseException as err:
-            # Only a cancel a PERSON asked for rolls back. A worker dropping this run from its
-            # cache cancels its tasks too, and must run no workflow code on the way out.
-            cancel_requested = workflow.in_workflow() and workflow.cancellation_reason() is not None
+            # Only a cancel a PERSON asked of THIS run rolls back. A worker dropping the run from
+            # its cache cancels its tasks too, and a brain that shut down leaves its coroutine
+            # to be thrown away inside another run's task: neither may run workflow code here.
+            cancel_requested = self._cancel_requested()
             if cancel_requested and is_cancelled_exception(err):
                 await self._roll_back_after_cancel(run_args.input)
-            if cancel_requested or isinstance(err, Exception):
+            if self._own_task() and (cancel_requested or isinstance(err, Exception)):
                 await self._settle_handlers()
             raise
         await self._settle_handlers()
@@ -344,7 +429,7 @@ class CreateVmWorkflow:
             )
 
         # Steps 2-5 — under the zone's lock: choose the oldest cluster that fits, create the VM there.
-        vm_cpu, vm_memory = pod_cpu_millicores(request.cpu), pod_memory_bytes(request.memory_gib)
+        vm_cpu, vm_memory = pod_cpu_millicores(request.cpu), pod_memory_bytes(request.cpu, request.memory_gib)
         created: VmCreated | None = None
         while created is None:
             if self._leases >= _MAX_LEASES:
@@ -365,8 +450,14 @@ class CreateVmWorkflow:
                     "the zone lease ended at cluster %d of %d; asking for the lock again",
                     self._reached + 1, len(clusters),
                 )
-            finally:
-                await self._release(lease)
+            except BaseException as err:
+                # The zone goes back on a failure and on a cancel asked of this run — and on
+                # nothing else: NOT in a `finally`, which also runs when the run is dropped
+                # from a cache or its coroutine thrown away (the module docstring).
+                if isinstance(err, Exception) or self._cancel_requested():
+                    await self._release(lease)
+                raise
+            await self._release(lease)
 
         # Step 6 — its root disk, bounded, with the zone free again.
         self._phase = "awaiting-root-disk"
@@ -426,6 +517,7 @@ class CreateVmWorkflow:
             day1_revision=listed.revision, root_disk_phase=ready.root_disk_phase, created=created.created,
             draws=created.draws, leases=self._leases, infra_env=request.infra_env,
             mce_cluster=request.mce_cluster, site=request.site, zone=request.zone,
+            stray_cleanups=list(self._stray_cleanups),
         )
 
     # --- the zone's lock ---------------------------------------------------------------
@@ -444,7 +536,7 @@ class CreateVmWorkflow:
         """Join the line: start the zone's lock with this run as its first waiter, or — it
         already runs — signal it. The lock keeps a run in its line once, however often it asks."""
         try:
-            await workflow.start_child_workflow(
+            lock = await workflow.start_child_workflow(
                 KvZoneLockWorkflow.run,
                 KvZoneLockRunArgs(site=request.site, zone=request.zone, line=[me]),
                 id=self._lock_id,
@@ -452,6 +544,10 @@ class CreateVmWorkflow:
                 # The lock outlives every run that started it.
                 parent_close_policy=workflow.ParentClosePolicy.ABANDON,
             )
+            # Never awaited: the lock has no result. Should a person terminate it while this
+            # run is still open, its end is READ here — unread, asyncio logs it from the brain
+            # as an exception "never retrieved", a traceback for nothing that went wrong here.
+            lock.add_done_callback(_end_read)
         except WorkflowAlreadyStartedError:
             await self._tell_lock(KvZoneLockWorkflow.request_lock, me)
 
@@ -481,7 +577,7 @@ class CreateVmWorkflow:
             # A cancel while waiting: leave the line before going. (Not for a worker dropping
             # the run from its cache: the run is still waiting, on another worker.)
             self._awaiting_lock = False
-            if workflow.in_workflow() and workflow.cancellation_reason() is not None:
+            if self._cancel_requested():
                 await self._tell_lock(KvZoneLockWorkflow.withdraw, me)
             raise
         finally:
@@ -498,7 +594,7 @@ class CreateVmWorkflow:
 
     async def _release(self, lease: KvZoneLockGrant) -> None:
         """Give the lock back — on every path. A lease that already ended is ignored by the lock."""
-        if self._lease is not lease or not workflow.in_workflow():
+        if self._lease is not lease or not self._own_task():
             return
         previous, self._phase = self._phase, "releasing-zone-lock"
         self._lease = None
@@ -586,28 +682,125 @@ class CreateVmWorkflow:
             self._phase = "creating-vm"
             self._kv_cluster = entry.name
             queue = vm_lifecycle_activity_queue(entry.name)
+            now = workflow.now()
+            vm_request = VmCreateRequest(
+                kv_cluster=entry.name, namespace=request.namespace, flavor=request.flavor, cpu=request.cpu,
+                memory_gib=request.memory_gib, site=request.site, zone=request.zone, mce=request.mce_cluster,
+                request_id=me.run_id, workflow_id=me.workflow_id,
+                create_before=min(lease.lease_ends_at - _LEASE_GUARD, now + _CREATE_ON_ONE_CLUSTER),
+            )
             # Recorded BEFORE the call: a cancel stops waiting for it, not the call itself.
             self._create_sent = True
-            created: VmCreated = await workflow.execute_activity(
-                create_vm_on_cluster,
-                VmCreateRequest(
-                    kv_cluster=entry.name, namespace=request.namespace, flavor=request.flavor, cpu=request.cpu,
-                    memory_gib=request.memory_gib, site=request.site, zone=request.zone, mce=request.mce_cluster,
-                    request_id=me.run_id, workflow_id=me.workflow_id,
-                    create_before=lease.lease_ends_at - _LEASE_GUARD,
-                ),
-                task_queue=queue,
-                start_to_close_timeout=_CREATE_TIMEOUT,
-                retry_policy=_RETRY_POLICY,
-            )
+            try:
+                created: VmCreated = await workflow.execute_activity(
+                    create_vm_on_cluster,
+                    vm_request,
+                    task_queue=queue,
+                    start_to_close_timeout=_CREATE_TIMEOUT,
+                    # Retried up to the deadline and no further: the worker starts no create
+                    # after it, and one still in flight is what the fence below waits out.
+                    schedule_to_close_timeout=vm_request.create_before - now,
+                    retry_policy=_RETRY_POLICY,
+                )
+            except ActivityError as err:
+                if is_cancelled_exception(err):
+                    raise
+                kept = await self._after_a_failed_create(vm_request, answer, err)
+                if kept is None:
+                    # Moved on: this cluster holds no VM of the run, or its delete-stray-vm will see to it.
+                    self._kv_cluster, self._create_sent, self._not_read = None, False, []
+                    self._reached += 1
+                    self._phase = "choosing-kv-cluster"
+                    continue
+                created = kept
             self._created = created
             return created
+        strays = (
+            f" A VM of this run MAY remain on {', '.join(self._stray_clusters)} (the cluster failed "
+            "the create and could not be checked): its delete-stray-vm workflow removes it once the cluster answers."
+            if self._stray_cleanups else " Nothing was created."
+        )
         raise ApplicationError(
             f"no KV cluster of site {request.site} zone {request.zone} takes a VM of {request.cpu} vCPU / "
-            f"{request.memory_gib} GiB (pod request {vm_cpu} m / {vm_memory // GIB} GiB) under the "
-            f"{buffer_percent}% buffer: {placement.summarise_skips(self._table)}. Nothing was created.",
+            f"{request.memory_gib} GiB (pod request {vm_cpu} m / {gib_needed(vm_memory)}) under the "
+            f"{buffer_percent}% buffer: {placement.summarise_skips(self._table)}.{strays}",
             type=NoKvClusterFitsError.__name__,
         )
+
+    async def _after_a_failed_create(
+        self, vm_request: VmCreateRequest, figures: KvClusterFigures, failure: ActivityError
+    ) -> VmCreated | None:
+        """The cluster failed the create: the VM the run has there after all, or None to move on.
+
+        None only once the cluster is known to hold no VM of the run — or, when it
+        cannot even be asked, once a delete-stray-vm child is on its way to it.
+        """
+        name, why = vm_request.kv_cluster, _activity_failure(failure)
+        queue = vm_lifecycle_activity_queue(name)
+        self._phase = "checking-kv-cluster"
+        workflow.logger.warning("%s failed the create (%s); checking it holds no VM of this run", name, why)
+        # The create is over: past its deadline (the worker starts no create after it), or refused
+        # (its attempts ended). After the fence nothing of the run can still land there: the
+        # worker's clock may be 20 s behind, and one call may still be in flight (25 s).
+        over_at = min(vm_request.create_before, workflow.now())
+        fence = over_at + _LEASE_GUARD - workflow.now()
+        if fence > timedelta(0):
+            await workflow.sleep(fence)
+        # The same create, with a deadline that has passed: the worker returns the run's VM if one
+        # is there and can create NOTHING (VmLeaseExpiredError) — it only finds.
+        check = vm_request.model_copy(update={"create_before": over_at})
+        try:
+            found: VmCreated = await workflow.execute_activity(
+                create_vm_on_cluster,
+                check,
+                task_queue=queue,
+                start_to_close_timeout=_CREATE_TIMEOUT,
+                schedule_to_close_timeout=_CHECK_DEADLINE,
+                retry_policy=_RETRY_POLICY,
+            )
+        except ActivityError as err:
+            if is_cancelled_exception(err):
+                raise
+            cause = err.cause
+            if isinstance(cause, ApplicationError) and cause.type in _CHECKED_CLEAN:
+                self._record(KvClusterRow(
+                    name=name, skip_reason=placement.CREATE_FAILED, figures=figures,
+                    skip_detail=f"{why}; checked afterwards: no VM of this run is there"[:500],
+                ))
+                return None
+            cleanup = await self._start_stray_cleanup(vm_request, why)
+            self._record(KvClusterRow(
+                name=name, skip_reason=placement.CREATE_FAILED, figures=figures,
+                skip_detail=(
+                    f"{why}; could not be checked afterwards ({_activity_failure(err)}), so a VM of this run "
+                    f"MAY be there: {cleanup} removes it once the cluster answers"
+                )[:500],
+            ))
+            return None
+        workflow.logger.warning("%s had created %s/%s after all: the run keeps it", name, found.namespace, found.name)
+        return found
+
+    async def _start_stray_cleanup(self, vm_request: VmCreateRequest, why: str) -> str:
+        """Start the delete-stray-vm child for a cluster that could not be checked; its id."""
+        cleanup_id = delete_stray_vm_workflow_id(vm_request.kv_cluster, vm_request.request_id)
+        try:
+            cleanup = await workflow.start_child_workflow(
+                DeleteStrayVmWorkflow.run,
+                DeleteStrayVmRunArgs(input=DeleteStrayVmInput(
+                    kv_cluster=vm_request.kv_cluster, namespace=vm_request.namespace,
+                    request_id=vm_request.request_id, workflow_id=vm_request.workflow_id, why=why[:500],
+                )),
+                id=cleanup_id,
+                task_queue=DELETE_STRAY_VM_WORKFLOW_QUEUE,
+                # It outlives this run: an outage can outlast the run by days.
+                parent_close_policy=workflow.ParentClosePolicy.ABANDON,
+            )
+            cleanup.add_done_callback(_end_read)
+        except WorkflowAlreadyStartedError:
+            pass  # one per (cluster, run): already on its way
+        self._stray_cleanups.append(cleanup_id)
+        self._stray_clusters.append(vm_request.kv_cluster)
+        return cleanup_id
 
     # --- removing the run's own VM -----------------------------------------------------------
 
@@ -661,5 +854,7 @@ class CreateVmWorkflow:
                 await workflow.sleep(_CANCEL_SETTLE)
             self._cancel_rollback = await self._remove_best_effort(me, self._created, "cancelled")
         except BaseException as err:  # noqa: BLE001 — the rollback never raises; the cancel still ends the run
+            if not self._own_task():
+                raise  # not cut off but thrown away, inside another run's task: nothing more is done here
             self._cancel_rollback = f"cancelled; the rollback itself was cut off ({type(err).__name__}): a VM labelled redbull.io/created-by={me.run_id} may remain on {self._kv_cluster}"
             workflow.logger.warning(self._cancel_rollback)

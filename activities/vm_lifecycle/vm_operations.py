@@ -29,11 +29,12 @@ from shared.exceptions import (
     VmDisappearedError,
     VmIdentityConflictError,
     VmLeaseExpiredError,
-    VmMacExhaustedError,
+    VmMacNotAssignedError,
     VmNamespaceNotFoundError,
     VmRequestRejectedError,
+    VmSerialExhaustedError,
 )
-from shared.infraenv_names import InfraEnvNameError, vm_name
+from shared.infraenv_names import VM_SERIAL_LENGTH, InfraEnvNameError, vm_name
 from shared.models.vm_lifecycle import (
     KvClusterFigures,
     KvFiguresRequest,
@@ -45,8 +46,7 @@ from shared.models.vm_lifecycle import (
     VmReadyRequest,
 )
 
-# MACs drawn per create attempt: a used MAC, an AlreadyExists and a KubeMacPool
-# refusal each spend one.
+# Serials drawn per create attempt: a name some VM of the cluster has, or an AlreadyExists, spends one.
 MAX_DRAWS = 3
 # One create ATTEMPT starts no call to the cluster's API after this many seconds.
 # With one call's own bound on top (kubevirt_api.REQUEST_TIMEOUT) the attempt is
@@ -69,7 +69,6 @@ class ClusterValues:
 
     kv_cluster: str
     site: str
-    mac_prefix: str
     storage_class_name: str
     # The zone the cluster's name carries (`ocp4-prod-kv-five-az1-a`); None only where a
     # caller builds values without one, and then no request's zone is checked against it.
@@ -196,7 +195,7 @@ async def create_vm(
             f"{request.zone}: a VM goes into its InfraEnv's zone"
         )
     try:  # every field the name is built from, before anything is asked of the cluster
-        vm_name(request.flavor, request.cpu, request.site, vm_spec.draw_mac(cluster.mac_prefix, bytes(vm_spec.RANDOM_OCTETS)))
+        vm_name(request.flavor, request.cpu, request.site, "0" * VM_SERIAL_LENGTH)
     except InfraEnvNameError as err:
         raise VmRequestRejectedError(f"the request cannot name a VM: {err}") from None
 
@@ -226,6 +225,7 @@ async def create_vm(
     existing = await _the_one_vm_of(api, cluster, request.request_id, everything, spend, log)
     if existing is not None:
         log(f"VM {vm_spec.namespace_of(existing)}/{vm_spec.name_of(existing)} already carries request {request.request_id}")
+        await _require_mac(api, cluster, existing, spend)
         return _created(cluster, existing, created=False, draws=0)
 
     # 2 — the lease, then the namespace.
@@ -237,42 +237,41 @@ async def create_vm(
             "creates a VM namespace (a kubevirt-redfish chassis namespace), this run never does"
         )
 
-    # 3-5 — draw, check the MAC against every VM of the cluster (any namespace:
-    # Kubernetes refuses a duplicate NAME only within one), create Halted.
-    # THIS check is what keeps a MAC unique on the cluster — never KubeMacPool:
-    # plain KubeVirt has none, and OpenShift Virtualization's does not refuse a
-    # duplicate on a Halted VM (seen in the lab, 2026-11-20). Nothing races it:
-    # the run holds the zone's lock, so no other create of ours is under way
-    # here. Should a KubeMacPool refuse a MAC all the same, that is one more draw.
-    taken = {mac for vm in everything for mac in vm_spec.macs(vm)}
+    # 3-4 — draw a serial, name the VM after it, create it Halted with NO MAC: KubeMacPool
+    # assigns one from its pool, unique on the cluster (the operator, 2026-11-25). A name any
+    # VM of the cluster has, in any namespace (Kubernetes refuses a duplicate only within
+    # one), or an AlreadyExists, is one more draw. Nothing races the check: the run holds
+    # the zone's lock.
+    taken = {vm_spec.name_of(vm) for vm in everything}
     spent: list[str] = []
     for draw in range(1, MAX_DRAWS + 1):
-        mac = vm_spec.draw_mac(cluster.mac_prefix, random_bytes(vm_spec.RANDOM_OCTETS))
-        if mac in taken:
-            spent.append(f"{mac} (a VM of the cluster has it)")
-            log(f"draw {draw}: MAC {mac} is a VM's on {cluster.kv_cluster}; drawing again")
-            continue
+        serial = vm_spec.draw_serial(random_bytes)
         body = vm_spec.build(
             namespace=request.namespace, flavor=request.flavor, cpu=request.cpu, memory_gib=request.memory_gib,
-            site=request.site, zone=request.zone, mce=request.mce, mac=mac, request_id=request.request_id,
+            site=request.site, zone=request.zone, mce=request.mce, serial=serial, request_id=request.request_id,
             workflow_id=request.workflow_id, redfish_label=cluster.redfish_label,
             storage_class_name=cluster.storage_class_name, network_name=cluster.network_name,
             node_selector=cluster.node_selector, root_disk_size=cluster.root_disk_size,
         )
+        name = vm_spec.name_of(body)
+        if name in taken:
+            spent.append(f"{name} (a VM of the cluster has it)")
+            log(f"draw {draw}: {name} is taken on {cluster.kv_cluster}; drawing again")
+            continue
         spend("creating the VM")
         require_lease()
         try:
             created = await api.create_vm(request.namespace, body)
         except NameTaken as err:
-            taken.add(mac)
-            spent.append(f"{mac} (its name exists)")
-            log(f"draw {draw}: {vm_spec.name_of(body)} already exists ({err}); drawing again")
+            taken.add(name)
+            spent.append(f"{name} (it exists)")
+            log(f"draw {draw}: {name} already exists ({err}); drawing again")
             continue
         except MacRefused as err:
-            taken.add(mac)
-            spent.append(f"{mac} (KubeMacPool refused it)")
-            log(f"draw {draw}: MAC {mac} was refused ({err}); drawing again")
-            continue
+            raise VmMacNotAssignedError(
+                f"KubeMacPool on KV cluster {cluster.kv_cluster} refused to give {name} a MAC: {err}. "
+                "Nothing was created"
+            ) from None
         except NotFound as err:
             if not await api.namespace_exists(request.namespace):
                 raise VmNamespaceNotFoundError(
@@ -282,20 +281,41 @@ async def create_vm(
                 f"KV cluster {cluster.kv_cluster} does not serve VirtualMachines (404: {err}): "
                 "OpenShift Virtualization is not installed or not ready there"
             ) from None
-        # 6 — read back (CLAUDE.md §6): the run must hold exactly ONE VM here before its
-        # name is recorded. A create this run's EARLIER attempt was cut off from may have
-        # landed since the lookup above; then the older of the two is the run's.
+        # 5 — read back (CLAUDE.md §6): the run must hold exactly ONE VM here, WITH the MAC
+        # KubeMacPool gave it, before its name is recorded. A create this run's EARLIER
+        # attempt was cut off from may have landed since the lookup above; then the older
+        # of the two is the run's.
         spend("reading the run's VMs back")
         labelled = await api.list_vms(f"{vm_spec.CREATED_BY_LABEL}={request.request_id}")
-        kept = await _the_one_vm_of(api, cluster, request.request_id, labelled, spend, log)
-        if kept is not None and vm_spec.name_of(kept) != vm_spec.name_of(body):
-            return _created(cluster, kept, created=False, draws=draw)
-        # The API echoes the object; fall back to what was sent if it echoed less.
-        return _created(cluster, created if vm_spec.mac_of(created) else body, created=True, draws=draw)
-    raise VmMacExhaustedError(
-        f"no free MAC behind {cluster.mac_prefix} on KV cluster {cluster.kv_cluster} after {MAX_DRAWS} draws: "
-        f"{'; '.join(spent)}. Three in a row out of 16.7 million means the prefix is wrong or shared. "
+        kept = await _the_one_vm_of(api, cluster, request.request_id, labelled, spend, log) or created
+        await _require_mac(api, cluster, kept, spend)
+        return _created(cluster, kept, created=vm_spec.name_of(kept) == name, draws=draw)
+    raise VmSerialExhaustedError(
+        f"no free VM name on KV cluster {cluster.kv_cluster} after {MAX_DRAWS} draws: {'; '.join(spent)}. "
+        "Three taken names in a row out of 2.8 trillion serials means something else names VMs this way. "
         "Nothing was created"
+    )
+
+
+async def _require_mac(api: Any, cluster: ClusterValues, vm: dict, spend: Callable[[str], None]) -> None:
+    """The VM carries the MAC KubeMacPool gave it; without one it is deleted and the create fails.
+
+    A BareMetalHost needs a fixed boot MAC, and KubeVirt draws a new one on every start when
+    none is set: a VM without one is KubeMacPool missing (not installed, or the namespace
+    labelled `mutatevirtualmachines.kubemacpool.io=ignore`). Its VM and root disk are removed
+    here, so a retry finds nothing of this run and the run leaves the cluster clean."""
+    if vm_spec.mac_of(vm):
+        return
+    namespace, name = vm_spec.namespace_of(vm), vm_spec.name_of(vm)
+    spend(f"deleting {namespace}/{name}, which came back without a MAC")
+    await api.delete_vm(namespace, name, vm_spec.uid_of(vm))
+    root = vm_spec.root_disk_name(vm)
+    if root:
+        await api.delete_datavolume(namespace, root)
+    raise VmMacNotAssignedError(
+        f"VM {namespace}/{name} on KV cluster {cluster.kv_cluster} came back with no MAC: KubeMacPool did not "
+        f"assign one (it is not installed, or namespace {namespace} is labelled "
+        "mutatevirtualmachines.kubemacpool.io=ignore). The VM was deleted; nothing of this run is left"
     )
 
 

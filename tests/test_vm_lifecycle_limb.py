@@ -5,6 +5,8 @@ activities, and its settings. docs/design/create-vm-placement.md §6.3.3, §7.5.
 from __future__ import annotations
 
 import asyncio
+import copy
+import dataclasses
 import json
 import os
 from datetime import UTC, datetime, timedelta
@@ -26,12 +28,14 @@ from shared.exceptions import (
     VmDisappearedError,
     VmIdentityConflictError,
     VmLeaseExpiredError,
-    VmMacExhaustedError,
+    VmMacNotAssignedError,
     VmNamespaceNotFoundError,
     VmRequestRejectedError,
+    VmSerialExhaustedError,
 )
 from shared.models.vm_lifecycle import KvFiguresRequest, VmCreateRequest, VmDeleteRequest, VmReadyRequest
 from shared.settings.vm_lifecycle import VmLifecycleActivitySettings
+from shared.vm_requests import pod_memory_bytes
 from tests.kv_fleet import GIB, FakeKvCluster, node, stopped_vm
 
 KV = "ocp4-prod-kv-five-az1-a"
@@ -41,13 +45,21 @@ NOW = datetime(2026, 11, 20, 12, 0, tzinfo=UTC)
 
 def cluster(**kwargs) -> FakeKvCluster:
     kwargs.setdefault("nodes", [node("n1", 100, 1024)])
-    kwargs.setdefault("mac_prefix", "0e:03:f2")
+    # KubeMacPool's range on the cluster (cluster-qcl8n's): it gives 02:b0:96:00:00:00 first.
+    kwargs.setdefault("mac_range", ("02:b0:96:00:00:00", "02:b0:96:ff:ff:ff"))
     return FakeKvCluster(KV, **kwargs)
+
+
+def ser(serial: str) -> bytes:
+    """The eight random bytes of one draw that make this serial."""
+    from shared.infraenv_names import VM_SERIAL_ALPHABET
+
+    return bytes(VM_SERIAL_ALPHABET.index(char) for char in serial)
 
 
 def create_request(**overrides) -> VmCreateRequest:
     values = dict(
-        kv_cluster=KV, namespace="inventory", flavor="c200", cpu=32, memory_gib=256, site="five", zone="az1",
+        kv_cluster=KV, namespace="inventory", flavor="c200", cpu=32, memory_gib=240, site="five", zone="az1",
         mce="ocp4-prod-mce-five-a", request_id=RUN, workflow_id="create-vm-ocp4-prod-mce-five-a_c200-kv32-az1_1",
         create_before=NOW + timedelta(minutes=4),
     )
@@ -66,7 +78,7 @@ class TestReadFigures:
     async def test_the_figures_are_measured_from_the_four_lists(self):
         kv = cluster(nodes=[node("n1", 64, 512), node("n2", 64, 512)])
         kv.add_pod("n1", 10_000, 20 * GIB)
-        kv.add_vm(stopped_vm("vm-a", 32, 256))
+        kv.add_vm(stopped_vm("vm-a", 32, 240))
         figures = await vm_operations.read_figures(kv, kv.values, KvFiguresRequest(kv_cluster=KV))
         assert figures.readable and figures.kv_cluster == KV
         assert (figures.usable_nodes, figures.allocatable_cpu_millicores) == (2, 128_000)
@@ -83,7 +95,7 @@ class TestReadFigures:
             return await original(label_selector)
 
         kv.list_vms = spy
-        kv.add_vm(stopped_vm("unlabelled", 8, 64, labels={}))
+        kv.add_vm(stopped_vm("unlabelled", 8, 60, labels={}))
         figures = await vm_operations.read_figures(kv, kv.values, KvFiguresRequest(kv_cluster=KV))
         assert seen == ["redfish-enabled=true"] and figures.stopped_vms == 0
 
@@ -136,12 +148,13 @@ class TestReadFigures:
 
 
 class TestCreateVm:
-    async def test_the_worker_draws_the_mac_names_the_vm_and_creates_it_halted(self):
+    async def test_the_worker_draws_a_serial_and_kubemacpool_gives_the_mac(self):
         kv = cluster()
-        kv.draws = [bytes([0xA1, 0xB2, 0xC3])]
+        kv.draws = [ser("k7q2m9xd")]
         created = await create(kv)
-        assert (created.name, created.mac, created.namespace) == ("ocp-c200-kv32-five-0e03f2a1b2c3", "0e:03:f2:a1:b2:c3", "inventory")
-        assert (created.created, created.draws, created.kv_cluster, created.cpu, created.memory_gib) == (True, 1, KV, 32, 256)
+        assert (created.name, created.mac, created.namespace) == ("ocp-c200-kv32-five-k7q2m9xd", "02:b0:96:00:00:00", "inventory")
+        assert kv.vms[("inventory", created.name)]["spec"]["template"]["spec"]["domain"]["firmware"]["serial"] == "k7q2m9xd"
+        assert (created.created, created.draws, created.kv_cluster, created.cpu, created.memory_gib) == (True, 1, KV, 32, 240)
         vm = kv.vms[("inventory", created.name)]
         assert vm["spec"]["runStrategy"] == "Halted" and vm_spec.created_by(vm) == RUN
         assert vm["metadata"]["labels"]["topology.kubernetes.io/zone"] == "az1"
@@ -155,15 +168,16 @@ class TestCreateVm:
         await create(kv)
         after = await kv.figures()
         assert (before.stopped_vms, after.stopped_vms) == (0, 1)
-        assert after.stopped_vms_cpu_millicores == 30_000 and after.stopped_vms_memory_bytes == 257 * GIB
+        assert after.stopped_vms_cpu_millicores == 30_000
+        assert after.stopped_vms_memory_bytes == pod_memory_bytes(32, 240) == 240 * GIB + 1036 * 1024**2
 
     async def test_a_retry_finds_the_vm_its_request_already_created_and_draws_nothing(self):
         kv = cluster()
         first = await create(kv)
-        kv.draws = [bytes([9, 9, 9])]
+        kv.draws = [ser("zzzzzzzz")]
         again = await create(kv)
         assert (again.name, again.mac, again.created, again.draws) == (first.name, first.mac, False, 0)
-        assert len(kv.vms) == 1 and kv.draws == [bytes([9, 9, 9])]  # nothing drawn, nothing created
+        assert len(kv.vms) == 1 and kv.draws == [ser("zzzzzzzz")]  # nothing drawn, nothing created
         assert kv.calls.count("create_vm") == 1
 
     async def test_a_retry_after_the_lease_still_returns_the_vm_it_created(self):
@@ -200,78 +214,83 @@ class TestCreateVm:
             await vm_operations.create_vm(kv, kv.values, create_request(), now=lambda: clock["now"], random_bytes=kv.random_bytes)
         assert kv.vms == {}
 
-    async def test_a_mac_a_vm_of_the_cluster_already_has_is_drawn_again_without_a_create(self):
+    async def test_the_worker_never_requests_a_mac(self):
+        """KubeMacPool admits a duplicate REQUESTED MAC (cluster-qcl8n, 2026-11-25): only a MAC it
+        assigns itself is kept unique, so the VM is created with none."""
         kv = cluster()
-        kv.add_vm(stopped_vm("someone", 8, 64, namespace="server-scan-vms", mac="0E:03:F2:01:02:03", labels={}))
-        kv.namespaces.add("server-scan-vms")
-        kv.draws = [bytes([1, 2, 3]), bytes([4, 5, 6])]
+        sent = []
+        original = kv.create_vm
+
+        async def spy(namespace, body):
+            sent.append(copy.deepcopy(body))
+            return await original(namespace, body)
+
+        kv.create_vm = spy
         created = await create(kv)
-        assert (created.mac, created.draws) == ("0e:03:f2:04:05:06", 2)
-        assert kv.calls.count("create_vm") == 1  # the taken MAC cost no round trip to the API
+        assert vm_spec.mac_of(sent[0]) is None and created.mac == "02:b0:96:00:00:00"
 
-    async def test_mac_uniqueness_never_depends_on_kubemacpool(self):
-        """Plain KubeVirt has no KubeMacPool, and OpenShift Virtualization's lets a duplicate MAC
-        through on a Halted VM: the worker's own check is the only guard, in every namespace."""
-        kv = cluster(kubemacpool=False, namespaces=("inventory", "other", "server-scan-vms"))
-        kv.add_vm(stopped_vm("in-another-namespace", 8, 64, namespace="other", mac="0e:03:f2:0a:0a:0a", labels={}))
-        kv.add_vm(stopped_vm("running-somewhere", 8, 64, namespace="server-scan-vms", mac="0E:03:F2:0B:0B:0B"))
-        kv.start("server-scan-vms", "running-somewhere", "n1")
-        kv.draws = [bytes([0x0A, 0x0A, 0x0A]), bytes([0x0B, 0x0B, 0x0B]), bytes([0x0C, 0x0C, 0x0C])]
+    async def test_kubemacpool_gives_a_mac_no_vm_of_the_cluster_holds_in_any_namespace(self):
+        kv = cluster(namespaces=("inventory", "other"))
+        kv.add_vm(stopped_vm("someone", 8, 60, namespace="other", mac="02:B0:96:00:00:00", labels={}))
         created = await create(kv)
-        assert (created.mac, created.draws) == ("0e:03:f2:0c:0c:0c", 3)
-        assert kv.calls.count("create_vm") == 1  # the API was never asked to take a used MAC
-        assert len(set(kv.macs())) == len(kv.macs()) == 3
+        assert created.mac == "02:b0:96:00:00:01"
+        assert len(set(kv.macs())) == len(kv.macs()) == 2
 
-    async def test_without_kubemacpool_a_hundred_creates_on_a_crowded_prefix_never_share_a_mac(self):
-        import random
-
-        kv = cluster(kubemacpool=False)
-        # A tiny random space (the last octet only), so draws collide all the time.
-        rng = random.Random(7)
-        kv.random_bytes = lambda count: bytes([0, 0, rng.randrange(256)])
-        made = 0
-        for index in range(150):
-            try:
-                await create(kv, create_request(request_id=f"run-{index}"))
-                made += 1
-            except VmMacExhaustedError:
-                pass  # three taken draws in a row: nothing created, never a duplicate
-        assert made > 100 and len(kv.macs()) == made == len(set(kv.macs())) == len(kv.vms)
+    async def test_a_name_any_vm_of_the_cluster_has_is_drawn_again_without_a_create(self):
+        """Kubernetes refuses a duplicate name only within one namespace: the worker checks them all."""
+        kv = cluster(namespaces=("inventory", "other"))
+        kv.add_vm(stopped_vm("ocp-c200-kv32-five-aaaaaaaa", 8, 60, namespace="other", labels={}))
+        kv.draws = [ser("aaaaaaaa"), ser("bbbbbbbb")]
+        created = await create(kv)
+        assert (created.name, created.draws) == ("ocp-c200-kv32-five-bbbbbbbb", 2)
+        assert kv.calls.count("create_vm") == 1  # the taken name cost no round trip to the API
 
     async def test_an_already_exists_is_drawn_again(self):
         kv = cluster()
         kv.fail("create_vm", NameTaken("already exists"))
-        kv.draws = [bytes([1, 1, 1]), bytes([2, 2, 2])]
+        kv.draws = [ser("aaaaaaaa"), ser("bbbbbbbb")]
         created = await create(kv)
-        assert (created.mac, created.draws) == ("0e:03:f2:02:02:02", 2) and len(kv.vms) == 1
+        assert (created.name, created.draws) == ("ocp-c200-kv32-five-bbbbbbbb", 2) and len(kv.vms) == 1
 
-    async def test_kubemacpool_refusing_the_mac_is_drawn_again(self):
+    async def test_three_taken_names_fail_with_nothing_created(self):
         kv = cluster()
-        kv.fail("create_vm", MacRefused("failed to allocate requested mac address"))
-        created = await create(kv)
-        assert created.draws == 2 and len(kv.vms) == 1
-
-    async def test_a_name_that_exists_in_the_namespace_is_refused_by_the_cluster_itself(self):
-        # Same flavor, size, site and MAC -> the same name: the fake API answers AlreadyExists.
-        kv = cluster(kubemacpool=False)
-        kv.draws = [bytes([7, 7, 7])]
-        first = await create(kv, create_request(request_id="run-1"))
-        # Pretend the MAC list missed it (no fixed MAC readable): only the name collides.
-        kv.vms[("inventory", first.name)]["spec"]["template"]["spec"]["domain"]["devices"]["interfaces"][0].pop("macAddress")
-        kv.draws = [bytes([7, 7, 7]), bytes([8, 8, 8])]
-        second = await create(kv, create_request(request_id="run-2"))
-        assert second.draws == 2 and second.name.endswith("0e03f2080808")
-
-    async def test_three_taken_draws_fail_with_nothing_created(self):
-        kv = cluster()
-        kv.add_vm(stopped_vm("a", 8, 64, mac="0e:03:f2:01:01:01"))
-        kv.draws = [bytes([1, 1, 1]), bytes([2, 2, 2]), bytes([3, 3, 3])]
-        kv.fail("create_vm", NameTaken("exists"), MacRefused("failed to allocate requested mac address"))
-        with pytest.raises(VmMacExhaustedError) as raised:
+        kv.add_vm(stopped_vm("ocp-c200-kv32-five-aaaaaaaa", 8, 60, labels={}))
+        kv.draws = [ser("aaaaaaaa"), ser("bbbbbbbb"), ser("cccccccc")]
+        kv.fail("create_vm", NameTaken("exists"), NameTaken("exists"))
+        with pytest.raises(VmSerialExhaustedError) as raised:
             await create(kv)
         said = str(raised.value)
-        assert "after 3 draws" in said and "0e:03:f2:01:01:01" in said and "Nothing was created" in said
+        assert "after 3 draws" in said and "ocp-c200-kv32-five-aaaaaaaa" in said and "Nothing was created" in said
         assert len(kv.vms) == 1 and kv.calls.count("create_vm") == 2
+
+    async def test_without_kubemacpool_the_vm_is_deleted_and_the_create_fails(self):
+        """A VM without a MAC cannot be a BareMetalHost (KubeVirt draws a new one on every start)."""
+        kv = cluster(kubemacpool=False)
+        with pytest.raises(VmMacNotAssignedError, match="came back with no MAC") as raised:
+            await create(kv)
+        assert "mutatevirtualmachines.kubemacpool.io=ignore" in str(raised.value)
+        assert kv.vms == {} and kv.datavolumes == {} and len(kv.deleted) == 1
+
+    async def test_a_retry_that_finds_its_vm_without_a_mac_removes_it_too(self):
+        kv = cluster(kubemacpool=False)
+        kv.add_vm(stopped_vm("ocp-c200-kv32-five-aaaaaaaa", 8, 60, labels={"redbull.io/created-by": RUN}))
+        with pytest.raises(VmMacNotAssignedError):
+            await create(kv)
+        assert kv.vms == {} and "create_vm" not in kv.calls
+
+    async def test_kubemacpool_refusing_to_give_a_mac_fails_the_create(self):
+        kv = cluster()
+        kv.fail("create_vm", MacRefused("failed to allocate requested mac address"))
+        with pytest.raises(VmMacNotAssignedError, match="refused"):
+            await create(kv)
+        assert kv.vms == {}
+
+    async def test_a_hundred_and_fifty_creates_never_share_a_mac_or_a_name(self):
+        kv = cluster(mac_range=("02:b0:96:00:00:00", "02:b0:96:00:00:ff"))
+        for index in range(150):
+            await create(kv, create_request(request_id=f"run-{index}"))
+        assert len(kv.macs()) == 150 == len(set(kv.macs())) == len(kv.vms) == len(set(kv.vm_names))
+        assert all(kv.in_range(mac) for mac in kv.macs())
 
     async def test_a_missing_namespace_is_named_and_nothing_is_drawn(self):
         kv = cluster(namespaces=())
@@ -352,7 +371,8 @@ class TestCreateVm:
         assert kv.calls == []
 
     async def test_the_clusters_own_values_shape_the_vm(self):
-        kv = FakeKvCluster(KV, nodes=[node("n1", 100, 1024)], mac_prefix="0e:0f:ff", node_selector={"role": "vm"})
+        kv = FakeKvCluster(KV, nodes=[node("n1", 100, 1024)], mac_range=("0e:0f:ff:00:00:00", "0e:0f:ff:ff:ff:ff"),
+                           node_selector={"role": "vm"})
         created = await create(kv)
         vm = kv.vms[("inventory", created.name)]
         assert created.mac.startswith("0e:0f:ff:")
@@ -434,8 +454,8 @@ class TestCreateVm:
         async def the_first_attempts_vm_lands_first(namespace, body):
             if not late:
                 earlier = vm_spec.build(
-                    namespace="inventory", flavor="c200", cpu=32, memory_gib=256, site="five", zone="az1",
-                    mce="ocp4-prod-mce-five-a", mac="0e:03:f2:00:00:01", request_id=RUN, workflow_id=None,
+                    namespace="inventory", flavor="c200", cpu=32, memory_gib=240, site="five", zone="az1",
+                    mce="ocp4-prod-mce-five-a", serial="earlier1", request_id=RUN, workflow_id=None,
                     redfish_label=kv.values.redfish_label, storage_class_name="cephfs", network_name=kv.values.network_name,
                     node_selector={}, root_disk_size="120Gi",
                 )
@@ -444,7 +464,7 @@ class TestCreateVm:
 
         kv.create_vm = the_first_attempts_vm_lands_first
         answered = await create(kv)
-        assert (answered.name, answered.mac, answered.created) == (late["name"], "0e:03:f2:00:00:01", False)
+        assert (answered.name, answered.mac, answered.created) == (late["name"], "02:b0:96:00:00:00", False)
         assert kv.vm_names == [late["name"]] and len(kv.datavolumes) == 1  # the surplus VM and its disk are gone
         assert (await kv.figures()).stopped_vms == 1
 
@@ -453,20 +473,20 @@ class TestCreateVm:
         first = await create(kv, create_request(request_id="twice"))
         # A second VM of the same run, made by an attempt that never saw the first.
         twin = dict(kv.vms[("inventory", first.name)])
-        twin = {**twin, "metadata": {**twin["metadata"], "name": "ocp-c200-kv32-five-0e03f2ffffff", "uid": "twin",
+        twin = {**twin, "metadata": {**twin["metadata"], "name": "ocp-c200-kv32-five-twin0000", "uid": "twin",
                                     "creationTimestamp": "2099-01-01T00:00:00+00:00"}}
-        kv.vms[("inventory", "ocp-c200-kv32-five-0e03f2ffffff")] = twin
+        kv.vms[("inventory", "ocp-c200-kv32-five-twin0000")] = twin
         for _ in range(2):  # whichever attempt meets them, and however often
             answered = await create(kv, create_request(request_id="twice"))
             assert (answered.name, answered.created, answered.draws) == (first.name, False, 0)
         assert kv.vm_names == [first.name]
 
-    async def test_ten_thousand_draws_never_leave_the_prefix_or_repeat_a_name(self):
+    async def test_three_hundred_draws_never_leave_the_range_or_repeat_a_name(self):
         kv = cluster()
         names = set()
         for index in range(300):
             created = await create(kv, create_request(request_id=f"run-{index}"))
-            assert created.mac.startswith("0e:03:f2:") and created.name.endswith(created.mac.replace(":", ""))
+            assert kv.in_range(created.mac) and len(created.name.rsplit("-", 1)[1]) == 8
             names.add(created.name)
         assert len(names) == 300 == len(kv.vms) == len(set(kv.macs()))
 
@@ -606,7 +626,7 @@ class TestDeleteVm:
 
     async def test_a_vm_without_our_label_is_never_deleted_whatever_its_name(self):
         kv = cluster()
-        kv.add_vm(stopped_vm("hand-made", 8, 64, mac="0e:03:f2:00:00:01"))
+        kv.add_vm(stopped_vm("hand-made", 8, 60, mac="0e:03:f2:00:00:01"))
         with pytest.raises(VmIdentityConflictError):
             await vm_operations.delete_vm(kv, kv.values, delete_request(name="hand-made", mac="0e:03:f2:00:00:01"))
         assert kv.vm_names == ["hand-made"]
@@ -912,7 +932,7 @@ def bound(monkeypatch):
 class TestTheActivities:
     def test_the_worker_is_bound_to_its_own_cluster_from_its_settings(self):
         assert limb._cluster.kv_cluster == "ocp4-prod-kv-five-az1-a" and limb._cluster.site == "five"
-        assert limb._cluster.mac_prefix == "0e:03:f2" and limb._cluster.storage_class_name == "test-cephfs"
+        assert limb._cluster.storage_class_name == "test-cephfs"
         assert limb._cluster.redfish_label == ("redfish-enabled", "true")
         assert isinstance(limb._api, KubevirtApi)
 
@@ -921,7 +941,7 @@ class TestTheActivities:
         figures = await env.run(limb.read_kv_cluster_figures, KvFiguresRequest(kv_cluster=KV))
         assert figures.readable and figures.stopped_vms == 0
         created = await env.run(limb.create_vm_on_cluster, create_request(create_before=datetime.now(UTC) + timedelta(minutes=4)))
-        assert created.created and created.mac.startswith("0e:03:f2:")
+        assert created.created and created.mac == "02:b0:96:00:00:00"  # KubeMacPool's
         beats: list = []
         env.on_heartbeat = lambda *details: beats.append(details)
         ready = await env.run(limb.await_vm_ready, VmReadyRequest(kv_cluster=KV, namespace="inventory", name=created.name))
@@ -934,13 +954,13 @@ class TestTheActivities:
         with pytest.raises(VmLeaseExpiredError):
             await env.run(limb.create_vm_on_cluster, create_request(create_before=datetime.now(UTC) - timedelta(seconds=1)))
 
-    async def test_the_macs_are_drawn_from_the_systems_randomness(self, bound):
+    async def test_the_serials_are_drawn_from_the_systems_randomness(self, bound):
         env = ActivityEnvironment()
-        macs = set()
+        names = set()
         for index in range(20):
             request = create_request(request_id=f"run-{index}", create_before=datetime.now(UTC) + timedelta(minutes=4))
-            macs.add((await env.run(limb.create_vm_on_cluster, request)).mac)
-        assert len(macs) == 20
+            names.add((await env.run(limb.create_vm_on_cluster, request)).name)
+        assert len(names) == 20 and bound.draws == []  # none came from the fake's queue
 
     async def test_the_wait_resumes_its_clock_from_the_heartbeat(self, bound, monkeypatch):
         bound.storage = "wffc"
@@ -986,7 +1006,7 @@ class TestTheActivities:
 
 
 def settings(**overrides) -> VmLifecycleActivitySettings:
-    values = dict(kv_cluster="ocp4-prod-kv-five-az1-a", vm_mac_prefix="0e:03:f2", vm_storage_class_name="cephfs")
+    values = dict(kv_cluster="ocp4-prod-kv-five-az1-a", vm_storage_class_name="cephfs")
     values.update(overrides)
     with mock.patch.dict(os.environ):
         os.environ.pop("VM_NETWORK_NAME", None)
@@ -1012,25 +1032,19 @@ class TestSettings:
         with pytest.raises(ValidationError):
             settings(kv_cluster=name)
 
-    def test_the_three_required_keys_have_no_default(self, monkeypatch):
-        for key in ("KV_CLUSTER", "VM_MAC_PREFIX", "VM_STORAGE_CLASS_NAME"):
+    def test_the_two_required_keys_have_no_default(self, monkeypatch):
+        """No per-cluster MAC value: the MAC comes from KubeMacPool's range on the cluster."""
+        for key in ("KV_CLUSTER", "VM_STORAGE_CLASS_NAME"):
             monkeypatch.delenv(key)
         with pytest.raises(ValidationError) as raised:
             VmLifecycleActivitySettings()
-        assert {error["loc"][0] for error in raised.value.errors()} == {
-            "kv_cluster", "vm_mac_prefix", "vm_storage_class_name",
-        }
+        assert {error["loc"][0] for error in raised.value.errors()} == {"kv_cluster", "vm_storage_class_name"}
 
-    @pytest.mark.parametrize(("prefix", "stored"), [("0e:03:f2", "0e:03:f2"), ("0E:00:02", "0e:00:02"), (" 0e:0f:ff ", "0e:0f:ff")])
-    def test_the_prefix_is_three_octets_behind_0e(self, prefix, stored):
-        assert settings(vm_mac_prefix=prefix).vm_mac_prefix == stored
-
-    @pytest.mark.parametrize(
-        "prefix", ["02:03:f2", "0a:03:f2", "0f:03:f2", "0e:03", "0e:03:f2:a1", "0e03f2", "0e-03-f2", "0e:03:fz", "", "0e:3:f2"],
-    )
-    def test_any_other_prefix_stops_the_worker(self, prefix):
-        with pytest.raises(ValidationError):
-            settings(vm_mac_prefix=prefix)
+    def test_an_old_charts_mac_prefix_is_ignored(self, monkeypatch):
+        """A chart rendered before the change still sets VM_MAC_PREFIX: the worker starts anyway."""
+        monkeypatch.setenv("VM_MAC_PREFIX", "0e:03:f2")
+        assert not hasattr(VmLifecycleActivitySettings(), "vm_mac_prefix")
+        assert not any("mac" in field for field in VmLifecycleActivitySettings.model_fields)  # no MAC value at all
 
     def test_the_vm_values_are_parsed_from_the_environment(self, monkeypatch):
         monkeypatch.setenv("VM_NETWORK_NAME", "inventory/vlan1010")
@@ -1068,14 +1082,34 @@ class TestSettings:
         if shutil.which("helm") is None:
             pytest.skip("needs helm")
         chart = pathlib.Path(__file__).resolve().parent.parent / "deploy" / "charts" / "vm-lifecycle-worker"
-        base = ["helm", "template", "x", str(chart), "--set", "kvCluster=ocp4-prod-kv-five-az1-a", "--set",
-                "config.vmMacPrefix=0e:03:f2", "--set", "vm.storageClassName=basic", "--set", "temporal.host=t:7233"]
+        base = ["helm", "template", "x", str(chart), "--set", "kvCluster=ocp4-prod-kv-five-az1-a",
+                "--set", "vm.storageClassName=basic", "--set", "temporal.host=t:7233"]
         default = subprocess.run(base, capture_output=True, text=True)
         assert default.returncode == 0 and 'VM_NETWORK_NAME: "openshift-cnv/vm-external-network"' in default.stdout
         other = subprocess.run([*base, "--set", "vm.networkName=inventory/vlan1010"], capture_output=True, text=True)
         assert other.returncode == 0 and 'VM_NETWORK_NAME: "inventory/vlan1010"' in other.stdout
         bare = subprocess.run([*base, "--set", "vm.networkName=vm-external-network"], capture_output=True, text=True)
         assert bare.returncode != 0 and "<namespace>/<name>" in bare.stderr
+
+    def test_the_chart_carries_no_mac_value(self):
+        """KubeMacPool assigns every VM's MAC: nothing per cluster about MACs in the chart."""
+        import pathlib
+        import shutil
+        import subprocess
+
+        import yaml
+
+        if shutil.which("helm") is None:
+            pytest.skip("needs helm")
+        chart = pathlib.Path(__file__).resolve().parent.parent / "deploy" / "charts" / "vm-lifecycle-worker"
+        rendered = subprocess.run(["helm", "template", "x", str(chart), "--set", "kvCluster=ocp4-prod-kv-five-az1-a",
+                                   "--set", "vm.storageClassName=basic", "--set", "temporal.host=t:7233"],
+                                  capture_output=True, text=True)
+        assert rendered.returncode == 0, rendered.stderr
+        docs = [doc for doc in yaml.safe_load_all(rendered.stdout) if doc]
+        config = next(doc for doc in docs if doc["kind"] == "ConfigMap")
+        assert not [key for key in config["data"] if "MAC" in key]
+        assert [doc["kind"] for doc in docs if doc["kind"] in ("Role", "RoleBinding")] == []
 
     def test_the_buffer_is_not_this_workers(self):
         assert "headroom_buffer_percent" not in VmLifecycleActivitySettings.model_fields

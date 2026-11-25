@@ -1,3 +1,0 @@
-# In the seed folder but not a `ocp4-kubevirt-lab-a…` cluster: the workflow filters it out.
-platform: agent
-nodepool: []

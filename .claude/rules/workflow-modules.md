@@ -37,10 +37,13 @@ procedure for new or running workflows is the `redbull-workflows` skill.
 - **Runs that must not act at once take a lock workflow** (`vm_lifecycle/kv_zone_lock.py`,
   §5): it holds only the line and a lease, is asked by start-child-or-signal, knows a
   run by its RUN id, skips a waiter that is gone, never fails and calls no activity.
-- **An exit path that awaits** (a cancel rollback, a signal, `all_handlers_finished`)
-  runs only for a real cancel — `workflow.in_workflow() and
-  workflow.cancellation_reason() is not None` — or an ordinary `Exception`; never in a
-  bare `finally`: a cache eviction cancels the tasks too, and may call no workflow API (§5).
+- **An exit path** (a cancel rollback, a signal on the way out, `all_handlers_finished`) acts
+  only in `except`, on `isinstance(err, Exception)` or on a cancel asked of THIS run, then
+  re-raises — never in a `finally`, never guarded by `workflow.in_workflow()` alone. A dropped
+  cache entry cancels the tasks with no reason; a run a stopped worker left behind is thrown
+  away by Python inside ANOTHER run's task, where `in_workflow()` is true and what the path
+  sends lands in that run's history (it then never replays). The run keeps its own
+  `workflow.info().run_id` and asks `_own_task()` first (`create_vm.py`, §5). [WF017]
 - **Progress**: `self._phase` and `@workflow.query def progress`. [WF014]
 - **Logging**: `workflow.logger` only. [WF013]
 - **Verify after mutate**: read back before recording; strict, absolute checks (§6, §7).

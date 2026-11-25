@@ -1,13 +1,13 @@
 {{- if .Values.rbac.create }}
 # Exactly the verbs activities/vm_lifecycle/kubevirt_api.py uses on THIS KV
 # cluster, each from a call in the code (README "RBAC"). Cluster-wide because
-# the figures count pods and stopped VMs in EVERY namespace, a VM's MAC must be
-# free in every namespace, and the VM namespace is the request's.
+# the figures count pods and stopped VMs in EVERY namespace, a run's VM is
+# found by its label in every namespace, and the VM namespace is the request's.
 #   * nodes                    list: allocatable, Ready, cordoned, taints (the figures)
 #   * pods                     list: every unfinished pod's requests (the figures)
 #   * namespaces               get: the VM namespace must exist; the run never creates one
 #   * persistentvolumeclaims   get: is the root disk's claim Bound (the ready wait)
-#   * virtualmachines          list (the figures; the MAC and request-id lookups),
+#   * virtualmachines          list (the figures; the name and request-id lookups),
 #                              get (the ready wait; the delete's identity check),
 #                              create (the VM), delete (a run's own VM only: the
 #                              one labelled with its run id, by UID)

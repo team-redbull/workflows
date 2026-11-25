@@ -73,7 +73,7 @@ and the checker in the same commit.
    | Updates, heartbeating watches, child driven by signals, dispatch helpers | `workflow_domains/cluster_upgrade/upgrade_cluster.py`, `dispatch.py` |
    | pure sandbox policy module | `workflow_domains/server_lifecycle/bond_selection.py`, `workflow_domains/vm_lifecycle/placement.py` |
    | a lock between runs: code-to-code signals, start-child-or-signal, leases, run-id identity, continue-as-new | `workflow_domains/vm_lifecycle/kv_zone_lock.py` + `create_vm.py` (`_acquire`, `_release`) |
-   | cancel rollback that tells a cancel from a cache eviction | `workflow_domains/vm_lifecycle/create_vm.py` (`run`) |
+   | an exit path that acts only on a failure or on ITS OWN run's cancel — never in a `finally`, never on `in_workflow()` alone (a dropped cache entry, a run thrown away inside another run's task) | `workflow_domains/vm_lifecycle/create_vm.py` (`_own_task`, `_cancel_requested`, `run`, `_run`) |
    | routes: single, bulk, slots, decisions, 410 for renamed paths, synchronous question | the domain `router.py` files |
    | temporary page | `workflow_domains/<domain>/ui.py` + `tests/test_<domain>_ui.py` |
    | thin activity surface over technology modules | `activities/server_lifecycle/activities.py` + `cluster_api.py`; `activities/vm_lifecycle/activities.py` + `vm_operations.py` (each activity's whole body over an `api` object) |

@@ -265,7 +265,8 @@ dhcp_values:
 
 
 # What the day1 chain's injector appends: without a header since the CI-header
-# removal (APPLY-PROVISION-CLUSTER.md §4), with one from a chain not yet changed.
+# removal (day1's injector, changed with provision-cluster's rollout), with one from a
+# chain not yet changed.
 CHAIN_SECTION = """
 mcConfigMap:
 - name: nm-conf

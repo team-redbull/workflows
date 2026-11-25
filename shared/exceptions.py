@@ -1401,12 +1401,23 @@ class VmDisappearedError(OrchestratorError):
     """
 
 
-class VmMacExhaustedError(OrchestratorError):
-    """Every MAC the KV cluster's worker drew for the VM was taken, MAX_DRAWS times over.
+class VmSerialExhaustedError(OrchestratorError):
+    """Every serial the KV cluster's worker drew named a VM that exists, MAX_DRAWS times over.
 
-    Deterministic, non-retryable: three draws out of 16.7 million landing on a
-    used MAC or name means the cluster's prefix is wrong or shared, not bad
-    luck. Nothing of this run was created.
+    Deterministic, non-retryable: three taken names in a row out of 2.8 trillion
+    serials is not bad luck but something else naming VMs this way. Nothing of
+    this run was created. (Until 2026-11-25 the name carried the MAC and this was
+    `VmMacExhaustedError`.)
+    """
+
+
+class VmMacNotAssignedError(OrchestratorError):
+    """KubeMacPool gave the VM no MAC: the VM came back without one, or KubeMacPool refused it.
+
+    Deterministic, non-retryable: KubeMacPool is not installed on the KV cluster,
+    or the VM namespace is labelled `mutatevirtualmachines.kubemacpool.io=ignore`.
+    A BareMetalHost needs a fixed boot MAC, so the VM is deleted and nothing of
+    this run is left (the operator, 2026-11-25: KubeMacPool picks every VM's MAC).
     """
 
 

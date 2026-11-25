@@ -1,7 +1,7 @@
 # vm-lifecycle-worker — one release per KV cluster, installed in that cluster.
 #
-# Everything under `kvCluster`, `config` and `vm` is THE CLUSTER'S OWN: rendered
-# when the KV cluster is created (through day2) and never typed in by hand. The
+# `kvCluster` is THE CLUSTER'S OWN; `vm` is the same on every KV cluster of a
+# platform unless one differs. Rendered through day2, never typed in by hand. The
 # chart creates no Namespace, runs no hooks and renders deterministically, so
 # Argo CD can sync and diff it as plain manifests. It needs no Secret: the
 # worker's ServiceAccount is its whole identity (rbac.yaml).
@@ -16,14 +16,10 @@
 # cluster shows as `no-worker` in every run of its zone.
 kvCluster: ""
 
-config:
-  # REQUIRED. The first three octets of every MAC this cluster's VMs get:
-  # `0e` + the cluster's VLAN ID over the next two octets (12 bits) — VLAN 1010
-  # = 0x3f2 -> "0e:03:f2", VLAN 2 -> "0e:00:02". Computed from the Segments
-  # Manager's allocation when the cluster is created. The worker draws the
-  # other three octets. No default and no other place it is set: two clusters
-  # that share a network never share a VLAN, so they never share a prefix.
-  vmMacPrefix: ""
+# No MAC value: KubeMacPool on the cluster assigns every VM's MAC (the operator,
+# 2026-11-25), so the cluster MUST run it and the VM namespace must not be labelled
+# `mutatevirtualmachines.kubemacpool.io=ignore`. Its range is the HyperConverged
+# object's (`spec.networking.kubeMacPoolConfiguration`), never this chart's.
 
 # The VirtualMachine this cluster's worker builds (the platform's vm.yaml).
 vm:

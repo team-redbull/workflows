@@ -43,11 +43,12 @@ from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
     from shared.models.vm_lifecycle import KvClusterFigures, KvClusterRow
-    from shared.vm_requests import GIB
+    from shared.vm_requests import gib_free, gib_needed
 
 # Every reason a cluster is skipped, keyed as the run's table records it, worded
 # for the operator who reads NoKvClusterFitsError. The first two are the run's
-# own (a cluster never read); the rest are skip_reason()'s.
+# own (a cluster never read), the last too (a cluster that fitted and then failed
+# the create); the rest are skip_reason()'s.
 SKIP_REASONS: dict[str, str] = {
     "day1-problem": "are listed in day1 with a problem and were never read (their file does not give them this zone)",
     "no-worker": "have no vm-lifecycle worker answering on their queue (not deployed, down, or deployed under another name)",
@@ -55,6 +56,7 @@ SKIP_REASONS: dict[str, str] = {
     "no-nodes": "have no usable node (none Ready, uncordoned and untainted)",
     "fit-node": "have no single node with the room for this VM's CPU and memory",
     "fit-buffer": "would go past the placement buffer on CPU or memory with this VM on them",
+    "create-failed": "fitted but failed to create the VM, and the run moved on (each one's row says why)",
 }
 DAY1_PROBLEM = "day1-problem"
 NO_WORKER = "no-worker"
@@ -62,6 +64,7 @@ UNREACHABLE = "unreachable"
 NO_NODES = "no-nodes"
 FIT_NODE = "fit-node"
 FIT_BUFFER = "fit-buffer"
+CREATE_FAILED = "create-failed"
 
 
 @dataclass(frozen=True)
@@ -103,8 +106,8 @@ def judge(figures: KvClusterFigures, vm_cpu_millicores: int, vm_memory_bytes: in
         roomiest = max(figures.node_headroom, key=lambda node: (node.cpu_millicores, node.memory_bytes, node.name))
         return Verdict(
             FIT_NODE,
-            f"no node holds {vm_cpu_millicores} m and {vm_memory_bytes // GIB} GiB together; the roomiest, "
-            f"{roomiest.name}, has {roomiest.cpu_millicores} m / {roomiest.memory_bytes // GIB} GiB free",
+            f"no node holds {vm_cpu_millicores} m and {gib_needed(vm_memory_bytes)} together; the roomiest, "
+            f"{roomiest.name}, has {roomiest.cpu_millicores} m / {gib_free(roomiest.memory_bytes)} free",
             cpu_after, memory_after,
         )
     ceiling = 100 - buffer_percent
@@ -118,8 +121,8 @@ def judge(figures: KvClusterFigures, vm_cpu_millicores: int, vm_memory_bytes: in
     if not _within_buffer(requested_memory, vm_memory_bytes, figures.allocatable_memory_bytes, buffer_percent):
         return Verdict(
             FIT_BUFFER,
-            f"memory after placing: {(requested_memory + vm_memory_bytes) // GIB} GiB of "
-            f"{figures.allocatable_memory_bytes // GIB} GiB allocatable; the {buffer_percent}% buffer allows {ceiling}%",
+            f"memory after placing: {gib_needed(requested_memory + vm_memory_bytes)} of "
+            f"{gib_free(figures.allocatable_memory_bytes)} allocatable; the {buffer_percent}% buffer allows {ceiling}%",
             cpu_after, memory_after,
         )
     return Verdict(None, None, cpu_after, memory_after)

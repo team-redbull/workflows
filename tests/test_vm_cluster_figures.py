@@ -143,23 +143,23 @@ class TestPodRequests:
 
 class TestStoppedVms:
     def test_a_stopped_labelled_vm_is_counted_at_what_its_pod_will_request(self):
-        figures = _figures([node("n1", 128, 1024)], vms=[stopped_vm("vm-a", 32, 256)])
-        # 32 vCPUs -> 30 cores; 256 GiB guest -> 257 GiB.
+        figures = _figures([node("n1", 128, 1024)], vms=[stopped_vm("vm-a", 32, 240)])
+        # 32 vCPUs -> 30 cores; 240 GiB guest -> 240 GiB + 300 + 8 × 32 + 240 × 1024 / 512 MiB.
         assert (figures.stopped_vms, figures.stopped_vms_cpu_millicores, figures.stopped_vms_memory_bytes) == (
-            1, 30_000, 257 * GIB)
+            1, 30_000, 240 * GIB + 1036 * MIB)
         # …and it is on NO node: the node's headroom is untouched.
         assert figures.node_headroom[0].cpu_millicores == 128_000
 
     def test_any_namespace_and_any_run_strategy_count(self):
-        vms = [stopped_vm("a", 8, 64, namespace="inventory"), stopped_vm("b", 8, 64, namespace="server-scan-vms"),
-               stopped_vm("c", 8, 64, run_strategy="Manual"), stopped_vm("d", 8, 64, run_strategy="Always"),
-               stopped_vm("e", 8, 64, run_strategy="RerunOnFailure")]
+        vms = [stopped_vm("a", 8, 60, namespace="inventory"), stopped_vm("b", 8, 60, namespace="server-scan-vms"),
+               stopped_vm("c", 8, 60, run_strategy="Manual"), stopped_vm("d", 8, 60, run_strategy="Always"),
+               stopped_vm("e", 8, 60, run_strategy="RerunOnFailure")]
         figures = _figures([node("n1", 128, 1024)], vms=vms)
         assert figures.stopped_vms == 5 and figures.stopped_vms_cpu_millicores == 5 * 7000
 
     def test_a_vm_without_the_redfish_label_is_not_ours_to_count(self):
-        vms = [stopped_vm("ours", 8, 64), stopped_vm("theirs", 8, 64, labels={}),
-               stopped_vm("off", 8, 64, labels={"redfish-enabled": "false"})]
+        vms = [stopped_vm("ours", 8, 60), stopped_vm("theirs", 8, 60, labels={}),
+               stopped_vm("off", 8, 60, labels={"redfish-enabled": "false"})]
         assert _figures([node("n1", 128, 1024)], vms=vms).stopped_vms == 1
 
     @pytest.mark.parametrize(
@@ -168,20 +168,20 @@ class TestStoppedVms:
          ("Pending", True), ("Scheduling", True), ("Succeeded", True), ("Failed", True), (None, True)],
     )
     def test_a_vm_with_a_launcher_pod_on_a_node_is_counted_once_through_its_pod(self, phase, counted_as_stopped):
-        vms = [stopped_vm("vm-a", 32, 256)]
+        vms = [stopped_vm("vm-a", 32, 240)]
         vmis = [_vmi("vm-a", phase)] if phase else []
         figures = _figures([node("n1", 128, 1024)], vms=vms, vmis=vmis)
         assert figures.stopped_vms == (1 if counted_as_stopped else 0)
 
     def test_a_running_vm_is_not_counted_twice(self):
         # Its launcher pod is in the pod sum; the VM itself must not be added again.
-        launcher = pod("virt-launcher-vm-a", "n1", "30", "257Gi", namespace="inventory")
-        figures = _figures([node("n1", 128, 1024)], [launcher], [stopped_vm("vm-a", 32, 256)], [_vmi("vm-a", "Running")])
+        launcher = pod("virt-launcher-vm-a", "n1", "30", "246789Mi", namespace="inventory")
+        figures = _figures([node("n1", 128, 1024)], [launcher], [stopped_vm("vm-a", 32, 240)], [_vmi("vm-a", "Running")])
         assert figures.stopped_vms == 0 and figures.pods_cpu_millicores == 30_000
         assert figures.pods_cpu_millicores + figures.stopped_vms_cpu_millicores == 30_000
 
     def test_a_vmi_of_the_same_name_in_another_namespace_is_another_vm(self):
-        figures = _figures([node("n1", 128, 1024)], vms=[stopped_vm("vm-a", 8, 64, namespace="inventory")],
+        figures = _figures([node("n1", 128, 1024)], vms=[stopped_vm("vm-a", 8, 60, namespace="inventory")],
                            vmis=[_vmi("vm-a", "Running", namespace="elsewhere")])
         assert figures.stopped_vms == 1
 
@@ -189,30 +189,34 @@ class TestStoppedVms:
         vm = stopped_vm("vm-a", 4, 64)
         vm["spec"]["template"]["spec"]["domain"]["cpu"].update({"sockets": 2, "threads": 2})
         assert cluster_figures.vcpus(vm) == 16
-        assert cluster_figures.stopped_vm_request(vm) == (15_000, 65 * GIB)
+        # The overhead follows the VM's vCPUs (16), not its cores (4): 300 + 8 × 16 + 64 × 2 MiB.
+        assert cluster_figures.stopped_vm_request(vm) == (15_000, 64 * GIB + 556 * MIB)
 
     def test_guest_memory_falls_back_to_the_memory_request(self):
-        vm = stopped_vm("vm-a", 8, 64)
+        vm = stopped_vm("vm-a", 8, 60)
         del vm["spec"]["template"]["spec"]["domain"]["memory"]
         vm["spec"]["template"]["spec"]["domain"]["resources"] = {"requests": {"memory": "32Gi"}}
-        assert cluster_figures.stopped_vm_request(vm) == (7000, 33 * GIB)
+        assert cluster_figures.stopped_vm_request(vm) == (7000, 32 * GIB + (300 + 64 + 64) * MIB)
 
     def test_a_vm_that_states_no_size_still_counts_a_core_and_the_overhead(self):
         bare = {"metadata": {"name": "odd", "namespace": "inventory", "labels": {"redfish-enabled": "true"}}, "spec": {}}
         figures = _figures([node("n1", 128, 1024)], vms=[bare])
-        assert (figures.stopped_vms, figures.stopped_vms_cpu_millicores, figures.stopped_vms_memory_bytes) == (1, 1000, GIB)
+        # One vCPU and no guest memory: a core, and the overhead's fixed and per-vCPU parts.
+        assert (figures.stopped_vms, figures.stopped_vms_cpu_millicores, figures.stopped_vms_memory_bytes) == (
+            1, 1000, 308 * MIB)
 
 
 class TestTheWholePicture:
     def test_a_cluster_of_three_nodes(self):
         nodes = [node("n1", 64, 512), node("n2", 64, 512), node("n3", 64, 512, cordoned=True)]
-        pods = [pod("virt-launcher-run", "n1", "30", "257Gi", namespace="inventory"), pod("dns", "n2", "100m", "70Mi"),
+        pods = [pod("virt-launcher-run", "n1", "30", "241Gi", namespace="inventory"), pod("dns", "n2", "100m", "70Mi"),
                 pod("on-cordoned", "n3", "20", "100Gi"), pod("job", "n1", "8", "8Gi", phase="Succeeded")]
-        vms = [stopped_vm("run", 32, 256), stopped_vm("halted-1", 32, 256), stopped_vm("halted-2", 8, 64)]
+        vms = [stopped_vm("run", 32, 240), stopped_vm("halted-1", 32, 240), stopped_vm("halted-2", 8, 60)]
         figures = _figures(nodes, pods, vms, [_vmi("run", "Running")])
         assert figures.model_dump(exclude={"node_headroom"}) == {
             "kv_cluster": "ocp4-prod-kv-five-az1-a", "readable": True, "detail": None, "nodes": 3, "usable_nodes": 2,
             "allocatable_cpu_millicores": 128_000, "allocatable_memory_bytes": 1024 * GIB,
-            "pods_cpu_millicores": 30_100, "pods_memory_bytes": 257 * GIB + 70 * MIB,
-            "stopped_vms": 2, "stopped_vms_cpu_millicores": 37_000, "stopped_vms_memory_bytes": (257 + 65) * GIB,
+            "pods_cpu_millicores": 30_100, "pods_memory_bytes": 241 * GIB + 70 * MIB,
+            "stopped_vms": 2, "stopped_vms_cpu_millicores": 37_000,
+            "stopped_vms_memory_bytes": (240 + 60) * GIB + (1036 + 484) * MIB,
         }

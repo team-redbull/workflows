@@ -15,7 +15,6 @@ data:
   TEMPORAL_HOST: {{ .Values.temporal.host | quote }}
   TEMPORAL_NAMESPACE: {{ .Values.temporal.namespace | quote }}
   KV_CLUSTER: {{ .Values.kvCluster | quote }}
-  VM_MAC_PREFIX: {{ .Values.config.vmMacPrefix | lower | quote }}
   VM_STORAGE_CLASS_NAME: {{ .Values.vm.storageClassName | quote }}
   VM_NETWORK_NAME: {{ .Values.vm.networkName | quote }}
   VM_NODE_SELECTOR: {{ .Values.vm.nodeSelector | default dict | toJson | quote }}

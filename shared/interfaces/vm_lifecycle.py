@@ -45,17 +45,18 @@ async def read_kv_cluster_figures(request: KvFiguresRequest) -> KvClusterFigures
 
 @activity.defn
 async def create_vm_on_cluster(request: VmCreateRequest) -> VmCreated:
-    """ONE Halted VirtualMachine for the request, its MAC drawn and its name derived HERE.
+    """ONE Halted VirtualMachine for the request, its serial drawn and its name derived HERE.
 
     Idempotent by the request id: a VM already labelled with it (an earlier
     attempt whose answer was lost) is returned, `created` False, whatever the
     time. Otherwise nothing is created after `create_before`
-    (VmLeaseExpiredError). Then up to three draws: three random bytes behind
-    the cluster's `VM_MAC_PREFIX`, the name
-    `ocp-<flavor>-kv<cpu>-<site>-<MAC>`; a MAC any VM of the cluster already
-    has (any namespace), an AlreadyExists, or KubeMacPool refusing the MAC,
-    draws again. Raises VmMacExhaustedError (three draws taken),
-    VmLeaseExpiredError, VmNamespaceNotFoundError, VmRequestRejectedError
+    (VmLeaseExpiredError). Then up to three draws of an 8-character serial,
+    the name `ocp-<flavor>-kv<cpu>-<site>-<serial>` (the serial also the VM's
+    SMBIOS serial): a name any VM of the cluster has, or an AlreadyExists,
+    draws again. The VM is created with NO MAC: KubeMacPool assigns one,
+    unique on the cluster, and the VM read back must carry it — one without is
+    deleted (VmMacNotAssignedError). Raises VmSerialExhaustedError (three
+    draws taken), VmMacNotAssignedError, VmLeaseExpiredError, VmNamespaceNotFoundError, VmRequestRejectedError
     (400/422), KvClusterMismatchError (another cluster's or site's request),
     KvClusterAccessError (403) — all permanent — and the retryable
     KvClusterApiError (5xx, 401, a timeout).

@@ -25,7 +25,7 @@ from temporalio.client import Client
 
 from shared.cluster_names import canonical_mce_cluster, parse_mce_cluster
 from shared.consts import CREATE_VM_WORKFLOW_QUEUE
-from shared.infraenv_names import InfraEnvKind, parse_infraenv, vm_name
+from shared.infraenv_names import VM_SERIAL_LENGTH, InfraEnvKind, parse_infraenv, vm_name
 from shared.models.vm_lifecycle import CreateVmInput, CreateVmRunArgs
 from shared.workflow_ids import create_vm_slot_workflow_id
 from workflow_domains.routers.deps import get_temporal_client
@@ -68,7 +68,7 @@ class CreateVmRequest(BaseModel):
         min_length=1,
         description=(
             "A KubeVirt InfraEnv, `<flavor>-kv<cpu>-<zone>` (`c200-kv32-az1`): the zone picks the "
-            "KV clusters, `kv<cpu>` the VM's vCPUs (memory is cpu × 8 GiB). A `-mtl-` InfraEnv has "
+            "KV clusters, `kv<cpu>` the VM's vCPUs, an even number (memory is cpu × 7.5 GiB). A `-mtl-` InfraEnv has "
             "servers, not VMs, and is refused."
         ),
     )
@@ -115,7 +115,7 @@ class CreateVmRequest(BaseModel):
         where it fails the run."""
         parsed = parse_infraenv(self.infra_env)
         assert parsed.cpu is not None  # a KubeVirt InfraEnv always has its vCPUs
-        vm_name(parsed.flavor, parsed.cpu, parse_mce_cluster(self.mce_cluster).site, "00:00:00:00:00:00")
+        vm_name(parsed.flavor, parsed.cpu, parse_mce_cluster(self.mce_cluster).site, "0" * VM_SERIAL_LENGTH)
         return self
 
     def run_input(self) -> CreateVmInput:

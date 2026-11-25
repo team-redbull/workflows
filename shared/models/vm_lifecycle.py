@@ -270,6 +270,37 @@ class VmDeleted(BaseModel):
 # --- progress and result ------------------------------------------------------------------
 
 
+class DeleteStrayVmInput(BaseModel):
+    """Delete whatever VM of one create-vm RUN is on one KV cluster (its `redbull.io/created-by`
+    label is `request_id`): a cluster that failed the run's create and could not then be asked
+    whether the VM landed. `workflow_id` (the create-vm run's) and `why` are for people."""
+
+    kv_cluster: str = Field(min_length=1)
+    namespace: str = Field(min_length=1)
+    request_id: str = Field(min_length=1)
+    workflow_id: str | None = None
+    why: str | None = None
+
+
+class DeleteStrayVmRunArgs(BaseModel):
+    input: DeleteStrayVmInput
+
+
+class DeleteStrayVmProgress(BaseModel):
+    phase: str
+    kv_cluster: str
+    request_id: str
+
+
+class DeleteStrayVmResult(BaseModel):
+    """`deleted` False: the cluster held no VM of the run — the create had never landed."""
+
+    kv_cluster: str
+    request_id: str
+    deleted: bool
+    names: list[str] = Field(default_factory=list)
+
+
 class CreateVmProgress(BaseModel):
     """Returned by the `progress` query."""
 
@@ -286,6 +317,9 @@ class CreateVmProgress(BaseModel):
     vm_name: str | None = None
     mac: str | None = None
     cancel_rollback: str | None = None
+    # The KV clusters that failed this run's create and could not be checked afterwards,
+    # each with its delete-stray-vm workflow, which removes the run's VM there if one landed.
+    stray_cleanups: list[str] = Field(default_factory=list)
 
 
 class CreateVmResult(BaseModel):
@@ -317,6 +351,9 @@ class CreateVmResult(BaseModel):
     mce_cluster: str
     site: str
     zone: str
+    # delete-stray-vm workflow ids, one per cluster the run moved on from without knowing
+    # whether its VM had landed there (each removes it once its cluster answers).
+    stray_cleanups: list[str] = Field(default_factory=list)
 
 
 # --- the zone lock -------------------------------------------------------------------------

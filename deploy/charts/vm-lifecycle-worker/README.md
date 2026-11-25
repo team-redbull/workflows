@@ -13,17 +13,24 @@ What it does there, all from `activities/vm_lifecycle/activities.py`, for
   nodes' allocatable, what pods request, what the stopped `redfish-enabled` VMs will request,
   each usable node's headroom as a CPU and memory pair. It only measures; the run on the hub
   decides, with one placement buffer for every cluster;
-- **creates** one Halted VirtualMachine per request (`create_vm_on_cluster`): it draws the MAC
-  behind this cluster's prefix, derives the name `ocp-<flavor>-kv<cpu>-<site>-<MAC>`, builds
-  the VirtualMachine with this cluster's own storage class, network and node selector, and
-  creates it, drawing again by itself when a MAC or a name is taken (3 draws);
+- **creates** one Halted VirtualMachine per request (`create_vm_on_cluster`): it draws an
+  8-character serial, derives the name `ocp-<flavor>-kv<cpu>-<site>-<serial>` (the serial also
+  the VM's SMBIOS serial), builds the VirtualMachine with NO MAC and this cluster's own storage
+  class, network and node selector, and creates it, drawing again by itself when the name is
+  taken (3 draws); it reads back the MAC KubeMacPool assigned;
 - **waits** for the VM's root disk to bind (`await_vm_ready`, one heartbeating activity);
 - **deletes** a run's own VM and its root DataVolume when that run will not complete
   (`delete_vm_on_cluster`): only the VM labelled with the run's id, only by the UID it read.
 
 It never starts, stops or patches a VM (kubevirt-redfish owns the power state), never
-creates a namespace, and never relies on KubeMacPool: a MAC is kept unique on the cluster by
-the worker's own check against every VM, in every namespace.
+creates a namespace, and never chooses a MAC: **KubeMacPool assigns every VM's MAC, unique on
+the cluster** (the operator, 2026-11-25). The worker requests none, because KubeMacPool does
+not refuse a duplicate REQUESTED MAC (tested on cluster-qcl8n). So the cluster MUST run
+KubeMacPool (OpenShift Virtualization does, by default) and the VM namespace must not be
+labelled `mutatevirtualmachines.kubemacpool.io=ignore`: a VM that comes back without a MAC is
+deleted and the create fails (`VmMacNotAssignedError`). The range is the HyperConverged
+object's (`spec.networking.kubeMacPoolConfiguration`), set apart from this chart — until it is,
+each cluster keeps the random `02:xx:xx` range KubeMacPool picked, which two clusters can share.
 
 The zone's list of KV clusters is not this worker's: it is day1's, read on the hub by the
 `cluster-lifecycle-worker`, which also holds the placement buffer
@@ -47,14 +54,13 @@ the cluster it is for.
 ## Install
 
 The brain must run first (it owns the workflow queues); this worker only polls its activity
-queue. Everything under `kvCluster`, `config` and `vm` is the cluster's own and is rendered
-when the KV cluster is created, through day2, never typed in by hand:
+queue. `kvCluster` is the cluster's own; `kubemacpool` and `vm` are the same on every KV
+cluster unless one differs. All are rendered through day2, never typed in by hand:
 
 ```bash
 helm upgrade --install vm-lifecycle-worker <chart dir> \
   -n redbull-workflows \
   --set kvCluster=ocp4-prod-kv-five-az1-a \
-  --set config.vmMacPrefix=0e:03:f2 \
   --set vm.storageClassName=<an Immediate, RWX-Filesystem class> \
   --set temporal.host=<the hub's Temporal Route>:443 \
   --set temporal.tls.enabled=true \
@@ -65,10 +71,7 @@ helm upgrade --install vm-lifecycle-worker <chart dir> \
 `<chart dir>`: this chart, in the workflows repo at `deploy/charts/vm-lifecycle-worker/` or its
 copy in redbull-platform at `gitops/charts/vm-lifecycle-worker/`.
 
-`config.vmMacPrefix`: `0e` followed by the cluster's VLAN ID over two octets, from the Segments
-Manager's allocation for the cluster: VLAN 1010 = 0x3f2 gives `0e:03:f2`, VLAN 2 gives
-`0e:00:02`. The Segments Manager never gives one VLAN to two clusters of a site, so two
-clusters that share a network never share a prefix. It is the only place the prefix is set.
+No value of the chart is a MAC: KubeMacPool on the cluster assigns every VM's.
 
 `<vX.Y.Z>`: a version tag. Every push to `main` that changes a file this limb loads publishes
 `ghcr.io/team-redbull/vm-lifecycle-worker:vX.Y.Z` (its job in CI's `build` matrix), writes that
@@ -108,7 +111,6 @@ minutes later, by deleting its VM again (`VmRootDiskNotBoundError`). ceph-rbd re
 | Value | Env | Default | Meaning |
 |---|---|---|---|
 | `kvCluster` | `KV_CLUSTER` | — (required) | The KV cluster this worker runs in: exactly its day1 file name; names its queue |
-| `config.vmMacPrefix` | `VM_MAC_PREFIX` | — (required) | The first three octets of every VM's MAC: `0e` + the cluster's VLAN ID |
 | `vm.storageClassName` | `VM_STORAGE_CLASS_NAME` | — (required) | The root disk's storage class (Immediate binding, RWX + Filesystem) |
 | `vm.networkName` | `VM_NETWORK_NAME` | `openshift-cnv/vm-external-network` | `<namespace>/<name>` of the NetworkAttachmentDefinition every VM boots on. The VM's network is ALWAYS multus, as in the platform's `vm.yaml`; only its name is a value, for a cluster whose NAD has another |
 | `vm.nodeSelector` | `VM_NODE_SELECTOR` (JSON) | `{}` | The VM template's nodeSelector. Capacity is measured on the nodes matching it only |
@@ -122,10 +124,10 @@ minutes later, by deleting its VM again (`VmRootDiskNotBoundError`). ceph-rbd re
 | `image.repository` / `image.tag` | | ghcr / appVersion | Mirror path and tag in a disconnected environment |
 
 The render fails (and so does the worker's start, on the same rules) without `kvCluster`,
-`config.vmMacPrefix`, `vm.storageClassName` or `temporal.host`; on a `vm.networkName` that is not
+`vm.storageClassName` or `temporal.host`; on a `vm.networkName` that is not
 `<namespace>/<name>`; on a `kvCluster`
-that is not `ocp4-<lifecycle>-kv-<site>-<zone>-<id>`; and on a prefix that is not three hex octets
-starting with `0e`. A KV cluster whose worker does not start is skipped as `no-worker` by
+that is not `ocp4-<lifecycle>-kv-<site>-<zone>-<id>`. (A chart rendered before 2026-11-25 still
+sets `VM_MAC_PREFIX`; the worker ignores it.) A KV cluster whose worker does not start is skipped as `no-worker` by
 every run of its zone, 30 seconds each.
 
 There is no placement buffer here. It is one value for every KV cluster,
@@ -143,9 +145,9 @@ from its last heartbeat.
 ## RBAC
 
 Every grant comes from a call in `activities/vm_lifecycle/kubevirt_api.py`; nothing else is
-granted. All of it is cluster-wide, on this KV cluster only: the capacity figures count pods
-and stopped VMs in every namespace, a VM's MAC must be free in every namespace, and the VM
-namespace is the request's.
+granted. All of it is cluster-wide, on this KV cluster only — the capacity figures count pods
+and stopped VMs in every namespace, a run's VM and a VM's name are looked for in every
+namespace, and the VM namespace is the request's.
 
 | Group / resource | Verbs | The call |
 |---|---|---|
@@ -153,7 +155,7 @@ namespace is the request's.
 | `""` pods | list | `list_unfinished_pods`: every unfinished pod's requests and node (the figures) |
 | `""` namespaces | get | `namespace_exists`: the VM namespace must exist; the worker never creates one |
 | `""` persistentvolumeclaims | get | `pvc_phase`: is the root disk's claim Bound (the ready wait) |
-| `kubevirt.io` virtualmachines | get, list, create, delete | `list_vms` (the figures; the MAC check and the run-id lookup of a create; the delete's lookup), `get_vm` (the ready wait; the delete's identity check), `create_vm`, `delete_vm` (a run's own VM, by UID) |
+| `kubevirt.io` virtualmachines | get, list, create, delete | `list_vms` (the figures; the run-id and name lookups of a create; the delete's lookup), `get_vm` (the ready wait; the delete's identity check), `create_vm`, `delete_vm` (a run's own VM, by UID) |
 | `kubevirt.io` virtualmachineinstances | list | `list_vmis`: which VMs have a launcher pod on a node (the figures) |
 | `cdi.kubevirt.io` datavolumes | get, delete | `get_datavolume` (the root disk's phase), `delete_datavolume` (with its VM) |
 

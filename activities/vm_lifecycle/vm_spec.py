@@ -3,30 +3,32 @@
 docs/design/create-vm-placement.md §7 is the design. No settings, no Temporal,
 no I/O: vm_operations.py hands this the request and the cluster's own values.
 
-  * THE MAC is half the cluster's, half random: the cluster's `VM_MAC_PREFIX`
-    (`0e` + its VLAN ID, three octets) and three random bytes drawn by the
-    worker — 16.7 million MACs per cluster, and never the same prefix on two
-    clusters that share a network (the Segments Manager never gives one VLAN
-    to two clusters of a site).
-  * THE NAME is the MAC in full, `ocp-<flavor>-kv<cpu>-<site>-<12 hex>`
-    (shared/infraenv_names.vm_name), so name and MAC agree by construction and
-    the name is unique wherever the MAC is. The zone is a label, never in it.
+  * THE MAC is KubeMacPool's: the VM is created with none and KubeMacPool
+    assigns one from its pool at admission, keeping it unique on the cluster
+    and fixed across restarts (the operator, 2026-11-25). A requested MAC it
+    does NOT guard — on cluster-qcl8n it admitted three VMs requesting one —
+    so this worker never requests one. Each cluster's range is set in its
+    HyperConverged object, later, so clusters on one network do not overlap.
+  * THE NAME carries a SERIAL, `ocp-<flavor>-kv<cpu>-<site>-<serial>`
+    (shared/infraenv_names.vm_name): 8 random lowercase letters and digits,
+    drawn by the worker, also the VM's SMBIOS serial (`firmware.serial`), as a
+    bare-metal node's name carries its serial. The zone is a label, never in it.
   * THE BODY is the platform's vm.yaml (redbull-platform, rendered until
     2026-11-20 by the kv-vm-api agent from `kv-agents/templates/vm.yaml.j2`),
     built here as a plain object: Halted, a blank root disk on a DataVolume
-    template (ReadWriteMany + Filesystem), one bridged interface with the
-    fixed MAC on the cluster's Multus network (vm.yaml's `openshift-cnv/vm-external-network`
-    unless the cluster names another), the CPU request `vCPUs × 15/16`
-    floored at one core. KubeVirt re-randomises an unset MAC on every start
-    and the BareMetalHost needs a fixed boot MAC, hence `macAddress`.
+    template (ReadWriteMany + Filesystem), one bridged interface on the
+    cluster's Multus network (vm.yaml's `openshift-cnv/vm-external-network`
+    unless the cluster names another) whose MAC KubeMacPool writes in, the CPU
+    request `vCPUs × 15/16` floored at one core.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 from activities.vm_lifecycle.cluster_figures import get, guest_memory_bytes, vcpus
-from shared.infraenv_names import ROOT_DISK_SUFFIX, vm_name, vm_size
+from shared.infraenv_names import ROOT_DISK_SUFFIX, VM_SERIAL_ALPHABET, VM_SERIAL_LENGTH, vm_name, vm_size
 from shared.upgrade_layout import ZONE_LABEL
 from shared.vm_requests import GIB, request_cores
 
@@ -44,18 +46,23 @@ MCE_LABEL = "redbull.io/mce"
 # A tenant warm-pool VM (the naming convention's §4.b).
 WORKER_ROLE = "worker"
 ROOT_DISK_VOLUME = "rootdisk"
-RANDOM_OCTETS = 3
 # printableStatus values KubeVirt reaches only after it accepted the spec.
 _ADMITTED_STATUSES = frozenset(
     {"Stopped", "Running", "Starting", "Stopping", "Paused", "Migrating", "WaitingForVolumeBinding"}
 )
 
 
-def draw_mac(prefix: str, random_bytes: bytes) -> str:
-    """`0e:03:f2` + three bytes -> `0e:03:f2:a1:b2:c3`, lowercase."""
-    if len(random_bytes) != RANDOM_OCTETS:
-        raise ValueError(f"a VM MAC takes exactly {RANDOM_OCTETS} random bytes, got {len(random_bytes)}")
-    return f"{prefix.lower()}:" + ":".join(f"{byte:02x}" for byte in random_bytes)
+def draw_serial(random_bytes: Callable[[int], bytes]) -> str:
+    """VM_SERIAL_LENGTH characters of VM_SERIAL_ALPHABET, uniform: a byte past the largest
+    multiple of the alphabet's size is passed over, so no character is likelier than another."""
+    size = len(VM_SERIAL_ALPHABET)
+    limit = 256 - 256 % size
+    serial: list[str] = []
+    while len(serial) < VM_SERIAL_LENGTH:
+        for byte in random_bytes(VM_SERIAL_LENGTH):
+            if byte < limit and len(serial) < VM_SERIAL_LENGTH:
+                serial.append(VM_SERIAL_ALPHABET[byte % size])
+    return "".join(serial)
 
 
 def size_label(cpu: int) -> str:
@@ -91,7 +98,7 @@ def build(
     site: str,
     zone: str,
     mce: str,
-    mac: str,
+    serial: str,
     request_id: str,
     workflow_id: str | None,
     redfish_label: tuple[str, str],
@@ -100,8 +107,9 @@ def build(
     node_selector: dict[str, str],
     root_disk_size: str,
 ) -> dict[str, Any]:
-    """The VirtualMachine for one request with one drawn MAC, as the object to create."""
-    name = vm_name(flavor, cpu, site, mac)
+    """The VirtualMachine for one request with one drawn serial, as the object to create.
+    No MAC: KubeMacPool assigns one at admission."""
+    name = vm_name(flavor, cpu, site, serial)
     root = f"{name}{ROOT_DISK_SUFFIX}"
     memory = f"{memory_gib}Gi"
     template_spec: dict[str, Any] = {
@@ -113,12 +121,12 @@ def build(
                 "requests": {"cpu": str(request_cores(cpu)), "memory": memory},
                 "limits": {"cpu": str(cpu), "memory": memory},
             },
-            "firmware": {"bootloader": {"efi": {"secureBoot": False}}},
+            "firmware": {"serial": serial, "bootloader": {"efi": {"secureBoot": False}}},
             "devices": {
                 "blockMultiQueue": True,
                 "networkInterfaceMultiqueue": True,
                 "disks": [{"name": ROOT_DISK_VOLUME, "dedicatedIOThread": True, "disk": {"bus": "virtio"}}],
-                "interfaces": [{"name": "default", "macAddress": mac.lower(), "bridge": {}}],
+                "interfaces": [{"name": "default", "bridge": {}}],
                 "rng": {},
             },
         },

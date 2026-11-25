@@ -134,6 +134,9 @@ def upgrade_agent_activity_queue(mce_cluster: str) -> str:
 # cluster-lifecycle limb (it holds the day1 token), on its own queue below.
 CREATE_VM_WORKFLOW_QUEUE = "create-vm-workflow"
 KV_ZONE_LOCK_WORKFLOW_QUEUE = "kv-zone-lock-workflow"
+# create-vm's child when a KV cluster failed the create and could not then be asked
+# whether the VM landed there: it deletes any VM of that run there once the cluster answers.
+DELETE_STRAY_VM_WORKFLOW_QUEUE = "delete-stray-vm-workflow"
 VM_LIFECYCLE_ACTIVITY_QUEUE = "vm-lifecycle-activity"
 
 

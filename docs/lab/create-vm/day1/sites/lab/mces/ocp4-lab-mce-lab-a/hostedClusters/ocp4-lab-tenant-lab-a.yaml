@@ -1,3 +1,0 @@
-# A hosted cluster of the MCE itself: not under a seed folder, never a candidate.
-platform: agent
-nodepool: []

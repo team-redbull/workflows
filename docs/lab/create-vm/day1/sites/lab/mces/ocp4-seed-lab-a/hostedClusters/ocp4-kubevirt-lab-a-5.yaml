@@ -1,3 +1,0 @@
-# KubeVirt cluster 5 of zone a (lab). clusterName derives from the file name: kubevirt-lab-a-5.
-platform: agent
-nodepool: []

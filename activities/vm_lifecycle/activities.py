@@ -52,7 +52,6 @@ _cluster = ClusterValues(
     kv_cluster=_settings.kv_cluster,
     site=_settings.site,
     zone=_settings.zone,
-    mac_prefix=_settings.vm_mac_prefix,
     storage_class_name=_settings.vm_storage_class_name,
     redfish_label=_settings.redfish_label,
     network_name=_settings.vm_network_name,

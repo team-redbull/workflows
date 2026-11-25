@@ -21,8 +21,9 @@ them), and the unit tests hand it fake ones.
      2. A stopped VM has no pod yet, but kubevirt-redfish will start it, so
      its room is taken: it is counted at what its pod WILL request
      (shared/vm_requests.py: vCPUs × 15/16, at least a core; guest memory +
-     1 GiB). THIS IS HOW A VM CREATED A MOMENT AGO IS COUNTED, and why the
-     zone needs no memory of its own between runs.
+     KubeVirt's overhead for a VM of its vCPUs and memory). THIS IS HOW A VM
+     CREATED A MOMENT AGO IS COUNTED, and why the zone needs no memory of its
+     own between runs.
   4. THE FIGURES: allocatable summed over usable nodes; pods summed; stopped
      VMs counted and summed; each usable node's headroom (allocatable minus
      its pods) as a CPU and memory PAIR.
@@ -182,7 +183,8 @@ def guest_memory_bytes(vm: dict) -> int:
 
 def stopped_vm_request(vm: dict) -> tuple[int, int]:
     """(cpu millicores, memory bytes) this VM's launcher pod will request when it starts."""
-    return pod_cpu_millicores(vcpus(vm)), pod_memory_bytes_of_guest(guest_memory_bytes(vm))
+    cpu = vcpus(vm)
+    return pod_cpu_millicores(cpu), pod_memory_bytes_of_guest(cpu, guest_memory_bytes(vm))
 
 
 def _key(obj: dict) -> tuple[str, str]:

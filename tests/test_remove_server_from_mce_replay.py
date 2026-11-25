@@ -20,7 +20,9 @@ The first five goldens were recorded on the workflow as it stood before it
 released server-scan's install lock (2026-10-31), so
 `remove-server-release-own-mce-lock` is proven against the shape production
 runs have; the lock scenarios were recorded with it, so the next change is
-proven against those too.
+proven against those too. Every golden before `metal3-deletes-the-host` and
+`bmh-still-deleting` powers the host off itself, which is what proves
+`remove-server-delete-without-power-off` (2026-11-24) replays them unchanged.
 
 The workflow was remove-server until 2026-11-01. Those goldens stay in
 tests/histories/remove_server/ (LEGACY_GOLDEN), as runs of type
@@ -114,6 +116,14 @@ SCENARIOS: dict[str, Callable[[], Scenario]] = {
     "pxe-failed-lock-kept": lambda: Scenario(
         mocks={"state": WITH_MACS, "lock": INSTALL_LOCK,
                "pxe_error": PxeMapAuthError("check PXE_MAP_TOKEN")}
+    ),
+    # Since 2026-11-24 (`remove-server-delete-without-power-off`): no power-off,
+    # the BMH deleted and waited on until metal3 lets it go ...
+    "metal3-deletes-the-host": lambda: Scenario(mocks={"state": WITH_MACS}),
+    # ... or fails at 15 min with metal3's finalizer left in place.
+    "bmh-still-deleting": lambda: Scenario(
+        mocks={"state": WITH_MACS, "never_deleted": True},
+        fails_with="BmhDeletionTimeoutError",
     ),
 }
 

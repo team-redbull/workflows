@@ -1,7 +1,8 @@
 """remove-server-from-mce's limb activities against a fake cluster API.
 
 What matters is which Agents count as the host's, when an Agent counts as
-bound, and that the two activities that ACT re-check the binding first.
+bound, that the activities that ACT re-check the binding first, and that the
+host's delete leaves metal3's finalizer and the BMC Secret to metal3.
 """
 
 from __future__ import annotations
@@ -13,7 +14,13 @@ import respx
 from activities.server_lifecycle import activities, cluster_api, server_scan
 from activities.server_lifecycle.bmh_resources import AGENT_BMH_LABEL
 from shared.exceptions import AgentBoundToClusterError, ServerScanAuthError, ServerScanError
-from shared.models.server_lifecycle import AgentDeleteRequest, BmhRef, HostPowerRequest
+from shared.models.server_lifecycle import (
+    AgentDeleteRequest,
+    BmcSecretRef,
+    BmhRef,
+    HostDeleteRequest,
+    HostPowerRequest,
+)
 
 SERVER = "ocp-cisco-m6-bat-yam-64c-512gb-FCH0001"
 BMH = SERVER.lower()
@@ -37,7 +44,8 @@ class _FakeCluster:
         self.objects: dict[tuple[str, str], dict] = {}
         if bmh:
             self.objects[("baremetalhosts", BMH)] = {
-                "spec": {"bootMACAddress": "00:25:B5:00:00:01", "online": True},
+                "spec": {"bootMACAddress": "00:25:B5:00:00:01", "online": True,
+                         "bmc": {"credentialsName": f"cisco-ucs-{BMH}"}},
                 "status": {"poweredOn": True},
             }
         if nmstate:
@@ -195,6 +203,51 @@ class TestPowerOff:
                 server_name=SERVER, namespace=NS, online=False, agents_must_be_unbound=["a1"]
             ))
         assert fake.patches == []
+
+
+class TestDeleteHostResources:
+    async def test_the_nmstateconfig_and_the_bmh_are_deleted_and_nothing_else_touched(self, cluster):
+        fake = cluster(_FakeCluster(agents=[_agent("a1", label=BMH)]))
+        result = await activities.delete_host_resources(HostDeleteRequest(
+            server_name=SERVER, namespace=NS, agents_must_be_unbound=["a1"]
+        ))
+
+        assert fake.deleted == [("nmstateconfigs", f"nmstate-config-{BMH}"), ("baremetalhosts", BMH)]
+        # No `detached` annotation, no `spec.online`, no finalizer: metal3
+        # deprovisions the host — powers it off — before it lets the BMH go.
+        assert fake.patches == []
+        assert result.removed == [f"NMStateConfig/nmstate-config-{BMH}", f"BareMetalHost/{BMH}"]
+        # Named for after the host is gone: metal3 needs it for the power-off.
+        assert result.bmc_secret == f"cisco-ucs-{BMH}"
+
+    async def test_an_agent_bound_since_the_inspection_stops_the_delete(self, cluster):
+        fake = cluster(_FakeCluster(agents=[_agent("a1", label=BMH, bound_to="hc-01")]))
+        with pytest.raises(AgentBoundToClusterError, match="hc-01"):
+            await activities.delete_host_resources(HostDeleteRequest(
+                server_name=SERVER, namespace=NS, agents_must_be_unbound=["a1"]
+            ))
+        assert fake.deleted == []
+
+    async def test_a_host_already_gone_is_success(self, cluster):
+        fake = cluster(_FakeCluster(bmh=False, nmstate=False))
+        result = await activities.delete_host_resources(
+            HostDeleteRequest(server_name=SERVER, namespace=NS)
+        )
+        assert result.removed == [] and result.bmc_secret is None
+        assert fake.patches == []
+
+
+@pytest.mark.parametrize("outlived", [True, False])
+async def test_the_bmc_secret_is_deleted_by_the_name_the_host_gave(monkeypatch, outlived):
+    deleted: list[tuple[str, str]] = []
+
+    async def _delete(namespace: str, name: str) -> bool:
+        deleted.append((namespace, name))
+        return outlived
+
+    monkeypatch.setattr(cluster_api, "delete_secret_if_present", _delete)
+    assert await activities.delete_bmc_secret(BmcSecretRef(namespace=NS, name="cisco-ucs-x")) is outlived
+    assert deleted == [(NS, "cisco-ucs-x")]
 
 
 class TestDeleteAgents:

@@ -74,7 +74,7 @@
       <div class="eyebrow">The first thing to know</div>
       <h2>Two ways to trigger it: name a server, or don&rsquo;t</h2>
       <p class="lede"><code>server_names</code> is optional, and <b>leaving it out is the normal mode</b>.
-      The InfraEnv&rsquo;s own name is then the hardware query, so you ask for &ldquo;a server for this
+      The InfraEnv&rsquo;s agent labels are then the hardware query, so you ask for &ldquo;a server for this
       InfraEnv&rdquo; and the workflow decides which one. Either way one run installs <b>one</b>
       server; several servers are several runs (<a href="#api">below</a>).</p>
     </div>
@@ -84,7 +84,7 @@
         <thead><tr><th></th><th><code>server_names</code> omitted</th><th><code>server_names</code> given</th></tr></thead>
         <tbody>
           <tr><td class="k">reads as</td><td class="muted"><em>&ldquo;fill this InfraEnv&rdquo;</em></td><td class="muted"><em>&ldquo;install this machine&rdquo;</em></td></tr>
-          <tr><td class="k">server-scan allocation</td><td class="muted"><code>POST /servers/available {"pattern": "^ocp-&lt;first 3 words of infraEnv&gt;-", …}</code></td><td class="muted"><code>POST /servers/available {"name": "&lt;server&gt;", …}</code></td></tr>
+          <tr><td class="k">server-scan allocation</td><td class="muted"><code>POST /servers/available {"pattern": "^ocp-&lt;flavor&gt;-&lt;size&gt;-&lt;site&gt;-", …}</code>, from the InfraEnv&rsquo;s <code>agentLabels</code></td><td class="muted"><code>POST /servers/available {"name": "&lt;server&gt;", …}</code></td></tr>
           <tr><td class="k">servers per run</td><td class="muted">one &mdash; server-scan picks it, locks it for the run and live-checks it</td><td class="muted">one &mdash; that one</td></tr>
           <tr><td class="k">already has a BareMetalHost</td><td class="muted">its lock <b>given back</b>, the run fails</td><td class="muted"><b>converged</b> &mdash; that is the point</td></tr>
           <tr><td class="k">workflow id</td><td class="muted"><code>add-server-to-mce-&lt;mce&gt;_&lt;infraEnv&gt;_&lt;slot&gt;</code>, the first free slot</td><td class="muted"><code>add-server-to-mce-&lt;mce&gt;_&lt;server&gt;</code></td></tr>
@@ -106,19 +106,30 @@
         expected state rather than a reason to give the server back.</p>
       </div>
       <div class="panel">
-        <h3>The pool: the InfraEnv&rsquo;s first three words</h3>
-        <p>server-scan names carry the InfraEnv&rsquo;s leading words behind an <code>ocp-</code> prefix,
-        so the query is the InfraEnv name&rsquo;s <b>first three <code>-</code>-separated words</b>
-        (the operator, 2026-11-19): <code>c200-mtl-haifa-az1</code> draws from
-        <code>^ocp-c200-mtl-haifa-</code>. Always three, whatever the name &mdash; a longer name such as
-        <code>cisco-m6-bat-yam-64c-512gb</code> draws from <code>^ocp-cisco-m6-bat-</code>, any size; a
-        name of fewer words is used whole. There is no mapping table to keep in step. The trailing
-        <code>-</code> is load-bearing (the operator, 2026-11-17): the third word must end where the
-        server&rsquo;s next word begins, so <code>c200-mtl-haifa</code> never draws a server of
-        <code>c200-mtl-haifa2</code> or <code>c200-mtl-haifax</code>.</p>
-        <p class="note">The InfraEnv name is caller data going into a regex, so it is escaped. Today&rsquo;s
-        names are <code>[a-z0-9-]</code> and it changes nothing &mdash; a <code>.</code> would silently
-        widen the pool without it.</p>
+        <h3>The pool: the InfraEnv&rsquo;s flavor, size and site labels</h3>
+        <p>Under the naming convention (since 2026-11-22) a server is named
+        <code>ocp-&lt;flavor&gt;-&lt;size&gt;-&lt;site&gt;-&lt;serial&gt;</code> and an InfraEnv
+        <code>&lt;flavor&gt;-&lt;size&gt;-&lt;zone&gt;</code>, so the InfraEnv&rsquo;s name no longer says
+        which servers are its: the zone is in no server&rsquo;s name, and the site is in no
+        InfraEnv&rsquo;s. Each InfraEnv carries every part as an agent label, so the query is built from
+        three of its <code>spec.agentLabels</code>:</p>
+<pre><code># InfraEnv c200-mtl-az1
+spec:
+  agentLabels:
+    redbull.io/flavor: c200
+    redbull.io/size: mtl
+    redbull.io/site: five
+    topology.kubernetes.io/zone: az1   # not part of the query</code></pre>
+        <p>draws from <code>^ocp-c200-mtl-five-</code>. The trailing <code>-</code> is load-bearing
+        (the operator, 2026-11-17): the site must end where the server&rsquo;s next word begins, so
+        <code>five</code> never draws a server of <code>five2</code>. Each of the three must be present and
+        one lowercase word of letters and digits, or the run fails before anything is allocated
+        (<code>InfraEnvAgentLabelsError</code>, naming each label). A named install needs none of them.</p>
+        <p class="note">A <code>server-lifecycle-worker</code> older than this rule reports no labels; a
+        run against it, and every run started before it, still draws from the InfraEnv name&rsquo;s
+        first three words (<code>c200-mtl-haifa-az1</code> &rarr; <code>^ocp-c200-mtl-haifa-</code>).
+        The zone is not filtered on yet: drawing only servers whose zone in server-scan matches the
+        InfraEnv&rsquo;s waits on server-scan&rsquo;s allocation taking a zone.</p>
       </div>
     </div>
   </section>
@@ -216,17 +227,19 @@
       <table>
         <thead><tr><th>Situation</th><th>What the run does</th><th>Where the lock ends up</th></tr></thead>
         <tbody>
+          <tr><td>The InfraEnv is not on the MCE, or (a pool draw) its <code>agentLabels</code> lack a flavor, size or site that can name a server</td><td class="muted">Fails at once, before the draw: <code>InfraEnvNotFoundError</code> / <code>InfraEnvAgentLabelsError</code> naming each label</td><td class="muted">never taken</td></tr>
           <tr><td>server-scan has nothing to allocate &mdash; nothing healthy, all claimed or locked, every candidate failing its live check</td><td class="muted">Fails at once, <code>ServerNotAvailableError</code> with server-scan&rsquo;s reasons</td><td class="muted">never taken</td></tr>
           <tr><td>The allocated server fails a check</td><td class="muted">Gives it back and fails, saying which check</td><td class="muted">released at once</td></tr>
           <tr><td>The Agent appears</td><td class="muted">Installed; then waits (up to 24 h, server-scan read every 5 min) for server-scan to show it <code>INSTALLED_TO_INVENTORY</code> / <code>INSTALLED</code>, and completes</td><td class="muted">held 24 h, then <b>released</b> as soon as server-scan shows it installed (<code>lock_released: true</code>)</td></tr>
           <tr><td>server-scan never shows it installed within the 24 h, cannot be read, or names another MCE</td><td class="muted"><b>Completes</b> all the same &mdash; the Agent proved the install; <code>lock_detail</code> says why</td><td class="muted">kept, expires on its own (<code>lock_released: false</code>)</td></tr>
           <tr><td>The server is removed from this MCE within that day (remove-server-from-mce)</td><td class="muted">&mdash;</td><td class="muted">runs until this run sees server-scan report the server, or to expiry: remove-server-from-mce releases no lock since 2026-11-17</td></tr>
-          <tr><td>No Agent within 1 h</td><td class="muted">Deletes the server&rsquo;s resources, puts it <b>in maintenance</b> in server-scan (so no run draws it again until someone ends that), then fails (<code>AgentNeverAppearedError</code>)</td><td class="muted">released once it is in maintenance; <b>kept</b> to expire (2 h) if server-scan refuses the maintenance</td></tr>
+          <tr><td>No Agent within 1 h</td><td class="muted">Deletes the server&rsquo;s resources and waits for metal3 to let the BareMetalHost go, puts it <b>in maintenance</b> in server-scan (so no run draws it again until someone ends that), then fails (<code>AgentNeverAppearedError</code>)</td><td class="muted">released once it is in maintenance; <b>kept</b> to expire (2 h) if server-scan refuses the maintenance</td></tr>
+          <tr><td>metal3 has not let the deleted BareMetalHost go 15 min into a rollback (usually a BMC it cannot reach)</td><td class="muted">Fails (<code>BmhDeletionTimeoutError</code>) with nothing after the delete &mdash; no PXE unmap, no maintenance; the BareMetalHost stays <code>Deleting</code>, its finalizer left to metal3</td><td class="muted">kept, expires on its own (2 h)</td></tr>
           <tr><td>The lock lapsed mid-install and another run took the machine</td><td class="muted">Deletes <em>its own</em> resources, then fails (<code>ServerReservedError</code>)</td><td class="muted">the other run&rsquo;s, untouched</td></tr>
           <tr><td>An operator cancels it while server-scan is still allocating</td><td class="muted">Ends CANCELED; it never learns which server server-scan may still lock for it</td><td class="muted">that one expires on its own (2 h)</td></tr>
           <tr><td>The allocation&rsquo;s answer is lost and it is retried (a worker died mid-call)</td><td class="muted">The retry is allocated <em>another</em> server: server-scan matches a lock to the request that took it</td><td class="muted">the first one expires on its own (2 h)</td></tr>
           <tr><td>The run crashes or fails while creating resources (e.g. <code>BmhConflictError</code>)</td><td class="muted">Stops; resources are <b>left</b> on the MCE</td><td class="muted">expires after 2 h; a re-run of the same named install extends it</td></tr>
-          <tr><td>An operator <b>cancels</b> the run before the Agent</td><td class="muted"><b>Rolls back</b> the server being installed (since 2026-11-09), then ends CANCELED: waits 2 min for a call already sent to land, then &mdash; anything written on the MCE &mdash; runs <b>remove-server-from-mce</b> for it (powered off, BareMetalHost, NMStateConfig and any Agent deleted, PXE MACs cleared, verified); nothing written &mdash; removes an IPMI PXE mapping itself. <code>progress.cancel_rollback</code> says what was done</td><td class="muted">released here, after remove-server-from-mce when it ran (which releases no lock since 2026-11-17); kept to expiry when its PXE cleanup failed</td></tr>
+          <tr><td>An operator <b>cancels</b> the run before the Agent</td><td class="muted"><b>Rolls back</b> the server being installed (since 2026-11-09), then ends CANCELED: waits 2 min for a call already sent to land, then &mdash; anything written on the MCE &mdash; runs <b>remove-server-from-mce</b> for it (BareMetalHost and NMStateConfig deleted and waited on until metal3 powers the host off, any Agent deleted, PXE MACs cleared, verified); nothing written &mdash; removes an IPMI PXE mapping itself. <code>progress.cancel_rollback</code> says what was done</td><td class="muted">released here, after remove-server-from-mce when it ran (which releases no lock since 2026-11-17); kept to expiry when its PXE cleanup failed</td></tr>
           <tr><td>An operator cancels it after the Agent (waiting for server-scan)</td><td class="muted">Stops waiting, ends CANCELED; the server <b>stays installed</b></td><td class="muted">kept, expires on its own</td></tr>
           <tr><td>An operator <b>terminates</b> the run</td><td class="muted">Stops at once, no code runs: <b>nothing is rolled back</b>, resources are left. Use Cancel to roll back</td><td class="muted">expires on its own</td></tr>
           <tr><td>No worker is running in that MCE</td><td class="muted">Waits; the <code>progress</code> query names the unserved queue</td><td class="muted">&mdash;</td></tr>
@@ -438,11 +451,12 @@
         <div class="marker">6</div>
         <div class="card">
           <div class="card-title">
-            <h3>teardown_bmh_resources, maintenance, then the run fails</h3>
+            <h3>delete_host_resources, maintenance, then the run fails</h3>
             <span class="phase">phases <b>rolling-back</b> / <b>setting-maintenance</b></span>
           </div>
-          <p>No Agent by the deadline: the server&rsquo;s NMStateConfig and BareMetalHost are removed, the
-          server is put <b>in maintenance</b> in server-scan (phase <b>setting-maintenance</b>; the
+          <p>No Agent by the deadline: the server&rsquo;s NMStateConfig and BareMetalHost are deleted and the
+          run waits for metal3 to let the BareMetalHost go (below), the server is put <b>in maintenance</b>
+          in server-scan (phase <b>setting-maintenance</b>; the
           operator, 2026-11-17), and only then its install lock released (phase
           <b>releasing-server</b>). The run fails as <code>AgentNeverAppearedError</code>, saying where
           the host&rsquo;s own state points (an Ironic registration error: the BMC; none: the bond, the
@@ -466,31 +480,30 @@
           <p>Leaving a rolled-back host in place would strand that machine <em>invisibly</em>: server-scan
           reports a server unclaimed until a cluster reports the node, so no other MCE would know it was
           taken.</p>
-          <p><b>The order is load-bearing</b>, and every step of it came from a live cluster rather than
-          from the docs:</p>
+          <p><b>The rollback never forces metal3</b> (the operator, 2026-11-24, after 2026-11-23). The same
+          rollback is used here, after a lapsed lock, and after an IPMI boot entry that never published:</p>
           <ol>
-            <li><b>Detach first.</b> <code>baremetalhost.metal3.io/detached</code> applied
-            <em>after</em> <code>deletionTimestamp</code> is set does nothing &mdash; measured inert for
-            four minutes. It only works before the delete.</li>
-            <li><b>The NMStateConfig explicitly</b> &mdash; it has no finalizer and no ownerReference, so
-            nothing removes it implicitly.</li>
-            <li><b>Delete the host, then wait, bounded.</b></li>
-            <li><b>Drop metal3&rsquo;s finalizer if it will not release.</b>
-            <code>baremetalhost.metal3.io</code> blocks while trying to deprovision through the BMC &mdash;
-            and a rollback happens <em>precisely because</em> that BMC never answered, so this is the
-            expected path here, not an exceptional one (stuck past four minutes, state
-            <code>deleting</code>, no error ever reported). Only that one: BMAC&rsquo;s
-            <code>bmac.agent-install.openshift.io/deprovision</code> released inside <b>one second</b>, so
-            taking it would rob a controller already doing its job.</li>
-            <li><b>Confirm the Secret is gone.</b> It carries an ownerReference to the BareMetalHost, so the
-            garbage collector takes it &mdash; but only once the host <em>genuinely</em> goes, which is
-            after the finalizer clears. Its name is read from the host&rsquo;s own
-            <code>credentialsName</code>, never rebuilt from the vendor.</li>
+            <li><b>The NMStateConfig and the BareMetalHost deleted</b> (<code>delete_host_resources</code>)
+            &mdash; no <code>detached</code> annotation, and metal3&rsquo;s
+            <code>baremetalhost.metal3.io</code> finalizer never touched. On the delete metal3 deprovisions
+            the host: powers it off through its BMC, deletes its ironic node, and only then lets the
+            BareMetalHost go.</li>
+            <li><b>Wait for it:</b> the BareMetalHost is read every <b>15 s</b>, for up to <b>15 min</b>,
+            until it is gone (30&ndash;45 s with a BMC that answers).</li>
+            <li><b>Then the BMC Secret</b>, if it outlived the host: metal3 needed it for the power-off. Its
+            name is read from the host&rsquo;s own <code>credentialsName</code> before the delete.</li>
           </ol>
-          <p class="note">Teardown <b>refuses to report success while the host still stands</b>
-          (<code>BmhTeardownError</code>, retryable). The server must never be reported back to the
-          inventory while a BareMetalHost still points at it &mdash; that is the one outcome worse than a
-          slow rollback.</p>
+          <p class="note"><b>Still there after 15 minutes:</b> the run fails with
+          <code>BmhDeletionTimeoutError</code>, naming why it was rolling back and metal3&rsquo;s state and
+          error &mdash; usually a BMC it cannot reach. <b>Nothing after the delete is done</b>: no PXE unmap,
+          no maintenance, no release. A BareMetalHost still points at the machine, so its install lock runs
+          to its expiry. Fix the BMC and metal3 finishes on its own. The BareMetalHost stays
+          <code>Deleting</code> meanwhile, visible on the MCE.</p>
+          <p class="note"><b>Why never force it.</b> Until 2026-11-24 the rollback detached the host and,
+          30 s after the delete, dropped metal3&rsquo;s finalizer itself. A deprovision through a BMC that
+          answers takes 30&ndash;45 s, so that cut healthy deletes off half-way and orphaned the ironic node,
+          whose power sync then forced the machine to a stale power state every minute. A run started before
+          then still rolls back that way (<code>teardown_bmh_resources</code>).</p>
         </div>
       </div>
 
@@ -892,7 +905,7 @@
       <table>
         <thead><tr><th>Field</th><th>Type</th><th>Rules</th><th>What it&rsquo;s for</th></tr></thead>
         <tbody>
-          <tr><td class="k">infra_env</td><td class="k">str</td><td class="muted">required, non-empty</td><td class="muted">The InfraEnv to fill. Labels both resources, <b>and</b> its first three words are the server query (<code>c200-mtl-haifa-az1</code> &rarr; <code>^ocp-c200-mtl-haifa-</code>). Must already exist, in <code>namespace</code>.</td></tr>
+          <tr><td class="k">infra_env</td><td class="k">str</td><td class="muted">required, non-empty</td><td class="muted">The InfraEnv to fill. Labels both resources, <b>and</b> its flavor, size and site <code>agentLabels</code> are a pool draw&rsquo;s server query (<code>c200</code>, <code>mtl</code>, <code>five</code> &rarr; <code>^ocp-c200-mtl-five-</code>). Must already exist, in <code>namespace</code>.</td></tr>
           <tr><td class="k">mce_cluster</td><td class="k">str</td><td class="muted">required, non-empty</td><td class="muted">Which MCE. Selects the <code>INVENTORY</code> segment the VLAN comes from <b>and</b> the activity queue the cluster writes go to.</td></tr>
           <tr><td class="k">namespace</td><td class="k">str</td><td class="muted">non-empty, default <code>inventory</code></td><td class="muted">Where the three resources go. Must be the InfraEnv&rsquo;s own namespace.</td></tr>
           <tr><td class="k">server_names</td><td class="k">str | list | null</td><td class="muted">default <code>null</code>; a list is 1&ndash;20 names, each once</td><td class="muted">Install these machines instead of letting the pool pick: one name, or a list &mdash; one run per name. Turns the already-installed refusal off; changes the workflow id.</td></tr>
@@ -918,7 +931,7 @@
         <tbody>
           <tr><td class="k">pending</td><td class="muted">Run accepted, nothing read yet</td><td class="muted">instant</td></tr>
           <tr><td class="k">resolving-vlan</td><td class="muted">Reading the MCE&rsquo;s <code>INVENTORY</code> segment from the Segments Manager</td><td class="muted">instant</td></tr>
-
+          <tr><td class="k">validating-infraenv</td><td class="muted">Reading the InfraEnv on the MCE: it must exist and, for a pool draw, its <code>agentLabels</code> name the servers to ask for</td><td class="muted">instant</td></tr>
           <tr><td class="k">acquiring-server</td><td class="muted">server-scan allocating ONE server: locked for this run, live-checked while locked</td><td class="muted">seconds to ~1 min (it reaches a vendor manager); ~22 min at its worst</td></tr>
           <tr><td class="k">selecting-server</td><td class="muted">Name, BMC, the two bond members picked, one BareMetalHost read; refused, the lock goes back and the run fails</td><td class="muted">seconds</td></tr>
           <tr><td class="k">reserving-server</td><td class="muted">Only a named server the allocation refused that the run takes anyway (its own leftover lock, <code>allow_unhealthy</code>): taking server-scan&rsquo;s install lock</td><td class="muted">instant</td></tr>
@@ -928,7 +941,7 @@
           <tr><td class="k">creating-baremetalhost</td><td class="muted">The BareMetalHost</td><td class="muted">instant</td></tr>
           <tr><td class="k">creating-nmstateconfig</td><td class="muted">The bond + tagged VLAN (for an IPMI blade this comes first, before <code>publishing-pxe-boot</code>)</td><td class="muted">instant</td></tr>
           <tr><td class="k">awaiting-agent</td><td class="muted">Waiting for an Agent to register &mdash; <b>bounded, &le; 1 h</b></td><td class="muted">5&ndash;30 min</td></tr>
-          <tr><td class="k">rolling-back</td><td class="muted">Removing a server that produced no Agent; the run then fails as <code>AgentNeverAppearedError</code></td><td class="muted">5&ndash;60 s</td></tr>
+          <tr><td class="k">rolling-back</td><td class="muted">Deleting a server&rsquo;s NMStateConfig and BareMetalHost and waiting (every 15 s) for metal3 to power it off and let it go &mdash; after no Agent, a lapsed lock or an unpublished boot entry; still there at 15 min: <code>BmhDeletionTimeoutError</code></td><td class="muted">30 s&ndash;15 min</td></tr>
           <tr><td class="k">setting-maintenance</td><td class="muted">Putting the server that produced no Agent in maintenance in server-scan, before its lock goes back</td><td class="muted">instant</td></tr>
           <tr><td class="k">releasing-server</td><td class="muted">Giving the refused or rolled-back server&rsquo;s install lock back, before the run fails</td><td class="muted">instant</td></tr>
           <tr><td class="k">holding-server</td><td class="muted">Extending the lock to a day on success, until server-scan sees the machine in a cluster</td><td class="muted">instant</td></tr>
@@ -948,7 +961,7 @@
           <tr><td class="k">SERVER_SCAN_URL</td><td class="muted"><code>server-lifecycle-config</code></td><td class="muted">Inventory API base, <b>including</b> <code>/api/v1</code>.</td></tr>
           <tr><td class="k">SERVER_SCAN_API_TOKEN</td><td class="muted"><code>server-lifecycle-credentials</code></td><td class="muted">An <b>admin</b> token &mdash; the install lock is taken and released, and a server with no Agent put in maintenance, through server-scan&rsquo;s mutation endpoints, and a viewer token fails every run with <code>ServerScanAuthError</code>. May be empty where server-scan runs with auth disabled.</td></tr>
           <tr><td class="k">{HP,DELL,CISCO,INTERSIGHT}_BMC_USERNAME / _PASSWORD</td><td class="muted"><code>server-lifecycle-credentials</code></td><td class="muted">What Ironic uses to drive the BMC. server-scan never holds these. A vendor with no pair fails its run with <code>BmcCredentialsMissingError</code>.</td></tr>
-          <tr><td class="k">RBAC</td><td class="muted">the chart&rsquo;s Role</td><td class="muted">Namespace-scoped. <code>get</code>,<code>create</code>,<code>delete</code> on <code>secrets</code>; <code>get</code>,<code>create</code>,<code>delete</code>,<code>patch</code> on <code>metal3.io/baremetalhosts</code>; <code>get</code>,<code>create</code>,<code>delete</code> on <code>agent-install.openshift.io/nmstateconfigs</code>; <code>get</code>,<code>list</code> on <code>agent-install.openshift.io/agents</code>; <code>get</code> on <code>agent-install.openshift.io/infraenvs</code> (an IPMI server&rsquo;s network boot reads its InfraEnv). <code>delete</code>+<code>patch</code> are the rollback (detach, then the finalizer); <code>list</code> on agents cannot be a <code>get</code>, because an Agent is matched by MAC. Still no <code>update</code> &mdash; nothing here overwrites an existing resource. A missing verb is a non-retryable <code>BmhPrerequisiteMissingError</code>, not a silent retry loop.</td></tr>
+          <tr><td class="k">RBAC</td><td class="muted">the chart&rsquo;s Role</td><td class="muted">Namespace-scoped. <code>get</code>,<code>create</code>,<code>delete</code> on <code>secrets</code>; <code>get</code>,<code>create</code>,<code>delete</code>,<code>patch</code> on <code>metal3.io/baremetalhosts</code>; <code>get</code>,<code>create</code>,<code>delete</code> on <code>agent-install.openshift.io/nmstateconfigs</code>; <code>get</code>,<code>list</code> on <code>agent-install.openshift.io/agents</code>; <code>get</code> on <code>agent-install.openshift.io/infraenvs</code> (an IPMI server&rsquo;s network boot reads its InfraEnv). <code>delete</code> is the rollback (<code>patch</code> too for a run started before 2026-11-24, which detached the host and dropped its finalizer); <code>list</code> on agents cannot be a <code>get</code>, because an Agent is matched by MAC. Still no <code>update</code> &mdash; nothing here overwrites an existing resource. A missing verb is a non-retryable <code>BmhPrerequisiteMissingError</code>, not a silent retry loop.</td></tr>
         </tbody>
       </table>
     </div>

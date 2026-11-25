@@ -170,7 +170,8 @@ class AcquireServerRequest(BaseModel):
     Exactly one of `pattern`/`name`, mirroring the endpoint's own contract.
     `pattern` is how an InfraEnv resolved to hardware for these runs: the whole
     InfraEnv name after an `ocp-` prefix. (A run since the allocation sends
-    AllocateServerRequest, built from the InfraEnv's first three words.)
+    AllocateServerRequest, built from the InfraEnv's flavor, size and site
+    agentLabels — from its name's first three words for a limb predating them.)
 
     `health` is sent as `max_health` since server-scan's ADR-0063 (2026-11-16):
     `health` is a 400 there now, and HEALTHY means the same in both — that
@@ -504,6 +505,11 @@ class InfraEnvState(BaseModel):
     # to this cluster at once, so a host added to it can be installed rather
     # than wait in the inventory. Reported, not refused.
     cluster_ref: str | None = None
+    # `spec.agentLabels`, as found (`{}` when it has none): every Agent that
+    # registers from it carries them. add-server-to-mce builds its pool draw
+    # from three of them. Always emitted, so a workflow can tell this limb from
+    # one predating the field (`"agent_labels" in model_fields_set`).
+    agent_labels: dict[str, str] = Field(default_factory=dict)
 
 
 class CreatedResource(BaseModel):
@@ -672,6 +678,39 @@ class HostPowerRequest(BaseModel):
     agents_must_be_unbound: list[str] = Field(default_factory=list)
 
 
+class HostDeleteRequest(BaseModel):
+    """Delete one host's NMStateConfig and BareMetalHost, and leave metal3 to finish.
+
+    `agents_must_be_unbound` is re-checked by the activity before it deletes
+    anything: a host whose Agent was bound to a cluster since the inspection is
+    refused with nothing deleted.
+    """
+
+    server_name: str = Field(min_length=1)
+    namespace: str = Field(min_length=1)
+    agents_must_be_unbound: list[str] = Field(default_factory=list)
+
+
+class HostDeletion(BaseModel):
+    """What `delete_host_resources` deleted, as `Kind/name`.
+
+    `bmc_secret` is the BareMetalHost's own `spec.bmc.credentialsName`, read
+    before the delete. metal3 still needs that Secret to power the host off
+    while it deletes it, so it is deleted only once the host is gone. None
+    when there was no BareMetalHost to read it from.
+    """
+
+    removed: list[str] = Field(default_factory=list)
+    bmc_secret: str | None = None
+
+
+class BmcSecretRef(BaseModel):
+    """One BMC credentials Secret, by name and namespace."""
+
+    namespace: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+
+
 class AgentDeleteRequest(BaseModel):
     """Agents to delete in one namespace. Each is re-checked as unbound first."""
 
@@ -718,6 +757,9 @@ class RemoveServerFromMceResult(BaseModel):
     namespace: str
     mce_cluster: str
     found: bool
+    # The run itself powered the host off (`spec.online: false`). Only a run
+    # recorded before `remove-server-delete-without-power-off` does; since then
+    # metal3's own delete of the BareMetalHost powers it off, and this is False.
     powered_off: bool = False
     agents_removed: list[str] = Field(default_factory=list)
     resources_removed: list[str] = Field(default_factory=list)
@@ -1315,7 +1357,8 @@ class AgentMachineCleanupRequest(BaseModel):
     """clean_up_agent_machines: every AgentMachine that still names this Agent, plus `known`.
 
     `clear_finalizers`: also drop the provider's own finalizer from one that is
-    deleting with no Machine — the provider removes it only through a Machine.
+    deleting with no owner Machine at all, which the provider keeps for ever.
+    One whose owner Machine is merely gone is left to the provider.
     """
 
     agent: AgentNameRef

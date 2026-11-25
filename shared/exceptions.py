@@ -453,6 +453,10 @@ class AgentNeverAppearedError(OrchestratorError):
 class BmhTeardownError(OrchestratorError):
     """A rolled-back candidate's resources are still on the cluster.
 
+    Raised only by `teardown_bmh_resources`, which only runs recorded before
+    2026-11-24 still call; since then a still-deleting host is waited on in the
+    workflow and fails as BmhDeletionTimeoutError, its finalizer untouched.
+
     RETRYABLE, and deliberately not classified permanent. The usual cause is
     Metal3 still holding `baremetalhost.metal3.io` while it tries to deprovision
     through a BMC that never answered, which is exactly the state a rollback
@@ -536,6 +540,18 @@ class InfraEnvNotFoundError(OrchestratorError):
     """
 
 
+class InfraEnvAgentLabelsError(OrchestratorError):
+    """WORKFLOW-RAISED. The InfraEnv a pool draw fills cannot name its servers.
+
+    Its servers are `ocp-<flavor>-<size>-<site>-…`, the three words taken from
+    its `spec.agentLabels` (`redbull.io/flavor`, `redbull.io/size`,
+    `redbull.io/site`) — the zone in its name is in no server's name, and the
+    site in its labels is in no InfraEnv's. A label missing, or not one
+    lowercase word of letters and digits, fails the run before anything is
+    allocated; the message names each. A named install needs none of them.
+    """
+
+
 class InfraEnvNotReadyError(OrchestratorError):
     """The InfraEnv exists but publishes no iPXE script URL yet.
 
@@ -592,10 +608,28 @@ class ServerStillPresentError(OrchestratorError):
 class HostPowerOffTimeoutError(OrchestratorError):
     """WORKFLOW-RAISED. The BareMetalHost never reported the host powered off.
 
-    remove-server-from-mce powers the host off BEFORE deleting anything: a host left
-    running the discovery image re-registers its Agent within a minute of the
-    Agent being deleted. The BMH is left with `online: false` and nothing is
-    deleted; the usual cause is an unreachable BMC. Re-run once it answers.
+    Only a remove-server-from-mce run recorded before
+    `remove-server-delete-without-power-off` (2026-11-24) powers the host off
+    itself, BEFORE deleting anything: a host left running the discovery image
+    re-registers its Agent within a minute of the Agent being deleted. The BMH
+    is left with `online: false` and nothing is deleted; the usual cause is an
+    unreachable BMC. Re-run once it answers.
+    """
+
+
+class BmhDeletionTimeoutError(OrchestratorError):
+    """WORKFLOW-RAISED. A deleted BareMetalHost was still on the MCE 15 min later.
+
+    remove-server-from-mce and add-server-to-mce's rollbacks delete the
+    BareMetalHost and leave metal3's `baremetalhost.metal3.io` finalizer to
+    metal3, which releases it only once it has deprovisioned the host — powered
+    it off through its BMC and deleted its ironic node. A host still there is
+    one metal3 cannot finish, usually because its BMC does not answer. The
+    finalizer is never dropped: dropping it orphans the ironic node, whose power
+    sync then forces the machine to a stale power state every minute
+    (2026-11-23). The NMStateConfig is deleted; nothing after the delete is
+    done (the Agent, the PXE map, maintenance, the lock release). Fix the BMC;
+    metal3 finishes on its own.
     """
 
 

@@ -265,7 +265,7 @@ before the BareMetalHost or the NMStateConfig is written.
 | cancelled while server-scan is still allocating | ends CANCELED, never learning which server server-scan may still lock for it | that one expires (2 h) |
 | the allocation's answer is lost and it is retried | the retry is allocated *another* server — server-scan ties a lock to the request that took it | the first expires (2 h) |
 | crash/failure while creating resources | stops, resources **left** on the MCE | expires after 2 h; a re-run of the same named install extends it |
-| operator **cancels** before the Agent | **rolls back** (since 2026-11-09): after 2 min for calls in flight, **remove-server-from-mce** takes the server out of the MCE (power off, delete, PXE, verify) — or, nothing written, its PXE mapping is removed here; ends CANCELED, `progress.cancel_rollback` says what was done | released here, after the child (which releases no lock since 2026-11-17); kept to expire if its PXE cleanup failed |
+| operator **cancels** before the Agent | **rolls back** (since 2026-11-09): after 2 min for calls in flight, **remove-server-from-mce** takes the server out of the MCE (delete, wait for metal3 to power it off, Agent, PXE, verify) — or, nothing written, its PXE mapping is removed here; ends CANCELED, `progress.cancel_rollback` says what was done | released here, after the child (which releases no lock since 2026-11-17); kept to expire if its PXE cleanup failed |
 | operator cancels after the Agent | stops the wait for server-scan, ends CANCELED; the server **stays installed** | expires |
 | operator **terminates** | stops at once — no rollback, resources left (use Cancel to roll back) | expires |
 | no worker in that MCE | waits; `progress` names the queue | — |
@@ -293,16 +293,23 @@ maintenance, its health — fails saying which.
    Manager by **cluster name**. Before the allocation, because no server could
    make a missing allocation usable (and one allocated first would sit locked).
    Runs on the *segment-lifecycle* queue, where that credential already lives.
+   **validating-infraenv** — the InfraEnv must exist on the MCE
+   (`InfraEnvNotFoundError`), and for a pool draw its `spec.agentLabels` must
+   name its servers (below; `InfraEnvAgentLabelsError` naming each label
+   missing or not one lowercase word). Nothing is allocated before it.
 2. **acquiring-server** — `POST /servers/available`: server-scan **allocates**
    ONE server, locked for this run (holder `add-server-to-mce`, the run's
    workflow id, 2 h) and live-checked while locked (its ADR-0063). The
-   pool is the InfraEnv name's **first three `-`-separated words** behind an
-   `ocp-` prefix (since 2026-11-19): InfraEnv `c200-mtl-haifa-az1` draws from
-   `^ocp-c200-mtl-haifa-`. Always three, whatever the name — a longer name like
-   `cisco-m6-bat-yam-64c-512gb` draws from `^ocp-cisco-m6-bat-`, any size; a name
-   of fewer words is used whole. The trailing `-` ends the third word, so
-   `c200-mtl-haifa` never draws `c200-mtl-haifa2-…`; `max_health: HEALTHY`,
-   `min_nic_macs: 2`. Nothing reservable is server-scan's 503
+   pool is `^ocp-<flavor>-<size>-<site>-`, from the InfraEnv's
+   `redbull.io/flavor`, `redbull.io/size` and `redbull.io/site` agentLabels
+   (the naming convention, since 2026-11-22): InfraEnv `c200-mtl-az1` labelled
+   `c200` / `mtl` / `five` draws from `^ocp-c200-mtl-five-`. Its name cannot
+   say it: the zone in it is in no server's name, and the site is in no
+   InfraEnv's. The zone label is not filtered on yet. The trailing `-` ends the
+   site, so `five` never draws `five2-…`; `max_health: HEALTHY`,
+   `min_nic_macs: 2`. A limb older than the labels, and a run started before
+   them, draw from the InfraEnv name's first three words instead
+   (`c200-mtl-haifa-az1` → `^ocp-c200-mtl-haifa-`). Nothing reservable is server-scan's 503
    `NO_AVAILABLE_SERVER` with its reasons → `ServerNotAvailableError`, the run
    fails. Seconds as a rule, ~22 min at server-scan's worst (five live checks):
    the activity heartbeats and allows 30. **Not idempotent**: a retry after a
@@ -363,9 +370,13 @@ maintenance, its health — fails saying which.
    instead. A run started before 2026-11-17 releases with no maintenance and
    tries its next candidate from step 3.
 
-   Teardown order is load-bearing — metal3 must be told to detach the host
-   *before* the delete, or its finalizer blocks forever trying to deprovision
-   through the BMC that just failed to answer.
+   The rollback never forces metal3 (since 2026-11-24): the NMStateConfig and
+   BareMetalHost are deleted with no detach and metal3's finalizer untouched,
+   and the run waits — every 15 s, up to 15 min — for metal3 to power the host
+   off and let the BareMetalHost go. Still there at 15 min, the run fails
+   `BmhDeletionTimeoutError` with nothing after it (no maintenance, no release:
+   the lock runs out). Dropping the finalizer, as runs started before still do,
+   orphaned ironic nodes that then forced the machines' power every minute.
 
    This replaced a 10-minute Ironic-registration deadline, which was the wrong
    signal both ways: it passed hosts whose bond or VLAN was wrong (they register
@@ -376,8 +387,8 @@ maintenance, its health — fails saying which.
 
 Its id is `add-server-to-mce-<mce>_<infraEnv>_<slot>` — the hub, the
 **pool** and a slot. The MCE is in the id so each hub finds only its own
-runs; the pool itself (`^ocp-<first 3 words of the infraEnv>-`) has no MCE in it, so
-two hubs filling InfraEnvs that start with the same three words draw from the same machines, and the install
+runs; the pool itself (`^ocp-<flavor>-<size>-<site>-`, from the InfraEnv's agentLabels) has no MCE in it, so
+two hubs filling InfraEnvs with the same three labels draw from the same machines, and the install
 lock is what keeps them apart. Installs drawing from one pool run in parallel,
 one per slot (see
 [Several servers at once](#several-servers-at-once--count-or-a-list-of-server_names));
@@ -467,7 +478,7 @@ error type of that one reason.
 
 | field | type | rules | what it is for |
 | --- | --- | --- | --- |
-| `infra_env` | str | non-empty | The InfraEnv to fill. Labels both resources, **and** its first three `-`-separated words are the server query (`c200-mtl-haifa-az1` → `^ocp-c200-mtl-haifa-`). Must already exist, in `namespace`. |
+| `infra_env` | str | non-empty | The InfraEnv to fill. Labels both resources, **and** its flavor, size and site `agentLabels` are a pool draw's server query (`c200`, `mtl`, `five` → `^ocp-c200-mtl-five-`). Must already exist, in `namespace`. |
 | `mce_cluster` | str | non-empty | Which MCE. Names the `INVENTORY` segment the VLAN comes from **and** the activity queue the cluster writes go to. |
 | `namespace` | str | non-empty | Where the three resources go. **Must be the InfraEnv's own namespace** — BMAC looks for the InfraEnv beside the BareMetalHost. |
 | `server_names` | str \| list \| null | default `null`; a list is 1–20 names, each once | Install these machines instead of letting the pool pick (see above): one name, or a list — one run per name. |

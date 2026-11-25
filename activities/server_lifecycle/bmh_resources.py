@@ -48,9 +48,10 @@ INFRAENV_GROUP = "agent-install.openshift.io"
 INFRAENV_VERSION = "v1beta1"
 INFRAENV_PLURAL = "infraenvs"
 
-# Tells metal3 to stop managing a host WITHOUT deprovisioning it. A teardown
-# sets this before deleting, because deprovisioning talks to the BMC and a
-# rollback happens precisely when that BMC never answered.
+# Tells metal3 to stop managing a host WITHOUT deprovisioning it. Set only by
+# teardown_bmh_resources, for runs recorded before 2026-11-24: every run since
+# deletes through delete_host_resources with no detach and lets metal3
+# deprovision (power off, delete the ironic node) before the host goes.
 #
 # IT MUST BE SET BEFORE THE DELETE. Measured on a live cluster: applied after
 # `deletionTimestamp` was already set, it changed nothing for four minutes —
@@ -58,7 +59,10 @@ INFRAENV_PLURAL = "infraenvs"
 # one.
 DETACHED_ANNOTATION = "baremetalhost.metal3.io/detached"
 
-# The finalizer a teardown may have to drop itself, and ONLY this one.
+# The finalizer teardown_bmh_resources drops itself, and ONLY this one — for runs
+# recorded before 2026-11-24 only. Dropping it after a fixed 30 s cut healthy
+# deprovisions off and orphaned their ironic nodes (2026-11-23); no run since
+# touches it.
 # baremetal-operator holds it while trying to deprovision through the BMC, which
 # never completes when the BMC is unreachable — stuck past four minutes when
 # measured. BMAC's `bmac.agent-install.openshift.io/deprovision` is deliberately

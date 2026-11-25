@@ -326,12 +326,26 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   (`SERVER_SCAN_URL`), and it ALLOCATES each run ONE server (server-scan's
   ADR-0063, 2026-11-16; adopted here 2026-11-17, the operator: "every workflow
   will ask for one server, no need for candidate"). `allocate_server` =
-  `POST /servers/available` {pattern `^ocp-<the InfraEnv's FIRST THREE words>-`
-  (the operator, 2026-11-19: `c200-mtl-haifa-az1` → `^ocp-c200-mtl-haifa-`; ALWAYS
-  three, so a longer-style name like `cisco-m6-bat-yam-64c-512gb` draws
-  `^ocp-cisco-m6-bat-`, size and the rest of the site dropped — accepted; fewer
-  words = the whole name; `server_pool_prefix`, `_POOL_WORDS`. The trailing `-`
-  is load-bearing, the operator 2026-11-17: `…-haifa` must not draw `…-haifa2-…`) | name, `max_health:
+  `POST /servers/available` {pattern `^ocp-<flavor>-<size>-<site>-` FROM THE
+  INFRAENV'S `spec.agentLabels` (`redbull.io/flavor`, `redbull.io/size`,
+  `redbull.io/site`; the operator, 2026-11-22, on the naming convention in
+  `Idan-Maimon/kubevirt-workflows` `docs/naming-convention.md`: InfraEnv
+  `<flavor>-<mtl|kv<cpu>>-<zone>` = `c200-mtl-az1`, servers
+  `ocp-<flavor>-<mtl|kv<cpu>>-<site>-<serial|mac>` — the zone is in no server's
+  name, the site in no InfraEnv's, so the NAME cannot be the query any more; do
+  not go back to parsing it). `check_infra_env` reports the labels
+  (`InfraEnvState.agent_labels`, always emitted, `{}` for none — the limb never
+  judges them, publish-infraenv-to-pxe-server needs none); a POOL draw judges them
+  in `validating-infraenv` (`agent_label_problems`: each present and ONE lowercase
+  `[a-z0-9]+` word) and fails `InfraEnvAgentLabelsError`, every label named,
+  before anything is allocated; a named install needs none. The zone label is NOT
+  filtered on: server-scan's allocation takes no zone yet (the convention's open
+  item 2). Gated on the KEY's presence, not a patch (§5(a)): a limb predating it,
+  and every run recorded before, keep the InfraEnv name's FIRST THREE words
+  (the operator, 2026-11-19: `c200-mtl-haifa-az1` → `^ocp-c200-mtl-haifa-`,
+  `pool_prefix_from_name`, `_POOL_WORDS`) — the allocation's input is not
+  compared on replay. The trailing `-` is load-bearing, the operator 2026-11-17:
+  `…-five` must not draw `…-five2-…`) | name, `max_health:
   HEALTHY`, `min_nic_macs: 2`, holder, workflow id, mce_cluster, infra_env,
   namespace, `ttl_seconds` = the install TTL}: server-scan draws a candidate,
   LOCKS it for the run, live-rechecks it against its vendor manager WHILE locked
@@ -518,7 +532,9 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
 - **add-server-to-mce checks the InfraEnv exists on the MCE before drawing**
   (`check_infra_env`, phase `validating-infraenv`, gated by
   `infraenv-precheck`): a missing one fails the run with `InfraEnvNotFoundError`
-  instead of locking, booting and waiting an hour on every candidate. An
+  instead of locking, booting and waiting an hour on every candidate, and a pool
+  draw's InfraEnv whose agentLabels cannot name its servers fails
+  `InfraEnvAgentLabelsError` (the server-scan bullet above). An
   early-bound InfraEnv (`spec.clusterRef`) is logged, not refused. The API
   defaults `namespace` to `inventory` — on the edge model only, so a recorded
   run's input never changes on replay.
@@ -538,13 +554,30 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   `/servers/{id}`, never `/servers/available`), which is what finds an Agent
   whose BMH is already gone. Any of the three may be missing. It refuses with
   `AgentBoundToClusterError` — changing nothing — if any is bound
-  (`spec.clusterDeploymentName`). Order is load-bearing: POWER OFF first
-  (`spec.online: false`, bounded wait on `status.poweredOn`, else
-  `HostPowerOffTimeoutError` with nothing deleted), then the BMH + NMStateConfig
-  via the same `teardown_bmh_resources` as add-server-to-mce's rollback, and the
-  Agent LAST — a host still running discovery re-registers a deleted Agent
-  within a minute. The power-off and the Agent delete each re-check the binding
-  right before acting. It ENDS by re-inspecting until none of the three is left
+  (`spec.clusterDeploymentName`). Order is load-bearing: the NMStateConfig + BMH
+  deleted FIRST (`delete_host_resources`) — NO power-off of its own, NO
+  `detached` annotation, metal3's `baremetalhost.metal3.io` finalizer NEVER
+  touched — then the BMH read every 15 s until metal3 lets it go (15 min, else
+  `BmhDeletionTimeoutError`, the Agent untouched), its BMC Secret deleted only
+  then (metal3 needs it), and the Agent LAST — a host still running discovery
+  re-registers a deleted Agent within a minute, and metal3 deprovisions a deleted
+  host (powers it off, deletes its ironic node) before releasing its finalizer.
+  Decided with the operator 2026-11-24, after 2026-11-23: the old power-off
+  (`spec.online: false`, `HostPowerOffTimeoutError`) could never pass for a host
+  mid-deploy — metal3 ignores `spec.online` while `provisioning` — and the shared
+  `teardown_bmh_resources` dropped the finalizer after a fixed 30 s, mid-way
+  through a deprovision that takes 30-45 s with a BMC that answers, orphaning
+  ironic nodes whose power sync then forced twelve servers' power every minute.
+  Do not re-add the power-off, the detach or a finalizer drop here. Gated
+  `remove-server-delete-without-power-off`: a run recorded before still powers
+  off and tears down. add-server-to-mce's rollbacks (no Agent, a lapsed lock, an
+  unpublished IPMI boot entry) do the same since then — delete, wait 15 s /
+  15 min, Secret after, never the finalizer, `BmhDeletionTimeoutError` with
+  nothing after it (no PXE unmap, no maintenance, no release; the lock runs out)
+  — gated `add-server-rollback-keeps-finalizer`; the wait is ONE policy for both,
+  `workflow_domains/server_lifecycle/bmh_deletion.py`. `teardown_bmh_resources`
+  (detach, 30 s, finalizer dropped) is left only for runs recorded before.
+  The delete and the Agent delete each re-check the binding right before acting. It ENDS by re-inspecting until none of the three is left
   (bounded, 5 min): anything still there — typically an Agent re-registered by
   a host with no BMH to power it off through — fails with
   `ServerStillPresentError` naming it, never a success. After the Agent delete
@@ -651,8 +684,8 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   `MachineDrainTimeoutError` naming conditions and pending hooks; `unbinding`
   once released, 1 h to `known-unbound` — add-server-to-mce's bare-metal reasoning —
   then `AgentUnbindTimeoutError`, or `MachineDeletionTimeoutError` when the Agent
-  is free and the Machine still stands) → `verifying-agentmachine` (gone, 5 min,
-  `ServerStillPresentError`) → `verifying-node` (no Node is the server — by
+  is free and the Machine still stands) → `verifying-agentmachine` (gone, 10 min
+  since 2026-11-25 — 5 before, `ServerStillPresentError`) → `verifying-node` (no Node is the server — by
   providerID, nodeRef or hostname, NEVER skipped for a missing nodeRef) →
   `verifying-agent` (no
   binding, no label, known-unbound, approved, BMH present and not in error; 5 min,
@@ -759,8 +792,14 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   provider release state, `release_machine_hook` drops the provider's hook;
   `verifying-agentmachine` (`clean_up_agent_machines`, re-derived FRESH: any
   AgentMachine naming the Agent by agentRef or label, a Machine-less one deleted,
-  one stuck deleting has ONLY the provider's finalizer dropped after 1 min and
-  only once the Agent is released; any Machine still linked =
+  one stuck deleting has ONLY the provider's finalizer dropped after 5 min (the
+  operator, 2026-11-25; 1 min before, gated `uninstall-agentmachine-finalizer-grace-5m`,
+  the check's deadline 10 min so the drop always gets its turn), only
+  once the Agent is released, and only with NO owner Machine at all — one whose
+  owner is merely gone the provider drops itself and is left to it (the
+  operator, 2026-11-24: a hold is removed only where no controller ever will;
+  RE-CHECK the hook and finalizer against cluster-api-provider-agent on every
+  provider upgrade, `hosted_resources.py`); any Machine still linked =
   `ServerStillPresentError`, a NodePool replacement taking it again);
   `verifying-node` deletes a Node still there once NotReady (the host is back in
   discovery) and fails on one still Ready. Writes go in `result.cleaned_up`, each
@@ -1186,11 +1225,13 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
     `VM_NODE_SELECTOR`, `VM_REDFISH_LABEL`, and `VM_ROOT_DISK_SIZE` (the lead's, default `120Gi`).
   - **kubevirt-redfish runs `systemIdConvention: legacy`** (the operator, 2026-11-05): the Redfish
     system id IS the VM name, so the id, the VM and the server name server-scan lists are one
-    string, now `ocp-<flavor>-kv<cpu>-<site>-<serial>`. add-server-to-mce's pool match (the
-    InfraEnv's first three words, 2026-11-19) assumed an InfraEnv WITH its site; under the
-    convention's `<flavor>-<size>-<zone>` it is the whole name (`^ocp-c200-kv32-az1-`) and matches
-    no server — the convention's §3 draws `^ocp-<flavor>-<size>-<MCE's site>-` AND server-scan's zone.
-    Reported to the operator 2026-11-22, not yet changed (add-server-to-mce is not create-vm's).
+    string, now `ocp-<flavor>-kv<cpu>-<site>-<serial>`. add-server-to-mce's pool match holds for
+    it again: since 2026-11-22 it draws `^ocp-<flavor>-<size>-<site>-` from the InfraEnv's
+    agentLabels (the server-scan bullet), which for a KubeVirt InfraEnv labelled
+    `redbull.io/size: kv<cpu>` is exactly this VM's prefix; the zone is not filtered on yet (the
+    convention's open item 2). Its InfraEnv-name fallback (the first three words, 2026-11-19, for a
+    limb predating the labels) matches no VM: under the convention the name has no site. The
+    KubeVirt branch, when built, draws no pool anyway (the install puts exactly that VM in).
   - **Deploy order**: terminate any old-shape run → redbull-platform's cleanup (the hub limb's
     `gitops/services/` entry, the two agent charts) → the brain → the cluster-lifecycle limb (the
     listing; `HEADROOM_BUFFER_PERCENT` has a default, so the chart need not ship first) → the
@@ -2124,11 +2165,11 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   localhost — no port assumptions in code).
 - Trigger via the unified API: `uvicorn workflow_domains.api:app --port 8080`, Swagger at `/docs`.
   `POST /workflows/server-lifecycle/add-server-to-mce` is ASYNC (202 + workflow id) and takes the
-  InfraEnv to fill plus its MCE cluster; the InfraEnv's name states which hardware it is for
-  (`cisco-m6-bat-yam-64c-512gb`) and server names carry the same tokens behind an `ocp-` prefix,
-  so the InfraEnv IS the server query. EVERY POOL RUN IS ON A SLOT of its HUB's CANDIDATE POOL — the
+  InfraEnv to fill plus its MCE cluster; the InfraEnv's agentLabels state which hardware it is
+  for (flavor `c200`, size `mtl`, site `five`) and server names carry the same words behind an
+  `ocp-` prefix, so the labels ARE the server query (§4). EVERY POOL RUN IS ON A SLOT of its HUB's CANDIDATE POOL — the
   MCE and the InfraEnv. The MCE is in the id (since 2026-10-25) so a hub finds only its own runs;
-  the machines the pool draws from (`^ocp-<the InfraEnv's first three words>-`) are still shared by every hub, so a run
+  the machines the pool draws from (`^ocp-<flavor>-<size>-<site>-`) are still shared by every hub, so a run
   sizing its spares no longer counts another hub's runs, and the install lock keeps two hubs off
   one machine. The install lock (§4) guards the machine itself, so draws are PARALLEL: a request
   without `count` starts ONE new run and `count` (1-20, on the request ONLY — never in a run's

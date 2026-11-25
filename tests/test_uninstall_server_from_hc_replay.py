@@ -74,7 +74,9 @@ from tests.test_uninstall_server_from_hc_workflow import (
     INSTALLED,
     INVENTORY_HOST,
     KEEP,
+    NO_MACHINE,
     ON_THE_MCE,
+    RELEASED_AND_FREE,
     _Harness,
     make_mocks,
 )
@@ -165,6 +167,14 @@ SCENARIOS: dict[str, Callable[[], Scenario]] = {
     # ... and an Agent already free completes at once.
     "inventory-host-free-agent": lambda: Scenario(
         mocks={"membership": IN_INVENTORY, "host": INVENTORY_HOST}, before_free_agent=False
+    ),
+    # Since 2026-11-25 (`uninstall-agentmachine-finalizer-grace-5m`): an
+    # AgentMachine left with no owner at all has the provider's finalizer
+    # dropped after five minutes, not one (every golden above predates it).
+    "agentmachine-finalizer-after-5-min": lambda: Scenario(
+        mocks={"host": NO_MACHINE, "nodes": [[]], "agents": RELEASED_AND_FREE,
+               "stuck_finalizer": True},
+        before_free_agent=False,
     ),
 }
 

@@ -641,6 +641,25 @@ class TestCheckInfraEnv:
         state = await activities.check_infra_env(self.REF)
         assert state.cluster_ref == "ocp4-hc-01"
 
+    async def test_its_agent_labels_are_reported_as_found(self, infra_env):
+        labels = {
+            "redbull.io/flavor": "c200",
+            "redbull.io/size": "mtl",
+            "redbull.io/site": "five",
+            "topology.kubernetes.io/zone": "az1",
+        }
+        infra_env({"spec": {"agentLabels": labels}})
+        state = await activities.check_infra_env(self.REF)
+        assert state.agent_labels == labels
+
+    async def test_no_agent_labels_is_reported_empty_never_refused(self, infra_env):
+        # Judging them is the workflow's: publish-infraenv-to-pxe-server needs none.
+        infra_env({"spec": {}})
+        state = await activities.check_infra_env(self.REF)
+        assert state.agent_labels == {}
+        # The key is always sent, so a workflow can tell this limb from one predating it.
+        assert "agent_labels" in type(state).model_validate_json(state.model_dump_json()).model_fields_set
+
     async def test_a_missing_infraenv_is_permanent_and_names_where_it_looked(self, infra_env):
         infra_env(None)
         with pytest.raises(InfraEnvNotFoundError, match="namespace inventory"):

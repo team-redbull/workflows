@@ -53,10 +53,13 @@ from shared.models.server_lifecycle import (
     AgentState,
     AllocateServerRequest,
     BmcEndpoint,
+    BmcSecretRef,
     BmhRef,
     BmhResourceRequest,
     BmhState,
     CreatedResource,
+    HostDeleteRequest,
+    HostDeletion,
     InfraEnvBootRequest,
     InfraEnvBootState,
     InfraEnvRef,
@@ -80,7 +83,6 @@ from shared.models.server_lifecycle import (
     ServerMembership,
     ServerMembershipRequest,
     ServerReservation,
-    TeardownResult,
     mac_is_valid,
 )
 from workflow_domains.server_lifecycle import add_server_to_mce
@@ -99,6 +101,14 @@ SERVER_NAME = "ocp-dell-r650-tlv-64c-1024gb-DEL0000485"
 INPUT = AddServerToMceInput(
     infra_env=INFRA_ENV, mce_cluster=MCE_CLUSTER, namespace=NAMESPACE
 )
+# The InfraEnv's spec.agentLabels, as the naming convention writes them: a pool
+# draw asks server-scan for `^ocp-c200-mtl-five-`.
+AGENT_LABELS = {
+    "redbull.io/flavor": "c200",
+    "redbull.io/size": "mtl",
+    "redbull.io/site": "five",
+    "topology.kubernetes.io/zone": "az1",
+}
 
 # One inventory segment per MCE, found by cluster name — no BMC-protocol class.
 INVENTORY_SEGMENT = SegmentEntry(
@@ -213,7 +223,8 @@ def make_mock_activities(
     agent_never_for: set[str] | None = None,
     agent_after_polls: int = 0,
     teardown_error: Exception | None = None,
-    finalizers_stuck: bool = False,
+    bmh_stays_deleting: set[str] | None = None,
+    secret_outlives: bool = False,
     reserved_elsewhere: set[str] | None = None,
     gone_from_inventory: set[str] | None = None,
     lock_lapses_for: set[str] | None = None,
@@ -221,6 +232,8 @@ def make_mock_activities(
     pxe_sites: set[str] | None = None,
     pxe_error: Exception | None = None,
     infra_env_missing: bool = False,
+    agent_labels: dict[str, str] | None = None,
+    infra_env_predates_labels: bool = False,
     image_after_polls: int = 0,
     image_never_updates: bool = False,
     boot_superseded: bool = False,
@@ -249,7 +262,10 @@ def make_mock_activities(
 
     `agent_never_for` names the servers that never register an Agent, which is
     what drives a rollback; `agent_after_polls` delays the Agent by that many
-    polls for the servers that do. Both are per-SERVER rather than global so a
+    polls for the servers that do. A rollback's delete is let go by metal3 at
+    once, except for the servers in `bmh_stays_deleting`, which it never lets go
+    (a BMC it cannot reach); `teardown_error` is raised by the delete, and
+    `secret_outlives` makes the BMC Secret outlive its host. Both are per-SERVER rather than global so a
     pool can be set up to fail its first candidate and install its second, which
     is the case the retry loop exists for.
 
@@ -266,6 +282,10 @@ def make_mock_activities(
     `nmstate_error` is raised by `create_nmstate_config` — the incident in which
     the NMStateConfig already existed with other content (BmhConflictError) —
     every time, or only the first time with `nmstate_error_once`.
+
+    `check_infra_env` reports `agent_labels` (default AGENT_LABELS) as the
+    InfraEnv's spec.agentLabels; `infra_env_predates_labels` answers as a limb
+    from before the field, whose payload has no `agent_labels` key at all.
 
     `scan_hides_locked` makes `acquire_servers` answer as server-scan's does
     for a NAMED machine under a live install lock: 404, whoever holds the lock
@@ -316,7 +336,8 @@ def make_mock_activities(
             "create_nmstate_config",
             "get_baremetal_host",
             "find_agent_for_host",
-            "teardown_bmh_resources",
+            "delete_host_resources",
+            "delete_bmc_secret",
             "reserve_server",
             "release_server",
             "register_pxe_boot",
@@ -338,6 +359,7 @@ def make_mock_activities(
     installed = already_installed or set()
     no_agent = agent_never_for or set()
     torn_down: set[str] = set()
+    stuck = bmh_stays_deleting or set()
     # `available`, not `registering`: registering is the state a host with a
     # WRONG BMC address sits in, so it can never count as proof of registration.
     registered = BmhState(
@@ -442,7 +464,14 @@ def make_mock_activities(
             raise InfraEnvNotFoundError(
                 f"InfraEnv {ref.name} does not exist in namespace {ref.namespace}"
             )
-        return InfraEnvState(name=ref.name, namespace=ref.namespace)
+        if infra_env_predates_labels:
+            # An older limb's payload: the model it sent had no such field.
+            return {"name": ref.name, "namespace": ref.namespace, "cluster_ref": None}  # type: ignore[return-value]
+        return InfraEnvState(
+            name=ref.name,
+            namespace=ref.namespace,
+            agent_labels=AGENT_LABELS if agent_labels is None else agent_labels,
+        )
 
     @activity.defn
     async def unregister_pxe_boot(ref: PxeMapRef) -> PxeUnregistration:
@@ -523,6 +552,15 @@ def make_mock_activities(
             # Rolled back: the machine is back in the inventory and the host is
             # gone, which is what lets the same pool be drawn again later.
             return BmhState(found=False)
+        if ref.server_name in stuck and any(
+            d.server_name == ref.server_name for d in calls["delete_host_resources"]
+        ):
+            # Deleted, but metal3 cannot power it off: its finalizer holds it.
+            return BmhState(
+                found=True, provisioning_state="powering off before delete",
+                operational_status="error", error_type="power management error",
+                error_message="Failed to power off: BMC unreachable",
+            )
         created = [c.server_name for c in calls["create_baremetal_host"]]
         if ref.server_name not in created:
             # The pre-selection probe: does this candidate already have a host?
@@ -565,19 +603,26 @@ def make_mock_activities(
         return AgentState(found=True, name=f"agent-{owner}", approved=False)
 
     @activity.defn
-    async def teardown_bmh_resources(ref: BmhRef) -> TeardownResult:
-        calls["teardown_bmh_resources"].append(ref)
-        calls["order"].append("teardown_bmh_resources")
+    async def delete_host_resources(request: HostDeleteRequest) -> HostDeletion:
+        calls["delete_host_resources"].append(request)
+        calls["order"].append("delete_host_resources")
         if teardown_error is not None:
             raise teardown_error
-        torn_down.add(ref.server_name)
-        return TeardownResult(
+        if request.server_name not in stuck:
+            # metal3 deprovisions it and lets the BareMetalHost go.
+            torn_down.add(request.server_name)
+        return HostDeletion(
             removed=[
-                f"NMStateConfig/nmstate-config-{ref.server_name}",
-                f"BareMetalHost/{ref.server_name}",
+                f"NMStateConfig/nmstate-config-{request.server_name}",
+                f"BareMetalHost/{request.server_name}",
             ],
-            finalizers_cleared=finalizers_stuck,
+            bmc_secret=f"cisco-ucs-{request.server_name}",
         )
+
+    @activity.defn
+    async def delete_bmc_secret(ref: BmcSecretRef) -> bool:
+        calls["delete_bmc_secret"].append(ref)
+        return secret_outlives
 
     held_elsewhere = set(reserved_elsewhere or ())
     gone = gone_from_inventory or set()
@@ -677,7 +722,8 @@ def make_mock_activities(
         create_nmstate_config,
         get_baremetal_host,
         find_agent_for_host,
-        teardown_bmh_resources,
+        delete_host_resources,
+        delete_bmc_secret,
         reserve_server,
         release_server,
         put_server_in_maintenance,
@@ -806,6 +852,47 @@ async def test_happy_path_resolves_vlan_acquires_creates_and_awaits_the_agent():
 
 
 @pytest.mark.parametrize(
+    ("labels", "prefix"),
+    [
+        (AGENT_LABELS, "c200-mtl-five"),
+        ({**AGENT_LABELS, "redbull.io/flavor": "c200n"}, "c200n-mtl-five"),  # a variant
+        ({**AGENT_LABELS, "redbull.io/size": "kv32"}, "c200-kv32-five"),  # a VM pool
+    ],
+)
+def test_the_pool_is_the_infraenvs_flavor_size_and_site_labels(labels, prefix):
+    assert add_server_to_mce.agent_label_problems(labels) == []
+    assert add_server_to_mce.pool_prefix_from_labels(labels) == prefix
+    pool = re.compile(f"^ocp-{re.escape(prefix)}-")
+    assert pool.match(f"ocp-{prefix}-fch2145v1ab")
+    assert not pool.match(f"ocp-{prefix}2-fch2145v1ab")
+
+
+@pytest.mark.parametrize(
+    ("labels", "problem"),
+    [
+        ({}, "redbull.io/flavor is missing"),
+        ({k: v for k, v in AGENT_LABELS.items() if k != "redbull.io/site"}, "redbull.io/site is missing"),
+        ({**AGENT_LABELS, "redbull.io/size": ""}, "redbull.io/size is missing"),
+        # Each is ONE word of the server name: a `-` would span two, a `.`
+        # is no name word at all, and server names are lowercase.
+        ({**AGENT_LABELS, "redbull.io/site": "bat-yam"}, "redbull.io/site='bat-yam' is not one"),
+        ({**AGENT_LABELS, "redbull.io/flavor": "c200.x"}, "redbull.io/flavor='c200.x' is not one"),
+        ({**AGENT_LABELS, "redbull.io/flavor": "C200"}, "redbull.io/flavor='C200' is not one"),
+    ],
+)
+def test_labels_that_cannot_name_a_server_are_each_named(labels, problem):
+    problems = add_server_to_mce.agent_label_problems(labels)
+    assert any(line.startswith(problem) for line in problems), problems
+
+
+def test_the_zone_label_is_not_part_of_the_pool():
+    # A server's zone is where it is cabled (server-scan's), never in its name.
+    labels = {k: v for k, v in AGENT_LABELS.items() if k != "topology.kubernetes.io/zone"}
+    assert add_server_to_mce.agent_label_problems(labels) == []
+    assert add_server_to_mce.pool_prefix_from_labels(labels) == "c200-mtl-five"
+
+
+@pytest.mark.parametrize(
     ("infra_env", "prefix"),
     [
         ("c200-mtl-haifa-az1", "c200-mtl-haifa"),
@@ -814,14 +901,12 @@ async def test_happy_path_resolves_vlan_acquires_creates_and_awaits_the_agent():
         ("dell-r660", "dell-r660"),  # fewer than three words: the whole name
     ],
 )
-def test_the_pool_is_the_infraenvs_first_three_words(infra_env, prefix):
-    assert add_server_to_mce.server_pool_prefix(infra_env) == prefix
-    pool = re.compile(f"^ocp-{re.escape(prefix)}-")
-    assert pool.match(f"ocp-{prefix}-anything-FCH0001")
-    assert not pool.match(f"ocp-{prefix}2-FCH0001")
+def test_without_labels_the_pool_is_the_infraenvs_first_three_words(infra_env, prefix):
+    # A limb predating agent_labels, and every run recorded before.
+    assert add_server_to_mce.pool_prefix_from_name(infra_env) == prefix
 
 
-async def test_the_infraenv_becomes_the_server_query():
+async def test_the_infraenv_labels_become_the_server_query():
     calls, segment_acts, server_acts = make_mock_activities()
     async with _Harness(segment_acts, server_acts) as client:
         await _execute_as(client, AddServerToMceRunArgs(input=INPUT), "add-server-to-mce-the-query")
@@ -830,18 +915,18 @@ async def test_the_infraenv_becomes_the_server_query():
     # only for runs recorded before the allocation.
     [request] = calls["allocate_server"]
     assert calls["acquire_servers"] == []
-    # The InfraEnv's FIRST THREE words (the operator, 2026-11-19), escaped,
-    # because the InfraEnv name is caller data going into a regex that
-    # server-scan hands to Mongo. `\-` is a literal `-`, so the pool is the
-    # same; an unescaped `.` or `+` in a future name would not be.
-    # The `-` after the third word is load-bearing (the operator, 2026-11-17).
-    assert request.pattern == f"^ocp-{re.escape('cisco-m6-bat')}-"
+    # `ocp-<flavor>-<size>-<site>-` from the InfraEnv's agentLabels (the naming
+    # convention, 2026-11-22), escaped: label values are caller data going
+    # into a regex server-scan hands to Mongo. The `-` after the site is
+    # load-bearing (the operator, 2026-11-17).
+    assert request.pattern == f"^ocp-{re.escape('c200-mtl-five')}-"
     pool = re.compile(request.pattern)
-    assert pool.match(f"ocp-{INFRA_ENV}-FCH0001")
-    assert pool.match("ocp-cisco-m6-bat-yam-64c-256gb-FCH0002")  # size is no longer part of it
-    assert not pool.match("ocp-cisco-m6-batx-FCH0001")
-    assert not pool.match("ocp-cisco-m6-bat2-FCH0001")
-    assert not pool.match("ocp-cisco-m6-bat")
+    assert pool.match("ocp-c200-mtl-five-fch2145v1ab")
+    assert pool.match("ocp-c200-mtl-five-7xk2m33")
+    assert not pool.match("ocp-c200-mtl-five2-fch2145v1ab")  # another site
+    assert not pool.match("ocp-c200n-mtl-five-fch2145v1ab")  # another variant
+    assert not pool.match("ocp-c200-kv32-five-02a1b2c3d4e5")  # another size
+    assert not pool.match(f"ocp-{INFRA_ENV}-FCH0001")  # the InfraEnv's name is not it
     assert request.name is None
     assert (request.max_health, request.min_nic_macs) == ("HEALTHY", 2)
     # The lock server-scan takes as it allocates IS this run's: its holder and
@@ -860,6 +945,52 @@ async def test_an_explicit_server_name_bypasses_the_pattern():
     [request] = calls["allocate_server"]
     assert request.name == SERVER_NAME
     assert request.pattern is None
+
+
+class TestThePoolComesFromTheInfraEnvsAgentLabels:
+    async def test_an_infraenv_without_them_fails_the_draw_before_anything_is_allocated(
+        self,
+    ) -> None:
+        calls, segment_acts, server_acts = make_mock_activities(
+            agent_labels={"topology.kubernetes.io/zone": "az1", "redbull.io/site": "Five"}
+        )
+        async with _Harness(segment_acts, server_acts) as client:
+            with pytest.raises(WorkflowFailureError) as excinfo:
+                await _execute(client, AddServerToMceRunArgs(input=INPUT))
+
+        error = _application_error(excinfo.value)
+        assert error.type == "InfraEnvAgentLabelsError"
+        # Every reason at once, so one fix of the InfraEnv is enough.
+        for part in (
+            f"InfraEnv {NAMESPACE}/{INFRA_ENV}",
+            "redbull.io/flavor is missing",
+            "redbull.io/size is missing",
+            "redbull.io/site='Five' is not one",
+        ):
+            assert part in error.message
+        assert calls["allocate_server"] == [] and calls["acquire_servers"] == []
+
+    async def test_a_named_install_needs_none_of_them(self) -> None:
+        calls, segment_acts, server_acts = make_mock_activities(agent_labels={})
+        named = INPUT.model_copy(update={"server_name": SERVER_NAME})
+        async with _Harness(segment_acts, server_acts) as client:
+            result = await _execute(client, AddServerToMceRunArgs(input=named))
+
+        assert result.server_name == SERVER_NAME
+        [request] = calls["allocate_server"]
+        assert (request.name, request.pattern) == (SERVER_NAME, None)
+
+    async def test_a_limb_predating_them_draws_by_the_infraenvs_first_three_words(
+        self,
+    ) -> None:
+        # The brain ships before the limb (CLAUDE.md §5): an older limb's answer
+        # has no `agent_labels` key, so the run draws as it did before.
+        calls, segment_acts, server_acts = make_mock_activities(infra_env_predates_labels=True)
+        async with _Harness(segment_acts, server_acts) as client:
+            await _execute(client, AddServerToMceRunArgs(input=INPUT))
+
+        [request] = calls["allocate_server"]
+        assert request.pattern == f"^ocp-{re.escape('cisco-m6-bat')}-"
 
 
 async def test_the_vlan_comes_from_the_mce_segment_not_the_caller():
@@ -1078,12 +1209,12 @@ async def test_a_host_that_never_produces_an_agent_is_rolled_back_released_and_f
     assert error.type == "AgentNeverAppearedError"
     assert "server-scan allocated ocp-doomed" in error.message
     assert [c.server_name for c in calls["create_baremetal_host"]] == ["ocp-doomed"]
-    assert [t.server_name for t in calls["teardown_bmh_resources"]] == ["ocp-doomed"]
+    assert [t.server_name for t in calls["delete_host_resources"]] == ["ocp-doomed"]
     # Torn down, in maintenance, THEN given back: never a lock released over a
     # live host, nor before server-scan keeps the machine out of every draw.
     order = calls["order"]
     assert (
-        order.index("teardown_bmh_resources")
+        order.index("delete_host_resources")
         < order.index("put_server_in_maintenance")
         < order.index("release_server")
     )
@@ -1091,6 +1222,51 @@ async def test_a_host_that_never_produces_an_agent_is_rolled_back_released_and_f
     assert [r.server_id for r in calls["release_server"]] == ["srv_doomed"]
     assert len(calls["allocate_server"]) == 1
     assert "server-scan had it in maintenance" in error.message
+
+
+class TestTheRollbackNeverForcesMetal3:
+    """2026-11-24 (the operator): deleted with no detach, metal3's finalizer never touched."""
+
+    async def test_it_waits_for_metal3_to_let_the_host_go_then_takes_the_secret(self):
+        calls, segment_acts, server_acts = make_mock_activities(
+            agent_never_for={SERVER_NAME}, secret_outlives=True
+        )
+        async with _Harness(segment_acts, server_acts) as client:
+            with pytest.raises(WorkflowFailureError) as excinfo:
+                await _execute(client, AddServerToMceRunArgs(input=INPUT))
+
+        assert _application_error(excinfo.value).type == "AgentNeverAppearedError"
+        assert calls["delete_host_resources"] == [
+            HostDeleteRequest(server_name=SERVER_NAME, namespace=NAMESPACE)
+        ]
+        # Read until metal3 let it go: the last read is the one that says so.
+        assert calls["get_baremetal_host"][-1] == BmhRef(server_name=SERVER_NAME, namespace=NAMESPACE)
+        # Only then the Secret metal3 needed to power the host off.
+        assert calls["delete_bmc_secret"] == [
+            BmcSecretRef(namespace=NAMESPACE, name=f"cisco-ucs-{SERVER_NAME}")
+        ]
+        order = calls["order"]
+        assert order.index("delete_host_resources") < order.index("put_server_in_maintenance")
+
+    async def test_a_host_metal3_never_lets_go_fails_at_15_min_with_nothing_after(self):
+        calls, segment_acts, server_acts = make_mock_activities(
+            agent_never_for={SERVER_NAME}, bmh_stays_deleting={SERVER_NAME}
+        )
+        async with _Harness(segment_acts, server_acts) as client:
+            with pytest.raises(WorkflowFailureError) as excinfo:
+                await _execute(client, AddServerToMceRunArgs(input=INPUT))
+
+        error = _application_error(excinfo.value)
+        assert error.type == "BmhDeletionTimeoutError"
+        # Why it was rolling back, and what metal3 is stuck on.
+        assert "no Agent within 1:00:00" in error.message
+        assert "'powering off before delete'" in error.message
+        assert "BMC unreachable" in error.message
+        # Nothing after the delete: a BareMetalHost still points at the machine,
+        # so it is neither put in maintenance nor released — its lock runs out.
+        assert calls["delete_bmc_secret"] == []
+        assert calls["put_server_in_maintenance"] == [] and calls["release_server"] == []
+        assert calls["unregister_pxe_boot"] == []
 
 
 async def test_an_agent_that_takes_its_time_is_waited_for():
@@ -1103,7 +1279,7 @@ async def test_an_agent_that_takes_its_time_is_waited_for():
     assert result.bmh_registered is True
     assert len(calls["find_agent_for_host"]) == 21
     # Waited, never rolled back.
-    assert calls["teardown_bmh_resources"] == []
+    assert calls["delete_host_resources"] == []
 
 
 async def test_the_agent_is_looked_for_by_bond_mac_not_by_name():
@@ -1151,7 +1327,7 @@ async def test_a_registration_error_points_the_failure_at_the_bmc():
     message = str(_application_error(excinfo.value))
     assert "registration error" in message
     assert "BMC address or credential" in message
-    assert len(calls["teardown_bmh_resources"]) == 1
+    assert len(calls["delete_host_resources"]) == 1
 
 
 async def test_without_a_registration_error_the_failure_points_at_the_network():
@@ -1451,7 +1627,7 @@ class TestTheInstallLock:
         assert result.server_name == SERVER_NAME
         assert result.attempts == 1
         assert [c.server_name for c in calls["create_bmc_secret"]] == [SERVER_NAME]
-        assert calls["teardown_bmh_resources"] == []
+        assert calls["delete_host_resources"] == []
 
     async def test_a_pool_all_held_elsewhere_fails_with_server_scans_reasons(self):
         calls, segment_acts, server_acts = make_mock_activities(
@@ -1509,7 +1685,7 @@ class TestTheInstallLock:
         error = _application_error(excinfo.value)
         assert error.type == "ServerReservedError"
         assert "Its lock had lapsed and another run holds the machine now" in error.message
-        assert [t.server_name for t in calls["teardown_bmh_resources"]] == ["ocp-lapsed"]
+        assert [t.server_name for t in calls["delete_host_resources"]] == ["ocp-lapsed"]
         # Never the lapsed one's lock — another run holds it now.
         assert calls["release_server"] == []
         # Never watched for an Agent: the machine is someone else's now.
@@ -1605,7 +1781,7 @@ class TestThePxeBootOfAnIpmiServer:
 
         assert _application_error(excinfo.value).type == "PxeSiteNotConfiguredError"
         # Nothing was written for the blade, and its lock went straight back.
-        assert calls["create_bmc_secret"] == calls["teardown_bmh_resources"] == []
+        assert calls["create_bmc_secret"] == calls["delete_host_resources"] == []
         assert [r.server_id for r in calls["release_server"]] == ["srv_ucs"]
 
     async def test_a_pool_of_blades_at_an_unmapped_site_fails_naming_the_fix(self):
@@ -1804,13 +1980,13 @@ class TestTheInfraEnvBootEntry:
         # Never powered on; undone in the rollback order, lock last.
         assert calls["create_bmc_secret"] == []
         assert calls["create_baremetal_host"] == []
-        watched = {"teardown_bmh_resources", "unregister_pxe_boot", "release_server"}
+        watched = {"delete_host_resources", "unregister_pxe_boot", "release_server"}
         assert [name for name in calls["order"] if name in watched] == [
-            "teardown_bmh_resources",
+            "delete_host_resources",
             "unregister_pxe_boot",
             "release_server",
         ]
-        assert [t.server_name for t in calls["teardown_bmh_resources"]] == [blade.name]
+        assert [t.server_name for t in calls["delete_host_resources"]] == [blade.name]
         assert [r.server_name for r in calls["unregister_pxe_boot"]] == [blade.name]
 
     async def test_a_redfish_server_keeps_its_order_and_never_publishes(self):
@@ -1878,13 +2054,13 @@ class TestThePxeMapIsCleanedOnRollback:
         # Teardown first (Ironic lets go), then the PXE map, the maintenance,
         # THEN the lock: after the release another run may map the same MACs.
         watched = {
-            "teardown_bmh_resources",
+            "delete_host_resources",
             "unregister_pxe_boot",
             "put_server_in_maintenance",
             "release_server",
         }
         assert [name for name in calls["order"] if name in watched] == [
-            "teardown_bmh_resources",
+            "delete_host_resources",
             "unregister_pxe_boot",
             "put_server_in_maintenance",
             "release_server",
@@ -1900,7 +2076,7 @@ class TestThePxeMapIsCleanedOnRollback:
             with pytest.raises(WorkflowFailureError):
                 await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
-        assert [t.server_name for t in calls["teardown_bmh_resources"]] == ["ocp-doomed"]
+        assert [t.server_name for t in calls["delete_host_resources"]] == ["ocp-doomed"]
         assert calls["unregister_pxe_boot"] == []
 
     async def test_a_lapsed_lock_leaves_the_pxe_map_to_the_run_that_took_it(self):
@@ -1914,7 +2090,7 @@ class TestThePxeMapIsCleanedOnRollback:
                 await _execute(client, AddServerToMceRunArgs(input=INPUT))
 
         assert _application_error(excinfo.value).type == "ServerReservedError"
-        assert [t.server_name for t in calls["teardown_bmh_resources"]] == [blade.name]
+        assert [t.server_name for t in calls["delete_host_resources"]] == [blade.name]
         assert calls["unregister_pxe_boot"] == calls["release_server"] == []
 
     async def test_an_installed_blade_keeps_its_mapping(self):
@@ -1973,7 +2149,7 @@ class TestAServerWithNoAgentGoesIntoMaintenance:
         )
         assert len(calls["put_server_in_maintenance"]) == 1  # permanent: once
         assert calls["release_server"] == []
-        assert len(calls["teardown_bmh_resources"]) == 1
+        assert len(calls["delete_host_resources"]) == 1
 
     async def test_a_server_server_scan_no_longer_knows_is_released_as_before(self):
         calls, segment_acts, server_acts = make_mock_activities(
@@ -2319,7 +2495,7 @@ class TestAllowUnhealthy:
         assert error.type == "AgentNeverAppearedError"
         assert "health checks waived on request: server-scan-health" in str(error)
         # Rolled back and released like any other candidate.
-        assert len(calls["teardown_bmh_resources"]) == 1
+        assert len(calls["delete_host_resources"]) == 1
         assert len(calls["release_server"]) == 1
 
 
@@ -2413,7 +2589,7 @@ class TestAnOlderLimbsInUseRefusal:
         # Nothing written for it — not even the PXE map — and its lock given back,
         # so a re-run after the cleanup is not held off for two hours.
         for kind in ("register_pxe_boot", "create_nmstate_config", "create_bmc_secret",
-                     "create_baremetal_host", "teardown_bmh_resources"):
+                     "create_baremetal_host", "delete_host_resources"):
             assert calls[kind] == [], kind
         assert [r.server_name for r in calls["release_server"]] == [blade.name]
 
@@ -2694,7 +2870,7 @@ class TestACancelRollsTheInstallBack:
         assert "taken out of the MCE by remove-server-from-mce-" in (progress.cancel_rollback or "")
         assert (progress.cancel_rollback or "").endswith("; install lock released")
         # The child did the removal; the lock, which the child leaves to its holder, here.
-        assert calls["teardown_bmh_resources"] == []
+        assert calls["delete_host_resources"] == []
         assert [(r.server_name, r.holder) for r in calls["release_server"]] == [
             (SERVER_NAME, "add-server-to-mce")
         ]
@@ -2784,7 +2960,7 @@ class TestACancelRollsTheInstallBack:
             progress = await _cancelled(handle)
             removal = await _child_ran(client, SERVER_NAME)
 
-        assert removal is None and calls["teardown_bmh_resources"] == [] and calls["release_server"] == []
+        assert removal is None and calls["delete_host_resources"] == [] and calls["release_server"] == []
         assert progress.phase == "cancelled" and "is installed and stays" in (progress.cancel_rollback or "")
 
     async def test_a_failed_pxe_cleanup_in_the_child_keeps_the_lock(self):

@@ -952,6 +952,22 @@ class TestTheProvidersWrites:
         # Only the provider's own finalizer: another controller's stays.
         assert "someone-else/keep" in cleared.remaining[0]
 
+    async def test_an_owner_machine_merely_gone_leaves_the_finalizer_to_the_provider(self, mce):
+        """The provider drops it itself once it sees its owner Machine gone (2026-11-24)."""
+        stuck = _agent_machine("stuck", machine="gone-machine",
+                               agent_ref={"name": "agent-1", "namespace": NS})
+        stuck["metadata"].update(deletionTimestamp="2026-10-24T08:00:00Z", finalizers=[AM_FINALIZER])
+        fake = mce(_FakeMce(agents=[_agent(state="known-unbound")], agent_machines=[stuck]))
+
+        cleanup = await activities.clean_up_agent_machines(
+            AgentMachineCleanupRequest(agent=AGENT_REF, clear_finalizers=True)
+        )
+
+        assert cleanup.finalizers_cleared == [] and fake.finalizers_cleared == []
+        assert cleanup.held_by_machine == []  # no Machine holds it: its owner is gone
+        assert "left to the Agent provider" in cleanup.remaining[0]
+        assert "gone-machine" in cleanup.remaining[0]
+
     async def test_a_bound_agent_keeps_the_finalizer(self, mce):
         stuck = _agent_machine("stuck", machine=None, agent_ref={"name": "agent-1", "namespace": NS})
         stuck["metadata"].update(deletionTimestamp="2026-10-24T08:00:00Z", finalizers=[AM_FINALIZER])

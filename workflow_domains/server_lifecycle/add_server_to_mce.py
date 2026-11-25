@@ -23,13 +23,14 @@ Shape of the run:
                            where that credential already lives.
      validating-infraenv — the InfraEnv must exist on the MCE, in the run's
                            namespace, before any server is drawn; missing
-                           fails the run (no candidate could fix it).
+                           fails the run (no candidate could fix it). For a
+                           pool draw, its agentLabels must name its servers.
   2. acquiring-server    — POST /servers/available: server-scan ALLOCATES one
-                           server (its ADR-0063). The InfraEnv name states
-                           which hardware it is for
-                           (cisco-m6-bat-yam-64c-512gb), and server names carry
-                           the same tokens behind an `ocp-` prefix, so the
-                           InfraEnv IS the query. server-scan locks a
+                           server (its ADR-0063). The InfraEnv's agentLabels
+                           state which hardware it is for (flavor c200, size
+                           mtl, site five), and server names carry the same
+                           words behind an `ocp-` prefix (ocp-c200-mtl-five-…),
+                           so the labels ARE the query. server-scan locks a
                            candidate for this run, live-checks it WHILE locked
                            and returns it, or releases it and tries its next —
                            so the server comes back already this run's, and no
@@ -188,17 +189,22 @@ server's own health is waived and recorded (`allowed_unhealthy` on the progress,
 the result and every create), a safety reason fails the run as before. The bond
 then accepts a member whose link is not UP — never one port alone.
 
-The teardown order is load-bearing and was established against a live cluster:
-metal3 must be told to detach the host BEFORE the delete, or its
-`baremetalhost.metal3.io` finalizer blocks forever trying to deprovision
-through the BMC that just failed to answer. See teardown_bmh_resources.
+A ROLLBACK NEVER FORCES metal3 (the operator, 2026-11-24, after 2026-11-23): the
+NMStateConfig and the BareMetalHost are deleted with no `detached` annotation
+and metal3's `baremetalhost.metal3.io` finalizer untouched, and the run waits —
+every 15 s, up to 15 min (bmh_deletion.py) — for metal3 to deprovision the host
+(power it off, delete its ironic node) and let it go. Dropping that finalizer
+after a fixed 30 s, as runs recorded before `add-server-rollback-keeps-finalizer`
+still do (teardown_bmh_resources), cut healthy deprovisions off half-way and
+orphaned their ironic nodes, whose power sync then forced the machines' power
+every minute. Still there at the deadline fails the run (_teardown).
 """
 
 from __future__ import annotations
 
 import asyncio
 import re
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import timedelta
 from typing import cast
 
@@ -234,9 +240,11 @@ with workflow.unsafe.imports_passed_through():
         BmcCredentialsMissingError,
         BmcEndpointMissingError,
         BmhConflictError,
+        BmhDeletionTimeoutError,
         AgentNeverAppearedError,
         BmhPrerequisiteMissingError,
         BmhRequestInvalidError,
+        InfraEnvAgentLabelsError,
         InfraEnvImageNotUpdatedError,
         InfraEnvNotFoundError,
         InvalidMacError,
@@ -264,6 +272,8 @@ with workflow.unsafe.imports_passed_through():
         create_baremetal_host,
         create_bmc_secret,
         create_nmstate_config,
+        delete_bmc_secret,
+        delete_host_resources,
         find_agent_for_host,
         get_baremetal_host,
         lookup_install_candidate,
@@ -287,11 +297,14 @@ with workflow.unsafe.imports_passed_through():
         AgentRef,
         AgentState,
         AllocateServerRequest,
+        BmcSecretRef,
         BmhRef,
         BmhResourceRequest,
         BmhState,
         BondMember,
         CreatedResource,
+        HostDeleteRequest,
+        HostDeletion,
         InfraEnvBootRequest,
         InfraEnvBootState,
         InfraEnvRef,
@@ -310,6 +323,11 @@ with workflow.unsafe.imports_passed_through():
         TeardownResult,
         WaivedHealthCheck,
         mac_is_valid,
+    )
+    from workflow_domains.server_lifecycle.bmh_deletion import (
+        BMH_DELETION_DEADLINE,
+        BMH_DELETION_POLL_INTERVAL,
+        describe_metal3,
     )
     from workflow_domains.server_lifecycle.bond_selection import (
         describe_candidate,
@@ -486,6 +504,13 @@ _CANCEL_RELEASES_AFTER_REMOVAL_PATCH = "add-server-cancel-releases-after-removal
 # for them, _evaluate_candidate), and a server with no Agent in the hour is put
 # in maintenance in server-scan before its lock goes back (_put_in_maintenance).
 _ALLOCATE_PATCH = "add-server-allocates-one-server"
+# Gates the rollback's delete (the operator, 2026-11-24, after 2026-11-23's
+# orphaned ironic nodes): the NMStateConfig and the BareMetalHost deleted with
+# no `detached` annotation and metal3's finalizer never touched, then the
+# BareMetalHost read every 15 s until metal3 lets it go (bmh_deletion.py). A
+# run recorded before it tears down through teardown_bmh_resources, which
+# detaches and drops the finalizer after 30 s.
+_ROLLBACK_KEEPS_FINALIZER_PATCH = "add-server-rollback-keeps-finalizer"
 # The allocation live-checks each candidate it locks, one at a time, against
 # its vendor manager — seconds as a rule, ~22 minutes at server-scan's worst
 # (five candidates, UCS Central's probe deadline each). Its HTTP client gives up
@@ -544,21 +569,51 @@ def _acquire_request(
     )
 
 
-# How many of the InfraEnv name's `-`-separated words its servers' names carry
-# after `ocp-` (the operator, 2026-11-19): `c200-mtl-haifa-az1` draws from
-# `ocp-c200-mtl-haifa-…`. ALWAYS the first three, whatever the name's style —
-# a longer name (`cisco-m6-bat-yam-64c-512gb`) draws from its first three words
-# too, size and the rest of the site dropped; the operator accepted that. A
+# The InfraEnv's agentLabels whose values its servers' names carry after
+# `ocp-`, in this order (the naming convention, adopted 2026-11-22): InfraEnv
+# `c200-mtl-az1`, labelled flavor c200, size mtl, site five, draws from
+# `ocp-c200-mtl-five-…`. The name alone can no longer say it: the zone in it is
+# in no server's name (a server's zone is where it is cabled, server-scan's to
+# know), and the site is in no InfraEnv's name (it is its MCE's).
+_POOL_LABELS = ("redbull.io/flavor", "redbull.io/size", "redbull.io/site")
+# One `-`-separated word of a server name, as the convention writes them.
+_POOL_WORD = re.compile(r"[a-z0-9]+")
+# For a limb predating the labels, and runs recorded before: how many of the
+# InfraEnv name's `-`-separated words its servers' names carry after `ocp-`
+# (the operator, 2026-11-19): `c200-mtl-haifa-az1` draws from
+# `ocp-c200-mtl-haifa-…`. ALWAYS the first three, whatever the name's style; a
 # name of fewer words is used whole.
 _POOL_WORDS = 3
 
 
-def server_pool_prefix(infra_env: str) -> str:
-    """What the names of an InfraEnv's servers start with after `ocp-`: its first three words."""
+def agent_label_problems(agent_labels: Mapping[str, str]) -> list[str]:
+    """Why an InfraEnv's agentLabels cannot name its servers: one line per label, empty when they can."""
+    problems = []
+    for key in _POOL_LABELS:
+        value = agent_labels.get(key)
+        if not value:
+            problems.append(f"{key} is missing")
+        elif not _POOL_WORD.fullmatch(value):
+            problems.append(f"{key}={value!r} is not one lowercase word of letters and digits")
+    return problems
+
+
+def pool_prefix_from_labels(agent_labels: Mapping[str, str]) -> str:
+    """What the names of an InfraEnv's servers start with after `ocp-`: `<flavor>-<size>-<site>`.
+
+    Only for labels agent_label_problems passed.
+    """
+    return "-".join(agent_labels[key] for key in _POOL_LABELS)
+
+
+def pool_prefix_from_name(infra_env: str) -> str:
+    """The same, for a limb predating the labels: the InfraEnv name's first three words."""
     return "-".join(infra_env.split("-")[:_POOL_WORDS])
 
 
-def _allocation_request(install_input: AddServerToMceInput) -> AllocateServerRequest:
+def _allocation_request(
+    install_input: AddServerToMceInput, pool_prefix: str
+) -> AllocateServerRequest:
     """What to ask server-scan to allocate: the named machine, or one from the InfraEnv's pool.
 
     Locked for this run's holder and workflow id for the install's TTL, which
@@ -567,17 +622,13 @@ def _allocation_request(install_input: AddServerToMceInput) -> AllocateServerReq
     server_name = install_input.server_name
     return AllocateServerRequest(
         name=server_name or None,
-        # The InfraEnv's first three words (server_pool_prefix). Escaped: the
-        # InfraEnv name is caller data going into a regex (see
-        # _acquire_request). The trailing `-` is load-bearing (the operator,
-        # 2026-11-17, kept 2026-11-19): the prefix must END where the server
-        # name's next word begins, or `c200-mtl-haifa` would also draw servers
-        # of `c200-mtl-haifa2` / `c200-mtl-haifax`.
-        pattern=(
-            None
-            if server_name
-            else f"^ocp-{re.escape(server_pool_prefix(install_input.infra_env))}-"
-        ),
+        # `<flavor>-<size>-<site>` from the InfraEnv's agentLabels (or its
+        # name's first three words, from a limb predating them). Escaped: it
+        # is caller data going into a regex (see _acquire_request). The
+        # trailing `-` is load-bearing (the operator, 2026-11-17, kept
+        # 2026-11-19): the prefix must END where the server name's next word
+        # begins, or site `five` would also draw servers of `five2` / `fivex`.
+        pattern=None if server_name else f"^ocp-{re.escape(pool_prefix)}-",
         max_health=_REQUIRED_HEALTH,
         min_nic_macs=_BOND_NIC_MACS,
         holder=_reservation_holder(),
@@ -814,6 +865,10 @@ class AddServerToMceWorkflow:
         self._release_once_installed = False
         self._rollback_on_cancel = False
         self._allocating = False
+        # A pool draw's server names after `ocp-`, from the InfraEnv's
+        # agentLabels; None = from its name (a limb predating the labels, a
+        # run recorded before) or a named install.
+        self._pool_prefix: str | None = None
         # What a cancel would have to undo, set BEFORE each call that may lock,
         # write or map (a call a cancel cuts off may still land): the candidate
         # being installed, whether anything may be on the MCE for it, and its PXE
@@ -929,12 +984,30 @@ class AddServerToMceWorkflow:
                     infra_env,
                     state.cluster_ref,
                 )
+            # A pool draw's servers are named by the InfraEnv's flavor, size
+            # and site agentLabels, judged here, before anything is allocated:
+            # a label missing would draw from no pool, or the wrong one. Gated
+            # on the key's PRESENCE (CLAUDE.md §5): a limb predating it, and
+            # every run recorded before, draw by the name's first three words.
+            if not install_input.server_name and "agent_labels" in state.model_fields_set:
+                problems = agent_label_problems(state.agent_labels)
+                if problems:
+                    raise ApplicationError(
+                        f"InfraEnv {namespace}/{infra_env} on MCE {install_input.mce_cluster} "
+                        "cannot name the servers of a pool draw "
+                        f"(ocp-<{'>-<'.join(_POOL_LABELS)}>-…): "
+                        + "; ".join(problems)
+                        + ". Set them in its spec.agentLabels, or name the server "
+                        "(server_names). Nothing was allocated",
+                        type=InfraEnvAgentLabelsError.__name__,
+                    )
+                self._pool_prefix = pool_prefix_from_labels(state.agent_labels)
 
-        # Step 2 — the InfraEnv name IS the hardware query. It encodes vendor,
-        # model, site and spec, and server names carry the same tokens behind
-        # an `ocp-` prefix, so no part of either is parsed apart. Since the
-        # allocation, ONE server, already locked for this run by server-scan
-        # (`allocated`); a run recorded before draws a list of candidates.
+        # Step 2 — the hardware query. A named machine is asked for by name; a
+        # pool draw by `ocp-<flavor>-<size>-<site>-`, from the InfraEnv's
+        # agentLabels (above). Since the allocation, ONE server, already
+        # locked for this run by server-scan (`allocated`); a run recorded
+        # before draws a list of candidates by the whole InfraEnv name.
         self._phase = "acquiring-server"
         candidates, record_waivers, allocated = await self._acquire(
             install_input, activity_queue
@@ -1099,7 +1172,10 @@ class AddServerToMceWorkflow:
                     # Not this machine's fault, so not a skip — but undo the
                     # candidate (NMStateConfig, MAC entries, lock) before failing.
                     self._phase = "rolling-back"
-                    await self._teardown(bmh_ref, activity_queue)
+                    await self._teardown(
+                        bmh_ref, activity_queue,
+                        why="the InfraEnv published no discovery image after its NMStateConfig",
+                    )
                     if self._pxe_cleanup:
                         self._phase = "unregistering-pxe-boot"
                         await self._unregister_pxe_boot(
@@ -1160,7 +1236,7 @@ class AddServerToMceWorkflow:
                 is None
             ):
                 self._phase = "rolling-back"
-                await self._teardown(bmh_ref, activity_queue)
+                await self._teardown(bmh_ref, activity_queue, why="its install lock lapsed")
                 continue
             agent, last_state = await self._await_agent(
                 bmh_ref, [member.mac for member in bond_members], activity_queue
@@ -1236,7 +1312,9 @@ class AddServerToMceWorkflow:
             # another — a BareMetalHost left pointing at it would make the same
             # server undrawable, and on another MCE, invisible.
             self._phase = "rolling-back"
-            teardown = await self._teardown(bmh_ref, activity_queue)
+            teardown = await self._teardown(
+                bmh_ref, activity_queue, why=f"no Agent within {_AGENT_DEADLINE}"
+            )
             workflow.logger.warning(
                 "Rolled back %s after no Agent in %s: removed %s",
                 candidate.name,
@@ -1389,7 +1467,10 @@ class AddServerToMceWorkflow:
             if self._allocating:
                 server = await workflow.execute_activity(
                     allocate_server,
-                    _allocation_request(install_input),
+                    _allocation_request(
+                        install_input,
+                        self._pool_prefix or pool_prefix_from_name(install_input.infra_env),
+                    ),
                     task_queue=task_queue,
                     start_to_close_timeout=_ALLOCATE_TIMEOUT,
                     heartbeat_timeout=_ALLOCATE_HEARTBEAT_TIMEOUT,
@@ -2163,24 +2244,74 @@ class AddServerToMceWorkflow:
                 return agent, await self._read_bmh(ref, task_queue)
             await workflow.sleep(_AGENT_POLL_INTERVAL)  # durable, replay-safe
 
-    async def _teardown(self, ref: BmhRef, task_queue: str) -> TeardownResult:
-        """Roll one candidate back so its machine returns to the inventory.
+    async def _teardown(self, ref: BmhRef, task_queue: str, why: str) -> TeardownResult:
+        """Roll one candidate back so its machine returns to the inventory; `why` it is rolled back.
 
-        Retried like any other activity, and that matters more here than
-        elsewhere: the usual reason teardown does not finish is metal3 holding
-        its finalizer while it tries to deprovision through the BMC that just
-        failed to answer, which is a state the activity is built to break out of
-        but should still be allowed to retry into.
+        Since `add-server-rollback-keeps-finalizer` (the operator, 2026-11-24):
+        the NMStateConfig and the BareMetalHost are deleted — no `detached`
+        annotation, metal3's finalizer never touched — and the BareMetalHost is
+        read every 15 s until metal3 has deprovisioned the host (powered it
+        off, deleted its ironic node) and let it go; then its BMC Secret, if it
+        outlived the host (metal3 needed it for the power-off). Still there at
+        the deadline fails the run with BmhDeletionTimeoutError and nothing
+        after it — no PXE unmap, no maintenance, no release: a BareMetalHost
+        still points at the machine, so its lock runs to its expiry.
+
+        A run recorded before tears down through teardown_bmh_resources, which
+        detaches, drops the finalizer after 30 s, and is retried until the host
+        is gone.
         """
-        return await workflow.execute_activity(
-            teardown_bmh_resources,
-            ref,
+        if not workflow.patched(_ROLLBACK_KEEPS_FINALIZER_PATCH):
+            return await workflow.execute_activity(
+                teardown_bmh_resources,
+                ref,
+                task_queue=task_queue,
+                start_to_close_timeout=_ACTIVITY_TIMEOUT,
+                schedule_to_start_timeout=_SCHEDULE_TO_START_TIMEOUT,
+                retry_policy=_RETRY_POLICY,
+                cancellation_type=_ON_CANCEL,
+            )
+
+        deletion: HostDeletion = await workflow.execute_activity(
+            delete_host_resources,
+            HostDeleteRequest(server_name=ref.server_name, namespace=ref.namespace),
             task_queue=task_queue,
             start_to_close_timeout=_ACTIVITY_TIMEOUT,
             schedule_to_start_timeout=_SCHEDULE_TO_START_TIMEOUT,
             retry_policy=_RETRY_POLICY,
             cancellation_type=_ON_CANCEL,
         )
+        started_at = workflow.now()
+        while True:
+            bmh = await self._read_bmh(ref, task_queue)
+            if not bmh.found:
+                break
+            if workflow.now() - started_at >= BMH_DELETION_DEADLINE:
+                raise ApplicationError(
+                    f"Rolling {ref.server_name} back ({why}): its BareMetalHost in {ref.namespace} "
+                    f"is still deleting {BMH_DELETION_DEADLINE} after the delete (metal3: "
+                    f"{describe_metal3(bmh)}). Its finalizer is left to metal3, which lets "
+                    "the host go only once it has powered it off and deleted its ironic "
+                    "node — usually it cannot reach the BMC. The NMStateConfig is deleted; "
+                    "nothing after the delete was done — no PXE unmap, no maintenance, no "
+                    "release — since a BareMetalHost still points at the machine, so its "
+                    "install lock runs to its expiry. Fix the BMC: metal3 finishes on its own",
+                    type=BmhDeletionTimeoutError.__name__,
+                )
+            await workflow.sleep(BMH_DELETION_POLL_INTERVAL)  # durable, replay-safe
+
+        removed = list(deletion.removed)
+        if deletion.bmc_secret and await workflow.execute_activity(
+            delete_bmc_secret,
+            BmcSecretRef(namespace=ref.namespace, name=deletion.bmc_secret),
+            task_queue=task_queue,
+            start_to_close_timeout=_ACTIVITY_TIMEOUT,
+            schedule_to_start_timeout=_SCHEDULE_TO_START_TIMEOUT,
+            retry_policy=_RETRY_POLICY,
+            cancellation_type=_ON_CANCEL,
+        ):
+            removed.append(f"Secret/{deletion.bmc_secret}")
+        return TeardownResult(removed=removed)
 
 
 @workflow.defn(name=_LEGACY_WORKFLOW_TYPE)

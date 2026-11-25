@@ -114,12 +114,15 @@ from shared.models.server_lifecycle import (
     AgentReleaseRequest,
     AgentState,
     AllocateServerRequest,
+    BmcSecretRef,
     BmhRef,
     BmhResourceRequest,
     BmhState,
     BoundHostState,
     CreatedResource,
     HostAgent,
+    HostDeleteRequest,
+    HostDeletion,
     HostedClusterRef,
     HostedNode,
     HostedNodeAction,
@@ -526,6 +529,69 @@ async def delete_agents(request: AgentDeleteRequest) -> AgentDeletion:
 
 
 @activity.defn
+async def delete_host_resources(request: HostDeleteRequest) -> HostDeletion:
+    """Delete a host's NMStateConfig and BareMetalHost; metal3's finalizer is metal3's."""
+    for name in request.agents_must_be_unbound:
+        agent = await _read(
+            AGENT_GROUP, AGENT_VERSION, AGENT_PLURAL, _AGENT_KIND, request.namespace, name
+        )
+        if agent is not None:
+            _refuse_if_bound(agent, request.namespace)
+
+    namespace = request.namespace
+    bmh_name = k8s_resource_name(request.server_name)
+    # The Secret the host itself names, read while it still exists: it is
+    # deleted only once the host is gone, because metal3 needs it to power the
+    # host off on its way out.
+    bmh = await _read(BMH_GROUP, BMH_VERSION, BMH_PLURAL, _BMH_KIND, namespace, bmh_name)
+    bmc_secret = (((bmh or {}).get("spec") or {}).get("bmc") or {}).get("credentialsName")
+
+    removed: list[str] = []
+    nmstate_name = nmstate_config_name(request.server_name)
+    if await cluster_api.delete_custom_object(
+        group=NMSTATE_GROUP,
+        version=NMSTATE_VERSION,
+        plural=NMSTATE_PLURAL,
+        kind=_NMSTATE_KIND,
+        namespace=namespace,
+        name=nmstate_name,
+    ):
+        removed.append(f"{_NMSTATE_KIND}/{nmstate_name}")
+    # No `detached` annotation and no finalizer touched: metal3 deprovisions
+    # the host — powers it off, deletes its ironic node — before it lets the
+    # object go, and the workflow waits for exactly that.
+    if await cluster_api.delete_custom_object(
+        group=BMH_GROUP,
+        version=BMH_VERSION,
+        plural=BMH_PLURAL,
+        kind=_BMH_KIND,
+        namespace=namespace,
+        name=bmh_name,
+    ):
+        removed.append(f"{_BMH_KIND}/{bmh_name}")
+    activity.logger.info(
+        "Deleted %s in %s, metal3 left to finish; BMC Secret %s kept until the host is gone",
+        removed or ["nothing (already absent)"],
+        namespace,
+        bmc_secret,
+    )
+    return HostDeletion(removed=removed, bmc_secret=bmc_secret or None)
+
+
+@activity.defn
+async def delete_bmc_secret(ref: BmcSecretRef) -> bool:
+    """Delete a BMC Secret once its BareMetalHost is gone; False when already absent."""
+    deleted = await cluster_api.delete_secret_if_present(ref.namespace, ref.name)
+    activity.logger.info(
+        "BMC Secret %s/%s %s",
+        ref.namespace,
+        ref.name,
+        "deleted: it outlived its BareMetalHost" if deleted else "already gone with its host",
+    )
+    return deleted
+
+
+@activity.defn
 async def check_infra_env(ref: InfraEnvRef) -> InfraEnvState:
     """Confirm the InfraEnv the run fills exists on this MCE."""
     infra_env = await cluster_api.read_custom_object(
@@ -542,14 +608,25 @@ async def check_infra_env(ref: InfraEnvRef) -> InfraEnvState:
             f"MCE {_settings.mce_cluster}: create it, or fix infra_env / namespace "
             "in the request"
         )
-    cluster_ref = ((infra_env.get("spec") or {}).get("clusterRef") or {}).get("name")
+    spec = infra_env.get("spec") or {}
+    cluster_ref = (spec.get("clusterRef") or {}).get("name")
+    labels = spec.get("agentLabels")
+    agent_labels = (
+        {str(key): str(value) for key, value in labels.items()} if isinstance(labels, dict) else {}
+    )
     activity.logger.info(
-        "InfraEnv %s/%s exists%s",
+        "InfraEnv %s/%s exists%s, agentLabels %s",
         ref.namespace,
         ref.name,
         f" (early-bound to cluster {cluster_ref})" if cluster_ref else "",
+        agent_labels or "none",
     )
-    return InfraEnvState(name=ref.name, namespace=ref.namespace, cluster_ref=cluster_ref)
+    return InfraEnvState(
+        name=ref.name,
+        namespace=ref.namespace,
+        cluster_ref=cluster_ref,
+        agent_labels=agent_labels,
+    )
 
 
 @activity.defn
@@ -938,7 +1015,8 @@ async def _bmh_is_gone(namespace: str, name: str) -> bool:
 async def teardown_bmh_resources(ref: BmhRef) -> TeardownResult:
     """Remove one candidate's resources so the machine returns to the inventory.
 
-    The ordering here was established against a live cluster and is load-bearing
+    Runs recorded before 2026-11-24 only (delete_host_resources since). The
+    ordering here was established against a live cluster and is load-bearing
     at every step — see the contract in shared/interfaces/server_lifecycle.py.
     """
     namespace = ref.namespace
@@ -1714,10 +1792,14 @@ async def clean_up_agent_machines(request: AgentMachineCleanupRequest) -> AgentM
         elif (
             request.clear_finalizers
             and released
+            and hosted_resources.machine_owner(agent_machine) is None
             and hosted_resources.AGENT_MACHINE_FINALIZER in (metadata.get("finalizers") or [])
         ):
-            # The finalizer's one job is the unbind, which is done; with no
-            # Machine the provider never removes it (handleDeletionHook).
+            # The finalizer's one job is the unbind, which is done; with NO
+            # owner Machine at all the provider keeps it for ever. One that
+            # still names its owner — gone — the provider drops itself, so it
+            # is left to the provider (the operator, 2026-11-24): a hold is
+            # removed here only where no controller ever will.
             if await cluster_api.clear_custom_object_finalizers(
                 group=hosted_resources.AGENT_MACHINE_GROUP,
                 version=hosted_resources.AGENT_MACHINE_VERSION,
@@ -1731,7 +1813,14 @@ async def clean_up_agent_machines(request: AgentMachineCleanupRequest) -> AgentM
         left = await _read_agent_machine(namespace, name)
         if left is not None:
             finalizers = ", ".join((left.get("metadata") or {}).get("finalizers") or []) or "none"
-            result.remaining.append(f"{key} (deleting; finalizers: {finalizers})")
+            owner = hosted_resources.machine_owner(left)
+            waiting = (
+                f"; left to the Agent provider, which drops its finalizer once it sees "
+                f"owner Machine {owner[0]} gone"
+                if owner is not None and (left.get("metadata") or {}).get("deletionTimestamp")
+                else ""
+            )
+            result.remaining.append(f"{key} (deleting; finalizers: {finalizers}{waiting})")
     activity.logger.info(
         "AgentMachines of Agent %s/%s: deleted=%s finalizers cleared=%s remaining=%s "
         "held by a Machine=%s, Machines=%s",

@@ -4,7 +4,8 @@ The cluster mocks are registered ONLY on the target MCE's activity queue —
 every step that acts on the MCE goes there — and the inventory-segment read
 (the site for the PXE cleanup) on the segment-lifecycle queue, as in
 production; a dispatch anywhere else would hang the run. The time-skipping
-environment collapses the power-off poll's durable timers.
+environment collapses the BMH-deletion poll's durable timers (and, for a run
+recorded before `remove-server-delete-without-power-off`, the power-off poll's).
 """
 
 from __future__ import annotations
@@ -38,8 +39,11 @@ from shared.models.server_lifecycle import (
     AgentBinding,
     AgentDeleteRequest,
     AgentDeletion,
+    BmcSecretRef,
     BmhRef,
     BmhState,
+    HostDeleteRequest,
+    HostDeletion,
     HostPowerRequest,
     InventoryHostState,
     PxeHostEntriesRef,
@@ -74,6 +78,9 @@ SEGMENT = SegmentEntry(
 UNBOUND = AgentBinding(name="agent-1")
 BOUND = AgentBinding(name="agent-1", cluster_deployment="clusters/hc-01")
 FULL = InventoryHostState(bmh_found=True, nmstate_found=True, powered_on=True, agents=[UNBOUND])
+# The BMC Secret the BMH names (`spec.bmc.credentialsName`).
+SECRET = f"cisco-ucs-{SERVER.lower()}"
+HOST_RESOURCES = [f"NMStateConfig/nmstate-config-{SERVER.lower()}", f"BareMetalHost/{SERVER.lower()}"]
 
 # server-scan's record of the server: no live lock unless a test gives one.
 MEMBERSHIP = ServerMembership(
@@ -91,6 +98,10 @@ INSTALL_LOCK = ServerLockRecord(
 def make_mocks(
     *,
     state: InventoryHostState = FULL,
+    polls_until_gone: int = 2,
+    never_deleted: bool = False,
+    delete_error: Exception | None = None,
+    secret_outlives: bool = False,
     polls_until_off: int = 2,
     never_powers_off: bool = False,
     power_error: Exception | None = None,
@@ -108,15 +119,22 @@ def make_mocks(
     release_error: Exception | None = None,
 ):
     """`state` is what the first inspection finds; `after` what every later
-    one finds (the final check) — gone by default. `pxe_kept` names the MACs
-    the PXE VM keeps because another MCE's boot entry owns them. `lock` is
-    server-scan's install lock on the server (none live by default)."""
+    one finds (the final check) — gone by default. After the delete, metal3
+    lets the BMH go on read `polls_until_gone` (never, with `never_deleted`).
+    `pxe_kept` names the MACs the PXE VM keeps because another MCE's boot entry
+    owns them. `lock` is server-scan's install lock on the server (none live by
+    default). The power-off knobs serve a run recorded before
+    `remove-server-delete-without-power-off`."""
     leftover = after if after is not None else InventoryHostState()
     kept = pxe_kept or set()
+    # How many BMH reads there had been when the host was deleted.
+    deleted_at: list[int] = []
     calls: dict[str, list] = {
         k: []
         for k in (
             "inspect_inventory_host",
+            "delete_host_resources",
+            "delete_bmc_secret",
             "set_host_online",
             "get_baremetal_host",
             "teardown_bmh_resources",
@@ -169,6 +187,25 @@ def make_mocks(
         return found
 
     @activity.defn
+    async def delete_host_resources(request: HostDeleteRequest) -> HostDeletion:
+        calls["delete_host_resources"].append(request)
+        calls["order"].append("delete-host")
+        if delete_error is not None:
+            raise delete_error
+        deleted_at.append(len(calls["get_baremetal_host"]))
+        return HostDeletion(
+            removed=[r for r in HOST_RESOURCES
+                     if (state.nmstate_found if r.startswith("NMState") else state.bmh_found)],
+            bmc_secret=SECRET if state.bmh_found else None,
+        )
+
+    @activity.defn
+    async def delete_bmc_secret(ref: BmcSecretRef) -> bool:
+        calls["delete_bmc_secret"].append(ref)
+        calls["order"].append("secret")
+        return secret_outlives
+
+    @activity.defn
     async def set_host_online(request: HostPowerRequest) -> bool:
         calls["set_host_online"].append(request)
         calls["order"].append("power-off")
@@ -179,6 +216,19 @@ def make_mocks(
     @activity.defn
     async def get_baremetal_host(ref: BmhRef) -> BmhState:
         calls["get_baremetal_host"].append(ref)
+        if deleted_at:
+            # Deleting: metal3 deprovisions, then lets the BMH go.
+            polls = len(calls["get_baremetal_host"]) - deleted_at[0]
+            if never_deleted:
+                return BmhState(
+                    found=True, provisioning_state="powering off before delete",
+                    operational_status="error", error_type="power management error",
+                    error_message="Failed to power off: BMC unreachable", powered_on=True,
+                )
+            if not state.bmh_found or polls >= polls_until_gone:
+                return BmhState(found=False)
+            return BmhState(found=True, provisioning_state="deprovisioning",
+                            operational_status="OK", powered_on=True)
         on = never_powers_off or len(calls["get_baremetal_host"]) < polls_until_off
         return BmhState(found=True, provisioning_state="provisioned", powered_on=on)
 
@@ -213,6 +263,8 @@ def make_mocks(
     return calls, {
         QUEUE: [
             inspect_inventory_host,
+            delete_host_resources,
+            delete_bmc_secret,
             set_host_online,
             get_baremetal_host,
             teardown_bmh_resources,
@@ -271,25 +323,63 @@ def _error(exc: WorkflowFailureError) -> ApplicationError:
     return cause
 
 
-async def test_an_inventory_host_is_powered_off_then_removed_agent_last():
+async def test_an_inventory_host_is_deleted_waited_on_then_its_agent_removed_last():
     calls, acts = make_mocks()
     async with _Harness(acts) as client:
         result = await _execute(client)
 
-    assert calls["order"] == ["inspect", "power-off", "teardown", "delete-agents", "verify"]
-    assert result.found and result.powered_off
+    assert calls["order"] == ["inspect", "delete-host", "secret", "delete-agents", "verify"]
+    # No power-off of its own and no teardown: metal3's delete powers the host off.
+    assert calls["set_host_online"] == [] and calls["teardown_bmh_resources"] == []
+    assert result.found and not result.powered_off
     assert result.agents_removed == ["agent-1"]
-    assert result.resources_removed == [
-        f"NMStateConfig/nmstate-config-{SERVER.lower()}",
-        f"BareMetalHost/{SERVER.lower()}",
+    assert result.resources_removed == HOST_RESOURCES
+    # Re-checked by the activity right before it deletes anything.
+    assert calls["delete_host_resources"] == [
+        HostDeleteRequest(server_name=SERVER, namespace=NS, agents_must_be_unbound=["agent-1"])
     ]
-    power = calls["set_host_online"][0]
-    assert power.online is False
-    # Re-checked by the activity right before it acts.
-    assert power.agents_must_be_unbound == ["agent-1"]
-    assert calls["delete_agents"] == [AgentDeleteRequest(namespace=NS, names=["agent-1"])]
-    # Waited for metal3 to report the host off before deleting anything.
+    # Waited until metal3 let the BMH go, and only then the Secret and the Agent.
     assert len(calls["get_baremetal_host"]) == 2
+    assert calls["delete_bmc_secret"] == [BmcSecretRef(namespace=NS, name=SECRET)]
+    assert calls["delete_agents"] == [AgentDeleteRequest(namespace=NS, names=["agent-1"])]
+
+
+async def test_a_bmh_metal3_never_lets_go_fails_after_15_min_with_the_agent_untouched():
+    """The finalizer is metal3's: a BMC that does not answer fails the run, never forced."""
+    calls, acts = make_mocks(never_deleted=True)
+    async with _Harness(acts) as client:
+        with pytest.raises(WorkflowFailureError) as excinfo:
+            await _execute(client)
+
+    error = _error(excinfo.value)
+    assert error.type == "BmhDeletionTimeoutError"
+    assert "'powering off before delete'" in error.message
+    assert "BMC unreachable" in error.message
+    assert "the Agent was NOT" in error.message
+    assert calls["order"] == ["inspect", "delete-host"]
+    # Every 15 s for 15 min — 61 reads, from t=0 to t=900 s.
+    assert 60 <= len(calls["get_baremetal_host"]) <= 61
+    # Nothing after it: the Secret metal3 still needs, the Agent, the PXE map.
+    assert calls["delete_bmc_secret"] == [] and calls["delete_agents"] == []
+    assert calls["remove_host_pxe_entries"] == []
+
+
+async def test_a_secret_that_outlives_its_host_is_deleted_and_reported():
+    calls, acts = make_mocks(secret_outlives=True)
+    async with _Harness(acts) as client:
+        result = await _execute(client)
+    assert result.resources_removed == [*HOST_RESOURCES, f"Secret/{SECRET}"]
+
+
+async def test_an_nmstateconfig_alone_is_deleted_with_nothing_to_wait_for():
+    calls, acts = make_mocks(state=InventoryHostState(nmstate_found=True))
+    async with _Harness(acts) as client:
+        result = await _execute(client)
+
+    assert calls["order"] == ["inspect", "delete-host", "verify"]
+    # One read says there is no BMH; no Secret named, so none deleted.
+    assert len(calls["get_baremetal_host"]) == 1
+    assert result.resources_removed == [HOST_RESOURCES[0]]
 
 
 async def test_a_host_bound_to_a_cluster_is_refused_untouched():
@@ -305,27 +395,67 @@ async def test_a_host_bound_to_a_cluster_is_refused_untouched():
 
 
 async def test_a_binding_made_after_the_inspection_is_still_caught():
-    calls, acts = make_mocks(power_error=AgentBoundToClusterError("bound since"))
+    calls, acts = make_mocks(delete_error=AgentBoundToClusterError("bound since"))
     async with _Harness(acts) as client:
         with pytest.raises(WorkflowFailureError) as excinfo:
             await _execute(client)
 
     assert _error(excinfo.value).type == "AgentBoundToClusterError"
     # Once — non-retryable — and nothing after it.
-    assert len(calls["set_host_online"]) == 1
-    assert calls["teardown_bmh_resources"] == [] and calls["delete_agents"] == []
+    assert len(calls["delete_host_resources"]) == 1
+    assert calls["get_baremetal_host"] == [] and calls["delete_agents"] == []
 
 
-async def test_a_host_that_never_powers_off_fails_with_nothing_deleted():
-    calls, acts = make_mocks(never_powers_off=True)
-    async with _Harness(acts) as client:
-        with pytest.raises(WorkflowFailureError) as excinfo:
-            await _execute(client)
+@pytest.fixture
+def recorded_with_the_power_off(monkeypatch):
+    """A run recorded before `remove-server-delete-without-power-off` (2026-11-24)."""
+    monkeypatch.setattr(
+        workflow, "patched",
+        lambda patch_id: patch_id != remove_server_from_mce._DELETE_WITHOUT_POWER_OFF_PATCH,
+    )
 
-    error = _error(excinfo.value)
-    assert error.type == "HostPowerOffTimeoutError"
-    assert "NOTHING was deleted" in error.message
-    assert calls["teardown_bmh_resources"] == [] and calls["delete_agents"] == []
+
+@pytest.mark.usefixtures("recorded_with_the_power_off")
+class TestARunRecordedWithThePowerOff:
+    """It replays as it began: power off, then add-server-to-mce's rollback teardown."""
+
+    async def test_an_inventory_host_is_powered_off_then_removed_agent_last(self):
+        calls, acts = make_mocks()
+        async with _Harness(acts) as client:
+            result = await _execute(client)
+
+        assert calls["order"] == ["inspect", "power-off", "teardown", "delete-agents", "verify"]
+        assert calls["delete_host_resources"] == [] and calls["delete_bmc_secret"] == []
+        assert result.found and result.powered_off
+        assert result.agents_removed == ["agent-1"]
+        assert result.resources_removed == HOST_RESOURCES
+        power = calls["set_host_online"][0]
+        assert power.online is False
+        # Re-checked by the activity right before it acts.
+        assert power.agents_must_be_unbound == ["agent-1"]
+        # Waited for metal3 to report the host off before deleting anything.
+        assert len(calls["get_baremetal_host"]) == 2
+
+    async def test_a_binding_made_after_the_inspection_is_still_caught(self):
+        calls, acts = make_mocks(power_error=AgentBoundToClusterError("bound since"))
+        async with _Harness(acts) as client:
+            with pytest.raises(WorkflowFailureError) as excinfo:
+                await _execute(client)
+
+        assert _error(excinfo.value).type == "AgentBoundToClusterError"
+        assert len(calls["set_host_online"]) == 1
+        assert calls["teardown_bmh_resources"] == [] and calls["delete_agents"] == []
+
+    async def test_a_host_that_never_powers_off_fails_with_nothing_deleted(self):
+        calls, acts = make_mocks(never_powers_off=True)
+        async with _Harness(acts) as client:
+            with pytest.raises(WorkflowFailureError) as excinfo:
+                await _execute(client)
+
+        error = _error(excinfo.value)
+        assert error.type == "HostPowerOffTimeoutError"
+        assert "NOTHING was deleted" in error.message
+        assert calls["teardown_bmh_resources"] == [] and calls["delete_agents"] == []
 
 
 async def test_nothing_on_the_mce_is_a_successful_no_op():
@@ -345,7 +475,7 @@ async def test_a_host_without_an_agent_still_has_its_resources_removed():
     async with _Harness(acts) as client:
         result = await _execute(client)
 
-    assert calls["order"] == ["inspect", "power-off", "teardown", "verify"]
+    assert calls["order"] == ["inspect", "delete-host", "secret", "verify"]
     assert result.agents_removed == []
 
 
@@ -395,8 +525,21 @@ async def test_a_resource_that_lingers_is_named_in_the_failure():
     error = _error(excinfo.value)
     assert error.type == "ServerStillPresentError"
     assert "BareMetalHost" in error.message
-    # Powered off through its BMH, so no "power it off" hint.
+    # No Agent came back, so no "power it off" hint.
     assert "BMC" not in error.message
+
+
+async def test_an_agent_back_after_metal3_let_the_bmh_go_says_to_power_it_off():
+    returned = InventoryHostState(agents=[AgentBinding(name="agent-2")])
+    calls, acts = make_mocks(after=returned)
+    async with _Harness(acts) as client:
+        with pytest.raises(WorkflowFailureError) as excinfo:
+            await _execute(client)
+
+    error = _error(excinfo.value)
+    assert error.type == "ServerStillPresentError"
+    assert "metal3 let the BareMetalHost go without the host powering off" in error.message
+    assert "power it off through its BMC" in error.message
 
 
 WITH_MACS = FULL.model_copy(
@@ -413,7 +556,7 @@ class TestThePxeMapIsCleared:
             result = await _execute(client)
 
         assert calls["order"] == [
-            "inspect", "power-off", "teardown", "delete-agents", "segment", "pxe", "verify",
+            "inspect", "delete-host", "secret", "delete-agents", "segment", "pxe", "verify",
         ]
         # Every MAC the host is known by, conditional on THIS MCE, and only on
         # the MCE's own site's VM — the one add-server-to-mce mapped it on.

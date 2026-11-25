@@ -827,12 +827,15 @@ class TestAHostedClustersNode:
         assert calls["inspect_inventory_host"] == []
 
     async def test_a_lingering_agentmachine_is_named(self):
-        _calls, acts = make_mocks(agent_machine_lingers=True)
+        calls, acts = make_mocks(agent_machine_lingers=True)
         async with _Harness(acts) as client:
             error = await _fails(client)
 
         assert error.type == "ServerStillPresentError"
         assert AM in error.message and "someone-else" in error.message
+        # Past the five-minute grace, so a drop always gets its turn: ten minutes.
+        assert "0:10:00 after the Agent was released" in error.message
+        assert len(calls["clean_up_agent_machines"]) >= 60
 
     async def test_an_agent_left_unclean_after_the_machine_went_is_refused_to_the_child(self):
         not_approved = AGENT_FREE.model_copy(update={"approved": False})
@@ -1013,9 +1016,23 @@ class TestHyperShiftLeftovers:
         flags = [r.clear_finalizers for r in calls["clean_up_agent_machines"]]
         # The provider gets the grace period first; then the run drops it.
         assert flags[0] is False and flags[-1] is True and flags.count(True) == 1
+        # Five minutes of 10 s polls (the operator, 2026-11-25), not one.
+        assert 29 <= flags.index(True) <= 31
         assert any(c.startswith(f"dropped the Agent provider's finalizer from AgentMachine {AM}")
                    for c in result.cleaned_up)
         assert result.remove_server.found
+
+    async def test_a_run_recorded_before_the_five_minutes_drops_it_after_one(self, monkeypatch):
+        monkeypatch.setattr(
+            workflow, "patched", _recorded_without(uninstall_server_from_hc._FINALIZER_GRACE_PATCH)
+        )
+        calls, acts = make_mocks(host=NO_MACHINE, nodes=[[]], agents=RELEASED_AND_FREE,
+                                 stuck_finalizer=True)
+        async with _Harness(acts) as client:
+            await _execute(client)
+
+        flags = [r.clear_finalizers for r in calls["clean_up_agent_machines"]]
+        assert 5 <= flags.index(True) <= 7 and flags.count(True) == 1
 
     async def test_a_machine_taking_the_host_again_fails_the_verification(self):
         calls, acts = make_mocks(

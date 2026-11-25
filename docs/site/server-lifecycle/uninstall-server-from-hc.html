@@ -274,7 +274,7 @@
         <thead><tr><th>what was left</th><th>why nothing finishes it</th><th>what the run does</th></tr></thead>
         <tbody>
           <tr><td class="k">AgentMachine + Machine, no Node</td><td class="muted">Nothing is broken: CAPI skips the drain of a Machine with no Node.</td><td class="muted">The normal path &mdash; but the Node is still <b>looked for</b> by providerID and hostname, never assumed absent because the Machine has no nodeRef.</td></tr>
-          <tr><td class="k">AgentMachine, no Machine</td><td class="muted">The provider unbinds <b>only from a Machine&rsquo;s pre-terminate hook</b>. With no Machine it never unbinds, and its finalizer is dropped without the unbind &mdash; or, with no owner reference at all, stays for ever.</td><td class="muted">Releases the Agent with <b>the provider&rsquo;s exact write</b> and deletes the AgentMachine. With no owner reference at all, drops the provider&rsquo;s finalizer if it is still stuck a minute later; with an owner that is merely gone, leaves the finalizer to the provider, which drops it itself.</td></tr>
+          <tr><td class="k">AgentMachine, no Machine</td><td class="muted">The provider unbinds <b>only from a Machine&rsquo;s pre-terminate hook</b>. With no Machine it never unbinds, and its finalizer is dropped without the unbind &mdash; or, with no owner reference at all, stays for ever.</td><td class="muted">Releases the Agent with <b>the provider&rsquo;s exact write</b> and deletes the AgentMachine. With no owner reference at all, drops the provider&rsquo;s finalizer if it is still stuck 5 minutes later; with an owner that is merely gone, leaves the finalizer to the provider, which drops it itself.</td></tr>
           <tr><td class="k">Machine, no AgentMachine</td><td class="muted">Found by its providerID <code>agent://&lt;agent&gt;</code>. The provider&rsquo;s hook stays on it for ever &mdash; there is no AgentMachine to reconcile &mdash; so the Machine never finishes deleting.</td><td class="muted">Deletes the Machine; at its pre-terminate hook releases the Agent, waits for a state the provider itself releases in, then <b>removes the provider&rsquo;s hook</b>. CAPI does the rest.</td></tr>
           <tr><td class="k">Agent still bound, both gone</td><td class="muted">Nothing on the CAPI side references the Agent any more.</td><td class="muted">Releases it &mdash; recognised by its binding into the HostedCluster&rsquo;s control-plane namespace.</td></tr>
           <tr><td class="k">Node, no Machine or AgentMachine</td><td class="muted">CAPI drains and deletes a Node <b>only through its Machine</b>.</td><td class="muted">Ready: <b>cordon and evict</b> (CAPI&rsquo;s drain rules, PodDisruptionBudgets respected, 20 min) <em>before</em> the release that reboots the host; once the host is back in discovery and the Node NotReady, <b>delete it</b>. NotReady from the start: no drain. Ready with nothing on the MCE to release the host through: <b>refused before any write</b>.</td></tr>
@@ -476,9 +476,10 @@
           (<code>AgentBindingChangedError</code>).</p>
           <p><b>verifying-agentmachine</b> &mdash; re-derived fresh: no AgentMachine names the Agent. One with
           no Machine is deleted; one stuck deleting on the provider&rsquo;s finalizer with <b>no owner at
-          all</b> (the provider keeps it for ever) has that finalizer dropped after a minute, while one whose
-          owner Machine is merely gone is left to the provider, which drops it itself; anything still there, or
-          a Machine still linked, fails the run (5 min,
+          all</b> (the provider keeps it for ever) has that finalizer dropped after <b>5 minutes</b> (one
+          minute on a run started before 2026-11-25), while one whose owner Machine is merely gone is left to the
+          provider, which drops it itself; anything still there, or a Machine still linked, fails the run
+          (10 min &mdash; 5 on a run started before,
           polled every 10 s). <b>verifying-node</b> &mdash; no Node of the hosted cluster is the server: a stale
           one, NotReady with no Machine left to delete it, is deleted; one still Ready fails the run (5 min).
           <b>verifying-agent</b> &mdash; unbound, no <code>agentMachineRef</code> label,
@@ -906,7 +907,7 @@
           <tr><td class="k">draining-node</td><td class="muted">A Node no Machine stands behind: cordon + evictions, every 30 s</td><td class="muted">&le; 20 min</td></tr>
           <tr><td class="k">deleting-machine</td><td class="muted">Hosted nodes: the Machine delete, or a recorded no-op</td><td class="muted">instant</td></tr>
           <tr><td class="k">awaiting-machine-deletion</td><td class="muted">Hosted nodes: <code>sub_phase</code> <b>draining</b> (Agent still bound), <b>releasing</b> (the run makes the provider&rsquo;s writes) and <b>unbinding</b> (released, rebooting), polled every 30 s; stops if another AgentMachine takes the Agent</td><td class="muted"><b>&le; 20 min</b> draining, <b>&le; 1 h</b> unbinding</td></tr>
-          <tr><td class="k">verifying-agentmachine</td><td class="muted">No AgentMachine names the Agent, and no Machine is linked to it; a Machine-less one deleted, a stuck provider finalizer dropped only with no owner at all. An inventory host: inspected again, fresh &mdash; anything linked stops the run</td><td class="muted">&le; 5 min</td></tr>
+          <tr><td class="k">verifying-agentmachine</td><td class="muted">No AgentMachine names the Agent, and no Machine is linked to it; a Machine-less one deleted, a stuck provider finalizer dropped after 5 min, only with no owner at all. An inventory host: inspected again, fresh &mdash; anything linked stops the run</td><td class="muted">&le; 10 min</td></tr>
           <tr><td class="k">verifying-node</td><td class="muted">No Node of the hosted cluster is the server; a stale (NotReady) one deleted</td><td class="muted">&le; 5 min</td></tr>
           <tr><td class="k">verifying-agent</td><td class="muted">Hosted nodes: the Agent is a clean free Agent &mdash; where a new run ends</td><td class="muted">&le; 5 min</td></tr>
           <tr><td class="k">holding-server</td><td class="muted">Recorded runs only: the lock extended to 24 h</td><td class="muted">instant</td></tr>

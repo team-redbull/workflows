@@ -417,9 +417,15 @@ _LEFTOVERS_RESERVATION_TTL = (
     2 * _DRAIN_DEADLINE + _UNBIND_DEADLINE + 3 * _VERIFY_DEADLINE + timedelta(minutes=10)
 )
 # How long an AgentMachine with no Machine may sit deleting before the run drops
-# the provider's finalizer: the provider gets the first chance (it removes it
-# itself when the owner reference names a Machine that is gone).
-_FINALIZER_GRACE = timedelta(minutes=1)
+# the provider's finalizer (only with no owner Machine at all — one whose owner
+# reference names a Machine that is gone the provider clears itself), and how
+# long that whole check may take: past the grace, so the drop always gets its
+# turn (the operator, 2026-11-25: five minutes, not one). A run recorded before
+# `uninstall-agentmachine-finalizer-grace-5m` waits one minute within five.
+_FINALIZER_GRACE = timedelta(minutes=5)
+_AGENT_MACHINE_DEADLINE = _FINALIZER_GRACE + _VERIFY_DEADLINE
+_LEGACY_FINALIZER_GRACE = timedelta(minutes=1)
+_FINALIZER_GRACE_PATCH = "uninstall-agentmachine-finalizer-grace-5m"
 # Where the Agent provider releases its own hook (handleDeletionHook's
 # removeHookStates) — the run waits for the same before releasing it.
 _PROVIDER_RELEASE_STATES = frozenset({
@@ -1817,13 +1823,13 @@ class UninstallServerFromHcWorkflow:
         result: UninstallServerFromHcResult,
         task_queue: str,
     ) -> None:
-        """Until no AgentMachine names the Agent, re-derived fresh each pass (bounded 5 min).
+        """Until no AgentMachine names the Agent, re-derived fresh each pass (bounded 10 min).
 
         One left with no Machine is deleted; one stuck deleting on the
         provider's finalizer with NO owner Machine at all — which the provider
-        keeps for ever — has that finalizer dropped after _FINALIZER_GRACE (one
-        whose owner Machine is merely gone the provider drops itself, and the
-        limb leaves it to it). A Machine still linked
+        keeps for ever — has that finalizer dropped after _FINALIZER_GRACE, 5 min
+        (one whose owner Machine is merely gone the provider drops itself, and
+        the limb leaves it to it). A Machine still linked
         to the Agent fails the run: the Machine's deletion is CAPI's, and one
         appearing now is a NodePool's replacement taking this host again.
         """
@@ -1831,6 +1837,12 @@ class UninstallServerFromHcWorkflow:
         if agent.agent_machine:
             namespace, name = agent.agent_machine.split("/", 1)
             known.append(AgentMachineRef(namespace=namespace, name=name))
+        # Five minutes' grace within ten since 2026-11-25; a run recorded before
+        # keeps the one minute within five it was started with.
+        if workflow.patched(_FINALIZER_GRACE_PATCH):
+            grace, deadline = _FINALIZER_GRACE, _AGENT_MACHINE_DEADLINE
+        else:
+            grace, deadline = _LEGACY_FINALIZER_GRACE, _VERIFY_DEADLINE
         started_at = workflow.now()
         deleting_since = None
         while True:
@@ -1841,7 +1853,7 @@ class UninstallServerFromHcWorkflow:
                     agent=agent_ref,
                     known=known,
                     clear_finalizers=deleting_since is not None
-                    and now - deleting_since >= _FINALIZER_GRACE,
+                    and now - deleting_since >= grace,
                 ),
                 task_queue,
             )
@@ -1868,10 +1880,10 @@ class UninstallServerFromHcWorkflow:
             if not cleanup.remaining:
                 return
             deleting_since = deleting_since or now
-            if now - started_at >= _VERIFY_DEADLINE:
+            if now - started_at >= deadline:
                 raise ApplicationError(
                     f"AgentMachine(s) of Agent {agent.name} still on MCE "
-                    f"{request.mce_cluster} {_VERIFY_DEADLINE} after the Agent was released: "
+                    f"{request.mce_cluster} {deadline} after the Agent was released: "
                     f"{'; '.join(cleanup.remaining)}. Nothing further was changed",
                     type=ServerStillPresentError.__name__,
                 )

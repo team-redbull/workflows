@@ -643,8 +643,8 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   `MachineDrainTimeoutError` naming conditions and pending hooks; `unbinding`
   once released, 1 h to `known-unbound` — add-server-to-mce's bare-metal reasoning —
   then `AgentUnbindTimeoutError`, or `MachineDeletionTimeoutError` when the Agent
-  is free and the Machine still stands) → `verifying-agentmachine` (gone, 5 min,
-  `ServerStillPresentError`) → `verifying-node` (no Node is the server — by
+  is free and the Machine still stands) → `verifying-agentmachine` (gone, 10 min
+  since 2026-11-25 — 5 before, `ServerStillPresentError`) → `verifying-node` (no Node is the server — by
   providerID, nodeRef or hostname, NEVER skipped for a missing nodeRef) →
   `verifying-agent` (no
   binding, no label, known-unbound, approved, BMH present and not in error; 5 min,
@@ -751,7 +751,9 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   provider release state, `release_machine_hook` drops the provider's hook;
   `verifying-agentmachine` (`clean_up_agent_machines`, re-derived FRESH: any
   AgentMachine naming the Agent by agentRef or label, a Machine-less one deleted,
-  one stuck deleting has ONLY the provider's finalizer dropped after 1 min, only
+  one stuck deleting has ONLY the provider's finalizer dropped after 5 min (the
+  operator, 2026-11-25; 1 min before, gated `uninstall-agentmachine-finalizer-grace-5m`,
+  the check's deadline 10 min so the drop always gets its turn), only
   once the Agent is released, and only with NO owner Machine at all — one whose
   owner is merely gone the provider drops itself and is left to it (the
   operator, 2026-11-24: a hold is removed only where no controller ever will;

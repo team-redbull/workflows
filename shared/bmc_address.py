@@ -164,5 +164,26 @@ def bmc_secret_name(bmc_vendor: str, server_name: str) -> str:
 
 
 def nmstate_config_name(server_name: str) -> str:
-    """`nmstate-config-{server}` — likewise unchanged from bmhgen."""
+    """The server's own name — what an NMStateConfig is CREATED under.
+
+    Since 2026-11-25 (the operator): one name for a server's BareMetalHost and
+    its NMStateConfig, bare metal and VM alike. Before, it was
+    `nmstate-config-{server}` (legacy_nmstate_config_name), and hosts installed
+    then keep that object: nothing renames it, so every read and delete looks
+    under BOTH names.
+    """
+    return k8s_resource_name(server_name)
+
+
+def legacy_nmstate_config_name(server_name: str) -> str:
+    """`nmstate-config-{server}` — bmhgen's name, written until 2026-11-25.
+
+    Never created any more. Read and deleted wherever nmstate_config_name is,
+    until no cluster holds one (`oc get nmstateconfig -A`).
+    """
     return f"nmstate-config-{k8s_resource_name(server_name)}"
+
+
+def nmstate_config_names(server_name: str) -> tuple[str, str]:
+    """Both names a server's NMStateConfig may be under: the current one first."""
+    return nmstate_config_name(server_name), legacy_nmstate_config_name(server_name)

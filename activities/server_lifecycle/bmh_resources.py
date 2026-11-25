@@ -11,9 +11,11 @@ from BareMetalHostUCS's `src/yaml_generators.py`, with two deliberate changes:
   * The BMC address is built from what server-scan parsed, not from a fixed
     per-vendor template — see shared/bmc_address.py.
 
-Resource NAMES are byte-identical to the operator's, so a cluster already
-holding resources it created is converged by this workflow rather than
-duplicated by it.
+The Secret's and the BareMetalHost's NAMES are byte-identical to the operator's,
+so a cluster already holding resources it created is converged by this workflow
+rather than duplicated by it. The NMStateConfig's was too (`nmstate-config-<server>`)
+until 2026-11-25; it is now the server's own name, and the activities read and
+delete under both (shared/bmc_address.nmstate_config_names).
 """
 
 from __future__ import annotations

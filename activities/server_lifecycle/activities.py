@@ -78,11 +78,12 @@ from activities.server_lifecycle.server_scan import fetch_available_servers
 # update-nodepool's day1 reader and replicas editor: the cluster-upgrade hub limb's
 # technology module, called with this limb's own DAY1_* settings.
 from activities.upgrade_gitops import day1_repo
-from shared.bmc_address import k8s_resource_name, nmstate_config_name
+from shared.bmc_address import k8s_resource_name, nmstate_config_names
 from shared.exceptions import (
     AgentBindingChangedError,
     AgentBoundToClusterError,
     BmcCredentialsMissingError,
+    BmhConflictError,
     BmhResourceError,
     BmhTeardownError,
     Day1ChangeRejectedError,
@@ -355,6 +356,52 @@ async def _read(group: str, version: str, plural: str, kind: str, namespace: str
     )
 
 
+async def _read_nmstate_configs(namespace: str, server_name: str) -> list[dict]:
+    """A server's NMStateConfigs: under its own name, and under the name used until 2026-11-25.
+
+    Usually one. Both names are looked under wherever a server's NMStateConfig is
+    read or deleted, because nothing renames the object of a host installed
+    before (shared/bmc_address.nmstate_config_names).
+    """
+    found = []
+    for name in nmstate_config_names(server_name):
+        nmstate = await _read(
+            NMSTATE_GROUP, NMSTATE_VERSION, NMSTATE_PLURAL, _NMSTATE_KIND, namespace, name
+        )
+        if nmstate is not None:
+            found.append(nmstate)
+    return found
+
+
+async def _delete_nmstate_configs(namespace: str, server_name: str) -> list[str]:
+    """Delete a server's NMStateConfig under both of its names; which were there."""
+    removed = []
+    for name in nmstate_config_names(server_name):
+        if await cluster_api.delete_custom_object(
+            group=NMSTATE_GROUP,
+            version=NMSTATE_VERSION,
+            plural=NMSTATE_PLURAL,
+            kind=_NMSTATE_KIND,
+            namespace=namespace,
+            name=name,
+        ):
+            removed.append(f"{_NMSTATE_KIND}/{name}")
+    return removed
+
+
+def _created_at(resource: dict) -> str:
+    """A resource's creationTimestamp, for ordering: RFC 3339 in UTC sorts as text."""
+    return (resource.get("metadata") or {}).get("creationTimestamp") or ""
+
+
+def _all_host_macs(bmh: dict | None, nmstates: list[dict]) -> set[str]:
+    """Every MAC the host's BareMetalHost and its NMStateConfigs name."""
+    macs = set(host_macs(bmh, None))
+    for nmstate in nmstates:
+        macs |= set(host_macs(None, nmstate))
+    return macs
+
+
 async def _list_agents(namespace: str) -> list[dict]:
     return await cluster_api.list_custom_objects(
         group=AGENT_GROUP,
@@ -380,20 +427,13 @@ async def inspect_inventory_host(ref: BmhRef) -> InventoryHostState:
     """What one server has on this MCE — BMH, NMStateConfig, Agents. Reads only."""
     bmh_name = k8s_resource_name(ref.server_name)
     bmh = await _read(BMH_GROUP, BMH_VERSION, BMH_PLURAL, _BMH_KIND, ref.namespace, bmh_name)
-    nmstate = await _read(
-        NMSTATE_GROUP,
-        NMSTATE_VERSION,
-        NMSTATE_PLURAL,
-        _NMSTATE_KIND,
-        ref.namespace,
-        nmstate_config_name(ref.server_name),
-    )
+    nmstates = await _read_nmstate_configs(ref.namespace, ref.server_name)
     # server-scan's MACs find an Agent with no BMH / NMStateConfig left to
     # take a MAC from.
     scan_macs = await server_scan.server_macs_by_name(
         _settings.server_scan_url, _settings.server_scan_api_token, ref.server_name
     )
-    macs = sorted(set(host_macs(bmh, nmstate)) | set(scan_macs))
+    macs = sorted(_all_host_macs(bmh, nmstates) | set(scan_macs))
     agents = [
         AgentBinding(
             name=(agent.get("metadata") or {}).get("name", ""),
@@ -404,7 +444,7 @@ async def inspect_inventory_host(ref: BmhRef) -> InventoryHostState:
     ]
     state = InventoryHostState(
         bmh_found=bmh is not None,
-        nmstate_found=nmstate is not None,
+        nmstate_found=bool(nmstates),
         powered_on=((bmh or {}).get("status") or {}).get("poweredOn"),
         agents=agents,
         server_scan_macs=scan_macs,
@@ -546,17 +586,7 @@ async def delete_host_resources(request: HostDeleteRequest) -> HostDeletion:
     bmh = await _read(BMH_GROUP, BMH_VERSION, BMH_PLURAL, _BMH_KIND, namespace, bmh_name)
     bmc_secret = (((bmh or {}).get("spec") or {}).get("bmc") or {}).get("credentialsName")
 
-    removed: list[str] = []
-    nmstate_name = nmstate_config_name(request.server_name)
-    if await cluster_api.delete_custom_object(
-        group=NMSTATE_GROUP,
-        version=NMSTATE_VERSION,
-        plural=NMSTATE_PLURAL,
-        kind=_NMSTATE_KIND,
-        namespace=namespace,
-        name=nmstate_name,
-    ):
-        removed.append(f"{_NMSTATE_KIND}/{nmstate_name}")
+    removed: list[str] = await _delete_nmstate_configs(namespace, request.server_name)
     # No `detached` annotation and no finalizer touched: metal3 deprovisions
     # the host — powers it off, deletes its ironic node — before it lets the
     # object go, and the workflow waits for exactly that.
@@ -760,15 +790,14 @@ async def publish_infra_env_boot(request: InfraEnvBootRequest) -> InfraEnvBootSt
     infra_env = await _read_infra_env(request.namespace, request.infra_env)
 
     if request.server_name:
-        awaited = nmstate_config_name(request.server_name)
-        nmstate = await _read(
-            NMSTATE_GROUP,
-            NMSTATE_VERSION,
-            NMSTATE_PLURAL,
-            _NMSTATE_KIND,
-            request.namespace,
-            awaited,
-        )
+        # The image must postdate the host's NMStateConfig: its newest, should
+        # it have one under each name (a create by a limb from before the
+        # rename, then one by this limb).
+        nmstates = await _read_nmstate_configs(request.namespace, request.server_name)
+        nmstate = max(nmstates, key=_created_at, default=None)
+        awaited = (nmstate or {}).get("metadata", {}).get("name") or nmstate_config_names(
+            request.server_name
+        )[0]
         waiting = infraenv_image_wait_reason(infra_env, nmstate)
     else:
         awaited = "its current image"
@@ -848,8 +877,27 @@ async def create_baremetal_host(request: BmhResourceRequest) -> CreatedResource:
 
 @activity.defn
 async def create_nmstate_config(request: BmhResourceRequest) -> CreatedResource:
-    """Create the NMStateConfig (`nmstate-config-{server}`)."""
+    """Create the NMStateConfig, named after the server.
+
+    One still under the name used until 2026-11-25 (`nmstate-config-{server}`)
+    that matches IS the server's NMStateConfig: success, nothing written, so a
+    host never ends with two. One that differs is the conflict it always was.
+    """
     _log_waived(request)
+    desired = build_nmstate_config(request)
+    _, legacy_name = nmstate_config_names(request.server_name)
+    legacy = await _read(
+        NMSTATE_GROUP, NMSTATE_VERSION, NMSTATE_PLURAL, _NMSTATE_KIND, request.namespace, legacy_name
+    )
+    if legacy is not None:
+        mismatches = nmstate_config_differences(desired, legacy)
+        if mismatches:
+            raise BmhConflictError(
+                f"{_NMSTATE_KIND} {legacy_name} already exists and does not match this "
+                "request: " + "; ".join(mismatches) + ". Nothing was overwritten — "
+                "reconcile the existing resource or install a different server"
+            )
+        return _log_outcome(CreatedResource(kind=_NMSTATE_KIND, name=legacy_name, changed=False))
     return _log_outcome(
         await cluster_api.create_custom_object_if_absent(
             group=NMSTATE_GROUP,
@@ -857,7 +905,7 @@ async def create_nmstate_config(request: BmhResourceRequest) -> CreatedResource:
             plural=NMSTATE_PLURAL,
             kind=_NMSTATE_KIND,
             namespace=request.namespace,
-            body=build_nmstate_config(request),
+            body=desired,
             differences=nmstate_config_differences,
         )
     )
@@ -870,50 +918,69 @@ async def replace_conflicting_nmstate_config(
     """Replace the server's NMStateConfig when it differs from this install.
 
     The contract, and why the order is what it is, is in
-    shared/interfaces/server_lifecycle.py.
+    shared/interfaces/server_lifecycle.py. The server may hold one under either
+    of its two names (nmstate_config_names): one that matches is left where it
+    is, whichever name it has; one that differs is deleted and the install's is
+    created under the server's own name; and of two, the old-named one goes.
     """
     resource = request.resource
     namespace = resource.namespace
     desired = build_nmstate_config(resource)
-    name = desired["metadata"]["name"]
-    existing = await _read(NMSTATE_GROUP, NMSTATE_VERSION, NMSTATE_PLURAL, _NMSTATE_KIND, namespace, name)
-    if existing is None:
+    name, legacy_name = nmstate_config_names(resource.server_name)
+    existing = {
+        (found.get("metadata") or {}).get("name"): found
+        for found in await _read_nmstate_configs(namespace, resource.server_name)
+    }
+    if not existing:
         return NmStateConfigReplacement(found=False)
-    differences = nmstate_config_differences(desired, existing)
-    if not differences:
+
+    # What goes, and why: every one that differs, and the old-named one of two.
+    reasons: dict[str, list[str]] = {}
+    for found_name, found in existing.items():
+        differences = nmstate_config_differences(desired, found)
+        if differences:
+            reasons[found_name] = differences
+        elif found_name == legacy_name and name in existing:
+            reasons[found_name] = [
+                f"{legacy_name}: a second NMStateConfig of {resource.server_name}, beside {name}"
+            ]
+    if not reasons:
         return NmStateConfigReplacement(found=True)
 
-    # Replace EXACTLY the object compared, then create it from this install and
-    # read it back. Delete-and-create rather than an update: the limb holds no
+    # Replace EXACTLY the objects compared, then create the install's and read
+    # it back. Delete-and-create rather than an update: the limb holds no
     # update verb, and a NEW creationTimestamp is what an IPMI blade's
     # boot-entry publish waits for the discovery image to postdate.
-    metadata = existing.get("metadata") or {}
-    activity.logger.warning(
-        "nmstateconfig-replacing %s/%s for %s: it differs: %s",
-        namespace,
-        name,
-        resource.server_name,
-        "; ".join(differences),
-    )
-    await cluster_api.delete_custom_object_exactly(
-        group=NMSTATE_GROUP,
-        version=NMSTATE_VERSION,
-        plural=NMSTATE_PLURAL,
-        kind=_NMSTATE_KIND,
-        namespace=namespace,
-        name=name,
-        uid=metadata.get("uid"),
-        resource_version=metadata.get("resourceVersion"),
-    )
-    await cluster_api.create_custom_object_if_absent(
-        group=NMSTATE_GROUP,
-        version=NMSTATE_VERSION,
-        plural=NMSTATE_PLURAL,
-        kind=_NMSTATE_KIND,
-        namespace=namespace,
-        body=desired,
-        differences=nmstate_config_differences,
-    )
+    differences = [line for lines in reasons.values() for line in lines]
+    for found_name in reasons:
+        metadata = existing[found_name].get("metadata") or {}
+        activity.logger.warning(
+            "nmstateconfig-replacing %s/%s for %s: %s",
+            namespace,
+            found_name,
+            resource.server_name,
+            "; ".join(reasons[found_name]),
+        )
+        await cluster_api.delete_custom_object_exactly(
+            group=NMSTATE_GROUP,
+            version=NMSTATE_VERSION,
+            plural=NMSTATE_PLURAL,
+            kind=_NMSTATE_KIND,
+            namespace=namespace,
+            name=found_name,
+            uid=metadata.get("uid"),
+            resource_version=metadata.get("resourceVersion"),
+        )
+    if name not in existing or name in reasons:
+        await cluster_api.create_custom_object_if_absent(
+            group=NMSTATE_GROUP,
+            version=NMSTATE_VERSION,
+            plural=NMSTATE_PLURAL,
+            kind=_NMSTATE_KIND,
+            namespace=namespace,
+            body=desired,
+            differences=nmstate_config_differences,
+        )
     written = await _read(NMSTATE_GROUP, NMSTATE_VERSION, NMSTATE_PLURAL, _NMSTATE_KIND, namespace, name)
     if written is None or nmstate_config_differences(desired, written):
         raise BmhResourceError(
@@ -1054,16 +1121,7 @@ async def teardown_bmh_resources(ref: BmhRef) -> TeardownResult:
 
     # 2. The NMStateConfig: no finalizer, no ownerReference, so nothing else
     #    removes it and it goes immediately.
-    nmstate_name = nmstate_config_name(ref.server_name)
-    if await cluster_api.delete_custom_object(
-        group=NMSTATE_GROUP,
-        version=NMSTATE_VERSION,
-        plural=NMSTATE_PLURAL,
-        kind=_NMSTATE_KIND,
-        namespace=namespace,
-        name=nmstate_name,
-    ):
-        removed.append(f"{_NMSTATE_KIND}/{nmstate_name}")
+    removed.extend(await _delete_nmstate_configs(namespace, ref.server_name))
 
     # 3. The host itself, then wait for it to really go.
     if await cluster_api.delete_custom_object(
@@ -1226,18 +1284,11 @@ async def inspect_bound_host(ref: BmhRef) -> BoundHostState:
     """The host on this MCE and, if it is one, the hosted-cluster node it is. Reads only."""
     bmh_name = k8s_resource_name(ref.server_name)
     bmh = await _read(BMH_GROUP, BMH_VERSION, BMH_PLURAL, _BMH_KIND, ref.namespace, bmh_name)
-    nmstate = await _read(
-        NMSTATE_GROUP,
-        NMSTATE_VERSION,
-        NMSTATE_PLURAL,
-        _NMSTATE_KIND,
-        ref.namespace,
-        nmstate_config_name(ref.server_name),
-    )
+    nmstates = await _read_nmstate_configs(ref.namespace, ref.server_name)
     scan_macs = await server_scan.server_macs_by_name(
         _settings.server_scan_url, _settings.server_scan_api_token, ref.server_name
     )
-    macs = sorted(set(host_macs(bmh, nmstate)) | set(scan_macs))
+    macs = sorted(_all_host_macs(bmh, nmstates) | set(scan_macs))
     matched = [
         agent
         for agent in await _list_agents(ref.namespace)

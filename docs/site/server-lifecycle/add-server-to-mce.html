@@ -408,9 +408,15 @@ spec:
           <div class="calls">
             <div class="call sm"><span class="verb">POST</span><span class="path">secrets/&lt;vendor&gt;-cred-&lt;server&gt; <em>· credentials from THIS worker&rsquo;s Secret</em></span></div>
             <div class="call nxt"><span class="verb">POST</span><span class="path">baremetalhosts/&lt;server&gt; <em>· customDeploy: start_assisted_install</em></span></div>
-            <div class="call nxt"><span class="verb">POST</span><span class="path">nmstateconfigs/nmstate-config-&lt;server&gt; <em>· 802.3ad bond + tagged VLAN</em></span></div>
+            <div class="call nxt"><span class="verb">POST</span><span class="path">nmstateconfigs/&lt;server&gt; <em>· 802.3ad bond + tagged VLAN</em></span></div>
           </div>
-          <p class="note">Resource names are byte-identical to the operator&rsquo;s, so a cluster already
+          <p class="note">The NMStateConfig is named after its server, like the BareMetalHost (since
+          2026-11-25). Until then it was <code>nmstate-config-&lt;server&gt;</code>, and a host installed
+          then keeps that object: nothing renames it. One still under the old name that matches the
+          install is success and is left where it is; one that differs is replaced, under the
+          server&rsquo;s own name; a server never ends with two.</p>
+          <p class="note">The Secret&rsquo;s and the BareMetalHost&rsquo;s names are byte-identical to the
+          operator&rsquo;s, so a cluster already
           holding resources bmhgen created is <em>converged</em> rather than duplicated. The one
           difference: names are lowercased, because server-scan names carry an uppercase vendor serial
           (<code>…-HP0001592</code>) and Kubernetes rejects any uppercase letter in a resource name

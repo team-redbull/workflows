@@ -607,7 +607,8 @@ async def start_remove_server_from_mce(
     """Take one server out of an MCE's inventory — returns immediately (202).
 
     Deletes the server's Agent, its BareMetalHost (`<server>`) and its
-    NMStateConfig (`nmstate-config-<server>`) after powering the host off.
+    NMStateConfig (`<server>`, or `nmstate-config-<server>` from before
+    2026-11-25) after powering the host off.
     Only for a server that is just inventory: if its Agent is bound to a
     cluster the run FAILS having changed nothing (`AgentBoundToClusterError`).
     A server with nothing on the MCE completes as a no-op (`found: false`).

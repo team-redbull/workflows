@@ -161,7 +161,8 @@ class TestNMStateConfig:
 
     def test_is_named_and_labelled_as_the_operator_did(self) -> None:
         nmstate = build_nmstate_config(_request())
-        assert nmstate["metadata"]["name"] == f"nmstate-config-{SERVER_K8S}"
+        # The server's own name since 2026-11-25; `nmstate-config-<server>` before.
+        assert nmstate["metadata"]["name"] == SERVER_K8S
         assert nmstate["metadata"]["labels"][INFRAENV_LABEL] == INFRA_ENV
 
     def test_a_non_lacp_mode_omits_lacp_rate(self) -> None:
@@ -318,7 +319,7 @@ class TestKubernetesNameCasing:
             "ocp-hp-gen11-nyc-64c-128gb-hp0001592"
         )
         assert build_nmstate_config(request)["metadata"]["name"] == (
-            "nmstate-config-ocp-hp-gen11-nyc-64c-128gb-hp0001592"
+            "ocp-hp-gen11-nyc-64c-128gb-hp0001592"
         )
 
     def test_the_hostname_annotation_is_lowercased_too(self) -> None:

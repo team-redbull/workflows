@@ -1,7 +1,8 @@
 """remove-server-from-mce — takes one server out of an MCE's inventory.
 
 The reverse of add-server-to-mce's end state: the BareMetalHost `<server>`, its
-NMStateConfig `nmstate-config-<server>` and the server's Agent are deleted, so
+NMStateConfig (`<server>`; `nmstate-config-<server>` for a host installed before
+2026-11-25) and the server's Agent are deleted, so
 the machine no longer sits in that MCE's InfraEnv. ONLY for a server that is
 just inventory: if its Agent is bound to a cluster, the run fails having
 changed nothing.

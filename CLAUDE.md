@@ -1331,6 +1331,21 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   (`lookup_install_candidate`) and sorted by `health_waiver.py`; every waiver lands in
   `allowed_unhealthy` (progress, result, each create's input). No patch gate: no recorded run
   carries the field.
+- **An NMStateConfig is named after its SERVER, like its BareMetalHost** (the operator,
+  2026-11-25: "just the server/vm name without nmstate-config prefix", bare metal and VM alike).
+  Until then it was bmhgen's `nmstate-config-<server>`, and a host installed then KEEPS that
+  object: nothing renames it. So `shared/bmc_address.nmstate_config_names` gives both, and the
+  limb reads and deletes under BOTH wherever it reads or deletes one (`inspect_inventory_host`,
+  `inspect_bound_host`, `delete_host_resources`, `teardown_bmh_resources`, the IPMI publish
+  wait, which waits on the NEWEST of two) and CREATES only the new name. A server never ends
+  with two (the same MACs twice in one InfraEnv): `create_nmstate_config` takes a matching
+  old-named one as "already there" and a differing one as `BmhConflictError`; the replace step
+  below leaves a matching one where it is, replaces a differing one under the server's own
+  name, and of two deletes the old-named one. Limb only — no workflow command changed, so no
+  patch. Known, accepted: during the limb's rolling update a create answered by a new pod,
+  lost, and retried on an old one can leave both names; the next replace step or removal
+  clears it. Delete `legacy_nmstate_config_name` and its reads once `oc get nmstateconfig -A`
+  shows no `nmstate-config-*` on any MCE.
 - **A conflicting NMStateConfig is REPLACED** (the operator, 2026-10-31: an install failed on an
   AlreadyExists NMStateConfig, and deleting it by hand was the only way on).
   `replace_conflicting_nmstate_config` runs once per candidate right after its lock and BEFORE

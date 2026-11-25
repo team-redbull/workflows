@@ -345,10 +345,14 @@ class TestPublishInfraEnvBoot:
             "ipxe_url": IPXE,
             "image_created_at": "2026-10-19T10:00:09Z",
         }
-        # The host's own NMStateConfig, by the name the create gave it.
-        nmstate_read = next(r for r in reads if r["plural"] == "nmstateconfigs")
-        assert nmstate_read["name"] == "nmstate-config-ocp-cisco-m6-bat-yam-64c-512gb-fch0001"
-        assert nmstate_read["namespace"] == REQUEST.namespace
+        # The host's own NMStateConfig: under the server's name, and under the
+        # name a limb from before 2026-11-25 created it with.
+        nmstate_reads = [r for r in reads if r["plural"] == "nmstateconfigs"]
+        assert [r["name"] for r in nmstate_reads] == [
+            "ocp-cisco-m6-bat-yam-64c-512gb-fch0001",
+            "nmstate-config-ocp-cisco-m6-bat-yam-64c-512gb-fch0001",
+        ]
+        assert {r["namespace"] for r in nmstate_reads} == {REQUEST.namespace}
 
     @respx.mock
     async def test_an_image_from_before_the_nmstateconfig_is_not_published(self, cluster):
@@ -377,6 +381,30 @@ class TestPublishInfraEnvBoot:
 
         assert state.published is False
         assert "failed to validate nmstate" in (state.detail or "")
+        assert not route.called
+
+    @respx.mock
+    async def test_of_two_nmstateconfigs_the_image_must_postdate_the_newest(self, monkeypatch):
+        """One under each name (a create from before the rename, then one after):
+        an image generated between the two does not include the second."""
+        server = BOOT_REQUEST.server_name.lower()
+        by_name = {
+            server: {"metadata": {"name": server, "creationTimestamp": "2026-10-19T10:00:20Z"}},
+            f"nmstate-config-{server}": _nmstate(),
+        }
+
+        async def _read(**kwargs):
+            if kwargs["plural"] == "infraenvs":
+                return _image()
+            return by_name.get(kwargs["name"])
+
+        monkeypatch.setattr(cluster_api, "read_custom_object", _read)
+        route = respx.put(url__startswith=PXE)
+
+        state = await activities.publish_infra_env_boot(BOOT_REQUEST)
+
+        assert state.published is False
+        assert "before the NMStateConfig was created" in (state.detail or "")
         assert not route.called
 
     @respx.mock

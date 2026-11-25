@@ -283,7 +283,10 @@ const FLOWS = {
     phases: {
       "pending": ["Starting", ""],
       "resolving-vlan": ["Reading the inventory VLAN", "The VLAN is the MCE's: it comes from the MCE's inventory segment in the Segments Manager, never from the caller."],
-      "validating-infraenv": ["Checking the InfraEnv", "The InfraEnv must exist on the MCE before any server is drawn."],
+      "validating-infraenv": ["Checking the InfraEnv", "The InfraEnv must exist on the MCE before any server is drawn. Its labels say what fills it: servers from server-scan, or (size kv…) a VM the run has made."],
+      "checking-kubevirt-bmc": ["Checking the worker can reach a VM", "A VM InfraEnv: this MCE's worker must know the kubevirt-redfish host and user of a KV cluster. Asked before any VM is made."],
+      "creating-vm": ["Having a VM made", "create-vm, as this run's child, makes one Halted VM on a KV cluster of the InfraEnv's zone. No server-scan: the VM is this run's."],
+      "deleting-vm": ["Deleting the VM", "The run did not end with an Agent: once its host is out of the MCE, its VM is deleted on its KV cluster."],
       "acquiring-server": ["Allocating a server", "server-scan picks ONE healthy, unclaimed server listed under the InfraEnv's name (or the one named), locks it for this run and live-checks it before handing it over."],
       "selecting-server": ["Checking the server", "A usable name, a known BMC and no BareMetalHost already; its two bond NICs are taken as server-scan checked them. If not, its lock goes back and the run fails, saying why."],
       "reserving-server": ["Locking the server", "Only for a named server the allocation refused that the run takes anyway — its own leftover lock: server-scan's install lock, taken before anything is written."],
@@ -301,6 +304,7 @@ const FLOWS = {
       "holding-server": ["Holding the lock a day", "So no other MCE draws the machine before a cluster reports it."],
       "awaiting-server-scan": ["Waiting for server-scan", "Installed. Reads server-scan every 5 min (up to a day) until it shows the server INSTALLED_TO_INVENTORY or INSTALLED; not seen by then, the lock is left to expire and the run still completes."],
       "releasing-lock": ["Releasing the lock", "server-scan now shows the server installed and hides it from every draw itself, so the lock goes back."],
+      "cancel-stopping-create-vm": ["Cancelled: stopping create-vm", "The child is cancelled and removes its own VM; if it had just completed, its VM is deleted by this run."],
       "cancel-settling": ["Cancelled: letting a last call land", "Waits 2 min so a create, lock or PXE mapping already sent cannot reappear after the cleanup."],
       "cancel-removing-server": ["Cancelled: removing the server", "remove-server-from-mce takes it out of the MCE: powered off, BareMetalHost, NMStateConfig and any Agent deleted, its PXE MACs cleared, the lock released."],
       "cancel-releasing-lock": ["Cancelled: releasing the lock", "Nothing of it on the MCE: its PXE mapping (IPMI) and its install lock go back."],
@@ -311,6 +315,7 @@ const FLOWS = {
       ["Inventory VLAN", ["resolving-vlan"]],
       ["InfraEnv on the MCE", ["validating-infraenv"]],
       ["Allocate a server (server-scan locks it)", ["acquiring-server"]],
+      ["A VM instead (KubeVirt InfraEnv)", ["checking-kubevirt-bmc", "creating-vm", "deleting-vm"]],
       ["Check the server", ["selecting-server", "rolling-back", "unregistering-pxe-boot", "setting-maintenance", "releasing-server"]],
       ["Lock it in server-scan", ["reserving-server"]],
       ["Existing NMStateConfig", ["checking-nmstateconfig"]],
@@ -319,7 +324,7 @@ const FLOWS = {
       ["Agent registers", ["awaiting-agent"]],
       ["Hold the lock a day", ["holding-server"]],
       ["Release it once server-scan sees it", ["awaiting-server-scan", "releasing-lock"]],
-      ["Rolled back on cancel", ["cancel-settling", "cancel-removing-server", "cancel-releasing-lock", "cancelled"]],
+      ["Rolled back on cancel", ["cancel-stopping-create-vm", "cancel-settling", "cancel-removing-server", "cancel-releasing-lock", "cancelled"]],
     ],
   },
   remove: {
@@ -502,8 +507,8 @@ function mceOf(v) {
 // add-server-to-mce's `progress.server_name` is the server being installed: set once it is locked
 // and about to be created, and kept while the run rolls it back (a run started before
 // 2026-11-17 then checks its next candidate). What it means therefore depends on the phase.
-const INSTALLING = ["checking-nmstateconfig", "creating-nmstateconfig", "publishing-pxe-boot", "creating-secret", "creating-baremetalhost", "awaiting-agent", "holding-server", "completed"];
-const ROLLING_BACK = ["rolling-back", "unregistering-pxe-boot", "setting-maintenance", "releasing-server"];
+const INSTALLING = ["creating-vm", "checking-nmstateconfig", "creating-nmstateconfig", "publishing-pxe-boot", "creating-secret", "creating-baremetalhost", "awaiting-agent", "holding-server", "completed"];
+const ROLLING_BACK = ["rolling-back", "deleting-vm", "unregistering-pxe-boot", "setting-maintenance", "releasing-server"];
 function serverRole(v) {
   const phase = v.p && v.p.phase;
   if (!isFailed(v) && INSTALLING.includes(phase)) return "Installing";
@@ -824,7 +829,7 @@ function renderFacts(v) {
   if (v.flow === FLOWS.install) {
     if (r) {
       return kv([
-        ["Server", `${code(r.server_name)} <span style="color:var(--muted)">${esc(r.server_id)}</span>`, true],
+        ["Server", `${code(r.server_name)}${r.server_id ? ` <span style="color:var(--muted)">${esc(r.server_id)}</span>` : ""}`, true],
         ["BMC", `${esc(r.bmc_vendor)} ${code(r.bmc_address)}`, true],
         ["Boots from", r.pxe_registered ? "the network: its site's PXE VM" : "virtual media"],
         ["Boot MAC", code(r.boot_mac), true],
@@ -833,7 +838,10 @@ function renderFacts(v) {
         ["BareMetalHost", r.bmh_registered ? "registered (its Agent proves it)" : "not registered"],
         ["Resources", r.resources_changed ? "created by this run" : "already there; nothing written"],
         ["Agent", r.agent_name ? code(r.agent_name) : "not named", true],
-        ["Lock", r.reservation_expires_at ? `held until ${clock(r.reservation_expires_at)}` : "no expiry recorded"],
+        r.kv_cluster ? ["VM on KV cluster", code(r.kv_cluster), true] : null,
+        r.kv_cluster ? ["Made by", `${code(r.create_vm_workflow_id)} <span style="color:var(--muted)">run ${esc(r.create_vm_run_id)}</span>`, true] : null,
+        r.kv_cluster ? ["Lock", "none: a VM is made for the run, not drawn from server-scan"]
+          : ["Lock", r.reservation_expires_at ? `held until ${clock(r.reservation_expires_at)}` : "no expiry recorded"],
         ["Attempts", r.attempts],
       ]);
     }
@@ -841,6 +849,9 @@ function renderFacts(v) {
       [p.server_name ? serverRole(v) : "Server", p.server_name ? code(p.server_name) : isFailed(v) ? "none attempted" : "none attempted yet", true],
       ["InfraEnv", v.ids.infraEnv],
       ["Worker queue", p.activity_queue ? code(p.activity_queue) : null, true],
+      ["create-vm", p.create_vm_workflow_id ? code(p.create_vm_workflow_id) : null, true],
+      ["VM on KV cluster", p.kv_cluster ? code(p.kv_cluster) : null, true],
+      ["Its VM", p.vm_rollback || null],
     ], "The BMC, bond, VLAN, Agent and lock are reported in the result, when the run succeeds.");
   }
   if (v.flow === FLOWS.remove) {

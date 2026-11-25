@@ -9,6 +9,7 @@ from __future__ import annotations
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from shared.bmc_address import kubevirt_bmc_host_template_problem
 from shared.cluster_names import canonical_mce_cluster
 
 
@@ -75,6 +76,35 @@ class ServerLifecycleActivitySettings(BaseSettings):
     cisco_bmc_password: str = ""
     intersight_bmc_username: str = ""
     intersight_bmc_password: str = ""
+
+    # --- VMs: a KubeVirt InfraEnv's hosts, behind kubevirt-redfish ------------
+    # add-server-to-mce has a VM made for an InfraEnv whose agentLabels say
+    # `redbull.io/size: kv<cpu>`, and its BareMetalHost drives the VM through
+    # the kubevirt-redfish of the KV cluster it landed on. That Route's host is
+    # ONE pattern in which only the KV cluster's name changes (the operator,
+    # 2026-11-25): `host[:port]`, no scheme, no path, naming {kv_cluster} — the
+    # cluster's day1 file name, `ocp4-prod-kv-five-az1-a` — e.g.
+    # `kubevirt-redfish-kubevirt-redfish.apps.{kv_cluster}.example.com`. The
+    # Redfish user is the same on every KV cluster.
+    #
+    # All three OPTIONAL (the day1 keys' reasoning, below): a worker without
+    # them serves every bare-metal install, and a VM install fails at its first
+    # step with KubevirtBmcNotConfiguredError, before any VM is made.
+    kubevirt_bmc_host_template: str = ""
+    kubevirt_bmc_username: str = ""
+    kubevirt_bmc_password: str = ""
+
+    @field_validator("kubevirt_bmc_host_template")
+    @classmethod
+    def _kubevirt_host_names_the_kv_cluster(cls, template: str) -> str:
+        """A typo (`{kv_clustr}`, a scheme, a path) fails at worker start, not mid-install."""
+        template = template.strip()
+        if not template:
+            return ""
+        problem = kubevirt_bmc_host_template_problem(template)
+        if problem is not None:
+            raise ValueError(f"kubevirt_bmc_host_template {template!r}: {problem}")
+        return template
 
     # --- PXE map: the network-boot path for IPMI servers --------------------
     # An IPMI BMC (a UCS-managed Cisco blade) has no virtual media, so the host

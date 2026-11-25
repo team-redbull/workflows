@@ -512,6 +512,25 @@ class InfraEnvState(BaseModel):
     agent_labels: dict[str, str] = Field(default_factory=dict)
 
 
+class KubevirtBmcConfigRequest(BaseModel):
+    """read_kubevirt_bmc_config: which install asks — carried for the worker's log and its refusal."""
+
+    infra_env: str = Field(min_length=1)
+    namespace: str = Field(min_length=1)
+
+
+class KubevirtBmcConfig(BaseModel):
+    """How this MCE's worker reaches a VM's BMC: the kubevirt-redfish host of a KV cluster.
+
+    `host_template` is `host[:port]` naming `{kv_cluster}` once
+    (shared/bmc_address.kubevirt_bmc_endpoint fills it). Not a secret — the
+    Redfish user and password stay in the worker's Secret and are only ever
+    confirmed to be set, never returned.
+    """
+
+    host_template: str = Field(min_length=1)
+
+
 class CreatedResource(BaseModel):
     """The outcome of one idempotent create.
 
@@ -887,7 +906,13 @@ class AddServerToMceProgress(_QuietDefaults):
     run that FAILS has no result to say it. Left out while empty.
     """
 
-    _quiet_defaults: ClassVar[tuple[str, ...]] = ("allowed_unhealthy",)
+    _quiet_defaults: ClassVar[tuple[str, ...]] = (
+        "allowed_unhealthy",
+        "kv_cluster",
+        "create_vm_workflow_id",
+        "create_vm_run_id",
+        "vm_rollback",
+    )
 
     phase: str
     server_name: str | None = None
@@ -896,6 +921,16 @@ class AddServerToMceProgress(_QuietDefaults):
     # A CANCELLED run has no result: what its rollback did (or could not) is
     # here, from phase `cancelled` on. None until the run is cancelled.
     cancel_rollback: str | None = None
+    # A KubeVirt InfraEnv's run only (left out otherwise): the create-vm child
+    # that makes its VM and that child's run id — the VM's
+    # `redbull.io/created-by` label — from the moment it starts; the KV cluster
+    # once the VM is there; and, for a run that FAILED after its VM existed,
+    # what was undone (the VM deleted, or kept and why). A failed run has no
+    # result, so this is where a VM left behind is named.
+    kv_cluster: str | None = None
+    create_vm_workflow_id: str | None = None
+    create_vm_run_id: str | None = None
+    vm_rollback: str | None = None
 
 
 class AddServerToMceResult(_QuietDefaults):
@@ -906,9 +941,17 @@ class AddServerToMceResult(_QuietDefaults):
     written this time.
     """
 
-    _quiet_defaults: ClassVar[tuple[str, ...]] = ("allowed_unhealthy",)
+    _quiet_defaults: ClassVar[tuple[str, ...]] = (
+        "allowed_unhealthy",
+        "kv_cluster",
+        "create_vm_workflow_id",
+        "create_vm_run_id",
+        "stray_cleanups",
+    )
 
-    server_id: str
+    # server-scan's id of the server. None for a VM the run had made (a KubeVirt
+    # InfraEnv): server-scan allocated nothing, and lists the VM only later.
+    server_id: str | None = None
     server_name: str
     infra_env: str
     namespace: str
@@ -952,6 +995,15 @@ class AddServerToMceResult(_QuietDefaults):
     lock_released: bool | None = None
     server_scan_state: str | None = None
     lock_detail: str | None = None
+    # A KubeVirt InfraEnv's run only (left out otherwise): the KV cluster the
+    # VM is on, the create-vm child that made it and that child's run id — the
+    # VM's `redbull.io/created-by` label, which is what finds and deletes it
+    # later — and the child's own delete-stray-vm cleanups, if a KV cluster it
+    # moved on from could not say whether a VM had landed there.
+    kv_cluster: str | None = None
+    create_vm_workflow_id: str | None = None
+    create_vm_run_id: str | None = None
+    stray_cleanups: list[str] = Field(default_factory=list)
 
 
 # --- uninstall-server-from-hc ---------------------------------------------------------

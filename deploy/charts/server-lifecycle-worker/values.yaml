@@ -54,6 +54,23 @@ pxeMap:
   urls: {}
   #  bat-yam: http://pxe-vm.bat-yam.example:8080
 
+# VMs: for an InfraEnv whose agentLabels say `redbull.io/size: kv<cpu>`,
+# add-server-to-mce has ONE VM made (create-vm) and installs exactly that one,
+# with no draw from server-scan. Its BareMetalHost drives the VM through the
+# kubevirt-redfish of the KV cluster the VM landed on. That Route's host is ONE
+# pattern in which only the KV cluster's name changes: host[:port] — no scheme,
+# no path — naming {kv_cluster}, the cluster's day1 file name
+# (ocp4-prod-kv-five-az1-a). The Redfish system is /redfish/v1/Systems/<vm name>
+# (kubevirt-redfish's `systemIdConvention: legacy`).
+#
+# OPTIONAL, with the credentials KUBEVIRT_BMC_USERNAME / KUBEVIRT_BMC_PASSWORD
+# (the Redfish user, the same on every KV cluster): without all three, every
+# bare-metal install works and a VM install fails at its first step
+# (KubevirtBmcNotConfiguredError), before any VM is made.
+kubevirt:
+  bmcHostTemplate: ""
+  #  kubevirt-redfish-kubevirt-redfish.apps.{kv_cluster}.example.com
+
 # update-nodepool reads the cluster's day1 file and commits its NodePools'
 # replicas to day1 `main` through this worker. OPTIONAL: with no repoUrl or no
 # token, update-nodepool fails at once on this MCE (Day1NotConfiguredError) and
@@ -77,8 +94,9 @@ argo:
   valuesRef: values
 
 # Secret keys the worker reads: SERVER_SCAN_API_TOKEN (ADMIN role),
-# <VENDOR>_BMC_USERNAME / <VENDOR>_BMC_PASSWORD for HP, DELL, CISCO, INTERSIGHT,
-# PXE_MAP_TOKEN, and DAY1_GIT_TOKEN unless day1.tokenSecret names another.
+# <VENDOR>_BMC_USERNAME / <VENDOR>_BMC_PASSWORD for HP, DELL, CISCO, INTERSIGHT
+# and KUBEVIRT (the kubevirt-redfish user of the KV clusters, see `kubevirt`
+# above), PXE_MAP_TOKEN, and DAY1_GIT_TOKEN unless day1.tokenSecret names another.
 #
 # With Argo CD keep credentials OUT of git: set existingSecret to a Secret made
 # by Sealed Secrets / External Secrets / Vault in the same namespace. `create`
@@ -90,6 +108,8 @@ credentials:
   #  SERVER_SCAN_API_TOKEN: ""
   #  CISCO_BMC_USERNAME: ""
   #  CISCO_BMC_PASSWORD: ""
+  #  KUBEVIRT_BMC_USERNAME: ""
+  #  KUBEVIRT_BMC_PASSWORD: ""
   #  PXE_MAP_TOKEN: ""
 
 # Namespaces on THIS cluster where the worker may create install resources —

@@ -87,6 +87,7 @@ from activities.server_lifecycle.activities import (
     set_host_online,
     teardown_bmh_resources,
     unmark_machines,
+    read_kubevirt_bmc_config,
     unregister_pxe_boot,
     watch_marked_machines,
 )
@@ -117,6 +118,7 @@ async def main() -> None:
             lookup_install_candidate,
             register_pxe_boot,
             publish_infra_env_boot,
+            read_kubevirt_bmc_config,
             unregister_pxe_boot,
             create_bmc_secret,
             create_baremetal_host,

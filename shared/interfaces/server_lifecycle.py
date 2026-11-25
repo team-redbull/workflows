@@ -54,6 +54,8 @@ from shared.models.server_lifecycle import (
     InfraEnvBootState,
     InfraEnvRef,
     InfraEnvState,
+    KubevirtBmcConfig,
+    KubevirtBmcConfigRequest,
     InstallCandidateRecord,
     InventoryHostState,
     MachineDeletion,
@@ -336,6 +338,25 @@ async def check_infra_env(ref: InfraEnvRef) -> InfraEnvState:
     Raises InfraEnvNotFoundError (non-retryable) when it is absent, and the
     cluster read's BmhPrerequisiteMissingError (403: no `get` on infraenvs;
     404 of the type: the Assisted Installer is not installed on this MCE).
+    """
+    ...
+
+
+@activity.defn
+async def read_kubevirt_bmc_config(request: KubevirtBmcConfigRequest) -> KubevirtBmcConfig:
+    """How THIS MCE's worker reaches a VM's BMC — asked before add-server-to-mce has a VM made.
+
+    A VM is driven through its KV cluster's kubevirt-redfish. Returns the host
+    pattern (KUBEVIRT_BMC_HOST_TEMPLATE, naming `{kv_cluster}`), which the
+    workflow fills with the KV cluster create-vm chose; confirms the Redfish
+    user and password are set (create_bmc_secret reads them later) without
+    returning either. Reads settings only: nothing is called, nothing written.
+
+    Asked FIRST on purpose: a worker not configured for VMs, and a worker from
+    before this activity existed (which Temporal retries until the new one
+    polls), both stop the run while there is still no VM to remove.
+
+    Raises KubevirtBmcNotConfiguredError (non-retryable), naming each missing key.
     """
     ...
 

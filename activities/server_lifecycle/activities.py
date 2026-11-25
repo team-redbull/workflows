@@ -78,12 +78,13 @@ from activities.server_lifecycle.server_scan import fetch_available_servers
 # update-nodepool's day1 reader and replicas editor: the cluster-upgrade hub limb's
 # technology module, called with this limb's own DAY1_* settings.
 from activities.upgrade_gitops import day1_repo
-from shared.bmc_address import k8s_resource_name, nmstate_config_names
+from shared.bmc_address import KUBEVIRT_BMC_VENDOR, k8s_resource_name, nmstate_config_names
 from shared.exceptions import (
     AgentBindingChangedError,
     AgentBoundToClusterError,
     BmcCredentialsMissingError,
     BmhConflictError,
+    KubevirtBmcNotConfiguredError,
     BmhResourceError,
     BmhTeardownError,
     Day1ChangeRejectedError,
@@ -138,6 +139,8 @@ from shared.models.server_lifecycle import (
     InfraEnvBootState,
     InfraEnvRef,
     InfraEnvState,
+    KubevirtBmcConfig,
+    KubevirtBmcConfigRequest,
     InstallCandidateRecord,
     InventoryHostState,
     MachineDeletion,
@@ -196,6 +199,11 @@ def _bmc_credentials(bmc_vendor: str) -> tuple[str, str]:
         "INTERSIGHT": (
             _settings.intersight_bmc_username,
             _settings.intersight_bmc_password,
+        ),
+        # A VM on a KV cluster: its kubevirt-redfish user, the same on every one.
+        KUBEVIRT_BMC_VENDOR: (
+            _settings.kubevirt_bmc_username,
+            _settings.kubevirt_bmc_password,
         ),
     }
     username, password = credentials.get(bmc_vendor.upper(), ("", ""))
@@ -657,6 +665,35 @@ async def check_infra_env(ref: InfraEnvRef) -> InfraEnvState:
         cluster_ref=cluster_ref,
         agent_labels=agent_labels,
     )
+
+
+@activity.defn
+async def read_kubevirt_bmc_config(request: KubevirtBmcConfigRequest) -> KubevirtBmcConfig:
+    """How this worker reaches a VM's BMC; refuses before any VM is made when it cannot."""
+    missing = [
+        key
+        for key, value in (
+            ("KUBEVIRT_BMC_HOST_TEMPLATE", _settings.kubevirt_bmc_host_template),
+            ("KUBEVIRT_BMC_USERNAME", _settings.kubevirt_bmc_username),
+            ("KUBEVIRT_BMC_PASSWORD", _settings.kubevirt_bmc_password),
+        )
+        if not value
+    ]
+    if missing:
+        raise KubevirtBmcNotConfiguredError(
+            f"InfraEnv {request.namespace}/{request.infra_env} is filled with VMs, and this "
+            f"MCE's server-lifecycle-worker ({_settings.mce_cluster}) is not configured to "
+            f"reach a VM's BMC: {', '.join(missing)} not set. Set them in its chart "
+            "(the kubevirt-redfish host of a KV cluster, naming {kv_cluster}, and the "
+            "Redfish user); no VM was created"
+        )
+    activity.logger.info(
+        "VMs for InfraEnv %s/%s are reached at %s",
+        request.namespace,
+        request.infra_env,
+        _settings.kubevirt_bmc_host_template,
+    )
+    return KubevirtBmcConfig(host_template=_settings.kubevirt_bmc_host_template)
 
 
 @activity.defn

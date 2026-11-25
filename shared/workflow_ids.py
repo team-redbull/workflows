@@ -308,6 +308,22 @@ def create_vm_slot_workflow_id(mce_cluster: str, infra_env: str, slot: int) -> s
     return f"create-vm-{mce_cluster}_{infra_env}_{slot}"
 
 
+def create_vm_child_workflow_id(parent_workflow_id: str) -> str:
+    """`create-vm-for-<parent workflow id>`: the create-vm an add-server-to-mce run starts as its child.
+
+    Derived from the parent, not a slot of its own: the parent IS already one
+    slot of the InfraEnv on its MCE (`add-server-to-mce-<mce>_<infraEnv>_<slot>`),
+    and a second walk for a free create-vm slot would compete with the runs
+    create-vm's own route starts. It can never equal one of those
+    (`create-vm-<mce>_…`: a canonical MCE starts `ocp4-`, never `for-`).
+
+    Reused when the parent's id is: one already RUNNING there is the child of an
+    earlier run that was terminated (CreateVmAlreadyRunningError). Like every
+    create-vm id it never identifies a VM — the VM carries the child's RUN id.
+    """
+    return f"create-vm-for-{parent_workflow_id}"
+
+
 def delete_stray_vm_workflow_id(kv_cluster: str, run_id: str) -> str:
     """`delete-stray-vm-<kv cluster>-<create-vm run id>`: the cleanup of ONE run on ONE cluster.
 

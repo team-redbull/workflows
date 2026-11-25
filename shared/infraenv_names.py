@@ -19,9 +19,11 @@ in it are, how big, and in which zone:
 The SITE is not in the name: an InfraEnv belongs to one MCE, and so to that
 MCE's site (`shared/cluster_names.site_of_mce_cluster`).
 
-A VM of a KubeVirt InfraEnv is `ocp-<flavor>-kv<cpu>-<site>-<its MAC, 12 hex>`
-(`ocp-c200-kv32-five-0e03f2a1b2c3`): the full MAC makes the name unique
-wherever the MAC is, and the zone is NOT in it (a label carries it).
+A VM of a KubeVirt InfraEnv is `ocp-<flavor>-kv<cpu>-<site>-<serial>`
+(`ocp-c200-kv32-five-k7q2m9xd`): 8 random letters and digits drawn by the
+worker inside the KV cluster, also the VM's SMBIOS serial (vm_name, below; the
+convention still says the VM's full MAC, a divergence reported to its owner),
+and the zone is NOT in it (a label carries it).
 
 This replaced `<conf>[-<opt>]-zone-<zone>-<cpu>` / `…-metal` and the
 `ocp-<infraenv>-<6 hex>` VM name on 2026-11-20 (no VM of that shape was ever
@@ -32,7 +34,9 @@ convention left draft.
 Lives in `shared/` because both sides apply the rule: the API edge derives
 the flavor, zone and VM size from the name (and the site from the MCE's) (the run carries them, never
 re-deriving on replay — the provision-dell-server region precedent), and the
-worker inside the KV cluster names the VM. No I/O, no third-party import.
+worker inside the KV cluster names the VM. add-server-to-mce applies the same
+rules to an InfraEnv's LABELS, one part at a time (`size_kind` and the
+`*_problem` checks below). No I/O, no third-party import.
 """
 
 from __future__ import annotations
@@ -65,6 +69,8 @@ _MIN_NAMED_CPU = 1
 _SITE = r"[a-z0-9]+(?:-[a-z0-9]+)*"
 _INFRAENV = re.compile(r"^(?P<flavor>[a-z][0-9a-z]*)-(?P<size>mtl|kv[1-9][0-9]*)-(?P<zone>az[1-9][0-9]*)$")
 _FLAVOR = re.compile(r"^[a-z][0-9a-z]*$")
+_KUBEVIRT_SIZE = re.compile(r"^kv(?P<cpu>[1-9][0-9]*)$")
+_ZONE = re.compile(r"^az[1-9][0-9]*$")
 _SITE_TOKEN = re.compile(rf"^{_SITE}$")
 # A VirtualMachine's name is a DNS-1123 label: the VM, its DataVolume
 # (`<name>-root`) and its launcher pod's prefix all need one.
@@ -117,16 +123,85 @@ def parse_infraenv(name: str) -> ParsedInfraEnv:
     if size == BARE_METAL_SIZE:
         return ParsedInfraEnv(name=name, kind=InfraEnvKind.METAL, flavor=flavor, zone=zone, cpu=None, memory_gib=None)
     cpu = int(size.removeprefix(KUBEVIRT_SIZE_PREFIX))
-    if not MIN_CPU <= cpu <= MAX_CPU:
-        raise InfraEnvNameError(f"InfraEnv {name!r} asks for {cpu} vCPUs; a KubeVirt InfraEnv has {MIN_CPU}..{MAX_CPU}")
-    if cpu % MEMORY_GIB_PER_CPU[1]:
-        raise InfraEnvNameError(
-            f"InfraEnv {name!r} asks for {cpu} vCPUs, an odd number: a VM's memory is 7.5 GiB per vCPU, which "
-            f"would not be a whole number of GiB. Use an even size (`kv{cpu + 1}`)"
-        )
+    problem = _vm_cpu_problem(cpu)
+    if problem is not None:
+        raise InfraEnvNameError(f"InfraEnv {name!r} asks for {problem}")
     return ParsedInfraEnv(
         name=name, kind=InfraEnvKind.KUBEVIRT, flavor=flavor, zone=zone, cpu=cpu, memory_gib=vm_memory_gib(cpu),
     )
+
+
+def _vm_cpu_problem(cpu: int) -> str | None:
+    """Why a KubeVirt InfraEnv cannot be of `cpu` vCPUs, worded to follow "… asks for "; None when it can."""
+    if not MIN_CPU <= cpu <= MAX_CPU:
+        return f"{cpu} vCPUs; a KubeVirt InfraEnv has {MIN_CPU}..{MAX_CPU}"
+    if cpu % MEMORY_GIB_PER_CPU[1]:
+        return (
+            f"{cpu} vCPUs, an odd number: a VM's memory is 7.5 GiB per vCPU, which "
+            f"would not be a whole number of GiB. Use an even size (`kv{cpu + 1}`)"
+        )
+    return None
+
+
+# --- the same rules, ONE PART AT A TIME ----------------------------------------------
+#
+# An InfraEnv states each part of its name again as a label its Agents receive
+# (`redbull.io/flavor`, `redbull.io/size`, `topology.kubernetes.io/zone`; the
+# convention's §4.a). add-server-to-mce reads the LABELS — the InfraEnv's own name
+# need not follow the convention — and judges each with the rule the name's
+# parser applies to that part. A problem is returned, never raised: workflow code
+# calls these, and an exception there hangs the run instead of failing it.
+
+
+def size_kind(size: str) -> InfraEnvKind:
+    """What a `redbull.io/size` value says its hosts ARE: `kv…` is KubeVirt, anything else bare metal.
+
+    THE marker of a VM InfraEnv (the operator, 2026-11-25: the size label "gives
+    the answer"; a second, kind label would state the same fact twice). By the
+    PREFIX, not the whole grammar: a mistyped VM size (`kv7`, `kvx`) is still a
+    VM InfraEnv, whose size is then refused by kubevirt_size_problem — never a
+    bare-metal pool that happens to be empty.
+    """
+    return InfraEnvKind.KUBEVIRT if size.startswith(KUBEVIRT_SIZE_PREFIX) else InfraEnvKind.METAL
+
+
+def kubevirt_size_problem(size: str) -> str | None:
+    """Why `size` is not a KubeVirt size a VM can be made of (`kv<even 2..256>`); None when it is."""
+    match = _KUBEVIRT_SIZE.fullmatch(size)
+    if match is None:
+        return f"{size!r} is not `kv<cpu>`, the vCPU count of its VMs (`kv32`)"
+    problem = _vm_cpu_problem(int(match.group("cpu")))
+    return None if problem is None else f"{size!r} asks for {problem}"
+
+
+def kubevirt_size_cpu(size: str) -> int:
+    """The vCPUs of a size kubevirt_size_problem passed: `kv32` -> 32."""
+    return int(size.removeprefix(KUBEVIRT_SIZE_PREFIX))
+
+
+def flavor_problem(flavor: str) -> str | None:
+    """Why `flavor` is not a flavor (a letter, then letters and digits: `c200`, `c200n`); None when it is."""
+    if _FLAVOR.fullmatch(flavor):
+        return None
+    return f"{flavor!r} is not a letter followed by lowercase letters and digits (`c200`)"
+
+
+def zone_problem(zone: str) -> str | None:
+    """Why `zone` is not an availability zone (`az<N>`); None when it is."""
+    return None if _ZONE.fullmatch(zone) else f"{zone!r} is not `az<N>` (`az1`)"
+
+
+def vm_name_problem(flavor: str, cpu: int, site: str) -> str | None:
+    """Why no VM of this flavor, size and site can be named (too long, a part out of shape); None when one can.
+
+    The name the KV cluster's worker will build, with a stand-in serial: checked
+    before any VM is made, where it can still be said rather than fail.
+    """
+    try:
+        vm_name(flavor, cpu, site, "0" * VM_SERIAL_LENGTH)
+    except InfraEnvNameError as err:
+        return str(err)
+    return None
 
 
 def vm_memory_gib(cpu: int) -> int:

@@ -5,8 +5,12 @@ An InfraEnv `<flavor>-kv<cpu>-<zone>` (its site is its MCE's) holds VMs of `<cpu
 `<cpu> × 7.5` GiB. A bare-metal InfraEnv has servers to draw; a KubeVirt one
 has nothing until a VM exists. This run creates it: once it is Halted and
 labelled `redfish-enabled: "true"`, kubevirt-redfish exposes it as a Redfish
-system and server-scan lists it under its name, `ocp-<flavor>-kv<cpu>-<site>-<serial>`
+system under its name, `ocp-<flavor>-kv<cpu>-<site>-<serial>`
 (8 random letters and digits, also its SMBIOS serial; its MAC is KubeMacPool's).
+add-server-to-mce runs this workflow as its CHILD for a KubeVirt InfraEnv
+(2026-11-25) and installs exactly the VM it made — from this run's result (the
+name, the MAC, the KV cluster) and its RUN ID, which is the VM's label. Started
+from its own route, nothing installs the VM.
 
 THE ZONE'S CLUSTERS COME FROM DAY1, THEIR NUMBERS FROM THE CLUSTERS THEMSELVES,
 ONLY ONE RUN AT A TIME CHOOSES IN A ZONE, AND THE CHOSEN CLUSTER BUILDS THE VM

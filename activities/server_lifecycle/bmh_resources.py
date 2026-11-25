@@ -31,7 +31,7 @@ from shared.bmc_address import (
     k8s_resource_name,
     nmstate_config_name,
 )
-from shared.exceptions import InvalidMacError
+from shared.exceptions import InvalidHostNetworkError, InvalidMacError
 from shared.models.server_lifecycle import BmhResourceRequest, mac_is_valid
 
 BMH_GROUP = "metal3.io"
@@ -73,6 +73,8 @@ DETACHED_ANNOTATION = "baremetalhost.metal3.io/detached"
 BMH_DEPROVISION_FINALIZERS = frozenset({"baremetalhost.metal3.io"})
 
 _INFRAENV_LABEL = "infraenvs.agent-install.openshift.io"
+# A bare-metal server's bond: two members, on two physical ports.
+_BOND_MEMBERS = 2
 
 
 def _validate_macs(request: BmhResourceRequest) -> None:
@@ -186,13 +188,14 @@ def _bond_iface(request: BmhResourceRequest) -> dict[str, Any]:
     }
 
 
-def _vlan_iface(request: BmhResourceRequest) -> dict[str, Any]:
-    """The DHCP VLAN riding the bond — the only interface with an address."""
+def _vlan_iface(request: BmhResourceRequest, base: str | None = None) -> dict[str, Any]:
+    """The DHCP VLAN — the only interface with an address — riding `base`: the bond, or a lone NIC."""
+    base = base or request.bond_name
     return {
-        "name": f"{request.bond_name}.{request.vlan_id}",
+        "name": f"{base}.{request.vlan_id}",
         "type": "vlan",
         "state": "up",
-        "vlan": {"base-iface": request.bond_name, "id": request.vlan_id},
+        "vlan": {"base-iface": base, "id": request.vlan_id},
         "ipv4": {
             "enabled": True,
             "dhcp": True,
@@ -210,12 +213,27 @@ def build_nmstate_config(request: BmhResourceRequest) -> dict[str, Any]:
     `spec.interfaces` is the MAC -> logical-name binding the agent applies
     before `spec.config` is evaluated; `spec.config` then refers only to the
     logical names.
+
+    ONE member is a host with one NIC — a VirtualMachine (add-server-to-mce's
+    KubeVirt branch): no bond, the VLAN straight on the NIC. Two is the bond of
+    a bare-metal server. Any other count is refused (InvalidHostNetworkError):
+    nothing selects it, and a bond of one port or of three would be written
+    without anyone having decided it.
     """
     _validate_macs(request)
+    if len(request.bond_members) not in (1, _BOND_MEMBERS):
+        raise InvalidHostNetworkError(
+            f"{request.server_name}: an NMStateConfig is built for one NIC (a VM) or a bond "
+            f"of {_BOND_MEMBERS}; {len(request.bond_members)} interfaces were given"
+        )
     members = [
         _ethernet_iface(member.logical_name, member.mac)
         for member in request.bond_members
     ]
+    if len(members) == 1:
+        layout = [*members, _vlan_iface(request, base=request.bond_members[0].logical_name)]
+    else:
+        layout = [*members, _bond_iface(request), _vlan_iface(request)]
     return {
         "apiVersion": f"{NMSTATE_GROUP}/{NMSTATE_VERSION}",
         "kind": "NMStateConfig",
@@ -225,9 +243,7 @@ def build_nmstate_config(request: BmhResourceRequest) -> dict[str, Any]:
             "labels": {_INFRAENV_LABEL: request.infra_env},
         },
         "spec": {
-            "config": {
-                "interfaces": [*members, _bond_iface(request), _vlan_iface(request)]
-            },
+            "config": {"interfaces": layout},
             "interfaces": [
                 {"name": member.logical_name, "macAddress": member.mac}
                 for member in request.bond_members

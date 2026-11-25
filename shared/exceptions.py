@@ -416,6 +416,16 @@ class BmhRequestInvalidError(OrchestratorError):
     """
 
 
+class InvalidHostNetworkError(OrchestratorError):
+    """An NMStateConfig was asked for a number of NICs nothing selects. Deterministic.
+
+    The limb writes one of two layouts: ONE NIC with the VLAN on it (a
+    VirtualMachine) or a bond of TWO (a bare-metal server). The workflow sends
+    one or two members; any other count would be a bond nobody decided on, so
+    it is refused before anything is written. Non-retryable.
+    """
+
+
 class InvalidMacError(OrchestratorError):
     """A MAC selected for the bond is not a MAC.
 
@@ -549,6 +559,74 @@ class InfraEnvAgentLabelsError(OrchestratorError):
     site in its labels is in no InfraEnv's. A label missing, or not one
     lowercase word of letters and digits, fails the run before anything is
     allocated; the message names each. A named install needs none of them.
+    """
+
+
+class NamedServerOnKubevirtInfraEnvError(OrchestratorError):
+    """WORKFLOW-RAISED. add-server-to-mce was asked for a NAMED server on a KubeVirt InfraEnv.
+
+    An InfraEnv whose agentLabels say `redbull.io/size: kv<cpu>` is filled with
+    VirtualMachines the run makes itself (create-vm, as its child): there is no
+    server to name. Refused before anything is read from server-scan or made on a
+    KV cluster. Ask without `server_names` (a pool draw) to get a new VM; a VM
+    that already exists has no install path yet.
+    """
+
+
+class MceNameNotConventionalError(OrchestratorError):
+    """WORKFLOW-RAISED. The MCE's name does not say its site and lifecycle, which a VM needs.
+
+    add-server-to-mce makes a KubeVirt InfraEnv's VM on a KV cluster of the
+    MCE's own site and lifecycle, and both are read from the MCE's name,
+    `ocp4-<lifecycle>-mce-<site>-<id>` (the naming convention; create-vm's route
+    requires the same). An MCE named otherwise fails the run before any VM is
+    made. Bare-metal installs need no such name.
+    """
+
+
+class KubevirtBmcNotConfiguredError(OrchestratorError):
+    """This MCE's server-lifecycle-worker cannot reach a VM's BMC: it is not configured. Deterministic.
+
+    A VM is driven through its KV cluster's kubevirt-redfish, so the worker
+    needs that host's pattern (KUBEVIRT_BMC_HOST_TEMPLATE) and the Redfish
+    user (KUBEVIRT_BMC_USERNAME / KUBEVIRT_BMC_PASSWORD). All three are
+    optional, so a worker without them still serves every bare-metal
+    workflow; add-server-to-mce asks for them BEFORE it has a VM made, so
+    this fails the run with nothing created. Non-retryable: set them in the
+    chart, then run again. The message names each missing key.
+    """
+
+
+class CreateVmAlreadyRunningError(OrchestratorError):
+    """WORKFLOW-RAISED. add-server-to-mce's create-vm child is already running under its id.
+
+    The child's id is derived from the parent's (`create-vm-for-<parent id>`),
+    so one already running there belongs to an EARLIER run of the same id that
+    was terminated while its child went on. The message names the id: let it
+    finish (it is cancelled when its parent closes, and removes its own VM),
+    then run again. Nothing was made by this run.
+    """
+
+
+class CreateVmFailedError(OrchestratorError):
+    """WORKFLOW-RAISED. add-server-to-mce's create-vm child did not produce a VM.
+
+    The message carries the child's own failure type and message — no KV cluster
+    of the zone had room (NoKvClusterFitsError), the zone's lock was not had in
+    time, the root disk never bound — and its id; the child's history has the
+    table of clusters it judged. create-vm leaves no VM behind when it does not
+    complete, so there is nothing to undo, and nothing was written on the MCE.
+    """
+
+
+class VmNameClashError(OrchestratorError):
+    """WORKFLOW-RAISED. A BareMetalHost of the new VM's name is already on the MCE.
+
+    A VM's name is unique on its KV cluster by a check, and across a site's KV
+    clusters only by chance (8 random characters): this is that chance — or a
+    host left under the name by hand. The existing host is another machine's
+    and is left alone; the VM just made is deleted. Run again: the next VM
+    draws another name.
     """
 
 

@@ -388,8 +388,38 @@ helm upgrade --install server-lifecycle-worker deploy/charts/server-lifecycle-wo
 
 The credentials Secret must exist in that namespace first. Its keys:
 `SERVER_SCAN_API_TOKEN` (server-scan ADMIN role), `<VENDOR>_BMC_USERNAME` /
-`<VENDOR>_BMC_PASSWORD` for HP, DELL, CISCO, INTERSIGHT, `PXE_MAP_TOKEN`, and
-`DAY1_GIT_TOKEN` unless `day1.tokenSecret.name` names another Secret.
+`<VENDOR>_BMC_PASSWORD` for HP, DELL, CISCO, INTERSIGHT and KUBEVIRT,
+`PXE_MAP_TOKEN`, and `DAY1_GIT_TOKEN` unless `day1.tokenSecret.name` names
+another Secret.
+
+### VMs: a KubeVirt InfraEnv (optional)
+
+For an InfraEnv whose `spec.agentLabels` say `redbull.io/size: kv<cpu>`,
+add-server-to-mce draws nothing from server-scan: it has **one VM made**
+(create-vm, as its child, on a KV cluster of the InfraEnv's zone) and installs
+exactly that one. This worker then writes, for the VM:
+
+| object | name | what differs from a bare-metal host |
+| --- | --- | --- |
+| NMStateConfig | `<vm>` | ONE NIC, `enp1s0`, no bond; the VLAN (`enp1s0.<vlan>`, DHCP) straight on it. Created FIRST |
+| Secret | `kubevirt-cred-<vm>` | `KUBEVIRT_BMC_USERNAME` / `KUBEVIRT_BMC_PASSWORD` |
+| BareMetalHost | `<vm>` | `bmc.address: redfish-virtualmedia://<host>/redfish/v1/Systems/<vm>`, boot MAC = the VM's |
+
+`<host>` is `kubevirt.bmcHostTemplate` with `{kv_cluster}` replaced by the KV
+cluster the VM is on (its day1 file name): the kubevirt-redfish Route of that
+cluster. The pattern is `host[:port]` — no scheme, no path — and a value of
+another shape stops the worker at start. The system id is the VM's name:
+kubevirt-redfish must run `systemIdConvention: legacy` on every KV cluster.
+
+Nothing new in the RBAC (the same three resources) and nothing new on the
+network for this worker: it never calls Redfish itself. **Ironic on this MCE
+does**, so the MCE must reach each KV cluster's kubevirt-redfish Route, and
+kubevirt-redfish must reach this MCE's Ironic for the discovery ISO.
+
+The three values are **optional**: without them a VM install fails at its first
+step with `KubevirtBmcNotConfiguredError`, before any VM is made, and every
+other workflow is unaffected. Set the two credentials in the Secret before, or
+with, the image that reads them.
 
 ### update-nodepool: day1 and Argo CD (optional)
 

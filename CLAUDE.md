@@ -1421,15 +1421,23 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
     Found and fixed: the no-Agent failure used the bare-metal wording. What the lab needed that
     production does not: a node-local bridge NAD (the OVN layer2 overlay DROPS 802.1Q frames,
     so it cannot carry the tagged VLAN), a router pod for DHCP and NAT on VLAN 1010, the
-    CONVERGED flow ON (with it off, nothing on OpenShift 4.22 fills the host's
-    PreprovisioningImage — the image-customization controller leaves InfraEnv-labelled ones to
-    assisted-service, which does it only with the converged flow — and the BareMetalHost waits
-    in `preparing` for ever; the 2026-10-22 lab on 4.19 ran with it off), and the control-plane
+    CONVERGED flow ON (with it off, the host's PreprovisioningImage was never
+    filled and the BareMetalHost sat in `preparing`; the 2026-10-22 lab on 4.19 ran with it
+    off), and the control-plane
     host given `192.168.110.2` on the bridge's VLAN so Ironic reaches the agent in the VM.
-    Not settled there, because of the cluster: its single control-plane node's API answers
-    writes in 2–11 s, so CDI, the IPAM webhook's controller and assisted-service keep losing
-    their leases (VM disks and VM starts wait minutes); and one boot of five ended in a QEMU
-    segfault on that nested-virtualization node, the others ran.
+    The converged-flow point is an OBSERVATION on that cluster, made while assisted-service was
+    itself restarting; the controllers' filter was not read — confirm which flow each
+    production MCE runs before relying on either. Not settled there: its single control-plane
+    node's API answers writes in 2–11 s, so CDI, the IPAM webhook's controller and
+    assisted-service keep losing their leases (VM disks and VM starts wait minutes); and of
+    the TWO guests seen booting, one ran to its Agent and one ended in a QEMU segfault 70 s in
+    (no symbols in the core). Unexplained: the node is a nested-virtualization VM, but one in
+    two is no basis to call it the lab's — repeated boots of this VM spec on a bare-metal KV
+    node settle it. Also not proven there: an MCE and a KV cluster that are DIFFERENT clusters
+    (Ironic reaching the KV cluster's Route, its kubevirt-redfish fetching the ISO from the
+    MCE's Ironic), the production NAD and `redfish-enabled` label (the lab used its own of
+    each), a wrong Redfish password, the KV worker down during `deleting-vm`, and a
+    BareMetalHost that never finishes deleting (all three are in the workflow tests only).
   - **Not built, reported**: a VM made by create-vm's own route has no install path; the pool
     draw refuses a multi-word site (`bat-yam`) where this branch, on the convention's parsers,
     accepts one; destroying an installed VM later (the convention's §5, the Inventory

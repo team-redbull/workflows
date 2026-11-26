@@ -577,6 +577,7 @@
           <tr><td class="k">topology.kubernetes.io/zone</td><td class="muted"><code>az1</code></td></tr>
           <tr><td class="k">redbull.io/role</td><td class="muted"><code>worker</code> (a tenant warm-pool VM)</td></tr>
           <tr><td class="k">redbull.io/mce</td><td class="muted">the MCE whose InfraEnv the VM serves</td></tr>
+          <tr><td class="k">redbull.io/kv-cluster</td><td class="muted">the KV cluster the VM lives on, its day1 file name (<code>ocp4-prod-kv-five-az1-a</code>; since 2026-11-26, the naming convention&rsquo;s &sect;4). An inventory gathered from many KV clusters says where each VM is, and <a href="/vm-lifecycle/delete-vm.html">delete-vm</a> refuses a VM that names another cluster than its worker&rsquo;s own.</td></tr>
           <tr><td class="k">redbull.io/created-by</td><td class="muted">the <b>run id</b> of the create-vm run (a UUID). A slot&rsquo;s workflow id is reused by later runs, so it cannot identify a VM; it goes on the VM as the annotation <code>redbull.io/workflow-id</code>, for a person.</td></tr>
         </tbody>
       </table>

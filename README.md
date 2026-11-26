@@ -77,7 +77,9 @@ workflow_domains/                 The brain — one folder per domain, plus main
                                     (its pure rules), dispatch.py, router.py (not
                                     mounted yet)
   vm_lifecycle/                   create_vm.py, kv_zone_lock.py (the per-zone lock it
-                                    takes), placement.py (the pure fit rule), router.py
+                                    takes), placement.py (the pure fit rule),
+                                    delete_stray_vm.py, delete_vm.py (one VM deleted
+                                    with its volumes; no route), router.py
   cluster_lifecycle/              provision_cluster.py, router.py (the body is the
                                     hosted-cluster YAML itself)
   routers/                        What no domain owns: deps, shared models, runs.py
@@ -104,7 +106,8 @@ activities/<domain>/              The limbs
                                     vm_lifecycle/kubevirt_api.py (its cluster's
                                     API), cluster_figures.py (the capacity
                                     arithmetic), vm_spec.py (the VirtualMachine it
-                                    builds), vm_operations.py (each activity's body)
+                                    builds), vm_volumes.py (which volumes are one
+                                    VM's), vm_operations.py (each activity's body)
   worker_init.py                  Registers this domain's activities, polls its queue
 docs/                             The static documentation site (its own image)
 ```
@@ -119,7 +122,7 @@ The prod charts are vendored into the Argo CD repo, not this one:
 | `redbull-platform/gitops/charts/server-provisioning-worker/` | the `server-provisioning-worker` limb — no `gitops/services/` entry yet, so nothing deploys it |
 | `redbull-platform/gitops/charts/cluster-lifecycle-worker/` | the `cluster-lifecycle-worker` limb (provision-cluster; create-vm's list of a zone's KV clusters and the placement buffer) — ONE release on the hub; reads the shared `redbull-git-token` (day1 push + its provider's merge-request API, the day2 sig repos) and names the `shortcuts-api-token` Secret |
 | `redbull-platform/gitops/charts/cluster-upgrade-worker/`, `.../upgrade-agent-worker/` | cluster-upgrade's per-MCE limbs, copied from `deploy/charts/` here by CI (`sync-upgrade-charts`) on every `main` push that changes them — no `gitops/services/` entry yet |
-| `redbull-platform/gitops/charts/vm-lifecycle-worker/` | the `vm-lifecycle-worker` limb (create-vm) — one release INSIDE each KV cluster, no Secret; copied from `deploy/charts/vm-lifecycle-worker/` here by the same CI job. No `gitops/services/` entry: each KV cluster gets it through day2. (Until 2026-11-20 this was a hub chart reaching each cluster through two HTTP agents) |
+| `redbull-platform/gitops/charts/vm-lifecycle-worker/` | the `vm-lifecycle-worker` limb (create-vm, delete-vm) — one release INSIDE each KV cluster, no Secret; copied from `deploy/charts/vm-lifecycle-worker/` here by the same CI job. No `gitops/services/` entry: each KV cluster gets it through day2. (Until 2026-11-20 this was a hub chart reaching each cluster through two HTTP agents) |
 | `redbull-platform/gitops/charts/upgrade-gitops-worker/` | cluster-upgrade's hub limb (its only copy) — no `gitops/services/` entry yet |
 
 Every image built on `main` is tagged `vX.Y.Z` by the shared build workflow, which writes the
@@ -151,7 +154,8 @@ and starts `allocate-segment` as an awaited child; `create-vm` reads its zone's
 KV clusters on `cluster-lifecycle-activity`, takes its zone's lock (`kv-zone-lock`,
 an internal workflow on its own queue, one run per site and zone) and asks
 everything else of the worker inside the chosen KV cluster, on
-`vm-lifecycle-activity-<kv cluster>`.
+`vm-lifecycle-activity-<kv cluster>`; `delete-vm` (a child workflow, no route)
+asks everything of the worker inside the KV cluster its VM is on.
 
 **The server-lifecycle workflows were renamed on 2026-11-01**, so each name says
 what it does to what:
@@ -884,6 +888,45 @@ the HyperConverged object will give each cluster its own range so that clusters 
 overlap. A cluster in day1 without a running worker is skipped.
 This design replaced the hub limb and its two HTTP agents (`kv-capacity`, `kv-vm-api`)
 on 2026-11-20; `docs/design/kubevirt-vm-placement.md` and `kv-agents-api.md` are superseded.
+
+### `delete-vm` — one VM deleted, with every volume of it (child only, no route)
+
+Deletes ONE VirtualMachine by name from its KV cluster — a VM `create-vm` made — and
+**completes only when nothing of it is left in Kubernetes, its PersistentVolumes
+included**: "the PersistentVolume is gone" is how it knows the volume left the storage
+array, with no call to any storage system. Full page:
+`docs/site/vm-lifecycle/delete-vm.html`.
+
+It has **no route** (decided 2026-11-26): it holds no MCE credential, so it cannot check
+that the VM's BareMetalHost is gone, and metal3 needs the VM's Redfish to release a host.
+`remove-server-from-mce` stays the one public way to remove a VM and is to start
+`delete-vm` as its child — **a later change; nothing starts it yet** but tests and the
+Temporal CLI. Id `delete-vm-<kv cluster>_<vm name>`, queue `delete-vm-workflow`, input
+`kv_cluster`, `namespace`, `vm_name`, `mce_cluster` (+ optional `created_by`, `mac`, `why`).
+
+1. **inspecting** — the VM must carry `redbull.io/created-by` (a hand-made VM is never
+   deleted), the caller's `redbull.io/mce`, and the run id and MAC when the caller names
+   them, or the run fails `VmIdentityConflictError` with nothing touched. Records the VM,
+   its DataVolumes, its claims (its root disk's; kubevirt-redfish's boot ISO claim when the
+   media was never ejected), the PersistentVolumes behind them, snapshots of them and the
+   pods mounting them. Nothing there: completed, `found: false`.
+2. **deleting** — everything read and checked again, then the VM (by UID), its
+   DataVolumes, each claim's CDI VolumeImportSource and every claim. A running VM is
+   deleted too (`was_running`). NEVER a PersistentVolume, a VolumeSnapshot or a pod.
+3. **awaiting-release** — one heartbeating activity, 8 s polls, 15 minutes that count only
+   the time the cluster was seen (an API outage or a worker that was away adds nothing).
+   A KV cluster with no worker fails the run at the inspection, before anything is written
+   (`KvClusterWorkerAbsentError`, 5 min).
+4. **Delete, then fail**: a `Retain` PersistentVolume, a PersistentVolume still there at
+   the deadline, a snapshot of one of the VM's disks or a look-alike claim fails the run
+   `VmVolumesLeftInStorageError` AFTER everything else went, naming each volume with its
+   CSI driver and volume handle; the VM, a DataVolume or a claim still there is
+   `VmDeletionTimeoutError`, naming the pods and finalizers holding it. A re-run resumes.
+
+It needs the `vm-lifecycle-worker` chart's widened ClusterRole (claims `list, delete`,
+PersistentVolumes `get, list`, VolumeSnapshots `list`, VolumeImportSources `delete`):
+**ship the chart before the image**, or every run fails `KvClusterAccessError` (403).
+`create-vm` now also labels each VM `redbull.io/kv-cluster: <its KV cluster>`.
 
 ### `provision-cluster` — a hosted cluster from the YAML a person wrote
 

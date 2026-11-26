@@ -24,6 +24,9 @@ CLAUDE.md §1, §2, §5, §6, §7. Checker ids in brackets.
   Temporal fails an activity error over 2 MiB as non-retryable "Failure exceeds size
   limit.". [AC007]
 - **Long machine waits** are one heartbeating activity that resumes from its heartbeat details.
+  Decide which clock its deadline runs on: a wall clock since the first attempt also runs through
+  an outage; "the cluster had this long to finish" counts only the time between two polls that
+  both answered (`await_vm_gone`). What it watches comes in its request, from the run's history.
 - **HTTP**: an `httpx.AsyncClient` per call, inside it, `timeout=` below the activity's
   `start_to_close_timeout`. [AC001, AC002]
 - **GitLab is the only git provider** (CLAUDE.md §4): no GitHub client, no setting choosing

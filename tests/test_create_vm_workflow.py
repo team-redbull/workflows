@@ -305,7 +305,7 @@ class TestOneVm:
         assert body["metadata"]["labels"] | {"redbull.io/created-by": "x"} == {
             "redfish-enabled": "true", "redbull.io/flavor": "c200n", "redbull.io/size": "kv8", "redbull.io/site": "five",
             "topology.kubernetes.io/zone": "az1", "redbull.io/role": "worker", "redbull.io/mce": MCE,
-            "redbull.io/created-by": "x",
+            "redbull.io/kv-cluster": A, "redbull.io/created-by": "x",
         }
         domain = body["spec"]["template"]["spec"]["domain"]
         assert domain["cpu"] == {"cores": 8} and domain["memory"] == {"guest": "60Gi"}

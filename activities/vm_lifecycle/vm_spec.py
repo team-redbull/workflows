@@ -43,6 +43,10 @@ SIZE_LABEL = "redbull.io/size"
 SITE_LABEL = "redbull.io/site"
 ROLE_LABEL = "redbull.io/role"
 MCE_LABEL = "redbull.io/mce"
+# The KV cluster the VM lives on, its day1 file name (the naming convention's §4, since
+# 2026-11-26): an inventory gathered from many KV clusters says where each VM is, and
+# delete-vm refuses a VM that names another cluster than its worker's own.
+KV_CLUSTER_LABEL = "redbull.io/kv-cluster"
 # A tenant warm-pool VM (the naming convention's §4.b).
 WORKER_ROLE = "worker"
 ROOT_DISK_VOLUME = "rootdisk"
@@ -73,7 +77,8 @@ def size_label(cpu: int) -> str:
 
 
 def labels(
-    *, flavor: str, cpu: int, site: str, zone: str, mce: str, request_id: str, redfish_label: tuple[str, str]
+    *, flavor: str, cpu: int, site: str, zone: str, mce: str, request_id: str, kv_cluster: str,
+    redfish_label: tuple[str, str],
 ) -> dict[str, str]:
     """The VM's labels (design §7.4). The redfish label is what kubevirt-redfish exposes
     it by AND what the capacity figures count a stopped VM by."""
@@ -85,6 +90,7 @@ def labels(
         ZONE_LABEL: zone,
         ROLE_LABEL: WORKER_ROLE,
         MCE_LABEL: mce,
+        KV_CLUSTER_LABEL: kv_cluster,
         CREATED_BY_LABEL: request_id,
     }
 
@@ -101,6 +107,7 @@ def build(
     serial: str,
     request_id: str,
     workflow_id: str | None,
+    kv_cluster: str,
     redfish_label: tuple[str, str],
     storage_class_name: str,
     network_name: str,
@@ -139,7 +146,8 @@ def build(
         "name": name,
         "namespace": namespace,
         "labels": labels(
-            flavor=flavor, cpu=cpu, site=site, zone=zone, mce=mce, request_id=request_id, redfish_label=redfish_label
+            flavor=flavor, cpu=cpu, site=site, zone=zone, mce=mce, request_id=request_id, kv_cluster=kv_cluster,
+            redfish_label=redfish_label,
         ),
     }
     if workflow_id:

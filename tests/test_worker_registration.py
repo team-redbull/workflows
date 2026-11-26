@@ -47,6 +47,7 @@ _WORKFLOW_MODULES = [
     "workflow_domains/server_provisioning/provision_dell_server.py",
     "workflow_domains/segment_lifecycle/release_segment.py",
     "workflow_domains/vm_lifecycle/create_vm.py",
+    "workflow_domains/vm_lifecycle/delete_vm.py",
     "workflow_domains/cluster_lifecycle/provision_cluster.py",
 ]
 

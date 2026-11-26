@@ -4,16 +4,25 @@
 # the figures count pods and stopped VMs in EVERY namespace, a run's VM is
 # found by its label in every namespace, and the VM namespace is the request's.
 #   * nodes                    list: allocatable, Ready, cordoned, taints (the figures)
-#   * pods                     list: every unfinished pod's requests (the figures)
+#   * pods                     list: every unfinished pod's requests (the figures);
+#                              which pods mount a claim of a VM being deleted (delete-vm)
 #   * namespaces               get: the VM namespace must exist; the run never creates one
-#   * persistentvolumeclaims   get: is the root disk's claim Bound (the ready wait)
+#   * persistentvolumeclaims   get: is the root disk's claim Bound (the ready wait);
+#                              list, delete (delete-vm: a deleted VM's own claims — its
+#                              root disk's and kubevirt-redfish's boot ISO — each by UID)
+#   * persistentvolumes        list, get (delete-vm: the volumes behind those claims,
+#                              watched until they are gone; NEVER deleted)
 #   * virtualmachines          list (the figures; the name and request-id lookups),
-#                              get (the ready wait; the delete's identity check),
-#                              create (the VM), delete (a run's own VM only: the
+#                              get (the ready wait; a delete's identity check),
+#                              create (the VM), delete (a VM create-vm made only: the
 #                              one labelled with its run id, by UID)
 #   * virtualmachineinstances  list: which VMs have a launcher pod (the figures)
 #   * datavolumes              get (the root disk's phase), delete (with its VM)
+#   * volumeimportsources      delete (delete-vm: what a boot ISO claim was filled from)
+#   * volumesnapshots          list (delete-vm: a snapshot of a deleted VM's disk keeps
+#                              its volume in the array; reported, NEVER deleted)
 # Nothing here starts, stops or patches a VM: kubevirt-redfish owns the power state.
+# Nothing here deletes a PersistentVolume, a snapshot or a pod.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -25,8 +34,14 @@ rules:
     resources: [nodes, pods]
     verbs: [list]
   - apiGroups: [""]
-    resources: [namespaces, persistentvolumeclaims]
+    resources: [namespaces]
     verbs: [get]
+  - apiGroups: [""]
+    resources: [persistentvolumeclaims]
+    verbs: [get, list, delete]
+  - apiGroups: [""]
+    resources: [persistentvolumes]
+    verbs: [get, list]
   - apiGroups: [kubevirt.io]
     resources: [virtualmachines]
     verbs: [get, list, create, delete]
@@ -36,6 +51,12 @@ rules:
   - apiGroups: [cdi.kubevirt.io]
     resources: [datavolumes]
     verbs: [get, delete]
+  - apiGroups: [cdi.kubevirt.io]
+    resources: [volumeimportsources]
+    verbs: [delete]
+  - apiGroups: [snapshot.storage.k8s.io]
+    resources: [volumesnapshots]
+    verbs: [list]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

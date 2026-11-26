@@ -23,6 +23,14 @@ Budgets, all under the workflow's timeouts (workflow_domains/vm_lifecycle/create
     operator, 2026-11-05), its clock in the heartbeat details so a retry on a
     restarted worker resumes it, `deadline` on its own clock, under the
     workflow's 12 min start_to_close and 2 min heartbeat timeout.
+
+delete-vm's three (workflow_domains/vm_lifecycle/delete_vm.py) are bound the same way:
+the inspection and the delete read and write a handful of objects under a 3 min
+start_to_close, every step idempotent, so two attempts side by side do no harm; the
+wait until nothing is left is one heartbeating activity like the ready wait, but its
+15 min count only the time the cluster was SEEN (the seconds between two polls that both
+answered, kept in the heartbeat details): an outage or a worker that was away adds
+nothing. One attempt runs under a 17 min start_to_close.
 """
 
 from __future__ import annotations
@@ -42,8 +50,12 @@ from shared.models.vm_lifecycle import (
     VmCreateRequest,
     VmDeleted,
     VmDeleteRequest,
+    VmDeletionState,
+    VmGoneOutcome,
     VmReadyOutcome,
     VmReadyRequest,
+    VmRemovalRequest,
+    VmVolumesDeleted,
 )
 from shared.settings.vm_lifecycle import VmLifecycleActivitySettings
 
@@ -123,3 +135,35 @@ async def await_vm_ready(request: VmReadyRequest) -> VmReadyOutcome:
 @activity.defn
 async def delete_vm_on_cluster(request: VmDeleteRequest) -> VmDeleted:
     return await vm_operations.delete_vm(_api, _cluster, request, log=activity.logger.info)
+
+
+@activity.defn
+async def inspect_vm_for_deletion(request: VmRemovalRequest) -> VmDeletionState:
+    return await vm_operations.inspect_for_deletion(_api, _cluster, request, log=activity.logger.info)
+
+
+@activity.defn
+async def delete_vm_and_volumes(request: VmRemovalRequest) -> VmVolumesDeleted:
+    return await vm_operations.delete_with_volumes(_api, _cluster, request, log=activity.logger.info)
+
+
+def _resumed_watch() -> tuple[float, int]:
+    """(seconds of watching, polls) from the last heartbeat, when this attempt retries the gone wait."""
+    details = activity.info().heartbeat_details
+    if not details or not isinstance(details[0], dict):
+        return 0.0, 0
+    try:
+        return max(float(details[0]["waited_seconds"]), 0.0), int(details[0].get("polls", 0))
+    except (KeyError, TypeError, ValueError):  # an unreadable detail starts the clock afresh
+        return 0.0, 0
+
+
+@activity.defn
+async def await_vm_gone(request: VmRemovalRequest) -> VmGoneOutcome:
+    """Until nothing of the VM is left, or only what never goes, or `deadline_minutes` of watching the cluster."""
+    waited_seconds, polls = _resumed_watch()
+    return await vm_operations.wait_gone(
+        _api, _cluster, request, waited_seconds=waited_seconds, polls=polls, now=_now,
+        heartbeat=lambda waited, count: activity.heartbeat({"waited_seconds": waited, "polls": count}),
+        log=activity.logger.info,
+    )

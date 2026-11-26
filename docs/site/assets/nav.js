@@ -126,13 +126,19 @@
       // on its own API server as its own ServiceAccount and dials out to the
       // hub's Temporal. The zone's cluster list is day1's, read on
       // cluster-lifecycle-activity. kv-zone-lock, the per-zone lock, has no
-      // route and is described on create-vm's page.
+      // route and is described on create-vm's page. delete-vm has no route
+      // either (a child workflow), and its own page.
       queue: "vm-lifecycle-activity-<kv cluster>",
       workflows: [
         {
           name: "create-vm",
           href: "/vm-lifecycle/create-vm.html",
           blurb: "one Halted VM, fixed MAC, on the oldest KV cluster of a zone with room · one run per zone at a time"
+        },
+        {
+          name: "delete-vm",
+          href: "/vm-lifecycle/delete-vm.html",
+          blurb: "one VM deleted by name with every volume of it · done when its PersistentVolumes are gone · child only, no route"
         }
       ]
     }

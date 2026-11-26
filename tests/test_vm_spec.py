@@ -13,7 +13,8 @@ def _build(**overrides):
     values = dict(
         namespace="inventory", flavor="c200", cpu=32, memory_gib=240, site="five", zone="az1",
         mce="ocp4-prod-mce-five-a", serial="k7q2m9xd", request_id="0196f6a2-1111-7222-8333-444455556666",
-        workflow_id="create-vm-ocp4-prod-mce-five-a_c200-kv32-az1_1", redfish_label=REDFISH_LABEL,
+        workflow_id="create-vm-ocp4-prod-mce-five-a_c200-kv32-az1_1", kv_cluster="ocp4-prod-kv-five-az1-a",
+        redfish_label=REDFISH_LABEL,
         storage_class_name="cephfs", network_name="openshift-cnv/vm-external-network",
         node_selector={}, root_disk_size="120Gi",
     )
@@ -66,6 +67,7 @@ class TestTheVirtualMachine:
             "topology.kubernetes.io/zone": "az1",
             "redbull.io/role": "worker",
             "redbull.io/mce": "ocp4-prod-mce-five-a",
+            "redbull.io/kv-cluster": "ocp4-prod-kv-five-az1-a",
             "redbull.io/created-by": "0196f6a2-1111-7222-8333-444455556666",
         }
 
@@ -171,7 +173,7 @@ class TestTheVirtualMachine:
         assert built["metadata"].pop("namespace") == "inventory"
         assert built["metadata"].pop("annotations") == {"redbull.io/workflow-id": "create-vm-ocp4-prod-mce-five-a_c200-kv32-az1_1"}
         assert built["metadata"]["labels"].pop("redbull.io/created-by")
-        for key in ("redbull.io/flavor", "redbull.io/size", "redbull.io/site", "topology.kubernetes.io/zone", "redbull.io/role", "redbull.io/mce"):
+        for key in ("redbull.io/flavor", "redbull.io/size", "redbull.io/site", "topology.kubernetes.io/zone", "redbull.io/role", "redbull.io/mce", "redbull.io/kv-cluster"):
             built["metadata"]["labels"].pop(key)
         assert built["spec"]["template"]["spec"]["domain"]["firmware"].pop("serial") == "k7q2m9xd"
         assert built == vm_yaml

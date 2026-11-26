@@ -28,15 +28,22 @@ from collections.abc import Callable
 from typing import Any
 
 from activities.vm_lifecycle.cluster_figures import get, guest_memory_bytes, vcpus
-from shared.infraenv_names import ROOT_DISK_SUFFIX, VM_SERIAL_ALPHABET, VM_SERIAL_LENGTH, vm_name, vm_size
+from shared.infraenv_names import (
+    CREATED_BY_LABEL,
+    KV_CLUSTER_LABEL,
+    ROOT_DISK_SUFFIX,
+    VM_SERIAL_ALPHABET,
+    VM_SERIAL_LENGTH,
+    vm_name,
+    vm_size,
+)
 from shared.upgrade_layout import ZONE_LABEL
 from shared.vm_requests import GIB, request_cores
 
 KUBEVIRT_API_VERSION = "kubevirt.io/v1"
 # How a run finds the VM it created (a retried create, a rollback): the RUN's
 # id, a UUID, as a label — a slot's workflow id is reused by later runs and
-# holds characters a label value cannot.
-CREATED_BY_LABEL = "redbull.io/created-by"
+# holds characters a label value cannot. CREATED_BY_LABEL, from shared/infraenv_names.py.
 WORKFLOW_ID_ANNOTATION = "redbull.io/workflow-id"
 FLAVOR_LABEL = "redbull.io/flavor"
 SIZE_LABEL = "redbull.io/size"
@@ -46,7 +53,7 @@ MCE_LABEL = "redbull.io/mce"
 # The KV cluster the VM lives on, its day1 file name (the naming convention's §4, since
 # 2026-11-26): an inventory gathered from many KV clusters says where each VM is, and
 # delete-vm refuses a VM that names another cluster than its worker's own.
-KV_CLUSTER_LABEL = "redbull.io/kv-cluster"
+# KV_CLUSTER_LABEL, from shared/infraenv_names.py.
 # A tenant warm-pool VM (the naming convention's §4.b).
 WORKER_ROLE = "worker"
 ROOT_DISK_VOLUME = "rootdisk"

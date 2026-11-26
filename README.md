@@ -209,7 +209,8 @@ Halted VM on a KV cluster of the InfraEnv's zone, and then writes for exactly
 that VM an NMStateConfig (one NIC `enp1s0`, the VLAN on it, no bond), the Secret
 `kubevirt-cred-<vm>` and a BareMetalHost whose BMC is the KV cluster's
 kubevirt-redfish (`redfish-virtualmedia://<KUBEVIRT_BMC_HOST_TEMPLATE>/redfish/v1/Systems/<vm>`),
-and waits for its Agent. No lock, no hold, no wait for server-scan. A run that
+labelled `redbull.io/kv-cluster` and `redbull.io/created-by` (where its VM lives and which
+one, for `delete-vm` once the host is removed), and waits for its Agent. No lock, no hold, no wait for server-scan. A run that
 does not end with an Agent takes the host out of the MCE and then **deletes its
 VM**; a cancel does the same; a terminated run's child cancels itself and removes
 its own VM. `server_names` is refused for such an InfraEnv

@@ -87,6 +87,15 @@ KUBEVIRT_SIZE_PREFIX = "kv"
 # The longest suffix a VM's name gets on another object: its root DataVolume.
 ROOT_DISK_SUFFIX = "-root"
 
+# Where a VM lives and which create-vm RUN made it (the naming convention's §4, its PR #2,
+# 2026-11-26). Both go on the VirtualMachine, written by its KV cluster's worker, and on the
+# VM's BareMetalHost, written by add-server-to-mce when it installs the VM: the BareMetalHost
+# is what remove-server-from-mce reads, and the only record on the MCE of which KV cluster holds
+# the VM and which VM there. The run id, not a workflow id: a create-vm slot's workflow id is
+# used again by later runs, each with a VM of its own. Here because both sides use them.
+KV_CLUSTER_LABEL = "redbull.io/kv-cluster"
+CREATED_BY_LABEL = "redbull.io/created-by"
+
 
 class InfraEnvNameError(ValueError):
     """The name is not one the convention describes. A ValueError too, so a

@@ -703,7 +703,7 @@ spec:
             <tbody>
               <tr><td class="k">NMStateConfig</td><td class="muted"><code>&lt;vm&gt;</code></td><td class="muted"><b>First.</b> ONE NIC, <code>enp1s0</code>, no bond: the VLAN <code>enp1s0.&lt;vlan&gt;</code> on DHCP, straight on it</td></tr>
               <tr><td class="k">Secret</td><td class="muted"><code>kubevirt-cred-&lt;vm&gt;</code></td><td class="muted">the kubevirt-redfish user, <code>KUBEVIRT_BMC_*</code></td></tr>
-              <tr><td class="k">BareMetalHost</td><td class="muted"><code>&lt;vm&gt;</code></td><td class="muted"><code>redfish-virtualmedia://&lt;host&gt;/redfish/v1/Systems/&lt;vm&gt;</code>; boot MAC = the VM&rsquo;s</td></tr>
+              <tr><td class="k">BareMetalHost</td><td class="muted"><code>&lt;vm&gt;</code></td><td class="muted"><code>redfish-virtualmedia://&lt;host&gt;/redfish/v1/Systems/&lt;vm&gt;</code>; boot MAC = the VM&rsquo;s; labelled <code>redbull.io/kv-cluster: &lt;kv cluster&gt;</code> and <code>redbull.io/created-by: &lt;create-vm run id&gt;</code> &mdash; where its VM lives and which one, for <a href="/vm-lifecycle/delete-vm.html">delete-vm</a> once the host is removed</td></tr>
             </tbody>
           </table>
         </div>

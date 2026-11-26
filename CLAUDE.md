@@ -1372,8 +1372,15 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
     bond's `nic1`: the VLAN sits straight on it, and that layout is the proven one), NO bond,
     `enp1s0.<vlan>` on DHCP; the limb's `build_nmstate_config` writes it for ONE member, the
     bond for two, and refuses any other count (`InvalidHostNetworkError`). The VLAN is the
-    MCE's inventory VLAN, as for every host. The BareMetalHost is the bare-metal body
-    unchanged. **Order: NMStateConfig → Secret → BareMetalHost** (bare-metal Redfish keeps
+    MCE's inventory VLAN, as for every host. The BareMetalHost is the bare-metal body, plus two
+    labels (2026-11-26, the naming convention's §4 since its PR #2): `redbull.io/kv-cluster: <the
+    KV cluster's day1 file name>` and `redbull.io/created-by: <the create-vm child's RUN id>` —
+    the only record on the MCE of where the VM lives and which VM there, for remove-server-from-mce
+    to destroy it through delete-vm once the host is removed (that integration is NOT built, its
+    questions are the operator's to answer first). Ours win over a caller's `labels` of the same
+    key; the NMStateConfig and the Secret get neither. The keys live in
+    `shared/infraenv_names.py`, read by both sides; no patch — only an activity's input changed,
+    and every `vm-*` golden replays. **Order: NMStateConfig → Secret → BareMetalHost** (bare-metal Redfish keeps
     Secret → BMH → NMStateConfig): a VM must never boot a discovery image from before its own
     network config — the IPMI order's reasoning; recorded in the `vm-*` goldens. No PXE step,
     and NO `replace_conflicting_nmstate_config`: a differing NMStateConfig under a brand-new
@@ -1445,8 +1452,9 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   - **Not built, reported**: a VM made by create-vm's own route has no install path; the pool
     draw refuses a multi-word site (`bat-yam`) where this branch, on the convention's parsers,
     accepts one; destroying an installed VM later (the convention's §5, the Inventory
-    Controller) needs its KV cluster and run id, which are in the run's result only for
-    Temporal's retention; redbull-platform's own `server-lifecycle-worker` chart is not synced
+    Controller) is delete-vm, on `main` since 2026-11-26, but nothing starts it yet — the KV
+    cluster and run id it needs are on the BareMetalHost's labels (above), which a removal that
+    already deleted the host can no longer read; redbull-platform's own `server-lifecycle-worker` chart is not synced
     and needs the three keys by hand. Not provable in tests: a VM booted by Ironic through
     kubevirt-redfish into an Agent — the first real run is that test.
 - **delete-vm (domain `vm-lifecycle`) deletes ONE VM by name from its KV cluster and COMPLETES ONLY

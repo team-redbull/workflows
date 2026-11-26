@@ -231,6 +231,7 @@ from temporalio.workflow import ActivityCancellationType, ParentClosePolicy
 
 with workflow.unsafe.imports_passed_through():
     from shared.cluster_names import canonical_mce_cluster
+    from shared.infraenv_names import CREATED_BY_LABEL, KV_CLUSTER_LABEL
     from shared.bmc_address import (
         BMC_VENDORS,
         KUBEVIRT_BMC_VENDOR,
@@ -575,7 +576,7 @@ _CREATES_VM_PATCH = "add-server-creates-vm"
 _VM_DELETE_TIMEOUT = timedelta(seconds=90)
 _VM_CANCEL_DELETE_DEADLINE = timedelta(minutes=10)
 # The VM's label that says which create-vm run made it: what finds it, by hand too.
-_VM_RUN_LABEL = "redbull.io/created-by"
+_VM_RUN_LABEL = CREATED_BY_LABEL
 # The allocation live-checks each candidate it locks, one at a time, against
 # its vendor manager — seconds as a rule, ~22 minutes at server-scan's worst
 # (five candidates, UCS Central's probe deadline each). Its HTTP client gives up
@@ -2101,7 +2102,15 @@ class AddServerToMceWorkflow:
                     )
                 ],
                 vlan_id=segment.vlan_id,
-                labels=install_input.labels,
+                # The BareMetalHost says where its VM lives and which create-vm run made it
+                # (the naming convention's §4): the only record on the MCE of what to destroy
+                # once the host is removed. Ours win over a caller's label of the same key;
+                # only the BareMetalHost is labelled from here, never its NMStateConfig or Secret.
+                labels={
+                    **install_input.labels,
+                    KV_CLUSTER_LABEL: kv_cluster,
+                    CREATED_BY_LABEL: cast(str, vm.run_id),
+                },
             )
             # A VM's name is unique on its KV cluster by a check and across a
             # site's clusters only by chance: a host of this name already here

@@ -73,6 +73,10 @@ DETACHED_ANNOTATION = "baremetalhost.metal3.io/detached"
 BMH_DEPROVISION_FINALIZERS = frozenset({"baremetalhost.metal3.io"})
 
 _INFRAENV_LABEL = "infraenvs.agent-install.openshift.io"
+# The add-server-to-mce run that created the object (the naming convention's §3, AD37), on
+# the BareMetalHost, the NMStateConfig and the BMC Secret alike: the Inventory Controller
+# matches a run still open to the Agent it produced, and counts the machine once.
+INSTALLED_BY_LABEL = "redbull.io/installed-by"
 # A bare-metal server's bond: two members, on two physical ports.
 _BOND_MEMBERS = 2
 
@@ -94,15 +98,23 @@ def _validate_macs(request: BmhResourceRequest) -> None:
             )
 
 
+def _installed_by(request: BmhResourceRequest) -> dict[str, str]:
+    """`redbull.io/installed-by: <run id>`, or nothing for a request from a brain predating it."""
+    return {INSTALLED_BY_LABEL: request.installed_by} if request.installed_by else {}
+
+
 def build_bmc_secret(request: BmhResourceRequest, username: str, password: str) -> dict[str, Any]:
     """The BMC credentials Secret the BareMetalHost references by name."""
+    metadata: dict[str, Any] = {
+        "name": bmc_secret_name(request.bmc_vendor, request.server_name),
+        "namespace": request.namespace,
+    }
+    if request.installed_by:
+        metadata["labels"] = _installed_by(request)
     return {
         "apiVersion": "v1",
         "kind": "Secret",
-        "metadata": {
-            "name": bmc_secret_name(request.bmc_vendor, request.server_name),
-            "namespace": request.namespace,
-        },
+        "metadata": metadata,
         "type": "Opaque",
         "data": {
             "username": base64.b64encode(username.encode()).decode(),
@@ -128,8 +140,9 @@ def build_baremetal_host(request: BmhResourceRequest) -> dict[str, Any]:
             "namespace": request.namespace,
             # Caller labels FIRST: the InfraEnv label binds this host to the
             # InfraEnv whose NMStateConfig carries the matching label, so a
-            # caller overriding it would split the two across InfraEnvs.
-            "labels": {**request.labels, _INFRAENV_LABEL: request.infra_env},
+            # caller overriding it would split the two across InfraEnvs. The
+            # run's own installed-by wins over a caller's too.
+            "labels": {**request.labels, **_installed_by(request), _INFRAENV_LABEL: request.infra_env},
             "annotations": {
                 "inspect.metal3.io": "disabled",
                 # The node's hostname, so it is DNS-cased for the same
@@ -240,7 +253,7 @@ def build_nmstate_config(request: BmhResourceRequest) -> dict[str, Any]:
         "metadata": {
             "name": nmstate_config_name(request.server_name),
             "namespace": request.namespace,
-            "labels": {_INFRAENV_LABEL: request.infra_env},
+            "labels": {**_installed_by(request), _INFRAENV_LABEL: request.infra_env},
         },
         "spec": {
             "config": {"interfaces": layout},

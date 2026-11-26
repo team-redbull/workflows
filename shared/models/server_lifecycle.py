@@ -313,6 +313,13 @@ class BmhResourceRequest(_QuietDefaults):
     `allowed_unhealthy` builds nothing: it is carried so each create's input in
     history — and the limb's log — says which health refusals this install
     waived. Left out of the payload when empty (_QuietDefaults).
+
+    `labels` go on the BareMetalHost only. `installed_by` is the add-server-to-mce
+    RUN id, and labels all three objects `redbull.io/installed-by` (the naming
+    convention's §3, AD37): the Inventory Controller matches an install run still
+    open to the Agent it already produced, and counts the machine once. A run id,
+    because a pool slot's workflow id is used again by later runs. None from a
+    brain predating it: nothing is labelled.
     """
 
     _quiet_defaults: ClassVar[tuple[str, ...]] = ("allowed_unhealthy",)
@@ -328,6 +335,7 @@ class BmhResourceRequest(_QuietDefaults):
     bond_mode: str = "802.3ad"
     labels: dict[str, str] = Field(default_factory=dict)
     allowed_unhealthy: list[WaivedHealthCheck] = Field(default_factory=list)
+    installed_by: str | None = None
 
 
 class NmStateConfigReplaceRequest(BaseModel):

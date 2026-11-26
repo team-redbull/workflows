@@ -1233,6 +1233,8 @@ class AddServerToMceWorkflow:
                 vlan_id=segment.vlan_id,
                 labels=install_input.labels,
                 allowed_unhealthy=self._allowed_unhealthy,
+                # Labels all three objects redbull.io/installed-by (AD37): this RUN's id.
+                installed_by=workflow.info().run_id,
             )
 
             # An NMStateConfig already under the server's name that differs from
@@ -2111,6 +2113,8 @@ class AddServerToMceWorkflow:
                     KV_CLUSTER_LABEL: kv_cluster,
                     CREATED_BY_LABEL: cast(str, vm.run_id),
                 },
+                # All three objects also carry redbull.io/installed-by: THIS run's id (AD37).
+                installed_by=workflow.info().run_id,
             )
             # A VM's name is unique on its KV cluster by a check and across a
             # site's clusters only by chance: a host of this name already here

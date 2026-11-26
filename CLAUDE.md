@@ -1378,7 +1378,7 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
     the only record on the MCE of where the VM lives and which VM there, for remove-server-from-mce
     to destroy it through delete-vm once the host is removed (that integration is NOT built, its
     questions are the operator's to answer first). Ours win over a caller's `labels` of the same
-    key; the NMStateConfig and the Secret get neither. The keys live in
+    key; the NMStateConfig and the Secret get neither (all three get `installed-by`, below). The keys live in
     `shared/infraenv_names.py`, read by both sides; no patch — only an activity's input changed,
     and every `vm-*` golden replays. **Order: NMStateConfig → Secret → BareMetalHost** (bare-metal Redfish keeps
     Secret → BMH → NMStateConfig): a VM must never boot a discovery image from before its own
@@ -1628,6 +1628,21 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   (`lookup_install_candidate`) and sorted by `health_waiver.py`; every waiver lands in
   `allowed_unhealthy` (progress, result, each create's input). No patch gate: no recorded run
   carries the field.
+- **Every install labels its BareMetalHost, NMStateConfig and BMC Secret
+  `redbull.io/installed-by: <the add-server-to-mce RUN id>`** (2026-11-26, the naming
+  convention's §3 and AD37; raised in PR #28's review). Bare metal and VM alike. Why: an install
+  run stays RUNNING after its Agent appears (bare metal: up to a day, waiting for server-scan),
+  so the Inventory Controller (herzi) counts that machine twice — an open run and a free Agent —
+  and orders too few; the label lets it match the two and count once. herzi does NOT read it yet
+  (its design accepts the double count as "seconds", L10): writing it now is harmless and unblocks
+  it. A RUN id, not the workflow id: a pool slot's id is used again by later runs. It travels as
+  `BmhResourceRequest.installed_by` (set to `workflow.info().run_id` on both paths; None from a
+  brain predating it, and then nothing is labelled), NOT in `labels`, which reach the
+  BareMetalHost only; the limb's three builders write it (`bmh_resources.INSTALLED_BY_LABEL`), the
+  run's value winning over a caller's label of that key. The "already there" rules compare only
+  the InfraEnv label, so a re-run meeting objects an earlier run of the same install made converges
+  as before — and those objects keep the EARLIER run's id: nothing relabels them (no update verb).
+  No patch: only activities' inputs changed, every golden replays.
 - **An NMStateConfig is named after its SERVER, like its BareMetalHost** (the operator,
   2026-11-25: "just the server/vm name without nmstate-config prefix", bare metal and VM alike).
   Until then it was bmhgen's `nmstate-config-<server>`, and a host installed then KEEPS that

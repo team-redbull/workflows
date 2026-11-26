@@ -111,6 +111,31 @@ class TestBareMetalHost:
             "/redfish/v1/Systems/vm-0042"
         )
 
+    def test_all_three_objects_say_which_install_run_made_them(self) -> None:
+        """redbull.io/installed-by: <the add-server-to-mce run id> (the naming convention's §3,
+        AD37) on the BareMetalHost, the NMStateConfig and the BMC Secret alike; the run's own
+        value wins over a caller's label of the same key."""
+        request = _request(installed_by="run-1", labels={"redbull.io/installed-by": "a-callers-guess"})
+        bmh = build_baremetal_host(request)
+        assert bmh["metadata"]["labels"] == {"redbull.io/installed-by": "run-1", INFRAENV_LABEL: INFRA_ENV}
+        assert build_nmstate_config(request)["metadata"]["labels"] == {
+            "redbull.io/installed-by": "run-1", INFRAENV_LABEL: INFRA_ENV,
+        }
+        assert build_bmc_secret(request, "u", "p")["metadata"]["labels"] == {"redbull.io/installed-by": "run-1"}
+
+    def test_a_request_from_a_brain_predating_installed_by_labels_nothing_new(self) -> None:
+        request = _request()
+        assert request.installed_by is None
+        assert "redbull.io/installed-by" not in build_baremetal_host(request)["metadata"]["labels"]
+        assert build_nmstate_config(request)["metadata"]["labels"] == {INFRAENV_LABEL: INFRA_ENV}
+        assert "labels" not in build_bmc_secret(request, "u", "p")["metadata"]
+
+    def test_installed_by_is_not_compared_so_a_re_run_meets_its_own_objects(self) -> None:
+        """An existing object made by an earlier run of the same install matches this run's."""
+        mine, earlier = _request(installed_by="run-2"), _request(installed_by="run-1")
+        assert baremetal_host_differences(build_baremetal_host(mine), build_baremetal_host(earlier)) == []
+        assert nmstate_config_differences(build_nmstate_config(mine), build_nmstate_config(earlier)) == []
+
     def test_extra_labels_are_merged_without_losing_the_infraenv_label(self) -> None:
         bmh = build_baremetal_host(_request(labels={"environment": "production"}))
         assert bmh["metadata"]["labels"][INFRAENV_LABEL] == INFRA_ENV

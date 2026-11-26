@@ -397,24 +397,29 @@ class TestAVmIsMadeThenInstalled:
             "labels": {"team": "platform", "redbull.io/kv-cluster": "a-callers-guess"},
         }))
         async with _Harness(mocks) as client:
-            await _result(await _start(client, caller))
+            handle = await _start(client, caller)
+            await _result(handle)
 
         request = calls["create_baremetal_host"][0]
+        assert request.installed_by == handle.result_run_id  # THIS run's id, on all three objects (AD37)
         assert request.labels == {
             "team": "platform",  # a caller's own label is kept
             "redbull.io/kv-cluster": KV_CLUSTER,  # ours win over the caller's
             "redbull.io/created-by": CHILD["run_ids"][0],  # the create-vm child's RUN id
         }
-        # The limb puts them on the BareMetalHost only: the NMStateConfig and the Secret
-        # carry the InfraEnv label alone, whatever the request's labels.
+        # The limb puts these on the BareMetalHost only; installed-by goes on all three objects.
         from activities.server_lifecycle import bmh_resources
 
         host = bmh_resources.build_baremetal_host(request)
         assert host["metadata"]["labels"] == {
-            **request.labels, "infraenvs.agent-install.openshift.io": INFRA_ENV,
+            **request.labels, "redbull.io/installed-by": handle.result_run_id,
+            "infraenvs.agent-install.openshift.io": INFRA_ENV,
         }
         assert bmh_resources.build_nmstate_config(request)["metadata"]["labels"] == {
-            "infraenvs.agent-install.openshift.io": INFRA_ENV,
+            "redbull.io/installed-by": handle.result_run_id, "infraenvs.agent-install.openshift.io": INFRA_ENV,
+        }
+        assert bmh_resources.build_bmc_secret(request, "u", "p")["metadata"]["labels"] == {
+            "redbull.io/installed-by": handle.result_run_id,
         }
 
     async def test_the_infraenvs_own_name_need_not_follow_the_convention(self):

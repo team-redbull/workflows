@@ -851,6 +851,21 @@ async def test_happy_path_resolves_vlan_acquires_creates_and_awaits_the_agent():
     assert len(calls["find_agent_for_host"]) == 1
 
 
+async def test_every_object_carries_the_install_runs_id():
+    """redbull.io/installed-by (AD37): the Inventory Controller matches a run still open to the
+    Agent it produced. The RUN id, the same on all three creates, and no other label added."""
+    calls, segment_acts, server_acts = make_mock_activities()
+    async with _Harness(segment_acts, server_acts) as client:
+        handle = await client.start_workflow(
+            AddServerToMceWorkflow.run, AddServerToMceRunArgs(input=INPUT), id=f"test-{uuid.uuid4()}",
+            task_queue=ADD_SERVER_TO_MCE_WORKFLOW_QUEUE,
+        )
+        await asyncio.wait_for(handle.result(), timeout=60)
+    requests = [calls[name][0] for name in ("create_bmc_secret", "create_baremetal_host", "create_nmstate_config")]
+    assert {request.installed_by for request in requests} == {handle.result_run_id}
+    assert all(request.labels == INPUT.labels for request in requests)
+
+
 @pytest.mark.parametrize(
     ("labels", "prefix"),
     [

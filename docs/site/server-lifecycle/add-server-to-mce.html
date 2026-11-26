@@ -405,6 +405,12 @@ spec:
           <p>In dependency order: the BareMetalHost references the Secret by name, so the Secret goes
           first. All three are idempotent &mdash; an existing resource is success, never an overwrite, so a
           BMC credential or a bond an operator corrected by hand survives a re-run.</p>
+          <p class="note">All three are labelled <code>redbull.io/installed-by: &lt;this run&rsquo;s run id&gt;</code>
+          (the naming convention&rsquo;s &sect;3, AD37): an install run stays open after its Agent appears,
+          and the Inventory Controller matches the two through it to count the machine once. The run id,
+          not the workflow id, because a pool slot&rsquo;s id is used again by later runs. Objects an earlier
+          run of the same install made keep that run&rsquo;s id: a re-run converges on them and relabels
+          nothing.</p>
           <div class="calls">
             <div class="call sm"><span class="verb">POST</span><span class="path">secrets/&lt;vendor&gt;-cred-&lt;server&gt; <em>· credentials from THIS worker&rsquo;s Secret</em></span></div>
             <div class="call nxt"><span class="verb">POST</span><span class="path">baremetalhosts/&lt;server&gt; <em>· customDeploy: start_assisted_install</em></span></div>

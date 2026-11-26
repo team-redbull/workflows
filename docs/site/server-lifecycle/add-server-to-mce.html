@@ -781,7 +781,9 @@ spec:
           <code>rolling-back</code>), then the VM is deleted on its KV cluster (phase
           <code>deleting-vm</code>, by its run-id label, name and MAC). The failure says so.</li>
           <li><b>Never the VM while its BareMetalHost may exist</b>: metal3 powers a host off through its
-          BMC &mdash; the VM&rsquo;s own kubevirt-redfish &mdash; before it lets it go. A host still deleting
+          BMC &mdash; the VM&rsquo;s own kubevirt-redfish &mdash; before it lets it go, and ejects the
+          virtual media, which is what deletes kubevirt-redfish&rsquo;s <code>&lt;vm&gt;-bootiso-&hellip;</code>
+          disk (nothing owns it). A host still deleting
           at 15 min <b>keeps</b> the VM; the failure names it, its KV cluster and its label.</li>
           <li><b>A conflict at a create</b> (an object of the VM&rsquo;s name that is not this
           install&rsquo;s) removes nothing on the MCE &mdash; a delete by name could take another

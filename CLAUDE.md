@@ -1399,6 +1399,37 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
     it just completed, the VM is known and deleted here; after the VM → settle,
     remove-server-from-mce as for a server, THEN the VM delete, bounded 10 min; after the Agent
     → nothing. Guarded by the run's own id and `cancellation_reason` (WF017).
+  - **The order also cleans the VIRTUAL MEDIA** (found in the lab below): kubevirt-redfish
+    copies Ironic's discovery ISO into a `<vm>-bootiso-<n>` PVC that NOTHING owns, and deletes
+    it when the media is ejected — which metal3 does while it releases the host. So host first,
+    VM second removes that disk too; a VM deleted under a live host would leave it.
+  - **THE 2026-11-26 LAB (cluster-qcl8n) ran the branch end to end** on a real cluster: MCE 5.0
+    (assisted-service only), metal3, OpenShift Virtualization 4.22 and its own kubevirt-redfish
+    (the team fork, `legacy` ids, its own Route `redfish-<kv cluster>.apps…`), the branch's
+    brain and both limbs run locally against their own Temporal dev server, and stubs only for
+    the inventory segment and day1's cluster list. A VM InfraEnv's run made its VM, wrote the
+    three objects, Ironic booted the discovery ISO by virtual media, the guest took a DHCP lease
+    on VLAN 1010 through `enp1s0.1010`, and an Agent registered `known-unbound` with every
+    validation passing, the InfraEnv's four labels and the VM's name as hostname — the run
+    completed. Proven there too: no room in the zone (`CreateVmFailedError`, nothing made); the
+    KV cluster's API unreachable, at the figures and at the create (no VM leaked: create-vm's
+    check after a failed create); no Agent in the hour (host released by metal3 through
+    kubevirt-redfish in about a minute, then the VM deleted); a cancel while waiting for the
+    Agent (settle, the real remove-server-from-mce, then the VM); a cancel and a TERMINATE
+    while create-vm waited for its disk (the child stopped, its VM removed: `REQUEST_CANCEL`
+    works); the MCE's worker gone 7 minutes after the VM existed (the run waited and went on).
+    Found and fixed: the no-Agent failure used the bare-metal wording. What the lab needed that
+    production does not: a node-local bridge NAD (the OVN layer2 overlay DROPS 802.1Q frames,
+    so it cannot carry the tagged VLAN), a router pod for DHCP and NAT on VLAN 1010, the
+    CONVERGED flow ON (with it off, nothing on OpenShift 4.22 fills the host's
+    PreprovisioningImage — the image-customization controller leaves InfraEnv-labelled ones to
+    assisted-service, which does it only with the converged flow — and the BareMetalHost waits
+    in `preparing` for ever; the 2026-10-22 lab on 4.19 ran with it off), and the control-plane
+    host given `192.168.110.2` on the bridge's VLAN so Ironic reaches the agent in the VM.
+    Not settled there, because of the cluster: its single control-plane node's API answers
+    writes in 2–11 s, so CDI, the IPAM webhook's controller and assisted-service keep losing
+    their leases (VM disks and VM starts wait minutes); and one boot of five ended in a QEMU
+    segfault on that nested-virtualization node, the others ran.
   - **Not built, reported**: a VM made by create-vm's own route has no install path; the pool
     draw refuses a multi-word site (`bat-yam`) where this branch, on the convention's parsers,
     accepts one; destroying an installed VM later (the convention's §5, the Inventory

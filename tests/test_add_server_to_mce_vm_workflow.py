@@ -544,6 +544,9 @@ class TestARunThatDoesNotEndWithAnAgentLeavesNoVm:
         assert failure.type == AgentNeverAppearedError.__name__
         assert f"The VM {VM} made on KV cluster {KV_CLUSTER}" in failure.message
         assert f"The VM {VM} was deleted on KV cluster {KV_CLUSTER}" in failure.message
+        # A VM's words, not a bare-metal draw's (found in the 2026-11-26 lab).
+        assert "it never registered an Agent" in failure.message
+        assert "returned to the inventory" not in failure.message and "the bond" not in failure.message
         # Never the VM while its BareMetalHost may exist: metal3 deprovisions through its BMC.
         order = calls["order"]
         assert order.index("delete_host_resources") < order.index("delete_vm_on_cluster")

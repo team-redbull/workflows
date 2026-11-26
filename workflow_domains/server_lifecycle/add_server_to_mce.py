@@ -2145,9 +2145,13 @@ class AddServerToMceWorkflow:
 
         if not agent.found:
             no_agent = _describe_no_agent(name, last_state, wiring="the VM's NIC")
+            # Not the bare-metal summary: a VM is no draw's candidate and goes
+            # back to no inventory — the run removes it.
             raise await self._failed_with_vm(
-                f"{made} could not be installed into {namespace} — "
-                f"{_REJECTION_SUMMARY['no-agent']}: {no_agent}",
+                f"{made} could not be installed into {namespace}: it never registered an "
+                "Agent. An Agent appears once the VM boots the discovery ISO from its virtual "
+                "media and reaches assisted-service, so what failed is downstream of its "
+                f"BareMetalHost — {no_agent}",
                 _REJECTION_TYPE["no-agent"], install_input, activity_queue,
                 why=f"no Agent within {_AGENT_DEADLINE}",
             )

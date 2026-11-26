@@ -11,9 +11,11 @@ from BareMetalHostUCS's `src/yaml_generators.py`, with two deliberate changes:
   * The BMC address is built from what server-scan parsed, not from a fixed
     per-vendor template — see shared/bmc_address.py.
 
-Resource NAMES are byte-identical to the operator's, so a cluster already
-holding resources it created is converged by this workflow rather than
-duplicated by it.
+The Secret's and the BareMetalHost's NAMES are byte-identical to the operator's,
+so a cluster already holding resources it created is converged by this workflow
+rather than duplicated by it. The NMStateConfig's was too (`nmstate-config-<server>`)
+until 2026-11-25; it is now the server's own name, and the activities read and
+delete under both (shared/bmc_address.nmstate_config_names).
 """
 
 from __future__ import annotations
@@ -29,7 +31,7 @@ from shared.bmc_address import (
     k8s_resource_name,
     nmstate_config_name,
 )
-from shared.exceptions import InvalidMacError
+from shared.exceptions import InvalidHostNetworkError, InvalidMacError
 from shared.models.server_lifecycle import BmhResourceRequest, mac_is_valid
 
 BMH_GROUP = "metal3.io"
@@ -71,6 +73,12 @@ DETACHED_ANNOTATION = "baremetalhost.metal3.io/detached"
 BMH_DEPROVISION_FINALIZERS = frozenset({"baremetalhost.metal3.io"})
 
 _INFRAENV_LABEL = "infraenvs.agent-install.openshift.io"
+# The add-server-to-mce run that created the object (the naming convention's §3, AD37), on
+# the BareMetalHost, the NMStateConfig and the BMC Secret alike: the Inventory Controller
+# matches a run still open to the Agent it produced, and counts the machine once.
+INSTALLED_BY_LABEL = "redbull.io/installed-by"
+# A bare-metal server's bond: two members, on two physical ports.
+_BOND_MEMBERS = 2
 
 
 def _validate_macs(request: BmhResourceRequest) -> None:
@@ -90,15 +98,23 @@ def _validate_macs(request: BmhResourceRequest) -> None:
             )
 
 
+def _installed_by(request: BmhResourceRequest) -> dict[str, str]:
+    """`redbull.io/installed-by: <run id>`, or nothing for a request from a brain predating it."""
+    return {INSTALLED_BY_LABEL: request.installed_by} if request.installed_by else {}
+
+
 def build_bmc_secret(request: BmhResourceRequest, username: str, password: str) -> dict[str, Any]:
     """The BMC credentials Secret the BareMetalHost references by name."""
+    metadata: dict[str, Any] = {
+        "name": bmc_secret_name(request.bmc_vendor, request.server_name),
+        "namespace": request.namespace,
+    }
+    if request.installed_by:
+        metadata["labels"] = _installed_by(request)
     return {
         "apiVersion": "v1",
         "kind": "Secret",
-        "metadata": {
-            "name": bmc_secret_name(request.bmc_vendor, request.server_name),
-            "namespace": request.namespace,
-        },
+        "metadata": metadata,
         "type": "Opaque",
         "data": {
             "username": base64.b64encode(username.encode()).decode(),
@@ -124,8 +140,9 @@ def build_baremetal_host(request: BmhResourceRequest) -> dict[str, Any]:
             "namespace": request.namespace,
             # Caller labels FIRST: the InfraEnv label binds this host to the
             # InfraEnv whose NMStateConfig carries the matching label, so a
-            # caller overriding it would split the two across InfraEnvs.
-            "labels": {**request.labels, _INFRAENV_LABEL: request.infra_env},
+            # caller overriding it would split the two across InfraEnvs. The
+            # run's own installed-by wins over a caller's too.
+            "labels": {**request.labels, **_installed_by(request), _INFRAENV_LABEL: request.infra_env},
             "annotations": {
                 "inspect.metal3.io": "disabled",
                 # The node's hostname, so it is DNS-cased for the same
@@ -184,13 +201,14 @@ def _bond_iface(request: BmhResourceRequest) -> dict[str, Any]:
     }
 
 
-def _vlan_iface(request: BmhResourceRequest) -> dict[str, Any]:
-    """The DHCP VLAN riding the bond — the only interface with an address."""
+def _vlan_iface(request: BmhResourceRequest, base: str | None = None) -> dict[str, Any]:
+    """The DHCP VLAN — the only interface with an address — riding `base`: the bond, or a lone NIC."""
+    base = base or request.bond_name
     return {
-        "name": f"{request.bond_name}.{request.vlan_id}",
+        "name": f"{base}.{request.vlan_id}",
         "type": "vlan",
         "state": "up",
-        "vlan": {"base-iface": request.bond_name, "id": request.vlan_id},
+        "vlan": {"base-iface": base, "id": request.vlan_id},
         "ipv4": {
             "enabled": True,
             "dhcp": True,
@@ -208,24 +226,37 @@ def build_nmstate_config(request: BmhResourceRequest) -> dict[str, Any]:
     `spec.interfaces` is the MAC -> logical-name binding the agent applies
     before `spec.config` is evaluated; `spec.config` then refers only to the
     logical names.
+
+    ONE member is a host with one NIC — a VirtualMachine (add-server-to-mce's
+    KubeVirt branch): no bond, the VLAN straight on the NIC. Two is the bond of
+    a bare-metal server. Any other count is refused (InvalidHostNetworkError):
+    nothing selects it, and a bond of one port or of three would be written
+    without anyone having decided it.
     """
     _validate_macs(request)
+    if len(request.bond_members) not in (1, _BOND_MEMBERS):
+        raise InvalidHostNetworkError(
+            f"{request.server_name}: an NMStateConfig is built for one NIC (a VM) or a bond "
+            f"of {_BOND_MEMBERS}; {len(request.bond_members)} interfaces were given"
+        )
     members = [
         _ethernet_iface(member.logical_name, member.mac)
         for member in request.bond_members
     ]
+    if len(members) == 1:
+        layout = [*members, _vlan_iface(request, base=request.bond_members[0].logical_name)]
+    else:
+        layout = [*members, _bond_iface(request), _vlan_iface(request)]
     return {
         "apiVersion": f"{NMSTATE_GROUP}/{NMSTATE_VERSION}",
         "kind": "NMStateConfig",
         "metadata": {
             "name": nmstate_config_name(request.server_name),
             "namespace": request.namespace,
-            "labels": {_INFRAENV_LABEL: request.infra_env},
+            "labels": {**_installed_by(request), _INFRAENV_LABEL: request.infra_env},
         },
         "spec": {
-            "config": {
-                "interfaces": [*members, _bond_iface(request), _vlan_iface(request)]
-            },
+            "config": {"interfaces": layout},
             "interfaces": [
                 {"name": member.logical_name, "macAddress": member.mac}
                 for member in request.bond_members

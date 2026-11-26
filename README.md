@@ -10,7 +10,9 @@ An OpenShift cluster lifecycle orchestrator built on Temporal. Four domains toda
   **add-server-to-mce** takes a healthy, unclaimed server from the **server-scan**
   inventory platform and creates the `BareMetalHost` + BMC `Secret` +
   `NMStateConfig` an InfraEnv needs. It replaces `bmh-generator-operator`, a
-  Kopf operator that queried four vendor managers itself.
+  Kopf operator that queried four vendor managers itself. For an InfraEnv whose
+  hosts are VMs it draws nothing: it has one VM made (**create-vm**, as its
+  child) and installs exactly that one.
 - **server-provisioning** owns getting a racked server INTO that inventory:
   **provision-dell-server** takes a Dell whose iDRAC has an IP and nothing else,
   and discovers it in OpenManage Enterprise, deploys its template (which sets
@@ -198,6 +200,28 @@ per-segment status — which is what lets the bulk route start N of them.
 
 `POST /workflows/server-lifecycle/add-server-to-mce` with the **InfraEnv** to fill
 and its **MCE cluster**.
+
+**An InfraEnv of VMs gets a VM, not a server.** When the InfraEnv's
+`spec.agentLabels` say `redbull.io/size: kv<cpu>` (the size label is the whole
+test: `mtl` is bare metal), the run asks server-scan for nothing. It runs
+`create-vm` as an awaited child (`create-vm-for-<run id>`), which makes ONE
+Halted VM on a KV cluster of the InfraEnv's zone, and then writes for exactly
+that VM an NMStateConfig (one NIC `enp1s0`, the VLAN on it, no bond), the Secret
+`kubevirt-cred-<vm>` and a BareMetalHost whose BMC is the KV cluster's
+kubevirt-redfish (`redfish-virtualmedia://<KUBEVIRT_BMC_HOST_TEMPLATE>/redfish/v1/Systems/<vm>`),
+labelled `redbull.io/kv-cluster` and `redbull.io/created-by` (where its VM lives and which
+one, for `delete-vm` once the host is removed), and waits for its Agent. Every install, bare
+metal or VM, also labels its BareMetalHost, NMStateConfig and BMC Secret
+`redbull.io/installed-by: <its run id>` (AD37), so the Inventory Controller counts a machine
+whose run is still open once. No lock, no hold, no wait for server-scan. A run that
+does not end with an Agent takes the host out of the MCE and then **deletes its
+VM**; a cancel does the same; a terminated run's child cancels itself and removes
+its own VM. `server_names` is refused for such an InfraEnv
+(`NamedServerOnKubevirtInfraEnvError`). What create-vm is asked for comes from
+the InfraEnv's labels (flavor, size, zone) and the MCE's name (site, lifecycle),
+so the MCE must be named `ocp4-<lifecycle>-mce-<site>-<id>`. Full section:
+`docs/site/server-lifecycle/add-server-to-mce.html#kubevirt`. Everything below
+is the bare-metal run.
 
 #### In plain terms — read this first
 
@@ -821,7 +845,9 @@ Under the platform naming convention an InfraEnv `<flavor>-kv<cpu>-<zone>`
 (`c200-kv32-az1`) holds VMs of `<cpu>` vCPUs (an even number) and `<cpu> × 7.5` GiB on one of the
 zone's KV clusters (the hosted clusters whose nodes run the warm-pool VMs); a
 `<flavor>-mtl-<zone>` InfraEnv holds physical servers. A KubeVirt InfraEnv has
-nothing to install until a VM exists, and `create-vm` is that step. Full page:
+nothing to install until a VM exists, and `create-vm` is that step:
+`add-server-to-mce` runs it as its child for such an InfraEnv and installs the
+VM it made (the route below makes a VM with no install). Full page:
 `docs/site/vm-lifecycle/create-vm.html`; the design: `docs/design/create-vm-placement.md`.
 
 **The zone's clusters come from day1, their numbers from the clusters themselves, only
@@ -1138,6 +1164,8 @@ would hide which segments actually got a workflow.
 | `SERVER_SCAN_URL` | `server-lifecycle-config` | inventory API base, INCLUDING `/api/v1` |
 | `SERVER_SCAN_API_TOKEN` | Secret | an **admin** token — add-server-to-mce takes and releases the install lock, and puts a server with no Agent in maintenance |
 | `{HP,DELL,CISCO,INTERSIGHT}_BMC_USERNAME`/`_PASSWORD` | Secret | what Ironic drives the BMC with |
+| `KUBEVIRT_BMC_HOST_TEMPLATE` | `server-lifecycle-config`, optional | a VM InfraEnv's hosts: the kubevirt-redfish Route host of a KV cluster, `host[:port]` naming `{kv_cluster}` (its day1 file name) and nothing else. Unset, only VM installs are refused on that MCE, before any VM is made |
+| `KUBEVIRT_BMC_USERNAME`/`_PASSWORD` | Secret, optional | the kubevirt-redfish user, the same on every KV cluster |
 | `DAY1_REPO_URL`, `DAY1_VALIDATE_COMMAND` | `server-lifecycle-config` | update-nodepool's day1 read and replicas commit, `https://`; OPTIONAL — unset, only update-nodepool is refused on that MCE |
 | `DAY1_GIT_TOKEN` | Secret (credentials, or `day1.tokenSecret`) | its push token; optional with the URL |
 | `ARGO_NAMESPACE`, `ARGO_VALUES_REF` | `server-lifecycle-config` | update-nodepool's Argo CD sync: the Applications' namespace (`openshift-gitops`) and the day1 source's `ref` (`values`) |

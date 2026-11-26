@@ -21,6 +21,9 @@ data:
   {{- with .Values.pxeMap.urls }}
   PXE_MAP_URLS: {{ toJson . | quote }}
   {{- end }}
+  {{- with .Values.kubevirt.bmcHostTemplate }}
+  KUBEVIRT_BMC_HOST_TEMPLATE: {{ . | quote }}
+  {{- end }}
   {{- with .Values.day1.repoUrl }}
   DAY1_REPO_URL: {{ . | quote }}
   {{- end }}

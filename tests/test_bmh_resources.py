@@ -111,6 +111,31 @@ class TestBareMetalHost:
             "/redfish/v1/Systems/vm-0042"
         )
 
+    def test_all_three_objects_say_which_install_run_made_them(self) -> None:
+        """redbull.io/installed-by: <the add-server-to-mce run id> (the naming convention's §3,
+        AD37) on the BareMetalHost, the NMStateConfig and the BMC Secret alike; the run's own
+        value wins over a caller's label of the same key."""
+        request = _request(installed_by="run-1", labels={"redbull.io/installed-by": "a-callers-guess"})
+        bmh = build_baremetal_host(request)
+        assert bmh["metadata"]["labels"] == {"redbull.io/installed-by": "run-1", INFRAENV_LABEL: INFRA_ENV}
+        assert build_nmstate_config(request)["metadata"]["labels"] == {
+            "redbull.io/installed-by": "run-1", INFRAENV_LABEL: INFRA_ENV,
+        }
+        assert build_bmc_secret(request, "u", "p")["metadata"]["labels"] == {"redbull.io/installed-by": "run-1"}
+
+    def test_a_request_from_a_brain_predating_installed_by_labels_nothing_new(self) -> None:
+        request = _request()
+        assert request.installed_by is None
+        assert "redbull.io/installed-by" not in build_baremetal_host(request)["metadata"]["labels"]
+        assert build_nmstate_config(request)["metadata"]["labels"] == {INFRAENV_LABEL: INFRA_ENV}
+        assert "labels" not in build_bmc_secret(request, "u", "p")["metadata"]
+
+    def test_installed_by_is_not_compared_so_a_re_run_meets_its_own_objects(self) -> None:
+        """An existing object made by an earlier run of the same install matches this run's."""
+        mine, earlier = _request(installed_by="run-2"), _request(installed_by="run-1")
+        assert baremetal_host_differences(build_baremetal_host(mine), build_baremetal_host(earlier)) == []
+        assert nmstate_config_differences(build_nmstate_config(mine), build_nmstate_config(earlier)) == []
+
     def test_extra_labels_are_merged_without_losing_the_infraenv_label(self) -> None:
         bmh = build_baremetal_host(_request(labels={"environment": "production"}))
         assert bmh["metadata"]["labels"][INFRAENV_LABEL] == INFRA_ENV
@@ -161,7 +186,8 @@ class TestNMStateConfig:
 
     def test_is_named_and_labelled_as_the_operator_did(self) -> None:
         nmstate = build_nmstate_config(_request())
-        assert nmstate["metadata"]["name"] == f"nmstate-config-{SERVER_K8S}"
+        # The server's own name since 2026-11-25; `nmstate-config-<server>` before.
+        assert nmstate["metadata"]["name"] == SERVER_K8S
         assert nmstate["metadata"]["labels"][INFRAENV_LABEL] == INFRA_ENV
 
     def test_a_non_lacp_mode_omits_lacp_rate(self) -> None:
@@ -318,7 +344,7 @@ class TestKubernetesNameCasing:
             "ocp-hp-gen11-nyc-64c-128gb-hp0001592"
         )
         assert build_nmstate_config(request)["metadata"]["name"] == (
-            "nmstate-config-ocp-hp-gen11-nyc-64c-128gb-hp0001592"
+            "ocp-hp-gen11-nyc-64c-128gb-hp0001592"
         )
 
     def test_the_hostname_annotation_is_lowercased_too(self) -> None:

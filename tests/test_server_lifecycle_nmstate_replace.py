@@ -33,13 +33,17 @@ from shared.models.server_lifecycle import (
     BmcEndpoint,
     BmhResourceRequest,
     BondMember,
+    CreatedResource,
     NmStateConfigReplaceRequest,
 )
 
 NAMESPACE = "inventory"
 SERVER = "ocp-dell-r650-tlv-64c-1024gb-DEL0000485"
 BMH_NAME = SERVER.lower()
-NMSTATE_NAME = f"nmstate-config-{BMH_NAME}"
+# An NMStateConfig is named after its server; until 2026-11-25 it was
+# `nmstate-config-<server>`, and a host installed then still has that one.
+NMSTATE_NAME = BMH_NAME
+LEGACY_NAME = f"nmstate-config-{BMH_NAME}"
 
 RESOURCE = BmhResourceRequest(
     server_name=SERVER,
@@ -134,12 +138,12 @@ class FakeCluster:
         if (plural, name) in self.objects:
             if differences(body, self.objects[(plural, name)]):
                 raise BmhConflictError(f"{name} already exists and does not match")
-            return None
+            return CreatedResource(kind="NMStateConfig", name=name, changed=False)
         stored = json.loads(json.dumps(body))
         stored["metadata"].update(uid="uid-new", resourceVersion="1", creationTimestamp="2026-10-31T10:00:00Z")
         self.objects[(plural, name)] = stored
         self.writes.append(("create", plural, name))
-        return None
+        return CreatedResource(kind="NMStateConfig", name=name, changed=True)
 
 
 @pytest.fixture
@@ -202,6 +206,130 @@ class TestReplacedWhenNothingIsInUse:
         with pytest.raises(BmhResourceError):
             await activities.replace_conflicting_nmstate_config(REQUEST)
         assert stale.writes == []
+
+
+def _under_the_old_name(body: dict) -> dict:
+    """The same NMStateConfig as a limb from before the rename wrote it."""
+    legacy = json.loads(json.dumps(body))
+    legacy["metadata"]["name"] = LEGACY_NAME
+    legacy["metadata"].setdefault("uid", "uid-legacy")
+    legacy["metadata"].setdefault("resourceVersion", "7")
+    return legacy
+
+
+def _matching() -> dict:
+    body = build_nmstate_config(RESOURCE)
+    body["metadata"].update(uid="u", resourceVersion="1")
+    return body
+
+
+class TestTheNameUsedBefore:
+    """A host installed before 2026-11-25 has `nmstate-config-<server>`; nothing renames it.
+
+    One that matches is the server's NMStateConfig and stays where it is; one
+    that differs is replaced under the server's own name; and a server never
+    ends with two (the same MACs twice in one InfraEnv).
+    """
+
+    def test_a_new_one_is_named_after_the_server(self):
+        assert build_nmstate_config(RESOURCE)["metadata"]["name"] == BMH_NAME
+
+    async def test_a_matching_old_named_one_is_left_as_it_is(self, monkeypatch):
+        cluster = FakeCluster(
+            monkeypatch, {("nmstateconfigs", LEGACY_NAME): _under_the_old_name(_matching())}
+        )
+        result = await activities.replace_conflicting_nmstate_config(REQUEST)
+        assert (result.found, result.replaced) == (True, False)
+        assert cluster.writes == []
+
+    async def test_a_differing_old_named_one_is_replaced_under_the_new_name(self, monkeypatch):
+        cluster = FakeCluster(
+            monkeypatch, {("nmstateconfigs", LEGACY_NAME): _under_the_old_name(_stale_nmstate())}
+        )
+        result = await activities.replace_conflicting_nmstate_config(REQUEST)
+
+        assert result.replaced
+        assert result.differences == ["VLAN id: want ['24'], found ['77']"]
+        assert cluster.writes == [
+            ("delete", "nmstateconfigs", LEGACY_NAME),
+            ("create", "nmstateconfigs", NMSTATE_NAME),
+        ]
+        assert ("nmstateconfigs", LEGACY_NAME) not in cluster.objects
+
+    async def test_of_two_that_match_the_old_named_one_goes(self, monkeypatch):
+        cluster = FakeCluster(
+            monkeypatch,
+            {
+                ("nmstateconfigs", NMSTATE_NAME): _matching(),
+                ("nmstateconfigs", LEGACY_NAME): _under_the_old_name(_matching()),
+            },
+        )
+        result = await activities.replace_conflicting_nmstate_config(REQUEST)
+
+        assert result.replaced
+        assert cluster.writes == [("delete", "nmstateconfigs", LEGACY_NAME)]
+        assert list(cluster.objects) == [("nmstateconfigs", NMSTATE_NAME)]
+        assert "a second NMStateConfig" in result.differences[0]
+
+    async def test_of_two_that_differ_both_go_and_one_is_created(self, monkeypatch):
+        cluster = FakeCluster(
+            monkeypatch,
+            {
+                ("nmstateconfigs", NMSTATE_NAME): _stale_nmstate(),
+                ("nmstateconfigs", LEGACY_NAME): _under_the_old_name(_stale_nmstate(vlan=78)),
+            },
+        )
+        result = await activities.replace_conflicting_nmstate_config(REQUEST)
+
+        assert result.replaced
+        assert sorted(cluster.writes) == sorted([
+            ("delete", "nmstateconfigs", NMSTATE_NAME),
+            ("delete", "nmstateconfigs", LEGACY_NAME),
+            ("create", "nmstateconfigs", NMSTATE_NAME),
+        ])
+        assert cluster.writes[-1] == ("create", "nmstateconfigs", NMSTATE_NAME)
+        assert list(cluster.objects) == [("nmstateconfigs", NMSTATE_NAME)]
+
+    async def test_a_new_named_one_that_differs_beside_a_matching_old_one(self, monkeypatch):
+        """Still one in the end, and it is the install's."""
+        cluster = FakeCluster(
+            monkeypatch,
+            {
+                ("nmstateconfigs", NMSTATE_NAME): _stale_nmstate(),
+                ("nmstateconfigs", LEGACY_NAME): _under_the_old_name(_matching()),
+            },
+        )
+        await activities.replace_conflicting_nmstate_config(REQUEST)
+
+        assert list(cluster.objects) == [("nmstateconfigs", NMSTATE_NAME)]
+        written = cluster.objects[("nmstateconfigs", NMSTATE_NAME)]
+        assert nmstate_config_differences(build_nmstate_config(RESOURCE), written) == []
+
+
+class TestCreateWithAnOldNamedOne:
+    """create_nmstate_config never makes a second NMStateConfig for a server."""
+
+    async def test_it_creates_under_the_servers_name(self, monkeypatch):
+        cluster = FakeCluster(monkeypatch)
+        created = await activities.create_nmstate_config(RESOURCE)
+        assert (created.name, created.changed) == (NMSTATE_NAME, True)
+        assert cluster.writes == [("create", "nmstateconfigs", NMSTATE_NAME)]
+
+    async def test_a_matching_old_named_one_is_already_there(self, monkeypatch):
+        cluster = FakeCluster(
+            monkeypatch, {("nmstateconfigs", LEGACY_NAME): _under_the_old_name(_matching())}
+        )
+        created = await activities.create_nmstate_config(RESOURCE)
+        assert (created.name, created.changed) == (LEGACY_NAME, False)
+        assert cluster.writes == []
+
+    async def test_a_differing_old_named_one_is_a_conflict(self, monkeypatch):
+        cluster = FakeCluster(
+            monkeypatch, {("nmstateconfigs", LEGACY_NAME): _under_the_old_name(_stale_nmstate())}
+        )
+        with pytest.raises(BmhConflictError, match=LEGACY_NAME):
+            await activities.create_nmstate_config(RESOURCE)
+        assert cluster.writes == []
 
 
 class TestNothingElseIsCheckedFirst:

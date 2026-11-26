@@ -39,8 +39,11 @@ def _agent(name: str, *, label: str | None = None, macs=(), bound_to: str | None
     return agent
 
 
+LEGACY_NMSTATE = f"nmstate-config-{BMH}"
+
+
 class _FakeCluster:
-    def __init__(self, *, bmh=True, nmstate=True, agents=()):
+    def __init__(self, *, bmh=True, nmstate=True, agents=(), nmstate_name=None):
         self.objects: dict[tuple[str, str], dict] = {}
         if bmh:
             self.objects[("baremetalhosts", BMH)] = {
@@ -49,7 +52,8 @@ class _FakeCluster:
                 "status": {"poweredOn": True},
             }
         if nmstate:
-            self.objects[("nmstateconfigs", f"nmstate-config-{BMH}")] = {
+            # Named after the server; `nmstate-config-<server>` until 2026-11-25.
+            self.objects[("nmstateconfigs", nmstate_name or BMH)] = {
                 "spec": {"interfaces": [{"name": "nic1", "macAddress": "00:25:b5:00:00:01"},
                                         {"name": "nic2", "macAddress": "00:25:b5:00:00:02"}]}
             }
@@ -205,6 +209,28 @@ class TestPowerOff:
         assert fake.patches == []
 
 
+class TestTheNmstateconfigNameUsedBefore:
+    """A host installed before 2026-11-25 has `nmstate-config-<server>`: found and deleted too."""
+
+    async def test_inspect_finds_it_and_its_macs(self, cluster):
+        cluster(_FakeCluster(bmh=False, nmstate_name=LEGACY_NMSTATE,
+                             agents=[_agent("by-mac", macs=["00:25:b5:00:00:02"])]))
+        state = await activities.inspect_inventory_host(REF)
+
+        assert state.nmstate_found
+        assert "00:25:b5:00:00:02" in state.macs
+        assert [a.name for a in state.agents] == ["by-mac"]
+
+    async def test_the_delete_removes_it(self, cluster):
+        fake = cluster(_FakeCluster(nmstate_name=LEGACY_NMSTATE))
+        result = await activities.delete_host_resources(HostDeleteRequest(
+            server_name=SERVER, namespace=NS, agents_must_be_unbound=[]
+        ))
+
+        assert result.removed == [f"NMStateConfig/{LEGACY_NMSTATE}", f"BareMetalHost/{BMH}"]
+        assert not [key for key in fake.objects if key[0] == "nmstateconfigs"]
+
+
 class TestDeleteHostResources:
     async def test_the_nmstateconfig_and_the_bmh_are_deleted_and_nothing_else_touched(self, cluster):
         fake = cluster(_FakeCluster(agents=[_agent("a1", label=BMH)]))
@@ -212,11 +238,16 @@ class TestDeleteHostResources:
             server_name=SERVER, namespace=NS, agents_must_be_unbound=["a1"]
         ))
 
-        assert fake.deleted == [("nmstateconfigs", f"nmstate-config-{BMH}"), ("baremetalhosts", BMH)]
+        # Both names an NMStateConfig may be under are tried, then the host.
+        assert fake.deleted == [
+            ("nmstateconfigs", BMH),
+            ("nmstateconfigs", LEGACY_NMSTATE),
+            ("baremetalhosts", BMH),
+        ]
         # No `detached` annotation, no `spec.online`, no finalizer: metal3
         # deprovisions the host — powers it off — before it lets the BMH go.
         assert fake.patches == []
-        assert result.removed == [f"NMStateConfig/nmstate-config-{BMH}", f"BareMetalHost/{BMH}"]
+        assert result.removed == [f"NMStateConfig/{BMH}", f"BareMetalHost/{BMH}"]
         # Named for after the host is gone: metal3 needs it for the power-off.
         assert result.bmc_secret == f"cisco-ucs-{BMH}"
 

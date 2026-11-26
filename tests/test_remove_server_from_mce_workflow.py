@@ -80,7 +80,7 @@ BOUND = AgentBinding(name="agent-1", cluster_deployment="clusters/hc-01")
 FULL = InventoryHostState(bmh_found=True, nmstate_found=True, powered_on=True, agents=[UNBOUND])
 # The BMC Secret the BMH names (`spec.bmc.credentialsName`).
 SECRET = f"cisco-ucs-{SERVER.lower()}"
-HOST_RESOURCES = [f"NMStateConfig/nmstate-config-{SERVER.lower()}", f"BareMetalHost/{SERVER.lower()}"]
+HOST_RESOURCES = [f"NMStateConfig/{SERVER.lower()}", f"BareMetalHost/{SERVER.lower()}"]
 
 # server-scan's record of the server: no live lock unless a test gives one.
 MEMBERSHIP = ServerMembership(
@@ -237,7 +237,7 @@ def make_mocks(
         calls["teardown_bmh_resources"].append(ref)
         calls["order"].append("teardown")
         return TeardownResult(
-            removed=[f"NMStateConfig/nmstate-config-{ref.server_name.lower()}",
+            removed=[f"NMStateConfig/{ref.server_name.lower()}",
                      f"BareMetalHost/{ref.server_name.lower()}"]
         )
 

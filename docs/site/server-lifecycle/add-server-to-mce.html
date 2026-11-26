@@ -405,12 +405,24 @@ spec:
           <p>In dependency order: the BareMetalHost references the Secret by name, so the Secret goes
           first. All three are idempotent &mdash; an existing resource is success, never an overwrite, so a
           BMC credential or a bond an operator corrected by hand survives a re-run.</p>
+          <p class="note">All three are labelled <code>redbull.io/installed-by: &lt;this run&rsquo;s run id&gt;</code>
+          (the naming convention&rsquo;s &sect;3, AD37): an install run stays open after its Agent appears,
+          and the Inventory Controller matches the two through it to count the machine once. The run id,
+          not the workflow id, because a pool slot&rsquo;s id is used again by later runs. Objects an earlier
+          run of the same install made keep that run&rsquo;s id: a re-run converges on them and relabels
+          nothing.</p>
           <div class="calls">
             <div class="call sm"><span class="verb">POST</span><span class="path">secrets/&lt;vendor&gt;-cred-&lt;server&gt; <em>· credentials from THIS worker&rsquo;s Secret</em></span></div>
             <div class="call nxt"><span class="verb">POST</span><span class="path">baremetalhosts/&lt;server&gt; <em>· customDeploy: start_assisted_install</em></span></div>
-            <div class="call nxt"><span class="verb">POST</span><span class="path">nmstateconfigs/nmstate-config-&lt;server&gt; <em>· 802.3ad bond + tagged VLAN</em></span></div>
+            <div class="call nxt"><span class="verb">POST</span><span class="path">nmstateconfigs/&lt;server&gt; <em>· 802.3ad bond + tagged VLAN</em></span></div>
           </div>
-          <p class="note">Resource names are byte-identical to the operator&rsquo;s, so a cluster already
+          <p class="note">The NMStateConfig is named after its server, like the BareMetalHost (since
+          2026-11-25). Until then it was <code>nmstate-config-&lt;server&gt;</code>, and a host installed
+          then keeps that object: nothing renames it. One still under the old name that matches the
+          install is success and is left where it is; one that differs is replaced, under the
+          server&rsquo;s own name; a server never ends with two.</p>
+          <p class="note">The Secret&rsquo;s and the BareMetalHost&rsquo;s names are byte-identical to the
+          operator&rsquo;s, so a cluster already
           holding resources bmhgen created is <em>converged</em> rather than duplicated. The one
           difference: names are lowercased, because server-scan names carry an uppercase vendor serial
           (<code>…-HP0001592</code>) and Kubernetes rejects any uppercase letter in a resource name
@@ -625,6 +637,7 @@ spec:
               <tr><td class="k">DELL</td><td class="muted">OpenManage</td><td class="muted"><code>idrac-virtualmedia</code></td></tr>
               <tr><td class="k">INTERSIGHT</td><td class="muted">Intersight</td><td class="muted"><code>redfish-virtualmedia</code></td></tr>
               <tr><td class="k">CISCO</td><td class="muted">UCS Central</td><td class="muted"><code>ipmi</code></td></tr>
+              <tr><td class="k">KUBEVIRT</td><td class="muted">a KV cluster&rsquo;s kubevirt-redfish (never from server-scan: <a href="#kubevirt">a VM the run had made</a>)</td><td class="muted"><code>redfish-virtualmedia</code></td></tr>
               <tr><td class="k">null</td><td class="muted">standalone</td><td class="muted"><em>refused</em></td></tr>
             </tbody>
           </table>
@@ -646,6 +659,169 @@ spec:
       consumer had to model. The Segments Manager&rsquo;s <code>Literal</code> accepts plain
       <code>INVENTORY</code> again and rejects the two split values, so an allocation still carrying one
       must be re-typed.</p>
+    </div>
+  </section>
+
+  <!-- ========================================================== KUBEVIRT -->
+  <section id="kubevirt">
+    <div class="sec-head">
+      <div class="eyebrow">An InfraEnv whose hosts are VMs</div>
+      <h2>A KubeVirt InfraEnv: the run has <em>its own VM made</em>, then installs that one</h2>
+      <p class="lede">An InfraEnv says what fills it in the labels its Agents receive. When its
+      <code>spec.agentLabels</code> say <code>redbull.io/size: kv&lt;cpu&gt;</code>, its hosts are
+      VirtualMachines, and the run asks server-scan for <b>nothing</b>: it has one VM made by
+      <a href="/vm-lifecycle/create-vm.html">create-vm</a>, as its child, and installs exactly that VM.
+      Nothing is locked, held or released in server-scan &mdash; the VM is this run&rsquo;s from the moment
+      it exists.</p>
+    </div>
+
+    <div class="grid-2" style="margin-top:24px">
+      <div class="panel">
+        <h3>What tells a VM InfraEnv from a bare-metal one</h3>
+        <p>The <b>size label</b>, and only it: <code>mtl</code> is bare metal, anything starting
+        <code>kv</code> is KubeVirt. The InfraEnv&rsquo;s own <em>name</em> is not read and need not follow
+        the naming convention. A size that starts <code>kv</code> but is not a VM size (<code>kv7</code>,
+        <code>kvx</code>) is still a VM InfraEnv &mdash; refused, never a draw from server-scan.</p>
+        <p>What create-vm is asked for comes from the same labels and from the MCE&rsquo;s name:</p>
+        <div class="table-scroll" style="margin-top:12px">
+          <table>
+            <thead><tr><th>create-vm needs</th><th>from</th><th>rule</th></tr></thead>
+            <tbody>
+              <tr><td class="k">flavor</td><td class="muted"><code>redbull.io/flavor</code></td><td class="muted">a letter, then letters and digits (<code>c200</code>)</td></tr>
+              <tr><td class="k">vCPUs, memory</td><td class="muted"><code>redbull.io/size</code></td><td class="muted"><code>kv&lt;cpu&gt;</code>, even, 2..256; memory is <code>cpu &times; 7.5</code> GiB</td></tr>
+              <tr><td class="k">zone</td><td class="muted"><code>topology.kubernetes.io/zone</code></td><td class="muted"><code>az&lt;N&gt;</code></td></tr>
+              <tr><td class="k">site, lifecycle</td><td class="muted">the MCE&rsquo;s name</td><td class="muted"><code>ocp4-&lt;lifecycle&gt;-mce-&lt;site&gt;-&lt;id&gt;</code>; <code>redbull.io/site</code> must equal that site</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="note">Each label is judged by the rule the InfraEnv <em>name</em> parser applies to that
+        part, so create-vm is asked for exactly what its own route would derive from a conventional name.
+        Every problem is named in one failure &mdash; <code>InfraEnvAgentLabelsError</code>, or
+        <code>MceNameNotConventionalError</code> when it is the MCE&rsquo;s name &mdash; before any VM is
+        made.</p>
+      </div>
+      <div class="panel">
+        <h3>What is written on the MCE for a VM</h3>
+        <p>The same three objects as for a server, in another order and with one NIC:</p>
+        <div class="table-scroll" style="margin-top:12px">
+          <table>
+            <thead><tr><th>object</th><th>name</th><th>what differs</th></tr></thead>
+            <tbody>
+              <tr><td class="k">NMStateConfig</td><td class="muted"><code>&lt;vm&gt;</code></td><td class="muted"><b>First.</b> ONE NIC, <code>enp1s0</code>, no bond: the VLAN <code>enp1s0.&lt;vlan&gt;</code> on DHCP, straight on it</td></tr>
+              <tr><td class="k">Secret</td><td class="muted"><code>kubevirt-cred-&lt;vm&gt;</code></td><td class="muted">the kubevirt-redfish user, <code>KUBEVIRT_BMC_*</code></td></tr>
+              <tr><td class="k">BareMetalHost</td><td class="muted"><code>&lt;vm&gt;</code></td><td class="muted"><code>redfish-virtualmedia://&lt;host&gt;/redfish/v1/Systems/&lt;vm&gt;</code>; boot MAC = the VM&rsquo;s; labelled <code>redbull.io/kv-cluster: &lt;kv cluster&gt;</code> and <code>redbull.io/created-by: &lt;create-vm run id&gt;</code> &mdash; where its VM lives and which one, for <a href="/vm-lifecycle/delete-vm.html">delete-vm</a> once the host is removed</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p><code>&lt;host&gt;</code> is the kubevirt-redfish Route of the KV cluster the VM landed on:
+        one pattern on this MCE&rsquo;s worker (<code>KUBEVIRT_BMC_HOST_TEMPLATE</code>) in which only
+        <code>{kv_cluster}</code> changes. The system id is the VM&rsquo;s name (kubevirt-redfish runs
+        <code>systemIdConvention: legacy</code>). The VLAN is the MCE&rsquo;s inventory VLAN, as for
+        every host; the MAC is the one KubeMacPool gave the VM.</p>
+        <p class="note">The NMStateConfig comes first so the VM can never boot a discovery image from
+        before its own network config &mdash; the IPMI order&rsquo;s reasoning. There is no PXE step (Redfish
+        virtual media) and no NMStateConfig <em>replace</em> step: a differing NMStateConfig under a
+        brand-new VM&rsquo;s name would be another machine&rsquo;s, not a leftover.</p>
+      </div>
+    </div>
+
+    <div class="flow" style="margin-top:24px">
+      <div class="step">
+        <div class="marker">a</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>read_kubevirt_bmc_config</h3>
+            <span class="phase">phase <b>checking-kubevirt-bmc</b></span>
+          </div>
+          <p>Before any VM exists: can this MCE&rsquo;s worker reach a VM&rsquo;s BMC at all &mdash; the host
+          pattern and the Redfish user. Not configured fails the run
+          (<code>KubevirtBmcNotConfiguredError</code>, every missing key named) with nothing made. A worker
+          from <em>before</em> this step cannot answer it and is retried until the new one polls, so that
+          rollout window waits here too, with no VM.</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="marker">b</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>create-vm, as an awaited child</h3>
+            <span class="phase">phase <b>creating-vm</b></span>
+          </div>
+          <p>Id <code>create-vm-for-&lt;this run&rsquo;s id&gt;</code>, on create-vm&rsquo;s own queue. It takes
+          its zone&rsquo;s lock, picks the oldest KV cluster of the zone with room, has the VM created
+          Halted and waits for its disk. It answers with the VM&rsquo;s <b>name</b>, <b>MAC</b> and
+          <b>KV cluster</b> &mdash; all the install needs. The child&rsquo;s <b>run id</b> is the VM&rsquo;s
+          <code>redbull.io/created-by</code> label: the run keeps it (<code>create_vm_run_id</code>), because
+          that is what finds and deletes the VM.</p>
+          <p class="note">Its failure fails the run as <code>CreateVmFailedError</code>, carrying
+          create-vm&rsquo;s own type and message (<code>NoKvClusterFitsError</code>, a lock not had in
+          time, a disk that never bound): create-vm leaves no VM when it does not complete, so there is
+          nothing to undo. One already running under that id &mdash; the child of an earlier run that was
+          terminated &mdash; is <code>CreateVmAlreadyRunningError</code>.</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="marker">c</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>NMStateConfig &rarr; Secret &rarr; BareMetalHost, then the Agent</h3>
+            <span class="phase">phases <b>selecting-server</b> / <b>creating-&hellip;</b> / <b>awaiting-agent</b></span>
+          </div>
+          <p>First one read: a BareMetalHost of the VM&rsquo;s name already on the MCE is another
+          machine&rsquo;s (<code>VmNameClashError</code>; a VM&rsquo;s name is unique across KV clusters only
+          by chance). Then the three creates, and the same wait as for a server: an Agent reporting the
+          VM&rsquo;s MAC, every 30 s, up to an hour. With an Agent the run <b>completes at once</b> &mdash;
+          no lock to hold, no wait for server-scan.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="grid-2" style="margin-top:24px">
+      <div class="panel">
+        <h3>A run that does not end with an Agent leaves no VM</h3>
+        <p>What a bare-metal run does about its lock, this run does about its VM: a Halted orphan would
+        count against its KV cluster for ever, and a re-run makes a <em>new</em> VM.</p>
+        <ul>
+          <li><b>No Agent in the hour</b>, or a create the worker refuses for good: the NMStateConfig and
+          the BareMetalHost are deleted, the run waits for metal3 to let the host go (phase
+          <code>rolling-back</code>), then the VM is deleted on its KV cluster (phase
+          <code>deleting-vm</code>, by its run-id label, name and MAC). The failure says so.</li>
+          <li><b>Never the VM while its BareMetalHost may exist</b>: metal3 powers a host off through its
+          BMC &mdash; the VM&rsquo;s own kubevirt-redfish &mdash; before it lets it go, and ejects the
+          virtual media, which is what deletes kubevirt-redfish&rsquo;s <code>&lt;vm&gt;-bootiso-&hellip;</code>
+          disk (nothing owns it). A host still deleting
+          at 15 min <b>keeps</b> the VM; the failure names it, its KV cluster and its label.</li>
+          <li><b>A conflict at a create</b> (an object of the VM&rsquo;s name that is not this
+          install&rsquo;s) removes nothing on the MCE &mdash; a delete by name could take another
+          host&rsquo;s &mdash; and deletes the VM.</li>
+          <li>The delete has no deadline: a KV cluster that is down is out-waited, the run sitting in
+          <code>deleting-vm</code>. One its cluster refuses (<code>403</code>, an identity that does not
+          match) is named in the failure with its label, to delete by hand.</li>
+        </ul>
+        <p class="note">A run that FAILED has no result: what was done about its VM is in
+        <code>progress.vm_rollback</code>, beside <code>kv_cluster</code>,
+        <code>create_vm_workflow_id</code> and <code>create_vm_run_id</code>.</p>
+      </div>
+      <div class="panel">
+        <h3>Cancel and terminate</h3>
+        <ul>
+          <li><b>Cancelled while create-vm runs</b> (phase <code>cancel-stopping-create-vm</code>): the
+          child is cancelled and removes its own VM. If it had just completed, its VM is known and this
+          run deletes it.</li>
+          <li><b>Cancelled after the VM exists</b>: as for a server, remove-server-from-mce takes the
+          host out of the MCE (after the 2 min settle), <em>then</em> the VM is deleted &mdash; bounded at
+          10 min, after which <code>progress.cancel_rollback</code> says where it is.</li>
+          <li><b>Cancelled after the Agent</b>: nothing is undone; the VM is installed and stays.</li>
+          <li><b>Terminated</b>: terminate runs no code here, so the child&rsquo;s close policy does it
+          &mdash; <code>REQUEST_CANCEL</code>, the one awaited child that is not abandoned. create-vm,
+          cancelled, removes its own VM. A VM whose host this run had already written is <em>not</em>
+          cleaned up by a terminate: use cancel.</li>
+        </ul>
+        <p class="note"><b>Not for a VM InfraEnv:</b> <code>server_names</code> &mdash; the run makes its
+        own VM, so there is no server to name (<code>NamedServerOnKubevirtInfraEnvError</code>, nothing
+        allocated). <code>count</code> works as always: N runs, N VMs, each child taking the zone&rsquo;s
+        lock in turn. A VM made by create-vm&rsquo;s own route has no install path yet.</p>
+      </div>
     </div>
   </section>
 
@@ -932,6 +1108,9 @@ spec:
           <tr><td class="k">pending</td><td class="muted">Run accepted, nothing read yet</td><td class="muted">instant</td></tr>
           <tr><td class="k">resolving-vlan</td><td class="muted">Reading the MCE&rsquo;s <code>INVENTORY</code> segment from the Segments Manager</td><td class="muted">instant</td></tr>
           <tr><td class="k">validating-infraenv</td><td class="muted">Reading the InfraEnv on the MCE: it must exist and, for a pool draw, its <code>agentLabels</code> name the servers to ask for</td><td class="muted">instant</td></tr>
+          <tr><td class="k">checking-kubevirt-bmc</td><td class="muted"><a href="#kubevirt">A VM InfraEnv</a> only: asking this MCE&rsquo;s worker for the kubevirt-redfish host pattern and that its Redfish user is set, before any VM is made</td><td class="muted">instant</td></tr>
+          <tr><td class="k">creating-vm</td><td class="muted">A VM InfraEnv only: create-vm, as this run&rsquo;s child, making ONE VM on a KV cluster of the zone (instead of every server-scan phase)</td><td class="muted">~30 s&ndash;1 min; up to ~45 min when the zone&rsquo;s lock is contended or clusters do not answer</td></tr>
+          <tr><td class="k">deleting-vm</td><td class="muted">A VM InfraEnv only: the run will not end with an Agent, its host is out of the MCE, and its VM is deleted on its KV cluster &mdash; no deadline on a failure, 10 min on a cancel</td><td class="muted">seconds</td></tr>
           <tr><td class="k">acquiring-server</td><td class="muted">server-scan allocating ONE server: locked for this run, live-checked while locked</td><td class="muted">seconds to ~1 min (it reaches a vendor manager); ~22 min at its worst</td></tr>
           <tr><td class="k">selecting-server</td><td class="muted">Name, BMC, the two bond members picked, one BareMetalHost read; refused, the lock goes back and the run fails</td><td class="muted">seconds</td></tr>
           <tr><td class="k">reserving-server</td><td class="muted">Only a named server the allocation refused that the run takes anyway (its own leftover lock, <code>allow_unhealthy</code>): taking server-scan&rsquo;s install lock</td><td class="muted">instant</td></tr>
@@ -960,6 +1139,8 @@ spec:
           <tr><td class="k">MCE_CLUSTER</td><td class="muted"><code>server-lifecycle-config</code></td><td class="muted"><b>Required, no default.</b> Names the queue this worker polls, so it must equal callers&rsquo; <code>mce_cluster</code>.</td></tr>
           <tr><td class="k">SERVER_SCAN_URL</td><td class="muted"><code>server-lifecycle-config</code></td><td class="muted">Inventory API base, <b>including</b> <code>/api/v1</code>.</td></tr>
           <tr><td class="k">SERVER_SCAN_API_TOKEN</td><td class="muted"><code>server-lifecycle-credentials</code></td><td class="muted">An <b>admin</b> token &mdash; the install lock is taken and released, and a server with no Agent put in maintenance, through server-scan&rsquo;s mutation endpoints, and a viewer token fails every run with <code>ServerScanAuthError</code>. May be empty where server-scan runs with auth disabled.</td></tr>
+          <tr><td class="k">KUBEVIRT_BMC_HOST_TEMPLATE</td><td class="muted"><code>server-lifecycle-config</code></td><td class="muted"><b>Optional</b>; only <a href="#kubevirt">a VM InfraEnv</a> needs it. The kubevirt-redfish Route host of a KV cluster: <code>host[:port]</code>, no scheme, no path, naming <code>{kv_cluster}</code> (the cluster&rsquo;s day1 file name) and nothing else in braces. Another shape stops the worker at start.</td></tr>
+          <tr><td class="k">KUBEVIRT_BMC_USERNAME / _PASSWORD</td><td class="muted"><code>server-lifecycle-credentials</code></td><td class="muted"><b>Optional</b>; the kubevirt-redfish user, the same on every KV cluster. Without the template or the pair a VM install fails at its first step, <code>KubevirtBmcNotConfiguredError</code>, before any VM is made.</td></tr>
           <tr><td class="k">{HP,DELL,CISCO,INTERSIGHT}_BMC_USERNAME / _PASSWORD</td><td class="muted"><code>server-lifecycle-credentials</code></td><td class="muted">What Ironic uses to drive the BMC. server-scan never holds these. A vendor with no pair fails its run with <code>BmcCredentialsMissingError</code>.</td></tr>
           <tr><td class="k">RBAC</td><td class="muted">the chart&rsquo;s Role</td><td class="muted">Namespace-scoped. <code>get</code>,<code>create</code>,<code>delete</code> on <code>secrets</code>; <code>get</code>,<code>create</code>,<code>delete</code>,<code>patch</code> on <code>metal3.io/baremetalhosts</code>; <code>get</code>,<code>create</code>,<code>delete</code> on <code>agent-install.openshift.io/nmstateconfigs</code>; <code>get</code>,<code>list</code> on <code>agent-install.openshift.io/agents</code>; <code>get</code> on <code>agent-install.openshift.io/infraenvs</code> (an IPMI server&rsquo;s network boot reads its InfraEnv). <code>delete</code> is the rollback (<code>patch</code> too for a run started before 2026-11-24, which detached the host and dropped its finalizer); <code>list</code> on agents cannot be a <code>get</code>, because an Agent is matched by MAC. Still no <code>update</code> &mdash; nothing here overwrites an existing resource. A missing verb is a non-retryable <code>BmhPrerequisiteMissingError</code>, not a silent retry loop.</td></tr>
         </tbody>
@@ -973,6 +1154,7 @@ spec:
   <footer>
     <span>workflow_domains/server_lifecycle/add_server_to_mce.py</span>
     <span>workflow_domains/server_lifecycle/bond_selection.py</span>
+    <span>workflow_domains/server_lifecycle/vm_install.py</span>
     <span>activities/server_lifecycle/activities.py</span>
     <span>activities/server_lifecycle/server_scan.py</span>
     <span>activities/server_lifecycle/cluster_api.py</span>

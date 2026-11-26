@@ -66,6 +66,10 @@ os.environ.update(
         "HP_BMC_PASSWORD": "test-hp-pass",
         "CISCO_BMC_USERNAME": "test-cisco-user",
         "CISCO_BMC_PASSWORD": "test-cisco-pass",
+        # --- add-server-to-mce's KubeVirt branch: a KV cluster's kubevirt-redfish ---
+        "KUBEVIRT_BMC_HOST_TEMPLATE": "kubevirt-redfish-kubevirt-redfish.apps.{kv_cluster}.example.test",
+        "KUBEVIRT_BMC_USERNAME": "test-redfish-user",
+        "KUBEVIRT_BMC_PASSWORD": "test-redfish-pass",
         # --- add-server-to-mce: the site PXE map, for IPMI servers ---
         "PXE_MAP_URLS": '{"bat-yam": "http://pxe.bat-yam.test:8080"}',
         "PXE_MAP_TOKEN": "test-pxe-token",

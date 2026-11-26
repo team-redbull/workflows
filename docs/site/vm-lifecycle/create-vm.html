@@ -44,11 +44,11 @@
     <p class="lede">
       One request creates <b>one VirtualMachine</b> for a <b>KubeVirt InfraEnv</b>, on the <b>oldest KV
       cluster of the InfraEnv&rsquo;s zone that has room</b> for it under the placement buffer. The VM is
-      created <b>Halted</b>, with a <b>fixed MAC</b> and the label kubevirt-redfish exposes it by, so
-      server-scan lists it as a server named
-      <code>ocp-&lt;flavor&gt;-kv&lt;cpu&gt;-&lt;site&gt;-&lt;MAC&gt;</code> and
-      <a href="/server-lifecycle/add-server-to-mce.html">add-server-to-mce</a> installs it through Ironic
-      like any physical machine.
+      created <b>Halted</b>, with a <b>fixed MAC</b> and the label kubevirt-redfish exposes it by, named
+      <code>ocp-&lt;flavor&gt;-kv&lt;cpu&gt;-&lt;site&gt;-&lt;serial&gt;</code>.
+      <a href="/server-lifecycle/add-server-to-mce.html#kubevirt">add-server-to-mce</a> runs this workflow
+      as its <b>child</b> for a KubeVirt InfraEnv and installs exactly the VM it made, through Ironic and
+      the KV cluster&rsquo;s kubevirt-redfish, like a physical machine.
     </p>
     <p class="lede">A bare-metal InfraEnv has servers to draw. A KubeVirt one &mdash; named
     <code>&lt;flavor&gt;-kv&lt;cpu&gt;-&lt;zone&gt;</code>, say <code>c200-kv32-az1</code>
@@ -355,8 +355,12 @@
           <code>kv_cluster</code> it is on, the per-cluster <code>table</code> (every cluster the run judged,
           with its figures and its skip reason) and <code>not_read</code>, the <code>buffer_percent</code>
           and <code>day1_revision</code> the run decided with, <code>draws</code>, <code>leases</code>,
-          <code>root_disk_phase</code>, and the request echoed back. The VM is Halted, waiting for
-          server-scan to list it and add-server-to-mce to install it.</p>
+          <code>root_disk_phase</code>, and the request echoed back. The VM is Halted. Started by
+          add-server-to-mce, that run now installs it: the name, the MAC and the KV cluster are all it
+          needs (the Redfish host is a pattern on the MCE&rsquo;s worker), and it keeps this run&rsquo;s
+          <b>run id</b> &mdash; the VM&rsquo;s <code>redbull.io/created-by</code> label &mdash; to delete
+          the VM if the install does not end with an Agent. Started from this route, nothing installs
+          it.</p>
         </div>
       </div>
 
@@ -1002,8 +1006,11 @@
       <li><b>Which namespace the VMs go in is not settled</b> (<code>inventory</code> here; the
         kubevirt-redfish facade exposes <code>server-scan-vms</code>). Capacity is right either way: stopped
         VMs are counted in every namespace.</li>
-      <li><b>Making the VM installable is not this run&rsquo;s</b>: add-server-to-mce&rsquo;s KubeVirt branch
-        is a later step.</li>
+      <li><b>Making the VM installable is not this run&rsquo;s</b>: it is
+        <a href="/server-lifecycle/add-server-to-mce.html#kubevirt">add-server-to-mce&rsquo;s KubeVirt
+        branch</a> (since 2026-11-25), which starts this workflow as its child
+        (<code>create-vm-for-&lt;its id&gt;</code>, cancelled with its parent, <code>REQUEST_CANCEL</code>).
+        A VM made from this page&rsquo;s own route has no install path yet.</li>
     </ul>
   </section>
 

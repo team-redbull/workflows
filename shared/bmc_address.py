@@ -34,7 +34,20 @@ _DRIVER_BY_VENDOR = {
     "DELL": "idrac-virtualmedia",
     "INTERSIGHT": "redfish-virtualmedia",
     "CISCO": "ipmi",
+    # A VirtualMachine on a KV cluster, driven through that cluster's
+    # kubevirt-redfish. Not a server-scan vendor: add-server-to-mce names it
+    # itself for the VM its create-vm child made (kubevirt_bmc_endpoint).
+    "KUBEVIRT": "redfish-virtualmedia",
 }
+
+# The vendor add-server-to-mce installs a create-vm VM under.
+KUBEVIRT_BMC_VENDOR = "KUBEVIRT"
+# kubevirt-redfish runs `systemIdConvention: legacy` (the operator, 2026-11-05,
+# confirmed 2026-11-25): a VM's Redfish system id IS its name.
+_KUBEVIRT_SYSTEMS_PATH = "/redfish/v1/Systems/"
+# The one placeholder of KUBEVIRT_BMC_HOST_TEMPLATE: the KV cluster's name as
+# its day1 file spells it (`ocp4-prod-kv-five-az1-a`).
+KUBEVIRT_HOST_PLACEHOLDER = "{kv_cluster}"
 
 # Where a vendor's Redfish system lives, when the BMC did not tell us. Used
 # only as a fallback: a path server-scan actually collected always wins.
@@ -105,6 +118,51 @@ def build_bmc_address(bmc_vendor: str, bmc: BmcEndpoint) -> str:
     return f"{driver}://{authority}{path}"
 
 
+_HOST_WITH_PORT = re.compile(r"^(?P<host>[A-Za-z0-9.-]+)(?::(?P<port>[0-9]{1,5}))?$")
+
+
+def kubevirt_bmc_host_template_problem(template: str) -> str | None:
+    """Why `template` cannot be a KV cluster's kubevirt-redfish host; None when it can.
+
+    The template is `host[:port]` — no scheme, no path — naming `{kv_cluster}`
+    exactly once and no other brace: the kubevirt-redfish Route's host is a
+    fixed pattern in which only the KV cluster's name changes (the operator,
+    2026-11-25). One rule, applied by the worker's settings at start and again
+    by whoever fills it.
+    """
+    if not template:
+        return "it is empty"
+    if template.count(KUBEVIRT_HOST_PLACEHOLDER) != 1:
+        return f"it must name {KUBEVIRT_HOST_PLACEHOLDER} exactly once"
+    filled = template.replace(KUBEVIRT_HOST_PLACEHOLDER, "kv")
+    if "{" in filled or "}" in filled:
+        return f"it must name {KUBEVIRT_HOST_PLACEHOLDER} and nothing else in braces"
+    if _HOST_WITH_PORT.fullmatch(filled) is None:
+        return (
+            "it must be a host, optionally with a port (`kubevirt-redfish-kubevirt-redfish."
+            f"apps.{KUBEVIRT_HOST_PLACEHOLDER}.example.com`): no scheme, no path"
+        )
+    return None
+
+
+def kubevirt_bmc_endpoint(template: str, kv_cluster: str, vm_name: str) -> BmcEndpoint:
+    """Where a VM's Redfish BMC is: its KV cluster's kubevirt-redfish, system `<vm name>`.
+
+    `template` is the worker's KUBEVIRT_BMC_HOST_TEMPLATE, already judged by
+    kubevirt_bmc_host_template_problem. Filled with `str.replace`, never
+    `.format`: this runs in workflow code, where a stray brace must not raise.
+    """
+    authority = template.replace(KUBEVIRT_HOST_PLACEHOLDER, kv_cluster)
+    host, _, port = authority.partition(":")
+    return BmcEndpoint(
+        scheme="https",
+        host=host,
+        host_is_ip=False,
+        port=int(port) if port.isdigit() else None,
+        path=f"{_KUBEVIRT_SYSTEMS_PATH}{vm_name}",
+    )
+
+
 _RFC1123_NAME = re.compile(r"[a-z0-9]([-a-z0-9.]*[a-z0-9])?")
 _MAX_NAME_LENGTH = 253
 
@@ -164,5 +222,26 @@ def bmc_secret_name(bmc_vendor: str, server_name: str) -> str:
 
 
 def nmstate_config_name(server_name: str) -> str:
-    """`nmstate-config-{server}` — likewise unchanged from bmhgen."""
+    """The server's own name — what an NMStateConfig is CREATED under.
+
+    Since 2026-11-25 (the operator): one name for a server's BareMetalHost and
+    its NMStateConfig, bare metal and VM alike. Before, it was
+    `nmstate-config-{server}` (legacy_nmstate_config_name), and hosts installed
+    then keep that object: nothing renames it, so every read and delete looks
+    under BOTH names.
+    """
+    return k8s_resource_name(server_name)
+
+
+def legacy_nmstate_config_name(server_name: str) -> str:
+    """`nmstate-config-{server}` — bmhgen's name, written until 2026-11-25.
+
+    Never created any more. Read and deleted wherever nmstate_config_name is,
+    until no cluster holds one (`oc get nmstateconfig -A`).
+    """
     return f"nmstate-config-{k8s_resource_name(server_name)}"
+
+
+def nmstate_config_names(server_name: str) -> tuple[str, str]:
+    """Both names a server's NMStateConfig may be under: the current one first."""
+    return nmstate_config_name(server_name), legacy_nmstate_config_name(server_name)

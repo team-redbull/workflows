@@ -554,7 +554,7 @@
           <p class="note">remove-server-from-mce reads and releases <b>no lock</b> (since 2026-11-17): this
           run&rsquo;s own lock is this run&rsquo;s to release, in step 8.</p>
           <div class="calls">
-            <div class="call sm"><span class="verb">DELETE</span><span class="path">nmstateconfigs/nmstate-config-&lt;server&gt;</span></div>
+            <div class="call sm"><span class="verb">DELETE</span><span class="path">nmstateconfigs/&lt;server&gt; <em>&middot; and nmstate-config-&lt;server&gt;</em></span></div>
             <div class="call sm"><span class="verb">DELETE</span><span class="path">baremetalhosts/&lt;server&gt; <em>&middot; then read every 15 s until metal3 lets it go</em></span></div>
             <div class="call sm"><span class="verb">DELETE</span><span class="path">secrets/&lt;bmc secret&gt; <em>&middot; only if it outlives the host</em></span></div>
             <div class="call sm"><span class="verb">DELETE</span><span class="path">agents/&lt;agent&gt;</span></div>

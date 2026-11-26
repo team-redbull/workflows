@@ -223,15 +223,18 @@ def test_every_dispatched_activity_is_registered_on_its_queues_worker(workflow_m
 
 
 def test_the_add_server_to_mce_workflow_reaches_both_queues():
-    """Guards the premise of the test above: add-server-to-mce really does span two limbs."""
+    """Guards the premise of the test above: add-server-to-mce really does span its limbs."""
     queues = {queue for _, queue in _dispatched(_WORKFLOW_MODULES[0])}
     assert queues == {
         # The Segments Manager credential lives on the segment-lifecycle limb,
         # on the hub...
         "SEGMENT_LIFECYCLE_ACTIVITY_QUEUE",
         # ...while everything that writes to a cluster is routed to the worker
-        # inside the target MCE, by a queue name computed from the request.
+        # inside the target MCE, by a queue name computed from the request...
         "server_lifecycle_activity_queue",
+        # ...and the VM a KubeVirt InfraEnv's run had made is deleted by the
+        # worker inside ITS KV cluster, the only thing that can.
+        "vm_lifecycle_activity_queue",
     }
 
 

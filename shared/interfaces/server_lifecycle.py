@@ -54,6 +54,8 @@ from shared.models.server_lifecycle import (
     InfraEnvBootState,
     InfraEnvRef,
     InfraEnvState,
+    KubevirtBmcConfig,
+    KubevirtBmcConfigRequest,
     InstallCandidateRecord,
     InventoryHostState,
     MachineDeletion,
@@ -219,8 +221,9 @@ async def put_server_in_maintenance(request: ServerMaintenanceRequest) -> Server
 async def inspect_inventory_host(ref: BmhRef) -> InventoryHostState:
     """remove-server-from-mce: what one server has on this MCE — BMH, NMStateConfig, Agents.
 
-    Reads only. The BMH is `<server>` and the NMStateConfig
-    `nmstate-config-<server>` (both lowercased); Agents are matched by BMAC's
+    Reads only. The BMH and the NMStateConfig are both `<server>` (lowercased);
+    the NMStateConfig is also looked for as `nmstate-config-<server>`, its name
+    until 2026-11-25, which a host installed then still has. Agents are matched by BMAC's
     `agent-install.openshift.io/bmh` label or by ANY MAC of the machine — from
     either resource, and every MAC server-scan holds for the server's name
     (`GET /servers?search=`, confirmed by exact name). server-scan's MACs are
@@ -335,6 +338,25 @@ async def check_infra_env(ref: InfraEnvRef) -> InfraEnvState:
     Raises InfraEnvNotFoundError (non-retryable) when it is absent, and the
     cluster read's BmhPrerequisiteMissingError (403: no `get` on infraenvs;
     404 of the type: the Assisted Installer is not installed on this MCE).
+    """
+    ...
+
+
+@activity.defn
+async def read_kubevirt_bmc_config(request: KubevirtBmcConfigRequest) -> KubevirtBmcConfig:
+    """How THIS MCE's worker reaches a VM's BMC — asked before add-server-to-mce has a VM made.
+
+    A VM is driven through its KV cluster's kubevirt-redfish. Returns the host
+    pattern (KUBEVIRT_BMC_HOST_TEMPLATE, naming `{kv_cluster}`), which the
+    workflow fills with the KV cluster create-vm chose; confirms the Redfish
+    user and password are set (create_bmc_secret reads them later) without
+    returning either. Reads settings only: nothing is called, nothing written.
+
+    Asked FIRST on purpose: a worker not configured for VMs, and a worker from
+    before this activity existed (which Temporal retries until the new one
+    polls), both stop the run while there is still no VM to remove.
+
+    Raises KubevirtBmcNotConfiguredError (non-retryable), naming each missing key.
     """
     ...
 
@@ -481,7 +503,12 @@ async def create_baremetal_host(request: BmhResourceRequest) -> CreatedResource:
 
 @activity.defn
 async def create_nmstate_config(request: BmhResourceRequest) -> CreatedResource:
-    """Create the NMStateConfig (`nmstate-config-{server}`).
+    """Create the NMStateConfig, named after the server (`{server}`, lowercased).
+
+    Until 2026-11-25 the name was `nmstate-config-{server}`, and nothing renames
+    the object of a host installed then. So one still under that name which
+    MATCHES is success, nothing written (the result names it); one that differs
+    is BmhConflictError. A server never ends with two.
 
     Builds an 802.3ad bond over the selected members with the DHCP VLAN riding
     it. Interface names are logical placeholders (`nic1`, `nic2`): the config
@@ -507,7 +534,13 @@ async def replace_conflicting_nmstate_config(
     anything else for it (the PXE map, the NMStateConfig, the Secret, the
     BareMetalHost), in BOTH create orders.
 
-    `nmstate-config-<server>` absent: found=False, nothing written —
+    The server's NMStateConfig is `<server>`, or `nmstate-config-<server>` when
+    it was created before 2026-11-25; both names are read. One under the old
+    name follows the rules below, a replacement is always created under the
+    server's own name, and of two the old-named one is deleted — a server never
+    ends with two.
+
+    Absent: found=False, nothing written —
     create_nmstate_config makes it as always. Present and matching (MAC set,
     VLAN id, InfraEnv label, as create_nmstate_config compares): found=True,
     nothing written. Present and DIFFERING: delete exactly the object compared

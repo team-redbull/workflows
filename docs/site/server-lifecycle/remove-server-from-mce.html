@@ -95,15 +95,17 @@
             <h3>inspect_inventory_host</h3>
             <span class="phase">phase <b>inspecting</b></span>
           </div>
-          <p>Reads only. The BareMetalHost <code>&lt;server&gt;</code> and the NMStateConfig
-          <code>nmstate-config-&lt;server&gt;</code> (both lowercased) in <code>namespace</code>, and the
+          <p>Reads only. The BareMetalHost and the NMStateConfig, both named
+          <code>&lt;server&gt;</code> (lowercased) in <code>namespace</code> &mdash; the NMStateConfig also
+          under <code>nmstate-config-&lt;server&gt;</code>, its name until 2026-11-25, which a host
+          installed then still has &mdash; and the
           host&rsquo;s <b>Agents</b>. An Agent is matched by BMAC&rsquo;s
           <code>agent-install.openshift.io/bmh</code> label, or by <b>any MAC</b> of the machine: the
           BMH&rsquo;s, the NMStateConfig&rsquo;s, and every MAC server-scan holds for the server&rsquo;s name.
           server-scan&rsquo;s MACs are what still find an Agent whose BMH is already gone.</p>
           <div class="calls">
             <div class="call sm"><span class="verb">GET</span><span class="path">baremetalhosts/&lt;server&gt;</span></div>
-            <div class="call sm"><span class="verb">GET</span><span class="path">nmstateconfigs/nmstate-config-&lt;server&gt;</span></div>
+            <div class="call sm"><span class="verb">GET</span><span class="path">nmstateconfigs/&lt;server&gt; <em>&middot; and nmstate-config-&lt;server&gt;</em></span></div>
             <div class="call sm"><span class="verb">LIST</span><span class="path">agents <em>&middot; matched by bmh label or MAC</em></span></div>
             <div class="call sm"><span class="verb">GET</span><span class="path">/servers?search=&lt;name&gt; <em>&middot; server-scan, confirmed by exact name</em></span></div>
           </div>
@@ -143,7 +145,7 @@
           <b>nothing else</b>: no power-off of its own, no <code>detached</code> annotation, no finalizer
           touched.</p>
           <div class="calls">
-            <div class="call sm"><span class="verb">DELETE</span><span class="path">nmstateconfigs/nmstate-config-&lt;server&gt;</span></div>
+            <div class="call sm"><span class="verb">DELETE</span><span class="path">nmstateconfigs/&lt;server&gt; <em>&middot; and nmstate-config-&lt;server&gt;</em></span></div>
             <div class="call sm"><span class="verb">DELETE</span><span class="path">baremetalhosts/&lt;server&gt;</span></div>
           </div>
           <p class="note"><b>metal3 powers the host off.</b> On the delete, metal3 deprovisions the host
@@ -298,7 +300,8 @@
           <li>the BareMetalHost <code>&lt;server&gt;</code> &mdash; metal3 powers the host off and deletes its
             ironic node before it lets it go;</li>
           <li>its BMC <b>Secret</b> &mdash; with the BMH, or explicitly if it outlives it;</li>
-          <li>the NMStateConfig <code>nmstate-config-&lt;server&gt;</code>;</li>
+          <li>the NMStateConfig <code>&lt;server&gt;</code> (and <code>nmstate-config-&lt;server&gt;</code>,
+            the name until 2026-11-25);</li>
           <li>every <b>unbound</b> Agent of the host;</li>
           <li>the host&rsquo;s MACs on its own site&rsquo;s PXE VM, where they chain to this MCE (best
             effort).</li>
@@ -516,7 +519,7 @@
     "found": true,                                <span class="c">// false: nothing of it was on the MCE</span>
     "powered_off": false,                         <span class="c">// metal3's delete powered it off</span>
     "agents_removed": [ "…" ],
-    "resources_removed": [ "NMStateConfig/nmstate-config-ocp-cisco-m6-bat-yam-64c-512gb-wzp12345",
+    "resources_removed": [ "NMStateConfig/ocp-cisco-m6-bat-yam-64c-512gb-wzp12345",
                            "BareMetalHost/ocp-cisco-m6-bat-yam-64c-512gb-wzp12345" ],
     "pxe_cleared": [ "bat-yam/0025b5000001", "bat-yam/0025b5000002" ],
     "pxe_kept":    [],                            <span class="c">// MACs that chain to another MCE</span>

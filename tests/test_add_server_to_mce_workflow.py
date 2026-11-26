@@ -443,7 +443,7 @@ def make_mock_activities(
         server = request.resource.server_name
         if server in (in_use or {}):
             raise ServerLooksInstalledError(
-                f"NMStateConfig nmstate-config-{server} differs from this install, and the "
+                f"NMStateConfig {server} differs from this install, and the "
                 f"server looks installed or in progress: {(in_use or {})[server]}. Nothing "
                 "was changed"
             )
@@ -543,7 +543,7 @@ def make_mock_activities(
             if nmstate_error_once:
                 nmstate_failed_once.append(True)
             raise nmstate_error
-        return _created("NMStateConfig", f"nmstate-config-{request.server_name}")
+        return _created("NMStateConfig", request.server_name)
 
     @activity.defn
     async def get_baremetal_host(ref: BmhRef) -> BmhState:
@@ -613,7 +613,7 @@ def make_mock_activities(
             torn_down.add(request.server_name)
         return HostDeletion(
             removed=[
-                f"NMStateConfig/nmstate-config-{request.server_name}",
+                f"NMStateConfig/{request.server_name}",
                 f"BareMetalHost/{request.server_name}",
             ],
             bmc_secret=f"cisco-ucs-{request.server_name}",
@@ -849,6 +849,21 @@ async def test_happy_path_resolves_vlan_acquires_creates_and_awaits_the_agent():
     # is the proof — and the one diagnostic read happens only on a failure.
     assert len(calls["get_baremetal_host"]) == 1
     assert len(calls["find_agent_for_host"]) == 1
+
+
+async def test_every_object_carries_the_install_runs_id():
+    """redbull.io/installed-by (AD37): the Inventory Controller matches a run still open to the
+    Agent it produced. The RUN id, the same on all three creates, and no other label added."""
+    calls, segment_acts, server_acts = make_mock_activities()
+    async with _Harness(segment_acts, server_acts) as client:
+        handle = await client.start_workflow(
+            AddServerToMceWorkflow.run, AddServerToMceRunArgs(input=INPUT), id=f"test-{uuid.uuid4()}",
+            task_queue=ADD_SERVER_TO_MCE_WORKFLOW_QUEUE,
+        )
+        await asyncio.wait_for(handle.result(), timeout=60)
+    requests = [calls[name][0] for name in ("create_bmc_secret", "create_baremetal_host", "create_nmstate_config")]
+    assert {request.installed_by for request in requests} == {handle.result_run_id}
+    assert all(request.labels == INPUT.labels for request in requests)
 
 
 @pytest.mark.parametrize(
@@ -2647,7 +2662,7 @@ class TestARerunAfterAFailure:
     async def test_the_incident_end_to_end(self):
         calls, segment_acts, server_acts = make_mock_activities(
             nmstate_error=BmhConflictError(
-                "NMStateConfig nmstate-config-x already exists and does not match this "
+                "NMStateConfig x already exists and does not match this "
                 "request: VLAN id: want ['24'], found ['77']"
             ),
             nmstate_error_once=True,

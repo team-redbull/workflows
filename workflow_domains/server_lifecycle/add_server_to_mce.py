@@ -14,6 +14,15 @@ holder. A run started before the rename is an `InstallServerWorkflow` (the
 subclass at the bottom of this file) and replays on its old queue, holding its
 lock as `install-server` to the end.
 
+A KUBEVIRT InfraEnv is not drawn for at all (since 2026-11-25, gated
+`add-server-creates-vm`): when its agentLabels say `redbull.io/size: kv<cpu>`,
+the run has ONE VirtualMachine made — create-vm, as its awaited child — and
+installs exactly that one, with no call to server-scan (_install_vm; the policy
+is vm_install.py). One NIC and no bond, the BMC the VM's KV cluster's
+kubevirt-redfish, NMStateConfig FIRST; and a run that does not end with an
+Agent takes its host out of the MCE and then deletes its VM. The shape below is
+the bare-metal run.
+
 Shape of the run:
 
   1. resolving-vlan      — the VLAN belongs to the target MCE, not to the
@@ -205,6 +214,7 @@ from __future__ import annotations
 import asyncio
 import re
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
 from datetime import timedelta
 from typing import cast
 
@@ -221,18 +231,24 @@ from temporalio.workflow import ActivityCancellationType, ParentClosePolicy
 
 with workflow.unsafe.imports_passed_through():
     from shared.cluster_names import canonical_mce_cluster
+    from shared.infraenv_names import CREATED_BY_LABEL, KV_CLUSTER_LABEL
     from shared.bmc_address import (
         BMC_VENDORS,
+        KUBEVIRT_BMC_VENDOR,
+        bmc_secret_name,
         boots_from_network,
         build_bmc_address,
         is_k8s_resource_name,
+        kubevirt_bmc_endpoint,
     )
     from shared.consts import (
+        CREATE_VM_WORKFLOW_QUEUE,
         REMOVE_SERVER_FROM_MCE_WORKFLOW_QUEUE,
         SEGMENT_LIFECYCLE_ACTIVITY_QUEUE,
         server_lifecycle_activity_queue,
+        vm_lifecycle_activity_queue,
     )
-    from shared.workflow_ids import remove_server_from_mce_workflow_id
+    from shared.workflow_ids import create_vm_child_workflow_id, remove_server_from_mce_workflow_id
     from shared.exceptions import (
         AllowUnhealthyNeedsServerNameError,
         AmbiguousInventorySegmentError,
@@ -244,13 +260,21 @@ with workflow.unsafe.imports_passed_through():
         AgentNeverAppearedError,
         BmhPrerequisiteMissingError,
         BmhRequestInvalidError,
+        CreateVmAlreadyRunningError,
+        CreateVmFailedError,
         InfraEnvAgentLabelsError,
         InfraEnvImageNotUpdatedError,
         InfraEnvNotFoundError,
+        InvalidHostNetworkError,
         InvalidMacError,
         InvalidServerNameError,
         InventorySegmentMismatchError,
         InventorySegmentNotFoundError,
+        KubevirtBmcNotConfiguredError,
+        KvClusterAccessError,
+        KvClusterMismatchError,
+        MceNameNotConventionalError,
+        NamedServerOnKubevirtInfraEnvError,
         NoBondableInterfacesError,
         PxeMapAuthError,
         PxeMapRequestRejectedError,
@@ -262,8 +286,19 @@ with workflow.unsafe.imports_passed_through():
         ServerScanAuthError,
         ServerScanRequestInvalidError,
         UnknownBmcVendorError,
+        VmIdentityConflictError,
+        VmNameClashError,
+        VmRequestRejectedError,
     )
     from shared.interfaces.segment_lifecycle import get_inventory_segment
+    from shared.interfaces.vm_lifecycle import delete_vm_on_cluster
+    from shared.models.vm_lifecycle import (
+        CreateVmInput,
+        CreateVmResult,
+        CreateVmRunArgs,
+        VmDeleteRequest,
+        VmDeleted,
+    )
     from shared.models.segment_lifecycle import SegmentEntry
     from shared.interfaces.server_lifecycle import (
         acquire_servers,
@@ -280,6 +315,7 @@ with workflow.unsafe.imports_passed_through():
         lookup_server_membership,
         publish_infra_env_boot,
         put_server_in_maintenance,
+        read_kubevirt_bmc_config,
         register_pxe_boot,
         release_server,
         replace_conflicting_nmstate_config,
@@ -308,6 +344,8 @@ with workflow.unsafe.imports_passed_through():
         InfraEnvBootRequest,
         InfraEnvBootState,
         InfraEnvRef,
+        KubevirtBmcConfig,
+        KubevirtBmcConfigRequest,
         NmStateConfigReplacement,
         NmStateConfigReplaceRequest,
         PxeBootRequest,
@@ -339,10 +377,14 @@ with workflow.unsafe.imports_passed_through():
         holds_own_lock,
         safety_refusal,
     )
+    from workflow_domains.server_lifecycle import vm_install
 
 # A cancelled install is taken back out of the MCE through remove-server-from-mce,
 # never reimplemented here.
 from workflow_domains.server_lifecycle.remove_server_from_mce import RemoveServerFromMceWorkflow
+
+# A KubeVirt InfraEnv's host is a VM this run has made: create-vm, as its child.
+from workflow_domains.vm_lifecycle.create_vm import CreateVmWorkflow
 
 # Same budget rules as the segment-lifecycle workflows: a bounded per-attempt
 # timeout (with the HTTP client timing out below it) and UNBOUNDED retries, so a
@@ -380,6 +422,14 @@ _PERMANENT_ACTIVITY_ERRORS: tuple[type[Exception], ...] = (
     PxeMapAuthError,
     PxeMapRequestRejectedError,
     ServerLooksInstalledError,
+    # The KubeVirt branch: the limb is not set up for VMs, a host network
+    # nothing selects, and what the KV cluster's worker refuses of a VM delete.
+    KubevirtBmcNotConfiguredError,
+    InvalidHostNetworkError,
+    KvClusterAccessError,
+    KvClusterMismatchError,
+    VmIdentityConflictError,
+    VmRequestRejectedError,
 )
 _RETRY_POLICY = RetryPolicy(
     initial_interval=timedelta(seconds=1),
@@ -511,6 +561,22 @@ _ALLOCATE_PATCH = "add-server-allocates-one-server"
 # run recorded before it tears down through teardown_bmh_resources, which
 # detaches and drops the finalizer after 30 s.
 _ROLLBACK_KEEPS_FINALIZER_PATCH = "add-server-rollback-keeps-finalizer"
+# Gates the KUBEVIRT BRANCH (the operator, 2026-11-25; the naming convention's
+# "A VM needs no draw", AD29): an InfraEnv whose agentLabels say
+# `redbull.io/size: kv<cpu>` gets a VM this run has made — create-vm, as an
+# awaited child — and installs exactly that one, with no server-scan call at
+# all. Asked LAZILY, only for such an InfraEnv, so a bare-metal run records no
+# marker for it. A run recorded before, on such an InfraEnv, draws from
+# server-scan as it did (and fails there: a VM has one NIC).
+_CREATES_VM_PATCH = "add-server-creates-vm"
+# Deleting the run's VM on its KV cluster: one attempt's budget, and how long
+# the CANCEL rollback keeps trying before it says where the VM is — create-vm's
+# own two numbers, for the same activity. A FAILED run's delete has no bound: an
+# outage of the KV cluster is out-waited, visibly, in phase `deleting-vm`.
+_VM_DELETE_TIMEOUT = timedelta(seconds=90)
+_VM_CANCEL_DELETE_DEADLINE = timedelta(minutes=10)
+# The VM's label that says which create-vm run made it: what finds it, by hand too.
+_VM_RUN_LABEL = CREATED_BY_LABEL
 # The allocation live-checks each candidate it locks, one at a time, against
 # its vendor manager — seconds as a rule, ~22 minutes at server-scan's worst
 # (five candidates, UCS Central's probe deadline each). Its HTTP client gives up
@@ -575,7 +641,7 @@ def _acquire_request(
 # `ocp-c200-mtl-five-…`. The name alone can no longer say it: the zone in it is
 # in no server's name (a server's zone is where it is cabled, server-scan's to
 # know), and the site is in no InfraEnv's name (it is its MCE's).
-_POOL_LABELS = ("redbull.io/flavor", "redbull.io/size", "redbull.io/site")
+_POOL_LABELS = (vm_install.FLAVOR_LABEL, vm_install.SIZE_LABEL, vm_install.SITE_LABEL)
 # One `-`-separated word of a server name, as the convention writes them.
 _POOL_WORD = re.compile(r"[a-z0-9]+")
 # For a limb predating the labels, and runs recorded before: how many of the
@@ -784,7 +850,7 @@ def _describe_bmh_state(state: BmhState) -> str:
 
 
 def _describe_no_agent(
-    server_name: str, state: BmhState | None, network_boot: bool = False
+    server_name: str, state: BmhState | None, network_boot: bool = False, wiring: str = "the bond"
 ) -> str:
     """Why one candidate is believed to have failed, for the rejection group.
 
@@ -811,7 +877,7 @@ def _describe_no_agent(
     return (
         f"{server_name} (no Agent in {minutes} min; {observed}. Ironic raised no "
         f"registration error, so the BMC answered and the host was driven to "
-        f"boot — look at the bond, the VLAN{pxe} and DHCP on this segment, not "
+        f"boot — look at {wiring}, the VLAN{pxe} and DHCP on this segment, not "
         f"at the BMC)"
     )
 
@@ -834,6 +900,51 @@ def _describe_waived(waived: list[WaivedHealthCheck]) -> str:
     return " [installed with health checks waived on request: " + "; ".join(
         f"{w.check}: {w.observed}" for w in waived
     ) + "]"
+
+
+@dataclass
+class _VmInstall:
+    """What a KubeVirt InfraEnv's run holds, for whatever must undo it.
+
+    Recorded BEFORE each call that may land (the cancel rollback's rule): the
+    child's id before it is started, `nmstate_sent` / `secret_sent` / `bmh_sent`
+    before each create. `run_id` is the create-vm child's — the value of the
+    VM's `redbull.io/created-by` label, which is what deletes it; taken from the
+    child's handle, since create-vm's result does not carry it.
+    """
+
+    child_id: str
+    # The task starting the child, and the child itself: kept as tasks of their
+    # own so that a cancel of this run never reaches them (see _create_vm).
+    start: asyncio.Future | None = None
+    handle: asyncio.Future | None = None
+    run_id: str | None = None
+    created: CreateVmResult | None = None
+    nmstate_sent: bool = False
+    secret_sent: bool = False
+    bmh_sent: bool = False
+    # What a FAILED run did about its VM (progress: a failed run has no result).
+    rollback: str | None = None
+
+
+def _child_failure(err: BaseException) -> str:
+    """Why a create-vm child did not produce a VM: its own failure type and message, bounded."""
+    cause = getattr(err, "cause", None)
+    if isinstance(cause, ActivityError):
+        cause = cause.cause
+    if isinstance(cause, ApplicationError):
+        return f"{cause.type or 'error'}: {str(cause.message)[:1500]}"
+    if is_cancelled_exception(err):
+        return "it was cancelled"
+    return f"{type(cause or err).__name__}: {str(cause or err)[:500]}"
+
+
+def _activity_failure(err: ActivityError) -> str:
+    """Why an activity call failed, in a few words, for a rollback's note."""
+    cause = err.cause
+    if isinstance(cause, ApplicationError):
+        return f"{cause.type or 'error'}: {str(cause.message)[:300]}"
+    return f"{type(cause or err).__name__}: {str(cause or err)[:300]}"
 
 
 def _reservation_holder() -> str:
@@ -879,6 +990,12 @@ class AddServerToMceWorkflow:
         self._pxe_mapped: tuple[list[BondMember], str] | None = None
         self._installed = False
         self._cancel_rollback: str | None = None
+        # The KubeVirt branch's own state (None on every other run): its
+        # create-vm child, the VM once made, and what was written for it.
+        self._vm: _VmInstall | None = None
+        # This run, to tell its own workflow task from another run's (WF017):
+        # set at the top of run().
+        self._run_id: str | None = None
         # The health refusals waived for the server being installed
         # (`allow_unhealthy`), each with what was observed.
         self._allowed_unhealthy: list[WaivedHealthCheck] = []
@@ -891,12 +1008,17 @@ class AddServerToMceWorkflow:
         does not advance means no `server-lifecycle-worker` is polling that
         MCE's queue, and the queue name says which MCE to go and look at.
         """
+        vm = self._vm
         return AddServerToMceProgress(
             phase=self._phase,
             server_name=self._server_name,
             activity_queue=self._activity_queue,
             allowed_unhealthy=self._allowed_unhealthy,
             cancel_rollback=self._cancel_rollback,
+            kv_cluster=vm.created.kv_cluster if vm and vm.created else None,
+            create_vm_workflow_id=vm.child_id if vm else None,
+            create_vm_run_id=vm.run_id if vm else None,
+            vm_rollback=vm.rollback if vm else None,
         )
 
     @workflow.run
@@ -908,6 +1030,7 @@ class AddServerToMceWorkflow:
         rollback, so the run still ends CANCELED, never FAILED. Terminate runs no
         code at all: it never rolls back.
         """
+        self._run_id = workflow.info().run_id
         try:
             return await self._install(run_args)
         except (asyncio.CancelledError, ActivityError, ChildWorkflowError) as err:
@@ -983,6 +1106,18 @@ class AddServerToMceWorkflow:
                     namespace,
                     infra_env,
                     state.cluster_ref,
+                )
+            # A KUBEVIRT InfraEnv (its size label says `kv<cpu>`) is not drawn
+            # from at all: the run has ONE VM made and installs exactly that
+            # one. Gated on the label's presence like the pool draw below, and
+            # asked of the patch only for such an InfraEnv.
+            if (
+                "agent_labels" in state.model_fields_set
+                and vm_install.is_kubevirt(state.agent_labels)
+                and workflow.patched(_CREATES_VM_PATCH)
+            ):
+                return await self._install_vm(
+                    install_input, state.agent_labels, segment, activity_queue
                 )
             # A pool draw's servers are named by the InfraEnv's flavor, size
             # and site agentLabels, judged here, before anything is allocated:
@@ -1098,6 +1233,8 @@ class AddServerToMceWorkflow:
                 vlan_id=segment.vlan_id,
                 labels=install_input.labels,
                 allowed_unhealthy=self._allowed_unhealthy,
+                # Labels all three objects redbull.io/installed-by (AD37): this RUN's id.
+                installed_by=workflow.info().run_id,
             )
 
             # An NMStateConfig already under the server's name that differs from
@@ -1853,6 +1990,526 @@ class AddServerToMceWorkflow:
                 "PXE map cleanup of %s skipped: %s", candidate.name, result.detail
             )
 
+    # --- a KubeVirt InfraEnv: the run has its VM made, then installs that one ---
+
+    def _own_task(self) -> bool:
+        """Whether this code runs inside THIS run's own workflow task (create_vm.py says why it matters)."""
+        return workflow.in_workflow() and workflow.info().run_id == self._run_id
+
+    def _cancel_requested(self) -> bool:
+        """A cancel a person asked of THIS run — never a worker dropping it from its cache."""
+        return self._own_task() and workflow.cancellation_reason() is not None
+
+    async def _install_vm(
+        self,
+        install_input: AddServerToMceInput,
+        agent_labels: Mapping[str, str],
+        segment: SegmentEntry,
+        activity_queue: str,
+    ) -> AddServerToMceResult:
+        """The KubeVirt branch: one VM made by create-vm, then installed like a server — no server-scan.
+
+        Nothing is drawn, locked, held or released in server-scan: the VM is
+        this run's from the moment its child made it, and server-scan lists it
+        only hours later. What a bare-metal run does about its lock, this run
+        does about its VM instead: a run that does not end with an Agent leaves
+        no VM (create-vm's own rule — a Halted orphan counts against its KV
+        cluster for ever, and a re-run makes a NEW one).
+
+        Everything that can fail without a VM fails first — a named server, the
+        labels, the MCE's name, a worker not set up for VMs — so those leave
+        nothing to undo.
+        """
+        infra_env, namespace = install_input.infra_env, install_input.namespace
+        mce_cluster = install_input.mce_cluster
+        size = agent_labels.get(vm_install.SIZE_LABEL)
+        where = (
+            f"InfraEnv {namespace}/{infra_env} on MCE {mce_cluster} is filled with VMs "
+            f"(its agentLabels say {vm_install.SIZE_LABEL}={size!r})"
+        )
+        if install_input.server_name:
+            raise ApplicationError(
+                f"{where}: the run has one made and installs that one, so there is no "
+                f"server to name ({install_input.server_name!r}). Ask without server_names "
+                "for a new VM. Nothing was allocated or created",
+                type=NamedServerOnKubevirtInfraEnvError.__name__,
+            )
+        wanted = vm_install.derive(
+            agent_labels, mce_cluster=mce_cluster, infra_env=infra_env, namespace=namespace
+        )
+        if wanted.input is None:
+            problems = [*wanted.label_problems, *([wanted.mce_problem] if wanted.mce_problem else [])]
+            raise ApplicationError(
+                f"{where}, and no VM can be asked for: " + "; ".join(problems) + ". "
+                + (
+                    "Fix its spec.agentLabels" if wanted.label_problems
+                    else "A VM's site and lifecycle are its MCE's, read from the MCE's name"
+                )
+                + ". No VM was created",
+                type=(
+                    InfraEnvAgentLabelsError if wanted.label_problems else MceNameNotConventionalError
+                ).__name__,
+            )
+
+        # Before any VM exists: can this MCE's worker reach a VM's BMC at all.
+        # A worker from before this activity cannot answer, and is retried
+        # until the new one polls — so that window waits here, with no VM.
+        self._phase = "checking-kubevirt-bmc"
+        config: KubevirtBmcConfig = await workflow.execute_activity(
+            read_kubevirt_bmc_config,
+            KubevirtBmcConfigRequest(infra_env=infra_env, namespace=namespace),
+            task_queue=activity_queue,
+            start_to_close_timeout=_ACTIVITY_TIMEOUT,
+            schedule_to_start_timeout=_SCHEDULE_TO_START_TIMEOUT,
+            retry_policy=_RETRY_POLICY,
+            cancellation_type=_ON_CANCEL,
+        )
+
+        created = await self._create_vm(wanted.input)
+        vm = cast(_VmInstall, self._vm)
+        name, kv_cluster, mac = created.vm_name, created.kv_cluster, created.mac
+        self._server_name = name
+        made = f"The VM {name} made on KV cluster {kv_cluster} for InfraEnv {infra_env}"
+        bmh_ref = BmhRef(server_name=name, namespace=namespace)
+        bmc = kubevirt_bmc_endpoint(config.host_template, kv_cluster, name)
+        agent: AgentState
+        try:
+            # What create-vm promises, checked all the same before anything is
+            # written from it: a wrong name or MAC would be a host nobody finds.
+            unusable = [
+                problem
+                for problem in (
+                    None if is_k8s_resource_name(name) else f"its name {name!r} is not a Kubernetes name",
+                    None if mac_is_valid(mac) else f"its MAC {mac!r} is not a MAC",
+                    None if created.namespace == namespace
+                    else f"it is in namespace {created.namespace!r}, not {namespace!r}",
+                )
+                if problem is not None
+            ]
+            if unusable:
+                raise await self._failed_with_vm(
+                    f"{made} cannot be installed: " + "; ".join(unusable),
+                    CreateVmFailedError, install_input, activity_queue, why="create-vm's answer was unusable",
+                )
+            request = BmhResourceRequest(
+                server_name=name,
+                namespace=namespace,
+                infra_env=infra_env,
+                bmc_vendor=KUBEVIRT_BMC_VENDOR,
+                bmc=bmc,
+                # ONE member: the limb writes the VLAN straight on it, no bond.
+                bond_members=[
+                    BondMember(
+                        logical_name=vm_install.VM_NIC_NAME, mac=mac, port_key=vm_install.VM_NIC_NAME
+                    )
+                ],
+                vlan_id=segment.vlan_id,
+                # The BareMetalHost says where its VM lives and which create-vm run made it
+                # (the naming convention's §4): the only record on the MCE of what to destroy
+                # once the host is removed. Ours win over a caller's label of the same key;
+                # only the BareMetalHost is labelled from here, never its NMStateConfig or Secret.
+                labels={
+                    **install_input.labels,
+                    KV_CLUSTER_LABEL: kv_cluster,
+                    CREATED_BY_LABEL: cast(str, vm.run_id),
+                },
+                # All three objects also carry redbull.io/installed-by: THIS run's id (AD37).
+                installed_by=workflow.info().run_id,
+            )
+            # A VM's name is unique on its KV cluster by a check and across a
+            # site's clusters only by chance: a host of this name already here
+            # is another machine's, and nothing may be written over it. (No
+            # NMStateConfig replace step either: one that differs under this
+            # name would be that other machine's, not a leftover of this one.)
+            self._phase = "selecting-server"
+            existing = await self._read_bmh(bmh_ref, activity_queue, None)
+            if existing.found:
+                raise await self._failed_with_vm(
+                    f"{made} cannot be installed into {namespace}: a BareMetalHost named "
+                    f"{name} is already there ({_describe_bmh_state(existing)}). It is another "
+                    "machine's and was left alone",
+                    VmNameClashError, install_input, activity_queue, why="its name is taken on the MCE",
+                )
+
+            # The NMStateConfig FIRST, then the Secret the BareMetalHost names,
+            # then the BareMetalHost that lets Ironic power the VM on: the host
+            # must never boot a discovery image from before its own network
+            # config (the IPMI order's reasoning). Each `…_sent` before its call.
+            self._mce_written = True
+            self._phase = "creating-nmstateconfig"
+            vm.nmstate_sent = True
+            nmstate = await self._create(create_nmstate_config, request, activity_queue, None)
+            self._phase = "creating-secret"
+            vm.secret_sent = True
+            secret = await self._create(create_bmc_secret, request, activity_queue, None)
+            self._phase = "creating-baremetalhost"
+            vm.bmh_sent = True
+            bmh = await self._create(create_baremetal_host, request, activity_queue, None)
+
+            self._phase = "awaiting-agent"
+            agent, last_state = await self._await_agent(bmh_ref, [mac], activity_queue, None)
+        except ActivityError as err:
+            if is_cancelled_exception(err):
+                raise
+            # A call the MCE's worker refused for good. The VM goes; the
+            # failure stays the worker's own, and what was undone is in progress.
+            await self._undo_vm(install_input, activity_queue, why="its install failed", failed=err)
+            raise
+
+        if not agent.found:
+            no_agent = _describe_no_agent(name, last_state, wiring="the VM's NIC")
+            # Not the bare-metal summary: a VM is no draw's candidate and goes
+            # back to no inventory — the run removes it.
+            raise await self._failed_with_vm(
+                f"{made} could not be installed into {namespace}: it never registered an "
+                "Agent. An Agent appears once the VM boots the discovery ISO from its virtual "
+                "media and reaches assisted-service, so what failed is downstream of its "
+                f"BareMetalHost — {no_agent}",
+                _REJECTION_TYPE["no-agent"], install_input, activity_queue,
+                why=f"no Agent within {_AGENT_DEADLINE}",
+            )
+
+        # Installed: a cancel from here on undoes nothing. No lock to hold and
+        # none to give back, so no wait for server-scan either.
+        self._installed = True
+        self._phase = "completed"
+        workflow.logger.info(
+            "VM %s on %s installed into InfraEnv %s as Agent %s (vlan=%d, mac=%s)",
+            name, kv_cluster, infra_env, agent.name, segment.vlan_id, mac,
+        )
+        return AddServerToMceResult(
+            server_id=None,
+            server_name=name,
+            infra_env=infra_env,
+            namespace=namespace,
+            mce_cluster=mce_cluster,
+            vlan_id=segment.vlan_id,
+            bmc_vendor=KUBEVIRT_BMC_VENDOR,
+            bmc_address=build_bmc_address(KUBEVIRT_BMC_VENDOR, bmc),
+            bond_macs=[mac],
+            boot_mac=mac,
+            resources_changed=any(resource.changed for resource in (nmstate, secret, bmh)),
+            bmh_registered=True,
+            agent_name=agent.name,
+            attempts=1,
+            kv_cluster=kv_cluster,
+            create_vm_workflow_id=vm.child_id,
+            create_vm_run_id=vm.run_id,
+            stray_cleanups=list(created.stray_cleanups),
+        )
+
+    async def _create_vm(self, vm_input: CreateVmInput) -> CreateVmResult:
+        """create-vm as an AWAITED child; its VM, or the run fails with nothing made.
+
+        THIS RUN'S CANCEL IS KEPT OFF THE CHILD'S HANDLE. Awaited directly, a
+        cancel landing in the same workflow task as the child's completion is
+        erased by the SDK today (the run would carry on installing), and under
+        the SDK's next default raises with the result unread — the VM made, its
+        KV cluster unknown, nothing able to remove it (read in temporalio
+        1.32.0, _await_temporal_operation). So the start and the child run as
+        tasks of their own, waited on with `workflow.wait`, which leaves its
+        futures alone when the waiter is cancelled; the cancel rollback then
+        stops the child itself and reads its real outcome (_undo_cancelled_vm).
+
+        The child's close policy is REQUEST_CANCEL, the one exception to
+        "ABANDON for an awaited child" (the operator, 2026-11-25): a parent
+        that is TERMINATED runs no code, and create-vm, cancelled, removes its
+        own VM — abandoned, it would complete and leave one nobody installs.
+        No retry policy: the VM carries the child's FIRST run id.
+        """
+        self._phase = "creating-vm"
+        child_id = create_vm_child_workflow_id(workflow.info().workflow_id)
+        vm = self._vm = _VmInstall(child_id=child_id)
+        vm.start = asyncio.ensure_future(
+            workflow.start_child_workflow(
+                CreateVmWorkflow.run,
+                CreateVmRunArgs(input=vm_input),
+                id=child_id,
+                task_queue=CREATE_VM_WORKFLOW_QUEUE,
+                parent_close_policy=ParentClosePolicy.REQUEST_CANCEL,
+            )
+        )
+        await workflow.wait([vm.start])
+        try:
+            handle = vm.start.result()
+        except WorkflowAlreadyStartedError:
+            raise ApplicationError(
+                f"create-vm is already running as {child_id}: the child of an earlier run of "
+                f"{workflow.info().workflow_id} that was stopped while it went on. It removes "
+                "its own VM when it is cancelled; let it end, then run again. Nothing was "
+                "created by this run",
+                type=CreateVmAlreadyRunningError.__name__,
+            ) from None
+        vm.handle = handle
+        vm.run_id = handle.first_execution_run_id
+        await workflow.wait([handle])
+        try:
+            vm.created = handle.result()
+        except ChildWorkflowError as err:
+            # A create-vm that FAILED or was CANCELLED ran its own rollback. One
+            # that was terminated or timed out ran no code: what it made is there.
+            cause = err.cause.cause if isinstance(err.cause, ActivityError) else err.cause
+            rolled_back = isinstance(cause, ApplicationError) or is_cancelled_exception(err)
+            raise ApplicationError(
+                f"create-vm {child_id} made no VM for InfraEnv {vm_input.infra_env} "
+                f"(zone {vm_input.zone} of site {vm_input.site}) — {_child_failure(err)}. "
+                + (
+                    "It leaves no VM behind"
+                    if rolled_back
+                    else "It was stopped without its own rollback, so a VM it had made may remain "
+                    f"on a KV cluster of the zone: find it by label {_VM_RUN_LABEL}={vm.run_id}"
+                )
+                + ", and nothing was written on the MCE",
+                type=CreateVmFailedError.__name__,
+            ) from err
+        workflow.logger.info(
+            "create-vm %s made VM %s on %s (mac %s)",
+            child_id, vm.created.vm_name, vm.created.kv_cluster, vm.created.mac,
+        )
+        return vm.created
+
+    async def _failed_with_vm(
+        self,
+        message: str,
+        error: type[Exception],
+        install_input: AddServerToMceInput,
+        activity_queue: str,
+        *,
+        why: str,
+    ) -> ApplicationError:
+        """The failure of a run whose VM exists: the VM undone FIRST, and the failure says how."""
+        note = await self._undo_vm(install_input, activity_queue, why=why)
+        return ApplicationError(f"{message}. {note}", type=error.__name__)
+
+    async def _undo_vm(
+        self,
+        install_input: AddServerToMceInput,
+        activity_queue: str,
+        *,
+        why: str,
+        failed: ActivityError | None = None,
+    ) -> str:
+        """A run that will not end with an Agent takes its host out of the MCE, THEN deletes its VM.
+
+        Never the VM while a BareMetalHost of this run may still be there:
+        metal3 lets a host go only once it has powered it off through its BMC —
+        the VM's own kubevirt-redfish — so a VM deleted first leaves a host
+        that can never finish deleting. A BareMetalHost still deleting at the
+        deadline therefore KEEPS the VM, and the note names it.
+
+        A CONFLICT at a create (a resource of the VM's name that is not this
+        install's) touches nothing on the MCE: whatever is under that name
+        there is another host's, and a delete by name would take it.
+
+        Never raises (a cancel aside, which the run's own handler takes over):
+        what was done is returned, kept in `progress.vm_rollback` and logged.
+        """
+        vm = cast(_VmInstall, self._vm)
+        created = cast(CreateVmResult, vm.created)
+        name, kv_cluster = created.vm_name, created.kv_cluster
+        kept = (
+            f"The VM {name} was KEPT on KV cluster {kv_cluster} (label "
+            f"{_VM_RUN_LABEL}={vm.run_id}): delete it once its BareMetalHost is gone"
+        )
+        cause = failed.cause if failed is not None else None
+        conflict = isinstance(cause, ApplicationError) and cause.type == BmhConflictError.__name__
+        on_mce = "Nothing had been written on the MCE"
+        if conflict:
+            # Only the BareMetalHost's create comes after others of this run:
+            # a conflict at the NMStateConfig, the first, leaves nothing of ours.
+            written = ["NMStateConfig", "Secret"] if vm.bmh_sent else []
+            on_mce = (
+                f"Nothing on the MCE was removed: a resource named for {name} there is not this "
+                "install's, so a delete by name could take another host's"
+                + (f" (this run's {' and '.join(written)} of that name may remain)" if written else "")
+            )
+        elif self._mce_written:
+            self._phase = "rolling-back"
+            try:
+                teardown = await self._teardown(
+                    BmhRef(server_name=name, namespace=install_input.namespace),
+                    activity_queue,
+                    why=why,
+                    schedule_to_start=None,
+                    aftermath=f"the VM {name} is kept on KV cluster {kv_cluster}, since metal3 "
+                    "still needs its BMC to let the host go",
+                )
+                removed = list(teardown.removed)
+                # A Secret whose BareMetalHost was never made is named by no
+                # host, so the teardown cannot learn of it: by its own name.
+                secret_name = bmc_secret_name(KUBEVIRT_BMC_VENDOR, name)
+                if vm.secret_sent and f"Secret/{secret_name}" not in removed and await workflow.execute_activity(
+                    delete_bmc_secret,
+                    BmcSecretRef(namespace=install_input.namespace, name=secret_name),
+                    task_queue=activity_queue,
+                    start_to_close_timeout=_ACTIVITY_TIMEOUT,
+                    retry_policy=_RETRY_POLICY,
+                    cancellation_type=_ON_CANCEL,
+                ):
+                    removed.append(f"Secret/{secret_name}")
+            except (ActivityError, ApplicationError) as err:
+                if is_cancelled_exception(err):
+                    raise
+                reason = (
+                    _activity_failure(err) if isinstance(err, ActivityError)
+                    else f"{err.type}: {str(err.message)[:600]}"
+                )
+                vm.rollback = f"Its host could not be taken out of the MCE ({reason}). {kept}"
+                workflow.logger.warning("Rollback of %s: %s", name, vm.rollback)
+                return vm.rollback
+            on_mce = "Removed from the MCE: " + (", ".join(removed) or "nothing (already absent)")
+        self._phase = "deleting-vm"
+        vm.rollback = f"{on_mce}. {await self._delete_vm(vm, namespace=install_input.namespace)}"
+        workflow.logger.warning("Rollback of %s (%s): %s", name, why, vm.rollback)
+        return vm.rollback
+
+    async def _delete_vm(self, vm: _VmInstall, *, namespace: str, bounded: bool = False) -> str:
+        """Delete the run's VM on its KV cluster, by its run-id label; what happened, in words.
+
+        On the KV cluster's own queue (its worker is the only thing that can),
+        with no schedule-to-start limit: a worker pod away must not strand the
+        VM. A FAILED run's delete is retried without bound — the run sits in
+        `deleting-vm` until that cluster answers; a CANCELLED run's is bounded
+        (`bounded`), then says where the VM is. Never raises.
+        """
+        created = cast(CreateVmResult, vm.created)
+        kv_queue = vm_lifecycle_activity_queue(created.kv_cluster)
+        request = VmDeleteRequest(
+            kv_cluster=created.kv_cluster,
+            namespace=created.namespace or namespace,
+            request_id=cast(str, vm.run_id),
+            name=created.vm_name,
+            mac=created.mac,
+        )
+        try:
+            if bounded:
+                deleted: VmDeleted = await workflow.execute_activity(
+                    delete_vm_on_cluster,
+                    request,
+                    task_queue=kv_queue,
+                    start_to_close_timeout=_VM_DELETE_TIMEOUT,
+                    schedule_to_close_timeout=_VM_CANCEL_DELETE_DEADLINE,
+                    retry_policy=_RETRY_POLICY,
+                    cancellation_type=_ON_CANCEL,
+                )
+            else:
+                deleted = await workflow.execute_activity(
+                    delete_vm_on_cluster,
+                    request,
+                    task_queue=kv_queue,
+                    start_to_close_timeout=_VM_DELETE_TIMEOUT,
+                    retry_policy=_RETRY_POLICY,
+                    cancellation_type=_ON_CANCEL,
+                )
+        except ActivityError as err:
+            if is_cancelled_exception(err):
+                raise
+            return (
+                f"The VM {created.vm_name} on KV cluster {created.kv_cluster} could NOT be "
+                f"deleted ({_activity_failure(err)}): find it by label "
+                f"{_VM_RUN_LABEL}={vm.run_id} and delete it"
+            )
+        if not deleted.deleted:
+            return f"No VM of this run was on KV cluster {created.kv_cluster} any more"
+        return f"The VM {', '.join(deleted.names)} was deleted on KV cluster {created.kv_cluster}"
+
+    async def _roll_back_vm(self, install_input: AddServerToMceInput) -> None:
+        """A CANCELLED KubeVirt run: its child stopped, its host out of the MCE, its VM deleted.
+
+        Only for a cancel a person asked of THIS run (WF017): a run dropped
+        from a worker's cache, or thrown away inside another run's task, calls
+        nothing. Never raises; `progress.cancel_rollback` says what was done.
+        """
+        if not self._cancel_requested():
+            return
+        try:
+            done = await self._undo_cancelled_vm(install_input)
+        except BaseException as err:  # noqa: BLE001 — the rollback never raises; the cancel still ends the run
+            if not self._own_task():
+                raise  # thrown away inside another run's task: nothing more is done here
+            vm = cast(_VmInstall, self._vm)
+            done = (
+                f"the rollback itself was cut off ({type(err).__name__}): a VM labelled "
+                f"{_VM_RUN_LABEL}={vm.run_id} may remain"
+            )
+        workflow.logger.info("Cancelled run rolled back: %s", done)
+        self._phase = "cancelled"
+        self._cancel_rollback = done
+
+    async def _undo_cancelled_vm(self, install_input: AddServerToMceInput) -> str:
+        """What a cancel must undo for a VM, wherever it met the run."""
+        vm = cast(_VmInstall, self._vm)
+        if self._installed and vm.created is not None:
+            return f"{vm.created.vm_name} is installed and stays"
+        if vm.created is None:
+            if vm.start is None:
+                return "nothing to undo: no VM had been asked for"
+            # The child, started or about to be: it is stopped HERE, and its
+            # real outcome read — a cancel is never left to race its completion.
+            self._phase = "cancel-stopping-create-vm"
+            await workflow.wait([vm.start])
+            if vm.start.cancelled() or vm.start.exception() is not None:
+                return f"nothing to undo: create-vm {vm.child_id} was not started by this run"
+            handle = vm.handle = vm.start.result()
+            vm.run_id = handle.first_execution_run_id
+            if not handle.done():
+                try:
+                    await workflow.get_external_workflow_handle(
+                        vm.child_id, run_id=vm.run_id
+                    ).cancel()
+                except Exception as err:  # noqa: BLE001 — it closed first: its outcome is read below
+                    workflow.logger.info(
+                        "create-vm %s took no cancel (%s): reading how it ended", vm.child_id, err
+                    )
+            await workflow.wait([handle])
+            if handle.cancelled() or handle.exception() is not None:
+                return (
+                    f"create-vm {vm.child_id} was stopped with this run and leaves no VM: it "
+                    f"removes its own (label {_VM_RUN_LABEL}={vm.run_id})"
+                )
+            vm.created = handle.result()
+        created = vm.created
+        name = created.vm_name
+        on_mce = "nothing was written on the MCE"
+        if self._mce_written:
+            # A create the cancel cut off may still land: let it, then take the
+            # host out through remove-server-from-mce, never reimplemented here.
+            task_queue = server_lifecycle_activity_queue(install_input.mce_cluster)
+            self._phase = "cancel-settling"
+            await workflow.sleep(_CANCEL_SETTLE)
+            self._phase = "cancel-removing-server"
+            child_id = remove_server_from_mce_workflow_id(name)
+            removal, why = await self._take_out_of_mce(name, install_input)
+            if removal is None:
+                return (
+                    f"{child_id} could not take {name} out of the MCE ({why}): what it left is "
+                    f"still there, so the VM is KEPT on KV cluster {created.kv_cluster} (label "
+                    f"{_VM_RUN_LABEL}={vm.run_id}) — delete it once its BareMetalHost is gone"
+                )
+            on_mce = (
+                f"{name} taken out of the MCE by {child_id}" if removal.found
+                else f"nothing of {name} was on the MCE"
+            )
+            if vm.secret_sent:
+                # The Secret of a host whose BareMetalHost was never made is
+                # named by nothing the child reads: by its own name.
+                try:
+                    await workflow.execute_activity(
+                        delete_bmc_secret,
+                        BmcSecretRef(
+                            namespace=install_input.namespace,
+                            name=bmc_secret_name(KUBEVIRT_BMC_VENDOR, name),
+                        ),
+                        task_queue=task_queue,
+                        start_to_close_timeout=_ACTIVITY_TIMEOUT,
+                        retry_policy=_RETRY_POLICY,
+                        cancellation_type=_ON_CANCEL,
+                    )
+                except ActivityError as err:
+                    on_mce += f" (its BMC Secret could not be deleted: {_activity_failure(err)})"
+        self._phase = "deleting-vm"
+        return f"{on_mce}; " + await self._delete_vm(vm, namespace=install_input.namespace, bounded=True)
+
     async def _roll_back_after_cancel(self, install_input: AddServerToMceInput) -> None:
         """Undo the candidate this cancelled run was installing (the operator, 2026-11-09).
 
@@ -1875,6 +2532,10 @@ class AddServerToMceWorkflow:
         (`cancel_rollback`), and the run still ends CANCELED — what is left then
         is what a cancel left before.
         """
+        if self._vm is not None:
+            # A KubeVirt InfraEnv's run holds no server-scan lock: its own rollback.
+            await self._roll_back_vm(install_input)
+            return
         candidate = self._held
         if candidate is None or self._installed:
             if candidate is not None:
@@ -1900,29 +2561,8 @@ class AddServerToMceWorkflow:
         if self._mce_written:
             self._phase = "cancel-removing-server"
             child_id = remove_server_from_mce_workflow_id(candidate.name)
-            try:
-                removal = await workflow.execute_child_workflow(
-                    RemoveServerFromMceWorkflow.run,
-                    RemoveServerFromMceRunArgs(
-                        input=RemoveServerFromMceInput(
-                            server_name=candidate.name,
-                            mce_cluster=install_input.mce_cluster,
-                            namespace=install_input.namespace,
-                        )
-                    ),
-                    id=child_id,
-                    task_queue=REMOVE_SERVER_FROM_MCE_WORKFLOW_QUEUE,
-                    # It powers off and deletes in a load-bearing order: closing
-                    # this run must never cut it off between two of those steps.
-                    parent_close_policy=ParentClosePolicy.ABANDON,
-                )
-            except (WorkflowAlreadyStartedError, ChildWorkflowError) as err:
-                cause = getattr(err, "cause", None)
-                why = (
-                    f"{cause.type}: {cause.message}" if isinstance(cause, ApplicationError)
-                    else f"{type(err).__name__}: {err}"
-                )
-                workflow.logger.warning("Rollback of cancelled %s failed at %s: %s", candidate.name, child_id, why)
+            removal, why = await self._take_out_of_mce(candidate.name, install_input)
+            if removal is None:
                 self._phase = "cancelled"
                 self._cancel_rollback = (
                     f"{child_id} could not take {candidate.name} out of the MCE ({why}): what it "
@@ -1958,6 +2598,41 @@ class AddServerToMceWorkflow:
         workflow.logger.info("Cancelled run rolled back: %s", done)
         self._phase = "cancelled"
         self._cancel_rollback = done
+
+    async def _take_out_of_mce(
+        self, server_name: str, install_input: AddServerToMceInput
+    ) -> tuple[RemoveServerFromMceResult | None, str | None]:
+        """A cancelled install's host taken out of the MCE by remove-server-from-mce, awaited.
+
+        The removal, or None and why it could not be done (already running on
+        that id, or failed) — never raised: a cancel rollback goes on.
+        """
+        child_id = remove_server_from_mce_workflow_id(server_name)
+        try:
+            removal = await workflow.execute_child_workflow(
+                RemoveServerFromMceWorkflow.run,
+                RemoveServerFromMceRunArgs(
+                    input=RemoveServerFromMceInput(
+                        server_name=server_name,
+                        mce_cluster=install_input.mce_cluster,
+                        namespace=install_input.namespace,
+                    )
+                ),
+                id=child_id,
+                task_queue=REMOVE_SERVER_FROM_MCE_WORKFLOW_QUEUE,
+                # It powers off and deletes in a load-bearing order: closing
+                # this run must never cut it off between two of those steps.
+                parent_close_policy=ParentClosePolicy.ABANDON,
+            )
+        except (WorkflowAlreadyStartedError, ChildWorkflowError) as err:
+            cause = getattr(err, "cause", None)
+            why = (
+                f"{cause.type}: {cause.message}" if isinstance(cause, ApplicationError)
+                else f"{type(err).__name__}: {err}"
+            )
+            workflow.logger.warning("Rollback of cancelled %s failed at %s: %s", server_name, child_id, why)
+            return None, why
+        return removal, None
 
     async def _release_after_removal(
         self, candidate: AcquiredServer, removal: RemoveServerFromMceResult, task_queue: str
@@ -2187,19 +2862,31 @@ class AddServerToMceWorkflow:
         activity_fn: _ResourceCreate,
         request: BmhResourceRequest,
         task_queue: str,
+        schedule_to_start: timedelta | None = _SCHEDULE_TO_START_TIMEOUT,
     ) -> CreatedResource:
-        """Run one idempotent resource create on the target MCE's queue."""
+        """Run one idempotent resource create on the target MCE's queue.
+
+        `schedule_to_start` None, here and in the three helpers below, is the
+        KubeVirt branch once its VM exists: Temporal never retries that
+        timeout, and an MCE worker away for five minutes must not fail a run
+        that then leaves a VM behind (create-vm's own rule, CLAUDE.md §5).
+        """
         return await workflow.execute_activity(
             activity_fn,
             request,
             task_queue=task_queue,
             start_to_close_timeout=_ACTIVITY_TIMEOUT,
-            schedule_to_start_timeout=_SCHEDULE_TO_START_TIMEOUT,
+            schedule_to_start_timeout=schedule_to_start,
             retry_policy=_RETRY_POLICY,
             cancellation_type=_ON_CANCEL,
         )
 
-    async def _read_bmh(self, ref: BmhRef, task_queue: str) -> BmhState:
+    async def _read_bmh(
+        self,
+        ref: BmhRef,
+        task_queue: str,
+        schedule_to_start: timedelta | None = _SCHEDULE_TO_START_TIMEOUT,
+    ) -> BmhState:
         """Read one BareMetalHost back from the target MCE's queue.
 
         Shared by the candidate probe and the registration poll: the same
@@ -2210,13 +2897,17 @@ class AddServerToMceWorkflow:
             ref,
             task_queue=task_queue,
             start_to_close_timeout=_ACTIVITY_TIMEOUT,
-            schedule_to_start_timeout=_SCHEDULE_TO_START_TIMEOUT,
+            schedule_to_start_timeout=schedule_to_start,
             retry_policy=_RETRY_POLICY,
             cancellation_type=_ON_CANCEL,
         )
 
     async def _await_agent(
-        self, ref: BmhRef, macs: list[str], task_queue: str
+        self,
+        ref: BmhRef,
+        macs: list[str],
+        task_queue: str,
+        schedule_to_start: timedelta | None = _SCHEDULE_TO_START_TIMEOUT,
     ) -> tuple[AgentState, BmhState | None]:
         """Wait for an Agent to register for this host, bounded by the deadline.
 
@@ -2234,17 +2925,24 @@ class AddServerToMceWorkflow:
                 agent_ref,
                 task_queue=task_queue,
                 start_to_close_timeout=_ACTIVITY_TIMEOUT,
-                schedule_to_start_timeout=_SCHEDULE_TO_START_TIMEOUT,
+                schedule_to_start_timeout=schedule_to_start,
                 retry_policy=_RETRY_POLICY,
                 cancellation_type=_ON_CANCEL,
             )
             if agent.found:
                 return agent, None
             if workflow.now() - started_at >= _AGENT_DEADLINE:
-                return agent, await self._read_bmh(ref, task_queue)
+                return agent, await self._read_bmh(ref, task_queue, schedule_to_start)
             await workflow.sleep(_AGENT_POLL_INTERVAL)  # durable, replay-safe
 
-    async def _teardown(self, ref: BmhRef, task_queue: str, why: str) -> TeardownResult:
+    async def _teardown(
+        self,
+        ref: BmhRef,
+        task_queue: str,
+        why: str,
+        schedule_to_start: timedelta | None = _SCHEDULE_TO_START_TIMEOUT,
+        aftermath: str | None = None,
+    ) -> TeardownResult:
         """Roll one candidate back so its machine returns to the inventory; `why` it is rolled back.
 
         Since `add-server-rollback-keeps-finalizer` (the operator, 2026-11-24):
@@ -2260,6 +2958,9 @@ class AddServerToMceWorkflow:
         A run recorded before tears down through teardown_bmh_resources, which
         detaches, drops the finalizer after 30 s, and is retried until the host
         is gone.
+
+        `aftermath` replaces the deadline failure's closing words about the
+        server's lock, for a host that has none (a VM).
         """
         if not workflow.patched(_ROLLBACK_KEEPS_FINALIZER_PATCH):
             return await workflow.execute_activity(
@@ -2277,13 +2978,13 @@ class AddServerToMceWorkflow:
             HostDeleteRequest(server_name=ref.server_name, namespace=ref.namespace),
             task_queue=task_queue,
             start_to_close_timeout=_ACTIVITY_TIMEOUT,
-            schedule_to_start_timeout=_SCHEDULE_TO_START_TIMEOUT,
+            schedule_to_start_timeout=schedule_to_start,
             retry_policy=_RETRY_POLICY,
             cancellation_type=_ON_CANCEL,
         )
         started_at = workflow.now()
         while True:
-            bmh = await self._read_bmh(ref, task_queue)
+            bmh = await self._read_bmh(ref, task_queue, schedule_to_start)
             if not bmh.found:
                 break
             if workflow.now() - started_at >= BMH_DELETION_DEADLINE:
@@ -2293,9 +2994,13 @@ class AddServerToMceWorkflow:
                     f"{describe_metal3(bmh)}). Its finalizer is left to metal3, which lets "
                     "the host go only once it has powered it off and deleted its ironic "
                     "node — usually it cannot reach the BMC. The NMStateConfig is deleted; "
-                    "nothing after the delete was done — no PXE unmap, no maintenance, no "
-                    "release — since a BareMetalHost still points at the machine, so its "
-                    "install lock runs to its expiry. Fix the BMC: metal3 finishes on its own",
+                    + (
+                        aftermath
+                        or "nothing after the delete was done — no PXE unmap, no maintenance, no "
+                        "release — since a BareMetalHost still points at the machine, so its "
+                        "install lock runs to its expiry"
+                    )
+                    + ". Fix the BMC: metal3 finishes on its own",
                     type=BmhDeletionTimeoutError.__name__,
                 )
             await workflow.sleep(BMH_DELETION_POLL_INTERVAL)  # durable, replay-safe
@@ -2306,7 +3011,7 @@ class AddServerToMceWorkflow:
             BmcSecretRef(namespace=ref.namespace, name=deletion.bmc_secret),
             task_queue=task_queue,
             start_to_close_timeout=_ACTIVITY_TIMEOUT,
-            schedule_to_start_timeout=_SCHEDULE_TO_START_TIMEOUT,
+            schedule_to_start_timeout=schedule_to_start,
             retry_policy=_RETRY_POLICY,
             cancellation_type=_ON_CANCEL,
         ):

@@ -196,6 +196,9 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   follow-up migrates it: it reports its own item model; what tied it to the busy count,
   `candidate_count`, went with the allocation on 2026-11-17). A slot id is REUSED by later runs, so
   it never identifies a VM or a waiter: the VM's label and the lock's line carry the RUN id.
+  create-vm is ALSO started as add-server-to-mce's awaited child, for a KubeVirt InfraEnv
+  (2026-11-25, §4): then its id is `create-vm-for-<the parent's workflow id>`
+  (`create_vm_child_workflow_id`), never a slot.
 - **cluster-lifecycle is ONE hub limb holding git tokens only.** provision-cluster reads day1 `main`
   (the shared `activities/day1_repo.py` reader), pushes a branch per cluster, opens the merge request
   through GitLab's API on the day1 repo's host (GitLab is the ONLY provider, §4 — same token as
@@ -1235,7 +1238,8 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
     `redbull.io/size: kv<cpu>` is exactly this VM's prefix; the zone is not filtered on yet (the
     convention's open item 2). Its InfraEnv-name fallback (the first three words, 2026-11-19, for a
     limb predating the labels) matches no VM: under the convention the name has no site. The
-    KubeVirt branch, when built, draws no pool anyway (the install puts exactly that VM in).
+    KubeVirt branch (2026-11-25, its own bullet below) draws no pool anyway: the install puts
+    exactly the VM it had made in.
   - **Deploy order**: terminate any old-shape run → redbull-platform's cleanup (the hub limb's
     `gitops/services/` entry, the two agent charts) → the brain → the cluster-lifecycle limb (the
     listing; `HEADROOM_BUFFER_PERCENT` has a default, so the chart need not ship first) → the
@@ -1244,8 +1248,9 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
     `vm-lifecycle-worker` chart (`kvCluster` = the day1 file name, the Temporal Route and CA, the
     storage class, the network; no MAC value since 2026-11-25). A cluster in day1
     without a running worker is skipped as `no-worker`. add-server-to-mce's KubeVirt branch
-    (starting create-vm as an awaited child when the InfraEnv is KubeVirt, AD29) is the operator's
-    LATER step; the input and result are shaped for it, and NO branch exists yet.
+    (starting create-vm as an awaited child when the InfraEnv is KubeVirt, AD29) was the operator's
+    LATER step and is BUILT (2026-11-25, the next bullet): create-vm's input and result were
+    shaped for it and did not change.
   - **What the lead added beyond the reviewed plan, awaiting the operator's confirmation** (each is
     marked above): the 45 s lease guard; the lease re-acquire, `_MAX_LEASES` and
     `KvZoneLeaseExpiredError`; the cancel rollback and the delete by run id; usable nodes without
@@ -1305,11 +1310,158 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
     history; two of its findings still hold: a 16 GiB guest's launcher pod requests about 308 MiB
     over the guest (the flat 1 GiB pad kept from it was replaced by the measured formula on
     2026-11-24, above), and ceph-rbd refuses the root disk's ReadWriteMany + Filesystem.
+- **add-server-to-mce has a KubeVirt InfraEnv's VM MADE, then installs exactly that one — no
+  server-scan at all** (the KubeVirt branch, AD29; with the operator 2026-11-25, on
+  `feat/add-server-to-mce-creates-vm`). The convention's §3 rule 3: "A VM needs no draw". The
+  pieces that are decisions:
+  - **The size LABEL is the marker, and the only one.** An InfraEnv whose `spec.agentLabels` say
+    `redbull.io/size: kv…` is a VM InfraEnv (`mtl` = bare metal), read through ONE helper,
+    `shared/infraenv_names.size_kind`. No second, "kind" label (the operator weighed it and
+    dropped it: the same fact twice, a new way for an InfraEnv to be wrong, and the size is
+    parsed for the vCPU count anyway — do not add one for this). By the PREFIX: `kv7` / `kvx` is
+    still a VM InfraEnv, refused as a label problem, never a silent draw from server-scan. The
+    InfraEnv's own NAME is not read and need not follow the convention.
+  - **What create-vm is asked for comes from the LABELS and the MCE's NAME, derived IN the run**
+    (`workflow_domains/server_lifecycle/vm_install.py`, pure, never raises): flavor, vCPUs and
+    zone from `redbull.io/flavor`, `redbull.io/size`, `topology.kubernetes.io/zone`, each judged
+    by the rule the InfraEnv NAME parser applies to that part (`flavor_problem`,
+    `kubevirt_size_problem`, `zone_problem` — `parse_infraenv` calls the same checks, one copy
+    of each rule); site and lifecycle from `parse_mce_cluster`, the `redbull.io/site` label
+    required to equal it. A test pins that this equals what create-vm's own route derives from a
+    conventional name. Every problem in ONE failure before any VM: `InfraEnvAgentLabelsError`,
+    or `MceNameNotConventionalError` when it is the MCE's name (so the branch needs an MCE named
+    `ocp4-<lifecycle>-mce-<site>-<id>`, as create-vm's route does). This is the one place a
+    name's parts are NOT carried from the API edge: the labels are known only in the run. Replay
+    holds because the inputs are recorded (an activity result, the run's input); a change to
+    what that module REFUSES is a `workflow.patched` change, a change to a derived value is not.
+  - **Gated `add-server-creates-vm`, asked LAZILY** — only for a KubeVirt-labelled InfraEnv, and
+    only when the limb reports `agent_labels` (key presence) — so a bare-metal run records no
+    marker for it and every older golden replays unchanged. A run recorded before, on such an
+    InfraEnv, draws from server-scan as it did.
+  - **Everything that can fail without a VM fails first**: `server_names` on a VM InfraEnv
+    (`NamedServerOnKubevirtInfraEnvError` — the run makes its own VM; re-adding an existing VM
+    is a later change), the labels and the MCE's name, then `read_kubevirt_bmc_config` on the
+    MCE's worker (phase `checking-kubevirt-bmc`): `KubevirtBmcNotConfiguredError`, permanent,
+    naming each missing key. That activity is also what makes the brain-before-limb window
+    SAFE: a limb from before it answers "not registered" (retryable), so the run waits there
+    with no VM made.
+  - **The VM's BMC is its KV cluster's kubevirt-redfish, by ONE host pattern on the MCE's
+    worker**: `KUBEVIRT_BMC_HOST_TEMPLATE`, `host[:port]` naming `{kv_cluster}` (the day1 file
+    name, with `ocp4-`) and nothing else in braces; `bmc.address` =
+    `redfish-virtualmedia://<host>/redfish/v1/Systems/<vm name>` (`legacy` system ids, above);
+    vendor `KUBEVIRT` in `shared/bmc_address.py`, Secret `kubevirt-cred-<vm>` from ONE pair,
+    `KUBEVIRT_BMC_USERNAME` / `_PASSWORD`, the same Redfish user on every KV cluster. All three
+    OPTIONAL on the limb (the `DAY1_*` precedent). The pattern is returned to the run by the
+    preflight (not a secret) and filled in workflow code with `str.replace`, never `.format`.
+    **create-vm's OUTPUT WAS NOT EXTENDED** (the operator asked; reviewed field by field): the
+    name, the MAC and the KV cluster are all the two objects need. The operator first weighed
+    create-vm returning the Redfish endpoint and dropped it: the Route is a fixed pattern.
+  - **The child**: `create-vm-for-<parent workflow id>` (`create_vm_child_workflow_id`; never a
+    slot of create-vm's own route), awaited, **`parent_close_policy=REQUEST_CANCEL` — the ONE
+    awaited child that is not ABANDON** (§5): a TERMINATED parent runs no code, and create-vm,
+    cancelled, removes its own VM, where abandoned it would complete and leave one nobody
+    installs. No retry policy and no continue-as-new in create-vm (a test pins it): the VM's
+    `redbull.io/created-by` label is the child's FIRST run id, which the parent takes from the
+    child's HANDLE (`first_execution_run_id`), not from the result — it is what
+    `delete_vm_on_cluster` needs. Failures: `CreateVmFailedError` (the child's own type and
+    message; a person cancelling the child is this, not a cancel of the parent),
+    `CreateVmAlreadyRunningError`. **The parent's cancel is kept OFF the child's handle** (§5).
+  - **The VM's two network objects** (the operator's hand-made, working ones, pinned field by
+    field in `tests/test_add_server_to_mce_vm_units.py`): the NMStateConfig is ONE NIC,
+    `enp1s0` (the guest's real name — `vm_install.VM_NIC_NAME` — not a placeholder like a
+    bond's `nic1`: the VLAN sits straight on it, and that layout is the proven one), NO bond,
+    `enp1s0.<vlan>` on DHCP; the limb's `build_nmstate_config` writes it for ONE member, the
+    bond for two, and refuses any other count (`InvalidHostNetworkError`). The VLAN is the
+    MCE's inventory VLAN, as for every host. The BareMetalHost is the bare-metal body, plus two
+    labels (2026-11-26, the naming convention's §4 since its PR #2): `redbull.io/kv-cluster: <the
+    KV cluster's day1 file name>` and `redbull.io/created-by: <the create-vm child's RUN id>` —
+    the only record on the MCE of where the VM lives and which VM there, for remove-server-from-mce
+    to destroy it through delete-vm once the host is removed (that integration is NOT built, its
+    questions are the operator's to answer first). Ours win over a caller's `labels` of the same
+    key; the NMStateConfig and the Secret get neither (all three get `installed-by`, below). The keys live in
+    `shared/infraenv_names.py`, read by both sides; no patch — only an activity's input changed,
+    and every `vm-*` golden replays. **Order: NMStateConfig → Secret → BareMetalHost** (bare-metal Redfish keeps
+    Secret → BMH → NMStateConfig): a VM must never boot a discovery image from before its own
+    network config — the IPMI order's reasoning; recorded in the `vm-*` goldens. No PXE step,
+    and NO `replace_conflicting_nmstate_config`: a differing NMStateConfig under a brand-new
+    VM's name is another machine's, not a leftover. A BareMetalHost of the VM's name already
+    there is `VmNameClashError` (names are unique across KV clusters only by chance).
+  - **No lock, no hold, no wait for server-scan**: with an Agent the run completes at once
+    (`server_id` None on the result; `kv_cluster`, `create_vm_workflow_id`, `create_vm_run_id`,
+    `stray_cleanups` on it instead). None of `allocate_server`, `reserve_server`,
+    `release_server`, `put_server_in_maintenance`, `lookup_server_membership` is called, and no
+    `AcquiredServer` is faked.
+  - **A run that does not end with an Agent leaves NO VM** (the operator chose delete over
+    keeping it for a person; create-vm's own rule): no Agent in the hour, or a create the limb
+    refuses for good → the host out of the MCE (`_teardown`, metal3 waited for), THEN
+    `delete_vm_on_cluster` on the KV cluster's own queue (phase `deleting-vm`; by run-id label,
+    name and MAC; unbounded retries, no schedule-to-start — the run sits there through a KV
+    outage). **NEVER the VM while its BareMetalHost may exist**: metal3 lets a host go only
+    after powering it off through its BMC, the VM's own kubevirt-redfish. So a host still
+    deleting at the deadline KEEPS the VM, named with its KV cluster and label. A CONFLICT at a
+    create (`BmhConflictError`) removes nothing on the MCE — a delete by name could take another
+    host's — and deletes the VM. A Secret whose BareMetalHost was never made is deleted by its
+    own name. The failure of an activity is re-raised UNCHANGED; what was undone is in
+    `progress.vm_rollback` (a failed run has no result). Once the VM exists the MCE-side calls
+    pass NO schedule-to-start (create-vm's rule: a worker pod away five minutes must not fail
+    the run and orphan the VM).
+  - **A CANCEL**: during the child → the child is cancelled BY ID (phase
+    `cancel-stopping-create-vm`), its real outcome read, and it removes its own VM — or, had
+    it just completed, the VM is known and deleted here; after the VM → settle,
+    remove-server-from-mce as for a server, THEN the VM delete, bounded 10 min; after the Agent
+    → nothing. Guarded by the run's own id and `cancellation_reason` (WF017).
+  - **The order also cleans the VIRTUAL MEDIA** (found in the lab below): kubevirt-redfish
+    copies Ironic's discovery ISO into a `<vm>-bootiso-<n>` PVC that NOTHING owns, and deletes
+    it when the media is ejected — which metal3 does while it releases the host. So host first,
+    VM second removes that disk too; a VM deleted under a live host would leave it.
+  - **THE 2026-11-26 LAB (cluster-qcl8n) ran the branch end to end** on a real cluster: MCE 5.0
+    (assisted-service only), metal3, OpenShift Virtualization 4.22 and its own kubevirt-redfish
+    (the team fork, `legacy` ids, its own Route `redfish-<kv cluster>.apps…`), the branch's
+    brain and both limbs run locally against their own Temporal dev server, and stubs only for
+    the inventory segment and day1's cluster list. A VM InfraEnv's run made its VM, wrote the
+    three objects, Ironic booted the discovery ISO by virtual media, the guest took a DHCP lease
+    on VLAN 1010 through `enp1s0.1010`, and an Agent registered `known-unbound` with every
+    validation passing, the InfraEnv's four labels and the VM's name as hostname — the run
+    completed. Proven there too: no room in the zone (`CreateVmFailedError`, nothing made); the
+    KV cluster's API unreachable, at the figures and at the create (no VM leaked: create-vm's
+    check after a failed create); no Agent in the hour (host released by metal3 through
+    kubevirt-redfish in about a minute, then the VM deleted); a cancel while waiting for the
+    Agent (settle, the real remove-server-from-mce, then the VM); a cancel and a TERMINATE
+    while create-vm waited for its disk (the child stopped, its VM removed: `REQUEST_CANCEL`
+    works); the MCE's worker gone 7 minutes after the VM existed (the run waited and went on).
+    Found and fixed: the no-Agent failure used the bare-metal wording. What the lab needed that
+    production does not: a node-local bridge NAD (the OVN layer2 overlay DROPS 802.1Q frames,
+    so it cannot carry the tagged VLAN), a router pod for DHCP and NAT on VLAN 1010, the
+    CONVERGED flow ON (with it off, the host's PreprovisioningImage was never
+    filled and the BareMetalHost sat in `preparing`; the 2026-10-22 lab on 4.19 ran with it
+    off), and the control-plane
+    host given `192.168.110.2` on the bridge's VLAN so Ironic reaches the agent in the VM.
+    The converged-flow point is an OBSERVATION on that cluster, made while assisted-service was
+    itself restarting; the controllers' filter was not read — confirm which flow each
+    production MCE runs before relying on either. Not settled there: its single control-plane
+    node's API answers writes in 2–11 s, so CDI, the IPAM webhook's controller and
+    assisted-service keep losing their leases (VM disks and VM starts wait minutes); and of
+    the TWO guests seen booting, one ran to its Agent and one ended in a QEMU segfault 70 s in
+    (no symbols in the core). Unexplained: the node is a nested-virtualization VM, but one in
+    two is no basis to call it the lab's — repeated boots of this VM spec on a bare-metal KV
+    node settle it. Also not proven there: an MCE and a KV cluster that are DIFFERENT clusters
+    (Ironic reaching the KV cluster's Route, its kubevirt-redfish fetching the ISO from the
+    MCE's Ironic), the production NAD and `redfish-enabled` label (the lab used its own of
+    each), a wrong Redfish password, the KV worker down during `deleting-vm`, and a
+    BareMetalHost that never finishes deleting (all three are in the workflow tests only).
+  - **Not built, reported**: a VM made by create-vm's own route has no install path; the pool
+    draw refuses a multi-word site (`bat-yam`) where this branch, on the convention's parsers,
+    accepts one; destroying an installed VM later (the convention's §5, the Inventory
+    Controller) is delete-vm, on `main` since 2026-11-26, but nothing starts it yet — the KV
+    cluster and run id it needs are on the BareMetalHost's labels (above), which a removal that
+    already deleted the host can no longer read; redbull-platform's own `server-lifecycle-worker` chart is not synced
+    and needs the three keys by hand. Not provable in tests: a VM booted by Ironic through
+    kubevirt-redfish into an Agent — the first real run is that test.
 - **delete-vm (domain `vm-lifecycle`) deletes ONE VM by name from its KV cluster and COMPLETES ONLY
   WHEN NOTHING OF IT IS LEFT IN KUBERNETES, ITS PERSISTENTVOLUMES INCLUDED**
   (`workflow_domains/vm_lifecycle/delete_vm.py`, own queue `delete-vm-workflow`, id
   `delete-vm-<kv cluster>_<vm name>`). Planned and built with the operator 2026-11-26
-  (`~/.claude/plans/i-want-u-to-frolicking-hopcroft.md`); (operator) marks his decisions, the rest
+  (`~/.claude/plans/i-want-u-to-frolicking-hopcroft.md`); (operator) marks the operator's decisions, the rest
   is the lead's. Why it exists: nothing removed an INSTALLED VM — remove-server-from-mce takes the
   host out of the MCE and stops, so the VM stayed Halted on its KV cluster, counted against its
   capacity for ever, its disks in the array; and `delete_vm_on_cluster` is a rollback tool (it
@@ -1476,6 +1628,36 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   (`lookup_install_candidate`) and sorted by `health_waiver.py`; every waiver lands in
   `allowed_unhealthy` (progress, result, each create's input). No patch gate: no recorded run
   carries the field.
+- **Every install labels its BareMetalHost, NMStateConfig and BMC Secret
+  `redbull.io/installed-by: <the add-server-to-mce RUN id>`** (2026-11-26, the naming
+  convention's §3 and AD37; raised in PR #28's review). Bare metal and VM alike. Why: an install
+  run stays RUNNING after its Agent appears (bare metal: up to a day, waiting for server-scan),
+  so the Inventory Controller (herzi) counts that machine twice — an open run and a free Agent —
+  and orders too few; the label lets it match the two and count once. herzi does NOT read it yet
+  (its design accepts the double count as "seconds", L10): writing it now is harmless and unblocks
+  it. A RUN id, not the workflow id: a pool slot's id is used again by later runs. It travels as
+  `BmhResourceRequest.installed_by` (set to `workflow.info().run_id` on both paths; None from a
+  brain predating it, and then nothing is labelled), NOT in `labels`, which reach the
+  BareMetalHost only; the limb's three builders write it (`bmh_resources.INSTALLED_BY_LABEL`), the
+  run's value winning over a caller's label of that key. The "already there" rules compare only
+  the InfraEnv label, so a re-run meeting objects an earlier run of the same install made converges
+  as before — and those objects keep the EARLIER run's id: nothing relabels them (no update verb).
+  No patch: only activities' inputs changed, every golden replays.
+- **An NMStateConfig is named after its SERVER, like its BareMetalHost** (the operator,
+  2026-11-25: "just the server/vm name without nmstate-config prefix", bare metal and VM alike).
+  Until then it was bmhgen's `nmstate-config-<server>`, and a host installed then KEEPS that
+  object: nothing renames it. So `shared/bmc_address.nmstate_config_names` gives both, and the
+  limb reads and deletes under BOTH wherever it reads or deletes one (`inspect_inventory_host`,
+  `inspect_bound_host`, `delete_host_resources`, `teardown_bmh_resources`, the IPMI publish
+  wait, which waits on the NEWEST of two) and CREATES only the new name. A server never ends
+  with two (the same MACs twice in one InfraEnv): `create_nmstate_config` takes a matching
+  old-named one as "already there" and a differing one as `BmhConflictError`; the replace step
+  below leaves a matching one where it is, replaces a differing one under the server's own
+  name, and of two deletes the old-named one. Limb only — no workflow command changed, so no
+  patch. Known, accepted: during the limb's rolling update a create answered by a new pod,
+  lost, and retried on an old one can leave both names; the next replace step or removal
+  clears it. Delete `legacy_nmstate_config_name` and its reads once `oc get nmstateconfig -A`
+  shows no `nmstate-config-*` on any MCE.
 - **A conflicting NMStateConfig is REPLACED** (the operator, 2026-10-31: an install failed on an
   AlreadyExists NMStateConfig, and deleting it by hand was the only way on).
   `replace_conflicting_nmstate_config` runs once per candidate right after its lock and BEFORE
@@ -1753,7 +1935,8 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   answering, the cluster becomes a row of the table instead of holding its zone's lock), the
   create on one cluster (to its own 90-s deadline) and the check of a cluster that failed it
   (1 min; either way the run moves on to the next cluster, §4), and the cancel rollback's delete
-  (10 min, then the run still ends CANCELED and says where the VM is).
+  (10 min, then the run still ends CANCELED and says where the VM is) — and the same delete in
+  add-server-to-mce's own cancel rollback of a VM it had made (10 min, §4).
 - **Name an error type ONCE — build the non-retryable list from the CLASSES.** Temporal matches
   `non_retryable_error_types` against the error's type NAME, so a string literal with a typo in it
   reads as "retryable" and there is nothing to notice. add-server-to-mce keeps a
@@ -1859,6 +2042,28 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   verifies by read-back and must never be cut off between the mutation and the verify; its id is
   the dedup key a re-run or a manual start meets. The builders-in-`shared/workflow_ids.py`
   arrangement is what makes both possible (a workflow can never import a router).
+  **THE ONE EXCEPTION is add-server-to-mce → create-vm, `REQUEST_CANCEL`** (the operator,
+  2026-11-25): what create-vm does when cut off is exactly what is wanted — cancelled, it
+  removes its own VM (its rollback is built for it) — while ABANDONed by a TERMINATED parent it
+  would complete and leave a Halted VM that nobody installs. ABANDON protects a child whose
+  half-done work must finish; this child's half-done work must be undone.
+- **A parent that must not lose its child's RESULT keeps its own cancel off the child's
+  handle** (add-server-to-mce → create-vm, 2026-11-25; read in temporalio 1.32.0,
+  `_await_temporal_operation`). `await handle` hands the parent's cancel to the handle: fine
+  while the child still runs (it is sent a cancel, and the await raises when it closes), but
+  when the cancel lands in the SAME workflow task as the child's completion the SDK today
+  returns the result and ERASES the cancel (the run would carry on), and under its next
+  default raises with the result unread — for create-vm, a VM made whose KV cluster the parent
+  never learns. So the start and the child run as tasks of their own
+  (`asyncio.ensure_future(workflow.start_child_workflow(...))`) waited on with
+  `workflow.wait([...])`, which leaves its futures alone when the waiter is cancelled; the
+  cancel rollback then stops the child ITSELF, by id and run id
+  (`get_external_workflow_handle(...).cancel()`, a failure caught — Temporal accepts a cancel
+  of a closed run, below), waits for the handle and reads its real outcome. Every
+  `ChildWorkflowError` in the main path is then a FAILURE (the parent's own cancel never
+  arrives through the handle), so a person cancelling the child fails the parent rather than
+  cancelling it. `test_once_the_child_has_completed_the_cancel_still_finds_the_vm` builds that
+  interleaving (the brain stopped while the child completes).
 - **NEVER cancel a sibling to make room for your own work — choose inputs that cannot have one.**
   A cancel result cannot tell you whether anything was running: Temporal ACCEPTS a cancel against an
   already-CLOSED execution and reports it accepted, failing only for an id that has NEVER existed. So
@@ -2123,7 +2328,9 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   `DAY2_GIT_TOKEN`, the day1 token when empty, and the shortcut's `SHORTCUTS_API_URL`,
   `SHORTCUTS_API_TOKEN`, `SHORTCUT_OWNER` and `CLUSTER_CONSOLE_URL_TEMPLATE`, which must name
   `{cluster}` and nothing else). `ServerLifecycleActivitySettings` carries `DAY1_*` too, OPTIONAL
-  there — update-nodepool's alone, §4 — and the server-lifecycle worker also builds
+  there — update-nodepool's alone, §4 — and, OPTIONAL the same way, the KubeVirt branch's
+  `KUBEVIRT_BMC_HOST_TEMPLATE` (validated at start: `host[:port]` naming `{kv_cluster}` and
+  nothing else) with `KUBEVIRT_BMC_USERNAME` / `KUBEVIRT_BMC_PASSWORD` — and the server-lifecycle worker also builds
   `ClusterUpgradeActivitySettings` (`shared/settings/cluster_upgrade.py`) for the two
   cluster-upgrade activities it re-registers, from the same pod env. Field names = Helm ConfigMap/Secret keys
   lowercased — keep aligned with redbull-platform's `gitops/charts/workflows-orchestrator/templates/config.yaml`

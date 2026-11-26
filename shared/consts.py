@@ -119,10 +119,12 @@ def upgrade_agent_activity_queue(mce_cluster: str) -> str:
     return f"{UPGRADE_AGENT_ACTIVITY_QUEUE}-{mce_cluster}"
 
 # -- VM-lifecycle domain --
-# TWO workflows, each on its own queue as everywhere above: create-vm, one run
-# per VM, and kv-zone-lock, ONE long-lived run per (site, zone) that hands the
+# FOUR workflows, each on its own queue as everywhere above: create-vm, one run
+# per VM; kv-zone-lock, ONE long-lived run per (site, zone) that hands the
 # zone to one create-vm run at a time (it has no route: a create-vm run starts
-# it, or signals the one already running).
+# it, or signals the one already running); delete-stray-vm, create-vm's cleanup
+# child; and delete-vm, which removes ONE VM by name with every volume of it
+# (no route either: remove-server-from-mce is to start it as its child).
 #
 # The ACTIVITY queue is per KV CLUSTER, exactly like server-lifecycle's per-MCE
 # queue above and for the same reason: a `vm-lifecycle-worker` runs INSIDE each
@@ -137,6 +139,9 @@ KV_ZONE_LOCK_WORKFLOW_QUEUE = "kv-zone-lock-workflow"
 # create-vm's child when a KV cluster failed the create and could not then be asked
 # whether the VM landed there: it deletes any VM of that run there once the cluster answers.
 DELETE_STRAY_VM_WORKFLOW_QUEUE = "delete-stray-vm-workflow"
+# One VM deleted by name from its KV cluster, done only when nothing of it is left in
+# Kubernetes, its PersistentVolumes included.
+DELETE_VM_WORKFLOW_QUEUE = "delete-vm-workflow"
 VM_LIFECYCLE_ACTIVITY_QUEUE = "vm-lifecycle-activity"
 
 

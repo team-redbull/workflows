@@ -1,6 +1,7 @@
 """Typed state for the vm-lifecycle domain: create-vm's input, progress and result, the
-zone lock's state and signals, and the activity requests and answers of the worker that
-runs inside each KV cluster (plus the zone's cluster list, read by the cluster-lifecycle limb).
+zone lock's state and signals, delete-vm's, and the activity requests and answers of the
+worker that runs inside each KV cluster (plus the zone's cluster list, read by the
+cluster-lifecycle limb).
 
 No `extra="forbid"` on any model here: these cross the workflow/activity
 boundary and are decoded from history (CLAUDE.md §5). The API edge's
@@ -354,6 +355,198 @@ class CreateVmResult(BaseModel):
     # delete-stray-vm workflow ids, one per cluster the run moved on from without knowing
     # whether its VM had landed there (each removes it once its cluster answers).
     stray_cleanups: list[str] = Field(default_factory=list)
+
+
+# --- delete-vm ------------------------------------------------------------------------------
+#
+# One VM removed by NAME from its KV cluster, with every volume of it. The rows below are
+# what the cluster's worker saw; they are recorded in history so that what the wait watches
+# never has to be found again once the objects that pointed at it are gone.
+
+
+class DeleteVmInput(BaseModel):
+    """Which VM to delete, where, and what must be true of it.
+
+    `kv_cluster` is the KV cluster's day1 file name (the queue), `namespace`
+    and `vm_name` the VirtualMachine. `mce_cluster` must equal the VM's
+    `redbull.io/mce` label: the caller says whose VM it believes this is.
+    `created_by` (the create-vm RUN id, the VM's `redbull.io/created-by`
+    label) and `mac`, when the caller knows them, must match too. `why` is for
+    people.
+    """
+
+    kv_cluster: str = Field(min_length=1)
+    namespace: str = Field(min_length=1)
+    vm_name: str = Field(min_length=1)
+    mce_cluster: str = Field(min_length=1)
+    created_by: str | None = None
+    mac: str | None = None
+    why: str | None = None
+
+
+class DeleteVmRunArgs(BaseModel):
+    """The workflow's single argument (see AddServerToMceRunArgs for why a wrapper)."""
+
+    input: DeleteVmInput
+
+
+class VmClaim(BaseModel):
+    """One PersistentVolumeClaim of the VM, and by which rule it is the VM's.
+
+    `rule`: `spec` (the VM names it), `root-disk` or `boot-iso` (its name),
+    `label` (kubevirt-redfish's own `vm.redfish` label), `owned` (an owner
+    reference to another of the VM's claims or DataVolumes) — or `cut-name`:
+    a name kubevirt-redfish cut short so that it no longer says whose it is,
+    which is REPORTED and never deleted. `used_by` are the unfinished pods
+    mounting it; `import_source` the CDI VolumeImportSource it was filled from.
+    """
+
+    name: str
+    rule: str
+    uid: str | None = None
+    phase: str | None = None
+    volume: str | None = None
+    storage_class: str | None = None
+    deleting: bool = False
+    finalizers: list[str] = Field(default_factory=list)
+    import_source: str | None = None
+    used_by: list[str] = Field(default_factory=list)
+
+
+class VmVolume(BaseModel):
+    """One PersistentVolume behind a claim of the VM: what a person needs to find it in the
+    storage array (`driver`, `volume_handle`) and why it may stay (`reclaim_policy`)."""
+
+    name: str
+    claim: str | None = None
+    reclaim_policy: str | None = None
+    phase: str | None = None
+    storage_class: str | None = None
+    driver: str | None = None
+    volume_handle: str | None = None
+    deleting: bool = False
+    finalizers: list[str] = Field(default_factory=list)
+
+
+class VmSnapshot(BaseModel):
+    """A VolumeSnapshot of one of the VM's claims: never deleted here (someone's backup),
+    and the reason the array may keep the volume after its PersistentVolume is gone."""
+
+    name: str
+    claim: str
+    ready: bool | None = None
+    content: str | None = None
+
+
+class VmRemovalRequest(BaseModel):
+    """ONE request model for delete-vm's three activities.
+
+    `mce`, `created_by` and `mac` are the identity the VM must carry (the
+    inspection and the delete check it, each freshly). The four lists and
+    `vm_uid` are the WAIT's: what the run saw of the VM, from history — a
+    volume is found through its claim, so once the claim is gone only this
+    list still names it. `deadline_minutes` is the wait's own clock.
+    """
+
+    kv_cluster: str = Field(min_length=1)
+    namespace: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    mce: str = Field(min_length=1)
+    created_by: str | None = None
+    mac: str | None = None
+    vm_uid: str | None = None
+    datavolumes: list[str] = Field(default_factory=list)
+    claims: list[str] = Field(default_factory=list)
+    volumes: list[str] = Field(default_factory=list)
+    deadline_minutes: int = Field(default=15, ge=1)
+
+
+class VmDeletionState(BaseModel):
+    """What is on the KV cluster of one VM, at the moment it was asked.
+
+    `found` False: nothing — no VirtualMachine, DataVolume, claim,
+    PersistentVolume or snapshot of it, and no look-alike. `vm_found` is the
+    VirtualMachine itself; the rest can be there without it (a re-run after
+    the VM went). `look_alikes` are claims that match only by a cut name
+    (VmClaim): reported, never deleted.
+    """
+
+    found: bool
+    vm_found: bool = False
+    vm_uid: str | None = None
+    was_running: bool = False
+    mac: str | None = None
+    created_by: str | None = None
+    datavolumes: list[str] = Field(default_factory=list)
+    claims: list[VmClaim] = Field(default_factory=list)
+    volumes: list[VmVolume] = Field(default_factory=list)
+    snapshots: list[VmSnapshot] = Field(default_factory=list)
+    look_alikes: list[VmClaim] = Field(default_factory=list)
+
+
+class VmVolumesDeleted(BaseModel):
+    """What one delete attempt removed (an object already gone is not listed: a retry's
+    lists are shorter, never wrong), and `seen`: the cluster as it was read right before."""
+
+    vm_deleted: bool = False
+    datavolumes_deleted: list[str] = Field(default_factory=list)
+    claims_deleted: list[str] = Field(default_factory=list)
+    import_sources_deleted: list[str] = Field(default_factory=list)
+    seen: VmDeletionState
+
+
+class VmGoneOutcome(BaseModel):
+    """`done`: nothing of the VM is left, its PersistentVolumes included. `left`: only what
+    can never go by itself is (a `Retain` PersistentVolume), so waiting on is pointless.
+    `deadline`: something was still there after `deadline_minutes`. The fields say what."""
+
+    result: Literal["done", "left", "deadline"]
+    vm: bool = False
+    datavolumes: list[str] = Field(default_factory=list)
+    claims: list[VmClaim] = Field(default_factory=list)
+    volumes: list[VmVolume] = Field(default_factory=list)
+    detail: str | None = None
+    polls: int = 0
+
+
+class DeleteVmProgress(BaseModel):
+    """Returned by the `progress` query."""
+
+    phase: str
+    kv_cluster: str
+    namespace: str
+    vm_name: str
+    found: bool | None = None
+    was_running: bool = False
+    datavolumes: list[str] = Field(default_factory=list)
+    claims: list[str] = Field(default_factory=list)
+    volumes: list[str] = Field(default_factory=list)
+    snapshots: list[str] = Field(default_factory=list)
+    deleted: list[str] = Field(default_factory=list)
+    remaining: str | None = None
+
+
+class DeleteVmResult(BaseModel):
+    """Nothing of the VM is left on its KV cluster.
+
+    `found` False: there was nothing to begin with (already deleted) — success
+    all the same. `was_running`: the VM had a guest running when it was
+    deleted, which is abnormal after its host left the MCE. `volumes_released`
+    are the PersistentVolumes that went with it, each with its CSI driver and
+    volume handle: the record of what left the storage array.
+    """
+
+    kv_cluster: str
+    namespace: str
+    vm_name: str
+    found: bool
+    vm_deleted: bool = False
+    was_running: bool = False
+    datavolumes_deleted: list[str] = Field(default_factory=list)
+    claims_deleted: list[str] = Field(default_factory=list)
+    import_sources_deleted: list[str] = Field(default_factory=list)
+    volumes_released: list[VmVolume] = Field(default_factory=list)
+    polls: int = 0
 
 
 # --- the zone lock -------------------------------------------------------------------------

@@ -1,4 +1,5 @@
-"""What the worker inside a KV cluster does for create-vm: measure, create, wait, delete.
+"""What the worker inside a KV cluster does for create-vm — measure, create, wait, delete —
+and for delete-vm: inspect one VM with its volumes, delete them, wait until nothing is left.
 
 Each function here is one activity's whole body, over an `api` object
 (kubevirt_api.KubevirtApi, or anything with its async surface) and the
@@ -21,7 +22,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
-from activities.vm_lifecycle import cluster_figures, vm_spec
+from activities.vm_lifecycle import cluster_figures, vm_spec, vm_volumes
 from activities.vm_lifecycle.kubevirt_api import MacRefused, NameTaken, NotFound, bounded
 from shared.exceptions import (
     KvClusterApiError,
@@ -42,8 +43,13 @@ from shared.models.vm_lifecycle import (
     VmCreateRequest,
     VmDeleted,
     VmDeleteRequest,
+    VmDeletionState,
+    VmGoneOutcome,
     VmReadyOutcome,
     VmReadyRequest,
+    VmRemovalRequest,
+    VmVolume,
+    VmVolumesDeleted,
 )
 
 # Serials drawn per create attempt: a name some VM of the cluster has, or an AlreadyExists, spends one.
@@ -58,6 +64,10 @@ CREATE_BUDGET_SECONDS = 55.0
 # the hub's 60 s start_to_close and its zone lease are sized against.
 FIGURES_TIMEOUT_SECONDS = 20.0
 READY_POLL_SECONDS = 8.0
+GONE_POLL_SECONDS = 8.0
+# A PersistentVolume with this reclaim policy is never removed by Kubernetes: once its
+# claim is gone it is `Released` for good, and waiting for it is pointless.
+RETAIN = "Retain"
 # The root disk is `done` in this DataVolume phase with its PVC bound.
 ROOT_DISK_READY_PHASE = "Succeeded"
 PVC_BOUND = "Bound"
@@ -249,7 +259,7 @@ async def create_vm(
         body = vm_spec.build(
             namespace=request.namespace, flavor=request.flavor, cpu=request.cpu, memory_gib=request.memory_gib,
             site=request.site, zone=request.zone, mce=request.mce, serial=serial, request_id=request.request_id,
-            workflow_id=request.workflow_id, redfish_label=cluster.redfish_label,
+            workflow_id=request.workflow_id, kv_cluster=cluster.kv_cluster, redfish_label=cluster.redfish_label,
             storage_class_name=cluster.storage_class_name, network_name=cluster.network_name,
             node_selector=cluster.node_selector, root_disk_size=cluster.root_disk_size,
         )
@@ -436,3 +446,216 @@ async def delete_vm(
     if not deleted:
         log(f"no VM of request {request.request_id} on {cluster.kv_cluster}: nothing to delete")
     return VmDeleted(deleted=bool(deleted), names=deleted)
+
+
+# --- delete-vm: inspect_vm_for_deletion, delete_vm_and_volumes, await_vm_gone ------------------
+
+
+def _require_identity(cluster: ClusterValues, request: VmRemovalRequest, vm: dict) -> None:
+    """The VirtualMachine of that name is one create-vm made, for the caller's MCE (and run, and
+    MAC, when the caller names them), on THIS cluster — or it is not the caller's to delete."""
+    labels = cluster_figures.get(vm, "metadata", "labels", default={}) or {}
+    owner, mce, mac = labels.get(vm_spec.CREATED_BY_LABEL), labels.get(vm_spec.MCE_LABEL), vm_spec.mac_of(vm)
+    home = labels.get(vm_spec.KV_CLUSTER_LABEL)
+    wrong: list[str] = []
+    if not owner:
+        wrong.append(f"it carries no {vm_spec.CREATED_BY_LABEL} label, so create-vm did not make it")
+    elif request.created_by and owner != request.created_by:
+        wrong.append(f"its {vm_spec.CREATED_BY_LABEL} is {owner}, not {request.created_by}")
+    if mce != request.mce:
+        wrong.append(f"its {vm_spec.MCE_LABEL} is {mce or '(none)'}, not {request.mce}")
+    if request.mac and mac != request.mac.lower():
+        wrong.append(f"its MAC is {mac or '(none)'}, not {request.mac.lower()}")
+    if home and home != cluster.kv_cluster:  # absent on a VM made before the label: nothing to compare
+        wrong.append(f"its {vm_spec.KV_CLUSTER_LABEL} is {home}, not {cluster.kv_cluster}")
+    if wrong:
+        raise VmIdentityConflictError(
+            bounded(
+                f"VM {request.namespace}/{request.name} on {cluster.kv_cluster} is not the VM asked for: "
+                f"{'; '.join(wrong)}. Nothing was deleted"
+            )
+        )
+
+
+async def _survey(api: Any, cluster: ClusterValues, request: VmRemovalRequest) -> VmDeletionState:
+    """The VM and everything of it on the cluster now, the identity checked before anything else."""
+    vm = await api.get_vm(request.namespace, request.name)
+    if vm is not None:
+        _require_identity(cluster, request, vm)
+    pvcs, pvs, snapshots, pods = await asyncio.gather(
+        api.list_pvcs(request.namespace),
+        api.list_pvs(),
+        api.list_volume_snapshots(request.namespace),
+        api.list_unfinished_pods(vm_volumes.pod_claims(request.namespace)),
+    )
+    mine = vm_volumes.claims_of(request.name, vm, pvcs, pods)
+    there = await asyncio.gather(*(api.get_datavolume(request.namespace, name) for name in mine.datavolumes))
+    datavolumes = [name for name, found in zip(mine.datavolumes, there, strict=True) if found is not None]
+    volumes = vm_volumes.volumes_of(request.name, request.namespace, mine.claims, pvs)
+    kept = vm_volumes.snapshots_of(request.name, mine.claims, snapshots)
+    return VmDeletionState(
+        found=bool(vm is not None or datavolumes or mine.claims or volumes or kept or mine.look_alikes),
+        vm_found=vm is not None,
+        vm_uid=vm_spec.uid_of(vm) if vm else None,
+        was_running=vm_volumes.is_running(vm),
+        mac=vm_spec.mac_of(vm) if vm else None,
+        created_by=vm_spec.created_by(vm) if vm else None,
+        datavolumes=datavolumes,
+        claims=mine.claims,
+        volumes=volumes,
+        snapshots=kept,
+        look_alikes=mine.look_alikes,
+    )
+
+
+def _summary(state: VmDeletionState) -> str:
+    return (
+        f"VM {'there' if state.vm_found else 'absent'}{' and RUNNING' if state.was_running else ''}, "
+        f"{len(state.datavolumes)} DataVolume(s), {len(state.claims)} claim(s), {len(state.volumes)} "
+        f"PersistentVolume(s), {len(state.snapshots)} snapshot(s), {len(state.look_alikes)} look-alike claim(s)"
+    )
+
+
+async def inspect_for_deletion(
+    api: Any, cluster: ClusterValues, request: VmRemovalRequest, *, log: Callable[[str], None] = lambda _message: None
+) -> VmDeletionState:
+    """What is on this cluster of the VM named. Observe-only."""
+    _require_own_cluster(cluster, request.kv_cluster, "inspect a VM")
+    state = await _survey(api, cluster, request)
+    log(f"{request.namespace}/{request.name} on {cluster.kv_cluster}: {_summary(state)}")
+    return state
+
+
+async def delete_with_volumes(
+    api: Any, cluster: ClusterValues, request: VmRemovalRequest, *, log: Callable[[str], None] = lambda _message: None
+) -> VmVolumesDeleted:
+    """Delete the VM, its DataVolumes and every claim of the rule; never a volume or a snapshot.
+
+    Everything is read again first, so a retry deletes what is left and an
+    identity that changed since the inspection stops it. Each object goes by
+    the UID just read where the API takes one: a namesake made in between is
+    left alone. A boot ISO claim's VolumeImportSource goes BEFORE its claim —
+    its name is only on the claim, so the other order would lose it to a
+    worker that died between the two.
+    """
+    _require_own_cluster(cluster, request.kv_cluster, "delete a VM")
+    seen = await _survey(api, cluster, request)
+    namespace = request.namespace
+    deleted = VmVolumesDeleted(seen=seen)
+    if seen.vm_found:
+        deleted.vm_deleted = await api.delete_vm(namespace, request.name, seen.vm_uid)
+    for name in seen.datavolumes:
+        if await api.delete_datavolume(namespace, name):
+            deleted.datavolumes_deleted.append(name)
+    for claim in seen.claims:
+        if claim.import_source and await api.delete_volume_import_source(namespace, claim.import_source):
+            deleted.import_sources_deleted.append(claim.import_source)
+        if await api.delete_pvc(namespace, claim.name, claim.uid):
+            deleted.claims_deleted.append(claim.name)
+    log(
+        f"{namespace}/{request.name} on {cluster.kv_cluster}: saw {_summary(seen)}; deleted "
+        f"{'the VM, ' if deleted.vm_deleted else ''}DataVolumes {deleted.datavolumes_deleted}, claims "
+        f"{deleted.claims_deleted}, import sources {deleted.import_sources_deleted}"
+    )
+    return deleted
+
+
+def _remaining(
+    namespace: str, name: str, vm: dict | None, datavolumes: list[str], claims: list[Any], volumes: list[VmVolume]
+) -> str:
+    """What is still there, in one bounded sentence: each object, its finalizers, who holds it."""
+    parts: list[str] = []
+    if vm is not None:
+        finalizers = cluster_figures.get(vm, "metadata", "finalizers", default=[]) or []
+        parts.append(
+            f"VirtualMachine {namespace}/{name} ({cluster_figures.get(vm, 'status', 'printableStatus')}, "
+            f"finalizers {list(finalizers)})"
+        )
+    parts.extend(f"DataVolume {item}" for item in datavolumes)
+    for claim in claims:
+        held = f", mounted by pod(s) {', '.join(claim.used_by)}" if claim.used_by else ""
+        parts.append(
+            f"claim {claim.name} ({'Terminating' if claim.deleting else claim.phase}, finalizers {claim.finalizers}{held})"
+        )
+    for volume in volumes:
+        parts.append(
+            f"PersistentVolume {volume.name} ({volume.phase}, reclaim policy {volume.reclaim_policy}, driver "
+            f"{volume.driver}, volume handle {volume.volume_handle})"
+        )
+    return bounded("; ".join(parts)) if parts else "nothing"
+
+
+async def wait_gone(
+    api: Any,
+    cluster: ClusterValues,
+    request: VmRemovalRequest,
+    *,
+    waited_seconds: float,
+    polls: int,
+    now: Callable[[], datetime],
+    heartbeat: Callable[[float, int], None],
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    log: Callable[[str], None] = lambda _message: None,
+) -> VmGoneOutcome:
+    """Poll until nothing of the VM is left, or only what never goes, or `deadline_minutes` of WATCHING.
+
+    WHAT IS WATCHED COMES FROM THE REQUEST — the run's own record of the VM's
+    DataVolumes, claims and PersistentVolumes — because a volume is found
+    through its claim: an attempt that starts after the claims are gone would
+    otherwise see no volume and report `done` over one still there. Claims the
+    rule still finds in the namespace are watched too. Deletes nothing.
+
+    THE DEADLINE COUNTS ONLY TIME THE CLUSTER WAS SEEN: the seconds between
+    two polls that both answered. An outage — a poll that fails ends the
+    attempt, and Temporal starts the next — and a worker that was away add
+    nothing, so a cluster that comes back after twenty minutes is given its
+    whole deadline to finish what it was doing, instead of the wait ending
+    the moment it answers again (found on cluster-qcl8n, 2026-11-26: its
+    controller manager was down, and a run failed over a volume the cluster
+    had simply not got to yet). `waited_seconds` and `polls` come from the
+    last heartbeat when this attempt resumes an earlier one's wait;
+    `heartbeat` records them after every poll.
+    """
+    _require_own_cluster(cluster, request.kv_cluster, "wait for a VM's deletion")
+    namespace = request.namespace
+    seen_at: datetime | None = None
+    while True:
+        vm, pvcs, datavolumes, pvs = await asyncio.gather(
+            api.get_vm(namespace, request.name),
+            api.list_pvcs(namespace),
+            asyncio.gather(*(api.get_datavolume(namespace, name) for name in request.datavolumes)),
+            asyncio.gather(*(api.get_pv(name) for name in request.volumes)),
+        )
+        answered_at = now()
+        if seen_at is not None:
+            waited_seconds += max((answered_at - seen_at).total_seconds(), 0.0)
+        seen_at = answered_at
+        if vm is not None and request.vm_uid and vm_spec.uid_of(vm) != request.vm_uid:
+            vm = None  # a namesake made since: the VM this run deleted is gone
+        claims = vm_volumes.claims_of(request.name, None, pvcs, known=request.claims).claims
+        left_datavolumes = [name for name, found in zip(request.datavolumes, datavolumes, strict=True) if found is not None]
+        volumes = [vm_volumes.volume_row(volume) for volume in pvs if volume is not None]
+        polls += 1
+        heartbeat(waited_seconds, polls)
+        outcome = VmGoneOutcome(
+            result="done", vm=vm is not None, datavolumes=left_datavolumes, claims=claims, volumes=volumes, polls=polls,
+        )
+        objects_gone = vm is None and not left_datavolumes and not claims
+        if objects_gone and not volumes:
+            log(f"nothing of {namespace}/{request.name} is left on {cluster.kv_cluster} after {polls} polls")
+            return outcome.model_copy(update={"detail": "nothing is left"})
+        if objects_gone and all(volume.reclaim_policy == RETAIN for volume in volumes):
+            detail = _remaining(namespace, request.name, None, [], [], volumes)
+            log(f"{namespace}/{request.name} on {cluster.kv_cluster}: only what never goes is left: {detail}")
+            return outcome.model_copy(update={"result": "left", "detail": detail})
+        if waited_seconds >= request.deadline_minutes * 60:
+            if claims:  # who holds them, asked once, at the end
+                pods = await api.list_unfinished_pods(vm_volumes.pod_claims(namespace))
+                claims = vm_volumes.claims_of(request.name, None, pvcs, pods, known=request.claims).claims
+            detail = _remaining(namespace, request.name, vm, left_datavolumes, claims, volumes)
+            log(
+                f"{namespace}/{request.name} on {cluster.kv_cluster} not gone after {polls} polls "
+                f"({waited_seconds:.0f}s of watching): {detail}"
+            )
+            return outcome.model_copy(update={"result": "deadline", "claims": claims, "detail": detail})
+        await sleep(GONE_POLL_SECONDS)

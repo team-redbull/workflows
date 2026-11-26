@@ -1585,6 +1585,41 @@ class VmRootDiskNotBoundError(OrchestratorError):
     """
 
 
+class KvClusterWorkerAbsentError(OrchestratorError):
+    """WORKFLOW-RAISED. No vm-lifecycle worker picked up delete-vm's first call on the KV cluster's queue.
+
+    Nothing polled `vm-lifecycle-activity-<kv cluster>` within the bound: the
+    cluster's worker is not running, cannot reach Temporal, or is deployed
+    under another `kvCluster` than the day1 file name. Names the queue.
+    Nothing was read and nothing was deleted; run again once it polls.
+    """
+
+
+class VmVolumesLeftInStorageError(OrchestratorError):
+    """WORKFLOW-RAISED. delete-vm deleted everything it may, and the storage is not provably clean.
+
+    The VM, its DataVolumes and its claims are gone (or were never there), but
+    one of these stands: a PersistentVolume still there — `Retain` keeps the
+    volume by design, another policy did not finish within the deadline — a
+    VolumeSnapshot of one of the VM's disks (the backend keeps the volume
+    under it), or a claim that only LOOKS like the VM's boot ISO (a name cut
+    short) and was left alone. Names each PersistentVolume with its CSI driver
+    and volume handle, each snapshot and each such claim, and what a person
+    does. The run never deletes a PersistentVolume or a snapshot; a re-run
+    fails the same way until a person has, then completes.
+    """
+
+
+class VmDeletionTimeoutError(OrchestratorError):
+    """WORKFLOW-RAISED. The VM, a DataVolume or a claim of it was still there at delete-vm's deadline.
+
+    Every delete was sent; something holds an object: a guest that does not
+    shut down, a pod still mounting a claim, a finalizer nobody removes. Names
+    each object left with its finalizers and the pods using it. A re-run
+    resumes: it inspects again and waits for the same objects.
+    """
+
+
 # --- cluster-lifecycle ------------------------------------------------------
 
 

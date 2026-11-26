@@ -20,7 +20,8 @@ CLASSIFICATION — everything a retry cannot fix is named, the rest is transient
     2026-11-25 — KubeMacPool assigns one — so this is KubeMacPool unable to
     give a VM one, which the caller reports as VmMacNotAssignedError.
   * 409 AlreadyExists on a create -> NameTaken: the caller draws another MAC.
-  * 404 -> None / False / NotFound: each caller knows what an absent object means.
+  * 404 -> None / False / NotFound: each caller knows what an absent object means
+    (a cluster that serves no VolumeSnapshots has none: an empty list).
   * 403 -> KvClusterAccessError (permanent): the chart's ClusterRole lacks a verb.
   * 400, 422 -> VmRequestRejectedError (permanent): the same body is refused again.
   * everything else — 5xx, 401 (a rotated ServiceAccount token), 429, 410, a
@@ -42,9 +43,12 @@ from shared.exceptions import KvClusterAccessError, KvClusterApiError, VmRequest
 
 KUBEVIRT_GROUP, KUBEVIRT_VERSION = "kubevirt.io", "v1"
 CDI_GROUP, CDI_VERSION = "cdi.kubevirt.io", "v1beta1"
+SNAPSHOT_GROUP, SNAPSHOT_VERSION = "snapshot.storage.k8s.io", "v1"
 VIRTUAL_MACHINES = "virtualmachines"
 VIRTUAL_MACHINE_INSTANCES = "virtualmachineinstances"
 DATA_VOLUMES = "datavolumes"
+VOLUME_IMPORT_SOURCES = "volumeimportsources"
+VOLUME_SNAPSHOTS = "volumesnapshots"
 
 # (connect, read) seconds on EVERY call: the SDK's own default is no timeout
 # at all. Read at 20 s, the bound the figures read promises the hub
@@ -359,3 +363,90 @@ class KubevirtApi:
             return True
 
         return await self._run(f"deleting {plural} {namespace}/{name}", call)
+
+    # --- reads and writes: one VM's volumes (delete-vm) ----------------------------------
+
+    async def list_pvcs(self, namespace: str) -> list[dict]:
+        """Every PersistentVolumeClaim of one namespace."""
+        core, _ = self._clients()
+        return await self._run(
+            f"listing PersistentVolumeClaims of {namespace}",
+            lambda: self._pages(
+                lambda token: core.list_namespaced_persistent_volume_claim(
+                    namespace, limit=PAGE_SIZE, _continue=token, _preload_content=False,
+                    _request_timeout=REQUEST_TIMEOUT,
+                )
+            ),
+        )
+
+    async def delete_pvc(self, namespace: str, name: str, uid: str | None = None) -> bool:
+        """Delete the claim, only while it is still the object `uid` names. False when it was
+        already gone, or is no longer that object (a failed UID precondition answers 409)."""
+        core, _ = self._clients()
+        body = k8s_client.V1DeleteOptions(preconditions=k8s_client.V1Preconditions(uid=uid)) if uid else None
+
+        def call() -> bool:
+            try:
+                core.delete_namespaced_persistent_volume_claim(
+                    name, namespace, body=body, _preload_content=False, _request_timeout=REQUEST_TIMEOUT
+                )
+            except k8s_client.ApiException as exc:
+                if exc.status == _NOT_FOUND or (uid is not None and exc.status == _CONFLICT):
+                    return False
+                raise
+            return True
+
+        return await self._run(f"deleting PersistentVolumeClaim {namespace}/{name}", call)
+
+    async def list_pvs(self) -> list[dict]:
+        """Every PersistentVolume of the cluster: a volume whose claim is gone is found only
+        by its `claimRef`, which no selector filters on."""
+        core, _ = self._clients()
+        return await self._run(
+            "listing PersistentVolumes",
+            lambda: self._pages(
+                lambda token: core.list_persistent_volume(
+                    limit=PAGE_SIZE, _continue=token, _preload_content=False, _request_timeout=REQUEST_TIMEOUT
+                )
+            ),
+        )
+
+    async def get_pv(self, name: str) -> dict | None:
+        core, _ = self._clients()
+
+        def call() -> dict | None:
+            try:
+                return _decode(
+                    core.read_persistent_volume(name, _preload_content=False, _request_timeout=REQUEST_TIMEOUT)
+                )
+            except k8s_client.ApiException as exc:
+                if exc.status == _NOT_FOUND:
+                    return None
+                raise
+
+        return await self._run(f"reading PersistentVolume {name}", call)
+
+    async def list_volume_snapshots(self, namespace: str) -> list[dict]:
+        """Every VolumeSnapshot of one namespace; none on a cluster that serves no
+        VolumeSnapshots (no snapshot CRDs: a 404 on the list itself)."""
+        _, custom = self._clients()
+
+        def fetch(token: str | None) -> Any:
+            return custom.list_namespaced_custom_object(
+                SNAPSHOT_GROUP, SNAPSHOT_VERSION, namespace, VOLUME_SNAPSHOTS, limit=PAGE_SIZE,
+                _request_timeout=REQUEST_TIMEOUT, **({"_continue": token} if token else {}),
+            )
+
+        def call() -> list[dict]:
+            try:
+                return self._pages(fetch)
+            except k8s_client.ApiException as exc:
+                if exc.status == _NOT_FOUND:
+                    return []
+                raise
+
+        return await self._run(f"listing VolumeSnapshots of {namespace}", call)
+
+    async def delete_volume_import_source(self, namespace: str, name: str) -> bool:
+        """Delete a CDI VolumeImportSource (what a boot ISO claim was filled from). False: already gone."""
+        return await self._delete_custom(CDI_GROUP, CDI_VERSION, VOLUME_IMPORT_SOURCES, namespace, name, None)

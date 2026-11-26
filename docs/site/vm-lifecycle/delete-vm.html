@@ -1,0 +1,390 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>delete-vm — Redbull Workflows</title>
+<meta name="description" content="The delete-vm workflow: one VirtualMachine deleted by name from its KV cluster, done only when nothing of it is left in Kubernetes, its PersistentVolumes included. A child workflow with no route.">
+<link rel="icon" href="/assets/favicon.svg?v=__DOC_VERSION__" type="image/svg+xml">
+<link rel="stylesheet" href="/assets/site.css?v=__DOC_VERSION__">
+</head>
+<body data-page="/vm-lifecycle/delete-vm.html">
+
+<a class="skip-link" href="#main">Skip to content</a>
+
+<!-- Topbar: identical on every page. Brand + deployed version upper-left; the
+     "Workflows" menu is built from the catalogue in assets/nav.js. -->
+<header class="topbar">
+  <a class="brand" href="/">
+    <img class="brand-mark" src="/assets/redbull-logo.png?v=__DOC_VERSION__" alt="" aria-hidden="true"
+         width="480" height="179">
+    <span class="brand-name">Redbull Workflows</span>
+    <span class="brand-ver" title="deployed image tag of this documentation site">__DOC_VERSION__</span>
+  </a>
+  <nav class="topnav" aria-label="Site">
+    <a class="topnav-link" href="/">Orchestrator guide</a>
+    <div class="wfmenu">
+      <button class="wfmenu-btn" id="wfmenu-btn" type="button"
+              aria-expanded="false" aria-haspopup="true" aria-controls="wfmenu-panel">
+        Workflows <span class="caret" aria-hidden="true">&#9662;</span>
+      </button>
+      <div class="wfmenu-panel" id="wfmenu-panel" role="menu" aria-label="Workflows by domain" hidden></div>
+    </div>
+    <noscript>
+      <a class="topnav-link" href="/vm-lifecycle/delete-vm.html">delete-vm</a>
+    </noscript>
+  </nav>
+</header>
+
+<main id="main">
+<header class="masthead">
+  <div class="masthead-inner">
+    <div class="eyebrow">Temporal workflow &middot; domain: vm-lifecycle &middot; child only, no route</div>
+    <h1>delete-vm<span class="dim"> &mdash; what actually happens</span></h1>
+    <p class="lede">
+      One run deletes <b>one VirtualMachine, by name, from its KV cluster</b> &mdash; a VM
+      <a href="/vm-lifecycle/create-vm.html">create-vm</a> made &mdash; and <b>completes only when nothing of
+      it is left in Kubernetes, its PersistentVolumes included</b>. &ldquo;The PersistentVolume object is
+      gone&rdquo; is how it knows the volume left the storage array: it calls no storage system.
+    </p>
+    <p class="lede">Without it a VM whose host left the MCE stays Halted on its KV cluster for ever: counted
+    against that cluster&rsquo;s capacity by every create-vm run, its disks in the array. When the storage
+    cannot be proven clean &mdash; a <code>Retain</code> volume, a snapshot, a volume still there at the
+    deadline &mdash; the run <b>deletes everything it may and then FAILS</b>, naming each volume. It is
+    never a success with a note.</p>
+    <div class="facts">
+      <div class="fact"><span class="k">Trigger</span><span class="v">none &mdash; a child workflow (remove-server-from-mce is to start it)</span></div>
+      <div class="fact"><span class="k">Workflow id</span><span class="v">delete-vm-&lt;kv cluster&gt;_&lt;vm name&gt;</span></div>
+      <div class="fact"><span class="k">Workflow queue</span><span class="v">delete-vm-workflow</span></div>
+      <div class="fact"><span class="k">Activity queue</span><span class="v">vm-lifecycle-activity-&lt;kv cluster&gt; (the worker inside that KV cluster)</span></div>
+    </div>
+    <p class="note"><b>It has no route on purpose</b> (decided 2026-11-26). delete-vm holds no credential for
+    an MCE, so it cannot check that the VM&rsquo;s BareMetalHost is gone &mdash; and metal3 needs the VM&rsquo;s
+    Redfish to release a host. <a href="/server-lifecycle/remove-server-from-mce.html">remove-server-from-mce</a>
+    stays the one public way to remove a VM, and is to start this run as its child once the host is gone;
+    <b>that integration is a later change</b>. Until then nothing starts delete-vm but a person with the
+    Temporal CLI.</p>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <!-- ============================================================== FLOW -->
+  <section id="flow">
+    <div class="sec-head">
+      <div class="eyebrow">Three steps and a verdict</div>
+      <h2>What the run does</h2>
+      <p class="lede" style="margin-bottom:24px">Every call goes to the KV cluster&rsquo;s <b>own</b> worker,
+      which acts on its own API server as its own ServiceAccount. Each card carries a <code>phase</code>,
+      read live through the <code>progress</code> query
+      (<code>GET /workflows/runs/{workflow_id}</code>).</p>
+    </div>
+
+    <div class="flow">
+
+      <div class="step">
+        <div class="marker">1</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>inspect_vm_for_deletion</h3>
+            <span class="phase">phase <b>inspecting</b></span>
+          </div>
+          <p><b>Is it the VM asked for?</b> A VirtualMachine of that name must be one create-vm made, for
+          the caller&rsquo;s MCE: it carries <code>redbull.io/created-by</code> (a hand-made VM is never
+          deleted) and <code>redbull.io/mce</code> equal to the request&rsquo;s; the run id and the MAC must
+          match too when the caller gives them, and a <code>redbull.io/kv-cluster</code> label must name this
+          cluster. Otherwise the run fails <code>VmIdentityConflictError</code> with <b>nothing touched</b>.</p>
+          <p><b>What is there?</b> The VM (and whether a guest is running), its DataVolumes, its claims, the
+          PersistentVolumes behind them &mdash; each with its reclaim policy, CSI driver and volume handle
+          &mdash; VolumeSnapshots of them, and the pods mounting them. All of it is recorded in the
+          run&rsquo;s history. <b>Nothing of the VM anywhere: the run COMPLETES</b>, <code>found: false</code>.</p>
+          <p class="muted">Observe-only. The one call with a schedule-to-start limit (5 min): nothing is
+          written yet, so a KV cluster with no worker fails the run here
+          (<code>KvClusterWorkerAbsentError</code>, naming the queue).</p>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="marker">2</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>delete_vm_and_volumes</h3>
+            <span class="phase">phase <b>deleting</b></span>
+          </div>
+          <p>Everything is <b>read again and the identity checked again</b>, then deleted in this order: the
+          VirtualMachine (by the UID read), its DataVolumes, each claim&rsquo;s CDI VolumeImportSource, every
+          claim of the VM (each by its UID). An object already gone is success, so a retry deletes what is
+          left.</p>
+          <p><b>A RUNNING VM is deleted too</b>, and the result says so (<code>was_running</code>). It is
+          abnormal &mdash; after metal3 released the host the VM is Halted &mdash; but the worker has no verb
+          to stop a VM, the caller has already proved the host left the MCE, and refusing would leave a
+          powered-on VM nobody owns. KubeVirt shuts the guest down as part of the delete.</p>
+          <p class="muted"><b>Never deleted by the run:</b> a PersistentVolume (deleting a <code>Retain</code>
+          one loses the only pointer to its volume in the array), a VolumeSnapshot (someone&rsquo;s backup),
+          a pod (a pod holding a claim is named in the failure), and a claim that only <i>looks</i> like the
+          VM&rsquo;s (below).</p>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="marker">3</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>await_vm_gone</h3>
+            <span class="phase">phase <b>awaiting-release</b></span>
+          </div>
+          <p>ONE heartbeating activity polls every 8 s until the VirtualMachine, the DataVolumes, the claims
+          and the PersistentVolumes are all gone. It answers <code>done</code>; <code>left</code> when only
+          <code>Retain</code> volumes remain (they never go, so it does not wait for them); or
+          <code>deadline</code> after <b>15 minutes</b>, naming every object left, its finalizers and the
+          pods holding it.</p>
+          <p><b>What it watches is the run&rsquo;s own record</b>, handed over in the request: a volume is
+          found through its claim, so once the claim is gone only that record still names it &mdash; an
+          attempt started after the claims went would otherwise report the VM gone over a volume still there.</p>
+          <p><b>The 15 minutes count only the time the cluster was seen</b> &mdash; the seconds between two
+          polls that both answered, kept in the heartbeat details. An outage of the cluster&rsquo;s API, or a
+          worker that was away, adds nothing: a cluster that comes back after twenty minutes gets its whole
+          deadline to finish what it was doing.</p>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="marker">4</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>The verdict</h3>
+            <span class="phase">phase <b>completed</b> or <b>failed</b></span>
+          </div>
+          <p><b>Completed</b>: nothing is left and no snapshot of the VM&rsquo;s disks stands. The result
+          lists the PersistentVolumes that went with the VM, each with its CSI driver and volume handle
+          &mdash; the record of what left the array.</p>
+          <p><b>Failed, after the deletes</b> &mdash; <code>VmVolumesLeftInStorageError</code> when the storage
+          is not provably clean, <code>VmDeletionTimeoutError</code> when the VM, a DataVolume or a claim is
+          still there. Both below.</p>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- =========================================================== VOLUMES -->
+  <section id="volumes">
+    <div class="sec-head">
+      <div class="eyebrow">One rule, used by all three activities</div>
+      <h2>Which volumes are the VM&rsquo;s</h2>
+      <p class="lede">A VM&rsquo;s storage outlives the VirtualMachine object in several ways, so the rule
+      must still find it once the VM &mdash; and then its claims &mdash; are gone.</p>
+    </div>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>rule</th><th>a claim of the VM&rsquo;s namespace is the VM&rsquo;s when&hellip;</th></tr></thead>
+        <tbody>
+          <tr><td class="k">spec</td><td class="muted">the VirtualMachine names it: <code>dataVolumeTemplates</code>, <code>volumes[].dataVolume</code>, <code>volumes[].persistentVolumeClaim</code></td></tr>
+          <tr><td class="k">root-disk</td><td class="muted">its name is <code>&lt;vm&gt;-root</code> (what create-vm&rsquo;s VM is built with)</td></tr>
+          <tr><td class="k">boot-iso</td><td class="muted">its name is kubevirt-redfish&rsquo;s boot ISO claim, <code>&lt;vm&gt;-bootiso-&lt;unix seconds&gt;-&lt;6 digits&gt;</code> (or its fallback <code>&lt;vm&gt;-bootiso</code>). kubevirt-redfish deletes that claim on eject &mdash; which metal3 does while releasing the host &mdash; so it is a leftover only when that did not happen</td></tr>
+          <tr><td class="k">label</td><td class="muted">it carries kubevirt-redfish&rsquo;s own label <code>vm.redfish: &lt;vm&gt;</code> (set when the ISO is filled through CDI)</td></tr>
+          <tr><td class="k">owned</td><td class="muted">an owner reference names the VirtualMachine, another of the VM&rsquo;s claims or one of its DataVolumes (CDI&rsquo;s <code>prime-&hellip;</code> claim)</td></tr>
+          <tr><td class="k">cut-name</td><td class="muted"><b>a look-alike, reported and NEVER deleted.</b> kubevirt-redfish cuts any name over 63 characters to its first 49 plus a hash and <code>truncated</code>. While the VM&rsquo;s name is at most 40 characters the cut still holds all of <code>&lt;vm&gt;-bootiso-</code> and the claim is a <code>boot-iso</code>; past that, the cut name no longer says whose it is (two long names differing in their last characters cut to the same 49). Such a claim is the VM&rsquo;s only by one of the rules above; alone, it is left and fails the run. Today&rsquo;s VM names are about 27 characters.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note" style="margin-top:10px">A <b>PersistentVolume</b> is the VM&rsquo;s when one of those claims is
+    bound to it, or its <code>claimRef</code> names one of them &mdash; or names a claim the <i>name</i> rules
+    recognise, which is how a re-run finds a volume after the VM and its claims are gone. A
+    <b>VolumeSnapshot</b> is the VM&rsquo;s when its source claim is, by the same two ways. A CDI
+    <b>VolumeImportSource</b> is read from the claim&rsquo;s <code>dataSourceRef</code>, never built from a
+    name, and deleted <i>before</i> its claim: its name is only on the claim.</p>
+  </section>
+
+  <!-- ========================================================== FAILURES -->
+  <section id="failures">
+    <div class="sec-head">
+      <div class="eyebrow">When it stops</div>
+      <h2>Delete, then fail; everything else is out-waited</h2>
+      <p class="lede">Every error below is a <b>FAILED run</b>. Two of the three the workflow raises come
+      <b>after</b> every delete was sent; the worker&rsquo;s fail the run after one attempt.</p>
+    </div>
+
+    <h3 style="margin:0 0 10px">Raised by the workflow itself</h3>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>error</th><th>when</th><th>what a person does</th></tr></thead>
+        <tbody>
+          <tr><td class="k">KvClusterWorkerAbsentError</td><td class="muted"><b>inspecting</b>: nothing polled <code>vm-lifecycle-activity-&lt;kv cluster&gt;</code> for 5 minutes. Nothing was read and nothing was deleted.</td><td class="muted">The worker inside that KV cluster is not running, cannot reach Temporal, or is deployed under another <code>kvCluster</code> than the day1 file name. Bring it up, then run again.</td></tr>
+          <tr><td class="k">VmVolumesLeftInStorageError</td><td class="muted">The VM, its DataVolumes and its claims are gone, and one of these stands: a PersistentVolume with reclaim policy <code>Retain</code> (now <code>Released</code>; its volume is kept by design); a PersistentVolume of another policy still there after the 15 minutes (the CSI driver has not deleted the volume); a VolumeSnapshot of one of the VM&rsquo;s disks (the storage keeps the volume under a snapshot even after its PersistentVolume is gone); a look-alike claim. The message names each PersistentVolume with its CSI driver and volume handle, each snapshot and each such claim.</td><td class="muted">Delete the volume in the array by its handle and then its PersistentVolume; or the snapshot, if nobody needs it; or see the CSI provisioner&rsquo;s log. Then run again.</td></tr>
+          <tr><td class="k">VmDeletionTimeoutError</td><td class="muted">The VirtualMachine, a DataVolume or a claim was still there after the 15 minutes. The message names each with its finalizers and the pods mounting it.</td><td class="muted">Something holds the object: a guest that does not shut down, a pod still mounting a claim, a finalizer nobody removes. Fix that, then run again.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 style="margin:24px 0 10px">Raised by the worker inside the KV cluster, non-retryable</h3>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>error</th><th>when</th></tr></thead>
+        <tbody>
+          <tr><td class="k">VmIdentityConflictError</td><td class="muted">The VirtualMachine of that name is not the one asked for: no <code>redbull.io/created-by</code> label, another MCE, another run id, another MAC, or another cluster&rsquo;s <code>redbull.io/kv-cluster</code>. The message says which. Checked at the inspection and again at the delete. Nothing was deleted.</td></tr>
+          <tr><td class="k">KvClusterAccessError</td><td class="muted">The cluster&rsquo;s API refused the worker&rsquo;s ServiceAccount (403): its ClusterRole predates delete-vm. <b>The chart ships before the image</b> (below).</td></tr>
+          <tr><td class="k">KvClusterMismatchError</td><td class="muted">The worker on that queue is deployed for another KV cluster.</td></tr>
+          <tr><td class="k">VmRequestRejectedError</td><td class="muted">The cluster&rsquo;s API refused a request as sent (400/422).</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note" style="margin-top:10px">Everything else is <b>retried without bound</b>, backing off from 2 s
+    to at most 1 min: the cluster&rsquo;s API failing or unreachable (<code>KvClusterApiError</code>: 5xx, 401,
+    429, a timeout, a dropped connection). The run stays RUNNING in its phase, the failure showing on the
+    activity in the Temporal UI. The delete and the wait carry <b>no</b> schedule-to-start limit: once a
+    delete was sent, a worker pod away for five minutes must not fail a run that only has to wait for it.</p>
+    <p class="note"><b>A cancel</b> ends the run CANCELED and undoes nothing &mdash; a delete has no rollback.
+    Nothing runs on an exit path.</p>
+  </section>
+
+  <!-- ======================================================= IDEMPOTENCY -->
+  <section id="idempotency">
+    <div class="sec-head">
+      <div class="eyebrow">Run it again</div>
+      <h2>A re-run resumes</h2>
+    </div>
+    <ul>
+      <li>The id is the VM itself, <code>delete-vm-&lt;kv cluster&gt;_&lt;vm name&gt;</code>: a second start while
+      one runs is refused, and a re-run of a closed id inspects again and removes whatever is still there
+      &mdash; found by the same rule, whether or not the VirtualMachine still exists.</li>
+      <li>After a <b>delete, then fail</b>, a re-run fails the same way, deleting nothing, until a person has
+      removed the snapshot or the Released volume. Then it completes, <code>found: false</code>.</li>
+      <li>After a <code>VmDeletionTimeoutError</code>, a re-run finds what is left and waits for it again,
+      with a fresh 15 minutes.</li>
+      <li>Inside one run every activity is idempotent: the delete reads the cluster again on each attempt,
+      and the wait resumes its watching from its last heartbeat.</li>
+      <li>No zone lock is taken: freeing room only makes a concurrent create-vm run&rsquo;s figures err on the
+      full side.</li>
+    </ul>
+  </section>
+
+  <!-- =============================================================== API -->
+  <section id="api">
+    <div class="sec-head">
+      <div class="eyebrow">Child only</div>
+      <h2>How it is started and how you watch it</h2>
+      <p class="lede">No HTTP route starts it. Its parent starts it as an awaited child on
+      <code>delete_vm_workflow_id(kv_cluster, vm_name)</code>, queue <code>delete-vm-workflow</code>. By hand,
+      for a VM whose host is already out of its MCE:</p>
+    </div>
+<pre>temporal workflow start --type DeleteVmWorkflow --task-queue delete-vm-workflow \
+  --workflow-id delete-vm-ocp4-prod-kv-five-az1-a_ocp-c200-kv32-five-k7q2m9xd \
+  --input '{"input": {"kv_cluster": "ocp4-prod-kv-five-az1-a", "namespace": "inventory",
+            "vm_name": "ocp-c200-kv32-five-k7q2m9xd", "mce_cluster": "ocp4-prod-mce-five-a",
+            "why": "its host was removed from the MCE on 2026-11-26"}}'</pre>
+    <p class="note">Watch it like any run: <code>GET /workflows/runs/delete-vm-&lt;kv cluster&gt;_&lt;vm name&gt;</code>
+    answers its status, its <code>progress</code> and, once closed, its result or failure.
+    <b>Never start it for a VM whose BareMetalHost still exists</b>: metal3 lets a host go only after
+    powering it off through the VM&rsquo;s own Redfish.</p>
+  </section>
+
+  <!-- ========================================================= REFERENCE -->
+  <section id="reference">
+    <div class="sec-head">
+      <div class="eyebrow">Reference</div>
+      <h2>Input, result, phases, and what the worker needs</h2>
+    </div>
+
+    <h3 style="margin-bottom:10px">Input &mdash; <code>DeleteVmInput</code></h3>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>field</th><th>required</th><th>meaning</th></tr></thead>
+        <tbody>
+          <tr><td class="k">kv_cluster</td><td class="muted">yes</td><td class="muted">The KV cluster&rsquo;s day1 file name; it names the queue. Its caller is to read it from the BareMetalHost&rsquo;s <code>redbull.io/kv-cluster</code> label.</td></tr>
+          <tr><td class="k">namespace</td><td class="muted">yes</td><td class="muted">The VM&rsquo;s namespace on that cluster</td></tr>
+          <tr><td class="k">vm_name</td><td class="muted">yes</td><td class="muted">The VirtualMachine&rsquo;s name</td></tr>
+          <tr><td class="k">mce_cluster</td><td class="muted">yes</td><td class="muted">Must equal the VM&rsquo;s <code>redbull.io/mce</code> label: whose VM the caller believes this is</td></tr>
+          <tr><td class="k">created_by</td><td class="muted">no</td><td class="muted">The create-vm RUN id; when given, must equal the VM&rsquo;s <code>redbull.io/created-by</code> label</td></tr>
+          <tr><td class="k">mac</td><td class="muted">no</td><td class="muted">When given, must equal the VM&rsquo;s MAC</td></tr>
+          <tr><td class="k">why</td><td class="muted">no</td><td class="muted">For people: logged with the run</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 style="margin:28px 0 10px">Result &mdash; <code>DeleteVmResult</code></h3>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>field</th><th>meaning</th></tr></thead>
+        <tbody>
+          <tr><td class="k">found</td><td class="muted"><code>false</code>: nothing of the VM was there (already deleted) &mdash; success all the same</td></tr>
+          <tr><td class="k">vm_deleted</td><td class="muted">The VirtualMachine itself was there and is gone (<code>false</code> on a re-run that only cleaned up what was left)</td></tr>
+          <tr><td class="k">was_running</td><td class="muted">A guest was running when the VM was deleted</td></tr>
+          <tr><td class="k">datavolumes_deleted, claims_deleted</td><td class="muted">What was there and is verified gone</td></tr>
+          <tr><td class="k">import_sources_deleted</td><td class="muted">The CDI VolumeImportSources the VM&rsquo;s claims named: deleted by the run, or already taken by the garbage collector with their DataVolume (not read back)</td></tr>
+          <tr><td class="k">volumes_released</td><td class="muted">The PersistentVolumes that went with it: name, claim, reclaim policy, storage class, CSI driver, volume handle</td></tr>
+          <tr><td class="k">polls</td><td class="muted">How many times the wait looked</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note" style="margin-top:10px"><code>DeleteVmProgress</code> carries <code>phase</code>,
+    <code>found</code>, <code>was_running</code>, the names of the <code>datavolumes</code>, <code>claims</code>,
+    <code>volumes</code> and <code>snapshots</code> seen, what was <code>deleted</code>, and
+    <code>remaining</code> (the wait&rsquo;s last word on what is left).</p>
+
+    <h3 style="margin:28px 0 10px">Phases you&rsquo;ll see on the status endpoint</h3>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>phase</th><th>Meaning</th><th>Normal duration</th></tr></thead>
+        <tbody>
+          <tr><td class="k">pending</td><td class="muted">Run accepted, nothing read yet</td><td class="muted">instant</td></tr>
+          <tr><td class="k">inspecting</td><td class="muted">The identity check, and what is there</td><td class="muted">seconds; fails after 5 min with no worker</td></tr>
+          <tr><td class="k">deleting</td><td class="muted">The VM, its DataVolumes, its claims</td><td class="muted">seconds</td></tr>
+          <tr><td class="k">awaiting-release</td><td class="muted">Polling every 8 s until nothing is left &mdash; <b>bounded, &le; 15 min of watching</b></td><td class="muted">seconds for a Halted VM; minutes when a guest shuts down</td></tr>
+          <tr><td class="k">completed</td><td class="muted">Nothing of the VM is left, or nothing was there</td><td class="muted">&mdash;</td></tr>
+          <tr><td class="k">failed</td><td class="muted">Deleted, and something is left: see the failure</td><td class="muted">&mdash;</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 style="margin:28px 0 10px">What <code>vm-lifecycle-worker</code> needs (inside each KV cluster)</h3>
+    <p class="note" style="margin-top:0">No new setting. The chart&rsquo;s ClusterRole gains, each from a call in
+    <code>kubevirt_api.py</code>: persistentvolumeclaims <code>list, delete</code> (beside <code>get</code>),
+    persistentvolumes <code>get, list</code>, <code>snapshot.storage.k8s.io</code> volumesnapshots
+    <code>list</code>, <code>cdi.kubevirt.io</code> volumeimportsources <code>delete</code>. Still no verb on
+    pods beyond <code>list</code>, none that patches, starts or stops a VM, and none that deletes a
+    PersistentVolume or a snapshot.</p>
+    <p class="note"><b>Deploy order: the chart (its RBAC) on every KV cluster &rarr; the brain &rarr; the
+    vm-lifecycle image.</b> An old image answers &ldquo;not registered&rdquo; and the run waits; a new image on
+    an old ClusterRole answers 403, which is permanent &mdash; so the chart goes first.</p>
+
+    <h3 style="margin:28px 0 10px">Known limits</h3>
+    <ul>
+      <li><b>&ldquo;PersistentVolume gone&rdquo; stands for &ldquo;volume gone from the array&rdquo;.</b> A CSI
+      provisioner removes a <code>Delete</code>-policy PersistentVolume only once its driver deleted the volume.
+      Checked on ceph as far as the CSI driver&rsquo;s own log goes (cluster-qcl8n, 2026-11-26): for cephfs
+      the driver logs <i>successfully deleted volume &lt;handle&gt;</i> before the PersistentVolume goes; for
+      <b>rbd</b> it only <i>queues</i> the image&rsquo;s removal (ceph&rsquo;s trash, emptied by a manager
+      task) and then answers &mdash; there a PersistentVolume that is gone means its removal was handed to
+      ceph, not that it has finished. The array itself was not listed. <b>Not yet checked on Trident</b>, in the air-gap: after a
+      delete, <code>oc get pv</code> shows nothing and <code>tridentctl get volume</code> has no entry for the
+      volume.</li>
+      <li>Two cases are known where it does not hold, and the run looks for both: <code>Retain</code>, and
+      snapshots &mdash; seen on that cluster: with a VolumeSnapshot of the root disk, ceph&rsquo;s driver
+      reported the volume deleted and the PersistentVolume went, while the snapshot stood.</li>
+      <li>A DataVolume&rsquo;s own claim also names a CDI VolumeImportSource
+      (<code>volume-import-source-&lt;uid&gt;</code>, seen on that cluster for the blank root disk): it is
+      deleted like a boot ISO&rsquo;s, and listed in <code>import_sources_deleted</code>.</li>
+      <li>A VolumeImportSource whose claim is already gone is not found again (its name was on the claim).
+      It is a small object, not storage.</li>
+      <li>Nothing starts delete-vm yet: wiring it into remove-server-from-mce is a later change.</li>
+    </ul>
+  </section>
+
+  <footer>
+    <span>workflow_domains/vm_lifecycle/delete_vm.py</span>
+    <span>activities/vm_lifecycle/activities.py</span>
+    <span>activities/vm_lifecycle/vm_operations.py</span>
+    <span>activities/vm_lifecycle/vm_volumes.py</span>
+    <span>activities/vm_lifecycle/kubevirt_api.py</span>
+    <span>shared/models/vm_lifecycle.py</span>
+    <span>shared/interfaces/vm_lifecycle.py</span>
+    <span>deploy/charts/vm-lifecycle-worker/</span>
+  </footer>
+
+</div>
+</main>
+
+<script src="/assets/nav.js?v=__DOC_VERSION__" defer></script>
+</body>
+</html>

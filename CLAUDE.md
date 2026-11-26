@@ -94,6 +94,8 @@ activities/<domain>/         The execution "limbs" (one deployment per domain)
                                a KV cluster: kubevirt_api.py (its own cluster's API),
                                cluster_figures.py (the capacity arithmetic),
                                vm_spec.py (the VirtualMachine it builds),
+                               vm_volumes.py (which claims, volumes and snapshots
+                               are ONE VM's — delete-vm's rule),
                                vm_operations.py (each activity's whole body, over an
                                `api` object — what lets tests/kv_fleet.py run the
                                real limb code for dozens of fake clusters)
@@ -177,13 +179,15 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   `KV_CLUSTER` is EXACTLY the cluster's day1 file name and is NEVER canonicalised: the hub builds the
   same queue name from the list it reads in day1. `activities/vm_lifecycle/`, chart
   `deploy/charts/vm-lifecycle-worker/` (copied to redbull-platform by CI), domain
-  `workflow_domains/vm_lifecycle/` with THREE workflows: `create-vm`, on `create-vm-workflow`;
+  `workflow_domains/vm_lifecycle/` with FOUR workflows: `create-vm`, on `create-vm-workflow`;
   `kv-zone-lock`, on `kv-zone-lock-workflow`, id `kv-zone-lock-<site>-<zone>` — one long-lived run per
-  (site, zone) that hands the zone to one create-vm run at a time; and `delete-stray-vm`, on
+  (site, zone) that hands the zone to one create-vm run at a time; `delete-stray-vm`, on
   `delete-stray-vm-workflow`, id `delete-stray-vm-<kv cluster>-<create-vm run id>` (2026-11-24) — it
   removes a create-vm run's VM from a KV cluster the run moved on from without being able to check
-  it (§4). The last two have NO route and no docs page of their own (create-vm starts them, and
-  describes them). The zone's cluster list is NOT
+  it (§4); and `delete-vm`, on `delete-vm-workflow`, id `delete-vm-<kv cluster>_<vm name>`
+  (2026-11-26) — it deletes ONE VM by name with every volume of it (§4). Those two have NO route and
+  no docs page of their own (create-vm starts them, and describes them); delete-vm has NO route
+  either — it is to be remove-server-from-mce's child — and its own page. The zone's cluster list is NOT
   this limb's: it is day1's, so `list_kv_clusters` lives on the cluster-lifecycle limb, which holds
   the day1 token (next bullet). create-vm's id is a SLOT of the InfraEnv on its MCE
   (`create-vm-<mce>_<infraEnv>_<slot>`, `shared/workflow_ids.py`): the VM's name is drawn inside the
@@ -1445,6 +1449,147 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
     Temporal's retention; redbull-platform's own `server-lifecycle-worker` chart is not synced
     and needs the three keys by hand. Not provable in tests: a VM booted by Ironic through
     kubevirt-redfish into an Agent — the first real run is that test.
+- **delete-vm (domain `vm-lifecycle`) deletes ONE VM by name from its KV cluster and COMPLETES ONLY
+  WHEN NOTHING OF IT IS LEFT IN KUBERNETES, ITS PERSISTENTVOLUMES INCLUDED**
+  (`workflow_domains/vm_lifecycle/delete_vm.py`, own queue `delete-vm-workflow`, id
+  `delete-vm-<kv cluster>_<vm name>`). Planned and built with the operator 2026-11-26
+  (`~/.claude/plans/i-want-u-to-frolicking-hopcroft.md`); (operator) marks the operator's decisions, the rest
+  is the lead's. Why it exists: nothing removed an INSTALLED VM — remove-server-from-mce takes the
+  host out of the MCE and stops, so the VM stayed Halted on its KV cluster, counted against its
+  capacity for ever, its disks in the array; and `delete_vm_on_cluster` is a rollback tool (it
+  finds a VM by a create-vm RUN id, waits for nothing, touches no claim). That activity and its
+  three callers are UNCHANGED. The pieces that are decisions:
+  - **Child only, NO ROUTE** (operator). It holds no MCE credential, so it cannot check that the
+    VM's BareMetalHost is gone, and metal3 needs the VM's Redfish to release a host.
+    remove-server-from-mce stays the one public way to remove a VM. **THE INTEGRATION IS NOT BUILT**:
+    remove-server-from-mce starting it (right after metal3 lets the host go — operator), and
+    add-server-to-mce writing the BareMetalHost's `redbull.io/kv-cluster` / `redbull.io/created-by`
+    labels it would read, are a later change with open questions to DISCUSS with the operator
+    first (the plan's "Later" section). Until then only tests and the Temporal CLI start it.
+  - **Input**: `kv_cluster`, `namespace`, `vm_name`, `mce_cluster` required; `created_by`, `mac`,
+    `why` optional. **By NAME, guarded by the VM's own labels**: the VM must carry
+    `redbull.io/created-by` (a hand-made VM is NEVER deleted) and `redbull.io/mce` equal to the
+    request's; `created_by` and `mac` must match when given; a `redbull.io/kv-cluster` label must
+    name the worker's own cluster (absent on a VM made before the label: not compared). Otherwise
+    `VmIdentityConflictError`, nothing written — checked at the inspection and FRESH at the delete.
+    Every delete is by the UID read.
+  - **The VM also carries `redbull.io/kv-cluster: <day1 file name>` since this change**
+    (`vm_spec.KV_CLUSTER_LABEL`; the naming convention's §4 since its PR #2, 2026-11-26). Written by
+    the cluster's worker; no patch — only a limb's body changed, every create-vm golden replays.
+  - **Three activities on the cluster's own worker**: `inspect_vm_for_deletion` (observe-only; the
+    ONLY call with a schedule-to-start limit, 5 min: nothing is written yet) →
+    `delete_vm_and_volumes` (re-read, re-checked; VM → its DataVolumes → each claim's CDI
+    VolumeImportSource → the claim; the import source goes BEFORE its claim because its name is
+    only on the claim) → `await_vm_gone` (ONE heartbeating activity, 8 s polls, 15 min, `done` /
+    `left` / `deadline`). Phases `inspecting`, `deleting`, `awaiting-release`, `completed` /
+    `failed`. Permanent, from the classes: `KvClusterAccessError`, `KvClusterMismatchError`,
+    `VmIdentityConflictError`, `VmRequestRejectedError`. No new limb-raised exception. Nothing found
+    anywhere is a COMPLETED run, `found: false`. That schedule-to-start timeout is answered by the
+    workflow as `KvClusterWorkerAbsentError` (WORKFLOW-RAISED, naming the queue, "nothing was
+    deleted") instead of Temporal's bare "activity ScheduleToStart timeout" (the lab, below).
+  - **"Not stale in the array" = the PersistentVolume object is gone** — deployment-agnostic (§3):
+    no ceph or Trident call, no driver CRD. An ASSUMPTION about CSI provisioners (a `Delete` PV is
+    removed only once the driver deleted the volume), checked on ceph in the lab below and NOT YET
+    on Trident (the air-gap: after a delete, `oc get pv` shows nothing and `tridentctl get volume`
+    has no entry). Two cases are KNOWN where it does not hold, so the run looks for both: `Retain`
+    (the PV goes `Released`, the volume stays) and snapshots (the backend keeps the volume under one).
+  - **DELETE, THEN FAIL** (operator): when the array cannot be proven clean the run deletes
+    everything it may and then FAILS — never a success with a note. `VmVolumesLeftInStorageError`
+    (WORKFLOW-RAISED): a `Retain` PV, a PV still there at the deadline, a VolumeSnapshot of one of
+    the VM's disks, or a look-alike claim (below) — each PV named with its CSI driver and volume
+    handle. `VmDeletionTimeoutError` (WORKFLOW-RAISED): the VM, a DataVolume or a claim still there
+    at the deadline, with its finalizers and the pods mounting it. A re-run RESUMES; after a
+    "delete, then fail" it fails the same way until a person removed the snapshot or the Released
+    volume, then completes `found: false`.
+  - **NEVER deleted by the run**: a PersistentVolume (deleting a `Retain` one loses the only pointer
+    to its backend volume), a VolumeSnapshot (someone's backup), a pod (the worker keeps no pod
+    verb; a pod holding a claim is NAMED in the failure).
+  - **A RUNNING VM is deleted too**, `was_running` on the result: abnormal (after metal3 released
+    the host the VM is Halted), but the worker has no verb to stop a VM, the caller has proved the
+    host left the MCE, and refusing would leave a powered-on VM nobody owns.
+  - **Which volumes are the VM's is ONE pure rule, `activities/vm_lifecycle/vm_volumes.py`**: a
+    claim of the VM's namespace is the VM's when its spec names it, or its name is `<vm>-root` or
+    kubevirt-redfish's boot ISO (`<vm>-bootiso-<unix ts>-<6 digits>`, a BARE claim nothing owns,
+    deleted by kubevirt-redfish on eject — so a leftover only when metal3's eject did not happen),
+    or it carries the fork's `vm.redfish: <vm>` label (the CDI import path only), or an owner
+    reference names the VM, one of its claims or DataVolumes. Read in the team's kubevirt-redfish
+    fork (`pkg/kubevirt/client.go`, commit 9f98767): it cuts any name over 63 characters to its
+    first 49 plus a hash and `truncated`, so a CUT boot ISO name is certain only while it still
+    holds all of `<vm>-bootiso-` (a VM name ≤ 40; today's are about 27). Past that it is a
+    `cut-name` LOOK-ALIKE — two long names differing in their last characters cut alike — which is
+    reported, NEVER deleted, and fails the run. A PV is the VM's by a bound claim or by a
+    `claimRef` naming one of them or a name the NAME rules know (how a re-run finds a volume after
+    the claims are gone); a snapshot by its source claim, the same two ways.
+  - **What the wait watches comes from the run's HISTORY** (the advisor's review): the workflow
+    hands `await_vm_gone` the union of what the inspection and the delete saw. A volume is found
+    through its claim, so an attempt that starts after the claims went would otherwise see no
+    volume and report `done` over one still there (`test_a_wait_resumed_after_the_claims_went…`).
+  - **The wait's 15 minutes count only the time the cluster was SEEN** — the seconds between two
+    polls that both answered, kept in the heartbeat details (`waited_seconds`), NOT a wall clock
+    since the first attempt (create-vm's ready wait keeps that one). Found in the lab below: the
+    cluster was away for twenty minutes of a wait, and the run failed the moment it answered again,
+    over a volume the cluster had simply not got to yet. Do not go back to `started_at` here.
+  - **No zone lock** (freeing room only makes a create-vm run's figures err on the full side), no
+    rollback, NOTHING on an exit path (WF017 has nothing to guard); a cancel ends the run CANCELED
+    and undoes nothing. The two non-heartbeating calls are `ABANDON` on cancel, the wait `TRY_CANCEL`.
+  - **RBAC, which REVERSES the chart's "no write to a claim"** (dated in its README): the
+    `vm-lifecycle-worker` ClusterRole gains persistentvolumeclaims `list, delete`,
+    persistentvolumes `get, list`, `snapshot.storage.k8s.io` volumesnapshots `list`,
+    `cdi.kubevirt.io` volumeimportsources `delete`. Still no pod, VM-patch or power verb, and no
+    delete of a PV or a snapshot. **Deploy order: the chart on every KV cluster → the brain → the
+    vm-lifecycle image**: an old image answers "not registered" (the run waits); a new image on an
+    old ClusterRole answers 403, permanent.
+  - **PARKED for the integration's discussion, so NOT built** (operator, 2026-11-26): "wait, do not
+    fail" — no schedule-to-start anywhere and a 403 RETRIED on purpose, because delete-vm's only
+    caller will have deleted the host and a failed run loses the one record of where the VM is.
+    Adopting it changes activity options only.
+  - **Tested on the fleet** (`tests/kv_fleet.py` now has real claim, PersistentVolume and snapshot
+    stores: a VM's delete takes its DataVolumes, a DataVolume its claim, a claim — once no pod
+    mounts it — its volume, removed after a settable number of reads or left `Released` under
+    `Retain`): `tests/test_vm_volumes.py`, `tests/test_vm_lifecycle_delete_limb.py`,
+    `tests/test_delete_vm_workflow.py`, goldens `tests/histories/delete_vm/` on the production
+    constants.
+  - **THE 2026-11-26 LAB (cluster-qcl8n) ran delete-vm alone, as its parent will start it**: the
+    branch's brain and the KV cluster's worker run locally on their own Temporal dev server, the
+    worker acting as the CHART's ServiceAccount (its rendered ClusterRole, a token kubeconfig — so a
+    missing verb would have shown), on VMs made by the real limb code (`vm_operations.create_vm`)
+    in the lab's own namespace, on external ceph (cephfs root disks, an rbd boot ISO). Proven there:
+    a Halted VM gone with its DataVolume, claim and PersistentVolume in 16 s, ceph's cephfs driver
+    logging `successfully deleted volume <handle>` before the PersistentVolume went — while for
+    RBD the driver's DeleteVolume only QUEUES the image's removal (`successfully added task to move
+    image …`: ceph's trash, emptied by a manager task) and then answers, so there "the
+    PersistentVolume is gone" means "its removal was handed to ceph", not "already removed";
+    nothing there → `found: false`; a `Retain` class → everything deleted, then
+    `VmVolumesLeftInStorageError` naming the Released volume and its handle, the same on a re-run,
+    and `found: false` once the volume was removed; a VolumeSnapshot of the root disk → the same
+    failure naming the snapshot, AND ceph's driver reported the volume deleted and the
+    PersistentVolume went while the snapshot stood (the reason snapshots are looked for); a boot ISO
+    inserted (CDI path, with its VolumeImportSource) plus an older bare one → all three claims and
+    volumes gone; a RUNNING VM → deleted, `was_running`, with the worker killed (`kill -9`) during
+    the wait and the next attempt resuming from its heartbeat (the SDK does not send every
+    heartbeat at once, so a hard kill can lose up to about a minute of the watched time — the wait
+    is then that much longer, never shorter); a pod holding the root disk → `VmDeletionTimeoutError`
+    naming the pod (that run was on the OLD wall clock and met the outage: 33 polls, not a clean
+    15 minutes), and a claim left Terminating by the cluster → the same on the new clock, after
+    15 minutes of WATCHING, 19 on the wall; a hand-made VM, another MCE's, another run's, another
+    MAC, another cluster's `kv-cluster` label → `VmIdentityConflictError`, nothing deleted; a worker
+    on the PRE-delete-vm ClusterRole → `KvClusterAccessError` at the first new verb, the VM
+    untouched, and the same worker completing once its role was the chart's (the deploy order); no
+    worker → the run failed after exactly 5 min, nothing read. A re-run whose VM and claim were
+    already gone found the leftover volume by its `claimRef` and completed. FOUND AND FIXED: the
+    cluster's API and controller manager went away for twenty minutes of one wait (that cluster's
+    chronic trouble: `kube-controller-manager` loses its lease on a slow API, 220 restarts in six
+    days) and the wall-clock deadline failed two runs the moment it answered again — hence the
+    watched-time clock above; and the bare ScheduleToStart message — hence
+    `KvClusterWorkerAbsentError`. Also seen: a DataVolume's own claim names a CDI VolumeImportSource
+    (`volume-import-source-<uid>`), deleted like a boot ISO's — and the result's
+    `import_sources_deleted` lists the sources the VM's claims NAMED, which a retry may find the
+    garbage collector already took. NOT proven there: the boot ISO made
+    by kubevirt-redfish itself (the lab made the claims by hand in the fork's shapes; pressing
+    InsertMedia needed its Redfish login), the ARRAY listed directly (`rbd ls` / `ceph fs subvolume
+    ls` — only the driver's log was read), Trident, and delete-vm as a real CHILD of
+    remove-server-from-mce. Twelve of its histories are goldens
+    (`tests/histories/delete_vm/lab-cluster-qcl8n-*.json`).
 - **Select bond members from `interfaces[]`, NEVER from `nic_macs`.**
   server-scan reduces Dell NPAR partitions to one entry per physical port in
   `interfaces` but leaves `nic_macs` whole on purpose, so a 4-port partitioned
@@ -2005,7 +2150,11 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   heartbeats every poll (`heartbeat_timeout` 2 min), keeps its progress snapshot and clocks in the
   heartbeat details so a retry after a dead worker resumes them, and returns `done | stalled |
   deadline` on its own clock, with `start_to_close_timeout` only a margin past that deadline. A
-  three-hour control-plane upgrade is then a handful of history events. Retries stay unbounded per
+  three-hour control-plane upgrade is then a handful of history events. WHICH clock is a decision:
+  a wall clock since the first attempt (create-vm's ready wait) also runs through an outage, so a
+  wait whose deadline means "the cluster had this long to finish" counts only the time between two
+  polls that both answered (delete-vm's `await_vm_gone`, §4) — and what such a wait watches is
+  handed to it from the run's history, never found again by an attempt that starts later. Retries stay unbounded per
   the rule above. Started with `workflow.start_activity` (`TRY_CANCEL`) so an abort can cancel it;
   commits and syncs are `WAIT_CANCELLATION_COMPLETED`, so a cancel never abandons a push half-way.
   The one write that is `TRY_CANCEL` is the Brain incident after an agent answer
@@ -2228,8 +2377,10 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   `deploy/charts/upgrade-agent-worker/` and `deploy/charts/vm-lifecycle-worker/` (2026-11-20:
   one release INSIDE each KV cluster, its ConfigMap that cluster's own values, a ClusterRole of
   exactly the verbs `activities/vm_lifecycle/kubevirt_api.py` uses — list nodes and pods, get
-  namespaces and PVCs, get/list/create/delete VirtualMachines, list VMIs, get/delete DataVolumes
-  — and NO Secret;
+  namespaces, get/list/delete PVCs, get/list PersistentVolumes, get/list/create/delete
+  VirtualMachines, list VMIs, get/delete DataVolumes, delete VolumeImportSources, list
+  VolumeSnapshots (the claim, volume, import-source and snapshot verbs since 2026-11-26, for
+  delete-vm, §4: ship the chart BEFORE the image) — and NO Secret;
   the render fails without `kvCluster` or the storage class;
   until then `gitops/charts/vm-lifecycle-worker/` was a hub chart with two agent-token Secrets)
   — the last three copied into redbull-platform's

@@ -9,9 +9,10 @@ dialling OUT (gRPC, TLS through the hub's Route): the KV cluster exposes
 nothing, and nothing on the hub holds a credential for it.
 
 Its own deployment because of where it runs and what it may do (CLAUDE.md §2):
-read nodes, pods, namespaces, VirtualMachineInstances and PersistentVolumeClaims,
-create/read/delete VirtualMachines, read/delete DataVolumes — on its own
-cluster only. No Secret at all.
+read nodes, pods, namespaces, VirtualMachineInstances, PersistentVolumes and
+VolumeSnapshots, create/read/delete VirtualMachines, read/delete DataVolumes
+and PersistentVolumeClaims, delete a boot ISO's VolumeImportSource — on its
+own cluster only. No Secret at all.
 
 `KV_CLUSTER` is EXACTLY the cluster's day1 file name: the hub builds the same
 queue name from the list it reads in day1, so a worker deployed under any
@@ -30,9 +31,12 @@ from datetime import timedelta
 from temporalio.worker import Worker
 
 from activities.vm_lifecycle.activities import (
+    await_vm_gone,
     await_vm_ready,
     create_vm_on_cluster,
+    delete_vm_and_volumes,
     delete_vm_on_cluster,
+    inspect_vm_for_deletion,
     read_kv_cluster_figures,
 )
 from shared.consts import vm_lifecycle_activity_queue
@@ -54,11 +58,15 @@ async def main() -> None:
     worker = Worker(
         client,
         task_queue=_TASK_QUEUE,
-        activities=[read_kv_cluster_figures, create_vm_on_cluster, await_vm_ready, delete_vm_on_cluster],
-        # The ready wait runs for minutes; on shutdown it is cancelled after
-        # this and Temporal's next attempt resumes its clock from the
-        # heartbeat. A create cut off mid-call is found again by its request
-        # id. Keep it below the pod's grace period.
+        activities=[
+            read_kv_cluster_figures, create_vm_on_cluster, await_vm_ready, delete_vm_on_cluster,
+            inspect_vm_for_deletion, delete_vm_and_volumes, await_vm_gone,
+        ],
+        # The two waits (a root disk bound; a deleted VM gone) run for minutes;
+        # on shutdown each is cancelled after this and Temporal's next attempt
+        # resumes its clock from the heartbeat. A create cut off mid-call is
+        # found again by its request id, a delete by reading the cluster
+        # again. Keep it below the pod's grace period.
         graceful_shutdown_timeout=timedelta(seconds=20),
     )
     stop = install_shutdown_handler()

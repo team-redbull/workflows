@@ -2,7 +2,9 @@
 
 Everything belonging to the domain lives together here — the create-vm
 workflow (create_vm.py), the per-zone lock it takes (kv_zone_lock.py), the fit
-rule it decides with (placement.py) and the APIRouter that fronts create-vm
+rule it decides with (placement.py), its cleanup child (delete_stray_vm.py),
+delete-vm (delete_vm.py: one VM deleted by name with every volume of it, a
+child workflow with no route) and the APIRouter that fronts create-vm
 (router.py) — mirroring activities/vm_lifecycle/ on the limb side, which runs
 inside each KV cluster. The domain's subject is the VirtualMachines that stand
 in for physical servers under a KubeVirt InfraEnv: created here — by

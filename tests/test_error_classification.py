@@ -398,6 +398,73 @@ class TestCreateVmClassification:
         assert permanent <= raised, sorted(permanent - raised)
 
 
+class TestDeleteVmClassification:
+    """The same invariants for delete-vm (workflow_domains/vm_lifecycle/delete_vm.py), on the same limb."""
+
+    _DELETE_VM = pathlib.Path(__file__).resolve().parent.parent / "workflow_domains/vm_lifecycle/delete_vm.py"
+
+    def test_every_entry_names_a_real_error_class_and_none_is_workflow_raised(self):
+        from workflow_domains.vm_lifecycle.delete_vm import _PERMANENT_ACTIVITY_ERRORS, _RETRY_POLICY as policy
+
+        listed = set(policy.non_retryable_error_types or [])
+        assert listed == {error.__name__ for error in _PERMANENT_ACTIVITY_ERRORS}
+        for name in listed:
+            assert isinstance(getattr(exceptions, name, None), type), name
+        assert not _workflow_raised_errors() & listed
+        # A 403 is permanent here as for create-vm: the chart's ClusterRole ships before the image.
+        assert listed == {"KvClusterAccessError", "KvClusterMismatchError", "VmIdentityConflictError", "VmRequestRejectedError"}
+        assert policy.maximum_attempts == 0 and policy.maximum_interval is not None  # unbounded, capped
+
+    def test_the_list_is_derived_from_classes_and_every_type_is_a_class(self):
+        tree = ast.parse(self._DELETE_VM.read_text())
+        listed = next(
+            node.value for node in ast.walk(tree)
+            if isinstance(node, ast.keyword) and node.arg == "non_retryable_error_types"
+        )
+        assert not isinstance(listed, ast.List)
+        types = [
+            keyword.value for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "ApplicationError"
+            for keyword in node.keywords if keyword.arg == "type"
+        ]
+        assert types and all(isinstance(value, ast.Attribute) and value.attr == "__name__" for value in types)
+        used = {value.value.id for value in types}
+        assert used == {"VmVolumesLeftInStorageError", "VmDeletionTimeoutError", "KvClusterWorkerAbsentError"}
+        assert used <= _workflow_raised_errors()
+
+    def test_what_its_three_operations_raise_is_permanent_or_the_retried_outage(self):
+        """delete-vm added no limb-raised error of its own: what vm_operations and kubevirt_api
+        raise for it is create-vm's set, of which these are the ones its calls can meet."""
+        from workflow_domains.vm_lifecycle.create_vm import _PERMANENT_ACTIVITY_ERRORS as create_vms
+        from workflow_domains.vm_lifecycle.delete_vm import _PERMANENT_ACTIVITY_ERRORS
+
+        assert set(_PERMANENT_ACTIVITY_ERRORS) <= set(create_vms)
+
+    def test_nothing_runs_on_an_exit_path(self):
+        """A delete has no rollback: no `finally`, and its one `except` names a timeout and re-raises
+        everything else — it awaits nothing and calls no workflow API (WF017 has nothing to guard)."""
+        tree = ast.parse(self._DELETE_VM.read_text())
+        tries = [node for node in ast.walk(tree) if isinstance(node, ast.Try)]
+        assert len(tries) == 1 and not tries[0].finalbody and len(tries[0].handlers) == 1
+        handler = tries[0].handlers[0]
+        assert handler.type.id == "ActivityError"
+        assert not [node for node in ast.walk(handler) if isinstance(node, ast.Await)]
+        assert any(isinstance(node, ast.Raise) and node.exc is None for node in ast.walk(handler))
+
+    def test_it_never_bounds_a_call_by_schedule_to_close(self):
+        tree = ast.parse(self._DELETE_VM.read_text())
+        keywords = {keyword.arg for node in ast.walk(tree) if isinstance(node, ast.Call) for keyword in node.keywords}
+        assert "schedule_to_close_timeout" not in keywords and "maximum_attempts" not in keywords
+        calls = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and getattr(node.func, "attr", None) == "execute_activity"
+        ]
+        assert len(calls) == 3
+        # Only the inspection may fail the run for want of a worker: nothing is written before it.
+        limited = [call.args[0].id for call in calls if any(k.arg == "schedule_to_start_timeout" for k in call.keywords)]
+        assert limited == ["inspect_vm_for_deletion"]
+
+
 class TestProvisionClusterClassification:
     """The same invariants for provision-cluster (workflow_domains/cluster_lifecycle/
     provision_cluster.py), its limb, and the refactored allocate-segment."""

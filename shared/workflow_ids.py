@@ -335,6 +335,20 @@ def delete_stray_vm_workflow_id(kv_cluster: str, run_id: str) -> str:
     return f"delete-stray-vm-{kv_cluster}-{run_id}"
 
 
+def delete_vm_workflow_id(kv_cluster: str, vm_name: str) -> str:
+    """`delete-vm-<kv cluster>_<vm name>`: the removal of ONE VM, by name, from ONE KV cluster.
+
+    Keyed on the VM itself — unlike every create-vm id, a delete knows its VM's
+    name — and on the cluster, because a name is unique on its cluster by a
+    check and across clusters only by chance. `_` joins the two: it cannot
+    occur in a Kubernetes name, so where the cluster ends is unambiguous. A
+    second start while one runs is refused (WorkflowAlreadyStartedError), and
+    a re-run of a closed id RESUMES: it inspects again and removes whatever is
+    still there.
+    """
+    return f"delete-vm-{kv_cluster}_{vm_name}"
+
+
 def kv_zone_lock_workflow_id(site: str, zone: str) -> str:
     """`kv-zone-lock-<site>-<zone>`: THE lock of one zone of one site.
 

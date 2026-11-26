@@ -19,6 +19,12 @@ depends on it:
   * label selectors and the unfinished-pods filter select;
   * a root disk binds after a few polls (an Immediate storage class) or never
     (WaitForFirstConsumer), and a deleted VM and its DataVolume are gone;
+  * a bound disk is a real CLAIM with a real PersistentVolume behind it (for
+    delete-vm): deleting a VM takes its DataVolumes with it, a DataVolume its
+    claim, and a claim — once no pod mounts it — its volume, which a `Delete`
+    reclaim policy removes after a settable number of reads and a `Retain`
+    one leaves `Released` for ever; a boot ISO claim, a VolumeSnapshot and a
+    pod holding a claim can be put there;
   * any call can be made to fail (5xx, 403, a timeout) or to hang, a set number
     of times; a cluster's worker can be absent, stopped and started again while
     a run is going — and so can the hub's own three workers (the brain's for
@@ -45,7 +51,7 @@ from temporalio.client import Client
 from temporalio.exceptions import ApplicationError
 from temporalio.worker import Worker
 
-from activities.vm_lifecycle import cluster_figures, vm_operations, vm_spec
+from activities.vm_lifecycle import cluster_figures, vm_operations, vm_spec, vm_volumes
 from activities.vm_lifecycle.kubevirt_api import MacRefused, NameTaken, NotFound
 from activities.vm_lifecycle.vm_operations import ClusterValues
 from shared.cluster_names import parse_kv_cluster, seed_folder_pattern
@@ -54,6 +60,7 @@ from shared.consts import (
     CLUSTER_LIFECYCLE_ACTIVITY_QUEUE,
     CREATE_VM_WORKFLOW_QUEUE,
     DELETE_STRAY_VM_WORKFLOW_QUEUE,
+    DELETE_VM_WORKFLOW_QUEUE,
     KV_ZONE_LOCK_WORKFLOW_QUEUE,
     vm_lifecycle_activity_queue,
 )
@@ -67,11 +74,16 @@ from shared.models.vm_lifecycle import (
     VmCreateRequest,
     VmDeleted,
     VmDeleteRequest,
+    VmDeletionState,
+    VmGoneOutcome,
     VmReadyOutcome,
     VmReadyRequest,
+    VmRemovalRequest,
+    VmVolumesDeleted,
 )
 from workflow_domains.vm_lifecycle.create_vm import CreateVmWorkflow
 from workflow_domains.vm_lifecycle.delete_stray_vm import DeleteStrayVmWorkflow
+from workflow_domains.vm_lifecycle.delete_vm import DeleteVmWorkflow
 from workflow_domains.vm_lifecycle.kv_zone_lock import KvZoneLockWorkflow
 
 GIB = 1024**3
@@ -236,6 +248,20 @@ class FakeKvCluster:
         self._random = random.Random(seed if seed is not None else hash(name) & 0xFFFF)
         self._dv_polls: dict[tuple[str, str], int] = {}
         self._dv_storage: dict[tuple[str, str], str] = {}  # how each disk's class behaved when it was made
+        # The cluster's storage, for delete-vm: claims and the PersistentVolumes behind them.
+        self.pvcs: dict[tuple[str, str], dict] = {}
+        self.pvs: dict[str, dict] = {}
+        self.snapshots: dict[tuple[str, str], dict] = {}
+        self.import_sources: set[tuple[str, str]] = set()
+        self.reclaim_policy = "Delete"  # the storage class's, given to each volume when it is made
+        # How many reads of a `Delete` volume it survives after its claim went (the CSI driver
+        # deleting it), and the volumes it never finishes with.
+        self.volume_release_polls = 0
+        self.stuck_volumes: set[str] = set()
+        # How many reads of a deleted VM that had a guest running it survives (the shutdown).
+        self.vm_shutdown_polls = 0
+        self._pv_polls: dict[str, int] = {}
+        self._vm_polls: dict[tuple[str, str], int] = {}
 
     # --- knobs ---------------------------------------------------------------------------
 
@@ -267,8 +293,136 @@ class FakeKvCluster:
         cpu, memory = cluster_figures.stopped_vm_request(vm)
         self.vmis[(namespace, name)] = {"metadata": {"name": name, "namespace": namespace}, "status": {"phase": phase}}
         if phase in {"Scheduled", "Running", "Unknown"}:
-            self.pods.append(pod(f"virt-launcher-{name}", node_name, f"{cpu}m", str(memory - 7 * 1024**2),
-                                 namespace=namespace))
+            launcher = pod(f"virt-launcher-{name}", node_name, f"{cpu}m", str(memory - 7 * 1024**2),
+                           namespace=namespace)
+            datavolumes, claims = vm_volumes.spec_names(vm)
+            launcher["spec"]["volumes"] = [
+                {"name": claim, "persistentVolumeClaim": {"claimName": claim}} for claim in sorted({*datavolumes, *claims})
+            ]
+            self.pods.append(launcher)
+            vm.setdefault("status", {}).update({"printableStatus": "Running", "created": True, "ready": True})
+
+    # --- storage knobs (delete-vm) -----------------------------------------------------------
+
+    def _new_claim(self, namespace: str, name: str, *, owner: tuple[str, str] | None = None,
+                   labels: dict[str, str] | None = None, import_source: str | None = None) -> dict:
+        claim: dict[str, Any] = {
+            "metadata": {"name": name, "namespace": namespace, "uid": str(uuid.uuid4()),
+                         "finalizers": ["kubernetes.io/pvc-protection"]},
+            "spec": {"storageClassName": self.values.storage_class_name},
+            "status": {"phase": "Pending"},
+        }
+        if owner:
+            claim["metadata"]["ownerReferences"] = [{"kind": owner[0], "name": owner[1]}]
+        if labels:
+            claim["metadata"]["labels"] = dict(labels)
+        if import_source:
+            claim["spec"]["dataSourceRef"] = {"apiGroup": "cdi.kubevirt.io", "kind": "VolumeImportSource", "name": import_source}
+            self.import_sources.add((namespace, import_source))
+        self.pvcs[(namespace, name)] = claim
+        return claim
+
+    def _bind(self, namespace: str, name: str) -> dict | None:
+        """The claim is Bound, with a PersistentVolume of the storage class's reclaim policy behind it."""
+        claim = self.pvcs.get((namespace, name))
+        if claim is None or claim["spec"].get("volumeName"):
+            return None
+        uid = claim["metadata"]["uid"]
+        volume = {
+            "metadata": {"name": f"pvc-{uid}", "finalizers": ["kubernetes.io/pv-protection"]},
+            "spec": {
+                "persistentVolumeReclaimPolicy": self.reclaim_policy,
+                "storageClassName": claim["spec"].get("storageClassName"),
+                "claimRef": {"namespace": namespace, "name": name, "uid": uid},
+                "csi": {"driver": "fake.csi.redbull.io", "volumeHandle": f"vol-{uid}"},
+            },
+            "status": {"phase": "Bound"},
+        }
+        self.pvs[volume["metadata"]["name"]] = volume
+        claim["spec"]["volumeName"] = volume["metadata"]["name"]
+        claim["status"]["phase"] = "Bound"
+        return volume
+
+    def bind_now(self, namespace: str, vm_name: str) -> None:
+        """The VM's root disk as it is once create-vm completed: imported, bound, the VM Stopped."""
+        root = vm_spec.root_disk_name(self.vms[(namespace, vm_name)])
+        self.datavolumes[(namespace, root)]["status"]["phase"] = "Succeeded"
+        self.vms[(namespace, vm_name)]["status"]["printableStatus"] = "Stopped"
+        self._bind(namespace, root)
+
+    def add_bootiso(self, namespace: str, vm_name: str, *, inserted: bool = True, cdi: bool = False,
+                    name: str | None = None) -> str:
+        """kubevirt-redfish's boot ISO claim for a VM: a bare claim nothing owns, bound. `inserted`:
+        the VM's volumes name it (the media was never ejected). `cdi`: filled through CDI — it
+        carries kubevirt-redfish's label and a VolumeImportSource."""
+        name = name or f"{vm_name}-bootiso-1795000000-{len(self.pvcs):06d}"
+        self._new_claim(
+            namespace, name, labels={vm_volumes.REDFISH_VM_LABEL: vm_name} if cdi else None,
+            import_source=f"{name}-populator"[:63] if cdi else None,
+        )
+        self._bind(namespace, name)
+        if inserted and (namespace, vm_name) in self.vms:
+            self.vms[(namespace, vm_name)]["spec"]["template"]["spec"].setdefault("volumes", []).append(
+                {"name": "cdrom0", "persistentVolumeClaim": {"claimName": name}}
+            )
+        return name
+
+    def add_snapshot(self, namespace: str, name: str, claim: str) -> dict:
+        """A VolumeSnapshot of one claim, ready, as a backup tool or a person left it."""
+        snapshot = {
+            "metadata": {"name": name, "namespace": namespace},
+            "spec": {"source": {"persistentVolumeClaimName": claim}},
+            "status": {"readyToUse": True, "boundVolumeSnapshotContentName": f"snapcontent-{name}"},
+        }
+        self.snapshots[(namespace, name)] = snapshot
+        return snapshot
+
+    def add_claim_pod(self, namespace: str, name: str, claim: str) -> dict:
+        """A running pod that mounts a claim: the claim cannot go while it is there."""
+        holder = pod(name, self.nodes[0]["metadata"]["name"], "100m", "64Mi", namespace=namespace)
+        holder["spec"]["volumes"] = [{"name": "data", "persistentVolumeClaim": {"claimName": claim}}]
+        self.pods.append(holder)
+        return holder
+
+    def remove_pod(self, name: str) -> None:
+        self.pods = [p for p in self.pods if p["metadata"]["name"] != name]
+
+    def _mounted(self, namespace: str, claim: str) -> bool:
+        return any(
+            p["metadata"].get("namespace") == namespace
+            and (p.get("status") or {}).get("phase") not in {"Succeeded", "Failed"}
+            and any((v.get("persistentVolumeClaim") or {}).get("claimName") == claim for v in p["spec"].get("volumes") or [])
+            for p in self.pods
+        )
+
+    def _remove_datavolume(self, namespace: str, name: str) -> bool:
+        """A DataVolume goes, and its claim with it (the garbage collector's cascade)."""
+        gone = self.datavolumes.pop((namespace, name), None) is not None
+        claim = self.pvcs.get((namespace, name))
+        if claim is not None and any(o.get("kind") == "DataVolume" for o in claim["metadata"].get("ownerReferences") or []):
+            claim["metadata"].setdefault("deletionTimestamp", datetime.now(UTC).isoformat())
+        return gone
+
+    def _remove_vm(self, namespace: str, name: str) -> None:
+        vm = self.vms.pop((namespace, name))
+        self.vmis.pop((namespace, name), None)
+        self._vm_polls.pop((namespace, name), None)
+        self.remove_pod(f"virt-launcher-{name}")
+        for template in vm["spec"].get("dataVolumeTemplates") or []:
+            self._remove_datavolume(namespace, template["metadata"]["name"])
+        self.deleted.append(name)
+
+    def _settle(self) -> None:
+        """What the cluster's controllers have done since the last read: a deleted claim no pod
+        mounts is gone, and its volume is Released — to stay (`Retain`) or to be deleted."""
+        for key, claim in list(self.pvcs.items()):
+            if not claim["metadata"].get("deletionTimestamp") or self._mounted(*key):
+                continue
+            del self.pvcs[key]
+            volume = self.pvs.get(claim["spec"].get("volumeName") or "")
+            if volume is not None:
+                volume["status"]["phase"] = "Released"
+                self._pv_polls.setdefault(volume["metadata"]["name"], 0)
 
     @property
     def vm_names(self) -> list[str]:
@@ -329,6 +483,11 @@ class FakeKvCluster:
     async def get_vm(self, namespace: str, name: str) -> dict | None:
         await self._enter("get_vm")
         vm = self.vms.get((namespace, name))
+        if vm is not None and vm["metadata"].get("deletionTimestamp"):  # a guest shutting down
+            self._vm_polls[(namespace, name)] = self._vm_polls.get((namespace, name), 0) + 1
+            if self._vm_polls[(namespace, name)] > self.vm_shutdown_polls:
+                self._remove_vm(namespace, name)
+                return None
         return copy.deepcopy(vm) if vm else None
 
     async def create_vm(self, namespace: str, body: dict) -> dict:
@@ -355,6 +514,7 @@ class FakeKvCluster:
             }
             self._dv_polls[(namespace, root)] = 0
             self._dv_storage[(namespace, root)] = self.storage
+            self._new_claim(namespace, root, owner=("DataVolume", root))
         self.created.append(name)
         return copy.deepcopy(stored)
 
@@ -363,9 +523,12 @@ class FakeKvCluster:
         vm = self.vms.get((namespace, name))
         if vm is None or (uid is not None and vm_spec.uid_of(vm) != uid):
             return False
-        del self.vms[(namespace, name)]
-        self.vmis.pop((namespace, name), None)
-        self.deleted.append(name)
+        if (namespace, name) in self.vmis and self.vm_shutdown_polls > 0:
+            # A guest is running: the VirtualMachine stays, Terminating, until it has shut down.
+            vm["metadata"].setdefault("deletionTimestamp", datetime.now(UTC).isoformat())
+            vm["metadata"]["finalizers"] = ["kubevirt.io/virtualMachineControllerFinalize"]
+            return True
+        self._remove_vm(namespace, name)
         return True
 
     async def get_datavolume(self, namespace: str, name: str) -> dict | None:
@@ -376,6 +539,7 @@ class FakeKvCluster:
         self._dv_polls[(namespace, name)] = self._dv_polls.get((namespace, name), 0) + 1
         if self._dv_storage.get((namespace, name), self.storage) == "immediate" and self._dv_polls[(namespace, name)] >= self.bind_after_polls:
             datavolume["status"]["phase"] = "Succeeded"
+            self._bind(namespace, name)
             owner = name.removesuffix("-root")
             if (namespace, owner) in self.vms:
                 self.vms[(namespace, owner)]["status"]["printableStatus"] = "Stopped"
@@ -383,7 +547,50 @@ class FakeKvCluster:
 
     async def delete_datavolume(self, namespace: str, name: str) -> bool:
         await self._enter("delete_datavolume")
-        return self.datavolumes.pop((namespace, name), None) is not None
+        return self._remove_datavolume(namespace, name)
+
+    async def list_pvcs(self, namespace: str) -> list[dict]:
+        await self._enter("list_pvcs")
+        self._settle()
+        return [copy.deepcopy(claim) for (ns, _), claim in self.pvcs.items() if ns == namespace]
+
+    async def delete_pvc(self, namespace: str, name: str, uid: str | None = None) -> bool:
+        await self._enter("delete_pvc")
+        claim = self.pvcs.get((namespace, name))
+        if claim is None or (uid is not None and claim["metadata"]["uid"] != uid):
+            return False
+        claim["metadata"].setdefault("deletionTimestamp", datetime.now(UTC).isoformat())
+        return True
+
+    async def list_pvs(self) -> list[dict]:
+        await self._enter("list_pvs")
+        self._settle()
+        return copy.deepcopy(list(self.pvs.values()))
+
+    async def get_pv(self, name: str) -> dict | None:
+        await self._enter("get_pv")
+        self._settle()
+        volume = self.pvs.get(name)
+        if volume is None:
+            return None
+        if (volume["status"]["phase"] == "Released" and volume["spec"]["persistentVolumeReclaimPolicy"] == "Delete"
+                and name not in self.stuck_volumes):
+            self._pv_polls[name] = self._pv_polls.get(name, 0) + 1
+            if self._pv_polls[name] > self.volume_release_polls:
+                del self.pvs[name]
+                return None
+        return copy.deepcopy(volume)
+
+    async def list_volume_snapshots(self, namespace: str) -> list[dict]:
+        await self._enter("list_volume_snapshots")
+        return [copy.deepcopy(snapshot) for (ns, _), snapshot in self.snapshots.items() if ns == namespace]
+
+    async def delete_volume_import_source(self, namespace: str, name: str) -> bool:
+        await self._enter("delete_volume_import_source")
+        if (namespace, name) not in self.import_sources:
+            return False
+        self.import_sources.discard((namespace, name))
+        return True
 
     async def pvc_phase(self, namespace: str, name: str) -> str | None:
         await self._enter("pvc_phase")
@@ -431,6 +638,7 @@ class KvFleet:
         # to a worker that is gone (the time-skipping test server never lets go of one).
         self.cache_workflows = True
         self.waited: dict[tuple[str, str, str], float] = {}  # seconds each VM's ready wait has run, across attempts
+        self.gone_attempts: dict[tuple[str, str, str], int] = {}  # attempts of each VM's delete wait
         self._workers: dict[str, Worker] = {}
         self._client: Client | None = None
         self._runner = None
@@ -514,7 +722,7 @@ class KvFleet:
         return list_kv_clusters
 
     def cluster_activities(self, cluster: FakeKvCluster) -> list:
-        """The four vm-lifecycle activities, bound to ONE fake cluster — the bodies are the
+        """The vm-lifecycle activities, bound to ONE fake cluster — the bodies are the
         real limb's (vm_operations), exactly as activities/vm_lifecycle/activities.py binds them."""
         fleet = self
 
@@ -556,7 +764,41 @@ class KvFleet:
         async def delete_vm_on_cluster(request: VmDeleteRequest) -> VmDeleted:
             return await vm_operations.delete_vm(cluster, cluster.values, request)
 
-        return [read_kv_cluster_figures, create_vm_on_cluster, await_vm_ready, delete_vm_on_cluster]
+        @activity.defn(name="inspect_vm_for_deletion")
+        async def inspect_vm_for_deletion(request: VmRemovalRequest) -> VmDeletionState:
+            return await vm_operations.inspect_for_deletion(cluster, cluster.values, request)
+
+        @activity.defn(name="delete_vm_and_volumes")
+        async def delete_vm_and_volumes(request: VmRemovalRequest) -> VmVolumesDeleted:
+            return await vm_operations.delete_with_volumes(cluster, cluster.values, request)
+
+        @activity.defn(name="await_vm_gone")
+        async def await_vm_gone(request: VmRemovalRequest) -> VmGoneOutcome:
+            details = activity.info().heartbeat_details
+            waited, polls = 0.0, 0
+            if details and isinstance(details[0], dict):
+                waited, polls = float(details[0]["waited_seconds"]), int(details[0].get("polls", 0))
+            key = (cluster.name, request.namespace, f"{request.name} gone")
+            fleet.gone_attempts[key] = fleet.gone_attempts.get(key, 0) + 1
+            # This attempt's own clock: every poll's sleep moves it on at once, so fifteen
+            # minutes of watching take a hundred and thirteen polls, not fifteen minutes.
+            slept = {"seconds": 0.0}
+
+            async def sleep(seconds: float) -> None:
+                slept["seconds"] += seconds
+                await asyncio.sleep(fleet.poll_seconds)
+
+            return await vm_operations.wait_gone(
+                cluster, cluster.values, request, waited_seconds=waited, polls=polls,
+                now=lambda: datetime.now(UTC) + timedelta(seconds=slept["seconds"]),
+                heartbeat=lambda seconds, count: activity.heartbeat({"waited_seconds": seconds, "polls": count}),
+                sleep=sleep,
+            )
+
+        return [
+            read_kv_cluster_figures, create_vm_on_cluster, await_vm_ready, delete_vm_on_cluster,
+            inspect_vm_for_deletion, delete_vm_and_volumes, await_vm_gone,
+        ]
 
     # --- the workers ---------------------------------------------------------------------------
 
@@ -564,6 +806,7 @@ class KvFleet:
     CREATE_VM = "create-vm"      # the brain's worker for the create-vm workflow
     ZONE_LOCK = "kv-zone-lock"   # the brain's worker for the zone locks
     STRAY = "delete-stray-vm"    # the brain's worker for create-vm's cleanup child
+    DELETE_VM = "delete-vm"      # the brain's worker for delete-vm
     DAY1 = "day1"                # the cluster-lifecycle worker (list_kv_clusters)
 
     @asynccontextmanager
@@ -579,6 +822,7 @@ class KvFleet:
             if brain:
                 await self.start_worker(self.CREATE_VM)
                 await self.start_worker(self.STRAY)
+                await self.start_worker(self.DELETE_VM)
                 if lock_worker:
                     await self.start_worker(self.ZONE_LOCK)
             if list_worker:
@@ -602,6 +846,8 @@ class KvFleet:
             return Worker(self._client, task_queue=KV_ZONE_LOCK_WORKFLOW_QUEUE, workflows=[KvZoneLockWorkflow], **runner)
         if name == self.STRAY:
             return Worker(self._client, task_queue=DELETE_STRAY_VM_WORKFLOW_QUEUE, workflows=[DeleteStrayVmWorkflow], **runner)
+        if name == self.DELETE_VM:
+            return Worker(self._client, task_queue=DELETE_VM_WORKFLOW_QUEUE, workflows=[DeleteVmWorkflow], **runner)
         if name == self.DAY1:
             return Worker(self._client, task_queue=CLUSTER_LIFECYCLE_ACTIVITY_QUEUE, activities=[self.list_activity()])
         return Worker(

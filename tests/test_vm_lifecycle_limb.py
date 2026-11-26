@@ -456,8 +456,8 @@ class TestCreateVm:
                 earlier = vm_spec.build(
                     namespace="inventory", flavor="c200", cpu=32, memory_gib=240, site="five", zone="az1",
                     mce="ocp4-prod-mce-five-a", serial="earlier1", request_id=RUN, workflow_id=None,
-                    redfish_label=kv.values.redfish_label, storage_class_name="cephfs", network_name=kv.values.network_name,
-                    node_selector={}, root_disk_size="120Gi",
+                    kv_cluster=kv.name, redfish_label=kv.values.redfish_label, storage_class_name="cephfs",
+                    network_name=kv.values.network_name, node_selector={}, root_disk_size="120Gi",
                 )
                 late["name"] = (await original(namespace, earlier))["metadata"]["name"]
             return await original(namespace, body)

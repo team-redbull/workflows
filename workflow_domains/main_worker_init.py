@@ -27,6 +27,7 @@ from shared.consts import (
     ALLOCATE_SEGMENT_WORKFLOW_QUEUE,
     CREATE_VM_WORKFLOW_QUEUE,
     DELETE_STRAY_VM_WORKFLOW_QUEUE,
+    DELETE_VM_WORKFLOW_QUEUE,
     INITIALIZE_SEGMENT_WORKFLOW_QUEUE,
     KV_ZONE_LOCK_WORKFLOW_QUEUE,
     LEGACY_INSTALL_SERVER_WORKFLOW_QUEUE,
@@ -89,6 +90,7 @@ from workflow_domains.server_provisioning.provision_dell_server import (
 )
 from workflow_domains.vm_lifecycle.create_vm import CreateVmWorkflow
 from workflow_domains.vm_lifecycle.delete_stray_vm import DeleteStrayVmWorkflow
+from workflow_domains.vm_lifecycle.delete_vm import DeleteVmWorkflow
 from workflow_domains.vm_lifecycle.kv_zone_lock import KvZoneLockWorkflow
 
 _settings = TemporalSettings()
@@ -102,6 +104,7 @@ _WORKER_SPECS: list[tuple[str, list[type]]] = [
     (ALLOCATE_SEGMENT_WORKFLOW_QUEUE, [AllocateSegmentWorkflow]),
     (CREATE_VM_WORKFLOW_QUEUE, [CreateVmWorkflow]),
     (DELETE_STRAY_VM_WORKFLOW_QUEUE, [DeleteStrayVmWorkflow]),
+    (DELETE_VM_WORKFLOW_QUEUE, [DeleteVmWorkflow]),
     (INITIALIZE_SEGMENT_WORKFLOW_QUEUE, [InitializeSegmentWorkflow]),
     (KV_ZONE_LOCK_WORKFLOW_QUEUE, [KvZoneLockWorkflow]),
     (PROVISION_CLUSTER_WORKFLOW_QUEUE, [ProvisionClusterWorkflow]),

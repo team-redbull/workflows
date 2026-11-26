@@ -7,7 +7,8 @@ The KV cluster exposes nothing, and nothing on the hub holds a credential for it
 prefix. The chart holds **no Secret at all**.
 
 What it does there, all from `activities/vm_lifecycle/activities.py`, for
-[create-vm](../../../docs/site/vm-lifecycle/create-vm.html):
+[create-vm](../../../docs/site/vm-lifecycle/create-vm.html) and
+[delete-vm](../../../docs/site/vm-lifecycle/delete-vm.html):
 
 - **measures** its cluster when a create-vm run asks (`read_kv_cluster_figures`): the usable
   nodes' allocatable, what pods request, what the stopped `redfish-enabled` VMs will request,
@@ -20,7 +21,15 @@ What it does there, all from `activities/vm_lifecycle/activities.py`, for
   taken (3 draws); it reads back the MAC KubeMacPool assigned;
 - **waits** for the VM's root disk to bind (`await_vm_ready`, one heartbeating activity);
 - **deletes** a run's own VM and its root DataVolume when that run will not complete
-  (`delete_vm_on_cluster`): only the VM labelled with the run's id, only by the UID it read.
+  (`delete_vm_on_cluster`): only the VM labelled with the run's id, only by the UID it read;
+- for **delete-vm** — one installed VM removed for good — **inspects** the VM named with its
+  DataVolumes, claims, PersistentVolumes, snapshots and the pods mounting them
+  (`inspect_vm_for_deletion`), **deletes** the VM, its DataVolumes, each claim's CDI
+  VolumeImportSource and its claims (`delete_vm_and_volumes`: its root disk's, and
+  kubevirt-redfish's boot ISO claim when the media was never ejected), and **waits** until
+  nothing of it is left, its PersistentVolumes included (`await_vm_gone`). Only a VM create-vm
+  made for the caller's MCE (its labels), only by the UIDs it read; it NEVER deletes a
+  PersistentVolume, a VolumeSnapshot or a pod.
 
 It never starts, stops or patches a VM (kubevirt-redfish owns the power state), never
 creates a namespace, and never chooses a MAC: **KubeMacPool assigns every VM's MAC, unique on
@@ -152,18 +161,26 @@ namespace, and the VM namespace is the request's.
 | Group / resource | Verbs | The call |
 |---|---|---|
 | `""` nodes | list | `list_nodes`: allocatable, Ready, cordoned, taints, labels (the figures) |
-| `""` pods | list | `list_unfinished_pods`: every unfinished pod's requests and node (the figures) |
+| `""` pods | list | `list_unfinished_pods`: every unfinished pod's requests and node (the figures); which pods mount a claim of a VM being deleted (delete-vm) |
 | `""` namespaces | get | `namespace_exists`: the VM namespace must exist; the worker never creates one |
-| `""` persistentvolumeclaims | get | `pvc_phase`: is the root disk's claim Bound (the ready wait) |
+| `""` persistentvolumeclaims | get, list, delete | `pvc_phase`: is the root disk's claim Bound (the ready wait); `list_pvcs`, `delete_pvc` (delete-vm: the claims of the VM being deleted, each by UID) |
+| `""` persistentvolumes | get, list | `list_pvs`, `get_pv` (delete-vm: the volumes behind those claims, found by `claimRef` and watched until gone; never deleted) |
 | `kubevirt.io` virtualmachines | get, list, create, delete | `list_vms` (the figures; the run-id and name lookups of a create; the delete's lookup), `get_vm` (the ready wait; the delete's identity check), `create_vm`, `delete_vm` (a run's own VM, by UID) |
 | `kubevirt.io` virtualmachineinstances | list | `list_vmis`: which VMs have a launcher pod on a node (the figures) |
 | `cdi.kubevirt.io` datavolumes | get, delete | `get_datavolume` (the root disk's phase), `delete_datavolume` (with its VM) |
+| `cdi.kubevirt.io` volumeimportsources | delete | `delete_volume_import_source` (delete-vm: what a claim was filled from, named by the claim's `dataSourceRef`) |
+| `snapshot.storage.k8s.io` volumesnapshots | list | `list_volume_snapshots` (delete-vm: a snapshot of a deleted VM's disk keeps its volume in the array; reported, never deleted) |
 
 Not granted, on purpose: any update or patch of a VirtualMachine, the `start`/`stop`
-subresources, any write to a node, pod, namespace or claim, Secrets, `pods/exec`.
+subresources, any write to a node, pod or namespace, any delete of a PersistentVolume or a
+VolumeSnapshot, Secrets, `pods/exec`. **A claim's `delete` IS granted since 2026-11-26**
+(it was on this list until then): delete-vm removes a deleted VM's own claims, which is the
+only way its volumes leave the storage array.
 
-A missing verb is `KvClusterAccessError` (403, permanent) on the create, the wait or the
-delete, and an `unreachable` row on the figures read.
+A missing verb is `KvClusterAccessError` (403, permanent) on the create, the wait or a
+delete, and an `unreachable` row on the figures read. **So this chart ships BEFORE an image
+with delete-vm**: a new image on the old ClusterRole fails every delete-vm run at its first
+call, where an old image only answers "not registered" and the run waits.
 
 ## Network
 

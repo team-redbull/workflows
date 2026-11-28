@@ -1,0 +1,15 @@
+# The ISO store: written by the worker, served read-only by the nginx sidecar.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "usw.fullname" . }}-isos
+  labels:
+    {{- include "usw.labels" . | nindent 4 }}
+spec:
+  accessModes: [ReadWriteOnce]
+  {{- with .Values.iso.storageClassName }}
+  storageClassName: {{ . }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.iso.storageSize }}

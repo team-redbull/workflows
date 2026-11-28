@@ -35,6 +35,7 @@ from workflow_domains.server_lifecycle.ui import router as server_lifecycle_ui_r
 from workflow_domains.server_provisioning.router import (
     router as server_provisioning_router,
 )
+from workflow_domains.upi_lifecycle.router import router as upi_lifecycle_router
 from workflow_domains.vm_lifecycle.router import router as vm_lifecycle_router
 
 _settings = TemporalSettings()
@@ -59,6 +60,9 @@ app.include_router(vm_lifecycle_router)
 # provision-cluster: the body is the hosted-cluster YAML itself; a run waits on
 # the cluster-lifecycle limb until it is deployed, then on a person's merge.
 app.include_router(cluster_lifecycle_router)
+# create-upi-cluster and add-server-to-upi: a run's activities wait, visible as
+# pending, on the upi-provisioning limb (hub) and each cluster's upi-server worker.
+app.include_router(upi_lifecycle_router)
 app.include_router(runs_router)
 # The temporary cluster-upgrade page, on the routes above.
 app.include_router(cluster_upgrade_ui_router)

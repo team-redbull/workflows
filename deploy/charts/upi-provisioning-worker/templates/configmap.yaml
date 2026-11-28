@@ -1,0 +1,23 @@
+# Everything this worker reads (shared/settings/upi_provisioning.py
+# UpiProvisioningActivitySettings and TemporalSettings); NAMESPACE comes from the
+# downward API in the Deployment. No credential: the worker's ServiceAccount is its
+# identity, and the install secrets are mounted only by the Jobs.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "upw.configName" . }}
+  labels:
+    {{- include "upw.labels" . | nindent 4 }}
+data:
+  TEMPORAL_HOST: {{ .Values.temporal.host | quote }}
+  TEMPORAL_NAMESPACE: {{ .Values.temporal.namespace | quote }}
+  INSTALLER_IMAGE: {{ .Values.installer.image | quote }}
+  INSTALLER_SERVICE_ACCOUNT: {{ .Values.installer.serviceAccount | quote }}
+  INSTALLER_SECRET_NAME: {{ .Values.installer.secretName | quote }}
+  INSTALLER_SITES_CONFIGMAP: {{ include "upw.sitesName" . | quote }}
+  INSTALLER_ACTIVE_DEADLINE_SECONDS: {{ .Values.installer.activeDeadlineSeconds | quote }}
+  INSTALLER_CSR_TIMEOUT_MINUTES: {{ .Values.installer.csrTimeoutMinutes | quote }}
+  WORK_VOLUME_SIZE: {{ .Values.workVolume.size | quote }}
+  WORK_STORAGE_CLASS: {{ .Values.workVolume.storageClassName | quote }}
+  VM_NETWORK_TEMPLATE: {{ .Values.vmNetworkTemplate | quote }}
+  ARGOCD_NAMESPACE: {{ .Values.argocd.namespace | quote }}

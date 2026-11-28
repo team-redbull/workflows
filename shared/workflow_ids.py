@@ -343,3 +343,25 @@ def kv_zone_lock_workflow_id(site: str, zone: str) -> str:
     a site of several fields (`kv-zone-lock-bat-yam-az1`).
     """
     return f"kv-zone-lock-{site}-{zone}"
+
+
+def create_upi_cluster_workflow_id(cluster: str) -> str:
+    """`create-upi-cluster-<cluster>`: one build of a UPI cluster at a time.
+
+    Keyed on the cluster's name alone: it is the Segments Manager's
+    `cluster_name`, the bootstrap-installer work volume, the Argo CD cluster name
+    and — for an MCE — the day1 folder, all unique across the estate. A second
+    request while a run waits (for its Jobs, or its merge request) is a 409.
+    """
+    return f"create-upi-cluster-{cluster}"
+
+
+def add_server_to_upi_workflow_id(cluster: str, server_name: str) -> str:
+    """`add-server-to-upi-<cluster>_<server>`: one join of one server at a time.
+
+    The server name is lowercased (server-scan's names are case-insensitive), the
+    cluster kept as given (it is a queue suffix). Two runs for one server into
+    two clusters do not collide here — server-scan's install lock refuses the
+    second.
+    """
+    return f"add-server-to-upi-{cluster}_{server_name.lower()}"

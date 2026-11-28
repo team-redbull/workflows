@@ -530,9 +530,15 @@ class TestProvisionClusterClassification:
         }
         assert used == {"UnsupportedSegmentType", "SiteMissingError", "UnknownSite", "AllocationNotConfirmed"}
 
-    def _raised_by_the_limb(self) -> set[str]:
+    # create-upi-cluster's module on this limb (publish_mce_folder): its errors are judged
+    # against THAT workflow's list, in test_the_mce_folder_errors_are_create_upi_clusters below.
+    _UPI_MODULES = {"mce_folder.py"}
+
+    def _raised_by_the_limb(self, only: set[str] | None = None) -> set[str]:
         root = pathlib.Path(__file__).resolve().parent.parent / "activities"
-        modules = [*sorted((root / "cluster_lifecycle").glob("*.py")), root / "git_repo.py", root / "day1_repo.py"]
+        own = [m for m in sorted((root / "cluster_lifecycle").glob("*.py"))
+               if (m.name in only if only is not None else m.name not in self._UPI_MODULES)]
+        modules = own if only is not None else [*own, root / "git_repo.py", root / "day1_repo.py"]
         names = set()
         for module in modules:
             for node in ast.walk(ast.parse(module.read_text())):
@@ -552,6 +558,14 @@ class TestProvisionClusterClassification:
         assert {"MceFolderNotFoundError", "AmbiguousMceFolderError", "ClusterAlreadyProvisionedError",
                 "ClusterValuesRejectedError", "ClusterFileConflictError", "GitProviderAuthError",
                 "GitProviderRequestRejectedError"} <= permanent
+
+    def test_the_mce_folder_errors_are_create_upi_clusters(self):
+        from workflow_domains.upi_lifecycle.create_upi_cluster import _PERMANENT_ACTIVITY_ERRORS
+
+        permanent = {error.__name__ for error in _PERMANENT_ACTIVITY_ERRORS}
+        raised = self._raised_by_the_limb(only=self._UPI_MODULES)
+        assert {"MceFolderConflictError", "Day1SiteNotFoundError"} <= raised
+        assert raised <= permanent | self.RETRIED, sorted(raised - permanent - self.RETRIED)
 
     def test_allocate_segments_permanent_errors_are_the_segments_managers_answers(self):
         from workflow_domains.segment_lifecycle.allocate_segment import _PERMANENT_ACTIVITY_ERRORS, _RETRY_POLICY as policy

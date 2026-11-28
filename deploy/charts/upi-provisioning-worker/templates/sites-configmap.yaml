@@ -1,0 +1,12 @@
+# bootstrap-installer's site profiles, mounted by every Job over config/sites/.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "upw.sitesName" . }}
+  labels:
+    {{- include "upw.labels" . | nindent 4 }}
+data:
+  {{- range $site, $profile := .Values.installer.sites }}
+  {{ $site }}.yaml: |
+    {{- toYaml $profile | nindent 4 }}
+  {{- end }}

@@ -42,8 +42,13 @@ There is deliberately NO wait for the DHCP scope (there was one — CLAUDE.md §
 has the history). Argo CD reads main only, so the scope appears only after a
 human merges the cluster file — after this run, outside it.
 
-HC only for now: any other type fails up front with UnsupportedSegmentType.
-Future types get their own functions when they arrive.
+Types: HC (provision-cluster's child), and since 2026-11-27 MCE, INVENTORY
+and UPI (create-upi-cluster's children: an MCE's node network and its
+BareMetalHost boot network, or a standalone UPI cluster's network). The
+allocation and its read-back are the same for each; a UPI segment's
+`cluster_name` is a LIST in the Segments Manager, so the read-back asks
+SegmentEntry.held_by. PXE (and any other) fails up front with
+UnsupportedSegmentType.
 
 On cancellation there is deliberately no compensating cleanup: the
 allocation is kept (a re-run idempotently reclaims it), and this workflow has
@@ -76,11 +81,11 @@ with workflow.unsafe.imports_passed_through():
         get_valid_sites,
     )
     from shared.models.segment_lifecycle import (
+        ALLOCATABLE_SEGMENT_TYPES,
         AllocateSegmentProgress,
         AllocateSegmentResult,
         AllocateSegmentRunArgs,
         SegmentAllocationRequest,
-        SegmentType,
     )
 
 # Same budget rules as initialize-segment: bounded attempts (with the HTTP
@@ -124,15 +129,15 @@ class AllocateSegmentWorkflow:
             cluster,
             allocate_input.site,
         )
-        # Strict first check (§7): this workflow supports HC allocation only.
+        # Strict first check (§7): the types this workflow allocates.
         # Deterministic failures raised from workflow code are plain
         # ApplicationErrors — non_retryable would be inert here, workflow
         # failures are never retried.
-        if allocate_input.type != SegmentType.HC:
+        if allocate_input.type not in ALLOCATABLE_SEGMENT_TYPES:
             raise ApplicationError(
-                f"allocate-segment supports type=HC only (got "
-                f"{allocate_input.type.value}); future segment types get "
-                "their own functions when they arrive",
+                f"allocate-segment allocates types "
+                f"{', '.join(sorted(t.value for t in ALLOCATABLE_SEGMENT_TYPES))} (got "
+                f"{allocate_input.type.value}); a segment of another type is assigned by hand",
                 type=UnsupportedSegmentType.__name__,
             )
         # The API requires the site (AllocateSegmentRequest); the boundary
@@ -183,9 +188,12 @@ class AllocateSegmentWorkflow:
             start_to_close_timeout=_ACTIVITY_TIMEOUT,
             retry_policy=_RETRY_POLICY,
         )
+        # The cluster is compared through held_by: a UPI segment's holder is a
+        # LIST in the Segments Manager. For every other type it is the same
+        # string comparison as before, so a recorded run replays unchanged.
         checks = [
             ("status", "Allocated", entry.status),
-            ("cluster_name", cluster, entry.cluster_name),
+            ("cluster_name", cluster, cluster if entry.held_by(cluster) else entry.cluster_name),
             ("vlan_id", allocation.vlan_id, entry.vlan_id),
         ]
         # The allocation also WROTE the type (Available segments have none), so

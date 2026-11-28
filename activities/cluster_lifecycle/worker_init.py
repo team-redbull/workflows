@@ -29,6 +29,7 @@ from activities.cluster_lifecycle.activities import (
     list_day1_clusters,
     list_kv_clusters,
     publish_cluster_file,
+    publish_mce_folder,
     register_cluster_in_day2_sig,
 )
 from shared.consts import CLUSTER_LIFECYCLE_ACTIVITY_QUEUE
@@ -58,6 +59,8 @@ async def main() -> None:
             # Shared with other domains: day1's clusters, read with this limb's token.
             list_day1_clusters,
             list_kv_clusters,
+            # Shared with upi-lifecycle: a new MCE's day1 folder.
+            publish_mce_folder,
         ],
         # A clone or a push in flight gets this long to finish after shutdown
         # starts; a cut push is re-done from a fresh clone by Temporal's retry.

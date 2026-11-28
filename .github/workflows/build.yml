@@ -1,10 +1,11 @@
 name: Build and Push
 
-# Ten images from this one repo: the workflow "brain" (workflow_domains/Dockerfile),
-# eight activity worker "limbs" (activities/<limb>/Dockerfile) — segment-lifecycle,
+# Twelve images from this one repo: the workflow "brain" (workflow_domains/Dockerfile),
+# ten activity worker "limbs" (activities/<limb>/Dockerfile) — segment-lifecycle,
 # server-lifecycle, server-provisioning, vm-lifecycle and cluster-lifecycle, one per
-# domain, and cluster-upgrade's three: cluster-upgrade and upgrade-agent per MCE,
-# upgrade-gitops on the hub — and the documentation site (docs/Dockerfile), which
+# domain, cluster-upgrade's three: cluster-upgrade and upgrade-agent per MCE,
+# upgrade-gitops on the hub, and upi-lifecycle's two: upi-provisioning on the hub,
+# upi-server per UPI cluster — and the documentation site (docs/Dockerfile), which
 # carries no code at all.
 
 # The job graph. `changes` decides which images this push builds and `test` runs the
@@ -523,4 +524,18 @@ jobs:
     uses: team-redbull/.github/.github/workflows/ghcr-cleanup-on-delete.yml@main
     with:
       image-name: cluster-lifecycle-worker
+    secrets: inherit
+
+  cleanup-upi-provisioning-worker-on-delete:
+    if: github.event_name == 'delete'
+    uses: team-redbull/.github/.github/workflows/ghcr-cleanup-on-delete.yml@main
+    with:
+      image-name: upi-provisioning-worker
+    secrets: inherit
+
+  cleanup-upi-server-worker-on-delete:
+    if: github.event_name == 'delete'
+    uses: team-redbull/.github/.github/workflows/ghcr-cleanup-on-delete.yml@main
+    with:
+      image-name: upi-server-worker
     secrets: inherit

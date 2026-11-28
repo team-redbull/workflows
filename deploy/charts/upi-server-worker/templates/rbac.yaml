@@ -1,0 +1,57 @@
+{{- if .Values.rbac.create }}
+{{- if .Values.rbac.clusterAdmin }}
+# `oc adm node-image create` (node_image.py) creates a namespace and a pod to build
+# the ISO and reads the cluster's release and pull secret: documented for cluster-admin.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "usw.fullname" . }}-cluster-admin
+  labels:
+    {{- include "usw.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "usw.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- else }}
+# Only what the worker's own calls use (node_api.py). node-image needs more.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "usw.fullname" . }}
+  labels:
+    {{- include "usw.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [get, list, patch]
+  - apiGroups: [certificates.k8s.io]
+    resources: [certificatesigningrequests]
+    verbs: [get, list]
+  - apiGroups: [certificates.k8s.io]
+    resources: [certificatesigningrequests/approval]
+    verbs: [update]
+  - apiGroups: [certificates.k8s.io]
+    resources: [signers]
+    resourceNames: [kubernetes.io/kube-apiserver-client-kubelet, kubernetes.io/kubelet-serving]
+    verbs: [approve]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "usw.fullname" . }}
+  labels:
+    {{- include "usw.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "usw.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "usw.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
+{{- end }}

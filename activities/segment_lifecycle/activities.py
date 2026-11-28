@@ -380,6 +380,15 @@ async def get_inventory_segment(mce_cluster: str) -> SegmentEntry:
 # --- release-segment --------------------------------------------------------
 
 
+def _holds(cluster_name: object, cluster: str) -> bool:
+    """Whether a listed segment's `cluster_name` names `cluster`: a string, or a UPI
+    segment's LIST (several clusters may share a UPI segment). SegmentEntry.held_by's
+    rule, on the raw row the list endpoint returns."""
+    if isinstance(cluster_name, list):
+        return cluster in cluster_name
+    return cluster_name == cluster
+
+
 @activity.defn
 async def find_cluster_allocation(
     request: ClusterAllocationLookupRequest,
@@ -409,7 +418,7 @@ async def find_cluster_allocation(
         row
         for row in body
         if isinstance(row, dict)
-        and row.get("cluster_name") == request.cluster
+        and _holds(row.get("cluster_name"), request.cluster)
         and row.get("type") == request.type.value
     ]
     if len(matches) > 1:

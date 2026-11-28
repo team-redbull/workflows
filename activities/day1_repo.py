@@ -100,6 +100,8 @@ from shared.upgrade_layout import ZONE_LABEL
 SITES = "sites"
 MCES = "mces"
 HOSTED_CLUSTERS = "hostedClusters"
+MCE_VALUES_FILE = "values.yaml"
+MCE_VERSION_FILE = "version.yaml"
 CONFIG_VALUES = f"{SITES}/configValues.yaml"
 # argocd-platform hostedClusters/values.yaml `clusterFilePrefix` (stack-export).
 DEFAULT_CLUSTER_FILE_PREFIX = "ocp4-"
@@ -151,6 +153,21 @@ def hosted_clusters_dir(site: str, folder: str) -> str:
 def cluster_file_path(folder_dir: str, cluster: str) -> str:
     """`<folder_dir>/hostedClusters/<cluster>.yaml`: where a cluster's file is, or goes."""
     return f"{folder_dir}/{HOSTED_CLUSTERS}/{cluster}.yaml"
+
+
+def site_dir(site: str) -> str:
+    """`sites/<site>`: a site's folder, relative to the repo root."""
+    return f"{SITES}/{site}"
+
+
+def mce_values_path(folder_dir: str) -> str:
+    """`<folder_dir>/values.yaml`: an MCE's own value layer (between the site's and a cluster file)."""
+    return f"{folder_dir}/{MCE_VALUES_FILE}"
+
+
+def mce_version_path(folder_dir: str) -> str:
+    """`<folder_dir>/version.yaml`: the MCE's own OpenShift version (`mastertag:`), which day2 reads."""
+    return f"{folder_dir}/{MCE_VERSION_FILE}"
 
 
 # --- YAML ---------------------------------------------------------------------

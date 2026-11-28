@@ -1,0 +1,98 @@
+# The worker, in its own namespace: the Jobs, their volumes and ConfigMaps, their
+# pods' logs, and the kubeconfig Secrets the prepare Jobs write (read only).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "upw.fullname" . }}
+  labels:
+    {{- include "upw.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [batch]
+    resources: [jobs]
+    verbs: [get, create]
+  - apiGroups: [""]
+    resources: [persistentvolumeclaims]
+    verbs: [get, create]
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [get, create, update]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [list]
+  - apiGroups: [""]
+    resources: [pods/log]
+    verbs: [get]
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "upw.fullname" . }}
+  labels:
+    {{- include "upw.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "upw.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "upw.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+---
+# Argo CD's declarative cluster Secrets, in Argo CD's namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "upw.fullname" . }}-argocd
+  namespace: {{ .Values.argocd.namespace }}
+  labels:
+    {{- include "upw.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get, create, update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "upw.fullname" . }}-argocd
+  namespace: {{ .Values.argocd.namespace }}
+  labels:
+    {{- include "upw.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "upw.fullname" . }}-argocd
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "upw.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+---
+# The Jobs: the prepare script `oc apply`s the kubeconfig Secret.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "upw.fullname" . }}-installer
+  labels:
+    {{- include "upw.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get, create, patch, update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "upw.fullname" . }}-installer
+  labels:
+    {{- include "upw.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "upw.fullname" . }}-installer
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.installer.serviceAccount }}
+    namespace: {{ .Release.Namespace }}

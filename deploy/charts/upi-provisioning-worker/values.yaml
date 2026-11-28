@@ -1,0 +1,55 @@
+image:
+  repository: ghcr.io/team-redbull/upi-provisioning-worker
+  tag: ""            # defaults to the chart's appVersion
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+temporal:
+  host: ""           # REQUIRED, e.g. temporal-frontend.redbull-workflows.svc:7233
+  namespace: default
+
+installer:
+  # REQUIRED: bootstrap-installer's image (`main`, vSphere), built with
+  # bin/openshift-install-4.20 and bin/oc (its Dockerfile says how).
+  image: ""
+  serviceAccount: upi-provisioning-installer
+  # An EXISTING Secret (nothing secret in Git) with: pull-secret.json (it must
+  # include the registry nodes are later added from — the runbook's Artifactory),
+  # additional-trust-bundle.pem, ssh.pub, vsphere-password.
+  secretName: upi-provisioning-install
+  # bootstrap-installer site profiles, one per site, rendered into the ConfigMap
+  # the Jobs mount as config/sites/. Each is config/sites/<site>.yaml's content:
+  # vcenter, vcenter_user, vcenter_password_env: VSPHERE_PASSWORD, datacenter,
+  # vsphere_cluster, vsphere_datastore_cluster, vsphere_dvs_name, vsphere_folder,
+  # vm_template, base_domain, search_domain, dns_servers, and this environment's
+  # image_mirrors, wildcard_dns_api_url and tool paths (they override defaults.yaml).
+  sites: {}
+  activeDeadlineSeconds: 14400
+  csrTimeoutMinutes: 90
+
+workVolume:
+  size: 5Gi
+  storageClassName: ""
+
+# The vSphere port group from the allocated segment: {epg_name} {vlan_id} {site} {cluster}.
+vmNetworkTemplate: "{epg_name}"
+
+argocd:
+  namespace: openshift-gitops
+
+serviceAccount:
+  create: true
+  name: ""
+
+replicaCount: 1
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    memory: 512Mi
+terminationGracePeriodSeconds: 30
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}

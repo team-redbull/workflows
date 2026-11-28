@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "usw.fullname" . }}-isos
+  labels:
+    {{- include "usw.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "usw.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080

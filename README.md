@@ -124,6 +124,8 @@ The prod charts are vendored into the Argo CD repo, not this one:
 | `redbull-platform/gitops/charts/cluster-upgrade-worker/`, `.../upgrade-agent-worker/` | cluster-upgrade's per-MCE limbs, copied from `deploy/charts/` here by CI (`sync-upgrade-charts`) on every `main` push that changes them — no `gitops/services/` entry yet |
 | `redbull-platform/gitops/charts/vm-lifecycle-worker/` | the `vm-lifecycle-worker` limb (create-vm, delete-vm) — one release INSIDE each KV cluster, no Secret; copied from `deploy/charts/vm-lifecycle-worker/` here by the same CI job. No `gitops/services/` entry: each KV cluster gets it through day2. (Until 2026-11-20 this was a hub chart reaching each cluster through two HTTP agents) |
 | `redbull-platform/gitops/charts/upgrade-gitops-worker/` | cluster-upgrade's hub limb (its only copy) — no `gitops/services/` entry yet |
+| `deploy/charts/upi-provisioning-worker/` | upi-lifecycle's HUB limb (create-upi-cluster): runs bootstrap-installer as Jobs, keeps each cluster's work volume and admin kubeconfig Secret, writes Argo CD's cluster Secret. To vendor into redbull-platform with its `gitops/services/` entry |
+| `deploy/charts/upi-server-worker/` | upi-lifecycle's limb INSIDE each UPI cluster (add-server-to-upi): node-image ISOs served by an nginx sidecar, Redfish virtual media, CSRs, Nodes. One release per UPI cluster |
 
 Every image built on `main` is tagged `vX.Y.Z` by the shared build workflow, which writes the
 tag into that chart's `values.yaml`; a branch build is tagged `<branch-slug>-<short sha>`.
@@ -986,6 +988,35 @@ found, folders already there are success. A cluster already on `main` fails
 for its merge is a 409. See `docs/design/provision-cluster.md` and the
 [docs page](docs/site/cluster-lifecycle/provision-cluster.html).
 
+### `create-upi-cluster` — an OpenShift UPI cluster on vSphere (an MCE is one kind)
+
+```
+POST /workflows/upi-lifecycle/create-upi-cluster
+{"cluster": "ocp4-prod-mce-tlv-a", "site": "tlv", "kind": "mce", "install_config": {}, "mce_values": null}
+```
+
+The segments (allocate-segment children: MCE + INVENTORY for an MCE, UPI for a
+`standalone` cluster), team-redbull/bootstrap-installer as two Jobs on the hub
+(`prepare`: configs, ignition, `*.apps` DNS; `install`: terraform apply and its CSR
+loop), a wait until every node is Ready and ClusterVersion Available, the hub Argo CD
+cluster Secret `cluster-<cluster>` (destination name = the cluster's), and — for an
+MCE — `sites/<site>/mces/<cluster>/` on `create-upi-cluster/<cluster>`, its merge
+request and the wait for a person to merge it. See the
+[docs page](docs/site/upi-lifecycle/create-upi-cluster.html).
+
+### `add-server-to-upi` — one bare-metal server into a UPI cluster as a Node
+
+```
+POST /workflows/upi-lifecycle/add-server-to-upi
+{"cluster": "ocp4-prod-mce-tlv-a", "server_name": "ocp-r760-tlv-abc1234", "bond_mode": "802.3ad"}
+```
+
+The cluster's node VLAN, the named server from server-scan (locked), two link-UP NICs
+on distinct ports for bond0 (add-server-to-mce's policy), an `oc adm node-image create`
+ISO with `bond0.<vlan>` on DHCP, the ISO on the BMC's Redfish virtual media, this host's
+CSRs approved until its Node is Ready, its labels. Every cluster call runs on the
+cluster's own upi-server worker. See the [docs page](docs/site/upi-lifecycle/add-server-to-upi.html).
+
 ### `allocate-segment` — give a cluster a segment
 
 Takes the cluster, the **site** to allocate at (the day1 folder the cluster's
@@ -1055,6 +1086,8 @@ result.
 | `POST /workflows/server-provisioning/provision-dell-server/bulk` | one workflow PER iDRAC IP |
 | `POST /workflows/vm-lifecycle/create-vm` | one workflow PER VM for a KubeVirt InfraEnv (`<flavor>-kv<cpu>-<zone>`; the site is the MCE's): one in the first free slot, or `count` of them; runs of one zone choose and create one after another |
 | `POST /workflows/cluster-lifecycle/provision-cluster?cluster=&mce=` | one hosted cluster from the YAML in the body (`application/yaml`): segment, day1 branch, merge request, the wait for the merge, day2, the console shortcut |
+| `POST /workflows/upi-lifecycle/create-upi-cluster` | one UPI cluster on vSphere (kind `mce` or `standalone`): segments, bootstrap-installer Jobs, readiness, Argo CD, and for an MCE its day1 folder by merge request |
+| `POST /workflows/upi-lifecycle/add-server-to-upi` | one named server joined to a UPI cluster as a Node: bond0, node-image ISO, virtual media, CSRs |
 | `GET  /workflows/runs/{workflow_id}` | (status, every domain) |
 
 ### Paths: `/workflows/<domain>/<workflow>`, status on `/workflows/runs`
@@ -1152,6 +1185,14 @@ would hide which segments actually got a workflow.
 | `SERVER_SCAN_URL`/`_API_TOKEN` | as above | the provisioning worker reads it too (a viewer token) |
 | `KV_CLUSTER` | `vm-lifecycle-config` (in each KV cluster) | the KV cluster this worker runs in: EXACTLY its day1 file name (`ocp4-<lifecycle>-kv-<site>-<zone>-<id>`), never abbreviated — it names the queue; the site and the zone are read from it |
 | `VM_STORAGE_CLASS_NAME` | `vm-lifecycle-config` | the root disk's storage class; must bind Immediately and allow RWX + Filesystem |
+| `INSTALLER_IMAGE` | `upi-provisioning-config` | bootstrap-installer's image (`main`, vSphere) the create-upi-cluster Jobs run |
+| `NAMESPACE` | downward API (upi-provisioning-worker) | where the Jobs, work volumes and kubeconfig Secrets live |
+| `INSTALLER_SECRET_NAME`, `INSTALLER_SITES_CONFIGMAP`, `INSTALLER_SERVICE_ACCOUNT` | `upi-provisioning-config` | the Jobs' install Secret (pull secret, trust bundle, SSH key, vSphere password), site profiles and identity |
+| `VM_NETWORK_TEMPLATE`, `ARGOCD_NAMESPACE`, `WORK_VOLUME_SIZE`, `WORK_STORAGE_CLASS`, `INSTALLER_ACTIVE_DEADLINE_SECONDS`, `INSTALLER_CSR_TIMEOUT_MINUTES` | `upi-provisioning-config` | the port group from the segment, Argo CD's namespace, the work volume, the Jobs' bounds |
+| `UPI_CLUSTER` | `upi-server-config` (in each UPI cluster) | the cluster this worker runs in, EXACTLY as create-upi-cluster was given it — it names the queue |
+| `ISO_BASE_URL`, `ISO_DIR` | `upi-server-config` | where the BMCs fetch the node ISOs (the chart's Route), and where the worker writes them |
+| `NODE_IMAGE_REGISTRY_CONFIG`, `NODE_IMAGE_INSECURE`, `DEFAULT_ROOT_DEVICE` | `upi-server-config` | `oc adm node-image create`'s registry auth and `--insecure`; the install disk by default |
+| `INTERSIGHT_BMC_USERNAME`, `INTERSIGHT_BMC_PASSWORD` | `upi-server-credentials` | Redfish credentials for Intersight-managed servers (with the DELL_/HP_ ones) |
 | `VM_NETWORK_NAME` | `vm-lifecycle-config` | `<namespace>/<name>` of the NetworkAttachmentDefinition every VM boots on (default `openshift-cnv/vm-external-network`, the platform's vm.yaml); the network is always multus |
 | `VM_NODE_SELECTOR` | `vm-lifecycle-config` | JSON: the VM template's nodeSelector (`{}` for none) |
 | `VM_REDFISH_LABEL`, `VM_ROOT_DISK_SIZE` | `vm-lifecycle-config` | `redfish-enabled=true` and `120Gi` by default |

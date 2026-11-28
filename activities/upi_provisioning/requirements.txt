@@ -1,0 +1,8 @@
+temporalio>=1.28,<2
+pydantic>=2,<3
+pydantic-settings>=2,<3
+# The hub's API (Jobs, claims, ConfigMaps, Secrets) and an installed cluster's API
+# as its admin. Synchronous SDK, wrapped in asyncio.to_thread (hub_api.py, spoke_api.py).
+kubernetes>=29,<32
+# The installed cluster's kubeconfig and the cluster YAML bootstrap-installer reads.
+PyYAML>=6,<7

@@ -1,0 +1,72 @@
+# REQUIRED: the UPI cluster's name, EXACTLY as create-upi-cluster was given it.
+# The worker polls upi-server-activity-<upiCluster>; any other spelling polls a
+# queue no run sends to.
+upiCluster: ""
+
+image:
+  repository: ghcr.io/team-redbull/upi-server-worker
+  tag: ""            # defaults to the chart's appVersion
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+temporal:
+  host: ""           # REQUIRED, host:port of the hub's Temporal frontend (its Route, TLS)
+  namespace: default # the TEMPORAL namespace; must match the hub
+  tls:
+    enabled: false
+    serverName: ""   # defaults to the host part of `host`
+    caCert: ""
+
+serverScan:
+  url: ""            # REQUIRED, e.g. https://server-scan.apps.hub.example.net
+
+# An EXISTING Secret (nothing secret in Git) with SERVER_SCAN_API_TOKEN (ADMIN:
+# the allocation locks the server) and the BMC credentials per vendor the
+# cluster's servers need: DELL_BMC_USERNAME/_PASSWORD, HP_BMC_USERNAME/_PASSWORD,
+# INTERSIGHT_BMC_USERNAME/_PASSWORD.
+credentials:
+  existingSecret: upi-server-credentials
+
+iso:
+  # The volume the worker builds ISOs into and the nginx sidecar serves.
+  storageSize: 50Gi
+  storageClassName: ""
+  # The URL the BMCs fetch the ISOs from. Empty: http://<route.host>.
+  baseUrl: ""
+  route:
+    enabled: true
+    host: ""         # e.g. upi-isos.apps.<cluster>.<domain>; empty lets the router pick one
+  nginxImage: registry.access.redhat.com/ubi9/nginx-124:latest
+
+nodeImage:
+  # Optional: an existing Secret with a `.dockerconfigjson` key — the runbook's
+  # `--registry-config` — mounted for `oc adm node-image create`.
+  registryConfigSecret: ""
+  insecure: false
+  defaultRootDevice: /dev/sda
+
+rbac:
+  create: true
+  # `oc adm node-image create` creates a namespace and a pod in the cluster to
+  # build the ISO, and reads its release and pull secret: Red Hat documents it
+  # for cluster-admin. true binds the worker's ServiceAccount to cluster-admin;
+  # false grants only the Node and CSR verbs the worker itself uses (README) —
+  # then node-image fails until you grant the rest.
+  clusterAdmin: true
+
+serviceAccount:
+  create: true
+  name: ""
+
+# ONE replica: the ISO a worker builds is on the volume its own nginx serves.
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    memory: 1Gi
+terminationGracePeriodSeconds: 30
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}

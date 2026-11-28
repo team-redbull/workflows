@@ -1,0 +1,12 @@
+apiVersion: v2
+name: upi-server-worker
+description: >-
+  The upi-lifecycle domain's per-cluster activity worker ("limb"), one release PER
+  UPI CLUSTER, installed INSIDE that cluster. It dials out to the hub's Temporal,
+  polls upi-server-activity-<upiCluster>, and joins bare-metal servers to its own
+  cluster for add-server-to-upi: `oc adm node-image create` ISOs (served to the
+  BMCs by an nginx sidecar from the same volume), Redfish virtual media, CSR
+  approval for the joining host only, Node labels.
+type: application
+version: 0.1.0
+appVersion: "v1.0.0"

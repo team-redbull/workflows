@@ -1,0 +1,25 @@
+# Everything this worker reads but its credentials (shared/settings/upi_server.py
+# UpiServerActivitySettings and TemporalSettings). The credentials come from
+# credentials.existingSecret.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "usw.configName" . }}
+  labels:
+    {{- include "usw.labels" . | nindent 4 }}
+data:
+  TEMPORAL_HOST: {{ .Values.temporal.host | quote }}
+  TEMPORAL_NAMESPACE: {{ .Values.temporal.namespace | quote }}
+  UPI_CLUSTER: {{ .Values.upiCluster | quote }}
+  SERVER_SCAN_URL: {{ .Values.serverScan.url | quote }}
+  ISO_DIR: /isos
+  ISO_BASE_URL: {{ include "usw.isoBaseUrl" . | quote }}
+  NODE_IMAGE_INSECURE: {{ .Values.nodeImage.insecure | quote }}
+  DEFAULT_ROOT_DEVICE: {{ .Values.nodeImage.defaultRootDevice | quote }}
+  {{- if .Values.nodeImage.registryConfigSecret }}
+  NODE_IMAGE_REGISTRY_CONFIG: /etc/node-image/config.json
+  {{- end }}
+  {{- if .Values.temporal.tls.enabled }}
+  TEMPORAL_TLS_CA: /etc/temporal-tls/ca.crt
+  TEMPORAL_TLS_SERVER_NAME: {{ .Values.temporal.tls.serverName | default (first (splitList ":" .Values.temporal.host)) | quote }}
+  {{- end }}

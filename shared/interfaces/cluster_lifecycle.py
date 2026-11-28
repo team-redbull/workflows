@@ -25,6 +25,7 @@ from shared.models.cluster_lifecycle import (
     MergeRequestState,
 )
 from shared.models.vm_lifecycle import KvClusterList, KvClusterListRequest
+from shared.models.upi_lifecycle import MceFolderPublishRequest, MceFolderRef
 
 
 @activity.defn
@@ -125,6 +126,34 @@ async def ensure_cluster_shortcut(request: ClusterShortcutRequest) -> ClusterSho
     nothing posted. Raises ShortcutTakenError (another owner holds the name —
     deterministic, non-retryable); EVERY other failure, refusals included, is the
     retryable ShortcutsApiError (the run is past its merge and cannot be re-run).
+    """
+    ...
+
+
+# --- shared with the upi-lifecycle domain -------------------------------------------------
+#
+# create-upi-cluster (workflow_domains/upi_lifecycle/create_upi_cluster.py) adds a new
+# MCE to day1's list of MCEs through THIS limb: it holds the day1 token and the GitLab
+# merge-request client (an activity lives where its credential is, CLAUDE.md §2). The
+# merge request itself is ensure_merge_request / get_merge_request_state above.
+
+
+@activity.defn
+async def publish_mce_folder(request: MceFolderPublishRequest) -> MceFolderRef:
+    """Put a new MCE's day1 folder — `sites/<site>/mces/<mce>/values.yaml` and
+    `version.yaml` (`mastertag: <version>`) — on its own branch.
+
+    At day1 `main`: the site folder must exist (Day1SiteNotFoundError); an MCE
+    folder of that name under ANOTHER site is MceFolderConflictError; the folder
+    already at this site with the same content (YAML-equal) is a re-run past the
+    merge: `on_main=True`, nothing pushed; with other content,
+    MceFolderConflictError. Otherwise the branch (`create-upi-cluster/<mce>`):
+    absent, cloned from `main`, both files written, committed and pushed, which
+    creates it; present, its files compared the same way — equal is
+    `changed=False`, anything else MceFolderConflictError. No `hostedClusters/`
+    folder is written: an empty file there breaks the MCE's ApplicationSet, and a
+    missing folder is an MCE with no hosted clusters. A rejected push is the
+    retryable ValuesRepoGitError and the retry re-clones.
     """
     ...
 

@@ -48,7 +48,7 @@ def _affected(*paths: str) -> list[str]:
 
 def test_every_image_of_the_repo_is_found():
     assert sorted(BY_NAME) == sorted([BRAIN, DOCS, *LIMBS])
-    assert len(LIMBS) == len(list((REPO_ROOT / "activities").glob("*/Dockerfile"))) == 8
+    assert len(LIMBS) == len(list((REPO_ROOT / "activities").glob("*/Dockerfile"))) == 10
     assert BY_NAME[BRAIN].entrypoints == ("workflow_domains.main_worker_init", "workflow_domains.api")
     for limb in LIMBS:
         folder = limb.removesuffix("-worker").replace("-", "_")
@@ -349,7 +349,9 @@ def test_a_workers_own_files_build_that_worker_only(limb):
     ("shared/vm_requests.py", ["vm-lifecycle-worker", "workflows-orchestrator"]),
     ("activities/upgrade_gitops/day1_repo.py", ["server-lifecycle-worker", "upgrade-gitops-worker"]),
     # one limb's models: the brain (it builds the requests) and that limb
-    ("shared/models/cluster_lifecycle.py", ["cluster-lifecycle-worker", "workflows-orchestrator"]),
+    # upi-lifecycle's models carry its MergeRequestRef (the MCE folder's merge request).
+    ("shared/models/cluster_lifecycle.py", ["cluster-lifecycle-worker", "upi-provisioning-worker",
+                                            "upi-server-worker", "workflows-orchestrator"]),
     # an interface is the BRAIN's stub: the limb registers its implementation by
     # name and never imports it (tests/test_contract.py keeps the two equal)
     ("shared/interfaces/cluster_lifecycle.py", ["workflows-orchestrator"]),

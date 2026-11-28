@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>create-upi-cluster — Redbull Workflows</title>
+<meta name="description" content="The create-upi-cluster workflow: an OpenShift UPI platform-none cluster on vSphere (an MCE is one kind) — segments, bootstrap-installer as Jobs, readiness, Argo CD registration and, for an MCE, its day1 folder by merge request.">
+<link rel="icon" href="/assets/favicon.svg?v=__DOC_VERSION__" type="image/svg+xml">
+<link rel="stylesheet" href="/assets/site.css?v=__DOC_VERSION__">
+</head>
+<body data-page="/upi-lifecycle/create-upi-cluster.html">
+
+<a class="skip-link" href="#main">Skip to content</a>
+
+<!-- Topbar: identical on every page. Brand + deployed version upper-left; the
+     "Workflows" menu is built from the catalogue in assets/nav.js. -->
+<header class="topbar">
+  <a class="brand" href="/">
+    <img class="brand-mark" src="/assets/redbull-logo.png?v=__DOC_VERSION__" alt="" aria-hidden="true"
+         width="480" height="179">
+    <span class="brand-name">Redbull Workflows</span>
+    <span class="brand-ver" title="deployed image tag of this documentation site">__DOC_VERSION__</span>
+  </a>
+  <nav class="topnav" aria-label="Site">
+    <a class="topnav-link" href="/">Orchestrator guide</a>
+    <div class="wfmenu">
+      <button class="wfmenu-btn" id="wfmenu-btn" type="button"
+              aria-expanded="false" aria-haspopup="true" aria-controls="wfmenu-panel">
+        Workflows <span class="caret" aria-hidden="true">&#9662;</span>
+      </button>
+      <div class="wfmenu-panel" id="wfmenu-panel" role="menu" aria-label="Workflows by domain" hidden></div>
+    </div>
+    <noscript>
+      <a class="topnav-link" href="/upi-lifecycle/create-upi-cluster.html">create-upi-cluster</a>
+    </noscript>
+  </nav>
+</header>
+
+<main id="main">
+<header class="masthead">
+  <div class="masthead-inner">
+    <div class="eyebrow">Temporal workflow · domain: upi-lifecycle</div>
+    <h1>create-upi-cluster<span class="dim"> — what actually happens</span></h1>
+    <p class="lede">You send a <b>name</b>, a <b>site</b> and a <b>kind</b> (<code>mce</code> or <code>standalone</code>). The run allocates the cluster's segments, runs the team's <b>bootstrap-installer</b> as two Jobs on the hub (prepare, install), waits until the cluster serves, registers it in the hub's <b>Argo CD</b> — and, for an MCE, opens the merge request adding it to day1's MCEs and <em>waits for a person to merge it</em>. This is the operator's "Creation MCE 4.20" runbook, steps 1–9, end to end.</p>
+    <div class="facts"><div class="fact"><span class="k">Trigger</span><span class="v">POST /workflows/upi-lifecycle/create-upi-cluster</span></div><div class="fact"><span class="k">Workflow id</span><span class="v">create-upi-cluster-&lt;cluster&gt;</span></div><div class="fact"><span class="k">Workflow queue</span><span class="v">create-upi-cluster-workflow</span></div><div class="fact"><span class="k">Activity queues</span><span class="v">upi-provisioning-activity, cluster-lifecycle-activity (+ segment-lifecycle through the children)</span></div></div>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <section id="flow">
+    <div class="sec-head">
+      <div class="eyebrow">The run, step by step</div>
+      <h2>From a name to a cluster Argo CD manages</h2>
+      <p class="lede">Each card carries a <code>phase</code>, read live through the run's <b>progress</b> query on
+      <code>GET /workflows/runs/{workflow_id}</code>.</p>
+    </div>
+    <div class="flow">
+      <div class="step">
+        <div class="marker">1</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>allocate-segment — awaited children</h3>
+            <span class="phase">phase <b>allocating-segment</b></span>
+          </div>
+          <p>The node network: an <b>MCE</b> segment for an MCE (<code>kind: mce</code>, the default), a <b>UPI</b> segment for a standalone cluster. An MCE also gets its <b>INVENTORY</b> segment — the BareMetalHost boot network <a href="/server-lifecycle/add-server-to-mce.html">add-server-to-mce</a> resolves by the MCE's name. Each is <a href="/segment-lifecycle/allocate-segment.html">allocate-segment</a> as a child on its own id (<code>allocate-segment-&lt;TYPE&gt;-&lt;cluster&gt;</code>), idempotent per (cluster, site, type).</p>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="marker">2</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>run_installer_step(prepare) — a Job on the hub</h3>
+            <span class="phase">phase <b>preparing</b></span>
+          </div>
+          <p>The upi-provisioning worker writes the cluster's work volume (<code>upi-&lt;cluster&gt;-work</code>, kept for ever: terraform's state), its cluster YAML (<code>upi-&lt;cluster&gt;-config</code>: your <code>install_config</code> plus the run's keys — segment, VLAN, port group, secret paths) and the Job <code>upi-&lt;cluster&gt;-prepare-&lt;token&gt;</code> running <b>bootstrap-installer</b> (<code>bootstrap.py --skip-terraform --skip-argocd</code>): the IPs from the segment (infra .1–.3, masters .4–.6, bootstrap .7, gateway .254 unless the site profile says otherwise), install-config, the v4InternalSubnet CR, the ignition configs and the <code>*.apps</code> DNS record. The Job then stores the admin kubeconfig and the node IPs in <code>upi-&lt;cluster&gt;-kubeconfig</code>. A volume whose terraform state still lists VMs is <b>refused</b> — destroy the cluster first.</p>
+          <div class="calls"><div class="call nxt"><span class="verb">K8S</span><span class="path">PVC, ConfigMap, Job in the worker's namespace · the Job polled every 15 s, heartbeating</span></div></div>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="marker">3</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>run_installer_step(install)</h3>
+            <span class="phase">phase <b>installing</b></span>
+          </div>
+          <p>Job <code>upi-&lt;cluster&gt;-install-&lt;token&gt;</code>: <code>bootstrap.py --skip-ignition --skip-dns --skip-argocd</code> — <code>terraform apply</code> of the VMs and their DNS records (the script answers its "yes" prompt) and bootstrap-installer's own CSR loop. A loop that times out exits 0, so the next step decides.</p>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="marker">4</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>await_upi_cluster_ready</h3>
+            <span class="phase">phase <b>verifying-cluster</b></span>
+          </div>
+          <p>As the cluster's admin: every 20 s, approves pending CSRs of a node bootstrapper or a <code>system:node:*</code> user, reads the Nodes and ClusterVersion. Done when <b>every recorded node IP is a Ready Node</b> and ClusterVersion is Available with a version. Up to 2 h, its clock in the heartbeat.</p>
+          <div class="calls"><div class="call nxt"><span class="verb">K8S</span><span class="path">the new cluster's API (its kubeconfig's own server and CA)</span></div></div>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="marker">5</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>register_upi_cluster_in_argocd</h3>
+            <span class="phase">phase <b>registering-argocd</b></span>
+          </div>
+          <p>bootstrap-installer's registration, as the worker: <code>kube-system/argocd-manager</code>, its token Secret and a cluster-admin binding on the cluster; on the hub, the Argo CD cluster Secret <code>cluster-&lt;cluster&gt;</code> with <code>name: &lt;cluster&gt;</code> — the destination name the hub's ApplicationSets target — read back. A Secret of that name for another server is <code>ArgoClusterSecretConflictError</code>.</p>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="marker">6</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>publish_mce_folder → merge request → a person merges (MCE only)</h3>
+            <span class="phase">phase <b>publishing-mce-folder / opening-merge-request / awaiting-merge</b></span>
+          </div>
+          <p>The MCE joins day1's list of MCEs: <code>sites/&lt;site&gt;/mces/&lt;cluster&gt;/values.yaml</code> (your <code>mce_values</code>, or a header only) and <code>version.yaml</code> (<code>mastertag:</code> the installed version) on <code>create-upi-cluster/&lt;cluster&gt;</code>, through the cluster-lifecycle limb; its merge request; and a <b>human wait</b> for the merge, polled every 5 min, no deadline. Once merged, the hub's <code>&lt;site&gt;-mces</code> ApplicationSet makes the MCE's Application with the cluster as destination, and from there its own Argo CD deploys day2 <code>in-cluster</code>. Already at <code>main</code> with this content (a re-run past the merge): nothing pushed, no merge request.</p>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <section id="start">
+    <div class="sec-head"><h2>How you start it and how you watch it</h2></div>
+    <pre><code>POST /workflows/upi-lifecycle/create-upi-cluster
+{
+  "cluster": "ocp4-prod-mce-tlv-a",       // ≤27, lowercase, the convention's MCE name
+  "site": "tlv",                          // Segments Manager site = site profile = day1 sites/&lt;site&gt;
+  "kind": "mce",                          // or "standalone"
+  "vm_network": null,                     // default VM_NETWORK_TEMPLATE from the segment
+  "install_config": {"compute_ip_offsets": [8, 9]},  // any bootstrap-installer key but the run's own
+  "mce_values": "imagePath: registry/ocp\n"          // kind mce only
+}
+→ 202 {"workflow_id": "create-upi-cluster-ocp4-prod-mce-tlv-a", "run_id": "…"}
+GET /workflows/runs/create-upi-cluster-ocp4-prod-mce-tlv-a</code></pre>
+<p>A 422 for a name bootstrap-installer refuses, <code>install_config</code> setting a key the run owns
+(<code>cluster_name site segment vlan_id vm_network pull_secret_path additional_trust_bundle_path
+ssh_public_key_path terraform_dir argocd_*</code>), or <code>mce_values</code> on a standalone cluster. A second request
+while the run goes is a 409. The API has no auth: this route creates VMs.</p>
+  </section>
+
+  <section id="failures">
+    <div class="sec-head"><h2>Failures — outages are out-waited, real errors stop the run</h2></div>
+    <ul>
+<li><code>AllocateSegmentFailedError</code> / <code>AllocateSegmentAlreadyRunningError</code> — the child's own type in the message.</li>
+<li><code>InstallerConfigRejectedError</code> — a run-owned key, or a site with no profile in the sites ConfigMap.</li>
+<li><code>InstallerJobFailedError</code> — a Job failed; its last log lines are in the message. Read the Job's log, fix, destroy what terraform made if the install failed, start again.</li>
+<li><code>UpiClusterNotReadyError</code> — 2 h after the install, a node not Ready or ClusterVersion not Available: named.</li>
+<li><code>UpiClusterAccessError</code>, <code>HubAccessError</code> — a missing kubeconfig Secret, a 403, a TLS failure.</li>
+<li><code>ArgoClusterSecretConflictError</code>, <code>MceFolderConflictError</code>, <code>Day1SiteNotFoundError</code> — never overwritten.</li>
+<li><code>MergeRequestClosedError</code> — a person closed the merge request; the cluster stands, registered.</li>
+<li>Anything transient (the hub's or the cluster's API, git, GitLab) is retried without end and shows on the activity.</li>
+</ul>
+  </section>
+
+  <section id="rerun">
+    <div class="sec-head"><h2>Run it again</h2></div>
+    <p>Inside one run nothing is done twice: every phase's outcome is in its state, kept across
+continue-as-new. A <b>new</b> run of the same cluster re-allocates idempotently and makes <b>new Jobs</b> (the run's
+token is in their names); its <code>prepare</code> refuses a work volume whose terraform state still lists VMs, so a failed
+install is destroyed (<code>bootstrap.py --destroy</code> against that volume) before it is created again. Past the merge,
+a re-run finds the folder at <code>main</code> and opens nothing.</p>
+<div class="panel warn"><h3>Not this run's</h3><p>The bootstrap VM is not removed (bootstrap-installer has no step for
+it). Workers are added by <a href="/upi-lifecycle/add-server-to-upi.html">add-server-to-upi</a>. Nothing is ever
+destroyed.</p></div>
+  </section>
+
+  <section id="deps">
+    <div class="sec-head"><h2>Dependencies</h2></div>
+    <ul>
+<li><b>upi-provisioning-worker</b> (hub, <code>deploy/charts/upi-provisioning-worker</code>): INSTALLER_IMAGE (bootstrap-installer <code>main</code>), the install Secret, the sites ConfigMap, Argo CD's namespace.</li>
+<li><b>cluster-lifecycle-worker</b>: the day1 token and GitLab merge requests (<code>publish_mce_folder</code>).</li>
+<li><b>segment-lifecycle-worker</b>: the Segments Manager, through allocate-segment.</li>
+</ul>
+  </section>
+
+  <footer>
+    <span>workflow_domains/upi_lifecycle/create_upi_cluster.py</span>
+    <span>activities/upi_provisioning/activities.py · installer_job.py · hub_api.py · spoke_api.py · cluster_ready.py</span>
+    <span>activities/cluster_lifecycle/mce_folder.py</span>
+    <span>shared/models/upi_lifecycle.py</span>
+  </footer>
+
+</div>
+</main>
+
+<script src="/assets/nav.js?v=__DOC_VERSION__" defer></script>
+</body>
+</html>

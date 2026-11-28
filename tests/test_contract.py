@@ -21,6 +21,8 @@ import activities.server_lifecycle.activities as server_impl
 import activities.server_provisioning.activities as provisioning_impl
 import activities.upgrade_agent.activities as upgrade_agent_impl
 import activities.upgrade_gitops.activities as upgrade_gitops_impl
+import activities.upi_provisioning.activities as upi_provisioning_impl
+import activities.upi_server.activities as upi_server_impl
 import activities.vm_lifecycle.activities as vm_lifecycle_impl
 import shared.interfaces.cluster_lifecycle as cluster_lifecycle_interface
 import shared.interfaces.cluster_upgrade as cluster_upgrade_interface
@@ -29,6 +31,8 @@ import shared.interfaces.server_lifecycle as server_interface
 import shared.interfaces.server_provisioning as provisioning_interface
 import shared.interfaces.upgrade_agent as upgrade_agent_interface
 import shared.interfaces.upgrade_gitops as upgrade_gitops_interface
+import shared.interfaces.upi_provisioning as upi_provisioning_interface
+import shared.interfaces.upi_server as upi_server_interface
 import shared.interfaces.vm_lifecycle as vm_lifecycle_interface
 
 # Every domain, not just the first one written: an activity whose stub and
@@ -42,6 +46,8 @@ _DOMAINS = [
     pytest.param(upgrade_gitops_interface, upgrade_gitops_impl, id="upgrade_gitops"),
     pytest.param(vm_lifecycle_interface, vm_lifecycle_impl, id="vm_lifecycle"),
     pytest.param(cluster_lifecycle_interface, cluster_lifecycle_impl, id="cluster_lifecycle"),
+    pytest.param(upi_provisioning_interface, upi_provisioning_impl, id="upi_provisioning"),
+    pytest.param(upi_server_interface, upi_server_impl, id="upi_server"),
 ]
 
 

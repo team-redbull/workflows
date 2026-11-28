@@ -1655,3 +1655,129 @@ class Day1QueryInvalidError(OrchestratorError):
     NON-RETRYABLE ApplicationError of this type, so no calling workflow has to
     list it: the activity is shared by other domains, and each would otherwise
     have to remember to."""
+
+
+# --- upi-lifecycle (create-upi-cluster, add-server-to-upi; 2026-11-27) ------------------
+
+
+class InstallerConfigRejectedError(OrchestratorError):
+    """create-upi-cluster's `install_config` sets a key the run owns (`cluster_name`,
+    `site`, `segment`, `vlan_id`, the secret paths, any `argocd_*` key), or the
+    site has no bootstrap-installer profile in the limb's sites ConfigMap. Every
+    reason is named. Deterministic — non-retryable."""
+
+
+class InstallerJobFailedError(OrchestratorError):
+    """A bootstrap-installer Job (prepare or install) ended Failed, or ran past its
+    activeDeadlineSeconds. The message carries the last lines of its log, bounded.
+    Deterministic for this run: the Job is not started again by a retry (its name is
+    the run's). A person reads the log, fixes the cause — and, after a failed
+    `install`, destroys what terraform made — then starts the cluster again: the new
+    run makes new Jobs, and its `prepare` refuses a work volume whose terraform state
+    still holds resources."""
+
+
+class HubApiError(OrchestratorError):
+    """The hub's own Kubernetes API failed for the upi-provisioning limb: 5xx, a
+    timeout, a dropped connection, a 401 of a rotated token. Retryable."""
+
+
+class HubAccessError(OrchestratorError):
+    """The hub refused the upi-provisioning limb (403: a verb missing from its
+    chart's Role), or answered 400/422 to a manifest it built. Deterministic —
+    non-retryable: the chart or the code is fixed, then the run is started again."""
+
+
+class UpiClusterAccessError(OrchestratorError):
+    """The installed UPI cluster cannot be reached as its admin: its kubeconfig
+    Secret is missing or unusable on the hub, or its API answered 403.
+    Deterministic — non-retryable."""
+
+
+class UpiClusterApiError(OrchestratorError):
+    """The installed UPI cluster's API failed transiently (5xx, timeout, connection
+    refused while it comes up, a 401 of a token not yet valid). Retryable."""
+
+
+class UpiClusterNotReadyError(OrchestratorError):
+    """The installed cluster did not serve in time: an expected node not Ready, or
+    ClusterVersion not Available, at the deadline. The message names what was
+    missing and the pending CSRs. Deterministic for the run — a person looks at the
+    cluster (`oc get nodes,co,csr`)."""
+
+
+class ArgoClusterSecretConflictError(OrchestratorError):
+    """The hub's Argo CD already has a cluster Secret of this name for ANOTHER API
+    server. This workflow never overwrites one. Deterministic — non-retryable."""
+
+
+class Day1SiteNotFoundError(OrchestratorError):
+    """create-upi-cluster's site has no `sites/<site>/` folder at day1 main, so an
+    MCE cannot be added under it (the `<site>-mces` ApplicationSet would not see it).
+    Deterministic — non-retryable."""
+
+
+class MceFolderConflictError(OrchestratorError):
+    """The MCE's day1 folder already exists — at main or on the run's branch — with
+    other content than this run's (or another site holds an MCE of that name). This
+    workflow never overwrites day1. Deterministic — non-retryable."""
+
+
+class UpiNetworkNotFoundError(OrchestratorError):
+    """WORKFLOW-RAISED. The UPI cluster holds no MCE or UPI segment in the Segments
+    Manager, so there is no VLAN for its new node's bond. Nothing was allocated."""
+
+
+class SegmentWithoutDhcpError(OrchestratorError):
+    """WORKFLOW-RAISED. The UPI cluster's node segment says `dhcp: false` in the
+    Segments Manager, and add-server-to-upi's nodes take their address by DHCP on
+    `bond0.<vlan>`. Nothing was allocated."""
+
+
+class VirtualMediaUnsupportedError(OrchestratorError):
+    """WORKFLOW-RAISED. The server's BMC is driven over IPMI (a UCS-managed blade),
+    which has no virtual media to mount a node-image ISO from. Its lock in
+    server-scan is given back."""
+
+
+class BmcCredentialsMissingError(OrchestratorError):
+    """The upi-server worker has no BMC username/password for this vendor
+    (`<VENDOR>_BMC_USERNAME` / `_PASSWORD`). Deterministic — non-retryable."""
+
+
+class RedfishAuthError(OrchestratorError):
+    """The BMC refused the worker's credentials (401/403). Deterministic —
+    non-retryable: iDRAC9 locks an address out after repeated failures."""
+
+
+class RedfishError(OrchestratorError):
+    """A Redfish call to the BMC failed transiently (5xx, a timeout, a busy BMC).
+    Retryable. The message is bounded."""
+
+
+class VirtualMediaUnavailableError(OrchestratorError):
+    """The BMC exposes no CD/DVD virtual media slot with an InsertMedia action, or
+    refused the insert as sent (400/405/422). Deterministic — non-retryable."""
+
+
+class NodeImageBuildError(OrchestratorError):
+    """`oc adm node-image create` exited non-zero: its stderr, bounded, is in the
+    message (a nodes-config the agent refuses, a release it cannot read). A run
+    that took too long is the retryable UpiNodeApiError instead. Deterministic —
+    non-retryable."""
+
+
+class UpiNodeApiError(OrchestratorError):
+    """The UPI cluster's own API (as the upi-server worker's ServiceAccount) failed
+    transiently, or `oc adm node-image create` timed out. Retryable."""
+
+
+class UpiNodeAccessError(OrchestratorError):
+    """The UPI cluster refused the upi-server worker (403: its chart's role lacks a
+    verb). Deterministic — non-retryable."""
+
+
+class NodeJoinTimeoutError(OrchestratorError):
+    """The server did not become a Ready Node of the UPI cluster in time. The message
+    names the Node's last state and the CSRs seen. Deterministic for the run — a
+    person looks at the server's console."""

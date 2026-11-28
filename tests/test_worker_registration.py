@@ -33,6 +33,8 @@ _WORKERS = {
     "UPGRADE_GITOPS_ACTIVITY_QUEUE": "activities/upgrade_gitops/worker_init.py",
     "vm_lifecycle_activity_queue": "activities/vm_lifecycle/worker_init.py",
     "CLUSTER_LIFECYCLE_ACTIVITY_QUEUE": "activities/cluster_lifecycle/worker_init.py",
+    "UPI_PROVISIONING_ACTIVITY_QUEUE": "activities/upi_provisioning/worker_init.py",
+    "upi_server_activity_queue": "activities/upi_server/worker_init.py",
 }
 
 # the workflow modules that dispatch activities, and the interface module each
@@ -49,6 +51,8 @@ _WORKFLOW_MODULES = [
     "workflow_domains/vm_lifecycle/create_vm.py",
     "workflow_domains/vm_lifecycle/delete_vm.py",
     "workflow_domains/cluster_lifecycle/provision_cluster.py",
+    "workflow_domains/upi_lifecycle/create_upi_cluster.py",
+    "workflow_domains/upi_lifecycle/add_server_to_upi.py",
 ]
 
 

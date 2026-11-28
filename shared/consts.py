@@ -163,3 +163,33 @@ def vm_lifecycle_activity_queue(kv_cluster: str) -> str:
 # on ALLOCATE_SEGMENT_WORKFLOW_QUEUE, never through a second copy of that token.
 PROVISION_CLUSTER_WORKFLOW_QUEUE = "provision-cluster-workflow"
 CLUSTER_LIFECYCLE_ACTIVITY_QUEUE = "cluster-lifecycle-activity"
+
+# -- UPI-lifecycle domain (2026-11-27) --
+# TWO workflows, each on its own queue: create-upi-cluster (an OpenShift UPI
+# `platform: none` cluster on vSphere — an MCE is one kind) and add-server-to-upi
+# (one bare-metal server joined to a running UPI cluster as a Node).
+#
+# TWO limbs, because the work needs two credential sets in two places (§2):
+#   * the HUB limb `upi-provisioning` runs bootstrap-installer as Jobs, holds each
+#     installed cluster's admin kubeconfig in a hub Secret and writes Argo CD's
+#     cluster Secret — one queue, like segment-lifecycle;
+#   * the `upi-server` limb runs INSIDE each UPI cluster, as its own
+#     ServiceAccount, with the BMC credentials and server-scan's token, and serves
+#     the node-image ISOs its BMCs fetch — a queue per cluster, routed like
+#     server-lifecycle.
+# The day1 MCE folder is written by the cluster-lifecycle limb (it holds the day1
+# token), the segments come from allocate-segment as awaited children.
+CREATE_UPI_CLUSTER_WORKFLOW_QUEUE = "create-upi-cluster-workflow"
+ADD_SERVER_TO_UPI_WORKFLOW_QUEUE = "add-server-to-upi-workflow"
+UPI_PROVISIONING_ACTIVITY_QUEUE = "upi-provisioning-activity"
+UPI_SERVER_ACTIVITY_QUEUE = "upi-server-activity"
+
+
+def upi_server_activity_queue(cluster: str) -> str:
+    """The upi-server activity queue for ONE UPI cluster (see server_lifecycle_activity_queue).
+
+    `cluster` is the UPI cluster's name exactly as create-upi-cluster was given it
+    — the `UPI_CLUSTER` its worker is deployed with, never canonicalised: the two
+    must be the same string or the worker polls a queue no run sends to.
+    """
+    return f"{UPI_SERVER_ACTIVITY_QUEUE}-{cluster}"

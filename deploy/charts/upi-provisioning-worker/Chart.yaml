@@ -1,0 +1,11 @@
+apiVersion: v2
+name: upi-provisioning-worker
+description: >-
+  The upi-lifecycle domain's HUB activity worker ("limb"), one release on the hub.
+  It runs team-redbull/bootstrap-installer as Kubernetes Jobs for create-upi-cluster
+  (prepare, install), keeps each cluster's work volume (terraform state) and admin
+  kubeconfig Secret, waits until the cluster serves, and registers it in the hub's
+  Argo CD.
+type: application
+version: 0.1.0
+appVersion: "v1.0.0"

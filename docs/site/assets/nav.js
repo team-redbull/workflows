@@ -33,6 +33,24 @@
       ]
     },
     {
+      domain: "upi-lifecycle",
+      // Two limbs: upi-provisioning on the hub (bootstrap-installer Jobs, Argo CD),
+      // upi-server inside each UPI cluster (node-image, BMCs, CSRs).
+      queue: "upi-provisioning-activity",
+      workflows: [
+        {
+          name: "create-upi-cluster",
+          href: "/upi-lifecycle/create-upi-cluster.html",
+          blurb: "a UPI cluster on vSphere (an MCE is one kind): segments, installer Jobs, Argo CD, day1"
+        },
+        {
+          name: "add-server-to-upi",
+          href: "/upi-lifecycle/add-server-to-upi.html",
+          blurb: "one bare-metal server into a UPI cluster: bond0, node-image ISO, virtual media, CSRs"
+        }
+      ]
+    },
+    {
       domain: "segment-lifecycle",
       queue: "segment-lifecycle-activity",
       workflows: [

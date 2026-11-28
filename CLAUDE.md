@@ -213,6 +213,19 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   workflow whose own limb has no day1 token) and `list_kv_clusters` (a zone's KV clusters oldest
   first, for create-vm, with the placement buffer — `HEADROOM_BUFFER_PERCENT`, this worker's, §4).
   Both under a "shared with…" header in `shared/interfaces/cluster_lifecycle.py`.
+- **upi-lifecycle has TWO limbs: `upi-provisioning` on the hub and `upi-server` INSIDE each UPI
+  cluster** (2026-11-27, with the operator). The domain builds and grows the layer UNDER the
+  hosted clusters: OpenShift UPI `platform: none` clusters on vSphere, an MCE being one KIND.
+  `create-upi-cluster` (queue `create-upi-cluster-workflow`, id `create-upi-cluster-<cluster>`)
+  runs on the HUB limb (`activities/upi_provisioning/`, queue `upi-provisioning-activity`, chart
+  `deploy/charts/upi-provisioning-worker/`): bootstrap-installer as Jobs in its namespace, each
+  cluster's admin kubeconfig in a hub Secret, Argo CD's cluster Secret. `add-server-to-upi`
+  (queue `add-server-to-upi-workflow`, id `add-server-to-upi-<cluster>_<server>`) runs on the
+  worker INSIDE the target cluster (`activities/upi_server/`,
+  `upi_server_activity_queue(<cluster>)`, chart `deploy/charts/upi-server-worker/`) — the per-MCE
+  server-lifecycle pattern: its own ServiceAccount, BMC credentials and server-scan token, nothing
+  on the hub holding a credential for the cluster. The MCE's day1 folder is the cluster-lifecycle
+  limb's (`publish_mce_folder`: it holds the day1 token), the segments allocate-segment's (children).
 - **Brain is ONE deployment for every domain**, not one per workflow — the `workflows-orchestrator`
   chart is standalone, deployed once. Each new domain adds `activities/<domain>/` + a
   `gitops/charts/<domain>-worker/` chart folder (plus its `gitops/services/` app.yaml) and registers
@@ -1618,6 +1631,34 @@ nothing, edit them never (GitHub rejects the push anyway — read-only).
   contract is reported from the air-gap) — see `docs/design/provision-cluster.md`. The chart's go-link
   DisposableRequest must GO (or create under `SHORTCUT_OWNER`): one made first under another owner
   fails every run at `ShortcutTakenError`.
+- **create-upi-cluster: bootstrap-installer stays the ONE install implementation; the workflow
+  drives it** (the operator, 2026-11-27, automating his "Creation MCE 4.20" runbook). Two Jobs per
+  run, `upi-<cluster>-<prepare|install>-<run token>`, from INSTALLER_IMAGE: `prepare` =
+  `bootstrap.py --skip-terraform --skip-argocd` (configs, ignition, `*.apps` DNS; then the admin
+  kubeconfig and ONLY the node IP lists — cluster-context.yaml also holds the vCenter password — into
+  `upi-<cluster>-kubeconfig`), `install` = `--skip-ignition --skip-dns --skip-argocd` (terraform apply,
+  its "yes" prompt answered by the script, and its CSR loop). The work volume `upi-<cluster>-work`
+  holds terraform's state and is NEVER deleted; a `prepare` refuses one whose state lists resources
+  (destroy first). bootstrap-installer's CSR loop exits 0 on timeout, so READINESS is the limb's
+  (`await_upi_cluster_ready`: every recorded IP a Ready Node, ClusterVersion Available with a
+  version). Argo CD registration is the LIMB's, not bootstrap-installer's (`oc --server --token`
+  from a hub pod cannot verify the hub's TLS): `cluster-<cluster>` with `name: <cluster>` — the
+  hub's `<site>-mces` ApplicationSet targets `destination.name: <folder>`, so an MCE's folder name,
+  its Argo CD cluster name and its Segments Manager cluster are ONE string. For an MCE, the run then
+  adds `sites/<site>/mces/<cluster>/{values.yaml, version.yaml}` by merge request and waits for the
+  merge (provision-cluster's shape); never an empty file under `hostedClusters/` (it breaks the
+  generator). allocate-segment allocates MCE, INVENTORY and UPI since the same day (a UPI segment's
+  holder is a LIST: `SegmentEntry.held_by`).
+- **add-server-to-upi: one named server, bond0 over two link-UP NICs, DHCP on `bond0.<vlan>`, the
+  ISO on the BMC's virtual media** (the operator, 2026-11-27; what cluster-expender tried as a CLI).
+  The bond is add-server-to-mce's `select_bond_members` (reused, `allow_link_down=True`: server-scan
+  vouches); an IPMI BMC (no virtual media) or an unknown vendor is refused and the lock given back.
+  The nodes-config binds MACs to LOGICAL names (`nic1`, `nic2`); the ISO is built by `oc adm
+  node-image create` as the worker's ServiceAccount (cluster-admin by default — node-image needs it)
+  and served by the worker pod's own nginx sidecar from its volume (ONE replica). Only THIS host's
+  CSRs are approved (the bootstrapper's client CSR with CN `system:node:<hostname>`, the serving CSR
+  BY that node). After the join, server-scan's lock is extended a day; on a failure it is left to
+  its TTL and nothing is undone. Not built yet: a pool draw, PXE for IPMI blades, a remove path.
 - **GitLab is the ONLY git provider the services know. Do not re-add a second one.** This repo's
   own source and CI live on GitHub; the air-gapped production is GitLab, with SUBGROUPS (which
   GitHub has not). provision-cluster's limb first carried both — `DAY1_GIT_PROVIDER` gitlab|github,

@@ -1,0 +1,20 @@
+{{- if .Values.iso.route.enabled }}
+# Plain HTTP on purpose: BMCs fetch virtual media over HTTP(S) and many refuse a
+# certificate they do not trust. The ISOs carry the cluster's ignition endpoint,
+# not its credentials.
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: {{ include "usw.fullname" . }}-isos
+  labels:
+    {{- include "usw.labels" . | nindent 4 }}
+spec:
+  {{- with .Values.iso.route.host }}
+  host: {{ . }}
+  {{- end }}
+  to:
+    kind: Service
+    name: {{ include "usw.fullname" . }}-isos
+  port:
+    targetPort: http
+{{- end }}

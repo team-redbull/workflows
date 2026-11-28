@@ -1,0 +1,121 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "usw.fullname" . }}
+  labels:
+    {{- include "usw.labels" . | nindent 4 }}
+spec:
+  # ONE replica, Recreate: the ISO a worker builds is on the volume its own
+  # sidecar serves, and the volume is ReadWriteOnce.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "usw.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "usw.selectorLabels" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "usw.serviceAccountName" . }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: upi-server-worker
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "usw.configName" . }}
+            - secretRef:
+                name: {{ .Values.credentials.existingSecret }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: isos
+              mountPath: /isos
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.nodeImage.registryConfigSecret }}
+            - name: registry-config
+              mountPath: /etc/node-image
+              readOnly: true
+            {{- end }}
+            {{- if .Values.temporal.tls.enabled }}
+            - name: temporal-ca
+              mountPath: /etc/temporal-tls
+              readOnly: true
+            {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+        - name: iso-server
+          image: {{ .Values.iso.nginxImage }}
+          # The UBI nginx image serves /opt/app-root/src on 8080, as any UID.
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            tcpSocket:
+              port: http
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: isos
+              mountPath: /opt/app-root/src
+              readOnly: true
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+      volumes:
+        - name: isos
+          persistentVolumeClaim:
+            claimName: {{ include "usw.fullname" . }}-isos
+        - name: tmp
+          emptyDir: {}
+        {{- if .Values.nodeImage.registryConfigSecret }}
+        - name: registry-config
+          secret:
+            secretName: {{ .Values.nodeImage.registryConfigSecret }}
+            items:
+              - key: .dockerconfigjson
+                path: config.json
+        {{- end }}
+        {{- if .Values.temporal.tls.enabled }}
+        - name: temporal-ca
+          configMap:
+            name: {{ include "usw.fullname" . }}-temporal-ca
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- include "usw.validate" . -}}

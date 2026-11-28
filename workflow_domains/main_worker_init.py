@@ -24,7 +24,9 @@ from temporalio.worker import Worker
 
 from shared.consts import (
     ADD_SERVER_TO_MCE_WORKFLOW_QUEUE,
+    ADD_SERVER_TO_UPI_WORKFLOW_QUEUE,
     ALLOCATE_SEGMENT_WORKFLOW_QUEUE,
+    CREATE_UPI_CLUSTER_WORKFLOW_QUEUE,
     CREATE_VM_WORKFLOW_QUEUE,
     DELETE_STRAY_VM_WORKFLOW_QUEUE,
     DELETE_VM_WORKFLOW_QUEUE,
@@ -88,6 +90,8 @@ from workflow_domains.server_lifecycle.update_nodepool import UpdateNodePoolWork
 from workflow_domains.server_provisioning.provision_dell_server import (
     ProvisionDellServerWorkflow,
 )
+from workflow_domains.upi_lifecycle.add_server_to_upi import AddServerToUpiWorkflow
+from workflow_domains.upi_lifecycle.create_upi_cluster import CreateUpiClusterWorkflow
 from workflow_domains.vm_lifecycle.create_vm import CreateVmWorkflow
 from workflow_domains.vm_lifecycle.delete_stray_vm import DeleteStrayVmWorkflow
 from workflow_domains.vm_lifecycle.delete_vm import DeleteVmWorkflow
@@ -101,7 +105,9 @@ _settings = TemporalSettings()
 # the order is only the order the Workers start in.
 _WORKER_SPECS: list[tuple[str, list[type]]] = [
     (ADD_SERVER_TO_MCE_WORKFLOW_QUEUE, [AddServerToMceWorkflow]),
+    (ADD_SERVER_TO_UPI_WORKFLOW_QUEUE, [AddServerToUpiWorkflow]),
     (ALLOCATE_SEGMENT_WORKFLOW_QUEUE, [AllocateSegmentWorkflow]),
+    (CREATE_UPI_CLUSTER_WORKFLOW_QUEUE, [CreateUpiClusterWorkflow]),
     (CREATE_VM_WORKFLOW_QUEUE, [CreateVmWorkflow]),
     (DELETE_STRAY_VM_WORKFLOW_QUEUE, [DeleteStrayVmWorkflow]),
     (DELETE_VM_WORKFLOW_QUEUE, [DeleteVmWorkflow]),

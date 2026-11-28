@@ -24,6 +24,8 @@ from shared.settings.server_provisioning import ServerProvisioningActivitySettin
 from shared.settings.temporal import TemporalSettings
 from shared.settings.upgrade_agent import UpgradeAgentActivitySettings
 from shared.settings.upgrade_gitops import UpgradeGitopsActivitySettings
+from shared.settings.upi_provisioning import UpiProvisioningActivitySettings
+from shared.settings.upi_server import UpiServerActivitySettings
 from shared.settings.vm_lifecycle import VmLifecycleActivitySettings
 
 for _settings_class in (
@@ -35,6 +37,8 @@ for _settings_class in (
     TemporalSettings,
     UpgradeAgentActivitySettings,
     UpgradeGitopsActivitySettings,
+    UpiProvisioningActivitySettings,
+    UpiServerActivitySettings,
     VmLifecycleActivitySettings,
 ):
     _settings_class.model_config["env_file"] = None
@@ -88,5 +92,11 @@ os.environ.update(
         "HEADROOM_BUFFER_PERCENT": "15",
         "KV_CLUSTER": "ocp4-prod-kv-five-az1-a",
         "VM_STORAGE_CLASS_NAME": "test-cephfs",
+        # --- create-upi-cluster: the hub limb ---
+        "NAMESPACE": "redbull-workflows-test",
+        "INSTALLER_IMAGE": "registry.test/bootstrap-installer:test",
+        # --- add-server-to-upi: the limb inside the UPI cluster ---
+        "UPI_CLUSTER": "ocp4-prod-mce-tlv-a",
+        "ISO_BASE_URL": "http://isos.test",
     }
 )

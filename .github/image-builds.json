@@ -68,5 +68,19 @@
     "chart-repo": "team-redbull/redbull-platform",
     "helm-values-path": "gitops/charts/workflows-docs/values.yaml",
     "helm-image-path": "image"
+  },
+  {
+    "image-name": "upi-provisioning-worker",
+    "dockerfile": "activities/upi_provisioning/Dockerfile",
+    "chart-repo": "team-redbull/redbull-platform",
+    "helm-values-path": "gitops/charts/upi-provisioning-worker/values.yaml",
+    "helm-image-path": "image"
+  },
+  {
+    "image-name": "upi-server-worker",
+    "dockerfile": "activities/upi_server/Dockerfile",
+    "chart-repo": "team-redbull/redbull-platform",
+    "helm-values-path": "gitops/charts/upi-server-worker/values.yaml",
+    "helm-image-path": "image"
   }
 ]

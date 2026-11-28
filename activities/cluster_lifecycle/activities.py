@@ -28,7 +28,7 @@ from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
 from activities import day1_repo
-from activities.cluster_lifecycle import day1_clusters, day1_writer, day2_sigs, git_provider, shortcuts_api
+from activities.cluster_lifecycle import day1_clusters, day1_writer, day2_sigs, git_provider, mce_folder, shortcuts_api
 from activities.cluster_lifecycle.dhcp_values import build_dhcp_values
 from shared.exceptions import Day1QueryInvalidError
 from shared.models.cluster_lifecycle import (
@@ -46,6 +46,7 @@ from shared.models.cluster_lifecycle import (
     MergeRequestRequest,
     MergeRequestState,
 )
+from shared.models.upi_lifecycle import MceFolderPublishRequest, MceFolderRef
 from shared.models.vm_lifecycle import KvClusterList, KvClusterListRequest
 from shared.settings.cluster_lifecycle import ClusterLifecycleActivitySettings
 
@@ -178,3 +179,21 @@ async def list_kv_clusters(request: KvClusterListRequest) -> KvClusterList:
         ", ".join(usable) or "none usable", len(listed.clusters) - len(usable),
     )
     return listed
+
+
+# --- shared with the upi-lifecycle domain -------------------------------------------------
+
+
+@activity.defn
+async def publish_mce_folder(request: MceFolderPublishRequest) -> MceFolderRef:
+    published = await mce_folder.publish(
+        repo_url=_settings.day1_repo_url, token=_settings.redbull_git_token, request=request
+    )
+    if published.on_main:
+        activity.logger.info("%s is already at day1 main as this run would write it — nothing pushed", published.folder)
+    elif published.changed:
+        activity.logger.info("pushed %s to %s (commit %s)", published.folder, published.branch, published.commit_sha)
+    else:
+        activity.logger.info("%s already carries %s as this run would write it — nothing pushed",
+                             published.branch, published.folder)
+    return published

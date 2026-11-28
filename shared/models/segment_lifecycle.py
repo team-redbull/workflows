@@ -34,6 +34,17 @@ class SegmentType(str, Enum):
     # the CLUSTER alone and add-server-to-mce resolves it once per run.
     INVENTORY = "INVENTORY"
     PXE = "PXE"
+    # A standalone UPI cluster's node network (create-upi-cluster, kind
+    # `standalone`, 2026-11-27). The ONE type the Segments Manager lets several
+    # clusters share: its `cluster_name` is a LIST there (SegmentEntry.held_by).
+    # An allocation of it always takes a fresh segment and stores `[cluster]`.
+    UPI = "UPI"
+
+
+# The types allocate-segment reserves. HC for provision-cluster; MCE and
+# INVENTORY (an MCE's node network and its BareMetalHost boot network) and UPI
+# for create-upi-cluster (2026-11-27). PXE is created and held by hand.
+ALLOCATABLE_SEGMENT_TYPES = frozenset({SegmentType.HC, SegmentType.MCE, SegmentType.INVENTORY, SegmentType.UPI})
 
 
 class InitializeSegmentInput(BaseModel):
@@ -177,7 +188,20 @@ class SegmentEntry(BaseModel):
     vlan_id: int
     status: str
     type: str | None = None
-    cluster_name: str | None = None
+    # A string for every type but UPI, whose segment several clusters may share:
+    # the Segments Manager stores a LIST there (`["ocp4-upi-a", "ocp4-upi-b"]`).
+    # Compare through held_by(), never with `==`.
+    cluster_name: str | list[str] | None = None
+    # Whether the segment's network serves DHCP (the Segments Manager's own
+    # flag; None from a payload without it). add-server-to-upi refuses a node
+    # network that says False: its nodes take their address by DHCP.
+    dhcp: bool | None = None
+
+    def held_by(self, cluster: str) -> bool:
+        """Whether `cluster` holds this segment — the one way to ask, for a string or a UPI list."""
+        if isinstance(self.cluster_name, list):
+            return cluster in self.cluster_name
+        return self.cluster_name == cluster
 
 
 class DhcpExclusion(BaseModel):

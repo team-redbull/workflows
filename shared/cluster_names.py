@@ -262,6 +262,39 @@ def provision_cluster_branch(stem: str) -> str:
     return f"{PROVISION_CLUSTER_BRANCH_PREFIX}{stem}"
 
 
+CREATE_UPI_CLUSTER_BRANCH_PREFIX = "create-upi-cluster/"
+
+
+def create_upi_cluster_branch(cluster: str) -> str:
+    """`create-upi-cluster/<cluster>`: the day1 branch an MCE's folder is proposed on.
+
+    provision_cluster_branch's rule for create-upi-cluster: the workflow and the
+    cluster in the name, so a re-run converges onto the same branch.
+    """
+    return f"{CREATE_UPI_CLUSTER_BRANCH_PREFIX}{cluster}"
+
+
+# A UPI cluster's name: what bootstrap-installer accepts (alphanumeric and
+# hyphens, no hyphen at either end, at most 27 characters) held to lowercase,
+# because it is also a DNS label, a Kubernetes name and a queue suffix.
+UPI_CLUSTER_NAME_MAX = 27
+_UPI_CLUSTER_NAME = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
+
+
+class UpiClusterNameError(ValueError):
+    """A UPI cluster name bootstrap-installer, DNS or Kubernetes would refuse."""
+
+
+def upi_cluster_name(name: str) -> str:
+    """The name, checked: lowercase letters, digits and inner hyphens, at most 27."""
+    if len(name) > UPI_CLUSTER_NAME_MAX or not _UPI_CLUSTER_NAME.fullmatch(name):
+        raise UpiClusterNameError(
+            f"UPI cluster name {name!r} must be 1-{UPI_CLUSTER_NAME_MAX} lowercase letters, digits "
+            "and inner hyphens (bootstrap-installer's limit, a DNS label, a Kubernetes name)"
+        )
+    return name
+
+
 def env_of_mce_folder(mce: str) -> str | None:
     """`ocp4-prod-mce-site2-a` -> `prod`; None for a folder not named `ocp4-<env>-mce…`
     (`ocp4-mce-site2`, `ocp4-mce-site4-prep` carry no environment)."""

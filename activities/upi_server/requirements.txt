@@ -1,0 +1,11 @@
+temporalio>=1.28,<2
+pydantic>=2,<3
+pydantic-settings>=2,<3
+# Its own cluster's API: Nodes and CSRs. Synchronous SDK, wrapped in asyncio.to_thread.
+kubernetes>=29,<32
+# server-scan (activities/server_lifecycle/server_scan.py, reused) and the BMCs' Redfish.
+httpx>=0.27,<1
+# nodes-config.yaml.
+PyYAML>=6,<7
+# The CN of a kubelet's client CSR, to approve only this host's (node_api.csr_is_for_host).
+cryptography>=42,<51

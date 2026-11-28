@@ -194,13 +194,14 @@ async def test_a_retired_values_branch_on_an_old_input_is_ignored():
     assert len(calls["allocate_segment"]) == 1
 
 
-async def test_non_hc_type_is_rejected_before_any_activity():
+async def test_an_unallocatable_type_is_rejected_before_any_activity():
+    """PXE segments are held by hand: allocate-segment allocates HC, MCE, INVENTORY and UPI only."""
     calls, mocks = make_mock_activities()
     async with _Harness(mocks) as client:
         with pytest.raises(WorkflowFailureError) as exc_info:
             await _execute(
                 client,
-                AllocateSegmentRunArgs(input=AllocateSegmentInput(cluster=CLUSTER, site=SITE, type=SegmentType.MCE)),
+                AllocateSegmentRunArgs(input=AllocateSegmentInput(cluster=CLUSTER, site=SITE, type=SegmentType.PXE)),
             )
 
     cause = _workflow_cause(exc_info)

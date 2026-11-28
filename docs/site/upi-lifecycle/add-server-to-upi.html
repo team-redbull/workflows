@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>add-server-to-upi — Redbull Workflows</title>
+<meta name="description" content="The add-server-to-upi workflow: one bare-metal server joined to a UPI cluster as a Node — server-scan, a bond over two link-up NICs, an oc adm node-image ISO on the BMC's virtual media, the host's CSRs.">
+<link rel="icon" href="/assets/favicon.svg?v=__DOC_VERSION__" type="image/svg+xml">
+<link rel="stylesheet" href="/assets/site.css?v=__DOC_VERSION__">
+</head>
+<body data-page="/upi-lifecycle/add-server-to-upi.html">
+
+<a class="skip-link" href="#main">Skip to content</a>
+
+<!-- Topbar: identical on every page. Brand + deployed version upper-left; the
+     "Workflows" menu is built from the catalogue in assets/nav.js. -->
+<header class="topbar">
+  <a class="brand" href="/">
+    <img class="brand-mark" src="/assets/redbull-logo.png?v=__DOC_VERSION__" alt="" aria-hidden="true"
+         width="480" height="179">
+    <span class="brand-name">Redbull Workflows</span>
+    <span class="brand-ver" title="deployed image tag of this documentation site">__DOC_VERSION__</span>
+  </a>
+  <nav class="topnav" aria-label="Site">
+    <a class="topnav-link" href="/">Orchestrator guide</a>
+    <div class="wfmenu">
+      <button class="wfmenu-btn" id="wfmenu-btn" type="button"
+              aria-expanded="false" aria-haspopup="true" aria-controls="wfmenu-panel">
+        Workflows <span class="caret" aria-hidden="true">&#9662;</span>
+      </button>
+      <div class="wfmenu-panel" id="wfmenu-panel" role="menu" aria-label="Workflows by domain" hidden></div>
+    </div>
+    <noscript>
+      <a class="topnav-link" href="/upi-lifecycle/add-server-to-upi.html">add-server-to-upi</a>
+    </noscript>
+  </nav>
+</header>
+
+<main id="main">
+<header class="masthead">
+  <div class="masthead-inner">
+    <div class="eyebrow">Temporal workflow · domain: upi-lifecycle</div>
+    <h1>add-server-to-upi<span class="dim"> — what actually happens</span></h1>
+    <p class="lede">You name a <b>UPI cluster</b> and a <b>server</b>. The run takes the server from server-scan, picks two link-UP NICs for <b>bond0</b>, builds an <code>oc adm node-image create</code> ISO with the cluster's VLAN on the bond (DHCP), boots it through the BMC's <b>Redfish virtual media</b>, approves the host's CSRs and ends when its <b>Node is Ready</b>. What the runbook did by hand, and what cluster-expender tried as a CLI.</p>
+    <div class="facts"><div class="fact"><span class="k">Trigger</span><span class="v">POST /workflows/upi-lifecycle/add-server-to-upi</span></div><div class="fact"><span class="k">Workflow id</span><span class="v">add-server-to-upi-&lt;cluster&gt;_&lt;server, lowercased&gt;</span></div><div class="fact"><span class="k">Workflow queue</span><span class="v">add-server-to-upi-workflow</span></div><div class="fact"><span class="k">Activity queues</span><span class="v">upi-server-activity-&lt;cluster&gt; (inside the cluster), segment-lifecycle-activity</span></div></div>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <section id="flow">
+    <div class="sec-head">
+      <div class="eyebrow">The run, step by step</div>
+      <h2>From a server's name to a Ready Node</h2>
+      <p class="lede">Each card carries a <code>phase</code>, read live through the run's <b>progress</b> query on
+      <code>GET /workflows/runs/{workflow_id}</code>.</p>
+    </div>
+    <div class="flow">
+      <div class="step">
+        <div class="marker">1</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>find_cluster_allocation</h3>
+            <span class="phase">phase <b>resolving-network</b></span>
+          </div>
+          <p>The cluster's node segment in the Segments Manager — its MCE one, else its UPI one — on the segment-lifecycle queue: the VLAN for <code>bond0.&lt;vlan&gt;</code>. A segment that says <code>dhcp: false</code> is <code>SegmentWithoutDhcpError</code>; none is <code>UpiNetworkNotFoundError</code>. Nothing allocated yet.</p>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="marker">2</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>allocate_upi_server</h3>
+            <span class="phase">phase <b>allocating-server</b></span>
+          </div>
+          <p>server-scan's <code>POST /servers/available</code> for the <b>named</b> server: locked for the run (holder <code>add-server-to-upi</code>, 4 h), live-checked, its BMC and <code>interfaces[]</code> returned.</p>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="marker">3</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>select_bond_members (pure)</h3>
+            <span class="phase">phase <b>selecting-bond</b></span>
+          </div>
+          <p>add-server-to-mce's policy, reused: two link-UP NICs on <b>two distinct physical ports</b> (never two NPAR partitions of one wire), <code>nic1</code> the first. A BMC driven over IPMI (no virtual media) is <code>VirtualMediaUnsupportedError</code>, an unknown one <code>UnknownBmcVendorError</code>, no bond <code>NoBondableInterfacesError</code> — each gives the lock back first.</p>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="marker">4</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>inspect_upi_node</h3>
+            <span class="phase">phase <b>checking-cluster</b></span>
+          </div>
+          <p>A Node of that hostname already Ready: the server is in (a re-run) — straight to finishing.</p>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="marker">5</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>build_node_iso</h3>
+            <span class="phase">phase <b>building-iso</b></span>
+          </div>
+          <p>On the cluster's upi-server worker: the host's <code>nodes-config.yaml</code> — <code>nic1</code>/<code>nic2</code> bound to their MACs, <code>bond0</code> (802.3ad by default) over them, <code>bond0.&lt;vlan&gt;</code> on DHCP, the install disk — and <code>oc adm node-image create</code>. The ISO lands in the worker's ISO volume as <code>&lt;hostname&gt;.iso</code> next to the config's hash: the same config is never built twice.</p>
+          <div class="calls"><div class="call nxt"><span class="verb">OC</span><span class="path">oc adm node-image create --dir … (as the worker's ServiceAccount)</span></div></div>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="marker">6</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>boot_from_virtual_media</h3>
+            <span class="phase">phase <b>booting</b></span>
+          </div>
+          <p>Redfish, discovered not hard-coded: the system (server-scan's path, else the first), the manager's CD/DVD virtual media; whatever else is mounted is ejected, the ISO (<code>ISO_BASE_URL/&lt;hostname&gt;.iso</code>, served by the worker's nginx sidecar) inserted and <b>read back</b>, a one-time boot to CD, then On or ForceRestart.</p>
+          <div class="calls"><div class="call nxt"><span class="verb">HTTPS</span><span class="path">the BMC's Redfish API, with the worker's per-vendor credentials</span></div></div>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="marker">7</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>await_node_joined</h3>
+            <span class="phase">phase <b>joining</b></span>
+          </div>
+          <p>Every 15 s, approves <b>only this host's</b> CSRs — the node-bootstrapper client CSR whose subject is <code>system:node:&lt;hostname&gt;</code>, and the serving CSR requested by that node — until the Node is Ready. <code>join_timeout_minutes</code> (90) bounds it: <code>NodeJoinTimeoutError</code>.</p>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="marker">8</div>
+        <div class="card">
+          <div class="card-title">
+            <h3>finish_upi_node · extend_upi_server_lock</h3>
+            <span class="phase">phase <b>finishing</b></span>
+          </div>
+          <p>The Node's <code>node_labels</code> (read back), the media ejected and the ISO deleted (both best effort, noted); server-scan's lock extended to a day so the server is not drawn again before server-scan sees it in the cluster.</p>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <section id="start">
+    <div class="sec-head"><h2>How you start it and how you watch it</h2></div>
+    <pre><code>POST /workflows/upi-lifecycle/add-server-to-upi
+{
+  "cluster": "ocp4-prod-mce-tlv-a",
+  "server_name": "ocp-r760-tlv-abc1234",
+  "hostname": null,                    // default: the server's name, lowercased (the Node's name)
+  "root_device": "/dev/sda",          // default DEFAULT_ROOT_DEVICE
+  "bond_mode": "802.3ad",             // or "active-backup"
+  "node_labels": {"node-role.kubernetes.io/storage": ""},
+  "join_timeout_minutes": 90
+}
+→ 202 {"workflow_id": "add-server-to-upi-ocp4-prod-mce-tlv-a_ocp-r760-tlv-abc1234", "run_id": "…"}</code></pre>
+<p>One server a run; several servers are several requests (their runs go in parallel). The cluster's
+<code>upi-server-worker</code> must be deployed in it (<code>deploy/charts/upi-server-worker</code>), or the run waits,
+visible as a pending activity.</p>
+  </section>
+
+  <section id="failures">
+    <div class="sec-head"><h2>Failures</h2></div>
+    <ul>
+<li><code>UpiNetworkNotFoundError</code>, <code>SegmentWithoutDhcpError</code> — before anything is allocated.</li>
+<li><code>ServerNotAvailableError</code>, <code>ServerScanAuthError</code>, <code>AmbiguousServerNameError</code>, <code>ServerReservedError</code> — server-scan's answers.</li>
+<li><code>UnknownBmcVendorError</code>, <code>VirtualMediaUnsupportedError</code>, <code>NoBondableInterfacesError</code> — the lock is given back.</li>
+<li><code>NodeImageBuildError</code> — oc's stderr in the message. <code>BmcCredentialsMissingError</code>, <code>RedfishAuthError</code>, <code>VirtualMediaUnavailableError</code> — the BMC.</li>
+<li><code>NodeJoinTimeoutError</code> — the Node's last state and the CSRs approved; look at the server's console.</li>
+<li>After the allocation, a failure LEAVES the lock to its 4 h TTL and undoes nothing (half-done work may still name the machine).</li>
+</ul>
+  </section>
+
+  <section id="rerun">
+    <div class="sec-head"><h2>Run it again</h2></div>
+    <p>The same server and cluster: the ISO is reused when its config is the same, and a Node already
+Ready skips straight to finishing. A cancel undoes nothing.</p>
+  </section>
+
+  <section id="deps">
+    <div class="sec-head"><h2>Dependencies</h2></div>
+    <ul>
+<li><b>upi-server-worker</b>, one per UPI cluster, inside it: its ServiceAccount (cluster-admin by default, for
+node-image), server-scan's ADMIN token, the BMC credentials per vendor, the ISO volume and its nginx sidecar + Route.</li>
+<li><b>segment-lifecycle-worker</b>: the cluster's node segment.</li>
+</ul>
+  </section>
+
+  <footer>
+    <span>workflow_domains/upi_lifecycle/add_server_to_upi.py</span>
+    <span>activities/upi_server/activities.py · nodes_config.py · node_image.py · redfish_media.py · node_api.py</span>
+    <span>workflow_domains/server_lifecycle/bond_selection.py (reused)</span>
+    <span>shared/models/upi_lifecycle.py</span>
+  </footer>
+
+</div>
+</main>
+
+<script src="/assets/nav.js?v=__DOC_VERSION__" defer></script>
+</body>
+</html>
